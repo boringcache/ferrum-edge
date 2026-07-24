@@ -650,6 +650,12 @@ pub mod _test_support {
         plugin.mirror_timeout_ms_for_test()
     }
 
+    pub fn request_mirror_metrics_snapshot_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
+        plugin.mirror_metrics_snapshot_for_test()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,

@@ -17586,11 +17586,17 @@ components:
         forwarding fields are stripped rather than regenerated, so mirrors do
         not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
         the mirror URL (mesh shadow Host uses a protocol-valid DNS `-shadow`
-        suffix; IPv4/IPv6 literals are left unchanged). Origin-bound credentials
-        (Authorization, Cookie, Proxy-Authorization, and related session/API-key
-        headers) are stripped by default; forwarding requires the fail-closed
-        pair forward_sensitive_headers=true plus a non-empty allowlist limited
-        to that closed set. Native gRPC mirrors re-synthesise te: trailers and dial
+        suffix; IPv4/IPv6 literals are left unchanged). Cross-origin credential
+        forwarding is deny-by-default: any header whose lowercased name is a
+        built-in credential (Authorization, Cookie, Proxy-Authorization,
+        WWW-Authenticate, X-Api-Key, …), contains a built-in credential substring
+        (so vendor variants like x-openai-api-key / x-amz-security-token are also
+        caught), or matches a configured sensitive_header_patterns entry is
+        stripped before the distinct mirror origin. Native gRPC metadata travels
+        as HTTP/2 headers, so the same predicate covers gRPC credential metadata.
+        Forwarding any denied header requires the fail-closed pair
+        forward_sensitive_headers=true plus a non-empty exact-name
+        forward_sensitive_header_allowlist. Native gRPC mirrors re-synthesise te: trailers and dial
         via the shared PluginHttpClient HTTP/2 companion (h2c prior knowledge for
         cleartext http targets; ALPN h2 for https). Ordinary HTTP mirrors keep
         the default all-version client so HTTP/1.1 destinations continue to work.
@@ -17652,11 +17658,13 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 1048576
           default: 256
           description: >-
             Maximum mirror tasks allowed concurrently. Requests that arrive
             while every permit is in use are still served normally but are not
-            mirrored.
+            mirrored. Capped at 1048576 (2^20): a larger value is rejected at
+            construction rather than panicking Tokio's semaphore.
         max_retained_request_body_bytes:
           type: integer
           format: uint64
@@ -17682,28 +17690,33 @@ components:
           default: false
           description: >-
             Dangerous opt-in. When true, selected origin-bound credential
-            headers may cross to the distinct mirror origin, but only names
-            listed in forward_sensitive_header_allowlist. Construction is
+            headers may cross to the distinct mirror origin, but only exact
+            names listed in forward_sensitive_header_allowlist. Construction is
             fail-closed: both fields are required together and the allowlist
             must be non-empty.
         forward_sensitive_header_allowlist:
           type: array
           items:
             type: string
-            enum:
-              - authorization
-              - cookie
-              - cookie2
-              - proxy-authorization
-              - www-authenticate
-              - x-api-key
-              - x-auth-token
-              - x-csrf-token
           description: >-
-            Lowercased allowlist of sensitive header names to forward when
-            forward_sensitive_headers is true. Unknown names are rejected at
-            construction. Default (with forward_sensitive_headers false) strips
-            the entire closed sensitive set.
+            Lowercased exact allowlist of denied sensitive header names to
+            forward when forward_sensitive_headers is true. Each entry must be a
+            valid HTTP header name that the deny-by-default policy actually
+            strips (a built-in credential or a sensitive_header_patterns match);
+            non-sensitive names are rejected at construction. Default (with
+            forward_sensitive_headers false) strips every sensitive header.
+        sensitive_header_patterns:
+          type: array
+          items:
+            type: string
+          description: >-
+            Additional lowercased substrings matched against the header name
+            (case-insensitive) that extend the built-in deny-by-default
+            credential set. A header whose lowercased name contains any pattern
+            is stripped before the mirror origin unless it is on the exact-name
+            forward_sensitive_header_allowlist. Covers HTTP headers and native
+            gRPC metadata (gRPC metadata is carried as HTTP/2 headers). Default
+            empty.
         max_response_body_bytes:
           type: integer
           format: uint64

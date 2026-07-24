@@ -1,9 +1,9 @@
 use ferrum_edge::_test_support::{
     request_mirror_append_shadow_host_suffix_for_test,
     request_mirror_max_retained_request_body_bytes_for_test,
-    request_mirror_resolve_timeout_ms_for_test, request_mirror_retained_request_body_bytes_for_test,
-    request_mirror_sample_phase_for_test, request_mirror_sample_threshold_for_test,
-    request_mirror_should_mirror_for_test,
+    request_mirror_metrics_snapshot_for_test, request_mirror_resolve_timeout_ms_for_test,
+    request_mirror_retained_request_body_bytes_for_test, request_mirror_sample_phase_for_test,
+    request_mirror_sample_threshold_for_test, request_mirror_should_mirror_for_test,
 };
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
@@ -775,6 +775,61 @@ fn test_max_in_flight_zero_is_error() {
     );
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("max_in_flight"));
+}
+
+/// #3070: `max_in_flight` must be range-checked against a deployment-safe hard
+/// cap before it reaches `tokio::sync::Semaphore::new`. Values between the cap
+/// and Tokio's `MAX_PERMITS` (`usize::MAX >> 3`) still fit `usize` and pass the
+/// nonzero check, but panic inside `Semaphore::new`. They must fail as ordinary
+/// config errors instead, and the exact cap boundary must be accepted.
+#[test]
+fn max_in_flight_hard_cap_rejects_unsafe_values_without_panicking() {
+    // Exactly at the documented cap (2^20) is accepted.
+    let at_cap = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_in_flight": 1_048_576u64 }),
+        PluginHttpClient::default(),
+    );
+    assert!(at_cap.is_ok(), "cap value must be accepted: {:?}", at_cap.err());
+
+    // One above the cap is rejected as a config error.
+    let above_cap = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_in_flight": 1_048_577u64 }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        above_cap
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("max_in_flight")),
+        "above-cap value must be rejected, got {above_cap:?}"
+    );
+
+    // A value past Tokio's MAX_PERMITS (usize::MAX >> 3 on 64-bit) would panic
+    // Semaphore::new; it must be a config error, never a panic.
+    let tokio_max_permits: u64 = (usize::MAX >> 3) as u64;
+    let past_tokio_cap = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_in_flight": tokio_max_permits }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        past_tokio_cap
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("max_in_flight")),
+        "value at/above Tokio MAX_PERMITS must be rejected, got {past_tokio_cap:?}"
+    );
+
+    // A value that overflows u64's usable range but still parses as u64.
+    let huge = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "max_in_flight": u64::MAX }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        huge.as_ref()
+            .err()
+            .is_some_and(|e| e.contains("max_in_flight")),
+        "u64::MAX must be rejected without panic, got {huge:?}"
+    );
 }
 
 #[test]
@@ -2962,17 +3017,56 @@ fn forward_sensitive_headers_opt_in_is_fail_closed() {
         "allowlist without opt-in flag must fail closed"
     );
 
-    let unknown = RequestMirror::new(
+    // A non-sensitive header name cannot be allowlisted: the allowlist only
+    // re-permits headers the deny-by-default policy actually strips, so a name
+    // that would never be stripped is a config error (catches typos).
+    let non_sensitive = RequestMirror::new(
         &json!({
             "mirror_host": "mirror.local",
             "forward_sensitive_headers": true,
-            "forward_sensitive_header_allowlist": ["x-custom-secret"]
+            "forward_sensitive_header_allowlist": ["x-trace-id"]
         }),
         PluginHttpClient::default(),
     );
     assert!(
-        unknown.err().unwrap().contains("must be one of"),
-        "unknown sensitive names must be rejected"
+        non_sensitive
+            .err()
+            .unwrap()
+            .contains("not a recognized sensitive header"),
+        "non-sensitive allowlist names must be rejected"
+    );
+
+    // An entry that is not a valid HTTP header name is rejected.
+    let invalid_name = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "forward_sensitive_headers": true,
+            "forward_sensitive_header_allowlist": ["bad header name"]
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        invalid_name
+            .err()
+            .unwrap()
+            .contains("is not a valid HTTP header name"),
+        "invalid header names must be rejected"
+    );
+
+    // A vendor credential caught only by a configured pattern can be
+    // allowlisted (patterns are parsed before the allowlist is validated).
+    assert!(
+        RequestMirror::new(
+            &json!({
+                "mirror_host": "mirror.local",
+                "sensitive_header_patterns": ["x-vendor-"],
+                "forward_sensitive_headers": true,
+                "forward_sensitive_header_allowlist": ["x-vendor-token"]
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "a header denied only by a configured pattern must be allowlistable"
     );
 
     assert!(
@@ -3212,6 +3306,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
             .as_deref()
             .is_some_and(|e| e.contains("max_retained_request_body_bytes")),
         "expected body-budget drop, got {dropped:?}"
+    );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).budget_drops,
+        1,
+        "the exhausted second attempt is a byte-budget drop"
     );
 
     let _ = release.send(());
@@ -3518,5 +3617,305 @@ async fn grpc_metadata_credentials_stripped_by_default_on_h2c_mirror() {
     assert!(
         lower.iter().any(|(k, v)| k == "grpc-timeout" && v == "1s"),
         "non-sensitive gRPC metadata must still forward: {observed:?}"
+    );
+}
+
+/// #3054: a mirror response advertising a `Content-Length` larger than
+/// `max_response_body_bytes` must still be drained under the byte + time bounds
+/// (never dropped unread with a fabricated `observed = max_bytes`). The observed
+/// size reflects bytes actually read, and the advertised length is recorded
+/// independently.
+#[tokio::test]
+async fn oversized_content_length_response_is_drained_under_bounds() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = stream.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        // Advertise and actually send 4096 bytes — larger than the 1024 cap —
+        // so the drain must bound the read rather than drop the response on the
+        // advertised length alone (the old Content-Length fast path).
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = stream.write_all(&vec![b'D'; 4096]).await;
+        let _ = stream.shutdown().await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "max_response_body_bytes": 1024
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let meta = ctx.collect_mirror_result().await.expect("mirror meta");
+    assert!(meta.mirror_error.is_none(), "truncation is not an error: {meta:?}");
+    assert_eq!(
+        meta.mirror_response_advertised_size_bytes,
+        Some(4096),
+        "advertised Content-Length must be recorded independently of observed"
+    );
+    let observed = meta
+        .mirror_response_size_bytes
+        .expect("observed size should be reported");
+    assert!(
+        observed > 1024,
+        "observed size must reflect a real bounded read, not a fabricated cap value: got {observed}"
+    );
+    assert!(
+        observed <= 4096,
+        "observed size must not exceed the actual body: got {observed}"
+    );
+}
+
+/// #3058: deny-by-default credential stripping covers vendor-prefixed headers
+/// via built-in credential substrings AND operator-configured
+/// `sensitive_header_patterns`, without over-stripping benign headers that only
+/// contain the deliberately-excluded bare `token` substring.
+#[tokio::test]
+async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "sensitive_header_patterns": ["x-vault-"]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    // Caught by the built-in `api-key` substring:
+    headers.insert("x-openai-api-key".to_string(), "sk-openai".to_string());
+    headers.insert("x-datadog-api-key".to_string(), "dd-key".to_string());
+    // Caught by the built-in `security-token` substring:
+    headers.insert("x-amz-security-token".to_string(), "amz-tok".to_string());
+    // Caught only by the operator pattern `x-vault-`:
+    headers.insert("x-vault-token".to_string(), "vault-tok".to_string());
+    // Benign: contains only the excluded bare `token` substring — must survive.
+    headers.insert("x-continuation-token".to_string(), "page2".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+        .await
+        .expect("timeout")
+        .expect("request");
+    let lower = request.to_ascii_lowercase();
+    for forbidden in [
+        "x-openai-api-key:",
+        "x-datadog-api-key:",
+        "x-amz-security-token:",
+        "x-vault-token:",
+        "sk-openai",
+        "dd-key",
+        "amz-tok",
+        "vault-tok",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "vendor credential `{forbidden}` must be stripped: {request}"
+        );
+    }
+    assert!(
+        lower.contains("x-continuation-token: page2"),
+        "benign pagination cursor must survive: {request}"
+    );
+    assert!(
+        lower.contains("x-custom: keep-me"),
+        "non-sensitive header must survive: {request}"
+    );
+}
+
+/// #3057: per-instance bounded-lifetime counters track the mirror lifecycle —
+/// dispatch, completion, and request-phase timeout — with a settled task never
+/// counted as a cancellation.
+#[tokio::test]
+async fn mirror_metrics_track_dispatch_completion_and_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // (1) Success path → dispatched + completed, no cancellations/timeouts.
+    let ok_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ok_addr = ok_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = ok_listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = stream.read(&mut buf).await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+    });
+    let ok_plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": ok_addr.ip().to_string(),
+            "mirror_port": ok_addr.port(),
+            "mirror_request_body": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(ok_plugin.before_proxy(&mut ctx, &mut headers).await);
+    let _ = ctx.collect_mirror_result().await;
+    let m = request_mirror_metrics_snapshot_for_test(&ok_plugin);
+    assert_eq!(m.dispatched, 1, "one task dispatched: {m:?}");
+    assert_eq!(m.completed, 1, "successful response counts as completed: {m:?}");
+    assert_eq!(m.cancellations, 0, "a settled task is not a cancellation: {m:?}");
+    assert_eq!(m.request_timeouts, 0, "{m:?}");
+    assert_eq!(m.request_failures, 0, "{m:?}");
+
+    // (2) Never-responding target under a short mirror deadline → request timeout.
+    let stuck_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stuck_addr = stuck_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = stuck_listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf).await;
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    });
+    let stuck_plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": stuck_addr.ip().to_string(),
+            "mirror_port": stuck_addr.port(),
+            "mirror_request_body": false,
+            "mirror_timeout_ms": 100
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx2 = make_ctx_with_proxy_timeout(0);
+    let mut headers2 = HashMap::new();
+    plugin_utils::assert_continue(stuck_plugin.before_proxy(&mut ctx2, &mut headers2).await);
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        ctx2.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror outcome must be bounded by the finite deadline")
+    .expect("mirror meta");
+    assert!(meta.mirror_error.is_some(), "never-responding target must error: {meta:?}");
+    let m2 = request_mirror_metrics_snapshot_for_test(&stuck_plugin);
+    assert_eq!(m2.dispatched, 1, "{m2:?}");
+    assert_eq!(
+        m2.request_timeouts, 1,
+        "reqwest read timeout must be counted as a request timeout: {m2:?}"
+    );
+    assert_eq!(m2.completed, 0, "{m2:?}");
+    assert_eq!(m2.cancellations, 0, "{m2:?}");
+}
+
+/// #3057: the concurrency-drop admission path increments the drop counter while
+/// leaving the primary request unaffected.
+#[tokio::test]
+async fn mirror_metrics_count_concurrency_drops() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    // Accept connections but never respond, so the first permit stays held for
+    // the duration of the test.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "max_in_flight": 1,
+            "mirror_timeout_ms": 5000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // First dispatch holds the only permit for the whole test.
+    let mut first = make_ctx_with_proxy();
+    let mut h1 = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut h1).await);
+
+    // Second dispatch cannot acquire a permit → explicit concurrency drop.
+    let mut second = make_ctx_with_proxy();
+    let mut h2 = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut second, &mut h2).await);
+    let dropped = second
+        .collect_mirror_result()
+        .await
+        .expect("concurrency drop must publish an explicit result");
+    assert!(
+        dropped
+            .mirror_error
+            .as_deref()
+            .is_some_and(|e| e.contains("max_in_flight")),
+        "expected concurrency drop, got {dropped:?}"
+    );
+
+    let m = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(m.dispatched, 1, "only the first attempt was dispatched: {m:?}");
+    assert_eq!(
+        m.concurrency_drops, 1,
+        "the saturated second attempt is a concurrency drop: {m:?}"
     );
 }

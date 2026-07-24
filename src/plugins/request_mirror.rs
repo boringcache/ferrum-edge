@@ -33,10 +33,17 @@
 //! destination, but set Host to a protocol-valid shadow authority — DNS
 //! hostnames receive a `-shadow` suffix before any port, while IPv4 and
 //! bracketed IPv6 literals keep their literal form (suffixing would yield an
-//! invalid Host). Origin-bound credentials (`Authorization`, `Cookie`,
-//! `Proxy-Authorization`, and related session/API-key headers) are stripped
-//! before the distinct mirror origin by default; forwarding them requires an
-//! explicit fail-closed allowlist opt-in. Native gRPC content-types
+//! invalid Host). Cross-origin credential forwarding is deny-by-default: any
+//! header whose lowercased name is a built-in credential (`Authorization`,
+//! `Cookie`, `Proxy-Authorization`, `WWW-Authenticate`, `X-Api-Key`, …),
+//! contains a built-in credential substring (so vendor variants like
+//! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
+//! caught), or matches an operator `sensitive_header_patterns` entry is stripped
+//! before the distinct mirror origin. Because native gRPC metadata is carried as
+//! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding
+//! any denied header requires the high-friction, fail-closed pair
+//! `forward_sensitive_headers=true` plus an exact-name
+//! `forward_sensitive_header_allowlist`. Native gRPC content-types
 //! re-synthesise `te: trailers` for HTTP/2-capable mirror targets. Native gRPC
 //! mirrors dial through `PluginHttpClient::get_http2` (h2c prior knowledge for
 //! cleartext `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep
@@ -65,6 +72,16 @@
 //! task's full configured lifetime, so late results remain visible without
 //! delaying the client response. The channel is seeded with a sanitized task
 //! failure fallback; concurrency drops are published as completed failures.
+//!
+//! Alongside the per-event summary, each instance keeps bounded-lifetime
+//! `AtomicU64` counters (`MirrorMetrics`) for the mirror lifecycle — dispatched,
+//! completed, request/drain timeouts, request/drain failures, cancellations,
+//! and concurrency/byte-budget drops. A cancellation (runtime shutdown, panic,
+//! or future cancellation before a terminal outcome) is counted via a drop
+//! guard, so a stalled/cancelled mirror is never silently invisible. Counters
+//! are pure tallies (no header names, URLs, or credential material), reset on
+//! config reload, and are not exposed on the unauthenticated `/metrics`
+//! surface, matching how mirror summaries are excluded from `prometheus_metrics`.
 //!
 //! Mirror timeout prefers an optional plugin `mirror_timeout_ms`, else the
 //! matched proxy's `backend_read_timeout_ms` when positive, else a finite
@@ -100,11 +117,12 @@
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed; bytes are discarded after sizing so keep-alive pools can reclaim the socket. |
-//! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. |
+//! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
 //! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Shared `Bytes` bodies are charged once per task for their length; exhaustion drops the new mirror attempt without affecting the primary request. |
 //! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
-//! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty and limited to the closed sensitive set). |
-//! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased allowlist of sensitive header names to forward when `forward_sensitive_headers` is `true`. Unknown names are rejected at construction. |
+//! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
+//! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); non-sensitive names are rejected at construction. |
+//! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
 //!
 //! ## Percentage sampling
 //!
@@ -164,6 +182,14 @@ use crate::proxy::headers::{
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
+/// Deployment-safe hard ceiling on `max_in_flight`. This is deliberately far
+/// below `tokio::sync::Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): a config
+/// value between this cap and `MAX_PERMITS` still fits `usize` and passes the
+/// nonzero check, but would panic inside `Semaphore::new`. Rejecting above this
+/// bound turns an unreasonable value into an ordinary validation error instead
+/// of a process/admission crash. 2^20 concurrent detached mirror tasks per
+/// instance is already far beyond any real deployment.
+const MAX_MAX_IN_FLIGHT_MIRRORS: usize = 1 << 20;
 /// Per-instance retained request-body budget for detached mirror tasks.
 const DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// Finite mirror deadline when the proxy has no positive read timeout.
@@ -182,8 +208,11 @@ const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
 const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
 const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
 
-/// Origin-bound credential / session headers stripped from cross-origin mirror
-/// requests unless an explicit fail-closed allowlist opts in.
+/// Well-known origin-bound credential / session header names stripped from
+/// cross-origin mirror requests unless an explicit fail-closed allowlist opts
+/// in. Most are also matched by [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]; the
+/// exact list is retained for `www-authenticate` (no covering substring) and as
+/// a self-documenting inventory of the standard credentials.
 const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
     "authorization",
     "cookie",
@@ -193,6 +222,35 @@ const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
     "x-api-key",
     "x-auth-token",
     "x-csrf-token",
+];
+
+/// Built-in credential/session substrings applied to lowercased header names so
+/// vendor-prefixed variants (`x-openai-api-key`, `x-amz-security-token`,
+/// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
+/// to match credential families only: bare `token`/`key`/`session`/`auth`
+/// substrings are deliberately excluded because they also match benign headers
+/// such as pagination cursors (`x-continuation-token`). Operators extend this
+/// with `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
+/// so the same predicate covers native gRPC credential metadata.
+const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "api-key",
+    "apikey",
+    "api_key",
+    "auth-token",
+    "access-token",
+    "refresh-token",
+    "id-token",
+    "session-token",
+    "security-token",
+    "csrf",
+    "xsrf",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
 ];
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
@@ -228,10 +286,20 @@ fn is_port_suffix(rest: &str) -> bool {
     matches!(rest.strip_prefix(':'), Some(port) if is_numeric_port(port))
 }
 
-fn is_mirror_sensitive_header(name_lower: &str) -> bool {
+/// Deny-by-default sensitivity test for a lowercased header name. A header is
+/// sensitive if it is a well-known credential name, contains a built-in
+/// credential substring, or contains any operator-configured
+/// `sensitive_header_patterns` substring.
+fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES
         .iter()
         .any(|sensitive| *sensitive == name_lower)
+        || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
+            .iter()
+            .any(|substr| name_lower.contains(substr))
+        || operator_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(pattern.as_str()))
 }
 
 /// Append Envoy/Istio's `-shadow` suffix to a Host/:authority value when the
@@ -308,14 +376,18 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.min(MAX_MIRROR_TIMEOUT_MS).max(1)
 }
 
+/// Strip origin-bound credentials before a distinct mirror origin. Deny by
+/// default: a sensitive header survives only when `forward_sensitive_headers`
+/// is set and the exact lowercased name is in the fail-closed allowlist.
 fn apply_mirror_credential_policy(
     headers: &mut Vec<(String, String)>,
     forward_sensitive_headers: bool,
     allowlist: &[String],
+    operator_patterns: &[String],
 ) {
     headers.retain(|(name, _)| {
         let lower = name.to_ascii_lowercase();
-        if !is_mirror_sensitive_header(&lower) {
+        if !is_mirror_sensitive_header(&lower, operator_patterns) {
             return true;
         }
         forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
@@ -384,6 +456,139 @@ impl Drop for RetainedMirrorBody {
     }
 }
 
+/// Per-instance, bounded-lifetime mirror observability counters.
+///
+/// Lifetime is bounded to the plugin instance: a config reload rebuilds the
+/// plugin and resets every counter to zero (no unbounded growth, no
+/// cross-generation accumulation). Counts are aggregate outcome tallies only —
+/// they never carry header names, URLs, or credential material, so they cannot
+/// leak secrets. Mirror summaries are intentionally excluded from the
+/// unauthenticated `/metrics` surface (see `prometheus_metrics`), so these
+/// counters follow the same convention as other plugins' internal `AtomicU64`
+/// state (`ai_rate_limiter`, `ai_federation`): internal, testable, and surfaced
+/// per-event through `mirror_error` on the transaction log.
+///
+/// Every dispatched task terminates in exactly one of
+/// `{completed, request_timeouts, request_failures, drain_timeouts,
+/// drain_failures, cancellations}`, so those six sum to `dispatched`. A task
+/// that is dropped before recording a terminal outcome — runtime shutdown,
+/// panic, or the executor cancelling the future — is counted as a cancellation
+/// by [`MirrorTaskGuard`].
+#[derive(Debug, Default)]
+struct MirrorMetrics {
+    /// Detached tasks spawned (admitted past both concurrency and byte budgets).
+    dispatched: AtomicU64,
+    /// Tasks that received a response and drained its body within bounds.
+    completed: AtomicU64,
+    /// Request-phase deadline expiries (connect/header/body request timeout).
+    request_timeouts: AtomicU64,
+    /// Other transport failures before a response (DNS, refused, reset, TLS…).
+    request_failures: AtomicU64,
+    /// Response-body drain-phase deadline expiries.
+    drain_timeouts: AtomicU64,
+    /// Response-body transport failures during the bounded drain.
+    drain_failures: AtomicU64,
+    /// Tasks dropped before a terminal outcome (shutdown/panic/cancellation).
+    cancellations: AtomicU64,
+    /// Mirror attempts dropped at admission because `max_in_flight` was full.
+    concurrency_drops: AtomicU64,
+    /// Mirror attempts dropped at admission because the byte budget was full.
+    budget_drops: AtomicU64,
+}
+
+/// Plain-`u64` snapshot of [`MirrorMetrics`] for external assertion in tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorMetricsSnapshot {
+    pub dispatched: u64,
+    pub completed: u64,
+    pub request_timeouts: u64,
+    pub request_failures: u64,
+    pub drain_timeouts: u64,
+    pub drain_failures: u64,
+    pub cancellations: u64,
+    pub concurrency_drops: u64,
+    pub budget_drops: u64,
+}
+
+impl MirrorMetrics {
+    fn snapshot(&self) -> MirrorMetricsSnapshot {
+        MirrorMetricsSnapshot {
+            dispatched: self.dispatched.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            request_timeouts: self.request_timeouts.load(Ordering::Relaxed),
+            request_failures: self.request_failures.load(Ordering::Relaxed),
+            drain_timeouts: self.drain_timeouts.load(Ordering::Relaxed),
+            drain_failures: self.drain_failures.load(Ordering::Relaxed),
+            cancellations: self.cancellations.load(Ordering::Relaxed),
+            concurrency_drops: self.concurrency_drops.load(Ordering::Relaxed),
+            budget_drops: self.budget_drops.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Terminal outcome recorded by a settled [`MirrorTaskGuard`].
+#[derive(Debug, Clone, Copy)]
+enum MirrorTaskOutcome {
+    Completed,
+    RequestTimeout,
+    RequestFailure,
+    DrainTimeout,
+    DrainFailure,
+}
+
+/// Guards a detached mirror task so a drop before recording a terminal outcome
+/// (runtime shutdown, panic, or future cancellation) is counted as a
+/// cancellation exactly once.
+struct MirrorTaskGuard {
+    metrics: Arc<MirrorMetrics>,
+    settled: bool,
+}
+
+impl MirrorTaskGuard {
+    fn new(metrics: Arc<MirrorMetrics>) -> Self {
+        Self {
+            metrics,
+            settled: false,
+        }
+    }
+
+    /// Record a terminal outcome; the guard then no longer counts a
+    /// cancellation. Only the first outcome per task is recorded (defensive).
+    fn settle(&mut self, outcome: MirrorTaskOutcome) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let counter = match outcome {
+            MirrorTaskOutcome::Completed => &self.metrics.completed,
+            MirrorTaskOutcome::RequestTimeout => &self.metrics.request_timeouts,
+            MirrorTaskOutcome::RequestFailure => &self.metrics.request_failures,
+            MirrorTaskOutcome::DrainTimeout => &self.metrics.drain_timeouts,
+            MirrorTaskOutcome::DrainFailure => &self.metrics.drain_failures,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MirrorTaskGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Classify a redacted transport-error string as a request-phase timeout.
+///
+/// `execute_redacted` / `execute_http2_redacted` render errors as
+/// `"{error_class} calling {url}"` using the stable snake_case `ErrorClass`
+/// Display tokens, so a leading `connection_timeout` / `read_write_timeout`
+/// identifies the mirror deadline firing (the #3057 never-responding target)
+/// without re-plumbing a typed error through the redaction boundary.
+fn redacted_error_is_timeout(error: &str) -> bool {
+    error.starts_with("connection_timeout") || error.starts_with("read_write_timeout")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MirrorDrainOutcome {
     Complete { observed: u64 },
@@ -398,18 +603,15 @@ async fn drain_mirror_response_body(
     response: reqwest::Response,
     max_bytes: usize,
 ) -> (Option<u64>, MirrorDrainOutcome) {
+    // Record the advertised `Content-Length` independently, then always drain.
+    // The advertised value is never used to short-circuit the drain: a body
+    // whose real length is within `max_bytes` (even when Content-Length
+    // over-advertises) must still be consumed to EOF so the pooled HTTP/1.1
+    // socket is reclaimed, and the reported observed size must reflect bytes
+    // actually read, not a fabricated `max_bytes`. Memory and time stay bounded
+    // by `max_bytes` (the measure helper discards bytes as it counts) and the
+    // drain timeout, so an oversized or slow body cannot pin the task.
     let advertised = response.content_length();
-    if advertised.is_some_and(|length| length > max_bytes as u64) {
-        // Oversized advertised bodies: do not attempt a full drain (would pin
-        // memory/time). Dropping the response forfeits keep-alive for this
-        // hostile/misconfigured sink, matching HTTP log-sink drain policy.
-        return (
-            advertised,
-            MirrorDrainOutcome::Truncated {
-                observed: max_bytes as u64,
-            },
-        );
-    }
     match tokio::time::timeout(
         MIRROR_RESPONSE_DRAIN_TIMEOUT,
         measure_response_body_bounded(response, max_bytes),
@@ -483,10 +685,13 @@ pub struct RequestMirror {
     /// `backend_read_timeout_ms` for detached mirror work.
     mirror_timeout_ms: Option<u64>,
     /// When true, only names in `forward_sensitive_header_allowlist` may cross
-    /// to the mirror origin. Default false strips the closed sensitive set.
+    /// to the mirror origin. Default false strips the sensitive set.
     forward_sensitive_headers: bool,
     /// Lowercased allowlist consulted only when `forward_sensitive_headers`.
     forward_sensitive_header_allowlist: Vec<String>,
+    /// Operator-configured lowercased substrings that extend the built-in
+    /// deny-by-default sensitive-header set (`sensitive_header_patterns`).
+    sensitive_header_patterns: Vec<String>,
     mirror_hostname: Option<String>,
     /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
     /// deterministic percentage sampling. Reset to `0` on construction/reload.
@@ -495,6 +700,8 @@ pub struct RequestMirror {
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
     /// Aggregate retained request-body bytes across in-flight mirror tasks.
     body_budget: Arc<MirrorBodyBudget>,
+    /// Per-instance, bounded-lifetime mirror lifecycle counters.
+    metrics: Arc<MirrorMetrics>,
 }
 
 impl RequestMirror {
@@ -572,12 +779,23 @@ impl RequestMirror {
         let max_in_flight = optional_u64(config, "max_in_flight")?
             .map(|v| {
                 if v == 0 {
-                    Err("request_mirror: 'max_in_flight' must be >= 1".to_string())
-                } else {
-                    usize::try_from(v).map_err(|_| {
-                        "request_mirror: 'max_in_flight' is too large for this platform".to_string()
-                    })
+                    return Err("request_mirror: 'max_in_flight' must be >= 1".to_string());
                 }
+                // Range-check against the deployment-safe hard cap before the
+                // value ever reaches `Semaphore::new`. A value above the cap
+                // (up to and past Tokio's `MAX_PERMITS`) fits `usize` and would
+                // otherwise panic construction; reject it as a config error.
+                let v = usize::try_from(v).map_err(|_| {
+                    format!(
+                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS}"
+                    )
+                })?;
+                if v > MAX_MAX_IN_FLIGHT_MIRRORS {
+                    return Err(format!(
+                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v})"
+                    ));
+                }
+                Ok(v)
             })
             .transpose()?
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT_MIRRORS);
@@ -607,10 +825,17 @@ impl RequestMirror {
             })
             .transpose()?;
 
+        // Parse operator patterns first: the allowlist may re-permit a header
+        // that only a configured pattern denies.
+        let sensitive_header_patterns = parse_sensitive_header_patterns(config)?;
+
         let forward_sensitive_headers =
             optional_bool(config, "forward_sensitive_headers")?.unwrap_or(false);
-        let forward_sensitive_header_allowlist =
-            parse_forward_sensitive_header_allowlist(config, forward_sensitive_headers)?;
+        let forward_sensitive_header_allowlist = parse_forward_sensitive_header_allowlist(
+            config,
+            forward_sensitive_headers,
+            &sensitive_header_patterns,
+        )?;
 
         let max_response_body_bytes = parse_max_response_body_bytes(
             config,
@@ -640,12 +865,16 @@ impl RequestMirror {
             mirror_timeout_ms,
             forward_sensitive_headers,
             forward_sensitive_header_allowlist,
+            sensitive_header_patterns,
             mirror_hostname,
             // Phase 0 defers the first selection until the accumulator crosses
             // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
             sample_phase: AtomicU64::new(0),
+            // `max_in_flight` is range-checked above, so `Semaphore::new` cannot
+            // panic on an out-of-range permit count.
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
             body_budget: MirrorBodyBudget::new(max_retained_request_body_bytes),
+            metrics: Arc::new(MirrorMetrics::default()),
         })
     }
 
@@ -681,6 +910,15 @@ impl RequestMirror {
     #[allow(dead_code)]
     pub(crate) fn max_retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.max_bytes
+    }
+
+    /// Snapshot of the per-instance mirror lifecycle counters for external
+    /// tests. Never surfaced on `/metrics` (mirror internals stay off the
+    /// unauthenticated surface); this is the assertion hook for the
+    /// bounded-lifetime observability contract.
+    #[allow(dead_code)]
+    pub(crate) fn mirror_metrics_snapshot_for_test(&self) -> MirrorMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Select the path segment for the mirror URL without consuming primary
@@ -839,9 +1077,42 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
     }
 }
 
+/// Parse the operator-configured `sensitive_header_patterns` list: lowercased,
+/// trimmed, non-blank substrings that extend the built-in deny-by-default set.
+fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String> {
+    match config.get("sensitive_header_patterns") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let Some(pattern) = item.as_str() else {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' must be a string"
+                    ));
+                };
+                let trimmed = pattern.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' must not be blank"
+                    ));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if !out.iter().any(|existing| existing == &lower) {
+                    out.push(lower);
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(
+            "request_mirror: 'sensitive_header_patterns' must be an array of strings".to_string(),
+        ),
+    }
+}
+
 fn parse_forward_sensitive_header_allowlist(
     config: &Value,
     forward_sensitive_headers: bool,
+    operator_patterns: &[String],
 ) -> Result<Vec<String>, String> {
     let raw = match config.get("forward_sensitive_header_allowlist") {
         None | Some(Value::Null) => Vec::new(),
@@ -865,10 +1136,15 @@ fn parse_forward_sensitive_header_allowlist(
                     ));
                 }
                 let lower = trimmed.to_ascii_lowercase();
-                if !is_mirror_sensitive_header(&lower) {
+                // The allowlist re-permits deny-by-default headers, so every
+                // entry must actually be denied by the effective policy
+                // (built-in credential name/substring or a configured
+                // sensitive_header_patterns match). Rejecting non-sensitive
+                // names catches typos and keeps the allowlist meaningful — a
+                // name that is not stripped could never be "forwarded" by it.
+                if !is_mirror_sensitive_header(&lower, operator_patterns) {
                     return Err(format!(
-                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must be one of: {}",
-                        MIRROR_SENSITIVE_HEADER_NAMES.join(", ")
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' ('{lower}') is not a recognized sensitive header (built-in credential or a configured sensitive_header_patterns match)"
                     ));
                 }
                 if !out.iter().any(|existing| existing == &lower) {
@@ -1037,6 +1313,7 @@ impl Plugin for RequestMirror {
             &mut mirror_headers,
             self.forward_sensitive_headers,
             &self.forward_sensitive_header_allowlist,
+            &self.sensitive_header_patterns,
         );
         if let Some(shadow_host) = mesh_shadow_host {
             // Keep the configured mirror URL as the dial/TLS identity. Only
@@ -1068,6 +1345,9 @@ impl Plugin for RequestMirror {
         let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
+                self.metrics
+                    .concurrency_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                     method, mirror_url_for_log
@@ -1096,6 +1376,7 @@ impl Plugin for RequestMirror {
         let retained_body = match self.body_budget.try_retain(body_bytes) {
             Some(retained) => retained,
             None => {
+                self.metrics.budget_drops.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_retained_request_body_bytes budget was exhausted",
                     method, mirror_url_for_log
@@ -1132,6 +1413,8 @@ impl Plugin for RequestMirror {
         let max_response_body_bytes = self.max_response_body_bytes;
         let mirror_plugin_id = self.plugin_config_id.clone();
         let body_for_request = retained_body.bytes.clone();
+        let metrics = Arc::clone(&self.metrics);
+        metrics.dispatched.fetch_add(1, Ordering::Relaxed);
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
@@ -1140,6 +1423,10 @@ impl Plugin for RequestMirror {
             let _permit = permit;
             // Keep the body-budget lease alive for the task lifetime.
             let _retained_body_lease = retained_body;
+            // Count a cancellation if this task is dropped (runtime shutdown,
+            // panic, or future cancellation) before recording a terminal
+            // outcome. Settled below once a terminal metric is recorded.
+            let mut task_guard = MirrorTaskGuard::new(metrics);
             let start = std::time::Instant::now();
 
             // Native gRPC must speak HTTP/2 (h2c prior knowledge on cleartext,
@@ -1208,8 +1495,12 @@ impl Plugin for RequestMirror {
                     let (advertised, drain) =
                         drain_mirror_response_body(resp, max_response_body_bytes).await;
                     let (size, body_error) = match drain {
-                        MirrorDrainOutcome::Complete { observed } => (Some(observed), None),
+                        MirrorDrainOutcome::Complete { observed } => {
+                            task_guard.settle(MirrorTaskOutcome::Completed);
+                            (Some(observed), None)
+                        }
                         MirrorDrainOutcome::Truncated { observed } => {
+                            task_guard.settle(MirrorTaskOutcome::Completed);
                             warn!(
                                 "request_mirror: response from {} truncated at {} bytes \
                                      (max_response_body_bytes = {}; advertised = {:?})",
@@ -1221,6 +1512,7 @@ impl Plugin for RequestMirror {
                             (Some(observed), None)
                         }
                         MirrorDrainOutcome::Timeout => {
+                            task_guard.settle(MirrorTaskOutcome::DrainTimeout);
                             warn!(
                                 "request_mirror: response body drain timed out for {}",
                                 mirror_url_for_log
@@ -1228,6 +1520,7 @@ impl Plugin for RequestMirror {
                             (None, Some(MIRROR_DRAIN_TIMEOUT_ERROR.to_string()))
                         }
                         MirrorDrainOutcome::TransportFailure => {
+                            task_guard.settle(MirrorTaskOutcome::DrainFailure);
                             (None, Some(MIRROR_DRAIN_TRANSPORT_ERROR.to_string()))
                         }
                     };
@@ -1237,7 +1530,13 @@ impl Plugin for RequestMirror {
                     // `err` is already sanitized by `execute_redacted`
                     // (ErrorClass + stripped URL); it never contains the query
                     // string. Use the same string for the log line and the
-                    // structured `mirror_error` field.
+                    // structured `mirror_error` field. Classify the mirror
+                    // deadline firing (never-responding target) as a timeout.
+                    if redacted_error_is_timeout(&err) {
+                        task_guard.settle(MirrorTaskOutcome::RequestTimeout);
+                    } else {
+                        task_guard.settle(MirrorTaskOutcome::RequestFailure);
+                    }
                     warn!(
                         "request_mirror: failed to mirror {} {} → {}",
                         method, mirror_url_for_log, err
