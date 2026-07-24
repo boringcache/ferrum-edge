@@ -239,9 +239,11 @@ impl DatabaseDeltaPollMetrics {
     }
 
     /// Record that a poll attempt finished normally (success, empty, rejection,
-    /// or handled error). Call only after the attempt future returns; do not
-    /// invoke from `Drop` on panic/abort/cancel. Lock-free; safe from the poll
-    /// task hot path.
+    /// or handled error). Call at normal poll-tick fallthrough and immediately
+    /// before each handled `continue`. Do not invoke from `Drop`, and do not
+    /// call on panic/abort/cancel of in-flight work — those must leave the prior
+    /// timestamp unchanged so task death stays observable (issue #2986).
+    /// Lock-free; safe from the poll task hot path.
     pub fn record_poll_completed(&self) {
         let millis = chrono::Utc::now().timestamp_millis();
         let millis = if millis < 0 { 0 } else { millis as u64 };
@@ -305,23 +307,6 @@ impl DatabaseDeltaPollMetrics {
             DatabaseDeltaResourceCategory::Mixed => &self.rejected_mixed,
         }
     }
-}
-
-/// Run one poll attempt and record freshness only after the attempt future
-/// returns normally.
-///
-/// Completed outcomes — success, empty, rejection, or handled error, including
-/// early exits that previously used `continue` — advance
-/// [`DatabaseDeltaPollMetrics::last_poll_completed_at_unix_ms`]. Panic,
-/// `JoinHandle` abort, cancellation, or dropping the attempt future mid-flight
-/// leaves the prior timestamp unchanged so task death stays observable
-/// (issue #2986).
-pub async fn run_poll_attempt_recording_completion(
-    metrics: &DatabaseDeltaPollMetrics,
-    attempt: impl std::future::Future<Output = ()>,
-) {
-    attempt.await;
-    metrics.record_poll_completed();
 }
 
 fn invalidate_database_delta_poll_metrics_cache() {
@@ -2115,9 +2100,6 @@ pub async fn run(
                     loop {
                         tokio::select! {
                             _ = interval.tick() => {
-                                run_poll_attempt_recording_completion(
-                                    database_delta_poll_metrics_for_poll.as_ref(),
-                                    async {
                     // Replica reconnect/DNS-watermark maintenance must run even when
                     // the plugin-migration gate later blocks publication.
                     if let Some(ref replica_url) = replica_url_for_reconnect {
@@ -2191,7 +2173,8 @@ pub async fn run(
                                 .await
                                 {
                                     None => {
-                                        return;
+                                        database_delta_poll_metrics_for_poll.record_poll_completed();
+                                        continue;
                                     }
                                     Some(true) => {
                                         force_full_reload = false;
@@ -2220,7 +2203,8 @@ pub async fn run(
                                     );
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
-                                return;
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                continue;
                             }
                         }
                     } else if let Some(after_sequence) = last_change_sequence {
@@ -2238,7 +2222,8 @@ pub async fn run(
                                 )
                                 .await
                                 {
-                                    return;
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                    continue;
                                 }
                                 let next_sequence = result.sequence_cursor;
                                 let rejected_delta_identity =
@@ -2289,7 +2274,8 @@ pub async fn run(
                                                     .await
                                                     {
                                                         None => {
-                                                            return;
+                                                            database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                            continue;
                                                         }
                                                         Some(true) => {
                                                             rejected_delta_tracker.record_accepted();
@@ -2357,7 +2343,8 @@ pub async fn run(
                                                                         .await
                                                                         {
                                                                             None => {
-                                                                                return;
+                                                                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                                                continue;
                                                                             }
                                                                             Some(true) => {
                                                                                 rejected_delta_tracker
@@ -2447,7 +2434,8 @@ pub async fn run(
                                         .await
                                         {
                                             None => {
-                                                return;
+                                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                continue;
                                             }
                                             Some(true) => {
                                                 rejected_delta_tracker.record_accepted();
@@ -2503,7 +2491,8 @@ pub async fn run(
                                                             .await
                                                             {
                                                                 None => {
-                                                                    return;
+                                                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                                    continue;
                                                                 }
                                                                 Some(true) => {
                                                                     rejected_delta_tracker.record_accepted();
@@ -2566,7 +2555,8 @@ pub async fn run(
                                 .await
                                 {
                                     None => {
-                                        return;
+                                        database_delta_poll_metrics_for_poll.record_poll_completed();
+                                        continue;
                                     }
                                     Some(true) => {
                                         rejected_delta_tracker.record_accepted();
@@ -2596,7 +2586,8 @@ pub async fn run(
                             }
                         }
                     }
-                                    }).await;
+                                // Normal fallthrough: success, empty, rejection, or handled error.
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
                             }
                             _ = poll_shutdown.changed() => {
                                 info!("Database polling shutting down");

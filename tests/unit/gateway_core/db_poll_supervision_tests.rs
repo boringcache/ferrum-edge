@@ -1,11 +1,10 @@
 //! Issue #2986: DB/CP config poll-task exit classification and supervision.
 
-use ferrum_edge::modes::database::{
-    DatabaseDeltaPollMetrics, run_poll_attempt_recording_completion,
-};
+use ferrum_edge::modes::database::DatabaseDeltaPollMetrics;
 use ferrum_edge::modes::db_poll_supervision::{
-    DbPollTaskExitKind, classify_db_poll_task_exit, record_unexpected_cp_poll_task_exit,
-    supervise_control_plane_poll_task, supervise_database_mode_poll_task_with_delay,
+    DATABASE_POLL_RESPAWN_DELAY, DbPollTaskExitKind, classify_db_poll_task_exit,
+    record_unexpected_cp_poll_task_exit, supervise_control_plane_poll_task,
+    supervise_database_mode_poll_task_with_delay,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -149,7 +148,9 @@ async fn database_mode_supervisor_respawns_after_abort_with_delay() {
     let spawn_count_for_factory = spawn_count.clone();
     let first_abort_for_factory = first_abort.clone();
     let shutdown_tx_for_poll = shutdown_tx.clone();
-    let respawn_delay = Duration::from_secs(1);
+    // Production uses DATABASE_POLL_RESPAWN_DELAY (1s); do not weaken it.
+    let respawn_delay = DATABASE_POLL_RESPAWN_DELAY;
+    assert_eq!(respawn_delay, Duration::from_secs(1));
 
     let supervisor = tokio::spawn(async move {
         supervise_database_mode_poll_task_with_delay(
@@ -339,51 +340,87 @@ async fn database_mode_shutdown_interrupts_respawn_wait_without_another_generati
     );
 }
 
+/// Simulated poll-tick exit classes matching production wiring: stamp freshness
+/// only on normal fallthrough / handled early-continue, never mid-attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimulatedPollExit {
+    FallthroughSuccess,
+    FallthroughEmpty,
+    HandledRejectionContinue,
+    HandledErrorContinue,
+    MidAttemptAbort,
+    MidAttemptPanic,
+    MidAttemptDrop,
+}
+
+async fn run_simulated_poll_attempt(
+    metrics: &DatabaseDeltaPollMetrics,
+    exit: SimulatedPollExit,
+) {
+    match exit {
+        SimulatedPollExit::FallthroughSuccess
+        | SimulatedPollExit::FallthroughEmpty => {
+            // Work completes; stamp at normal fallthrough.
+            metrics.record_poll_completed();
+        }
+        SimulatedPollExit::HandledRejectionContinue
+        | SimulatedPollExit::HandledErrorContinue => {
+            // Production records immediately before each handled `continue`.
+            metrics.record_poll_completed();
+        }
+        SimulatedPollExit::MidAttemptAbort | SimulatedPollExit::MidAttemptDrop => {
+            // In-flight work never reaches record_poll_completed.
+            std::future::pending::<()>().await;
+        }
+        SimulatedPollExit::MidAttemptPanic => {
+            panic!("intentional mid-poll panic for freshness test");
+        }
+    }
+}
+
 #[tokio::test]
-async fn last_poll_completed_at_advances_on_normal_empty_success() {
+async fn last_poll_completed_at_advances_on_every_normal_completion_exit_class() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
     assert_eq!(metrics.last_poll_completed_at_unix_ms(), 0);
 
-    run_poll_attempt_recording_completion(metrics.as_ref(), async {
-        // Empty-success poll tick body returns normally.
-    })
-    .await;
-
-    let first = metrics.last_poll_completed_at_unix_ms();
-    assert!(
-        first > 0,
-        "empty-success poll must stamp last_poll_completed_at"
-    );
-    assert!(metrics.snapshot().last_poll_completed_at.is_some());
-
-    std::thread::sleep(Duration::from_millis(2));
-    run_poll_attempt_recording_completion(metrics.as_ref(), async {
-        // Handled rejection/error path also returns normally.
-    })
-    .await;
-    let second = metrics.last_poll_completed_at_unix_ms();
-    assert!(
-        second >= first,
-        "subsequent handled outcome must advance or retain freshness"
-    );
+    let mut previous = 0u64;
+    for exit in [
+        SimulatedPollExit::FallthroughSuccess,
+        SimulatedPollExit::FallthroughEmpty,
+        SimulatedPollExit::HandledRejectionContinue,
+        SimulatedPollExit::HandledErrorContinue,
+    ] {
+        std::thread::sleep(Duration::from_millis(2));
+        run_simulated_poll_attempt(metrics.as_ref(), exit).await;
+        let stamped = metrics.last_poll_completed_at_unix_ms();
+        assert!(
+            stamped > 0,
+            "{exit:?} must stamp last_poll_completed_at"
+        );
+        assert!(
+            stamped >= previous,
+            "{exit:?} must advance or retain freshness (prev={previous}, now={stamped})"
+        );
+        previous = stamped;
+        assert!(metrics.snapshot().last_poll_completed_at.is_some());
+    }
 }
 
 #[tokio::test]
 async fn mid_poll_abort_does_not_advance_freshness() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
-    // Seed a prior completed stamp so we can detect unwanted advancement.
-    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    run_simulated_poll_attempt(metrics.as_ref(), SimulatedPollExit::FallthroughEmpty).await;
     let before = metrics.last_poll_completed_at_unix_ms();
     assert!(before > 0);
 
     let metrics_for_task = metrics.clone();
     let handle = tokio::spawn(async move {
-        run_poll_attempt_recording_completion(metrics_for_task.as_ref(), async {
-            std::future::pending::<()>().await;
-        })
+        run_simulated_poll_attempt(
+            metrics_for_task.as_ref(),
+            SimulatedPollExit::MidAttemptAbort,
+        )
         .await;
     });
-    // Let the attempt future start, then abort mid-poll.
     tokio::task::yield_now().await;
     handle.abort();
     let _ = handle.await;
@@ -398,15 +435,16 @@ async fn mid_poll_abort_does_not_advance_freshness() {
 #[tokio::test]
 async fn mid_poll_panic_does_not_advance_freshness() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
-    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    run_simulated_poll_attempt(metrics.as_ref(), SimulatedPollExit::FallthroughEmpty).await;
     let before = metrics.last_poll_completed_at_unix_ms();
     assert!(before > 0);
 
     let metrics_for_task = metrics.clone();
     let handle = tokio::spawn(async move {
-        run_poll_attempt_recording_completion(metrics_for_task.as_ref(), async {
-            panic!("intentional mid-poll panic for freshness test");
-        })
+        run_simulated_poll_attempt(
+            metrics_for_task.as_ref(),
+            SimulatedPollExit::MidAttemptPanic,
+        )
         .await;
     });
     let result = handle.await;
@@ -422,13 +460,12 @@ async fn mid_poll_panic_does_not_advance_freshness() {
 #[tokio::test]
 async fn dropping_in_flight_poll_attempt_future_does_not_advance_freshness() {
     let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
-    run_poll_attempt_recording_completion(metrics.as_ref(), async {}).await;
+    run_simulated_poll_attempt(metrics.as_ref(), SimulatedPollExit::FallthroughEmpty).await;
     let before = metrics.last_poll_completed_at_unix_ms();
 
     {
-        let attempt = run_poll_attempt_recording_completion(metrics.as_ref(), async {
-            std::future::pending::<()>().await;
-        });
+        let attempt =
+            run_simulated_poll_attempt(metrics.as_ref(), SimulatedPollExit::MidAttemptDrop);
         // Simulate select-cancellation / future drop during an in-flight poll.
         drop(attempt);
     }
@@ -437,5 +474,131 @@ async fn dropping_in_flight_poll_attempt_future_does_not_advance_freshness() {
         metrics.last_poll_completed_at_unix_ms(),
         before,
         "dropping an in-flight poll attempt must not publish a fresh timestamp"
+    );
+}
+
+/// Extract the poll-tick arm body between `interval.tick()` and the shutdown arm.
+fn poll_tick_body<'a>(source: &'a str, shutdown_marker: &str) -> &'a str {
+    let tick = source
+        .find("_ = interval.tick() => {")
+        .expect("poll tick arm");
+    let shutdown = source[tick..]
+        .find(shutdown_marker)
+        .expect("shutdown arm")
+        + tick;
+    &source[tick..shutdown]
+}
+
+fn assert_every_continue_records_completion(tick_body: &str, label: &str) {
+    let lines: Vec<&str> = tick_body.lines().collect();
+    let mut continues = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        if line.trim() != "continue;" {
+            continue;
+        }
+        continues += 1;
+        let prev = lines[..idx]
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim())
+            .unwrap_or("");
+        assert!(
+            prev.contains("record_poll_completed()"),
+            "{label}: continue at line offset {idx} must be immediately preceded by \
+             record_poll_completed(); got prev={prev:?}"
+        );
+    }
+    assert!(
+        continues > 0,
+        "{label}: expected handled continue exits in poll tick"
+    );
+}
+
+fn assert_fallthrough_records_completion(tick_body: &str, label: &str) {
+    let trimmed = tick_body.trim_end();
+    // Last non-empty statement before the tick arm closes should record completion.
+    let last_stmt = trimmed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && *l != "}")
+        .unwrap_or("");
+    assert!(
+        last_stmt.contains("record_poll_completed()"),
+        "{label}: normal fallthrough must end with record_poll_completed(); got {last_stmt:?}"
+    );
+}
+
+#[test]
+fn database_poll_tick_records_on_every_normal_exit_without_async_wrapper() {
+    let source = include_str!("../../../src/modes/database.rs");
+    assert!(
+        !source.contains("run_poll_attempt_recording_completion"),
+        "database mode must not wrap the poll tick in an async completion helper"
+    );
+    assert!(
+        !source.contains("PollCompletedGuard"),
+        "Drop-based poll completion must not return (panic/abort false positives)"
+    );
+
+    let tick = poll_tick_body(source, "_ = poll_shutdown.changed() => {");
+    assert!(
+        !tick.contains("async {"),
+        "database poll tick must not introduce a nested async block around the body"
+    );
+    assert_every_continue_records_completion(tick, "database");
+    assert_fallthrough_records_completion(tick, "database");
+
+    // Base main had 8 handled continues in this loop; keep that exit class count.
+    let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
+    assert_eq!(
+        continue_count, 8,
+        "database poll tick handled-continue exit count drifted"
+    );
+    let record_count = tick.matches("record_poll_completed()").count();
+    assert_eq!(
+        record_count,
+        continue_count + 1,
+        "database: one record per continue plus fallthrough"
+    );
+}
+
+#[test]
+fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() {
+    let source = include_str!("../../../src/modes/control_plane.rs");
+    assert!(
+        !source.contains("run_poll_attempt_recording_completion"),
+        "control-plane mode must not wrap the poll tick in an async completion helper"
+    );
+
+    let tick = poll_tick_body(source, "_ = cp_poll_shutdown.changed() => {");
+    assert!(
+        !tick.contains("async {"),
+        "control-plane poll tick must not introduce a nested async block around the body"
+    );
+    assert_every_continue_records_completion(tick, "control_plane");
+    assert_fallthrough_records_completion(tick, "control_plane");
+
+    let continue_count = tick.lines().filter(|l| l.trim() == "continue;").count();
+    assert_eq!(
+        continue_count, 11,
+        "control-plane poll tick handled-continue exit count drifted"
+    );
+    let record_count = tick.matches("record_poll_completed()").count();
+    assert_eq!(
+        record_count,
+        continue_count + 1,
+        "control_plane: one record per continue plus fallthrough"
+    );
+}
+
+#[test]
+fn database_poll_respawn_delay_remains_one_second() {
+    assert_eq!(DATABASE_POLL_RESPAWN_DELAY, Duration::from_secs(1));
+    let source = include_str!("../../../src/modes/db_poll_supervision.rs");
+    assert!(
+        source.contains("Duration::from_secs(1)"),
+        "DATABASE_POLL_RESPAWN_DELAY must stay a 1-second shutdown-aware backoff"
     );
 }

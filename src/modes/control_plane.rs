@@ -1520,9 +1520,6 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    crate::modes::database::run_poll_attempt_recording_completion(
-                        database_delta_poll_metrics_for_poll.as_ref(),
-                        async {
                     // Check if the database FQDN now resolves to different IPs
                     if let Some(ref hostname) = db_hostname
                         && let Ok(ips) = dns_cache_for_poll.resolve_all(hostname, None, None).await
@@ -1599,7 +1596,8 @@ pub async fn run(
                                 )
                                 .await
                                 {
-                                    return;
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                    continue;
                                 }
                                 // Treat pool swap as a new source snapshot.
                                 last_change_sequences = sequences;
@@ -1645,7 +1643,8 @@ pub async fn run(
                                     )
                                     .await
                                     {
-                                        return;
+                                        database_delta_poll_metrics_for_poll.record_poll_completed();
+                                        continue;
                                     }
                                     // Reachable backend, invalid snapshot: keep the
                                     // admin API writable (subject to the migration
@@ -1666,7 +1665,8 @@ pub async fn run(
                                     );
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
-                                return;
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                continue;
                             }
                         }
                     } else {
@@ -1710,14 +1710,16 @@ pub async fn run(
                                 )
                                 .await
                                 {
-                                    return;
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                    continue;
                                 }
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
                                     last_change_sequences = next_change_sequences;
                                     rejected_delta_tracker.record_accepted();
-                                    return;
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                    continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
 
@@ -1828,7 +1830,8 @@ pub async fn run(
                                             "Incremental CP config update rejected by validation; leaving sequence cursors unchanged so the next poll retries the same rows"
                                         );
                                     }
-                                    return;
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
+                                    continue;
                                 }
 
                                 // Validation passed — broadcast the delta to DPs
@@ -1908,7 +1911,8 @@ pub async fn run(
                                         )
                                         .await
                                         {
-                                            return;
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
+                                            continue;
                                         }
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         crate::modes::clear_config_rejected_after_accepted_full_reload(
@@ -1948,7 +1952,8 @@ pub async fn run(
                                             )
                                             .await
                                             {
-                                                return;
+                                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                continue;
                                             }
                                             crate::modes::record_config_validation_rejection(
                                                 &db_poll,
@@ -1958,7 +1963,8 @@ pub async fn run(
                                                 "full fallback reload",
                                             )
                                             .await;
-                                            return;
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
+                                            continue;
                                         }
                                         // Both incremental and full reload failed —
                                         // try failover URLs before giving up.
@@ -1977,7 +1983,8 @@ pub async fn run(
                                                         )
                                                         .await
                                                         {
-                                                            return;
+                                                            database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                            continue;
                                                         }
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         crate::modes::clear_config_rejected_after_accepted_full_reload(
@@ -2012,7 +2019,8 @@ pub async fn run(
                                                             )
                                                             .await
                                                             {
-                                                                return;
+                                                                database_delta_poll_metrics_for_poll.record_poll_completed();
+                                                                continue;
                                                             }
                                                             crate::modes::record_config_validation_rejection(
                                                                 &db_poll,
@@ -2046,7 +2054,8 @@ pub async fn run(
                         }
                     }
 
-                        }).await;
+                    // Normal fallthrough: success, empty, rejection, or handled error.
+                    database_delta_poll_metrics_for_poll.record_poll_completed();
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");
