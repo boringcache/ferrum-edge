@@ -5114,9 +5114,12 @@ async fn test_high_ratio_amplification_aborts_early() {
     // generous absolute size cap, so the amplification ratio must trip first.
     let plugin = make_plugin(json!({
         "decompress_request": true,
-        "max_decompressed_request_size": 8 * 1024 * 1024
+        "max_decompressed_request_size": 16 * 1024 * 1024
     }));
-    let zeros = vec![0u8; 4 * 1024 * 1024];
+    // Four MiB sits on the 1024:1 boundary with some flate2/miniz versions
+    // once gzip framing is included. Eight MiB keeps the fixture decisively
+    // beyond the policy ratio without approaching the absolute cap.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
     let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(&zeros).unwrap();
     let compressed = encoder.finish().unwrap();
