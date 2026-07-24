@@ -1680,6 +1680,7 @@ async fn test_semantic_embedding_size_counts_against_total_cache_limit() {
         "semantic_similarity_enabled": true,
         "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
         "semantic_embedding_api_key": "test-key",
+        "max_entry_size_bytes": 512,
         "max_total_size_bytes": 512
     }));
 
@@ -3091,7 +3092,7 @@ async fn test_concurrent_different_key_budget_rejects_overshoot() {
         "ttl_seconds": 600,
         "scope_by_consumer": false,
         "max_total_size_bytes": max_total,
-        "max_entry_size_bytes": 8_192
+        "max_entry_size_bytes": max_total
     })));
 
     let request_a = json!({
@@ -4426,6 +4427,7 @@ async fn test_hnsw_rebuild_budget_failure_releases_candidate_lease() {
     let plugin = make_plugin(json!({
         "ttl_seconds": 600,
         "scope_by_consumer": false,
+        "max_entry_size_bytes": 65_536,
         "max_total_size_bytes": 65_536,
         "semantic_similarity_enabled": true,
         "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",

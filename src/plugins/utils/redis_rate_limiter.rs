@@ -519,6 +519,19 @@ pub enum BoundedRedisValue {
     Oversized { length: usize },
 }
 
+/// Why a Redis `GETRANGE` inclusive end index cannot be derived from a byte cap.
+///
+/// Callers must fail closed on either variant: Redis treats a negative end as
+/// "read to the end of the string", so an unrepresentable or zero cap must never
+/// be cast into a sentinel that would transfer an attacker-controlled value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisGetrangeEndIndexError {
+    /// Cap was zero (no positive inclusive end index).
+    ZeroCap,
+    /// Cap cannot be represented as a non-negative `isize` on this platform.
+    Overflow,
+}
+
 /// Convert a Redis `GETRANGE` inclusive end index from a byte cap.
 ///
 /// Redis treats a negative end index as an offset from the end of the string
@@ -526,11 +539,11 @@ pub enum BoundedRedisValue {
 /// `as isize` can therefore saturate to `-1` and ask Redis for the entire
 /// attacker-controlled value. Fail closed before dispatch when the cap cannot
 /// be represented as a non-negative `isize`.
-pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, ()> {
+pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrangeEndIndexError> {
     if max_bytes == 0 {
-        return Err(());
+        return Err(RedisGetrangeEndIndexError::ZeroCap);
     }
-    isize::try_from(max_bytes).map_err(|_| ())
+    isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
 }
 
 /// gateway's shared DNS cache. On connection failure, every pool slot is cleared
@@ -1506,7 +1519,7 @@ impl RedisRateLimitClient {
     ) -> Result<BoundedRedisValue, ()> {
         // Fail closed before any Redis dispatch when the cap cannot be expressed
         // as a non-negative GETRANGE end index (for example `usize::MAX` → `-1`).
-        let end = redis_getrange_end_index(max_bytes)?;
+        let end = redis_getrange_end_index(max_bytes).map_err(|_| ())?;
         let mut conn = self.get_connection().await.ok_or(())?;
 
         // GETRANGE end index is inclusive, so `0..=max_bytes` reads at most
@@ -1829,12 +1842,21 @@ impl std::fmt::Debug for RedisRateLimitClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_floored_total, floor_zero_compensation, redis_getrange_end_index};
+    use super::{
+        clamp_floored_total, floor_zero_compensation, redis_getrange_end_index,
+        RedisGetrangeEndIndexError,
+    };
 
     #[test]
     fn redis_getrange_end_index_rejects_zero_and_platform_overflow() {
-        assert!(redis_getrange_end_index(0).is_err());
-        assert!(redis_getrange_end_index(usize::MAX).is_err());
+        assert_eq!(
+            redis_getrange_end_index(0),
+            Err(RedisGetrangeEndIndexError::ZeroCap)
+        );
+        assert_eq!(
+            redis_getrange_end_index(usize::MAX),
+            Err(RedisGetrangeEndIndexError::Overflow)
+        );
         assert_eq!(redis_getrange_end_index(1).expect("1 fits"), 1);
         assert_eq!(redis_getrange_end_index(1024).expect("1 KiB fits"), 1024);
     }

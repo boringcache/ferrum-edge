@@ -1325,21 +1325,21 @@ impl AiSemanticCache {
         if entry.version != SEMANTIC_CACHE_ENTRY_VERSION {
             return None;
         }
-        let Some(provided_mac_hex) = entry.integrity.as_deref() else {
-            return None;
-        };
+        let provided_mac_hex = entry.integrity.as_deref()?;
         let Ok(provided_mac) = hex::decode(provided_mac_hex) else {
             return None;
         };
         let expected_mac = compute_redis_envelope_mac(
             integrity_key,
-            redis_key,
-            entry.version,
-            entry.status_code,
-            &entry.headers,
-            &entry.body,
-            entry.semantic_scope_key.as_deref(),
-            entry.embedding.as_deref(),
+            &RedisEnvelopeMacInput {
+                redis_key,
+                version: entry.version,
+                status_code: entry.status_code,
+                headers: &entry.headers,
+                body: &entry.body,
+                semantic_scope_key: entry.semantic_scope_key.as_deref(),
+                embedding: entry.embedding.as_deref(),
+            },
         )?;
         if !constant_time_eq(&provided_mac, &expected_mac) {
             return None;
@@ -1824,13 +1824,15 @@ impl AiSemanticCache {
         let integrity_key = self.redis_integrity_key.as_ref()?;
         let mac = compute_redis_envelope_mac(
             integrity_key,
-            redis_key,
-            SEMANTIC_CACHE_ENTRY_VERSION,
-            status_code,
-            headers,
-            body,
-            None,
-            None,
+            &RedisEnvelopeMacInput {
+                redis_key,
+                version: SEMANTIC_CACHE_ENTRY_VERSION,
+                status_code,
+                headers,
+                body,
+                semantic_scope_key: None,
+                embedding: None,
+            },
         )?;
         Some(SerializableCacheEntry {
             version: SEMANTIC_CACHE_ENTRY_VERSION,
@@ -4145,14 +4147,14 @@ impl Plugin for AiSemanticCache {
                     headers: response_headers,
                 };
             }
-            // Expired — remove
+            // Expired — remove. Lease releases when `removed` drops (including
+            // when the embedding guard fails after remove succeeds).
             drop(entry);
-            if let Some((_, removed)) = self.cache.remove(&cache_key) {
-                if removed.embedding.is_some() {
-                    self.mark_vector_index_dirty();
-                    self.signal_vector_index_refresh_if_due();
-                }
-                // Lease releases when `removed` drops.
+            if let Some((_, removed)) = self.cache.remove(&cache_key)
+                && removed.embedding.is_some()
+            {
+                self.mark_vector_index_dirty();
+                self.signal_vector_index_refresh_if_due();
             }
         }
 
@@ -4388,13 +4390,12 @@ impl Plugin for AiSemanticCache {
             let redis_key = redis.make_key(&[&cache_key]);
             if let Some(serializable) =
                 self.seal_redis_entry(&redis_key, response_status, &safe_headers, body)
+                && let Ok(data) = serde_json::to_vec(&serializable)
             {
-                if let Ok(data) = serde_json::to_vec(&serializable) {
-                    let ttl_seconds = self.ttl.as_secs().max(1);
-                    let _ = redis
-                        .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
-                        .await;
-                }
+                let ttl_seconds = self.ttl.as_secs().max(1);
+                let _ = redis
+                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+                    .await;
             }
         }
 
@@ -4453,6 +4454,20 @@ fn append_effective_destination_identity(
     }
 }
 
+/// Length-framed Redis envelope fields covered by the authenticity MAC.
+///
+/// Kept as one cohesive input so the MAC surface stays auditable without an
+/// 8-argument helper (key material remains a separate first parameter).
+struct RedisEnvelopeMacInput<'a> {
+    redis_key: &'a str,
+    version: u8,
+    status_code: u16,
+    headers: &'a HashMap<String, String>,
+    body: &'a [u8],
+    semantic_scope_key: Option<&'a str>,
+    embedding: Option<&'a [f32]>,
+}
+
 /// HMAC-SHA256 authenticity tag over the Redis envelope and key context.
 ///
 /// Binds status/headers/body (and optional semantic fields) to the Redis
@@ -4461,21 +4476,16 @@ fn append_effective_destination_identity(
 /// to initialize (fail closed).
 fn compute_redis_envelope_mac(
     key: &[u8],
-    redis_key: &str,
-    version: u8,
-    status_code: u16,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-    semantic_scope_key: Option<&str>,
-    embedding: Option<&[f32]>,
+    envelope: &RedisEnvelopeMacInput<'_>,
 ) -> Option<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).ok()?;
     mac.update(b"ai_semantic_cache.v3\0");
-    mac.update(&(redis_key.len() as u64).to_le_bytes());
-    mac.update(redis_key.as_bytes());
-    mac.update(&[version]);
-    mac.update(&status_code.to_le_bytes());
-    let mut header_pairs: Vec<(&str, &str)> = headers
+    mac.update(&(envelope.redis_key.len() as u64).to_le_bytes());
+    mac.update(envelope.redis_key.as_bytes());
+    mac.update(&[envelope.version]);
+    mac.update(&envelope.status_code.to_le_bytes());
+    let mut header_pairs: Vec<(&str, &str)> = envelope
+        .headers
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
@@ -4487,16 +4497,16 @@ fn compute_redis_envelope_mac(
         mac.update(&(value.len() as u64).to_le_bytes());
         mac.update(value.as_bytes());
     }
-    mac.update(&(body.len() as u64).to_le_bytes());
-    mac.update(body);
-    if let Some(scope) = semantic_scope_key {
+    mac.update(&(envelope.body.len() as u64).to_le_bytes());
+    mac.update(envelope.body);
+    if let Some(scope) = envelope.semantic_scope_key {
         mac.update(&[1]);
         mac.update(&(scope.len() as u64).to_le_bytes());
         mac.update(scope.as_bytes());
     } else {
         mac.update(&[0]);
     }
-    if let Some(values) = embedding {
+    if let Some(values) = envelope.embedding {
         mac.update(&[1]);
         mac.update(&(values.len() as u64).to_le_bytes());
         for value in values {
@@ -5192,13 +5202,15 @@ mod tests {
         let integrity = if seal {
             let mac = compute_redis_envelope_mac(
                 TEST_INTEGRITY_KEY.as_bytes(),
-                TEST_REDIS_KEY,
-                version,
-                status_code,
-                &headers,
-                body,
-                None,
-                None,
+                &RedisEnvelopeMacInput {
+                    redis_key: TEST_REDIS_KEY,
+                    version,
+                    status_code,
+                    headers: &headers,
+                    body,
+                    semantic_scope_key: None,
+                    embedding: None,
+                },
             )
             .expect("test HMAC");
             Some(hex::encode(mac))
@@ -5222,27 +5234,32 @@ mod tests {
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),
         ]);
-        let fused_headers = HashMap::from([("a".to_string(), "1\0b\02".to_string())]);
+        // Intentional embedded NULs: `1` NUL `b` NUL `2` (not an octal `\02`).
+        let fused_headers = HashMap::from([("a".to_string(), "1\0b\x0002".to_string())]);
         let split_mac = compute_redis_envelope_mac(
             TEST_INTEGRITY_KEY.as_bytes(),
-            TEST_REDIS_KEY,
-            SEMANTIC_CACHE_ENTRY_VERSION,
-            200,
-            &split_headers,
-            b"body",
-            None,
-            None,
+            &RedisEnvelopeMacInput {
+                redis_key: TEST_REDIS_KEY,
+                version: SEMANTIC_CACHE_ENTRY_VERSION,
+                status_code: 200,
+                headers: &split_headers,
+                body: b"body",
+                semantic_scope_key: None,
+                embedding: None,
+            },
         )
         .expect("test HMAC");
         let fused_mac = compute_redis_envelope_mac(
             TEST_INTEGRITY_KEY.as_bytes(),
-            TEST_REDIS_KEY,
-            SEMANTIC_CACHE_ENTRY_VERSION,
-            200,
-            &fused_headers,
-            b"body",
-            None,
-            None,
+            &RedisEnvelopeMacInput {
+                redis_key: TEST_REDIS_KEY,
+                version: SEMANTIC_CACHE_ENTRY_VERSION,
+                status_code: 200,
+                headers: &fused_headers,
+                body: b"body",
+                semantic_scope_key: None,
+                embedding: None,
+            },
         )
         .expect("test HMAC");
         assert_ne!(
@@ -5275,13 +5292,15 @@ mod tests {
             .insert("set-cookie".to_string(), "sid=secret".to_string());
         let mac = compute_redis_envelope_mac(
             TEST_INTEGRITY_KEY.as_bytes(),
-            TEST_REDIS_KEY,
-            valid.version,
-            valid.status_code,
-            &valid.headers,
-            &valid.body,
-            None,
-            None,
+            &RedisEnvelopeMacInput {
+                redis_key: TEST_REDIS_KEY,
+                version: valid.version,
+                status_code: valid.status_code,
+                headers: &valid.headers,
+                body: &valid.body,
+                semantic_scope_key: None,
+                embedding: None,
+            },
         )
         .expect("test HMAC");
         valid.integrity = Some(hex::encode(mac));
