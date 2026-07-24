@@ -357,8 +357,7 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
         async move {
             for i in 0..ITERATIONS {
                 barrier.wait().await;
-                let upstream =
-                    make_namespace_upstream(namespace, &format!("u-{namespace}-{i}"));
+                let upstream = make_namespace_upstream(namespace, &format!("u-{namespace}-{i}"));
                 match store.create_upstream(&upstream).await {
                     Ok(()) => {}
                     Err(error) if is_mysql_lock_deadlock(&error) => {

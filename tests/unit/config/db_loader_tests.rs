@@ -118,7 +118,10 @@ fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
     let proxy_route = source
         .split("async fn lock_proxy_route_bucket_tx(")
         .nth(1)
-        .and_then(|rest| rest.split("async fn lock_config_change_sequence_tx(").next())
+        .and_then(|rest| {
+            rest.split("async fn lock_config_change_sequence_tx(")
+                .next()
+        })
         .expect("lock_proxy_route_bucket_tx body");
     assert!(
         proxy_route.contains("db_type != \"mysql\""),
