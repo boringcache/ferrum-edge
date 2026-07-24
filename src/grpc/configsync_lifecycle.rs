@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use semver::Version;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::types::GatewayConfig;
+use crate::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet};
 use crate::util::backoff::{BACKOFF_INITIAL_SECS, BACKOFF_MAX_SECS, next_backoff_secs};
 
 /// HTTP/2 PING interval on the DP→CP ConfigSync channel.
@@ -29,6 +31,19 @@ pub const CONFIGSYNC_HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// are not treated as dead.
 pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 
+/// Bounded, material-free view of the last accepted CP-authoritative gateway
+/// trust-bundle state used by older-cross-source snapshot equivalence.
+///
+/// Present fingerprints are SHA-256 digests of a canonical encoding; raw trust
+/// material is never retained here and must never be logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayTrustEquivalenceState {
+    /// Explicit clear / absent CP-delivered gateway trust.
+    Absent,
+    /// Present CP-delivered gateway trust, compared by canonical fingerprint.
+    Present { fingerprint: String },
+}
+
 /// Authoritative freshness watermark already established by this DP.
 ///
 /// `version` is the monotonic high-water mark used to fence cross-source
@@ -36,10 +51,16 @@ pub const CONFIGSYNC_MAX_SILENCE_SECS: u64 = 150;
 /// timestamps and never decreases on same-source recovery. It is `None` only
 /// when an older authority was recorded without a comparable timestamp (should
 /// not arise for newly committed applies that always carry `loaded_at`).
+///
+/// `gateway_trust` is the last accepted CP-authoritative trust equivalence view.
+/// It is updated on FULL_SNAPSHOT applies and on accepted trust Replace/Clear
+/// updates (including trust-only deltas) so the identical-fallback exception
+/// cannot compare against a stale trust view after a later trust change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedSnapshotAuthority {
     pub version: Option<DateTime<Utc>>,
     pub source_cp_url: String,
+    pub gateway_trust: GatewayTrustEquivalenceState,
 }
 
 /// Why an envelope version failed to reconcile with committed config freshness.
@@ -117,6 +138,11 @@ pub fn monotonic_watermark(
 /// polling CPs can produce identical snapshots with different timestamps.
 /// Object keys are canonicalized recursively so map insertion order cannot
 /// create a false mismatch; array order remains significant.
+///
+/// This compares only `GatewayConfig` JSON. CP full snapshots deliver gateway
+/// trust bundles exclusively through `ConfigUpdate.trust_bundles_json`, so
+/// older-cross-source identical-fallback decisions must use
+/// [`authoritative_snapshot_payload_matches`] instead.
 pub fn gateway_config_content_matches(current: &GatewayConfig, incoming: &GatewayConfig) -> bool {
     let (Ok(mut current), Ok(mut incoming)) = (
         serde_json::to_value(current),
@@ -133,6 +159,103 @@ pub fn gateway_config_content_matches(current: &GatewayConfig, incoming: &Gatewa
     current_object.remove("loaded_at");
     incoming_object.remove("loaded_at");
     canonical_json_value(current) == canonical_json_value(incoming)
+}
+
+/// Build the bounded trust-equivalence view for an accepted CP trust state.
+///
+/// `None` means absent/cleared CP trust. Fingerprints are order-insensitive for
+/// federated domains and certificate/JWT authority membership.
+pub fn gateway_trust_equivalence_state(
+    trust: Option<&RuntimeTrustBundleSet>,
+) -> GatewayTrustEquivalenceState {
+    match trust {
+        None => GatewayTrustEquivalenceState::Absent,
+        Some(trust) => GatewayTrustEquivalenceState::Present {
+            fingerprint: fingerprint_runtime_trust_bundles(trust),
+        },
+    }
+}
+
+/// Compare the complete authoritative ConfigSync snapshot payload.
+///
+/// Includes GatewayConfig content (excluding `loaded_at`) and the effective
+/// CP gateway-trust state from the side channel. `incoming_trust = None` means
+/// the incoming side channel did not establish a comparable trust state
+/// (empty/unchanged mixed-version channel, or comparison inputs unavailable)
+/// and therefore fails closed.
+pub fn authoritative_snapshot_payload_matches(
+    current_config: &GatewayConfig,
+    current_trust: &GatewayTrustEquivalenceState,
+    incoming_config: &GatewayConfig,
+    incoming_trust: Option<&GatewayTrustEquivalenceState>,
+) -> bool {
+    let Some(incoming_trust) = incoming_trust else {
+        return false;
+    };
+    gateway_config_content_matches(current_config, incoming_config)
+        && current_trust == incoming_trust
+}
+
+/// Record the last accepted CP gateway-trust equivalence view on authority.
+///
+/// No-op when authority has not been established yet. Callers must invoke this
+/// after every accepted trust Replace/Clear (FULL_SNAPSHOT or trust-only DELTA)
+/// so later identical-fallback comparisons stay synchronized.
+pub fn record_applied_gateway_trust(
+    authority: &mut Option<AppliedSnapshotAuthority>,
+    trust: GatewayTrustEquivalenceState,
+) {
+    if let Some(existing) = authority.as_mut() {
+        existing.gateway_trust = trust;
+    }
+}
+
+fn fingerprint_runtime_trust_bundles(trust: &RuntimeTrustBundleSet) -> String {
+    let mut hasher = Sha256::new();
+    hash_trust_bundle(&mut hasher, &trust.local);
+    let mut federated_domains: Vec<_> = trust.federated.keys().collect();
+    federated_domains.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    for domain in federated_domains {
+        hasher.update(domain.as_str().as_bytes());
+        hasher.update([0xff]);
+        if let Some(bundle) = trust.federated.get(domain) {
+            hash_trust_bundle(&mut hasher, bundle);
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn hash_trust_bundle(hasher: &mut Sha256, bundle: &TrustBundle) {
+    hasher.update(bundle.trust_domain.as_str().as_bytes());
+    hasher.update([0x00]);
+
+    let mut authorities = bundle.x509_authorities.clone();
+    authorities.sort_unstable();
+    hasher.update((authorities.len() as u64).to_le_bytes());
+    for der in authorities {
+        hasher.update((der.len() as u64).to_le_bytes());
+        hasher.update(&der);
+    }
+
+    let mut jwt_authorities = bundle.jwt_authorities.clone();
+    jwt_authorities.sort_by(|left, right| {
+        (&left.key_id, &left.public_key_pem).cmp(&(&right.key_id, &right.public_key_pem))
+    });
+    hasher.update((jwt_authorities.len() as u64).to_le_bytes());
+    for jwt in jwt_authorities {
+        hasher.update((jwt.key_id.len() as u64).to_le_bytes());
+        hasher.update(jwt.key_id.as_bytes());
+        hasher.update((jwt.public_key_pem.len() as u64).to_le_bytes());
+        hasher.update(jwt.public_key_pem.as_bytes());
+    }
+
+    match bundle.refresh_hint_seconds {
+        Some(hint) => {
+            hasher.update([0x01]);
+            hasher.update(hint.to_le_bytes());
+        }
+        None => hasher.update([0x00]),
+    }
 }
 
 fn canonical_json_value(value: Value) -> Value {
@@ -157,7 +280,10 @@ fn canonical_json_value(value: Value) -> Value {
 ///
 /// The watermark is monotonic: same-source recovery that intentionally applies
 /// an older body still keeps the highest known ordering for later cross-source
-/// fencing. Source URL is always updated to the committing CP.
+/// fencing. Source URL is always updated to the committing CP. Gateway-trust
+/// equivalence state is preserved on existing authority (resource deltas do
+/// not clear trust); new authority starts with absent trust until a trust
+/// update is recorded.
 pub fn advance_authority_from_committed(
     authority: &mut Option<AppliedSnapshotAuthority>,
     source_cp_url: &str,
@@ -172,6 +298,7 @@ pub fn advance_authority_from_committed(
             *authority = Some(AppliedSnapshotAuthority {
                 version: Some(committed),
                 source_cp_url: source_cp_url.to_string(),
+                gateway_trust: GatewayTrustEquivalenceState::Absent,
             });
         }
     }
@@ -195,9 +322,10 @@ pub fn resource_delta_advances_authority(accepted: bool, was_empty: bool) -> boo
 ///   recorded watermark stays monotonic even when the recovery body is older.
 /// - Cross-source failover snapshots are fenced when a parseable applied
 ///   authority exists and the incoming committed stamp is strictly older,
-///   unless the incoming snapshot's effective content matches the applied
-///   snapshot exactly. Equivalent content establishes a safe delta base while
-///   the recorded watermark stays monotonic.
+///   unless the incoming snapshot's complete authoritative payload matches
+///   the applied payload exactly (GatewayConfig content excluding `loaded_at`
+///   plus effective CP gateway-trust state). Equivalent complete payloads
+///   establish a safe delta base while the recorded watermark stays monotonic.
 /// - With no applied authority (first snapshot) or an authority whose own
 ///   version is unknown, there is nothing to fence against, so the snapshot is
 ///   accepted and its committed stamp adopted.

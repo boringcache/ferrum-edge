@@ -40,14 +40,15 @@ use super::configsync_lifecycle::{
     AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
-    DeltaRejectionKind, FullSnapshotStreamDisposition, MultiCpBackoffState,
-    SnapshotFailureStreamDisposition, SubscriptionApplyState, advance_authority_from_committed,
-    advance_multi_cp_backoff, check_peer_version_compatibility, connection_error_outcome,
-    delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
-    full_snapshot_stream_disposition, gateway_config_content_matches,
-    grow_backoff_after_failure_sleep, reconcile_snapshot_version,
-    resource_delta_advances_authority, snapshot_failure_stream_disposition,
-    stale_reject_from_reconcile,
+    DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
+    MultiCpBackoffState, SnapshotFailureStreamDisposition, SubscriptionApplyState,
+    advance_authority_from_committed, advance_multi_cp_backoff,
+    authoritative_snapshot_payload_matches, check_peer_version_compatibility,
+    connection_error_outcome, delta_rejection_stream_disposition,
+    evaluate_delta_against_subscription_base, full_snapshot_stream_disposition,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep,
+    reconcile_snapshot_version, record_applied_gateway_trust, resource_delta_advances_authority,
+    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
@@ -894,6 +895,24 @@ fn parse_gateway_trust_bundle_update(
     Ok(GatewayTrustBundleUpdate::Unchanged)
 }
 
+/// Map an accepted trust side-channel update onto the bounded equivalence view.
+///
+/// `Unchanged` returns `None` so callers can leave remembered trust state alone
+/// (and so older-cross-source complete-payload matching fails closed when a
+/// FULL_SNAPSHOT cannot establish comparable trust state). `Clear` / `Replace`
+/// always produce a comparable state.
+fn gateway_trust_equivalence_after_update(
+    update: &GatewayTrustBundleUpdate,
+) -> Option<GatewayTrustEquivalenceState> {
+    match update {
+        GatewayTrustBundleUpdate::Unchanged => None,
+        GatewayTrustBundleUpdate::Clear => Some(GatewayTrustEquivalenceState::Absent),
+        GatewayTrustBundleUpdate::Replace(trust_bundles) => {
+            Some(gateway_trust_equivalence_state(Some(trust_bundles)))
+        }
+    }
+}
+
 fn apply_gateway_trust_bundle_update(
     proxy_state: &ProxyState,
     update: GatewayTrustBundleUpdate,
@@ -1526,11 +1545,26 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         return Ok(DpStreamEnd::StaleSnapshotFenced);
                     }
                 };
+                // Older-cross-source identical-fallback must compare the complete
+                // authoritative payload: GatewayConfig content plus effective CP
+                // gateway-trust side-channel state. Empty/unchanged trust side
+                // channels fail closed (cannot establish equivalence).
+                let incoming_trust_equiv =
+                    gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                let incoming_matches_applied = match snapshot_authority.as_ref() {
+                    Some(authority) => authoritative_snapshot_payload_matches(
+                        proxy_state.current_config().as_ref(),
+                        &authority.gateway_trust,
+                        &config,
+                        incoming_trust_equiv.as_ref(),
+                    ),
+                    None => false,
+                };
                 let watermark = match full_snapshot_stream_disposition(
                     snapshot_authority.as_ref(),
                     committed,
                     cp_url,
-                    gateway_config_content_matches(proxy_state.current_config().as_ref(), &config),
+                    incoming_matches_applied,
                 ) {
                     FullSnapshotStreamDisposition::Apply { version } => version,
                     FullSnapshotStreamDisposition::RefuseAndTerminate(reason) => {
@@ -1559,14 +1593,26 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                             cp_frontend_tls_materialized.as_ref(),
                         )
                         .await;
+                        let next_trust =
+                            gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
                         apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
                         update_state_config_received(connection_state);
                         received_config = true;
                         // Watermark is the monotonic value from fencing policy
                         // (max of prior authority and committed loaded_at).
+                        // Preserve prior trust equivalence when the side channel
+                        // is Unchanged (mixed-version); otherwise record the
+                        // accepted Clear/Replace view.
+                        let gateway_trust = next_trust.unwrap_or_else(|| {
+                            snapshot_authority
+                                .as_ref()
+                                .map(|authority| authority.gateway_trust.clone())
+                                .unwrap_or(GatewayTrustEquivalenceState::Absent)
+                        });
                         *snapshot_authority = Some(AppliedSnapshotAuthority {
                             version: Some(watermark),
                             source_cp_url: cp_url.to_string(),
+                            gateway_trust,
                         });
                         // Authoritative FULL_SNAPSHOT clears sticky divergence
                         // from a prior rejected delta (issue #2394).
@@ -1703,10 +1749,16 @@ async fn connect_and_subscribe_with_startup_ready_inner(
 
                         match proxy_state.apply_incremental(result).await {
                             ConfigApplyOutcome::Applied => {
+                                let next_trust = gateway_trust_equivalence_after_update(
+                                    &gateway_trust_bundle_update,
+                                );
                                 apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
                                 );
+                                if let Some(trust) = next_trust {
+                                    record_applied_gateway_trust(snapshot_authority, trust);
+                                }
                                 update_state_config_received(connection_state);
                                 received_config = true;
                                 // Advance freshness from the committed delta
@@ -1723,17 +1775,28 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 info!("Incremental config delta applied from CP");
                             }
                             ConfigApplyOutcome::Unchanged => {
+                                let next_trust = gateway_trust_equivalence_after_update(
+                                    &gateway_trust_bundle_update,
+                                );
                                 if apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
                                 ) {
+                                    if let Some(trust) = next_trust {
+                                        // Keep identical-fallback equivalence in
+                                        // sync after accepted trust-only updates.
+                                        record_applied_gateway_trust(snapshot_authority, trust);
+                                    }
                                     update_state_config_received(connection_state);
                                     // An accepted trust-only update is authoritative
                                     // config delivery even though the gateway object
                                     // is unchanged — keep `received_config` in step
                                     // with the connection-state timestamp.
-                                    // Do NOT advance snapshot authority: trust-only
-                                    // side-channels are not resource-config freshness.
+                                    // Do NOT advance snapshot authority watermark:
+                                    // trust-only side-channels are not resource-config
+                                    // freshness. Trust equivalence state is updated
+                                    // above so later complete-payload comparisons
+                                    // cannot see a stale trust view.
                                     received_config = true;
                                     info!("Gateway trust bundle update applied from CP");
                                     continue;
@@ -2160,6 +2223,16 @@ mod tests {
         assert!(err.contains("failed validation"), "unexpected error: {err}");
         assert!(
             err.contains("has no authorities"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_gateway_trust_bundle_update_rejects_unparseable_json_fail_closed() {
+        let err = parse_gateway_trust_bundle_update("{not-json")
+            .expect_err("malformed trust side-channel must fail closed");
+        assert!(
+            err.contains("not valid JSON"),
             "unexpected error: {err}"
         );
     }

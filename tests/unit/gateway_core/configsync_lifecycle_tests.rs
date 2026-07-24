@@ -1,11 +1,12 @@
 //! External unit tests for DP ConfigSync lifecycle policy helpers.
 //!
 //! Covers silent-partition/keepalive constants, multi-CP backoff continuity,
-//! FULL_SNAPSHOT fencing, monotonic watermarks, version/`loaded_at` reconcile,
-//! subscription base gating, SemVer negotiation, delta-rejection divergence,
-//! connection-state staleness preservation, and namespace-qualified removal
-//! filtering surfaces exposed for deterministic verification without standing
-//! up a live CP.
+//! FULL_SNAPSHOT fencing (including complete-payload trust equivalence for the
+//! older-cross-source identical-fallback exception), monotonic watermarks,
+//! version/`loaded_at` reconcile, subscription base gating, SemVer negotiation,
+//! delta-rejection divergence, connection-state staleness preservation, and
+//! namespace-qualified removal filtering surfaces exposed for deterministic
+//! verification without standing up a live CP.
 
 use chrono::{TimeZone, Utc};
 use ferrum_edge::FERRUM_VERSION;
@@ -16,19 +17,21 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_MAX_SILENCE_SECS,
     CONFIGSYNC_TCP_KEEPALIVE_SECS, ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics,
     DeltaRefuse, DeltaRejectionKind, DeltaRejectionStreamDisposition,
-    FullSnapshotStreamDisposition, MultiCpBackoffState, SnapshotFailureStreamDisposition,
-    StaleSnapshotReject, SubscriptionApplyState, VersionCompatError, VersionReconcileError,
-    advance_authority_from_committed, advance_multi_cp_backoff, backoff_max_secs,
+    FullSnapshotStreamDisposition, GatewayTrustEquivalenceState, MultiCpBackoffState,
+    SnapshotFailureStreamDisposition, StaleSnapshotReject, SubscriptionApplyState,
+    VersionCompatError, VersionReconcileError, advance_authority_from_committed,
+    advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
     check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
     evaluate_delta_against_subscription_base, evaluate_full_snapshot_authority,
     failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
-    grow_backoff_after_failure_sleep, monotonic_watermark, reconcile_snapshot_version,
-    resource_delta_advances_authority, silence_exceeds_liveness,
-    snapshot_failure_stream_disposition, stale_reject_from_reconcile,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, monotonic_watermark,
+    reconcile_snapshot_version, record_applied_gateway_trust, resource_delta_advances_authority,
+    silence_exceeds_liveness, snapshot_failure_stream_disposition, stale_reject_from_reconcile,
 };
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, check_cp_version_compatibility, configure_configsync_endpoint,
 };
+use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet, TrustDomain};
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
 use tonic::transport::Channel;
 
@@ -169,6 +172,7 @@ fn full_snapshot_fencing_rejects_older_cross_source() {
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
     let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
 
@@ -207,6 +211,7 @@ fn same_source_recovery_watermark_is_monotonic() {
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-a:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
     let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
     let newer = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
@@ -236,6 +241,7 @@ fn fenced_full_snapshot_disposition_terminates_stream() {
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
 
     match full_snapshot_stream_disposition(
@@ -266,6 +272,7 @@ fn accepted_full_snapshot_disposition_applies_and_adopts_version() {
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
 
     // A newer cross-source failover snapshot applies and adopts its version.
@@ -309,6 +316,7 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
     let authority = AppliedSnapshotAuthority {
         version: Some(applied),
         source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
     let mut current = GatewayConfig {
         loaded_at: applied,
@@ -320,6 +328,12 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
     };
 
     assert!(gateway_config_content_matches(&current, &incoming));
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &GatewayTrustEquivalenceState::Absent,
+        &incoming,
+        Some(&GatewayTrustEquivalenceState::Absent),
+    ));
     assert_eq!(
         evaluate_full_snapshot_authority(
             Some(&authority),
@@ -333,6 +347,12 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
 
     current.version = "different-content".to_string();
     assert!(!gateway_config_content_matches(&current, &incoming));
+    assert!(!authoritative_snapshot_payload_matches(
+        &current,
+        &GatewayTrustEquivalenceState::Absent,
+        &incoming,
+        Some(&GatewayTrustEquivalenceState::Absent),
+    ));
     assert!(matches!(
         evaluate_full_snapshot_authority(
             Some(&authority),
@@ -344,6 +364,210 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
     ));
 }
 
+fn test_runtime_trust(domain: &str, ders: &[&[u8]]) -> RuntimeTrustBundleSet {
+    RuntimeTrustBundleSet {
+        local: TrustBundle {
+            trust_domain: TrustDomain::new(domain).expect("test trust domain"),
+            x509_authorities: ders.iter().map(|der| der.to_vec()).collect(),
+            jwt_authorities: Vec::new(),
+            refresh_hint_seconds: None,
+        },
+        federated: Default::default(),
+    }
+}
+
+#[test]
+fn older_cross_source_same_config_different_trust_is_fenced() {
+    // Security: GatewayConfig-only equality must NOT bypass fencing when the
+    // CP trust side channel differs (or clear-vs-present). Otherwise an older
+    // fallback snapshot would apply stale trust anchors.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let current_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[1, 2, 3, 4]],
+    )));
+    let stale_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[9, 9, 9, 9]],
+    )));
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: current_trust.clone(),
+    };
+    let current = GatewayConfig {
+        loaded_at: applied,
+        ..GatewayConfig::default()
+    };
+    let incoming = GatewayConfig {
+        loaded_at: older,
+        ..current.clone()
+    };
+
+    assert!(gateway_config_content_matches(&current, &incoming));
+    assert!(
+        !authoritative_snapshot_payload_matches(
+            &current,
+            &current_trust,
+            &incoming,
+            Some(&stale_trust),
+        ),
+        "different trust material must not match"
+    );
+    assert!(
+        !authoritative_snapshot_payload_matches(
+            &current,
+            &current_trust,
+            &incoming,
+            Some(&GatewayTrustEquivalenceState::Absent),
+        ),
+        "clear-vs-present trust must not match"
+    );
+    assert!(
+        !authoritative_snapshot_payload_matches(&current, &current_trust, &incoming, None),
+        "unknown/unparseable trust side channel must fail closed"
+    );
+
+    assert!(matches!(
+        evaluate_full_snapshot_authority(
+            Some(&authority),
+            older,
+            "http://cp-fallback:50051",
+            false,
+        ),
+        Err(StaleSnapshotReject::OlderThanApplied { .. })
+    ));
+    assert_eq!(
+        full_snapshot_stream_disposition(
+            Some(&authority),
+            older,
+            "http://cp-fallback:50051",
+            false,
+        ),
+        FullSnapshotStreamDisposition::RefuseAndTerminate(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: older,
+        })
+    );
+}
+
+#[test]
+fn older_cross_source_same_config_equivalent_trust_establishes_safe_base() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let trust_a = test_runtime_trust("cluster.local", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
+    // Same material with reordered x509 authorities must still fingerprint equal.
+    let trust_b = test_runtime_trust("cluster.local", &[&[5, 6, 7, 8], &[1, 2, 3, 4]]);
+    let current_trust = gateway_trust_equivalence_state(Some(&trust_a));
+    let incoming_trust = gateway_trust_equivalence_state(Some(&trust_b));
+    assert_eq!(current_trust, incoming_trust);
+
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: current_trust.clone(),
+    };
+    let current = GatewayConfig {
+        loaded_at: applied,
+        ..GatewayConfig::default()
+    };
+    let incoming = GatewayConfig {
+        loaded_at: older,
+        ..current.clone()
+    };
+
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &current_trust,
+        &incoming,
+        Some(&incoming_trust),
+    ));
+    assert_eq!(
+        evaluate_full_snapshot_authority(
+            Some(&authority),
+            older,
+            "http://cp-fallback:50051",
+            true,
+        )
+        .expect("complete equivalent payload establishes a safe delta base"),
+        applied
+    );
+}
+
+#[test]
+fn trust_only_update_keeps_authority_trust_equivalence_in_sync() {
+    let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let older = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let initial_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[1, 2, 3, 4]],
+    )));
+    let rotated_trust = gateway_trust_equivalence_state(Some(&test_runtime_trust(
+        "cluster.local",
+        &[&[5, 6, 7, 8]],
+    )));
+
+    let mut authority = Some(AppliedSnapshotAuthority {
+        version: Some(t0),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: initial_trust.clone(),
+    });
+
+    // Accepted trust-only Replace keeps the watermark but refreshes trust view.
+    record_applied_gateway_trust(&mut authority, rotated_trust.clone());
+    assert_eq!(authority.as_ref().unwrap().version, Some(t0));
+    assert_eq!(authority.as_ref().unwrap().gateway_trust, rotated_trust);
+
+    let current = GatewayConfig {
+        loaded_at: t0,
+        ..GatewayConfig::default()
+    };
+    let incoming = GatewayConfig {
+        loaded_at: older,
+        ..current.clone()
+    };
+
+    // Stale snapshot carrying the pre-rotation trust must not match after the
+    // trust-only update synchronized authority equivalence state.
+    assert!(!authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&initial_trust),
+    ));
+    assert!(matches!(
+        evaluate_full_snapshot_authority(
+            authority.as_ref(),
+            older,
+            "http://cp-fallback:50051",
+            false,
+        ),
+        Err(StaleSnapshotReject::OlderThanApplied { .. })
+    ));
+
+    // Equivalent complete trust after rotation still establishes the safe base.
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&rotated_trust),
+    ));
+
+    // Clear also stays in sync.
+    record_applied_gateway_trust(&mut authority, GatewayTrustEquivalenceState::Absent);
+    assert_eq!(
+        authority.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Absent
+    );
+    assert!(authoritative_snapshot_payload_matches(
+        &current,
+        &authority.as_ref().unwrap().gateway_trust,
+        &incoming,
+        Some(&GatewayTrustEquivalenceState::Absent),
+    ));
+}
+
 #[test]
 fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
     let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
@@ -351,6 +575,7 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
     let mut authority = Some(AppliedSnapshotAuthority {
         version: Some(t0),
         source_cp_url: "http://cp-a:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     });
 
     assert!(resource_delta_advances_authority(true, false));
@@ -359,10 +584,19 @@ fn accepted_resource_delta_advances_authority_trust_only_and_reject_do_not() {
 
     advance_authority_from_committed(&mut authority, "http://cp-a:50051", t1);
     assert_eq!(authority.as_ref().unwrap().version, Some(t1));
+    assert_eq!(
+        authority.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Absent,
+        "resource-delta watermark advances must preserve trust equivalence state"
+    );
 
     // A later older stamp must not lower the watermark.
     advance_authority_from_committed(&mut authority, "http://cp-a:50051", t0);
     assert_eq!(authority.as_ref().unwrap().version, Some(t1));
+    assert_eq!(
+        authority.as_ref().unwrap().gateway_trust,
+        GatewayTrustEquivalenceState::Absent
+    );
 }
 
 #[test]
@@ -598,6 +832,7 @@ fn unknown_prior_authority_still_accepts_cross_source() {
     let authority = AppliedSnapshotAuthority {
         version: None,
         source_cp_url: "http://cp-a:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
     };
     let newer = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
     let accepted =
