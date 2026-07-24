@@ -2593,8 +2593,14 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
-    // Verify that an unsupported legacy delta shape doesn't corrupt existing config.
+async fn test_dp_keeps_last_good_config_after_unparseable_delta_shape() {
+    // Verify that an unclassifiable delta body doesn't corrupt existing config.
+    //
+    // Note this is deliberately NOT the legacy bare-ID removal shape: that one
+    // is a supported same-major.minor rolling-upgrade encoding and is applied
+    // (see `dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace`). Only
+    // a removal entry that is neither a bare ID nor a namespace-qualified key is
+    // unclassifiable, and it must fail closed.
     let cp_config = create_test_config(2);
     let (addr, update_tx, config_arc, _server_handle) =
         start_test_cp_server_with_capacity(cp_config, 16).await;
@@ -2632,9 +2638,9 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
     .await;
     assert!(received.is_ok());
 
-    // Legacy CPs sent removed consumer IDs as bare strings. Mixed-version
-    // CP/DP fleets are unsupported during build-out, so this valid JSON must
-    // fail the current namespaced delta schema safely.
+    // A removal entry that is neither a bare ID string nor a namespace-qualified
+    // key is unclassifiable. It is valid JSON, so it must be rejected by the
+    // delta schema and fail closed rather than partially applying.
     let mut legacy_delta = serde_json::to_value(IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -2648,7 +2654,7 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
         poll_timestamp: Utc::now(),
     })
     .unwrap();
-    legacy_delta["removed_consumer_ids"] = serde_json::json!(["consumer-legacy"]);
+    legacy_delta["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
     let malformed = ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1, // DELTA
         config_json: serde_json::to_string(&legacy_delta).unwrap(),
@@ -2666,7 +2672,7 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
     assert_eq!(
         proxy_state.config.load().proxies.len(),
         2,
-        "Config should remain unchanged after unsupported legacy delta"
+        "Config should remain unchanged after an unclassifiable delta"
     );
 
     // A later partial CP update would omit resources that were part of the
