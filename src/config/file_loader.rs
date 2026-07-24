@@ -104,7 +104,7 @@ pub fn load_config_from_file(
                 *other = serde_json::Value::String(s.clone());
                 if let Some(serde_yaml::Value::Mapping(mapping)) = yaml_value.as_mut()
                     && let Some(yaml_version) =
-                        mapping.get_mut(&serde_yaml::Value::String("version".to_string()))
+                        mapping.get_mut(serde_yaml::Value::String("version".to_string()))
                 {
                     *yaml_version = serde_yaml::Value::String(s.clone());
                 }
