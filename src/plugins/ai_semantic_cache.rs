@@ -232,12 +232,15 @@ const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 2;
 /// singleflight in [`AiSemanticCache::compute_embedding`]) so they share one
 /// outbound request rather than each consuming a permit.
 const MAX_CONCURRENT_EMBEDDINGS: usize = 8;
-/// How long a follower waits for a singleflight leader before re-entering
-/// leader election. Bounds waiter latency when a leader stalls without
-/// cancelling, while cancellation still frees the slot immediately.
+/// How long a follower waits for a singleflight leader before bypassing the
+/// semantic lookup. Bounds waiter latency when a leader stalls without
+/// cancelling; a timeout must not evict a still-running leader and duplicate
+/// the same outbound embedding call. Cancellation closes the channel and frees
+/// the slot immediately, allowing one replacement leader to be elected.
 const EMBEDDING_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(30);
 /// Upper bound on singleflight re-election attempts for one caller so a
-/// pathological cancel storm cannot loop forever on the request task.
+/// pathological leader-cancellation storm cannot loop forever on the request
+/// task.
 const EMBEDDING_SINGLEFLIGHT_MAX_RETRIES: usize = 16;
 /// Test-only override for [`EMBEDDING_SINGLEFLIGHT_WAIT`] (milliseconds). `0`
 /// means use the production default.
@@ -1080,8 +1083,9 @@ impl AiSemanticCache {
     /// dropped before publishing frees its slot (via [`EmbeddingFlightCleanup`])
     /// and closes its channel, so waiters re-enter the map and elect exactly one
     /// replacement leader rather than each issuing a duplicate outbound call.
-    /// Followers also re-elect after [`EMBEDDING_SINGLEFLIGHT_WAIT`] so a stalled
-    /// leader cannot pin waiters indefinitely. One shared success or failure is
+    /// Followers wait at most [`EMBEDDING_SINGLEFLIGHT_WAIT`]. A timeout bypasses
+    /// semantic lookup for that follower without evicting the live leader, so it
+    /// cannot create duplicate outbound work. One shared success or failure is
     /// published to all waiters on each completed leadership.
     async fn compute_embedding(&self, input: &str) -> Result<EmbeddingPoint, String> {
         if self.semantic.is_none() {
@@ -1127,7 +1131,6 @@ impl AiSemanticCache {
                 }
                 EmbeddingFlightRole::Follower(mut rx) => {
                     let wait_deadline = Instant::now() + embedding_singleflight_wait();
-                    let mut reelect = false;
                     loop {
                         // Bind the cloned value so the borrow guard drops before
                         // the wait below re-borrows `rx`.
@@ -1137,40 +1140,33 @@ impl AiSemanticCache {
                         }
                         let remaining = wait_deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
-                            // Wait timed out; re-enter election for one leader.
-                            reelect = true;
-                            break;
+                            return Err(
+                                "embedding singleflight leader exceeded follower wait bound"
+                                    .to_string(),
+                            );
                         }
                         match tokio::time::timeout(remaining, rx.changed()).await {
                             Ok(Ok(())) => continue,
                             Ok(Err(_)) => {
                                 // Leader vanished before publishing; re-elect.
-                                reelect = true;
                                 break;
                             }
                             Err(_) => {
-                                // Wait timed out while the leader slot is still
-                                // occupied and unpublished. Steal that slot so
-                                // exactly one waiter can become the replacement
-                                // leader instead of every waiter looping on the
-                                // same stalled flight until the retry budget
-                                // collapses into a stampede.
-                                self.embedding_flights.remove_if(&flight_key, |_, existing| {
-                                    existing.rx.borrow().is_none()
-                                });
-                                reelect = true;
-                                break;
+                                // The leader still owns the slot. Bypass this
+                                // follower rather than stealing a live flight
+                                // and issuing a duplicate outbound request.
+                                return Err(
+                                    "embedding singleflight leader exceeded follower wait bound"
+                                        .to_string(),
+                                );
                             }
                         }
-                    }
-                    if reelect {
-                        continue;
                     }
                 }
             }
         }
 
-        // Exhausted re-election budget under a cancel/timeout storm: still
+        // Exhausted re-election budget under a leader-cancellation storm: still
         // honor the per-instance semaphore for one final bounded attempt.
         let _permit = self.embedding_semaphore.acquire().await.ok();
         self.compute_embedding_inner(input).await
@@ -2089,7 +2085,8 @@ fn append_identity_key_parts(
 
     if let Some(ref proxy) = ctx.matched_proxy {
         start_key_part(key_input, has_part);
-        key_input.push_str(&proxy.id);
+        key_input.push_str("proxy:");
+        append_len_prefixed(key_input, &proxy.id);
 
         // Canonical route/operation identity within the same proxy. This plugin
         // runs after route-dispatch plugins (`ai_stream_router`, `mcp_gateway`,
@@ -2129,7 +2126,8 @@ fn append_identity_key_parts(
         && let Some(identity) = ctx.effective_identity()
     {
         start_key_part(key_input, has_part);
-        let _ = write!(key_input, "{identity}");
+        key_input.push_str("consumer:");
+        append_len_prefixed(key_input, identity);
     }
 
     if plugin.include_model_in_key
@@ -2137,7 +2135,7 @@ fn append_identity_key_parts(
     {
         start_key_part(key_input, has_part);
         key_input.push_str("m:");
-        push_ascii_lowercase(key_input, model);
+        append_ascii_lowercase_len_prefixed(key_input, model);
     }
 
     if plugin.include_params_in_key {
@@ -2434,44 +2432,10 @@ fn extract_responses_input_text(input: &Value, mode: PromptTextCanon) -> String 
 
 fn append_responses_prompt_exact_key(input: &Value, key_input: &mut String) -> Option<()> {
     match input {
-        Value::String(text) => {
-            key_input.push_str("string:");
-            append_len_prefixed(key_input, text);
-        }
-        Value::Array(items) => {
-            let _ = write!(key_input, "array:{}:", items.len());
-            for item in items {
-                append_responses_prompt_item(item, key_input)?;
-            }
-        }
-        Value::Object(_) => {
-            key_input.push_str("object:");
-            append_responses_prompt_item(input, key_input)?;
-        }
+        Value::String(_) | Value::Array(_) | Value::Object(_) => {}
         _ => return None,
     }
-    Some(())
-}
-
-fn append_responses_prompt_item(item: &Value, key_input: &mut String) -> Option<()> {
-    if let Some(text) = item.as_str() {
-        key_input.push_str("string:");
-        append_len_prefixed(key_input, text);
-        return Some(());
-    }
-    let object = item.as_object()?;
-    key_input.push_str("item:");
-    append_len_prefixed(
-        key_input,
-        object
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("input"),
-    );
-    append_len_prefixed(
-        key_input,
-        &extract_responses_input_text(item, PromptTextCanon::Exact),
-    );
+    append_len_prefixed(key_input, &input.to_string());
     Some(())
 }
 
@@ -2521,9 +2485,11 @@ fn append_family_prompt_exact_key(
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown");
-                let content = extract_message_content(msg, PromptTextCanon::Exact);
                 append_len_prefixed(key_input, role);
-                append_len_prefixed(key_input, &content);
+                append_len_prefixed(
+                    key_input,
+                    &msg.get("content").unwrap_or(&Value::Null).to_string(),
+                );
             }
             Some(())
         }
@@ -2545,13 +2511,11 @@ fn append_family_prompt_exact_key(
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("user");
-                let text = content
-                    .get("parts")
-                    .and_then(|p| p.as_array())
-                    .map(|parts| extract_gemini_parts_text(parts, PromptTextCanon::Exact))
-                    .unwrap_or_default();
                 append_len_prefixed(key_input, role);
-                append_len_prefixed(key_input, &text);
+                append_len_prefixed(
+                    key_input,
+                    &content.get("parts").unwrap_or(&Value::Null).to_string(),
+                );
             }
             Some(())
         }
@@ -2564,13 +2528,15 @@ fn append_family_prompt_exact_key(
                         .get("role")
                         .and_then(|r| r.as_str())
                         .unwrap_or("unknown");
-                    let content = msg
-                        .get("message")
-                        .or_else(|| msg.get("content"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
                     append_len_prefixed(key_input, role);
-                    append_len_prefixed(key_input, content);
+                    append_len_prefixed(
+                        key_input,
+                        &msg
+                            .get("message")
+                            .or_else(|| msg.get("content"))
+                            .unwrap_or(&Value::Null)
+                            .to_string(),
+                    );
                 }
             }
             if let Some(message) = body.get("message").and_then(|m| m.as_str()) {
@@ -2583,21 +2549,27 @@ fn append_family_prompt_exact_key(
             let prompt = body.get("prompt")?;
             start_key_part(key_input, has_part);
             key_input.push_str("prompt:");
-            key_input.push_str(&prompt_value_for_key(prompt, PromptTextCanon::Exact));
+            append_len_prefixed(
+                key_input,
+                &prompt_value_for_key(prompt, PromptTextCanon::Exact),
+            );
             Some(())
         }
         CacheRequestFamily::Tgi => {
             let inputs = body.get("inputs")?;
             start_key_part(key_input, has_part);
             key_input.push_str("inputs:");
-            key_input.push_str(&prompt_value_for_key(inputs, PromptTextCanon::Exact));
+            append_len_prefixed(
+                key_input,
+                &prompt_value_for_key(inputs, PromptTextCanon::Exact),
+            );
             Some(())
         }
         CacheRequestFamily::Titan => {
             let input_text = body.get("inputText").and_then(|v| v.as_str())?;
             start_key_part(key_input, has_part);
             key_input.push_str("inputText:");
-            key_input.push_str(input_text);
+            append_len_prefixed(key_input, input_text);
             Some(())
         }
     }
@@ -2614,24 +2586,27 @@ fn append_family_instruction_exact_key(
             if let Some(system) = body.get("system") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("sys:");
-                key_input.push_str(&system_value_for_key(system, PromptTextCanon::Exact));
+                append_len_prefixed(key_input, &system.to_string());
             }
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("preamble:");
-                key_input.push_str(preamble);
+                append_len_prefixed(key_input, preamble);
             }
         }
         CacheRequestFamily::Responses => {
             if let Some(instructions) = body.get("instructions") {
                 start_key_part(key_input, has_part);
                 key_input.push_str("instructions:");
-                key_input.push_str(&prompt_value_for_key(instructions, PromptTextCanon::Exact));
+                append_len_prefixed(
+                    key_input,
+                    &prompt_value_for_key(instructions, PromptTextCanon::Exact),
+                );
             }
             if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("previous_response_id:");
-                key_input.push_str(previous);
+                append_len_prefixed(key_input, previous);
             }
         }
         CacheRequestFamily::Gemini => {
@@ -2640,7 +2615,7 @@ fn append_family_instruction_exact_key(
                     start_key_part(key_input, has_part);
                     key_input.push_str(field);
                     key_input.push(':');
-                    key_input.push_str(&gemini_instruction_for_key(system, PromptTextCanon::Exact));
+                    append_len_prefixed(key_input, &system.to_string());
                 }
             }
         }
@@ -2648,7 +2623,7 @@ fn append_family_instruction_exact_key(
             if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("preamble:");
-                key_input.push_str(preamble);
+                append_len_prefixed(key_input, preamble);
             }
         }
         CacheRequestFamily::LegacyPrompt | CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
@@ -2801,7 +2776,7 @@ fn append_family_instruction_scope(
             if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
                 start_key_part(key_input, has_part);
                 key_input.push_str("previous_response_id:");
-                key_input.push_str(previous);
+                append_len_prefixed(key_input, previous);
             }
         }
         CacheRequestFamily::Gemini => {
@@ -4262,11 +4237,10 @@ impl Plugin for AiSemanticCache {
 
         // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
         // `before_proxy` sets `meta_cache_key` so this hook stores the
-        // (real) backend response. But this plugin (priority 2980) runs BEFORE
-        // the later synthetic-2xx producers — `mesh_route_dispatch` (2995),
-        // `serverless_function` (3025), `ai_federation` (4060),
-        // `response_mock` (3030), `request_termination`, and a
-        // `request_deduplication` replay — so when ANY of those short-circuits
+        // (real) backend response. But this plugin (priority 2996) runs before
+        // later synthetic-2xx producers such as `serverless_function` (3025),
+        // `response_mock` (3030), and `ai_federation` (4060), so when one of
+        // those short-circuits
         // with a 2xx body, the generic synthetic body-hook path
         // (`apply_synthetic_response_body_hooks`) re-runs this
         // `on_final_response_body` with `meta_cache_key` still set from

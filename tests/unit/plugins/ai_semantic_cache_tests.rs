@@ -1855,6 +1855,57 @@ async fn test_exact_key_preserves_case_and_whitespace() {
 }
 
 #[tokio::test]
+async fn exact_key_length_frames_user_controlled_instruction_fields() {
+    let embedded_separator = json!({
+        "model": "claude-3-5-sonnet",
+        "system": "guard\npreamble:evil",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    let separate_field = json!({
+        "model": "claude-3-5-sonnet",
+        "system": "guard",
+        "preamble": "evil",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    assert_exact_miss_for_variant(embedded_separator, separate_field, br#""safe""#).await;
+
+    let model_with_separator = json!({
+        "model": "model\nt:0",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    let model_and_temperature = json!({
+        "model": "model",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    assert_exact_miss_for_variant(
+        model_with_separator,
+        model_and_temperature,
+        br#""safe""#,
+    )
+    .await;
+
+    let two_text_parts = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"}
+            ]
+        }]
+    });
+    let one_text_part = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world"}]
+        }]
+    });
+    assert_exact_miss_for_variant(two_text_parts, one_text_part, br#""safe""#).await;
+}
+
+#[tokio::test]
 async fn test_exact_key_distinguishes_code_case_and_indentation() {
     let plugin = make_plugin(json!({"ttl_seconds": 300, "scope_by_consumer": false}));
 
@@ -4772,10 +4823,11 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
 }
 
 #[tokio::test]
-async fn singleflight_timeout_reelects_instead_of_hanging() {
+async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
     ai_semantic_cache_set_singleflight_wait_override_for_test(Some(Duration::from_millis(80)));
     let mock_server = MockServer::start().await;
-    // First leadership hangs past the override; the re-elected leader succeeds.
+    // The live leader runs past the follower wait bound. Followers must bypass
+    // semantic lookup rather than evicting it and issuing a duplicate request.
     Mock::given(method("POST"))
         .and(path("/embeddings"))
         .and(header("authorization", "Bearer test-key"))
@@ -4786,7 +4838,7 @@ async fn singleflight_timeout_reelects_instead_of_hanging() {
                     "data": [{"embedding": [1.0, 0.0, 0.0]}]
                 })),
         )
-        .expect(1..=2)
+        .expect(1)
         .mount(&mock_server)
         .await;
 

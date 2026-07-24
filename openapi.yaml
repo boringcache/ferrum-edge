@@ -18795,7 +18795,9 @@ components:
         LLM-significant prompt case and whitespace while applying structurally
         safe canonicalization; optional semantic similarity uses a configured
         embedding provider and a local HNSW vector index.
-        Supports local DashMap and Redis exact-response storage. Redis mode requires redis_integrity_key and treats Redis as an untrusted, authenticated trust boundary. Multiple
+        Supports local DashMap and Redis exact-response storage. Redis mode
+        requires redis_integrity_key and treats Redis as an untrusted,
+        authenticated trust boundary. Multiple
         instances on one proxy namespace request staging metadata under
         ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
         per-instance RequestContext maps so differing key policies and
