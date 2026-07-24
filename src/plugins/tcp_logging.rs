@@ -967,7 +967,7 @@ mod tests {
         // Larger than the shrunk send/recv windows so write_all blocks against
         // a non-reading peer and hits write_timeout_ms.
         let huge = "x".repeat(256 * 1024);
-        let budget = ByteBudget::new("tcp_logging_test", 1024 * 1024);
+        let budget = ByteBudget::new("tcp_logging_test", 4 * 1024 * 1024);
         let summary = TransactionSummary {
             client_ip: "127.0.0.1".to_string(),
             http_method: "GET".to_string(),
