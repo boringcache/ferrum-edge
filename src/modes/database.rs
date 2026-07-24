@@ -1094,13 +1094,15 @@ pub async fn run(
             // (serve backup, publish config_rejected, and enable writes after
             // the recovery migration gate)
             // and is left unclassified so no "refusing to bootstrap" wrapper
-            // clouds the rejection log. Every OTHER non-transient failure
-            // (schema drift, bad rows, decode, query, auth) is classified and
-            // must fail startup rather than mask a broken database with stale
-            // on-disk config — the same policy the connect path applies via
-            // `is_non_transient_init_error`. Only transient connectivity/
-            // resource errors are silently backup-eligible.
-            let e = if crate::modes::is_poll_validation_rejection(&e) {
+            // clouds the rejection log. Row-DECODE rejections (issue #2997) are
+            // deliberately NOT backup-eligible here — startup stays fail-loud so
+            // a broken row cannot be masked by stale on-disk config; the poll
+            // loop still classifies them via `is_poll_validation_rejection` to
+            // keep admin writable after a successful boot. Every OTHER
+            // non-transient failure (schema drift, query, auth) is classified
+            // and must fail startup. Only transient connectivity/resource
+            // errors are silently backup-eligible.
+            let e = if crate::config::validation_pipeline::is_config_validation_rejection(&e) {
                 e
             } else {
                 DatabaseStore::classify_initial_config_load_error(e)
@@ -1117,7 +1119,8 @@ pub async fn run(
                 );
                 match load_config_backup(path) {
                     Some(cfg) => {
-                        startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);
+                        startup_config_rejected =
+                            crate::config::validation_pipeline::is_config_validation_rejection(&e);
                         if startup_config_rejected {
                             error!(
                                 "Initial database snapshot was rejected by runtime validation; \
@@ -3205,9 +3208,20 @@ mod tests {
         let source = include_str!("database.rs");
         assert!(
             source.contains(
-                "startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);"
+                "crate::config::validation_pipeline::is_config_validation_rejection(&e)"
             ),
-            "backup startup must classify the initial full-load failure"
+            "backup startup must classify ONLY ConfigValidationRejection (not row-decode) \
+             so decode failures stay fail-loud / non-transient at startup"
+        );
+        // Split the forbidden poll-loop classifier reference so this assertion
+        // string itself does not match `include_str!("database.rs")`.
+        let forbidden = format!(
+            "startup_config_rejected = {}::is_poll_validation_rejection(&e);",
+            "crate::modes"
+        );
+        assert!(
+            !source.contains(&forbidden),
+            "startup must NOT use the poll-loop classifier (which includes RowDecodeRejection)"
         );
         assert!(
             source.contains("AtomicBool::new(startup_config_rejected)"),
@@ -3217,6 +3231,15 @@ mod tests {
             source.contains("if bootstrap_from_backup && startup_config_rejected")
                 && source.contains("initial validation-rejected snapshot"),
             "a validation-rejected offline bootstrap must run the recovery migration gate"
+        );
+        // Poll-loop sites must still use the broader classifier that includes
+        // RowDecodeRejection (issue #2997).
+        assert!(
+            source
+                .matches("crate::modes::is_poll_validation_rejection(")
+                .count()
+                >= 4,
+            "poll-loop full-load failure sites must classify via is_poll_validation_rejection"
         );
     }
 

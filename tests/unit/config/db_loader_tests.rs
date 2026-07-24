@@ -1477,6 +1477,32 @@ fn initial_config_load_validation_error_is_non_transient() {
 }
 
 #[test]
+fn initial_config_load_row_decode_rejection_is_non_transient() {
+    // Issue #2997: poll loops treat RowDecodeRejection like a validation
+    // rejection (keep admin writable), but startup must stay fail-loud — a
+    // decode failure must still refuse FERRUM_DB_CONFIG_BACKUP_PATH bootstrap.
+    use ferrum_edge::_test_support::{
+        is_poll_validation_rejection, is_row_decode_rejection, row_decode_rejection_error,
+    };
+
+    let raw = row_decode_rejection_error(
+        "consumer",
+        Some("c-bad"),
+        "Consumer c-bad: failed to parse credentials JSON: EOF",
+    );
+    assert!(is_row_decode_rejection(&raw));
+    assert!(
+        is_poll_validation_rejection(&raw),
+        "row-decode must classify for the poll loop"
+    );
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "startup must keep row-decode fail-loud / non-transient: {classified}"
+    );
+}
+
+#[test]
 fn initial_config_load_transient_sqlx_error_stays_backup_eligible() {
     // A connectivity failure during the initial full load (the DB became
     // unreachable between connect and load) must stay backup-eligible so the

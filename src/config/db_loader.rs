@@ -89,8 +89,61 @@ impl FullLoadPurpose {
                 error,
             ))
         } else {
-            error
+            // Runtime full loads tag undecodable rows so the DB/CP poll loop can
+            // keep admin writes open for in-band repair (issue #2997 / #2158).
+            mark_row_decode_rejection(resource_type, resource_id, error)
         }
+    }
+}
+
+/// Marker for a reachable-SQL row whose column values could not be decoded into
+/// the domain model (malformed JSON, `ColumnDecode`, etc.).
+///
+/// Distinct from connectivity/driver failures and from
+/// [`ConfigValidationRejection`]: the database answered, but one or more rows
+/// are undecodable. Poll loops treat this like a validation rejection — keep
+/// last-known-good runtime config and leave admin writable after the migration
+/// gate — while startup still marks the load non-transient so backup bootstrap
+/// cannot mask a broken row (issue #2997).
+#[derive(Debug)]
+pub(crate) struct RowDecodeRejection {
+    pub resource_type: &'static str,
+    pub resource_id: Option<String>,
+}
+
+impl std::fmt::Display for RowDecodeRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.resource_id {
+            Some(id) => write!(
+                f,
+                "SQL row decode rejected for {} '{}'",
+                self.resource_type, id
+            ),
+            None => write!(f, "SQL row decode rejected for {}", self.resource_type),
+        }
+    }
+}
+
+impl std::error::Error for RowDecodeRejection {}
+
+/// Returns `true` when any link in the error chain is a [`RowDecodeRejection`].
+pub(crate) fn is_row_decode_rejection(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<RowDecodeRejection>())
+}
+
+/// Attach a [`RowDecodeRejection`] marker unless one is already present.
+pub(crate) fn mark_row_decode_rejection(
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if is_row_decode_rejection(&error) {
+        error
+    } else {
+        error.context(RowDecodeRejection {
+            resource_type,
+            resource_id,
+        })
     }
 }
 
@@ -8868,6 +8921,15 @@ fn row_to_proxy(
     id: String,
     plugins: Vec<PluginAssociation>,
 ) -> Result<Proxy, anyhow::Error> {
+    row_to_proxy_inner(row, id.clone(), plugins)
+        .map_err(|error| mark_row_decode_rejection("proxy", Some(id), error))
+}
+
+fn row_to_proxy_inner(
+    row: &AnyRow,
+    id: String,
+    plugins: Vec<PluginAssociation>,
+) -> Result<Proxy, anyhow::Error> {
     // Clone id for use in error messages (the original is moved into the Proxy struct).
     let pid = id.clone();
     let scheme_str: String = row
@@ -8927,13 +8989,19 @@ fn row_to_proxy(
             .try_get::<i64, _>("backend_write_timeout_ms")
             .map(|v| v.max(0) as u64)
             .unwrap_or(30000),
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Trust/routing columns: `Option<String>` already represents SQL NULL.
+        // Propagate real decode errors (issue #3000) — `.ok()` would silently
+        // drop a custom CA / mTLS client cert or detach an upstream_id.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
         dns_override: row.try_get("dns_override").ok(),
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
@@ -8941,7 +9009,7 @@ fn row_to_proxy(
             .map(|v| v as u64),
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
-        upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
         circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
             Ok(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
@@ -9097,6 +9165,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_consumer_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("consumer", id, error)
+    })
+}
+
+fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, anyhow::Error> {
     let creds_str: String = row.try_get("credentials").map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to read credentials column: {}",
@@ -9138,6 +9213,16 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_plugin_config_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("plugin_config", id, error)
+    })
+}
+
+fn row_to_plugin_config_inner(
+    row: &AnyRow,
+    id_preview: &str,
+) -> Result<PluginConfig, anyhow::Error> {
     let config_str: String = row.try_get("config").map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to read config column: {}",
@@ -9194,6 +9279,13 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_upstream_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("upstream", id, error)
+    })
+}
+
+fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
     let targets_str: String = row.try_get("targets").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read targets column: {}",
@@ -9317,10 +9409,16 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // writes, so SQL rows always start `false`.
         locality_lb_strict: false,
         locality_lb_setting: None,
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Trust columns: `Option<String>` already represents SQL NULL.
+        // Propagate real decode errors (issue #3000) — `.ok()` would silently
+        // drop backend mTLS material or a custom CA trust anchor.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh
@@ -9585,5 +9683,75 @@ mod proxy_insert_sql_drift_tests {
             "submit_api_spec_bundle proxy INSERT placeholder count must match \
              PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
         );
+    }
+}
+
+#[cfg(test)]
+mod row_decode_nullable_column_drift_tests {
+    //! Source guards for issue #3000: trust/routing nullable columns in
+    //! `row_to_proxy` / `row_to_upstream` must use `try_get::<Option<_>>(...)?`
+    //! and must not swallow decode errors with `.ok()`.
+
+    fn mapper_body<'a>(source: &'a str, fn_name: &str, next_marker: &str) -> &'a str {
+        let start = source
+            .find(&format!("fn {fn_name}("))
+            .unwrap_or_else(|| panic!("{fn_name} must exist"));
+        let after = &source[start..];
+        let end = after
+            .find(next_marker)
+            .unwrap_or_else(|| panic!("{fn_name} must be followed by {next_marker}"));
+        &after[..end]
+    }
+
+    fn assert_option_try_get_no_ok(body: &str, column: &str, mapper: &str) {
+        let option_get = format!("try_get::<Option<String>, _>(\"{column}\")");
+        assert!(
+            body.contains(&option_get),
+            "{mapper} must decode {column} via try_get::<Option<String>, _>(...)? \
+             so SQL NULL stays None while real decode errors propagate"
+        );
+        let forbidden = [
+            format!("try_get(\"{column}\").ok()"),
+            format!("try_get::<String, _>(\"{column}\").ok()"),
+        ];
+        for pattern in forbidden {
+            assert!(
+                !body.contains(&pattern),
+                "{mapper} must not swallow {column} decode errors with `.ok()` \
+                 (found `{pattern}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn row_to_proxy_trust_routing_columns_use_explicit_nullable_decode() {
+        let source = include_str!("db_loader.rs");
+        // Guard the inner mapper (after the thin RowDecodeRejection wrapper).
+        let body = mapper_body(source, "row_to_proxy_inner", "\nfn row_to_consumer(");
+        for column in [
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_server_ca_cert_path",
+            "upstream_id",
+        ] {
+            assert_option_try_get_no_ok(body, column, "row_to_proxy_inner");
+        }
+    }
+
+    #[test]
+    fn row_to_upstream_trust_columns_use_explicit_nullable_decode() {
+        let source = include_str!("db_loader.rs");
+        let body = mapper_body(
+            source,
+            "row_to_upstream_inner",
+            "\npub(crate) fn strip_api_spec_id_from_runtime_config(",
+        );
+        for column in [
+            "backend_tls_client_cert_path",
+            "backend_tls_client_key_path",
+            "backend_tls_server_ca_cert_path",
+        ] {
+            assert_option_try_get_no_ok(body, column, "row_to_upstream_inner");
+        }
     }
 }

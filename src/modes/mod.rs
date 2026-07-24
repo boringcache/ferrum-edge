@@ -359,13 +359,16 @@ async fn handle_startup_plugin_migrations_with_list(
 // classification so the two runtimes cannot drift.
 // ---------------------------------------------------------------------------
 
-/// Classify a poll-loop full-load failure: `true` for a config-VALIDATION
-/// rejection (reachable backend, semantically-invalid snapshot), `false` for a
-/// connectivity/driver failure. A validation rejection is downcast-discoverable
-/// through the `anyhow` source chain (see
-/// [`crate::config::validation_pipeline::ConfigValidationRejection`]).
+/// Classify a poll-loop full-load failure: `true` for a reachable-backend config
+/// rejection (semantic VALIDATION via
+/// [`crate::config::validation_pipeline::ConfigValidationRejection`], or SQL
+/// row DECODE via [`crate::config::db_loader::RowDecodeRejection`]), `false` for
+/// a connectivity/driver failure. Both markers are downcast-discoverable through
+/// the `anyhow` source chain so poll loops keep `db_available=true` (after the
+/// migration gate) and raise `config_rejected` (issues #2158 / #2997).
 pub(crate) fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
     crate::config::validation_pipeline::is_config_validation_rejection(err)
+        || crate::config::db_loader::is_row_decode_rejection(err)
 }
 
 /// Apply the config-validation-rejection state transition once the deferred
@@ -664,6 +667,14 @@ mod tests {
         .into_anyhow()
     }
 
+    fn row_decode_rejection_error() -> anyhow::Error {
+        anyhow::anyhow!("Consumer bad: failed to parse credentials JSON: EOF")
+            .context(crate::config::db_loader::RowDecodeRejection {
+                resource_type: "consumer",
+                resource_id: Some("bad".to_string()),
+            })
+    }
+
     #[test]
     fn is_poll_validation_rejection_classifies_marker_and_ignores_connectivity() {
         assert!(
@@ -673,6 +684,14 @@ mod tests {
         // Context-wrapped rejections must still classify.
         let wrapped = validation_rejection_error().context("while polling authoritative primary");
         assert!(is_poll_validation_rejection(&wrapped));
+        // Row-decode rejections from a reachable SQL backend (issue #2997).
+        assert!(
+            is_poll_validation_rejection(&row_decode_rejection_error()),
+            "a RowDecodeRejection must classify as a poll rejection so admin stays writable"
+        );
+        let wrapped_decode =
+            row_decode_rejection_error().context("while polling authoritative primary");
+        assert!(is_poll_validation_rejection(&wrapped_decode));
         // A plain connectivity error must fall through to fail-closed handling.
         assert!(!is_poll_validation_rejection(&anyhow::anyhow!(
             "connection refused (os error 61)"

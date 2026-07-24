@@ -1842,6 +1842,43 @@ pub mod _test_support {
         crate::config::validation_pipeline::is_config_validation_rejection(error)
     }
 
+    pub fn is_row_decode_rejection(error: &anyhow::Error) -> bool {
+        crate::config::db_loader::is_row_decode_rejection(error)
+    }
+
+    pub fn row_decode_rejection_error(
+        resource_type: &'static str,
+        resource_id: Option<&str>,
+        message: &str,
+    ) -> anyhow::Error {
+        use anyhow::Context as _;
+        anyhow::anyhow!("{}", message).context(crate::config::db_loader::RowDecodeRejection {
+            resource_type,
+            resource_id: resource_id.map(str::to_string),
+        })
+    }
+
+    pub fn is_poll_validation_rejection(error: &anyhow::Error) -> bool {
+        crate::modes::is_poll_validation_rejection(error)
+    }
+
+    pub async fn record_config_validation_rejection(
+        db: &std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        db_available: &std::sync::atomic::AtomicBool,
+        config_rejected: &std::sync::atomic::AtomicBool,
+        err: &anyhow::Error,
+        context: &str,
+    ) {
+        crate::modes::record_config_validation_rejection(
+            db,
+            db_available,
+            config_rejected,
+            err,
+            context,
+        )
+        .await
+    }
+
     // ── config/mongo_store: classic (DocumentDB) migration-lease builders ─────
     // The `$$NOW` aggregation pipeline is the primary skew-immune lease mode for
     // real MongoDB; DocumentDB does not support pipeline-form updates, so the
