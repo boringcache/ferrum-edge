@@ -21,7 +21,9 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
-use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig, GrpcJwtSecret};
+use ferrum_edge::grpc::dp_client::{
+    self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret,
+};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::config::{
@@ -573,23 +575,33 @@ async fn test_dp_stores_gateway_trust_bundles_from_delta_side_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
+async fn test_dp_rejects_gateway_trust_bundles_from_rejected_delta() {
     let cp_config = create_test_config(1);
-    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
+    let client_connection_state = connection_state.clone();
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            "trust-bundle-rejected-delta-node",
-            &ps,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
             None,
-            "ferrum",
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(client_connection_state),
+            None,
         )
-        .await
+        .await;
     });
 
     let received_initial = timeout(Duration::from_secs(5), async {
@@ -604,7 +616,10 @@ async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
     assert!(received_initial.is_ok(), "DP should receive initial config");
 
     let delta = IncrementalResult {
-        added_or_modified_proxies: vec![create_test_proxy("proxy-conflict", "/api-0")],
+        added_or_modified_proxies: vec![
+            create_test_proxy("proxy-missed", "/api-missed"),
+            create_test_proxy("proxy-conflict", "/api-0"),
+        ],
         removed_proxy_ids: vec![],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
@@ -623,13 +638,39 @@ async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
         Some(&trust_bundles),
     );
 
-    let received_trust = timeout(Duration::from_secs(5), async {
+    // The CP fixes only the bad member in a later delta. Because the original
+    // mixed batch was rejected atomically, the DP must not keep consuming that
+    // stream and apply this partial fix against the wrong base. Its reconnect
+    // must instead recover all three resources from the authoritative snapshot.
+    let mut authoritative = create_test_config(1);
+    authoritative
+        .proxies
+        .push(create_test_proxy("proxy-missed", "/api-missed"));
+    authoritative
+        .proxies
+        .push(create_test_proxy("proxy-conflict", "/api-fixed"));
+    authoritative.loaded_at = Utc::now();
+    config_arc.store(Arc::new(authoritative));
+    let partial_fix = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("proxy-conflict", "/api-fixed")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 0,
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &partial_fix, "partial-fix");
+
+    let resubscribed = timeout(Duration::from_secs(5), async {
         loop {
-            let loaded = proxy_state.gateway_trust_bundles.load();
-            if loaded
-                .as_ref()
-                .as_ref()
-                .is_some_and(|tb| tb.local.x509_authorities == vec![vec![1, 2, 3, 4]])
+            let state = connection_state.load();
+            if state.config_divergence_recoveries_total >= 1
+                && !state.config_diverged
+                && proxy_state.config.load().proxies.len() == 3
             {
                 break;
             }
@@ -638,13 +679,17 @@ async fn test_dp_applies_gateway_trust_bundles_from_rejected_delta() {
     })
     .await;
     assert!(
-        received_trust.is_ok(),
-        "DP should apply valid gateway trust bundles even when resource delta is rejected"
+        resubscribed.is_ok(),
+        "DP should terminate the rejected-delta stream and resubscribe"
+    );
+    assert!(
+        proxy_state.gateway_trust_bundles.load().is_none(),
+        "Trust side-channel from a rejected resource batch must not apply"
     );
     assert_eq!(
         proxy_state.config.load().proxies.len(),
-        1,
-        "Rejected resource delta must not mutate the gateway config"
+        3,
+        "Full-snapshot recovery must restore both members of the rejected mixed batch"
     );
 
     client_handle.abort();
@@ -1678,22 +1723,28 @@ async fn test_cp_with_custom_issuer_accepts_only_matching_tokens() {
 async fn test_dp_handles_malformed_config() {
     // Start CP server with valid initial config
     let cp_config = create_test_config(1);
-    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    // Spawn DP client (DP generates JWT from shared secret)
+    // Spawn the production reconnect loop (DP generates JWT from shared secret).
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            "test-node-malformed",
-            &ps,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
             None,
-            "ferrum",
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
         )
-        .await
+        .await;
     });
 
     // Wait for initial config
@@ -1731,9 +1782,11 @@ async fn test_dp_handles_malformed_config() {
         "Config should remain unchanged after malformed update"
     );
 
-    // Now send a valid update to prove the client is still alive
+    // Make the CP's authoritative snapshot valid before the DP reconnects.
+    // Recovery must come from that new subscription base, not from continuing
+    // to consume the rejected stream.
     let valid_config = create_test_config(2);
-    CpGrpcServer::broadcast_update(&update_tx, &valid_config);
+    config_arc.store(Arc::new(valid_config));
 
     let recovered = timeout(Duration::from_secs(5), async {
         loop {
@@ -1746,7 +1799,7 @@ async fn test_dp_handles_malformed_config() {
     .await;
     assert!(
         recovered.is_ok(),
-        "Client should recover and process valid updates after malformed one"
+        "Client should reconnect and recover from the authoritative full snapshot"
     );
 
     client_handle.abort();
@@ -1755,21 +1808,27 @@ async fn test_dp_handles_malformed_config() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
     let cp_config = create_test_config(1);
-    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            "test-node-invalid-host",
-            &ps,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
             None,
-            "ferrum",
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
         )
-        .await
+        .await;
     });
 
     let received = timeout(Duration::from_secs(5), async {
@@ -1797,7 +1856,7 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
     );
 
     let valid_config = create_test_config(2);
-    CpGrpcServer::broadcast_update(&update_tx, &valid_config);
+    config_arc.store(Arc::new(valid_config));
     let recovered = timeout(Duration::from_secs(5), async {
         loop {
             if proxy_state.config.load().proxies.len() == 2 {
@@ -1809,7 +1868,7 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
     .await;
     assert!(
         recovered.is_ok(),
-        "Client should continue processing valid updates after rejecting invalid hosts"
+        "Client should reconnect and recover from a valid authoritative snapshot"
     );
 
     client_handle.abort();
@@ -1818,21 +1877,27 @@ async fn test_dp_rejects_snapshot_with_invalid_proxy_hosts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update() {
     let cp_config = create_test_config(1);
-    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            "test-node-mtls-dns-collision",
-            &ps,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
             None,
-            "ferrum",
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
         )
-        .await
+        .await;
     });
 
     timeout(Duration::from_secs(5), async {
@@ -1894,7 +1959,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
     drop(retained);
 
     let valid_config = create_test_config(2);
-    CpGrpcServer::broadcast_update(&update_tx, &valid_config);
+    config_arc.store(Arc::new(valid_config));
     timeout(Duration::from_secs(5), async {
         loop {
             if proxy_state.config.load().proxies.len() == 2 {
@@ -1904,7 +1969,7 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
         }
     })
     .await
-    .expect("DP should continue after rejecting the ambiguous update");
+    .expect("DP should reconnect and recover after rejecting the ambiguous update");
 
     client_handle.abort();
 }
@@ -2509,22 +2574,28 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
     // Verify that an unsupported legacy delta shape doesn't corrupt existing config.
     let cp_config = create_test_config(2);
-    let (addr, update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(cp_config, 16).await;
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &test_secret(),
-            "delta-node-4",
-            &ps,
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            vec![cp_url],
+            test_secret(),
+            ps,
             None,
-            "ferrum",
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            None,
+            None,
         )
-        .await
+        .await;
     });
 
     // Wait for initial snapshot
@@ -2575,20 +2646,15 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
         "Config should remain unchanged after unsupported legacy delta"
     );
 
-    // Send a valid delta to prove client is still alive
-    let delta = IncrementalResult {
-        added_or_modified_proxies: vec![create_test_proxy("proxy-after", "/api-after")],
-        removed_proxy_ids: vec![],
-        added_or_modified_consumers: vec![],
-        removed_consumer_ids: vec![],
-        added_or_modified_plugin_configs: vec![],
-        removed_plugin_config_ids: vec![],
-        added_or_modified_upstreams: vec![],
-        removed_upstream_ids: vec![],
-        sequence_cursor: 0,
-        poll_timestamp: Utc::now(),
-    };
-    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+    // A later partial CP update would omit resources that were part of the
+    // rejected batch, so recovery must instead re-establish an authoritative
+    // full-snapshot base containing the complete current state.
+    let mut recovered_config = create_test_config(2);
+    recovered_config
+        .proxies
+        .push(create_test_proxy("proxy-after", "/api-after"));
+    recovered_config.loaded_at = Utc::now();
+    config_arc.store(Arc::new(recovered_config));
 
     let recovered = timeout(Duration::from_secs(5), async {
         loop {
@@ -2601,7 +2667,7 @@ async fn test_dp_keeps_last_good_config_after_legacy_delta_shape() {
     .await;
     assert!(
         recovered.is_ok(),
-        "Client should recover and apply valid delta after malformed one"
+        "Client should reconnect and recover from the authoritative full snapshot"
     );
 
     client_handle.abort();
