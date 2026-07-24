@@ -696,7 +696,7 @@ pub enum ConfigSyncAttemptOutcome {
     /// Transport/RPC failure before this attempt accepted any config.
     ConnectionError,
     /// Transport/RPC failure after this attempt already accepted config.
-    /// Counts as healthy progress for backoff reset while still failing over.
+    /// Counts as healthy progress for backoff reset while still reconnecting.
     ConnectionErrorAfterConfig,
     /// Stream ended cleanly after delivering at least one config message.
     CleanCloseAfterConfig,
