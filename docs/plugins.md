@@ -814,7 +814,7 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
 | `latency_total_ms` | f64 | Total request-to-response time (for streamed responses: request receipt → body terminal) |
 | `latency_gateway_processing_ms` | f64 | Total time excluding attributed backend communication; `-1.0` when streaming backend total is unknown |
-| `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
+| `latency_backend_ttfb_ms` | f64 | Time to first byte / response headers from backend; `-1.0` when no backend first byte or response headers were observed (including failures before response headers) |
 | `latency_backend_total_ms` | f64 | Full backend response time; `-1.0` for streaming responses (concurrent backend-body / client-delivery lifetime cannot be separated) |
 | `latency_plugin_execution_ms` | f64 | Wall-clock time in all plugin hooks |
 | `latency_plugin_external_io_ms` | f64 | Subset of plugin time spent on external HTTP calls |

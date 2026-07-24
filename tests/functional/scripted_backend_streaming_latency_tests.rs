@@ -163,12 +163,10 @@ fn extract_bool_field(text: &str, field: &str) -> Option<bool> {
 /// Select the intended transaction summary by unique path/proxy marker.
 /// Do not take the first similarly-named field from unrelated probe/startup lines.
 fn find_summary_for_marker<'a>(logs: &'a str, marker: &str) -> Option<&'a str> {
-    let path_needle = format!("\"request_path\":\"/api/{marker}");
-    let path_needle_esc = format!("\\\"request_path\\\":\\\"/api/{marker}");
     for line in logs.lines() {
-        let matches_marker =
-            line.contains(&path_needle) || line.contains(&path_needle_esc) || line.contains(marker);
-        if matches_marker
+        // The scenario marker is unique in request_path / proxy_id; a bare
+        // contains(marker) already selects the structured summary line.
+        if line.contains(marker)
             && line.contains("latency_gateway_overhead_ms")
             && (line.contains("\"response_streamed\":true")
                 || line.contains("\\\"response_streamed\\\":true")
@@ -180,7 +178,10 @@ fn find_summary_for_marker<'a>(logs: &'a str, marker: &str) -> Option<&'a str> {
     }
     // Fallback: multi-line / concatenated capture without clean newlines.
     if let Some(pos) = logs.find(marker) {
-        let window_start = pos.saturating_sub(200);
+        let mut window_start = pos.saturating_sub(200);
+        while window_start > 0 && !logs.is_char_boundary(window_start) {
+            window_start -= 1;
+        }
         let window = &logs[window_start..];
         if window.contains("latency_gateway_overhead_ms") {
             return Some(window);
@@ -284,7 +285,7 @@ fn write_frontend_certs(scratch: &std::path::Path) -> (String, String) {
 async fn spawn_native_h3_logging_gateway(
     backend_port: u16,
     proxy_id: &str,
-) -> (GatewayHarness, u16) {
+) -> (GatewayHarness, u16, tempfile::TempDir) {
     let mut last_err = String::new();
     for _ in 0..5 {
         let reservation = reserve_port().await.expect("reserve https port");
@@ -310,8 +311,9 @@ async fn spawn_native_h3_logging_gateway(
             .await
         {
             Ok(harness) => {
-                Box::leak(Box::new(scratch));
-                return (harness, https_port);
+                // Keep TempDir alive for the gateway lifetime; caller drops it
+                // after the harness so cert files are cleaned up.
+                return (harness, https_port, scratch);
             }
             Err(e) => last_err = e.to_string(),
         }
@@ -825,7 +827,8 @@ async fn run_native_h3(pace: Pace, outcome: Outcome) {
     );
 
     let proxy_id = format!("stream-latency-{marker}");
-    let (harness, https_port) = spawn_native_h3_logging_gateway(backend_port, &proxy_id).await;
+    let (harness, https_port, cert_dir) =
+        spawn_native_h3_logging_gateway(backend_port, &proxy_id).await;
 
     h3_drive(https_port, &path, pace, outcome).await;
 
@@ -833,6 +836,9 @@ async fn run_native_h3(pace: Pace, outcome: Outcome) {
     let summary = find_summary_for_marker(&logs, &marker)
         .unwrap_or_else(|| panic!("{marker}: missing marked streamed summary; logs:\n{logs}"));
     assert_streamed_unknown_gateway_contract(&marker, summary, outcome.expect_disconnect());
+    // Stop the gateway before TempDir deletes the frontend cert/key files.
+    drop(harness);
+    drop(cert_dir);
 }
 
 async fn run_grpc(pace: Pace, outcome: Outcome) {

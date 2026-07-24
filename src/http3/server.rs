@@ -6079,7 +6079,10 @@ async fn handle_h3_request(
             h3_stream_result.backend_admission_elapsed,
         );
 
-        let backend_ttfb_ms = h3_stream_result.backend_admission_elapsed.as_secs_f64() * 1000.0;
+        // Admission elapsed above still drives adaptive concurrency. TTFB is
+        // only concrete when response headers were observed — pre-header
+        // dispatch failures report LATENCY_UNKNOWN_MS (mirrors native-H3 gRPC).
+        let backend_ttfb_ms = h3_stream_backend_ttfb_ms(&h3_stream_result);
         let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
 
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -7614,8 +7617,9 @@ fn h3_streaming_body_failure_outcome(
 /// Streamed responses still follow the shared unknown-backend-total contract
 /// (`LATENCY_UNKNOWN_MS` for backend total / gateway fields) because concurrent
 /// backend-body and client-delivery lifetime cannot be separated on the pipe;
-/// only `latency_total_ms` and `latency_backend_ttfb_ms` (from
-/// `backend_admission_elapsed`) are concrete terminal observations.
+/// only `latency_total_ms` is always concrete. `latency_backend_ttfb_ms` is
+/// concrete from `backend_admission_elapsed` only when response headers were
+/// observed; pre-header dispatch failures report `LATENCY_UNKNOWN_MS`.
 struct H3StreamResult {
     /// Client-facing HTTP status (what was/will be sent downstream). On an
     /// `after_proxy` reject or a gateway-side size-limit rejection this is the
@@ -7691,6 +7695,25 @@ fn h3_backend_unavailable_stream_result(
         body_error_class: None,
         request_on_wire,
         backend_admission_elapsed,
+    }
+}
+
+/// Backend TTFB for a completed native-H3 stream result.
+///
+/// `backend_admission_elapsed` is always preserved for adaptive-concurrency
+/// sampling. TTFB itself requires observed response headers:
+/// * pre-header dispatch failure (`error_class` set, `body_error_class` unset,
+///   via [`h3_backend_unavailable_stream_result`]) → `LATENCY_UNKNOWN_MS`
+/// * content-length `ResponseBodyTooLarge` reject after headers → real TTFB
+/// * success / body-phase outcomes → real TTFB from admission elapsed
+fn h3_stream_backend_ttfb_ms(result: &H3StreamResult) -> f64 {
+    match (result.error_class, result.body_error_class) {
+        (Some(crate::retry::ErrorClass::ResponseBodyTooLarge), None) => {
+            // Headers were received before the gateway size-limit reject.
+            result.backend_admission_elapsed.as_secs_f64() * 1000.0
+        }
+        (Some(_), None) => crate::plugins::LATENCY_UNKNOWN_MS,
+        _ => result.backend_admission_elapsed.as_secs_f64() * 1000.0,
     }
 }
 
@@ -12572,6 +12595,80 @@ mod h3_streaming_outcome_tests {
         assert_eq!(
             delivered.backend_admission_elapsed,
             std::time::Duration::from_millis(11)
+        );
+    }
+
+    #[test]
+    fn pre_header_failure_reports_unknown_backend_ttfb() {
+        // Plain native-H3 completion must not label admission elapsed as TTFB
+        // when response headers never arrived. Adaptive concurrency still sees
+        // the real admission duration via record_h3_backend_admission_outcome.
+        let failed = super::h3_backend_unavailable_stream_result(
+            502,
+            ErrorClass::ConnectionRefused,
+            /* request_on_wire = */ false,
+            /* reject_sent = */ true,
+            std::time::Duration::from_millis(42),
+        );
+        assert_eq!(
+            failed.backend_admission_elapsed,
+            std::time::Duration::from_millis(42),
+            "admission elapsed must remain available for adaptive concurrency"
+        );
+        assert_eq!(
+            super::h3_stream_backend_ttfb_ms(&failed),
+            crate::plugins::LATENCY_UNKNOWN_MS,
+            "pre-header failure must report TTFB as unavailable"
+        );
+
+        let headers_ok = super::H3StreamResult {
+            status: 200,
+            backend_status: 200,
+            error_class: None,
+            body_completed: true,
+            bytes_streamed: 64,
+            client_disconnected: false,
+            body_error_class: None,
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(7),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&headers_ok) - 7.0).abs() < f64::EPSILON,
+            "successful first-header timing must remain intact"
+        );
+
+        // Content-length ResponseBodyTooLarge rejects after headers arrive —
+        // TTFB is a real first-header observation (matches native-H3 gRPC).
+        let oversized = super::H3StreamResult {
+            status: 502,
+            backend_status: 200,
+            error_class: Some(ErrorClass::ResponseBodyTooLarge),
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: false,
+            body_error_class: None,
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(11),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&oversized) - 11.0).abs() < f64::EPSILON,
+            "post-header size reject must keep real TTFB"
+        );
+
+        let body_abort = super::H3StreamResult {
+            status: 200,
+            backend_status: 200,
+            error_class: None,
+            body_completed: false,
+            bytes_streamed: 16,
+            client_disconnected: true,
+            body_error_class: Some(ErrorClass::ClientDisconnect),
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(5),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&body_abort) - 5.0).abs() < f64::EPSILON,
+            "body-phase abort after headers must keep real TTFB"
         );
     }
 }
