@@ -211,6 +211,10 @@ const MAX_TOTAL_SIZE_BYTES_HARD_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
 /// headers/MAC framing stays under this regardless of saturating arithmetic on
 /// the configured entry size.
 const MAX_REDIS_VALUE_BYTES_HARD_CAP: usize = 96 * 1024 * 1024; // 96 MiB
+/// Deployment-safe hard maximum for `semantic_vector_max_candidates`. The value
+/// flows into HNSW `ef_search` / `ef_construction`; unbounded configs can turn
+/// semantic lookup/rebuild into unbounded graph walks. Rejected at admission.
+const MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP: usize = 1_024;
 /// Minimum length for `redis_integrity_key` (UTF-8 bytes). Shorter secrets are
 /// rejected so Redis envelopes cannot be authenticated with a trivial key.
 const MIN_REDIS_INTEGRITY_KEY_BYTES: usize = 32;
@@ -486,21 +490,53 @@ impl EmbeddingPoint {
             ));
         }
 
-        let mut norm_squared = 0.0_f32;
+        // f32::MAX is finite but squaring it in f32 overflows to infinity, which
+        // then normalizes every component to zero and admits an invalid vector.
+        // Accumulate in f64 and fail closed for any non-finite / zero-length /
+        // non-unit normalized result.
+        let mut norm_squared = 0.0_f64;
         for value in &values {
             if !value.is_finite() {
                 return Err("embedding vector contains a non-finite value".to_string());
             }
+            let value = f64::from(*value);
             norm_squared += value * value;
+            if !norm_squared.is_finite() {
+                return Err("embedding vector norm is non-finite".to_string());
+            }
         }
-
-        if norm_squared <= f32::EPSILON {
+        if norm_squared == 0.0 {
             return Err("embedding vector must not have zero length".to_string());
         }
 
         let norm = norm_squared.sqrt();
+        if !norm.is_finite() || norm == 0.0 {
+            return Err("embedding vector norm is invalid".to_string());
+        }
+
+        let mut normalized = Vec::with_capacity(values.len());
+        for value in values {
+            let component = f64::from(value) / norm;
+            if !component.is_finite() {
+                return Err("normalized embedding contains a non-finite value".to_string());
+            }
+            let component = component as f32;
+            if !component.is_finite() {
+                return Err("normalized embedding is outside f32 range".to_string());
+            }
+            normalized.push(component);
+        }
+
+        let unit_norm_squared = normalized.iter().fold(0.0_f64, |acc, value| {
+            let value = f64::from(*value);
+            acc + value * value
+        });
+        if !unit_norm_squared.is_finite() || (unit_norm_squared.sqrt() - 1.0).abs() > 1.0e-4 {
+            return Err("normalized embedding does not have unit length".to_string());
+        }
+
         Ok(Self {
-            values: values.into_iter().map(|value| value / norm).collect(),
+            values: normalized.into(),
         })
     }
 
@@ -1246,7 +1282,12 @@ impl AiSemanticCache {
             .map_err(|err| format!("embedding response parse failed: {err}"))?;
         let values = parse_embedding_response(&body, semantic.output_dimension)
             .map_err(|err| format!("embedding response invalid: {err}"))?;
-        let dimension = values.len();
+        // Validate/normalize before learning the instance dimension so an
+        // invalid first provider response cannot permanently pin a dimension
+        // and reject later valid vectors.
+        let point = EmbeddingPoint::from_raw(values)
+            .map_err(|err| format!("embedding response invalid: {err}"))?;
+        let dimension = point.values.len();
         let learned = self.embedding_dimension.get_or_init(|| dimension);
         if *learned != dimension {
             return Err(format!(
@@ -1254,7 +1295,7 @@ impl AiSemanticCache {
                 *learned
             ));
         }
-        EmbeddingPoint::from_raw(values).map_err(|err| format!("embedding response invalid: {err}"))
+        Ok(point)
     }
 
     fn lookup_semantic(
@@ -4689,6 +4730,11 @@ fn parse_semantic_config(
         optional_threshold(config, "semantic_similarity_threshold")?.unwrap_or(0.95);
     let max_candidates =
         optional_positive_usize(config, "semantic_vector_max_candidates")?.unwrap_or(16);
+    if max_candidates > MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP {
+        return Err(format!(
+            "ai_semantic_cache: 'semantic_vector_max_candidates' must be <= {MAX_SEMANTIC_VECTOR_CANDIDATES_HARD_CAP} (deployment hard cap)"
+        ));
+    }
     let timeout_ms =
         optional_positive_u64(config, "semantic_embedding_timeout_ms")?.unwrap_or(5_000);
 

@@ -18901,7 +18901,13 @@ components:
           type: integer
           format: uint64
           default: 16
-          description: Number of nearest HNSW candidates to inspect during semantic lookup.
+          minimum: 1
+          maximum: 1024
+          description: >-
+            Number of nearest HNSW candidates to inspect during semantic lookup
+            (`ef_search` / `ef_construction`). Hard maximum 1024; larger values
+            are rejected at admission so semantic search cannot be configured
+            into an unbounded graph walk.
         semantic_embedding_timeout_ms:
           type: integer
           format: uint64

@@ -4602,7 +4602,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `semantic_embedding_auth_header` | String | provider default | HTTP header used for `semantic_embedding_api_key`. Defaults to `Authorization`, except Azure OpenAI uses `api-key` and Google Gemini uses `x-goog-api-key`. |
 | `semantic_embedding_auth_scheme` | String | provider default | Prefix for the API key header value. Defaults to `Bearer`, except Azure OpenAI and Google Gemini send the raw key. Set to an empty string to send the raw key. |
 | `semantic_similarity_threshold` | number | `0.95` | Minimum cosine similarity for a semantic cache hit. Must be > 0 and <= 1. |
-| `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect. Increase when semantic entries span many scopes. |
+| `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect (`ef_search` / `ef_construction`). Increase when semantic entries span many scopes. Hard maximum 1024; larger values are rejected at admission. |
 | `semantic_embedding_timeout_ms` | u64 | `5000` | Per-request timeout for embedding calls. Embedding failures fall back to a normal cache miss. |
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |

@@ -463,6 +463,7 @@ fn test_new_invalid_config_shapes_fail() {
         json!({"semantic_similarity_threshold": 0.0}),
         json!({"semantic_similarity_threshold": 1.1}),
         json!({"semantic_vector_max_candidates": 0}),
+        json!({"semantic_vector_max_candidates": 1025}),
         json!({"semantic_embedding_timeout_ms": 0}),
         json!({"semantic_embedding_auth_header": "bad header"}),
         json!({"semantic_embedding_provider": "bogus"}),
@@ -4597,6 +4598,155 @@ async fn test_embedding_response_rejects_oversize_dimension() {
     assert!(
         ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
         "adversarial embedding dimensions must not stage a vector"
+    );
+}
+
+#[tokio::test]
+async fn large_finite_embedding_components_normalize_without_zero_collapse() {
+    // Squaring ~3e38 in f32 overflows the norm to +inf and previously normalized
+    // every component to 0, admitting an invalid zero vector. f64 reduction must
+    // keep large finite provider values on a unit-length vector.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [3.0e38_f32, f32::from_bits(1), 0.0]}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "large finite embedding components"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    let embedding = ai_semantic_cache_embedding(&ctx, instance_id(&plugin))
+        .expect("large finite embeddings must stage a normalized vector");
+    assert_eq!(embedding.len(), 3);
+    assert!(
+        embedding.iter().all(|value| value.is_finite()),
+        "normalized embedding must remain finite: {embedding:?}"
+    );
+    assert!(
+        embedding.iter().any(|value| *value != 0.0),
+        "large finite overflow must not collapse to an all-zero vector: {embedding:?}"
+    );
+    let unit_norm = embedding
+        .iter()
+        .fold(0.0_f64, |acc, value| acc + f64::from(*value) * f64::from(*value))
+        .sqrt();
+    assert!(
+        (unit_norm - 1.0).abs() < 1.0e-4,
+        "normalized embedding must have unit length, got {unit_norm}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_first_embedding_does_not_pin_learned_dimension() {
+    // An invalid first provider response must fail closed without initializing
+    // embedding_dimension, so a later valid vector of a different length is
+    // still admitted.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(move |_request: &Request| {
+            let call = responder_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 1 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"embedding": [0.0, 0.0, 0.0]}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"embedding": [0.0, 1.0, 0.0, 0.0]}]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+
+    let first_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "invalid first embedding"}]
+    });
+    let (first_ctx, first_result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&first_body).unwrap(), None).await;
+    assert!(matches!(first_result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &first_ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&first_ctx, instance_id(&plugin)).is_none(),
+        "zero-length first embedding must not stage or pin a dimension"
+    );
+
+    let second_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "valid second embedding different dim"}]
+    });
+    let (second_ctx, second_result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&second_body).unwrap(), None).await;
+    assert!(matches!(second_result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &second_ctx).unwrap(), "MISS");
+    let embedding = ai_semantic_cache_embedding(&second_ctx, instance_id(&plugin))
+        .expect("valid later embedding must be admitted after an invalid first response");
+    assert_eq!(
+        embedding.len(),
+        4,
+        "learned dimension must come from the first successfully admitted vector"
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn semantic_vector_max_candidates_rejects_above_deployment_hard_cap() {
+    let at_cap = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+            "semantic_vector_max_candidates": 1024,
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        at_cap.is_ok(),
+        "hard-cap boundary must be accepted: {:?}",
+        at_cap.err()
+    );
+
+    let above = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+            "semantic_vector_max_candidates": 1025,
+        }),
+        PluginHttpClient::default(),
+    );
+    let Err(error) = above else {
+        panic!("semantic_vector_max_candidates above hard cap must be rejected");
+    };
+    assert!(
+        error.contains("semantic_vector_max_candidates") && error.contains("1024"),
+        "unexpected admission error: {error}"
     );
 }
 
