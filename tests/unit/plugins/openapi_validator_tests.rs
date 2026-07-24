@@ -3431,10 +3431,7 @@ async fn multipart_and_urlencoded_reject_duplicate_scalar_values() {
 
 #[test]
 fn exploded_object_key_collisions_are_rejected_for_form_and_multipart() {
-    for media_type in [
-        "application/x-www-form-urlencoded",
-        "multipart/form-data",
-    ] {
+    for media_type in ["application/x-www-form-urlencoded", "multipart/form-data"] {
         let root_child = OpenapiValidator::new(&json!({
             "operations": [{
                 "method": "POST",
