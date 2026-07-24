@@ -1447,10 +1447,7 @@ Istio `DestinationRule` resources are translated into Ferrum upstream and proxy 
 ### Traffic Policy
 
 - **`connectionPool.tcp.connectTimeout`**: mapped to the proxy's `backend_connect_timeout_ms`.
-- **`outlierDetection`**: translated to Ferrum passive health checks:
-  - `consecutive5xxErrors` -> `passive_health_check.consecutive_failures`
-  - `interval` -> `passive_health_check.check_interval_seconds`
-  - `baseEjectionTime` -> `passive_health_check.eject_duration_seconds`
+- **`outlierDetection`**: translated to Ferrum passive health checks (`unhealthy_threshold` / `unhealthy_window_seconds` / `healthy_after_seconds` / `max_ejection_percent`). Automatic recovery after `baseEjectionTime` is scoped to the ejecting proxy and the **effective** per-port / subset / upstream policy that caused the ejection (deadline stored on the entry; independent cooldowns when two proxies share an endpoint; SD-discovered targets recover the same way as static ones). See [Passive Health Checks](load_balancing.md#passive-health-checks).
 
 ### Load Balancer
 
@@ -1466,7 +1463,7 @@ Consistent hash load balancing (`consistentHash`) is translated to Ferrum's `con
 
 ### Subsets
 
-DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream. Each subset can carry a `loadBalancer` override that takes precedence over the top-level traffic policy. Subset-level `tls` is also applied per subset: the cold-path apply layers the subset's TLS overlay onto the upstream-level TLS and stores the result on `Upstream.resolved_subset_tls[subset_name]`. `GatewayConfig::resolve_upstream_tls` then projects that overlay onto `Proxy.resolved_tls` for proxies whose `upstream_subset` selects the subset, so two proxies pointed at the same upstream but at different subsets (each carrying distinct `caCertificates` / `clientCertificate` / `privateKey` / `sni` / `subjectAltNames`) land on different resolved TLS values and partition the backend pool. Subset-level `outlierDetection` and `connectionPool` are still parsed by the K8s translator and warned but not applied per subset — top-level `trafficPolicy.outlierDetection` / `trafficPolicy.connectionPool.tcp.connectTimeout` remain the only paths to per-upstream passive health and connect timeout.
+DestinationRule `subsets` are preserved as named subsets in the Ferrum upstream. Each subset can carry a `loadBalancer` override that takes precedence over the top-level traffic policy. Subset-level `tls` is also applied per subset: the cold-path apply layers the subset's TLS overlay onto the upstream-level TLS and stores the result on `Upstream.resolved_subset_tls[subset_name]`. `GatewayConfig::resolve_upstream_tls` then projects that overlay onto `Proxy.resolved_tls` for proxies whose `upstream_subset` selects the subset, so two proxies pointed at the same upstream but at different subsets (each carrying distinct `caCertificates` / `clientCertificate` / `privateKey` / `sni` / `subjectAltNames`) land on different resolved TLS values and partition the backend pool. Subset-level `outlierDetection` is applied in full onto that same `resolved_subset_tls` overlay (thresholds + `maxEjectionPercent`, with automatic recovery honoring the subset `baseEjectionTime`); subset-scoped `connectionPool.http.{h2UpgradePolicy,maxRetries}` remain deferred-and-warned — see the DestinationRule status table above.
 
 ### Deferred Fields
 
