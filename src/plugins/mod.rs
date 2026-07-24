@@ -3241,8 +3241,7 @@ impl RequestContext {
     /// pin as early as possible on the request path so the pinned value covers
     /// every gate read the response pipeline will later perform.
     pub(crate) fn pin_response_policy_stamp(&mut self) -> &GatePolicyStamp {
-        self
-            .response_policy_stamp
+        self.response_policy_stamp
             .get_or_insert_with(response_transformer::runtime_overlay::policy_stamp)
     }
 

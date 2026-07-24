@@ -773,12 +773,7 @@ mod runtime_overlay_cache_provenance {
         for plugin in plugins {
             assert!(matches!(
                 plugin
-                    .on_response_body(
-                        ctx,
-                        response_status,
-                        &mut response_headers,
-                        &response_body,
-                    )
+                    .on_response_body(ctx, response_status, &mut response_headers, &response_body,)
                     .await,
                 PluginResult::Continue
             ));
@@ -1222,8 +1217,14 @@ async fn test_response_cache_revalidation_respects_gate_change() {
         status, 200,
         "a superseded entry must not certify a 304 revalidation"
     );
-    assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("MISS"));
-    assert_eq!(headers.get("x-secret").map(String::as_str), Some("[redacted]"));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("[redacted]")
+    );
 
     harness::reset_gates();
 }
