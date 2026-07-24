@@ -1955,8 +1955,20 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
+    /// Process-local compression instance that reserved response codec admission
+    /// in `before_proxy`, before the response-buffer decision. First-wins across
+    /// sibling instances so at most one response permit is held per request. The
+    /// reservation is what bounds the population of response bodies admitted onto
+    /// the compression-only buffered path; `after_proxy` consumes this instance's
+    /// reserved permit rather than acquiring a fresh one on the hot path.
+    compression_response_admission_owner: Option<u64>,
+    /// Set when `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission. The response then streams identity (or
+    /// fails closed with 406 when identity is prohibited) instead of buffering
+    /// for a compression it cannot run; `after_proxy` must not reacquire.
+    compression_response_admission_declined: bool,
     /// Reserved codec CPU admission permit for gateway response compression.
-    /// Taken in `after_proxy` before committing `Content-Encoding` and moved
+    /// Reserved in `before_proxy` before the response-buffer decision and moved
     /// into the `spawn_blocking` closure during the body transform. Drop
     /// releases the slot if the transform never runs (cancellation). Clones
     /// do not duplicate the exclusive permit.
@@ -2360,6 +2372,8 @@ impl RequestContext {
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
+            compression_response_admission_owner: None,
+            compression_response_admission_declined: false,
             compression_response_codec_permit: HeldCodecPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
@@ -2627,6 +2641,45 @@ impl RequestContext {
         self.compression_response_encode_owner == Some(owner)
     }
 
+    pub(crate) fn has_compression_response_admission_owner(&self) -> bool {
+        self.compression_response_admission_owner.is_some()
+    }
+
+    pub(crate) fn claim_compression_response_admission(&mut self, owner: u64) -> bool {
+        if self.compression_response_admission_owner.is_some() {
+            return false;
+        }
+        self.compression_response_admission_owner = Some(owner);
+        // A held permit supersedes any earlier sibling's decline: the request now
+        // has bounded admission, so the response is no longer stream-only. (Once
+        // an owner exists, siblings skip reservation, so `declined` cannot be set
+        // again afterward, which keeps `owner.is_some()` implying `!declined`.)
+        self.compression_response_admission_declined = false;
+        true
+    }
+
+    pub(crate) fn owns_compression_response_admission(&self, owner: u64) -> bool {
+        self.compression_response_admission_owner == Some(owner)
+    }
+
+    pub(crate) fn mark_compression_response_admission_declined(&mut self) {
+        self.compression_response_admission_declined = true;
+    }
+
+    pub(crate) fn compression_response_admission_declined(&self) -> bool {
+        self.compression_response_admission_declined
+    }
+
+    /// Drop this request's reserved response codec admission (permit + owner)
+    /// when `instance_id` is the reserving instance. A no-op for siblings so a
+    /// non-owner declining to compress never releases another instance's slot.
+    pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+            let _ = self.compression_response_codec_permit.take();
+        }
+    }
+
     pub(crate) fn set_compression_response_codec_permit(
         &mut self,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -2659,6 +2712,7 @@ impl RequestContext {
     pub(crate) fn clear_gateway_response_compression(&mut self) {
         self.gateway_response_compression_algorithm = None;
         self.compression_response_encode_owner = None;
+        self.compression_response_admission_owner = None;
         let _ = self.compression_response_codec_permit.take();
     }
 
@@ -3096,12 +3150,15 @@ impl RequestContext {
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
-            // Transfer the response codec permit with the compatibility clone so
-            // the body-transform path that consumes this context still owns the
-            // reserved admission slot; the donor context must not double-release.
-            compression_response_codec_permit: std::mem::take(
-                &mut self.compression_response_codec_permit,
-            ),
+            compression_response_admission_owner: self.compression_response_admission_owner,
+            compression_response_admission_declined: self.compression_response_admission_declined,
+            // The reserved response codec permit stays on the donor (live)
+            // context: this compatibility clone runs only the request-body hooks,
+            // never the response-body transform that consumes the permit. Moving
+            // it here would drop the slot when this short-lived clone is dropped
+            // (only `metadata`/WAF/AI state is copied back), releasing admission
+            // while the live context still owns the response encode.
+            compression_response_codec_permit: HeldCodecPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),
@@ -4617,9 +4674,13 @@ pub struct MirrorResponseMeta {
     /// before a response was received or was dropped/cancelled (DNS, connect,
     /// timeout, task, and concurrency errors).
     pub mirror_response_status_code: Option<u16>,
-    /// Response body size in bytes from the mirror target. Derived from
-    /// `content-length` header when present, otherwise from reading the body.
+    /// Response body size in bytes observed after a bounded drain of the
+    /// mirror response (or the truncated count when the drain cap fired).
     pub mirror_response_size_bytes: Option<u64>,
+    /// Advertised `Content-Length` from the mirror response when present.
+    /// Recorded independently of [`Self::mirror_response_size_bytes`] so
+    /// operators can compare advertised vs observed after bounded drain.
+    pub mirror_response_advertised_size_bytes: Option<u64>,
     /// Wall-clock latency of the mirror request in milliseconds.
     pub mirror_latency_ms: f64,
     /// Human-readable error message when the mirror request failed.
@@ -5053,6 +5114,7 @@ impl TransactionSummary {
             "mirror_error",
             "mirror_plugin_id",
             "response_size_bytes",
+            "mirror_response_advertised_size_bytes",
         ] {
             mirror.metadata.remove(key);
         }
@@ -5065,6 +5127,12 @@ impl TransactionSummary {
             mirror
                 .metadata
                 .insert("response_size_bytes".to_string(), size.to_string());
+        }
+        if let Some(advertised) = result.mirror_response_advertised_size_bytes {
+            mirror.metadata.insert(
+                "mirror_response_advertised_size_bytes".to_string(),
+                advertised.to_string(),
+            );
         }
         if let Some(err) = result.mirror_error {
             mirror.metadata.insert("mirror_error".to_string(), err);

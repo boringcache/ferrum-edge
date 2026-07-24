@@ -106,6 +106,31 @@ pub mod _test_support {
         ctx.take_compression_response_codec_permit()
     }
 
+    /// Whether a compression instance reserved response codec admission for this
+    /// request in `before_proxy` (the early bound on the buffered population).
+    pub fn compression_response_admission_reserved_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_compression_response_admission_owner()
+    }
+
+    /// Whether `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission (so the response streams identity).
+    pub fn compression_response_admission_declined_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.compression_response_admission_declined()
+    }
+
+    /// Build the request-body-hook compatibility context. Used to prove the
+    /// reserved response codec permit stays on the donor (live) context rather
+    /// than being moved into this short-lived clone.
+    pub fn clone_for_final_request_body_hooks_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        ctx.clone_for_final_request_body_hooks()
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {
@@ -674,6 +699,44 @@ pub mod _test_support {
         plugin.sample_phase_for_test()
     }
 
+    pub fn request_mirror_append_shadow_host_suffix_for_test(authority: &str) -> String {
+        crate::plugins::request_mirror::append_shadow_host_suffix(authority)
+    }
+
+    pub fn request_mirror_resolve_timeout_ms_for_test(
+        configured_mirror_timeout_ms: Option<u64>,
+        backend_read_timeout_ms: Option<u64>,
+    ) -> u64 {
+        crate::plugins::request_mirror::resolve_mirror_timeout_ms(
+            configured_mirror_timeout_ms,
+            backend_read_timeout_ms,
+        )
+    }
+
+    pub fn request_mirror_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_max_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_mirror_timeout_ms_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> Option<u64> {
+        plugin.mirror_timeout_ms_for_test()
+    }
+
+    pub fn request_mirror_metrics_snapshot_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
+        plugin.mirror_metrics_snapshot_for_test()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
@@ -708,10 +771,53 @@ pub mod _test_support {
         plugin.snapshot_generation_registered_for_tests()
     }
 
+    pub fn api_chargeback_sink_force_compact_snapshot_finalization_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.force_compact_snapshot_finalization_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_compact_recovery_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_compact_recovery_registered_for_tests()
+    }
+
     pub fn api_chargeback_sink_emit_snapshot_tick_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
     ) -> Option<Result<usize, String>> {
         plugin.emit_snapshot_tick_for_tests()
+    }
+
+    pub fn api_chargeback_sink_spool_snapshot_overflow_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        event: crate::plugins::api_chargeback_sink::ChargeEvent,
+    ) -> bool {
+        plugin.spool_snapshot_overflow_for_tests(event)
+    }
+
+    pub fn api_chargeback_sink_abort_spool_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.abort_spool_delivery_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_overflow_counters_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(u64, u64, u64)> {
+        plugin.snapshot_overflow_counters_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_overflow_delivery_then_succeeds_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
