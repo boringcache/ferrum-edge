@@ -223,10 +223,13 @@ one runs.
 
 The splitter preserves semicolons inside:
 
-- single-quoted strings (`''` and `\'` escapes)
-- double-quoted identifiers/strings (`""` escapes)
-- backtick identifiers (MySQL / SQLite)
-- `--` / `/* … */` comments (and MySQL `#` line comments)
+- single-quoted strings with doubled quotes (`''`); MySQL strings and explicit
+  PostgreSQL `E'…'` / `U&'…'` strings also recognize backslash escapes
+- double-quoted identifiers/strings with doubled quotes (`""`); MySQL and
+  explicit PostgreSQL `U&"…"` forms also recognize backslash escapes
+- backtick identifiers (MySQL / SQLite), including MySQL backslash escapes
+- `--` / `/* … */` comments (plus MySQL `#` line comments and PostgreSQL
+  nested block comments); MySQL `--` requires following whitespace/control
 - PostgreSQL dollar-quoted bodies (`$tag$ … $tag$`)
 - `BEGIN … END` compound bodies (SQLite triggers, MySQL routines)
 

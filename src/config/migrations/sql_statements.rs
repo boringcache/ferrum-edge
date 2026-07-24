@@ -38,8 +38,8 @@ impl std::error::Error for SqlStatementSplitError {}
 /// Split custom-plugin migration SQL into executable statements for `db_type`.
 ///
 /// Supported quoting/comment forms (all dialects unless noted):
-/// - single-quoted strings with `''` and `\'` escapes
-/// - double-quoted identifiers/strings with `""` escapes
+/// - single-quoted strings with doubled quotes (plus dialect-valid backslash escapes)
+/// - double-quoted identifiers/strings with doubled quotes (plus MySQL backslash escapes)
 /// - backtick identifiers (MySQL / SQLite), including doubled-backtick escapes
 /// - `--` line comments and `/* ... */` block comments
 /// - MySQL `#` line comments
@@ -135,22 +135,22 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
 
         match bytes[i] {
             b'\'' => {
-                i = scan_single_quoted(sql, i)?;
+                i = scan_single_quoted(sql, i, dialect)?;
             }
             b'"' => {
-                i = scan_double_quoted(sql, i)?;
+                i = scan_double_quoted(sql, i, dialect)?;
             }
             b'`' if dialect.allows_backticks() => {
-                i = scan_backtick_quoted(sql, i)?;
+                i = scan_backtick_quoted(sql, i, dialect)?;
             }
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+            b'-' if starts_dash_line_comment(bytes, i, dialect) => {
                 i = scan_line_comment(bytes, i + 2);
             }
             b'#' if dialect.allows_hash_line_comments() => {
                 i = scan_line_comment(bytes, i + 1);
             }
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i = scan_block_comment(sql, i)?;
+                i = scan_block_comment(sql, i, dialect)?;
             }
             b'$' if dialect.allows_dollar_quotes() => {
                 if let Some(after) = try_scan_dollar_quoted(sql, i)? {
@@ -167,7 +167,7 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
                 }
                 let word = &sql[word_start..i];
                 if word.eq_ignore_ascii_case("BEGIN") {
-                    if !is_transaction_begin_keyword(sql, i) {
+                    if !is_transaction_begin_keyword(sql, i, dialect) {
                         compound_depth = compound_depth.saturating_add(1);
                     }
                 } else if word.eq_ignore_ascii_case("CASE") {
@@ -198,7 +198,7 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
             _ => {
                 if compound_depth == 0 && case_depth == 0 && delimiter.matches_at(sql, i) {
                     let delim_len = delimiter.len();
-                    push_statement(sql, stmt_start, i, &mut statements)?;
+                    push_statement(sql, stmt_start, i, dialect, &mut statements)?;
                     i += delim_len;
                     skip_whitespace_and_newlines(bytes, &mut i);
                     stmt_start = i;
@@ -223,7 +223,7 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
     }
 
     if stmt_start < bytes.len() {
-        push_statement(sql, stmt_start, bytes.len(), &mut statements)?;
+        push_statement(sql, stmt_start, bytes.len(), dialect, &mut statements)?;
     }
 
     if !matches!(delimiter, CowDelim::Semicolon) {
@@ -238,12 +238,14 @@ fn scan_statements(sql: &str, dialect: SplitDialect) -> Result<Vec<&str>, SqlSta
 }
 
 /// `BEGIN` starts a transaction when followed by `;` / EOF or a transaction mode keyword.
-fn is_transaction_begin_keyword(sql: &str, after_begin: usize) -> bool {
+fn is_transaction_begin_keyword(
+    sql: &str,
+    after_begin: usize,
+    dialect: SplitDialect,
+) -> bool {
     let bytes = sql.as_bytes();
     let mut i = after_begin;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
+    skip_sql_whitespace_and_comments(sql, &mut i, dialect);
     if i >= bytes.len() || bytes[i] == b';' {
         return true;
     }
@@ -252,11 +254,23 @@ fn is_transaction_begin_keyword(sql: &str, after_begin: usize) -> bool {
         end += 1;
     }
     let word = &sql[i..end];
-    word.eq_ignore_ascii_case("TRANSACTION")
-        || word.eq_ignore_ascii_case("WORK")
-        || word.eq_ignore_ascii_case("IMMEDIATE")
-        || word.eq_ignore_ascii_case("DEFERRED")
-        || word.eq_ignore_ascii_case("EXCLUSIVE")
+    match dialect {
+        SplitDialect::Postgres => {
+            word.eq_ignore_ascii_case("TRANSACTION")
+                || word.eq_ignore_ascii_case("WORK")
+                || word.eq_ignore_ascii_case("ISOLATION")
+                || word.eq_ignore_ascii_case("READ")
+                || word.eq_ignore_ascii_case("DEFERRABLE")
+                || word.eq_ignore_ascii_case("NOT")
+        }
+        SplitDialect::Sqlite => {
+            word.eq_ignore_ascii_case("TRANSACTION")
+                || word.eq_ignore_ascii_case("IMMEDIATE")
+                || word.eq_ignore_ascii_case("DEFERRED")
+                || word.eq_ignore_ascii_case("EXCLUSIVE")
+        }
+        SplitDialect::Mysql => word.eq_ignore_ascii_case("WORK"),
+    }
 }
 
 fn consume_mysql_end_block_suffix<'a>(sql: &'a str, i: &mut usize) -> Option<&'a str> {
@@ -322,7 +336,7 @@ fn is_at_statement_start(sql: &str, stmt_start: usize, i: usize) -> bool {
             j += 1;
             continue;
         }
-        if j + 1 < i && bytes[j] == b'-' && bytes[j + 1] == b'-' {
+        if j + 1 < i && starts_dash_line_comment(bytes, j, SplitDialect::Mysql) {
             // Line comments extend through newline; require the scanned span
             // to stay within `[stmt_start, i)`.
             let after = scan_line_comment(bytes, j + 2);
@@ -441,6 +455,7 @@ fn push_statement<'a>(
     sql: &'a str,
     start: usize,
     end: usize,
+    dialect: SplitDialect,
     out: &mut Vec<&'a str>,
 ) -> Result<(), SqlStatementSplitError> {
     let raw = &sql[start..end];
@@ -451,7 +466,7 @@ fn push_statement<'a>(
     // Preserve historical behavior of skipping pure-whitespace segments, but
     // also skip comment-only segments so classification/execution never see
     // non-SQL leftovers produced solely by comment stripping around delimiters.
-    if strip_leading_sql_comments(trimmed).is_empty() {
+    if strip_leading_sql_comments_for_dialect(trimmed, dialect).is_empty() {
         return Ok(());
     }
     out.push(trimmed);
@@ -468,9 +483,57 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn scan_single_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSplitError> {
+fn starts_dash_line_comment(bytes: &[u8], start: usize, dialect: SplitDialect) -> bool {
+    if bytes.get(start..start.saturating_add(2)) != Some(b"--") {
+        return false;
+    }
+    if dialect != SplitDialect::Mysql {
+        return true;
+    }
+    bytes
+        .get(start + 2)
+        .is_some_and(|next| next.is_ascii_whitespace() || next.is_ascii_control())
+}
+
+fn skip_sql_whitespace_and_comments(sql: &str, i: &mut usize, dialect: SplitDialect) {
+    let bytes = sql.as_bytes();
+    loop {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if starts_dash_line_comment(bytes, *i, dialect) {
+            *i = scan_line_comment(bytes, *i + 2);
+            continue;
+        }
+        if dialect.allows_hash_line_comments() && bytes.get(*i) == Some(&b'#') {
+            *i = scan_line_comment(bytes, *i + 1);
+            continue;
+        }
+        if bytes.get(*i..(*i).saturating_add(2)) == Some(b"/*") {
+            match scan_block_comment(sql, *i, dialect) {
+                Ok(next) => {
+                    *i = next;
+                    continue;
+                }
+                Err(_) => return,
+            }
+        }
+        return;
+    }
+}
+
+fn scan_single_quoted(
+    sql: &str,
+    start: usize,
+    dialect: SplitDialect,
+) -> Result<usize, SqlStatementSplitError> {
     // start points at opening '
     let bytes = sql.as_bytes();
+    let backslash_escapes = match dialect {
+        SplitDialect::Mysql => true,
+        SplitDialect::Postgres => postgres_quote_uses_backslash(sql, start, true),
+        SplitDialect::Sqlite => false,
+    };
     let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
@@ -481,8 +544,7 @@ fn scan_single_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSpli
                     return Ok(i + 1);
                 }
             }
-            b'\\' => {
-                // Preserve escaped quote / backslash inside strings (MySQL + common SQL).
+            b'\\' if backslash_escapes => {
                 if i + 1 < bytes.len() {
                     i += 2;
                 } else {
@@ -501,8 +563,17 @@ fn scan_single_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSpli
     ))
 }
 
-fn scan_double_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSplitError> {
+fn scan_double_quoted(
+    sql: &str,
+    start: usize,
+    dialect: SplitDialect,
+) -> Result<usize, SqlStatementSplitError> {
     let bytes = sql.as_bytes();
+    let backslash_escapes = match dialect {
+        SplitDialect::Mysql => true,
+        SplitDialect::Postgres => postgres_quote_uses_backslash(sql, start, false),
+        SplitDialect::Sqlite => false,
+    };
     let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
@@ -513,7 +584,7 @@ fn scan_double_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSpli
                     return Ok(i + 1);
                 }
             }
-            b'\\' => {
+            b'\\' if backslash_escapes => {
                 if i + 1 < bytes.len() {
                     i += 2;
                 } else {
@@ -532,8 +603,13 @@ fn scan_double_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSpli
     ))
 }
 
-fn scan_backtick_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSplitError> {
+fn scan_backtick_quoted(
+    sql: &str,
+    start: usize,
+    dialect: SplitDialect,
+) -> Result<usize, SqlStatementSplitError> {
     let bytes = sql.as_bytes();
+    let backslash_escapes = dialect == SplitDialect::Mysql;
     let mut i = start + 1;
     while i < bytes.len() {
         match bytes[i] {
@@ -542,6 +618,16 @@ fn scan_backtick_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSp
                     i += 2;
                 } else {
                     return Ok(i + 1);
+                }
+            }
+            b'\\' if backslash_escapes => {
+                if i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    return Err(SqlStatementSplitError::new(
+                        "unclosed backtick-quoted identifier (trailing backslash)",
+                        Some(start),
+                    ));
                 }
             }
             _ => i += 1,
@@ -553,6 +639,34 @@ fn scan_backtick_quoted(sql: &str, start: usize) -> Result<usize, SqlStatementSp
     ))
 }
 
+fn postgres_quote_uses_backslash(sql: &str, quote_start: usize, single_quote: bool) -> bool {
+    let prefix = &sql[..quote_start];
+    if single_quote
+        && prefix
+            .as_bytes()
+            .last()
+            .is_some_and(|last| matches!(last, b'E' | b'e'))
+    {
+        let prefix_start = quote_start - 1;
+        if postgres_prefix_has_boundary(sql, prefix_start) {
+            return true;
+        }
+    }
+    if prefix.ends_with("U&") || prefix.ends_with("u&") {
+        let prefix_start = quote_start - 2;
+        return postgres_prefix_has_boundary(sql, prefix_start);
+    }
+    false
+}
+
+fn postgres_prefix_has_boundary(sql: &str, prefix_start: usize) -> bool {
+    prefix_start == 0
+        || !sql[..prefix_start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+}
+
 fn scan_line_comment(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && bytes[i] != b'\n' {
         i += 1;
@@ -560,13 +674,28 @@ fn scan_line_comment(bytes: &[u8], mut i: usize) -> usize {
     if i < bytes.len() { i + 1 } else { i }
 }
 
-fn scan_block_comment(sql: &str, start: usize) -> Result<usize, SqlStatementSplitError> {
+fn scan_block_comment(
+    sql: &str,
+    start: usize,
+    dialect: SplitDialect,
+) -> Result<usize, SqlStatementSplitError> {
     // start points at '/' of '/*'
     let bytes = sql.as_bytes();
     let mut i = start + 2;
+    let mut depth = 1usize;
     while i + 1 < bytes.len() {
+        if dialect == SplitDialect::Postgres && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            return Ok(i + 2);
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Ok(i);
+            }
+            continue;
         }
         i += 1;
     }
@@ -589,9 +718,34 @@ fn try_scan_dollar_quoted(
     if bytes.get(start) != Some(&b'$') {
         return Ok(None);
     }
+    if sql[..start]
+        .chars()
+        .next_back()
+        .is_some_and(is_postgres_identifier_char)
+    {
+        return Ok(None);
+    }
     let mut tag_end = start + 1;
-    while tag_end < bytes.len() && is_ident_byte(bytes[tag_end]) {
-        tag_end += 1;
+    if bytes.get(tag_end) != Some(&b'$') {
+        let Some(first) = sql[tag_end..].chars().next() else {
+            return Ok(None);
+        };
+        if first != '_' && !first.is_alphabetic() {
+            return Ok(None);
+        }
+        tag_end += first.len_utf8();
+        while tag_end < bytes.len() {
+            let Some(ch) = sql[tag_end..].chars().next() else {
+                break;
+            };
+            if ch == '$' {
+                break;
+            }
+            if ch != '_' && !ch.is_alphanumeric() {
+                return Ok(None);
+            }
+            tag_end += ch.len_utf8();
+        }
     }
     if tag_end >= bytes.len() || bytes[tag_end] != b'$' {
         // Not `$tag$` — treat the initial `$` as an ordinary character.
@@ -612,19 +766,40 @@ fn try_scan_dollar_quoted(
     ))
 }
 
-/// Leading `--` / `/* */` comment stripper shared with non-transactional
-/// PostgreSQL classification. Kept identical to the historical helper.
-pub(super) fn strip_leading_sql_comments(mut sql: &str) -> &str {
+fn is_postgres_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '$')
+}
+
+fn strip_leading_sql_comments_for_dialect(
+    mut sql: &str,
+    dialect: SplitDialect,
+) -> &str {
     loop {
         sql = sql.trim_start();
-        if let Some(comment) = sql.strip_prefix("--") {
-            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
-        } else if let Some(comment) = sql.strip_prefix("/*") {
-            sql = comment.split_once("*/").map_or("", |(_, rest)| rest);
-        } else {
-            return sql;
+        let bytes = sql.as_bytes();
+        if starts_dash_line_comment(bytes, 0, dialect) {
+            sql = sql.split_once('\n').map_or("", |(_, rest)| rest);
+            continue;
         }
+        if dialect.allows_hash_line_comments() && bytes.first() == Some(&b'#') {
+            sql = sql.split_once('\n').map_or("", |(_, rest)| rest);
+            continue;
+        }
+        if bytes.get(..2) == Some(b"/*") {
+            sql = match scan_block_comment(sql, 0, dialect) {
+                Ok(after) => &sql[after..],
+                Err(_) => "",
+            };
+            continue;
+        }
+        return sql;
     }
+}
+
+/// Leading PostgreSQL `--` / nested `/* */` comment stripper shared with
+/// non-transactional statement classification.
+pub(super) fn strip_leading_sql_comments(sql: &str) -> &str {
+    strip_leading_sql_comments_for_dialect(sql, SplitDialect::Postgres)
 }
 
 fn validate_mysql_compound_statements(statements: &[&str]) -> Result<(), SqlStatementSplitError> {
@@ -651,7 +826,8 @@ fn validate_mysql_compound_statements(statements: &[&str]) -> Result<(), SqlStat
 }
 
 fn is_orphan_mysql_end_block(statement: &str) -> bool {
-    let body = strip_leading_sql_comments(statement).trim();
+    let body =
+        strip_leading_sql_comments_for_dialect(statement, SplitDialect::Mysql).trim();
     let mut tokens = body.split_whitespace();
     match (tokens.next(), tokens.next(), tokens.next()) {
         (Some(end), Some(kind), None) => {
@@ -672,7 +848,7 @@ fn is_orphan_mysql_end_block(statement: &str) -> bool {
 }
 
 fn mysql_stored_program_looks_incomplete(statement: &str) -> bool {
-    let body = strip_leading_sql_comments(statement);
+    let body = strip_leading_sql_comments_for_dialect(statement, SplitDialect::Mysql);
     if !starts_mysql_stored_program(body) {
         return false;
     }
@@ -736,24 +912,24 @@ fn contains_sql_word(sql: &str, word: &str) -> bool {
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' => match scan_single_quoted(sql, i) {
+            b'\'' => match scan_single_quoted(sql, i, SplitDialect::Mysql) {
                 Ok(next) => i = next,
                 Err(_) => return false,
             },
-            b'"' => match scan_double_quoted(sql, i) {
+            b'"' => match scan_double_quoted(sql, i, SplitDialect::Mysql) {
                 Ok(next) => i = next,
                 Err(_) => return false,
             },
-            b'`' => match scan_backtick_quoted(sql, i) {
+            b'`' => match scan_backtick_quoted(sql, i, SplitDialect::Mysql) {
                 Ok(next) => i = next,
                 Err(_) => return false,
             },
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+            b'-' if starts_dash_line_comment(bytes, i, SplitDialect::Mysql) => {
                 i = scan_line_comment(bytes, i + 2);
             }
             b'#' => i = scan_line_comment(bytes, i + 1),
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                match scan_block_comment(sql, i) {
+                match scan_block_comment(sql, i, SplitDialect::Mysql) {
                     Ok(next) => i = next,
                     Err(_) => return false,
                 }

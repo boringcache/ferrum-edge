@@ -1340,11 +1340,12 @@ CustomPluginMigration {
 Separate multiple SQL statements with semicolons. Each statement is executed
 independently. Ferrum uses a quote/comment/dollar-quote-aware splitter (shared
 by classification and execution) so semicolons inside string literals,
-comments, PostgreSQL dollar-quoted bodies, and `BEGIN … END` compound blocks
-do not create false boundaries. MySQL compound routines may use `DELIMITER //`
-… `//` `DELIMITER ;` (client meta-commands are stripped and never sent to the
-server). Malformed SQL fails during apply validation before statement one
-runs — see [Multi-Statement Migrations](docs/migrations.md#multi-statement-migrations).
+comments (including PostgreSQL nested block comments), PostgreSQL dollar-quoted
+bodies, and `BEGIN … END` compound blocks do not create false boundaries.
+MySQL compound routines may use `DELIMITER //` … `//` `DELIMITER ;` (client
+meta-commands are stripped and never sent to the server). Malformed SQL fails
+during apply validation before statement one runs — see
+[Multi-Statement Migrations](docs/migrations.md#multi-statement-migrations).
 
 ```rust
 CustomPluginMigration {

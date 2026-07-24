@@ -69,14 +69,33 @@ fn preserves_semicolon_inside_single_quoted_string() {
 }
 
 #[test]
-fn preserves_doubled_and_backslash_escaped_single_quotes() {
+fn preserves_doubled_single_quotes() {
     assert_split(
         "postgres",
-        r#"INSERT INTO t VALUES ('it''s;fine'); INSERT INTO t VALUES ('it\'s;fine');"#,
-        &[
-            "INSERT INTO t VALUES ('it''s;fine')",
-            r#"INSERT INTO t VALUES ('it\'s;fine')"#,
-        ],
+        "INSERT INTO t VALUES ('it''s;fine'); SELECT 1;",
+        &["INSERT INTO t VALUES ('it''s;fine')", "SELECT 1"],
+    );
+}
+
+#[test]
+fn postgres_and_sqlite_ordinary_strings_do_not_treat_backslash_as_an_escape() {
+    let sql = r#"SELECT 'left\'; SELECT 2;"#;
+    let expected = &[r#"SELECT 'left\'"#, "SELECT 2"];
+    assert_split("postgres", sql, expected);
+    assert_split("sqlite", sql, expected);
+}
+
+#[test]
+fn postgres_escape_strings_preserve_backslash_escaped_quotes_and_semicolons() {
+    assert_split(
+        "postgres",
+        r#"SELECT E'left\';inside'; SELECT 2;"#,
+        &[r#"SELECT E'left\';inside'"#, "SELECT 2"],
+    );
+    assert_split(
+        "mysql",
+        r#"SELECT 'left\';inside'; SELECT 2;"#,
+        &[r#"SELECT 'left\';inside'"#, "SELECT 2"],
     );
 }
 
@@ -117,11 +136,32 @@ fn preserves_semicolon_inside_line_and_block_comments() {
 }
 
 #[test]
+fn postgres_nested_block_comments_preserve_inner_semicolons() {
+    assert_split(
+        "postgres",
+        "SELECT 1; /* outer; /* inner; */ still outer; */ SELECT 2;",
+        &[
+            "SELECT 1",
+            "/* outer; /* inner; */ still outer; */ SELECT 2",
+        ],
+    );
+}
+
+#[test]
 fn mysql_hash_line_comments_are_recognized() {
     assert_split(
         "mysql",
         "SELECT 1; # comment with ; semicolon\nSELECT 2;",
         &["SELECT 1", "# comment with ; semicolon\nSELECT 2"],
+    );
+}
+
+#[test]
+fn mysql_dash_dash_requires_following_whitespace_or_control() {
+    assert_split(
+        "mysql",
+        "SELECT 1--2; SELECT 3;",
+        &["SELECT 1--2", "SELECT 3"],
     );
 }
 
@@ -155,6 +195,20 @@ fn transaction_begin_does_not_swallow_following_statements() {
         "BEGIN; CREATE TABLE t (id TEXT); COMMIT;",
         &["BEGIN", "CREATE TABLE t (id TEXT)", "COMMIT"],
     );
+    assert_split(
+        "postgres",
+        "BEGIN /* transaction comment */; CREATE TABLE t (id TEXT); COMMIT;",
+        &[
+            "BEGIN /* transaction comment */",
+            "CREATE TABLE t (id TEXT)",
+            "COMMIT",
+        ],
+    );
+    assert_split(
+        "postgres",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1; COMMIT;",
+        &["BEGIN ISOLATION LEVEL SERIALIZABLE", "SELECT 1", "COMMIT"],
+    );
 }
 
 #[test]
@@ -180,6 +234,20 @@ fn postgres_dollar_quoted_body_handles_non_ascii_without_byte_boundary_panics() 
         "postgres",
         "CREATE FUNCTION f() RETURNS text AS $body$ SELECT '日本語;é'; $body$ LANGUAGE sql;",
         &["CREATE FUNCTION f() RETURNS text AS $body$ SELECT '日本語;é'; $body$ LANGUAGE sql"],
+    );
+    assert_split(
+        "postgres",
+        "CREATE FUNCTION f() RETURNS text AS $é$ SELECT '日本語;é'; $é$ LANGUAGE sql;",
+        &["CREATE FUNCTION f() RETURNS text AS $é$ SELECT '日本語;é'; $é$ LANGUAGE sql"],
+    );
+}
+
+#[test]
+fn postgres_dollar_quote_tags_follow_identifier_boundaries() {
+    assert_split(
+        "postgres",
+        "SELECT foo$tag$bar; SELECT $9$not_a_tag; SELECT 3;",
+        &["SELECT foo$tag$bar", "SELECT $9$not_a_tag", "SELECT 3"],
     );
 }
 
