@@ -4107,13 +4107,7 @@ mod backend_target_selection_tests {
             locality: None,
         };
         let expected = LoadBalancerCache::select_next_target_for_port_from(
-            &snapshot,
-            "ferrum",
-            "orders",
-            &flow_key,
-            5432,
-            &exclude,
-            None,
+            &snapshot, "ferrum", "orders", &flow_key, 5432, &exclude, None,
         )
         .expect("expected retry target");
         assert_eq!(host, expected.host);
