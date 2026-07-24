@@ -897,6 +897,7 @@ jobs:
               functional_body_validator_response_stream_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
+              functional_request_mirror_grpc_transport_test
               functional_logging_plugins_test
               functional_logging_test
               functional_mesh_vs_traffic_mgmt_test
@@ -944,6 +945,7 @@ jobs:
               scripted_backend_h3_tests
               scripted_backend_matrix_tests
               scripted_backend_network_sim_tests
+              scripted_backend_streaming_latency_tests
               scripted_backend_tests
               scripted_backend_udp_tests
               functional_query_param_limits_test
