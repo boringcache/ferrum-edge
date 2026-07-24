@@ -189,8 +189,7 @@ fn circuit_breaker_target_semantics_direct_vs_upstream() {
 #[test]
 fn unhealthy_target_active_omits_proxy_id_passive_requires_it() {
     let active = AdminMetricsUnhealthyTarget::active("ferrum", "upstream-a", "10.0.3.12:8080", 100);
-    let passive =
-        AdminMetricsUnhealthyTarget::passive("ferrum", "proxy-x", "10.0.5.7:8080", 200);
+    let passive = AdminMetricsUnhealthyTarget::passive("ferrum", "proxy-x", "10.0.5.7:8080", 200);
 
     let active_json = serde_json::to_value(&active).expect("active serializes");
     let passive_json = serde_json::to_value(&passive).expect("passive serializes");
@@ -270,17 +269,15 @@ fn contract_fixtures_cover_modes_breakers_and_health_variants() {
         .expect("breaker/health fixture");
 
     let breakers = rich["circuit_breakers"].as_array().expect("breakers array");
+    assert!(breakers.iter().any(|entry| {
+        entry.get("target").is_none()
+            && entry["namespace"] == "ferrum"
+            && entry["proxy_id"] == "proxy-payments-v2"
+    }));
     assert!(
-        breakers.iter().any(|entry| {
-            entry.get("target").is_none()
-                && entry["namespace"] == "ferrum"
-                && entry["proxy_id"] == "proxy-payments-v2"
-        })
-    );
-    assert!(
-        breakers.iter().any(|entry| {
-            entry["namespace"] == "ferrum" && entry["target"] == "10.0.2.1:8080"
-        })
+        breakers
+            .iter()
+            .any(|entry| { entry["namespace"] == "ferrum" && entry["target"] == "10.0.2.1:8080" })
     );
 
     let unhealthy = rich["health_check"]["unhealthy_targets"]

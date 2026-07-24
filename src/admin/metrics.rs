@@ -244,14 +244,9 @@ impl AdminMetricsCircuitBreaker {
     ) -> Option<Self> {
         let (namespace, id, target) = parse_namespaced_runtime_key(key)?;
         Some(match target {
-            Some(target) => Self::upstream_target(
-                namespace,
-                id,
-                target,
-                state,
-                failure_count,
-                success_count,
-            ),
+            Some(target) => {
+                Self::upstream_target(namespace, id, target, state, failure_count, success_count)
+            }
             None => Self::direct_backend(namespace, id, state, failure_count, success_count),
         })
     }
@@ -486,9 +481,8 @@ pub fn build_admin_metrics(
             targets: target_map,
         });
     }
-    active_connections.sort_by(|a, b| {
-        (&a.namespace, &a.upstream_id).cmp(&(&b.namespace, &b.upstream_id))
-    });
+    active_connections
+        .sort_by(|a, b| (&a.namespace, &a.upstream_id).cmp(&(&b.namespace, &b.upstream_id)));
 
     let (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries) =
         ps.router_cache.cache_stats();
