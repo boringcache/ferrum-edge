@@ -1118,10 +1118,14 @@ impl AiSemanticCache {
                         key: flight_key,
                         slot,
                     };
-                    // `acquire` only errors if the semaphore is closed, which
-                    // never happens here; degrade to unbounded rather than panic
-                    // if it somehow does.
-                    let _permit = self.embedding_semaphore.acquire().await.ok();
+                    // A closed semaphore is not expected while this plugin
+                    // instance is live, but it must still fail closed rather
+                    // than silently issuing an unadmitted outbound request.
+                    let _permit = self
+                        .embedding_semaphore
+                        .acquire()
+                        .await
+                        .map_err(|_| "embedding concurrency admission is closed".to_string())?;
                     let shared = Arc::new(self.compute_embedding_inner(input).await);
                     // Publish one shared success/failure to every waiter.
                     let _ = tx.send(Some(Arc::clone(&shared)));
@@ -1166,7 +1170,11 @@ impl AiSemanticCache {
 
         // Exhausted re-election budget under a leader-cancellation storm: still
         // honor the per-instance semaphore for one final bounded attempt.
-        let _permit = self.embedding_semaphore.acquire().await.ok();
+        let _permit = self
+            .embedding_semaphore
+            .acquire()
+            .await
+            .map_err(|_| "embedding concurrency admission is closed".to_string())?;
         self.compute_embedding_inner(input).await
     }
 
