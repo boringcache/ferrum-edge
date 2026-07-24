@@ -560,7 +560,7 @@ jobs:
     # Integration tests are an in-process suite — they spin up gateway state,
     # databases, gRPC servers, etc. inside the test process (no external
     # binary), so they ALSO don't need redis/mongo services. The shard split
-    # below keeps all 74 test-file filters visible to the grep-based coverage
+    # below keeps all 82 test-file filters visible to the grep-based coverage
     # contract while balancing them across two runners. Two-hundred-plus
     # wall-clock waits in `wait_for_poll` / `wait_for_route` / fixed sleeps
     # make elapsed time, not CPU utilisation, the useful balancing signal.
@@ -584,6 +584,7 @@ jobs:
               integration::admin_backend_capabilities_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
+              integration::admin_metrics_tls_inventory_snapshot_tests
               integration::admin_namespace_claim_tests
               integration::admin_cached_config_tests
               integration::admin_cross_namespace_refs_tests

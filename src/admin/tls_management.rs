@@ -51,6 +51,46 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
     crate::tls::inventory::TlsInventory::collect(env_config, config.as_deref())
 }
 
+/// Metrics-safe inventory producer for the cached snapshot (issue #2410).
+///
+/// Holds the resolved `EnvConfig` and the *live* gateway-config `ArcSwap`, so a
+/// background refresh always collects against the currently published config
+/// without the admin state having to re-register on every reload.
+struct AdminTlsInventoryCollector {
+    env_config: Option<Arc<crate::config::EnvConfig>>,
+    config: Option<Arc<arc_swap::ArcSwap<crate::config::types::GatewayConfig>>>,
+}
+
+impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCollector {
+    fn collect_public_metadata(&self) -> crate::tls::inventory::TlsInventory {
+        let config = self.config.as_ref().map(|config| config.load_full());
+        crate::tls::inventory::TlsInventory::collect_public_metadata(
+            self.env_config.as_deref(),
+            config.as_deref(),
+        )
+    }
+}
+
+/// Install the process-wide metrics inventory collector. Idempotent: the first
+/// installation wins, so calling it from the admin serving path and from the
+/// scrape handler costs one lock-free load after startup.
+pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
+    if crate::tls::inventory_cache::collector_installed() {
+        return;
+    }
+    let env_config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.env_config));
+    let config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.config))
+        .or_else(|| state.cached_config.clone());
+    let collector = AdminTlsInventoryCollector { env_config, config };
+    crate::tls::inventory_cache::install_collector(Arc::new(collector));
+}
+
 pub(super) async fn handle_events(
     pagination: &PaginationParams,
     query: Option<&str>,
