@@ -309,8 +309,10 @@ impl<T: Send + 'static> BatchingLogger<T> {
             run_flush_loop_with_hooks(
                 cfg,
                 receiver,
-                worker_queue_depth,
-                worker_outstanding_count,
+                FlushAccounting {
+                    queue_depth: worker_queue_depth,
+                    outstanding_count: worker_outstanding_count,
+                },
                 worker_drain_control,
                 close_rx,
                 flush,
@@ -826,11 +828,15 @@ pub async fn wait_until_committed_or_closed(
     }
 }
 
+struct FlushAccounting {
+    queue_depth: Arc<AtomicUsize>,
+    outstanding_count: Arc<AtomicUsize>,
+}
+
 async fn run_flush_loop_with_hooks<T, F, Fut>(
     cfg: BatchConfig,
     mut receiver: mpsc::Receiver<T>,
-    queue_depth: Arc<AtomicUsize>,
-    outstanding_count: Arc<AtomicUsize>,
+    accounting: FlushAccounting,
     worker: Arc<DeliveryWorkerControl>,
     mut close_rx: watch::Receiver<bool>,
     flush: F,
@@ -862,13 +868,13 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
             item = receiver.recv() => {
                 match item {
                     Some(item) => {
-                        decrement_queue_depth(&queue_depth);
+                        decrement_queue_depth(&accounting.queue_depth);
                         buffer.push(item);
                         if buffer.len() >= cfg.batch_size {
                             let batch = std::mem::take(&mut buffer);
                             let batch_len = batch.len();
                             flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
-                            decrement_outstanding_by(&outstanding_count, batch_len);
+                            decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                         }
                     }
                     None => {
@@ -876,7 +882,7 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
                             let batch = std::mem::take(&mut buffer);
                             let batch_len = batch.len();
                             flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
-                            decrement_outstanding_by(&outstanding_count, batch_len);
+                            decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                         }
                         break;
                     }
@@ -888,7 +894,7 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
                     let batch = std::mem::take(&mut buffer);
                     let batch_len = batch.len();
                     flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
-                    decrement_outstanding_by(&outstanding_count, batch_len);
+                    decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                 }
             }
 
