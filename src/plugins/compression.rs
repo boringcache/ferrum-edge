@@ -548,9 +548,7 @@ impl CompressionPlugin {
                 let decode_source: Option<Vec<u8>> = if let Some(body) = body.as_deref() {
                     Some(body.to_vec())
                 } else {
-                    ctx.request_body_bytes
-                        .as_ref()
-                        .map(|bytes| bytes.to_vec())
+                    ctx.request_body_bytes.as_ref().map(|bytes| bytes.to_vec())
                 };
                 let Some(decode_source) = decode_source else {
                     // Unbuffered path (e.g. HBONE CONNECT): without a rejectable body
