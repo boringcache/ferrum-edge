@@ -4627,3 +4627,707 @@ async fn explode_false_arrays_require_one_serialized_property_occurrence() {
         Some(400),
     );
 }
+
+#[tokio::test]
+async fn multipart_chooses_earliest_header_body_separator_over_later_crlf() {
+    // Hostile case from #3015: LF-LF terminates headers first; a later CRLF-CRLF
+    // in the body must not reclassify body bytes as part headers.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/payload",
+            "path_regex": "^/payload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["payload"],
+                        "properties": {
+                            "payload": {"type": "string", "const": "safe"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = b"--b\r\nContent-Disposition: form-data; name=\"payload\"\n\nX-Reclassified: attacker-controlled\r\n\r\nsafe\r\n--b--\r\n";
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+        Some(400),
+    );
+    let err = request_error(&ctx).unwrap_or_default();
+    assert!(
+        !err.contains("duplicate header"),
+        "body prefix must remain body bytes, not reclassified headers: {err}"
+    );
+
+    // Valid LF-only and CRLF-only parts still accept.
+    for body in [
+        &b"--b\nContent-Disposition: form-data; name=\"payload\"\n\nsafe\n--b--\n"[..],
+        &b"--b\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\nsafe\r\n--b--\r\n"[..],
+    ] {
+        let mut ctx = post_ctx("/payload");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_rejects_unquoted_boundary_values_that_require_quoting() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {"title": {"type": "string", "const": "ok"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    for (content_type, body) in [
+        (
+            "multipart/form-data; boundary=abc:def",
+            &b"--abc:def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc:def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=abc/def",
+            &b"--abc/def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc/def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=abc?def",
+            &b"--abc?def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc?def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=abc=def",
+            &b"--abc=def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc=def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=abc,def",
+            &b"--abc,def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc,def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=abc(def)",
+            &b"--abc(def)\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc(def)--\r\n"[..],
+        ),
+    ] {
+        let headers = content_type_headers(content_type);
+        let mut ctx = post_ctx("/upload");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+            Some(400),
+        );
+        assert!(
+            request_error(&ctx)
+                .unwrap_or_default()
+                .contains("Unquoted multipart boundary"),
+            "unquoted non-token boundary must fail closed, got {:?}",
+            request_error(&ctx)
+        );
+    }
+
+    // Same values are accepted when correctly quoted.
+    for (content_type, body) in [
+        (
+            "multipart/form-data; boundary=\"abc:def\"",
+            &b"--abc:def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc:def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=\"abc def\"",
+            &b"--abc def\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--abc def--\r\n"[..],
+        ),
+        (
+            "multipart/form-data; boundary=simpleToken",
+            &b"--simpleToken\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nok\r\n--simpleToken--\r\n"[..],
+        ),
+    ] {
+        let headers = content_type_headers(content_type);
+        let mut ctx = post_ctx("/upload");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_requires_form_data_content_disposition_type() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/role",
+            "path_regex": "^/role$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["role"],
+                        "properties": {"role": {"type": "string", "const": "user"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+
+    for disposition in ["attachment", "inline", "", "form-datax"] {
+        let body = format!(
+            "--b\r\nContent-Disposition: {disposition}; name=\"role\"\r\n\r\nuser\r\n--b--\r\n"
+        );
+        let mut ctx = post_ctx("/role");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+            Some(400),
+        );
+        assert!(
+            request_error(&ctx)
+                .unwrap_or_default()
+                .contains("Content-Disposition type must be form-data"),
+            "non-form disposition must not reach schema conversion, got {:?}",
+            request_error(&ctx)
+        );
+    }
+
+    for disposition in ["form-data", "Form-Data", "FORM-DATA"] {
+        let body = format!(
+            "--b\r\nContent-Disposition: {disposition}; name=\"role\"\r\n\r\nuser\r\n--b--\r\n"
+        );
+        let mut ctx = post_ctx("/role");
+        ctx.headers = headers.clone();
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_and_urlencoded_reject_duplicate_scalar_values() {
+    let multipart = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/role",
+            "path_regex": "^/role$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["role"],
+                        "properties": {"role": {"type": "string", "const": "user"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+    // First-win hostile body: validator must not accept by reading only "user".
+    let body = concat!(
+        "--b\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n",
+        "--b--\r\n"
+    );
+    let mut ctx = post_ctx("/role");
+    ctx.headers = headers.clone();
+    assert_reject(
+        multipart
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx)
+            .unwrap_or_default()
+            .contains("expects a scalar"),
+        "duplicate scalar multipart values must reject, got {:?}",
+        request_error(&ctx)
+    );
+
+    // Last-win hostile ordering is also rejected.
+    let body = concat!(
+        "--b\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nuser\r\n",
+        "--b--\r\n"
+    );
+    let mut ctx = post_ctx("/role");
+    ctx.headers = headers.clone();
+    assert_reject(
+        multipart
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Duplicate scalar file metadata objects are rejected the same way.
+    let file_plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/file",
+            "path_regex": "^/file$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename"],
+                                "properties": {"filename": {"const": "a.txt"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nx\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\ny\r\n",
+        "--b--\r\n"
+    );
+    let mut ctx = post_ctx("/file");
+    ctx.headers = headers.clone();
+    assert_reject(
+        file_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Array fields still preserve every value in order.
+    let array_plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/tags",
+            "path_regex": "^/tags$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["tags"],
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "const": ["a", "b"]
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let body = concat!(
+        "--b\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\na\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\nb\r\n",
+        "--b--\r\n"
+    );
+    let mut ctx = post_ctx("/tags");
+    ctx.headers = headers.clone();
+    assert_continue(
+        array_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+
+    // URL-encoded scalars follow the same schema-driven duplicate rule.
+    let form = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/role-form",
+            "path_regex": "^/role-form$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "type": "object",
+                        "required": ["role"],
+                        "properties": {"role": {"type": "string", "const": "user"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let form_headers = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/role-form");
+    ctx.headers = form_headers.clone();
+    assert_reject(
+        form.on_final_request_body_with_context(&mut ctx, &form_headers, b"role=user&role=admin")
+            .await,
+        Some(400),
+    );
+    assert!(
+        request_error(&ctx)
+            .unwrap_or_default()
+            .contains("Repeated form field values"),
+        "duplicate scalar urlencoded values must reject, got {:?}",
+        request_error(&ctx)
+    );
+}
+
+#[test]
+fn exploded_object_key_collisions_are_rejected_for_form_and_multipart() {
+    for media_type in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+        let root_child = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/claims",
+                "path_regex": "^/claims$",
+                "request_body": {
+                    "content": {
+                        (media_type): {
+                            "schema": {
+                                "type": "object",
+                                "required": ["tenant", "claims"],
+                                "properties": {
+                                    "tenant": {"type": "string"},
+                                    "claims": {
+                                        "type": "object",
+                                        "properties": {
+                                            "tenant": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "claims": {"style": "form", "explode": true}
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        let error = match root_child {
+            Ok(_) => panic!("{media_type}: root/child collision must fail admission"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("collides with a root request-body property"),
+            "{media_type}: unexpected admission error: {error}"
+        );
+
+        let child_child = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/overlap",
+                "path_regex": "^/overlap$",
+                "request_body": {
+                    "content": {
+                        (media_type): {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "left": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"shared": {"type": "string"}}
+                                    },
+                                    "right": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"shared": {"type": "string"}}
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "left": {"style": "form", "explode": true},
+                                "right": {"style": "form", "explode": true}
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        let error = match child_child {
+            Ok(_) => panic!("{media_type}: child/child collision must fail admission"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("emit colliding child keys"),
+            "{media_type}: unexpected admission error: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_overlapping_exploded_objects_convert_one_wire_key_to_one_property() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/colors",
+            "path_regex": "^/colors$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["rgb", "alpha"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "rgb": {
+                                    "type": "object",
+                                    "required": ["R", "G"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "R": {"type": "integer", "const": 1},
+                                        "G": {"type": "integer", "const": 2}
+                                    }
+                                },
+                                "alpha": {
+                                    "type": "object",
+                                    "required": ["A"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "A": {"type": "integer", "const": 3}
+                                    }
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "rgb": {"style": "form", "explode": true},
+                            "alpha": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("application/x-www-form-urlencoded");
+    let mut ctx = post_ctx("/colors");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"R=1&G=2&A=3")
+            .await,
+    );
+
+    let multipart = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/colors-mp",
+            "path_regex": "^/colors-mp$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["rgb", "alpha"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "rgb": {
+                                    "type": "object",
+                                    "required": ["R", "G"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "R": {"type": "integer", "const": 1},
+                                        "G": {"type": "integer", "const": 2}
+                                    }
+                                },
+                                "alpha": {
+                                    "type": "object",
+                                    "required": ["A"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "A": {"type": "integer", "const": 3}
+                                    }
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "rgb": {"style": "form", "explode": true},
+                            "alpha": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+    let body = concat!(
+        "--b\r\nContent-Disposition: form-data; name=\"R\"\r\n\r\n1\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"G\"\r\n\r\n2\r\n",
+        "--b\r\nContent-Disposition: form-data; name=\"A\"\r\n\r\n3\r\n",
+        "--b--\r\n"
+    );
+    let mut ctx = post_ctx("/colors-mp");
+    ctx.headers = headers.clone();
+    assert_continue(
+        multipart
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_earliest_separator_rejects_mixed_lf_crlf_blank_line() {
+    // Residual of #3015: a header block that ends with an LF line followed by a
+    // CRLF blank line (`...name"\n\r\n...`) matches neither `\n\n` nor
+    // `\r\n\r\n`. Recognizing only those two patterns lets a later `\r\n\r\n`
+    // win, promoting the intervening `X-Reclassified` line into part headers.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/payload",
+            "path_regex": "^/payload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["payload"],
+                        "properties": {
+                            "payload": {"type": "string", "const": "safe"}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=b");
+
+    // The mixed `\n\r\n` blank line must be the header/body separator, so the
+    // `X-Reclassified` line stays body bytes and the const check sees the whole
+    // smuggled prefix rather than a bare "safe".
+    let body = b"--b\r\nContent-Disposition: form-data; name=\"payload\"\n\r\nX-Reclassified: attacker-controlled\r\n\r\nsafe\r\n--b--\r\n";
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+        Some(400),
+    );
+    let err = request_error(&ctx).unwrap_or_default();
+    assert!(
+        !err.contains("duplicate header"),
+        "body prefix must remain body bytes, not reclassified headers: {err}"
+    );
+
+    // A part that legitimately uses the mixed `\n\r\n` blank line as its sole
+    // header/body separator still parses, with the body consumed correctly.
+    let body = b"--b\r\nContent-Disposition: form-data; name=\"payload\"\n\r\nsafe\r\n--b--\r\n";
+    let mut ctx = post_ctx("/payload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await,
+    );
+}
+
+#[test]
+fn exploded_free_form_object_cannot_coexist_with_declared_exploded_object() {
+    // Residual of #3019: admission rejects two free-form exploded objects and
+    // declared-child collisions, but a single free-form object coexisting with a
+    // declared exploded object was admitted. At runtime the free-form object
+    // absorbs the declared object's child keys, so one wire occurrence populates
+    // two logical properties depending on declaration order. Fail closed instead.
+    for media_type in ["application/x-www-form-urlencoded", "multipart/form-data"] {
+        let result = OpenapiValidator::new(&json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/mix",
+                "path_regex": "^/mix$",
+                "request_body": {
+                    "content": {
+                        (media_type): {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "freeform": {
+                                        "type": "object",
+                                        "additionalProperties": {"type": "string"}
+                                    },
+                                    "declared": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {"x": {"type": "string"}}
+                                    }
+                                }
+                            },
+                            "encoding": {
+                                "freeform": {"style": "form", "explode": true},
+                                "declared": {"style": "form", "explode": true}
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        let error = match result {
+            Ok(_) => {
+                panic!("{media_type}: free-form + declared exploded objects must fail admission")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("free-form object") && error.contains("cannot coexist"),
+            "{media_type}: unexpected admission error: {error}"
+        );
+    }
+
+    // A lone free-form exploded object (no other exploded object) still admits.
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/labels",
+            "path_regex": "^/labels$",
+            "request_body": {
+                "content": {
+                    "application/x-www-form-urlencoded": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["labels"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "labels": {
+                                    "type": "object",
+                                    "additionalProperties": {"type": "integer"}
+                                }
+                            }
+                        },
+                        "encoding": {
+                            "labels": {"style": "form", "explode": true}
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        plugin.is_ok(),
+        "a lone free-form exploded object must remain valid: {:?}",
+        plugin.err()
+    );
+}
