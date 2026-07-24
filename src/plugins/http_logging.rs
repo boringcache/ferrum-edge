@@ -84,10 +84,7 @@ impl HttpLogging {
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
             schema,
-            byte_budget: Arc::new(ByteBudget::new(
-                "http_logging",
-                limits.buffer_max_bytes,
-            )),
+            byte_budget: Arc::new(ByteBudget::new("http_logging", limits.buffer_max_bytes)),
             max_entry_bytes: limits.max_entry_bytes,
         })
     }

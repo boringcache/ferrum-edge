@@ -6,8 +6,8 @@
 //! measurement, and release on drop (or when ownership moves downstream).
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde_json::Value;
 use tracing::warn;

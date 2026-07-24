@@ -10,9 +10,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use super::batching_logger::{BatchingLoggerPermit, DeferredBatchingLogger};
-use super::byte_budget::{
-    BoundedJsonWriter, ByteBudget, ByteLease, accounted_summary_bytes,
-};
+use super::byte_budget::{BoundedJsonWriter, ByteBudget, ByteLease, accounted_summary_bytes};
 use super::log_schema::{SchemaView, SummarySchema};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 

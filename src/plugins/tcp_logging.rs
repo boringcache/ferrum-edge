@@ -203,10 +203,7 @@ impl TcpLogging {
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host.warmup_hostname,
             schema,
-            byte_budget: Arc::new(ByteBudget::new(
-                "tcp_logging",
-                limits.buffer_max_bytes,
-            )),
+            byte_budget: Arc::new(ByteBudget::new("tcp_logging", limits.buffer_max_bytes)),
             max_entry_bytes: limits.max_entry_bytes,
         })
     }
@@ -976,8 +973,10 @@ mod tests {
             response_status_code: 200,
             ..TransactionSummary::default()
         };
-        let batch = vec![serialize_under_byte_budget(&budget, 1024 * 1024, &summary)
-            .expect("test payload must serialize")];
+        let batch = vec![
+            serialize_under_byte_budget(&budget, 1024 * 1024, &summary)
+                .expect("test payload must serialize"),
+        ];
 
         let started = tokio::time::Instant::now();
         let stalled_err = match send_batch(&stalled_cfg, &writer, batch).await {
@@ -1013,8 +1012,10 @@ mod tests {
             response_status_code: 200,
             ..TransactionSummary::default()
         };
-        let small_batch = vec![serialize_under_byte_budget(&budget, 1024 * 1024, &small_summary)
-            .expect("small test payload must serialize")];
+        let small_batch = vec![
+            serialize_under_byte_budget(&budget, 1024 * 1024, &small_summary)
+                .expect("small test payload must serialize"),
+        ];
         must(
             send_batch(&healthy_cfg, &writer, small_batch).await,
             "healthy collector must accept the reconnecting send",

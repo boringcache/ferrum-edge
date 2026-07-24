@@ -1474,7 +1474,10 @@ impl ApiChargebackSink {
 
         let byte_budget = Arc::new(ByteBudget::new(
             PLUGIN_NAME,
-            self.config.batch.buffer_max_bytes.max(MAX_CHARGE_EVENT_BYTES),
+            self.config
+                .batch
+                .buffer_max_bytes
+                .max(MAX_CHARGE_EVENT_BYTES),
         ));
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::new(SinkRuntime {
@@ -5079,13 +5082,7 @@ fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
     total = total.saturating_add(event.node_id.len());
     total = total.saturating_add(event.namespace.len());
     total = total.saturating_add(event.consumer_id.len());
-    total = total.saturating_add(
-        event
-            .consumer_name
-            .as_ref()
-            .map(String::len)
-            .unwrap_or(0),
-    );
+    total = total.saturating_add(event.consumer_name.as_ref().map(String::len).unwrap_or(0));
     total = total.saturating_add(event.proxy_id.len());
     total = total.saturating_add(event.proxy_name.len());
     total = total.saturating_add(event.route_id.as_ref().map(String::len).unwrap_or(0));

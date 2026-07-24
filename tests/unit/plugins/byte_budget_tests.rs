@@ -12,8 +12,11 @@ fn admit_byte_limits_defaults_and_bounds() {
     assert_eq!(defaults.max_entry_bytes, DEFAULT_MAX_ENTRY_BYTES);
     assert_eq!(defaults.buffer_max_bytes, DEFAULT_BUFFER_MAX_BYTES);
 
-    let err = admit_byte_limits(&json!({"max_entry_bytes": MIN_MAX_ENTRY_BYTES - 1}), "probe")
-        .expect_err("below minimum");
+    let err = admit_byte_limits(
+        &json!({"max_entry_bytes": MIN_MAX_ENTRY_BYTES - 1}),
+        "probe",
+    )
+    .expect_err("below minimum");
     assert!(err.contains("max_entry_bytes"), "{err}");
 
     let err = admit_byte_limits(
@@ -49,7 +52,10 @@ fn byte_budget_reserves_before_serialize_and_rejects_oversize() {
     let budget = ByteBudget::new("probe", 256);
     let held = budget.try_acquire(256).expect("fill budget");
     let rejected = serialize_under_byte_budget(&budget, 64, &json!({"k": "v"}));
-    assert!(rejected.is_none(), "saturated budget must reject before retain");
+    assert!(
+        rejected.is_none(),
+        "saturated budget must reject before retain"
+    );
     assert!(budget.drops_total() > 0);
     drop(held);
     assert_eq!(budget.used(), 0);

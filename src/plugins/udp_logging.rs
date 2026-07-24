@@ -184,10 +184,7 @@ impl UdpLogging {
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host_warmup,
             schema,
-            byte_budget: Arc::new(ByteBudget::new(
-                "udp_logging",
-                limits.buffer_max_bytes,
-            )),
+            byte_budget: Arc::new(ByteBudget::new("udp_logging", limits.buffer_max_bytes)),
             max_entry_bytes: limits.max_entry_bytes,
             flush_state,
             next_resolve_addr,
