@@ -42,11 +42,13 @@ fn configsync_keepalive_constants_are_bounded_and_ordered() {
     assert_eq!(CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS, 30);
     assert_eq!(CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, 10);
     assert_eq!(CONFIGSYNC_TCP_KEEPALIVE_SECS, 30);
-    assert!(CONFIGSYNC_MAX_SILENCE_SECS > CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS);
-    assert!(
-        CONFIGSYNC_MAX_SILENCE_SECS
-            > ferrum_edge::grpc::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS
-    );
+    const {
+        assert!(CONFIGSYNC_MAX_SILENCE_SECS > CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS);
+        assert!(
+            CONFIGSYNC_MAX_SILENCE_SECS
+                > ferrum_edge::grpc::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS
+        );
+    }
     assert!(!silence_exceeds_liveness(CONFIGSYNC_MAX_SILENCE_SECS - 1));
     assert!(silence_exceeds_liveness(CONFIGSYNC_MAX_SILENCE_SECS));
 }
@@ -127,7 +129,7 @@ fn connection_error_after_accepted_config_resets_backoff() {
     assert_eq!(before.current_cp_index, 1);
     assert_eq!(before.backoff_secs, 16);
     grow_backoff_after_failure_sleep(&mut before);
-    assert_eq!(before.backoff_secs, 32);
+    assert_eq!(before.backoff_secs, backoff_max_secs());
 
     let mut after = MultiCpBackoffState {
         backoff_secs: 16,

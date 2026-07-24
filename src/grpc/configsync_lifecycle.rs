@@ -769,6 +769,7 @@ pub fn grow_backoff_after_failure_sleep(state: &mut MultiCpBackoffState) {
 /// Deterministic failure-sleep sequence for continuously failing CPs.
 ///
 /// Used by tests to prove N≥2 dead CPs still reach [`BACKOFF_MAX_SECS`].
+#[allow(dead_code)] // external unit-test contract; production grows the live state directly
 pub fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
     let mut state = MultiCpBackoffState::new();
     let mut sleeps = Vec::with_capacity(attempts);
@@ -787,11 +788,13 @@ pub fn failure_backoff_sequence(cp_count: usize, attempts: usize) -> Vec<u64> {
 }
 
 /// True when a silence interval exceeds the ConfigSync liveness bound.
+#[allow(dead_code)] // external unit-test contract for the liveness boundary
 pub fn silence_exceeds_liveness(silence_secs: u64) -> bool {
     silence_secs >= CONFIGSYNC_MAX_SILENCE_SECS
 }
 
 /// Cap used by tests/docs — exported so callers can assert the documented max.
+#[allow(dead_code)] // external unit-test contract for the documented ceiling
 pub fn backoff_max_secs() -> u64 {
     BACKOFF_MAX_SECS
 }

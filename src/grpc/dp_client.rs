@@ -174,6 +174,7 @@ pub struct DpFrontendTlsRuntime {
 }
 
 impl DpFrontendTlsRuntime {
+    #[allow(dead_code)] // compatibility wrapper and external unit-test construction
     pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
         Self {
             listener_slot,
@@ -1131,6 +1132,7 @@ pub async fn connect_and_subscribe(
 
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // compatibility wrapper; production uses the lifecycle-aware inner entry point
 pub async fn connect_and_subscribe_with_startup_ready(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
