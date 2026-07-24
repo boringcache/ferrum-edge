@@ -1463,17 +1463,17 @@ async fn run_tcp_accept_loop(
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
                     let final_proxy = epoch.proxy_by_id(&final_proxy_id);
+                    let proxy_namespace = final_proxy
+                        .map(|p| p.namespace.clone())
+                        .unwrap_or_else(crate::config::types::default_namespace);
                     let plugins = epoch
                         .plugin_cache
                         .get_plugins_for_protocol(
-                            &proxy.namespace,
+                            &proxy_namespace,
                             &final_proxy_id,
                             ProxyProtocol::Tcp,
                         );
                     let proxy_name = stream_ctx.proxy_name.clone();
-                    let proxy_namespace = final_proxy
-                        .map(|p| p.namespace.clone())
-                        .unwrap_or_else(crate::config::types::default_namespace);
                     let backend_scheme = final_proxy
                         .map(|p| p.effective_scheme())
                         .unwrap_or(stream_ctx.backend_scheme);

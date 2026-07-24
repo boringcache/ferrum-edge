@@ -919,10 +919,8 @@ async fn test_http3_streaming_decision_logic() {
     // Case 2: Retry configured → buffered
     let has_retry_2 = proxy_buffered.retry.is_some();
     assert!(has_retry_2, "Retry is configured");
-    let needs_resp_buf_2 = plugin_cache.requires_response_body_buffering(
-        &proxy_buffered.namespace,
-        &proxy_buffered.id,
-    );
+    let needs_resp_buf_2 = plugin_cache
+        .requires_response_body_buffering(&proxy_buffered.namespace, &proxy_buffered.id);
     let should_stream_2 = !has_retry_2 && !needs_resp_buf_2;
     assert!(
         !should_stream_2,

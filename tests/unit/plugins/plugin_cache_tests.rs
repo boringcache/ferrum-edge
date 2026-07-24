@@ -5621,7 +5621,11 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
         ProxyProtocol::Tcp,
         ProxyProtocol::Udp,
     ] {
-        assert!(cache.get_plugins_for_protocol("ferrum", "p1", protocol).is_empty());
+        assert!(
+            cache
+                .get_plugins_for_protocol("ferrum", "p1", protocol)
+                .is_empty()
+        );
     }
 }
 
@@ -8803,7 +8807,7 @@ fn test_auth_plugins_precomputed_for_protocol() {
     );
     let cache = PluginCache::new(&config).unwrap();
 
-    let auth = cache.get_auth_plugins("p1", ProxyProtocol::Http);
+    let auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Http);
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].name(), "key_auth");
 
@@ -8814,7 +8818,7 @@ fn test_auth_plugins_precomputed_for_protocol() {
     );
 
     // TCP should not have key_auth (HTTP_FAMILY only)
-    let tcp_auth = cache.get_auth_plugins("p1", ProxyProtocol::Tcp);
+    let tcp_auth = cache.get_auth_plugins("ferrum", "p1", ProxyProtocol::Tcp);
     assert_eq!(
         tcp_auth.len(),
         0,
