@@ -21,9 +21,8 @@ async fn pending_sibling_plus_listener_error_returns_err() {
         Ok::<(), anyhow::Error>(())
     });
 
-    let failing = tokio::spawn(async {
-        Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed"))
-    });
+    let failing =
+        tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed")) });
 
     let started = Instant::now();
     let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(

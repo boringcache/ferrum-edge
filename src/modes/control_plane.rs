@@ -2990,9 +2990,8 @@ mod tests {
     async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        let stuck = tokio::spawn(async {
-            std::future::pending::<Result<(), anyhow::Error>>().await
-        });
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
         let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
         let started = Instant::now();
