@@ -302,6 +302,23 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 |---|---|---|---|
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 
+File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation.
+
+File-mode configuration documents are limited to 64 MiB; larger files fail before allocation and parsing.
+
+**Publish updates with an atomic replace.** Write a temporary file beside the target, `fsync` it, then `rename(2)` over `FERRUM_FILE_CONFIG_PATH` (Kubernetes ConfigMap symlink swaps are equivalent). Avoid editor save-in-place, shell `>` redirection, or `cp` onto the live path: those create a torn-write window where a truncated-but-still-valid YAML document (commonly cutting a trailing `plugin_configs` list after item N-1) can parse and pass validators while silently dropping auth/ACL plugins.
+
+Optional top-level `resource_counts` is a defense-in-depth seal for that trailing-section hazard. Place it near the top of the document (before the resource lists). When present it is validated against the file's pre-namespace-filter lengths and is stripped before `GatewayConfig` deserialization:
+
+```yaml
+version: "1"
+resource_counts:
+  proxies: 1
+  consumers: 0
+  plugin_configs: 2
+  upstreams: 0
+```
+
 ### Control Plane / Data Plane
 
 | Variable | Required | Default | Description |
@@ -902,7 +919,18 @@ A reference `ferrum.conf` with all available fields and descriptions is included
 
 Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
+Publish replacements atomically (temp file + `rename`, or an equivalent ConfigMap symlink swap). See [File Mode](#file-mode) for the loader's stability contract and optional `resource_counts` seal.
+
 ```yaml
+version: "1"
+# Optional integrity seal — validated before namespace filtering. Declaring
+# plugin_configs: 2 rejects a torn truncation that drops the trailing item.
+resource_counts:
+  proxies: 1
+  consumers: 1
+  plugin_configs: 2
+  upstreams: 0
+
 proxies:
   - id: "my-api"
     name: "My Backend API"
@@ -922,6 +950,7 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "log-plugin"
+      - plugin_config_id: "key-auth"
 
 consumers:
   - id: "user-1"
@@ -934,6 +963,11 @@ consumers:
 plugin_configs:
   - id: "log-plugin"
     plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+  - id: "key-auth"
+    plugin_name: "key_auth"
     config: {}
     scope: global
     enabled: true
