@@ -1533,6 +1533,12 @@ pub async fn handle_admin_request(
                 ));
             }
         },
+        Err(JwtError::NotConfigured) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Admin authentication is unavailable"}),
+            ));
+        }
         Err(JwtError::MissingHeader) => {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
