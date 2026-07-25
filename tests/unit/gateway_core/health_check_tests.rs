@@ -1095,8 +1095,8 @@ fn eject_once(
     checker.report_response(proxy, upstream, target, 500, false, Some(&config));
 }
 
-#[test]
-fn per_port_only_passive_policy_recovers_via_entry_deadline() {
+#[tokio::test]
+async fn per_port_only_passive_policy_recovers_via_entry_deadline() {
     // Upstream has NO base passive policy; only a per-port overlay. Recovery
     // must still fire from the ejection's stored deadline.
     use ferrum_edge::config::types::UpstreamPortOverride;
@@ -1154,8 +1154,8 @@ fn per_port_only_passive_policy_recovers_via_entry_deadline() {
     );
 }
 
-#[test]
-fn subset_only_passive_policy_recovers_via_entry_deadline() {
+#[tokio::test]
+async fn subset_only_passive_policy_recovers_via_entry_deadline() {
     use ferrum_edge::config::types::ResolvedSubsetTrafficPolicy;
 
     let target = make_target("10.0.0.9", 8080);
@@ -1247,8 +1247,8 @@ fn shared_endpoint_independent_cooldowns_across_proxies() {
     );
 }
 
-#[test]
-fn passive_recovery_deadline_survives_policy_reload() {
+#[tokio::test]
+async fn passive_recovery_deadline_survives_policy_reload() {
     let target = make_target("backend1", 8080);
     let checker = HealthChecker::new();
 
@@ -1286,8 +1286,25 @@ fn passive_recovery_deadline_survives_policy_reload() {
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
-#[test]
-fn service_discovery_only_target_recovers_after_passive_ejection() {
+#[tokio::test]
+async fn in_flight_passive_recovery_scanner_survives_policy_removal() {
+    let target = make_target("backend1", 8080);
+    let checker = HealthChecker::new();
+    eject_once(&checker, TEST_PROXY, "up1", &target, 30);
+
+    let mut reloaded = make_upstream_passive_only("up1", vec![target], 0);
+    reloaded.health_checks = None;
+    checker.restart_with_shutdown(&config_with_upstreams(vec![reloaded]), None);
+
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "an in-flight auto-recovery deadline must retain a scanner after its policy is removed"
+    );
+}
+
+#[tokio::test]
+async fn service_discovery_only_target_recovers_after_passive_ejection() {
     // Target is not in the static upstream.targets list used at scanner spawn —
     // recovery must still clear it because deadlines live on the entry.
     let static_target = make_target("static-a", 8080);

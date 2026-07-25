@@ -447,7 +447,14 @@ impl HealthChecker {
         // from its own stored deadline. Per-upstream timers keyed on static
         // host:port sets cannot honor per-port/subset-only policies, SD-only
         // targets, or independent cooldowns for proxies sharing an endpoint.
-        if config_needs_passive_recovery(config) {
+        let pending_passive_recovery = self.passive_health.iter().any(|proxy| {
+            proxy
+                .value()
+                .unhealthy
+                .iter()
+                .any(|entry| entry.value().auto_recover)
+        });
+        if config_needs_passive_recovery(config) || pending_passive_recovery {
             new_handles.push(
                 self.start_passive_recovery_scanner(shutdown_rx.clone(), recovery_generation),
             );
