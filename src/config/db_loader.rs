@@ -8194,8 +8194,7 @@ impl DatabaseStore {
                 break;
             }
         }
-        let hit_batch_budget =
-            crate::admin::audit::audit_retention_hit_prune_batch_budget(total);
+        let hit_batch_budget = crate::admin::audit::audit_retention_hit_prune_batch_budget(total);
         Ok((total, hit_batch_budget))
     }
 
