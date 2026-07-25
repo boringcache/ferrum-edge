@@ -1344,6 +1344,17 @@ pub mod _test_support {
         Ok((handshake.stream, proto))
     }
 
+    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
+    /// for kTLS. Always returns `false`: the public buffered API cannot prove
+    /// that the inbound deframer is empty and record-aligned (issue #2955).
+    /// The shared borrow is part of the contract — external tests use it to
+    /// pin that the refusal leaves every staged application byte readable.
+    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
+        server_conn: &rustls::ServerConnection,
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.
@@ -3648,5 +3659,20 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    /// Drive CP listener supervision the same way `control_plane::run` does,
+    /// so external tests can assert Ok/Err without constructing a full CP.
+    pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        listener_handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::control_plane::wait_for_cp_listeners_until_shutdown_or_exit(
+            listener_handles,
+            shutdown_tx,
+            drain_timeout,
+        )
+        .await
     }
 }
