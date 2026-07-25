@@ -8,53 +8,6 @@ use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::GatewayConfig;
-
-/// Last reconciler-accepted Kubernetes translation held independently of the
-/// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
-/// before publication so a DB poll cannot wipe in-memory K8s-derived state
-/// (issues #2982 / #2984).
-#[derive(Debug, Clone)]
-pub struct AcceptedK8sOverlay {
-    pub translation: GatewayConfig,
-    pub managed_namespaces: BTreeSet<String>,
-}
-
-/// Shared slot written by the K8s reconciler and read by CP DB publication.
-pub type K8sOverlaySlot = Arc<ArcSwap<Option<AcceptedK8sOverlay>>>;
-
-/// Create an empty overlay slot (no K8s translation accepted yet).
-pub fn empty_k8s_overlay_slot() -> K8sOverlaySlot {
-    Arc::new(ArcSwap::from_pointee(None))
-}
-
-/// Record the last accepted K8s translation for later CP full-reload re-merge.
-pub fn store_accepted_k8s_overlay(
-    slot: &K8sOverlaySlot,
-    translation: GatewayConfig,
-    managed_namespaces: BTreeSet<String>,
-) {
-    slot.store(Arc::new(Some(AcceptedK8sOverlay {
-        translation,
-        managed_namespaces,
-    })));
-}
-
-/// Compose a DB-authored snapshot with the independently owned K8s overlay.
-///
-/// When the slot is empty the DB snapshot is returned unchanged.
-pub fn compose_db_with_k8s_overlay(
-    db_config: &GatewayConfig,
-    overlay_slot: &K8sOverlaySlot,
-) -> GatewayConfig {
-    match overlay_slot.load_full().as_ref() {
-        Some(overlay) => merge_k8s_translation(
-            db_config,
-            &overlay.translation,
-            &overlay.managed_namespaces,
-        ),
-        None => db_config.clone(),
-    }
-}
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     translate_k8s_objects_with_filter,
@@ -74,6 +27,53 @@ use crate::k8s_controller::watcher::namespaces_with_istio_root;
 
 const INITIAL_STORE_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
+
+/// Last reconciler-accepted Kubernetes translation, held independently of the
+/// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
+/// before publication so a DB poll can no longer wipe in-memory K8s-derived
+/// state and broadcast the wipe (issues #2982 / #2984).
+#[derive(Debug, Clone)]
+pub struct AcceptedK8sOverlay {
+    pub translation: GatewayConfig,
+    pub managed_namespaces: BTreeSet<String>,
+}
+
+/// Shared slot written by the K8s reconciler and read by CP DB publication.
+pub type K8sOverlaySlot = Arc<ArcSwap<Option<AcceptedK8sOverlay>>>;
+
+/// Create an empty overlay slot (no K8s translation accepted yet).
+pub fn empty_k8s_overlay_slot() -> K8sOverlaySlot {
+    Arc::new(ArcSwap::from_pointee(None))
+}
+
+/// Record the last accepted K8s translation for later CP full-reload re-merge.
+///
+/// Only ever called after a translation SUCCEEDS, so a failed translate never
+/// overwrites the last accepted overlay with an empty one.
+pub fn store_accepted_k8s_overlay(
+    slot: &K8sOverlaySlot,
+    translation: GatewayConfig,
+    managed_namespaces: BTreeSet<String>,
+) {
+    slot.store(Arc::new(Some(AcceptedK8sOverlay {
+        translation,
+        managed_namespaces,
+    })));
+}
+
+/// Compose a DB-authored snapshot with the independently owned K8s overlay.
+///
+/// When the slot is empty the DB snapshot is returned unchanged.
+pub fn compose_db_with_k8s_overlay(
+    db_config: &GatewayConfig,
+    overlay_slot: &K8sOverlaySlot,
+) -> GatewayConfig {
+    let slot = overlay_slot.load_full();
+    let Some(overlay) = slot.as_ref() else {
+        return db_config.clone();
+    };
+    merge_k8s_translation(db_config, &overlay.translation, &overlay.managed_namespaces)
+}
 
 pub struct ReconcilerConfig {
     pub namespace: String,

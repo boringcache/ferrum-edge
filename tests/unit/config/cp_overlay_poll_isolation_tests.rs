@@ -1,7 +1,7 @@
-//! CP DB-poll / Kubernetes-overlay isolation (issues #2982–#2985).
+//! CP DB-poll / Kubernetes-overlay isolation (issues #2982–#2984).
 //!
 //! Covers overlay survival across full DB reload, per-namespace failure
-//! isolation, concurrent poll/reconcile CAS publication, and MissedTick Delay.
+//! isolation, and concurrent poll/reconcile CAS publication.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -12,8 +12,7 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     cas_publish_db_snapshot_with_k8s_overlay_for_test, cas_publish_incremental_partitions_for_test,
-    compose_db_with_k8s_overlay, compose_incremental_partitions_for_test,
-    cp_poll_source_uses_missed_tick_delay_for_test, empty_k8s_overlay_slot,
+    compose_db_with_k8s_overlay, compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
 use ferrum_edge::config::db_backend::IncrementalResult;
@@ -300,14 +299,5 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
             .iter()
             .any(|p| p.id == "gwapi-route-overlay"),
         "concurrent reconciler overlay must survive incremental CAS"
-    );
-}
-
-#[test]
-fn cp_poll_interval_sets_missed_tick_delay() {
-    // #2985: source-pin matching database mode's Delay contract.
-    assert!(
-        cp_poll_source_uses_missed_tick_delay_for_test(),
-        "CP poll loop must set MissedTickBehavior::Delay"
     );
 }

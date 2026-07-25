@@ -43,9 +43,7 @@ use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
-use crate::k8s_controller::{
-    K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
-};
+use crate::k8s_controller::{K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
@@ -450,11 +448,17 @@ async fn load_incremental_config_multi(
 }
 
 /// Outcome of a multi-namespace incremental load with per-namespace isolation.
-#[derive(Debug)]
+///
+/// Deliberately not `Debug`: `IncrementalResult` carries consumer credentials
+/// and intentionally omits a `Debug` impl so it can never be formatted into a
+/// log line.
 struct IncrementalMultiLoad {
     result: IncrementalResult,
     /// Cursors only for namespaces whose load succeeded.
     next_sequences: HashMap<String, u64>,
+    /// `(namespace, error)` for namespaces whose delta load failed outright
+    /// (connectivity / decode). These keep their prior cursor and their
+    /// last-known-good resources; they are NOT validation rejections.
     load_failures: Vec<(String, String)>,
 }
 
@@ -480,17 +484,22 @@ async fn load_full_config_multi(
         let config = db
             .load_full_config_for_purpose(ns, FullConfigLoadPurpose::ControlPlane)
             .await?;
-        let config = prepare_cp_full_snapshot(config)?;
+        let mut config = prepare_cp_full_snapshot(config)?;
+        // `mesh` is owned by the K8s overlay slot, never by a DB snapshot; the
+        // publication step re-merges it (#2982).
+        config.mesh = None;
         return Ok(FullLoadMultiOutcome {
             config,
             rejected_namespaces: Vec::new(),
             refreshed_namespaces: vec![ns.to_string()],
+            failed_namespaces: Vec::new(),
         });
     }
 
     let mut combined: Option<GatewayConfig> = None;
     let mut rejected_namespaces = Vec::new();
     let mut refreshed_namespaces = Vec::new();
+    let mut failed_namespaces = Vec::new();
     let mut any_success = false;
     let mut last_hard_error: Option<anyhow::Error> = None;
 
@@ -565,6 +574,7 @@ async fn load_full_config_multi(
                         previous,
                         ns,
                     );
+                    failed_namespaces.push(ns.clone());
                     last_hard_error = Some(error);
                 }
             }
@@ -598,14 +608,23 @@ async fn load_full_config_multi(
         config,
         rejected_namespaces,
         refreshed_namespaces,
+        failed_namespaces,
     })
 }
 
-#[derive(Debug)]
+/// Not `Debug`: `GatewayConfig` carries consumer credentials, so this outcome
+/// must never be formattable into a log line.
 struct FullLoadMultiOutcome {
     config: GatewayConfig,
+    /// `(namespace, error)` for namespaces whose snapshot was REJECTED by the
+    /// runtime validation contract (backend reachable, data invalid).
     rejected_namespaces: Vec<(String, String)>,
+    /// Namespaces whose snapshot loaded and validated; only these advance a
+    /// change-sequence cursor and only these are broadcast.
     refreshed_namespaces: Vec<String>,
+    /// Namespaces whose snapshot load failed outright (connectivity / decode)
+    /// rather than being rejected by validation.
+    failed_namespaces: Vec<String>,
 }
 
 fn clear_namespaced_resources(config: &mut GatewayConfig) {
@@ -660,7 +679,7 @@ async fn load_full_config_multi_with_sequence(
     namespaces: &[String],
     previous: &GatewayConfig,
 ) -> Result<(FullLoadMultiOutcome, HashMap<String, u64>), anyhow::Error> {
-    let outcome = load_full_config_multi(db, namespaces, previous).await?;
+    let mut outcome = load_full_config_multi(db, namespaces, previous).await?;
     let mut sequences = HashMap::new();
     if namespaces.is_empty() {
         sequences.insert(
@@ -668,10 +687,29 @@ async fn load_full_config_multi_with_sequence(
             db.latest_change_sequence("ferrum").await?,
         );
     }
-    // Only advance cursors for namespaces that successfully refreshed.
-    for ns in &outcome.refreshed_namespaces {
-        sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
+    // Only advance cursors for namespaces that successfully refreshed. A
+    // cursor read that fails demotes just that namespace out of
+    // `refreshed_namespaces` (it keeps its old cursor and is not broadcast);
+    // it must not `?` and abort the reload for every other tenant (#2983).
+    let mut refreshed = Vec::with_capacity(outcome.refreshed_namespaces.len());
+    for ns in std::mem::take(&mut outcome.refreshed_namespaces) {
+        match db.latest_change_sequence(&ns).await {
+            Ok(sequence) => {
+                sequences.insert(ns.clone(), sequence);
+                refreshed.push(ns);
+            }
+            Err(error) => {
+                error!(
+                    namespace = %ns,
+                    error = %error,
+                    "CP could not read the change-sequence cursor for namespace after a full \
+                     reload; leaving its cursor unchanged and skipping its broadcast"
+                );
+                outcome.failed_namespaces.push(ns);
+            }
+        }
     }
+    outcome.refreshed_namespaces = refreshed;
     Ok((outcome, sequences))
 }
 
@@ -695,21 +733,50 @@ pub(crate) fn cas_publish_db_snapshot_with_k8s_overlay(
     }
 }
 
-/// Apply accepted per-namespace incremental partitions onto `base`, validating
-/// each namespace independently. Rejected namespaces keep their prior resources
-/// in the composed view (#2983).
+/// Apply per-namespace incremental partitions onto `base`, validating each
+/// namespace independently so one invalid tenant cannot freeze the others
+/// (#2983). Rejected namespaces keep their prior resources in the composed view.
+///
+/// Two-phase by design. The healthy path applies every partition to a single
+/// candidate and runs the same combined rejecting contract the CP has always
+/// used, so a normal poll tick still costs exactly one `GatewayConfig` clone.
+/// Only when that combined view is rejected does the per-namespace isolation
+/// pass run, which necessarily clones once per namespace.
 pub(crate) fn compose_incremental_partitions(
     base: &GatewayConfig,
     partitions: &HashMap<String, IncrementalResult>,
 ) -> PartitionComposeOutcome {
+    // Deterministic order for stable tests / logs.
+    let mut namespaces: Vec<String> = partitions.keys().cloned().collect();
+    namespaces.sort();
+
+    // Scoped so the combined candidate is released before the isolation pass
+    // starts cloning again.
+    {
+        let mut candidate = base.clone();
+        for ns in &namespaces {
+            if let Some(delta) = partitions.get(ns) {
+                apply_incremental_to_config(&mut candidate, delta.clone());
+            }
+        }
+        candidate.normalize_fields();
+        candidate.resolve_upstream_tls();
+        if collect_rejecting_cp_incremental_errors(&candidate, &namespaces).is_empty() {
+            return PartitionComposeOutcome {
+                config: candidate,
+                accepted: partitions.clone(),
+                rejected: Vec::new(),
+            };
+        }
+    }
+
+    // Isolation pass: a namespace's rejecting validators only ever read that
+    // namespace's view, so applying one partition at a time and validating the
+    // filtered view attributes the failure to the namespace that caused it.
     let mut working = base.clone();
     let mut accepted = HashMap::new();
     let mut rejected = Vec::new();
-
-    // Deterministic order for stable tests / logs.
-    let mut namespaces: Vec<&String> = partitions.keys().collect();
-    namespaces.sort();
-    for ns in namespaces {
+    for ns in &namespaces {
         let Some(delta) = partitions.get(ns) else {
             continue;
         };
@@ -740,7 +807,8 @@ pub(crate) fn compose_incremental_partitions(
     }
 }
 
-#[derive(Debug)]
+/// Not `Debug`: holds `IncrementalResult` (consumer credentials) and a
+/// `GatewayConfig`, neither of which may reach a log line.
 pub(crate) struct PartitionComposeOutcome {
     pub config: GatewayConfig,
     pub accepted: HashMap<String, IncrementalResult>,
@@ -778,19 +846,14 @@ fn merge_refreshed_change_sequences(
     }
 }
 
-fn observe_namespace_load_rejections(
-    rejected_namespaces: &[(String, String)],
-    context: &str,
-) -> Option<anyhow::Error> {
+/// Build the typed rejection marker for a set of per-namespace validation
+/// rejections, or `None` when there are none.
+///
+/// Pure constructor: every caller already emits the per-namespace `error!`
+/// line at the point of rejection, so this must not log again per poll tick.
+fn namespace_rejection_error(rejected_namespaces: &[(String, String)]) -> Option<anyhow::Error> {
     if rejected_namespaces.is_empty() {
         return None;
-    }
-    for (namespace, message) in rejected_namespaces {
-        error!(
-            namespace = %namespace,
-            context,
-            "CP namespace config rejected; last-known-good retained: {message}"
-        );
     }
     let errors: Vec<String> = rejected_namespaces
         .iter()
@@ -805,8 +868,51 @@ fn observe_namespace_load_rejections(
     )
 }
 
+/// Settle the config-rejection signal after a CP full reload that may have
+/// covered only some namespaces (#2983).
+///
+/// Only a reload that refreshed EVERY polled namespace may clear
+/// `config_rejected` — issue #2158 keeps an accepted full reload as the single
+/// clearing site precisely because it is the only thing that re-reads the whole
+/// snapshot from the backend. A namespace rejected by validation raises the
+/// typed rejection (backend reachable, admin stays writable for in-band
+/// repair); a namespace whose load merely failed leaves any standing signal
+/// untouched so a partial reload is never mistaken for proof of a clean
+/// snapshot.
+async fn settle_full_reload_rejection_state(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    config_rejected: &AtomicBool,
+    rejected_namespaces: &[(String, String)],
+    failed_namespaces: &[String],
+    context: &str,
+) {
+    if let Some(rejection) = namespace_rejection_error(rejected_namespaces) {
+        crate::modes::record_config_validation_rejection(
+            db,
+            db_available,
+            config_rejected,
+            &rejection,
+            context,
+        )
+        .await;
+        return;
+    }
+    if !failed_namespaces.is_empty() {
+        warn!(
+            context,
+            failed_namespaces = %failed_namespaces.join(","),
+            "CP full reload could not refresh every namespace; serving last-known-good for the \
+             remainder and leaving any standing config-rejection signal in place"
+        );
+        return;
+    }
+    crate::modes::clear_config_rejected_after_accepted_full_reload(config_rejected, context);
+}
+
 /// Publish a DB full-reload snapshot with K8s overlay re-merge + CAS, then
 /// broadcast only namespaces that successfully refreshed (#2982 / #2983 / #2984).
+#[allow(clippy::too_many_arguments)]
 fn publish_cp_full_reload(
     config_arc: &ArcSwap<GatewayConfig>,
     overlay_slot: &K8sOverlaySlot,
@@ -819,9 +925,8 @@ fn publish_cp_full_reload(
         crate::grpc::mesh_server::MeshConfigBroadcast,
     >,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
-) -> Arc<GatewayConfig> {
-    let published =
-        cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
+) {
+    let published = cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
     for namespace in refreshed_namespaces {
         CpGrpcServer::broadcast_namespace_update(
             broadcasts,
@@ -831,12 +936,7 @@ fn publish_cp_full_reload(
             cp_scope,
         );
     }
-    MeshGrpcServer::broadcast_full_with_registry(
-        mesh_update_tx,
-        published.clone(),
-        mesh_registry,
-    );
-    published
+    MeshGrpcServer::broadcast_full_with_registry(mesh_update_tx, published, mesh_registry);
 }
 
 fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
@@ -1203,21 +1303,36 @@ pub async fn run(
     }
 
     let empty_previous = GatewayConfig::default();
-    let (full_load, initial_change_sequences) = load_full_config_multi_with_sequence(
-        db.as_ref(),
-        &polled_namespaces,
-        &empty_previous,
-    )
-    .await?;
-    let config = full_load.config;
-    if !full_load.rejected_namespaces.is_empty() {
-        for (namespace, message) in &full_load.rejected_namespaces {
-            error!(
-                namespace = %namespace,
-                "CP startup full load rejected namespace; continuing with remaining namespaces: {message}"
-            );
-        }
+    let (full_load, initial_change_sequences) =
+        load_full_config_multi_with_sequence(db.as_ref(), &polled_namespaces, &empty_previous)
+            .await?;
+    // Startup fails CLOSED. Per-namespace isolation (#2983) exists so a broken
+    // tenant cannot freeze *distribution of a last-known-good snapshot* for the
+    // others — at startup there is no last-known-good snapshot, so a namespace
+    // that did not load would be published as an EMPTY tenant: every route 404s
+    // and mesh subscribers see zero AuthorizationPolicies (mesh_authz allows
+    // when no ALLOW rules exist). Refuse to start instead.
+    if !full_load.rejected_namespaces.is_empty() || !full_load.failed_namespaces.is_empty() {
+        let mut details: Vec<String> = full_load
+            .rejected_namespaces
+            .iter()
+            .map(|(namespace, message)| format!("namespace '{namespace}' rejected: {message}"))
+            .collect();
+        details.extend(
+            full_load
+                .failed_namespaces
+                .iter()
+                .map(|namespace| format!("namespace '{namespace}': initial full load failed")),
+        );
+        anyhow::bail!(
+            "CP startup aborted: {} of {} namespace(s) failed the initial full config load, and \
+             there is no last-known-good snapshot to serve them from: {}",
+            details.len(),
+            polled_namespaces.len().max(1),
+            details.join("; ")
+        );
     }
+    let config = full_load.config;
     info!(
         "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),
@@ -1881,8 +1996,7 @@ pub async fn run(
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
-        // Match database mode: a slow poll must not fire a catch-up burst of
-        // missed ticks against a degraded DB (#2985).
+        // Match database mode: never burst catch-up full polls after a slow cycle.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip first immediate tick
 
@@ -1997,7 +2111,7 @@ pub async fn run(
                                 force_full_reload = false;
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
-                                let _published = publish_cp_full_reload(
+                                publish_cp_full_reload(
                                     config_poll.as_ref(),
                                     &overlay_poll,
                                     outcome.config,
@@ -2008,24 +2122,15 @@ pub async fn run(
                                     &mesh_update_tx,
                                     &mesh_registry_poll,
                                 );
-                                if let Some(rejection) = observe_namespace_load_rejections(
+                                settle_full_reload_rejection_state(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    &config_rejected_poll,
                                     &outcome.rejected_namespaces,
+                                    &outcome.failed_namespaces,
                                     "full reload after DB DNS reconnect",
-                                ) {
-                                    crate::modes::record_config_validation_rejection(
-                                        &db_poll,
-                                        &db_available_poll,
-                                        &config_rejected_poll,
-                                        &rejection,
-                                        "full reload after DB DNS reconnect",
-                                    )
-                                    .await;
-                                } else {
-                                    crate::modes::clear_config_rejected_after_accepted_full_reload(
-                                        &config_rejected_poll,
-                                        "full reload after DB DNS reconnect",
-                                    );
-                                }
+                                )
+                                .await;
                                 debug!("Full config reload complete after DB DNS reconnect");
                             }
                             Err(e) => {
@@ -2113,21 +2218,28 @@ pub async fn run(
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
 
+                                // Per-namespace delta-load failures are
+                                // connectivity/decode faults, NOT validation
+                                // rejections: they are already logged per
+                                // namespace, their cursor is untouched so the
+                                // next tick retries the same rows, and they must
+                                // NOT be laundered through
+                                // `record_config_validation_rejection` — that
+                                // path asserts the backend proved itself
+                                // reachable for this read and would re-derive
+                                // `db_available` from a deferred-migration probe
+                                // on every poll tick.
                                 if !load_failures.is_empty() {
-                                    let rejection_pairs: Vec<(String, String)> = load_failures;
-                                    if let Some(rejection) = observe_namespace_load_rejections(
-                                        &rejection_pairs,
-                                        "incremental load",
-                                    ) {
-                                        crate::modes::record_config_validation_rejection(
-                                            &db_poll,
-                                            &db_available_poll,
-                                            &config_rejected_poll,
-                                            &rejection,
-                                            "incremental load",
-                                        )
-                                        .await;
-                                    }
+                                    warn!(
+                                        failed_namespaces = %load_failures
+                                            .iter()
+                                            .map(|(ns, _)| ns.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                        "CP incremental poll skipped namespace(s) after a load \
+                                         failure; their cursors are unchanged and the remaining \
+                                         namespaces continue"
+                                    );
                                 }
 
                                 if result.is_empty() {
@@ -2156,58 +2268,97 @@ pub async fn run(
                                     &current_upstream_ns,
                                 );
 
-                                // Warn-only validators over the union of
-                                // accepted+pending partitions applied to a
-                                // scratch clone (does not affect publication).
-                                {
-                                    let mut warn_config = (*config_poll.load_full()).clone();
-                                    apply_incremental_to_config(&mut warn_config, result.clone());
-                                    warn_config.normalize_fields();
-                                    warn_config.resolve_upstream_tls();
-                                    if let Err(errors) = warn_config
-                                        .validate_all_fields_with_ip_policy(
-                                            poll_cert_expiry_warning_days,
-                                            &poll_backend_allow_ips,
-                                        )
-                                    {
-                                        for msg in &errors {
-                                            warn!("CP config field validation: {}", msg);
-                                        }
-                                    }
-                                    if let Err(errors) = warn_config.validate_hosts() {
-                                        for msg in &errors {
-                                            warn!("CP config validation: {}", msg);
-                                        }
-                                    }
+                                // Publication now flows THROUGH the partitions,
+                                // so a non-empty delta that partitions to
+                                // nothing (deletions for ids already absent
+                                // from the CP snapshot, so their namespace
+                                // cannot be resolved) has nothing to publish.
+                                // The cursor must still advance or the same
+                                // rows are re-read on every tick forever.
+                                if partitions.is_empty() {
+                                    warn!(
+                                        "CP incremental delta contained no namespace-attributable \
+                                         changes; advancing cursors for the namespaces that loaded"
+                                    );
+                                    merge_refreshed_change_sequences(
+                                        &mut last_change_sequences,
+                                        next_sequences,
+                                    );
+                                    rejected_delta_tracker.record_accepted();
+                                    continue;
                                 }
 
                                 let compose =
                                     cas_publish_incremental_partitions(config_poll.as_ref(), &partitions);
 
+                                // Warn-only validators (same set as
+                                // `ProxyState::validate_full_config`) run on the
+                                // composed view rather than on a second scratch
+                                // clone, so they describe exactly what was
+                                // published and the healthy path still pays for
+                                // only one `GatewayConfig` clone per tick.
+                                if let Err(errors) = compose
+                                    .config
+                                    .validate_all_fields_with_ip_policy(
+                                        poll_cert_expiry_warning_days,
+                                        &poll_backend_allow_ips,
+                                    )
+                                {
+                                    for msg in &errors {
+                                        warn!("CP config field validation: {}", msg);
+                                    }
+                                }
+                                if let Err(errors) = compose.config.validate_hosts() {
+                                    for msg in &errors {
+                                        warn!("CP config validation: {}", msg);
+                                    }
+                                }
+
                                 if !compose.rejected.is_empty() {
                                     let rejection_pairs: Vec<(String, String)> = compose
                                         .rejected
                                         .iter()
-                                        .map(|(ns, errors)| {
-                                            (ns.clone(), errors.join("; "))
+                                        .map(|(ns, errors)| (ns.clone(), errors.join("; ")))
+                                        .collect();
+                                    // Identify the stuck batch by the REJECTED
+                                    // namespaces' cursors only. Keying on every
+                                    // namespace would reset the counter on every
+                                    // tick a healthy tenant advanced, so a
+                                    // persistently invalid tenant would never
+                                    // reach the escalation threshold and
+                                    // `config_rejected` could never be cleared
+                                    // by an accepted full reload.
+                                    let rejected_sequences: HashMap<String, u64> = compose
+                                        .rejected
+                                        .iter()
+                                        .filter_map(|(ns, _)| {
+                                            next_sequences.get(ns).map(|seq| (ns.clone(), *seq))
                                         })
                                         .collect();
                                     let decision = rejected_delta_tracker
-                                        .record_rejection(&next_sequences);
-                                    if let Some(rejection) = observe_namespace_load_rejections(
-                                        &rejection_pairs,
-                                        "incremental validation",
-                                    ) {
-                                        crate::modes::record_config_validation_rejection(
-                                            &db_poll,
-                                            &db_available_poll,
-                                            &config_rejected_poll,
-                                            &rejection,
-                                            "incremental validation",
-                                        )
-                                        .await;
+                                        .record_rejection(&rejected_sequences);
+                                    // Only probe the deferred-migration gate on
+                                    // the transition into the rejected state or
+                                    // on an escalation tick, so a long-lived bad
+                                    // tenant does not add a DB round trip to
+                                    // every poll cycle.
+                                    if decision.should_escalate
+                                        || !config_rejected_poll.load(Ordering::Relaxed)
+                                    {
+                                        if let Some(rejection) =
+                                            namespace_rejection_error(&rejection_pairs)
+                                        {
+                                            crate::modes::record_config_validation_rejection(
+                                                &db_poll,
+                                                &db_available_poll,
+                                                &config_rejected_poll,
+                                                &rejection,
+                                                "incremental validation",
+                                            )
+                                            .await;
+                                        }
                                     }
-                                    if compose.accepted.is_empty() && decision.should_escalate {
+                                    if decision.should_escalate {
                                         error!(
                                             consecutive_identical_rejections = decision.consecutive,
                                             "Repeated CP delta rejection reached threshold; attempting authoritative full reload"
@@ -2225,7 +2376,7 @@ pub async fn run(
                                                     sequences,
                                                 );
                                                 last_polled_namespaces = nslist.clone();
-                                                let _published = publish_cp_full_reload(
+                                                publish_cp_full_reload(
                                                     config_poll.as_ref(),
                                                     &overlay_poll,
                                                     outcome.config,
@@ -2238,26 +2389,15 @@ pub async fn run(
                                                 );
                                                 rejected_delta_tracker.record_accepted();
                                                 db_available_poll.store(true, Ordering::Relaxed);
-                                                if let Some(rejection) =
-                                                    observe_namespace_load_rejections(
-                                                        &outcome.rejected_namespaces,
-                                                        "rejected-delta escalation full reload",
-                                                    )
-                                                {
-                                                    crate::modes::record_config_validation_rejection(
-                                                        &db_poll,
-                                                        &db_available_poll,
-                                                        &config_rejected_poll,
-                                                        &rejection,
-                                                        "rejected-delta escalation full reload",
-                                                    )
-                                                    .await;
-                                                } else {
-                                                    crate::modes::clear_config_rejected_after_accepted_full_reload(
-                                                        &config_rejected_poll,
-                                                        "rejected-delta escalation full reload",
-                                                    );
-                                                }
+                                                settle_full_reload_rejection_state(
+                                                    &db_poll,
+                                                    &db_available_poll,
+                                                    &config_rejected_poll,
+                                                    &outcome.rejected_namespaces,
+                                                    &outcome.failed_namespaces,
+                                                    "rejected-delta escalation full reload",
+                                                )
+                                                .await;
                                                 info!(
                                                     "Rejected CP delta recovered by authoritative full reload and full-snapshot broadcast"
                                                 );
@@ -2306,74 +2446,77 @@ pub async fn run(
                                         &poll_scope,
                                     );
                                 }
-                                if !compose.accepted.is_empty() {
-                                    // Mesh gets the union of accepted deltas.
-                                    let mut mesh_delta = IncrementalResult {
-                                        added_or_modified_proxies: Vec::new(),
-                                        removed_proxy_ids: Vec::new(),
-                                        added_or_modified_consumers: Vec::new(),
-                                        removed_consumer_ids: Vec::new(),
-                                        added_or_modified_plugin_configs: Vec::new(),
-                                        removed_plugin_config_ids: Vec::new(),
-                                        added_or_modified_upstreams: Vec::new(),
-                                        removed_upstream_ids: Vec::new(),
-                                        sequence_cursor: result.sequence_cursor,
-                                        poll_timestamp: poll_ts,
-                                    };
-                                    for delta in compose.accepted.values() {
-                                        mesh_delta
-                                            .added_or_modified_proxies
-                                            .extend(delta.added_or_modified_proxies.clone());
-                                        mesh_delta
-                                            .removed_proxy_ids
-                                            .extend(delta.removed_proxy_ids.clone());
-                                        mesh_delta
-                                            .added_or_modified_consumers
-                                            .extend(delta.added_or_modified_consumers.clone());
-                                        mesh_delta
-                                            .removed_consumer_ids
-                                            .extend(delta.removed_consumer_ids.clone());
-                                        mesh_delta.added_or_modified_plugin_configs.extend(
-                                            delta.added_or_modified_plugin_configs.clone(),
-                                        );
-                                        mesh_delta.removed_plugin_config_ids.extend(
-                                            delta.removed_plugin_config_ids.clone(),
-                                        );
-                                        mesh_delta
-                                            .added_or_modified_upstreams
-                                            .extend(delta.added_or_modified_upstreams.clone());
-                                        mesh_delta
-                                            .removed_upstream_ids
-                                            .extend(delta.removed_upstream_ids.clone());
-                                    }
-                                    MeshGrpcServer::broadcast_delta_with_registry(
-                                        &mesh_update_tx,
-                                        mesh_delta,
-                                        &version,
-                                        &mesh_registry_poll,
+                                // Mesh subscribers are not namespace-partitioned,
+                                // so they receive the union of exactly the
+                                // accepted per-namespace deltas — never a
+                                // rejected namespace's rows.
+                                let mut mesh_delta = IncrementalResult {
+                                    added_or_modified_proxies: Vec::new(),
+                                    removed_proxy_ids: Vec::new(),
+                                    added_or_modified_consumers: Vec::new(),
+                                    removed_consumer_ids: Vec::new(),
+                                    added_or_modified_plugin_configs: Vec::new(),
+                                    removed_plugin_config_ids: Vec::new(),
+                                    added_or_modified_upstreams: Vec::new(),
+                                    removed_upstream_ids: Vec::new(),
+                                    sequence_cursor: result.sequence_cursor,
+                                    poll_timestamp: poll_ts,
+                                };
+                                for delta in compose.accepted.values() {
+                                    mesh_delta
+                                        .added_or_modified_proxies
+                                        .extend(delta.added_or_modified_proxies.iter().cloned());
+                                    mesh_delta
+                                        .removed_proxy_ids
+                                        .extend(delta.removed_proxy_ids.iter().cloned());
+                                    mesh_delta
+                                        .added_or_modified_consumers
+                                        .extend(delta.added_or_modified_consumers.iter().cloned());
+                                    mesh_delta
+                                        .removed_consumer_ids
+                                        .extend(delta.removed_consumer_ids.iter().cloned());
+                                    mesh_delta.added_or_modified_plugin_configs.extend(
+                                        delta.added_or_modified_plugin_configs.iter().cloned(),
                                     );
-                                    info!(
-                                        "Incremental config update validated and pushed to {} namespace(s) (version={})",
-                                        compose.accepted.len(),
-                                        version
-                                    );
-                                    // Advance only accepted namespace cursors.
-                                    for ns in compose.accepted.keys() {
-                                        if let Some(seq) = next_sequences.get(ns) {
-                                            last_change_sequences.insert(ns.clone(), *seq);
-                                        }
+                                    mesh_delta
+                                        .removed_plugin_config_ids
+                                        .extend(delta.removed_plugin_config_ids.iter().cloned());
+                                    mesh_delta
+                                        .added_or_modified_upstreams
+                                        .extend(delta.added_or_modified_upstreams.iter().cloned());
+                                    mesh_delta
+                                        .removed_upstream_ids
+                                        .extend(delta.removed_upstream_ids.iter().cloned());
+                                }
+                                MeshGrpcServer::broadcast_delta_with_registry(
+                                    &mesh_update_tx,
+                                    mesh_delta,
+                                    &version,
+                                    &mesh_registry_poll,
+                                );
+                                info!(
+                                    "Incremental config update validated and pushed to {} namespace(s) (version={})",
+                                    compose.accepted.len(),
+                                    version
+                                );
+                                // Advance the cursor for accepted namespaces and
+                                // for namespaces that loaded with no changes at
+                                // all. A REJECTED namespace is present in
+                                // `partitions` and absent from `accepted`, so it
+                                // keeps its cursor and the next poll retries the
+                                // same rows (#2983).
+                                for ns in compose.accepted.keys() {
+                                    if let Some(seq) = next_sequences.get(ns) {
+                                        last_change_sequences.insert(ns.clone(), *seq);
                                     }
-                                    // Also advance namespaces that loaded with
-                                    // empty partitions (present in next_sequences
-                                    // but not in partitions).
-                                    for (ns, seq) in &next_sequences {
-                                        if !partitions.contains_key(ns) {
-                                            last_change_sequences.insert(ns.clone(), *seq);
-                                        }
+                                }
+                                for (ns, seq) in &next_sequences {
+                                    if !partitions.contains_key(ns) {
+                                        last_change_sequences.insert(ns.clone(), *seq);
                                     }
-                                    if compose.rejected.is_empty() {
-                                        rejected_delta_tracker.record_accepted();
-                                    }
+                                }
+                                if compose.rejected.is_empty() {
+                                    rejected_delta_tracker.record_accepted();
                                 }
                             }
                             Err(e) => {
@@ -2415,7 +2558,7 @@ pub async fn run(
                                             sequences,
                                         );
                                         rejected_delta_tracker.record_accepted();
-                                        let _published = publish_cp_full_reload(
+                                        publish_cp_full_reload(
                                             config_poll.as_ref(),
                                             &overlay_poll,
                                             outcome.config,
@@ -2426,24 +2569,15 @@ pub async fn run(
                                             &mesh_update_tx,
                                             &mesh_registry_poll,
                                         );
-                                        if let Some(rejection) = observe_namespace_load_rejections(
+                                        settle_full_reload_rejection_state(
+                                            &db_poll,
+                                            &db_available_poll,
+                                            &config_rejected_poll,
                                             &outcome.rejected_namespaces,
+                                            &outcome.failed_namespaces,
                                             "full fallback reload",
-                                        ) {
-                                            crate::modes::record_config_validation_rejection(
-                                                &db_poll,
-                                                &db_available_poll,
-                                                &config_rejected_poll,
-                                                &rejection,
-                                                "full fallback reload",
-                                            )
-                                            .await;
-                                        } else {
-                                            crate::modes::clear_config_rejected_after_accepted_full_reload(
-                                                &config_rejected_poll,
-                                                "full fallback reload",
-                                            );
-                                        }
+                                        )
+                                        .await;
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs and mesh nodes");
                                     }
                                     Err(e2) => {
@@ -2506,7 +2640,7 @@ pub async fn run(
                                                             sequences,
                                                         );
                                                         rejected_delta_tracker.record_accepted();
-                                                        let _published = publish_cp_full_reload(
+                                                        publish_cp_full_reload(
                                                             config_poll.as_ref(),
                                                             &overlay_poll,
                                                             outcome.config,
@@ -2517,26 +2651,15 @@ pub async fn run(
                                                             &mesh_update_tx,
                                                             &mesh_registry_poll,
                                                         );
-                                                        if let Some(rejection) =
-                                                            observe_namespace_load_rejections(
-                                                                &outcome.rejected_namespaces,
-                                                                "failover full reload",
-                                                            )
-                                                        {
-                                                            crate::modes::record_config_validation_rejection(
-                                                                &db_poll,
-                                                                &db_available_poll,
-                                                                &config_rejected_poll,
-                                                                &rejection,
-                                                                "failover full reload",
-                                                            )
-                                                            .await;
-                                                        } else {
-                                                            crate::modes::clear_config_rejected_after_accepted_full_reload(
-                                                                &config_rejected_poll,
-                                                                "failover full reload",
-                                                            );
-                                                        }
+                                                        settle_full_reload_rejection_state(
+                                                            &db_poll,
+                                                            &db_available_poll,
+                                                            &config_rejected_poll,
+                                                            &outcome.rejected_namespaces,
+                                                            &outcome.failed_namespaces,
+                                                            "failover full reload",
+                                                        )
+                                                        .await;
                                                         info!("Configuration reloaded from database (failover) and pushed to DPs and mesh nodes");
                                                     }
                                                     Err(e3) => {
@@ -3048,18 +3171,6 @@ mod tests {
                 "missing CP migration gate for {context}"
             );
         }
-    }
-
-    #[test]
-    fn cp_poll_interval_uses_missed_tick_delay() {
-        // Issue #2985: parity with database mode — slow polls must not burst.
-        let source = include_str!("control_plane.rs");
-        assert!(
-            source.contains(
-                "interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);"
-            ),
-            "CP poll interval must use MissedTickBehavior::Delay"
-        );
     }
 
     #[test]
