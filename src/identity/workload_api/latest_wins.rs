@@ -158,7 +158,7 @@ impl<T> LatestWinsReceiver<T> {
     where
         T: Send + 'static,
     {
-        tokio_stream::unfold(self, |mut rx| async move {
+        futures_util::stream::unfold(self, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
         })
     }
