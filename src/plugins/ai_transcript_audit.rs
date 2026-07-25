@@ -1132,9 +1132,7 @@ impl AiTranscriptAudit {
         let bounded_tools = if self.capture.tool_calls {
             parsed
                 .as_ref()
-                .map(|json| {
-                    extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
-                })
+                .map(|json| extract_tool_names_bounded(json, &self.redactor, redact_before_bound))
                 .unwrap_or_default()
         } else {
             BoundedToolNames::default()
@@ -1365,19 +1363,14 @@ impl AiTranscriptAudit {
                     // Protected modes redact the full observed string first so a
                     // PII span straddling the model ceiling cannot leak as a raw
                     // prefix; `full_body` keeps the bounded raw prefix.
-                    let bounded = bound_model_str(
-                        value,
-                        &self.redactor,
-                        self.mode != AuditMode::FullBody,
-                    );
+                    let bounded =
+                        bound_model_str(value, &self.redactor, self.mode != AuditMode::FullBody);
                     harvest.model = bounded.value;
                     harvest.model_truncated = bounded.truncated;
                     harvest.model_hash = bounded.hash;
                 }
                 "ai_provider" => harvest.provider = Some(bound_short_metadata(value)),
-                "ai_federation_provider" => {
-                    federation_provider = Some(bound_short_metadata(value))
-                }
+                "ai_federation_provider" => federation_provider = Some(bound_short_metadata(value)),
                 "ai_total_tokens"
                 | "ai_prompt_tokens"
                 | "ai_completion_tokens"
@@ -1432,12 +1425,7 @@ impl AiTranscriptAudit {
         // replacements may expand an already-bounded value and violate the
         // queued-record memory contract. `full_body` deliberately staged the
         // bounded raw value instead.
-        let (
-            tool_names,
-            tool_names_truncated,
-            tool_names_omitted,
-            tool_names_hash,
-        ) = if harvests {
+        let (tool_names, tool_names_truncated, tool_names_omitted, tool_names_hash) = if harvests {
             let tool_names = staging.map(|s| s.tool_names.clone()).unwrap_or_default();
             let tool_names_truncated = staging.map(|s| s.tool_names_truncated).unwrap_or(false);
             let tool_names_omitted = staging.map(|s| s.tool_names_omitted).unwrap_or(0);
@@ -1461,11 +1449,7 @@ impl AiTranscriptAudit {
                         staging.and_then(|s| s.request_model_hash.clone()),
                     )
                 } else {
-                    (
-                        harvest.model,
-                        harvest.model_truncated,
-                        harvest.model_hash,
-                    )
+                    (harvest.model, harvest.model_truncated, harvest.model_hash)
                 };
             (model, model_truncated, model_hash)
         } else {
@@ -2919,11 +2903,7 @@ fn extract_model_bounded(
 /// Truncation evidence always hashes the original unredacted value; staging
 /// never retains raw excess bytes. `full_body` deliberately keeps the bounded
 /// raw prefix.
-fn bound_model_str(
-    raw: &str,
-    redactor: &PiiRedactor,
-    redact_before_bound: bool,
-) -> BoundedModel {
+fn bound_model_str(raw: &str, redactor: &PiiRedactor, redact_before_bound: bool) -> BoundedModel {
     if raw.is_empty() {
         return BoundedModel::default();
     }

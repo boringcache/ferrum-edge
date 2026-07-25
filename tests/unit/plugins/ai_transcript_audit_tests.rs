@@ -16,7 +16,7 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
     HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES,
-    HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAMES, MAX_TOOL_NAME_BYTES,
+    HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES,
     MAX_TOOL_NAMES_AGGREGATE_BYTES, max_retained_record_bytes, snapshots,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
@@ -5275,7 +5275,9 @@ async fn authenticated_status_exposes_admitted_limits_without_content() {
     );
     let published = snapshots();
     assert!(
-        published.iter().any(|entry| entry.instance_id == snap.instance_id),
+        published
+            .iter()
+            .any(|entry| entry.instance_id == snap.instance_id),
         "committed instance must appear in authenticated snapshots"
     );
     let encoded = serde_json::to_string(&snap).expect("status serializes");
@@ -5314,9 +5316,8 @@ async fn huge_model_is_bounded_with_truncation_hash() {
     plugin.commit_background_tasks();
 
     let huge_model = "m".repeat(MAX_MODEL_BYTES + 4096);
-    let body = format!(
-        r#"{{"model":"{huge_model}","messages":[{{"role":"user","content":"hi"}}]}}"#
-    );
+    let body =
+        format!(r#"{{"model":"{huge_model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -5417,7 +5418,10 @@ async fn truncation_metadata_stable_serialization_omits_false_flags() {
         .mount(&mock)
         .await;
     let plugin = AiTranscriptAudit::new(
-        &config_with_sink(&mock.uri(), json!({ "mode": "full_body", "allow_full_body": true })),
+        &config_with_sink(
+            &mock.uri(),
+            json!({ "mode": "full_body", "allow_full_body": true }),
+        ),
         loopback_http_client(),
     )
     .unwrap();
@@ -5502,8 +5506,14 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
     let tool_pad = MAX_TOOL_NAME_BYTES - 6;
     let huge_model = format!("{}{ssn}", "m".repeat(model_pad));
     let huge_tool = format!("{}{ssn}", "t".repeat(tool_pad));
-    assert_eq!(&huge_model[..MAX_MODEL_BYTES], format!("{}123-45", "m".repeat(model_pad)));
-    assert_eq!(&huge_tool[..MAX_TOOL_NAME_BYTES], format!("{}123-45", "t".repeat(tool_pad)));
+    assert_eq!(
+        &huge_model[..MAX_MODEL_BYTES],
+        format!("{}123-45", "m".repeat(model_pad))
+    );
+    assert_eq!(
+        &huge_tool[..MAX_TOOL_NAME_BYTES],
+        format!("{}123-45", "t".repeat(tool_pad))
+    );
 
     let body = json!({
         "model": huge_model.clone(),
@@ -5522,10 +5532,7 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
         let mut overrides = mode.clone();
         if let Some(obj) = overrides.as_object_mut() {
             obj.insert("capture".to_string(), json!({ "tool_calls": true }));
-            obj.insert(
-                "redaction".to_string(),
-                json!({ "hash_secret": secret }),
-            );
+            obj.insert("redaction".to_string(), json!({ "hash_secret": secret }));
         }
         let plugin = AiTranscriptAudit::new(
             &config_with_sink(&endpoint, overrides.clone()),
