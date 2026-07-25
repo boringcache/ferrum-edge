@@ -536,6 +536,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         // unreachable primary pool times out and the backup rejection path
         // runs. If the process keeps running, it accepted the invalid snapshot.
         let deadline = SystemTime::now() + Duration::from_secs(25);
+        let mut try_wait_err = None;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
@@ -544,7 +545,7 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
                 }
                 Ok(None) => break None,
                 Err(e) => {
-                    last_err = format!("attempt {}: try_wait failed: {}", attempt, e);
+                    try_wait_err = Some(format!("attempt {}: try_wait failed: {}", attempt, e));
                     break None;
                 }
             }
@@ -591,10 +592,12 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
                 );
             }
             None => {
-                last_err = format!(
-                    "attempt {}: gateway did not exit after accepting an invalid backup\nstderr:\n{}",
-                    attempt, stderr
-                );
+                last_err = try_wait_err.unwrap_or_else(|| {
+                    format!(
+                        "attempt {}: gateway did not exit after accepting an invalid backup\nstderr:\n{}",
+                        attempt, stderr
+                    )
+                });
             }
         }
 
