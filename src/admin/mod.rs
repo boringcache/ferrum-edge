@@ -3735,12 +3735,6 @@ struct PersistCounts {
     upstreams: usize,
 }
 
-impl PersistCounts {
-    fn any(&self) -> bool {
-        self.proxies > 0 || self.consumers > 0 || self.plugin_configs > 0 || self.upstreams > 0
-    }
-}
-
 /// Reject a retry-enabled batch proxy whose `mesh_route_dispatch` rules route
 /// matched traffic to a mesh-tagged upstream (`mesh.hbone` / `mesh.mtls`) — the
 /// batch-import equivalent of the route-override conflict check in

@@ -178,20 +178,26 @@ async fn get_ns(base: &str, path: &str, namespace: &str) -> (u16, Value) {
 /// no dependencies, proxies referencing an in-batch upstream, a proxy-scoped
 /// plugin config referencing an in-batch proxy, and an explicit proxy→plugin
 /// association so the association phase has real work.
-fn graph_payload(count: usize) -> Value {
+///
+/// `id_prefix` must be unique per phase iteration inside one shared SQLite
+/// store. Upstream/proxy/plugin primary keys are global (`id` alone), so
+/// reusing the same ids across namespaces collides on retry after an earlier
+/// phase's successful commit — exactly the false `409` these tests were
+/// trapping as an atomicity failure.
+fn graph_payload(count: usize, id_prefix: &str) -> Value {
     let consumers: Vec<Value> = (0..count)
         .map(|index| {
             json!({
-                "id": format!("atomic-consumer-{index}"),
-                "username": format!("atomic-user-{index}"),
+                "id": format!("{id_prefix}-consumer-{index}"),
+                "username": format!("{id_prefix}-user-{index}"),
             })
         })
         .collect();
     let upstreams: Vec<Value> = (0..count)
         .map(|index| {
             json!({
-                "id": format!("atomic-upstream-{index}"),
-                "name": format!("atomic-upstream-name-{index}"),
+                "id": format!("{id_prefix}-upstream-{index}"),
+                "name": format!("{id_prefix}-upstream-name-{index}"),
                 "targets": [{"host": "10.0.0.10", "port": 8080, "weight": 100}],
                 "algorithm": "round_robin",
             })
@@ -200,24 +206,26 @@ fn graph_payload(count: usize) -> Value {
     let proxies: Vec<Value> = (0..count)
         .map(|index| {
             json!({
-                "id": format!("atomic-proxy-{index}"),
-                "name": format!("atomic-proxy-name-{index}"),
-                "listen_path": format!("/atomic/{index}"),
+                "id": format!("{id_prefix}-proxy-{index}"),
+                "name": format!("{id_prefix}-proxy-name-{index}"),
+                "listen_path": format!("/{id_prefix}/{index}"),
                 "backend_scheme": "http",
                 "backend_host": "127.0.0.1",
                 "backend_port": 8080,
-                "upstream_id": format!("atomic-upstream-{index}"),
-                "plugins": [{"plugin_config_id": format!("atomic-plugin-{index}")}],
+                "upstream_id": format!("{id_prefix}-upstream-{index}"),
+                "plugins": [{
+                    "plugin_config_id": format!("{id_prefix}-plugin-{index}"),
+                }],
             })
         })
         .collect();
     let plugin_configs: Vec<Value> = (0..count)
         .map(|index| {
             json!({
-                "id": format!("atomic-plugin-{index}"),
+                "id": format!("{id_prefix}-plugin-{index}"),
                 "plugin_name": "request_size_limiting",
                 "scope": "proxy",
-                "proxy_id": format!("atomic-proxy-{index}"),
+                "proxy_id": format!("{id_prefix}-proxy-{index}"),
                 "enabled": true,
                 "config": {"max_bytes": 1048576},
             })
@@ -295,7 +303,7 @@ async fn every_dependency_phase_fault_leaves_nothing_durable_and_retries_cleanly
         let namespace = format!("atomic-phase-{label}");
         set_atomic_batch_fault_for_test(&namespace, Some(AtomicBatchFault::new(phase, 0)));
 
-        let payload = graph_payload(2);
+        let payload = graph_payload(2, &format!("phase-{label}"));
         let (status, body) = post_ns(&base, "/batch", &namespace, &payload).await;
         assert_eq!(
             status, 503,
@@ -353,7 +361,7 @@ async fn fault_after_chunk_boundary_leaves_nothing_durable_and_retries_cleanly()
 
         // 3 records per family with a chunk size of 2: the first chunk of the
         // faulted phase completes, the second never runs.
-        let payload = graph_payload(3);
+        let payload = graph_payload(3, &format!("chunk-{label}"));
         let (status, body) = post_ns(&base, "/batch", &namespace, &payload).await;
         assert_eq!(
             status, 503,
@@ -470,7 +478,7 @@ async fn committed_graph_writes_one_audit_event_with_full_counts() {
     let (base, _shutdown) = start_admin(admin_state(make_store(&tmp).await)).await;
     let namespace = "atomic-audit";
 
-    let (status, body) = post_ns(&base, "/batch", namespace, &graph_payload(2)).await;
+    let (status, body) = post_ns(&base, "/batch", namespace, &graph_payload(2, "audit")).await;
     assert_eq!(status, 201, "atomic batch failed: {body:?}");
 
     let mut audit = json!({});

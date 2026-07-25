@@ -720,8 +720,10 @@ fn admission_lease_release_drains_every_guard_before_reporting() {
     );
 
     // Fail-closed pre-commit behavior is unchanged: a definitively failed
-    // mutation still surfaces an error to the caller.
-    let run = mongo_method("run_mtls_dns_mutations(");
+    // mutation still surfaces an error to the caller. The source marker uses
+    // `<` because the method is generic (`run_mtls_dns_mutations<T, F>(`);
+    // searching for `name(` would miss it.
+    let run = mongo_method("run_mtls_dns_mutations<");
     assert!(
         run.contains("mongo_mutation_outcome_is_uncertain(&error) => Err(error)"),
         "an uncertain mutation outcome must still retain its leases and fail closed"

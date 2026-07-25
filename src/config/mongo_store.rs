@@ -8475,7 +8475,7 @@ mod inner {
                     .start_transaction()
                     .and_run((self, &plan), |s, (this, plan)| {
                         Box::pin(async move {
-                            this.write_atomic_batch_graph_in_session(&mut *s, *plan)
+                            this.write_atomic_batch_graph_in_session(&mut *s, plan)
                                 .await
                         })
                     })
