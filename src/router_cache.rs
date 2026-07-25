@@ -3309,7 +3309,7 @@ mod tests {
     #[test]
     fn cms_overlapping_threshold_rearms_without_double_halving() {
         // Production minimum width: one chunk cannot finish a pass.
-        let width = 1024;
+        let width: usize = 1024;
         let total_cells = width * 2;
         let steps_per_pass = total_cells.div_ceil(CountMinSketch::AGE_CHUNK);
         assert!(steps_per_pass > 2);
@@ -3532,7 +3532,7 @@ mod tests {
         // leave every cell at 2 (8 >> 2); overlapping gens would push some ≤ 1.
         use std::sync::{Arc, Barrier};
 
-        let width = 1024;
+        let width: usize = 1024;
         let total_cells = width * 2;
         let steps_per_pass = total_cells.div_ceil(CountMinSketch::AGE_CHUNK);
         assert!(steps_per_pass > 2);
