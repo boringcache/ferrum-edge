@@ -376,12 +376,14 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     let admin = token("security-admin", Some("admin"));
 
     let secret_key = "super-secret-load-test-key-0123456789!";
+    let redis_integrity_key = "redis-integrity-key-0123456789abcdef";
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
         "scope": "global",
         "config": {
             "key": secret_key,
+            "redis_integrity_key": redis_integrity_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "ramp": true
@@ -401,12 +403,16 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     .await;
     let event = &audit_body["items"].as_array().expect("audit items")[0];
     assert_eq!(event["diff"]["after"]["config"]["key"], "[REDACTED]");
+    assert_eq!(
+        event["diff"]["after"]["config"]["redis_integrity_key"],
+        "[REDACTED]"
+    );
     assert_eq!(event["diff"]["after"]["config"]["ramp"], true);
     assert_eq!(event["diff"]["after"]["config"]["concurrent_clients"], 1);
     assert_eq!(event["diff"]["after"]["config"]["duration_seconds"], 1);
     let serialized = event["diff"].to_string();
     assert!(
-        !serialized.contains(secret_key),
+        !serialized.contains(secret_key) && !serialized.contains(redis_integrity_key),
         "secret key leaked: {event:?}"
     );
 }
@@ -421,12 +427,14 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     let operator = token("mesh-operator", Some("operator"));
 
     let secret_key = "read-secret-load-test-key-0123456789!";
+    let redis_integrity_key = "redis-integrity-key-fedcba9876543210";
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",
         "scope": "global",
         "config": {
             "key": secret_key,
+            "redis_integrity_key": redis_integrity_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "ramp": true
@@ -440,10 +448,12 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
         get_json(&base, "/plugins/config/read-plugin-secret", &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
+    assert_eq!(viewer_body["config"]["redis_integrity_key"], "[REDACTED]");
     assert_eq!(viewer_body["config"]["ramp"], true);
     assert_eq!(viewer_body["config"]["concurrent_clients"], 1);
     assert!(
-        !viewer_body.to_string().contains(secret_key),
+        !viewer_body.to_string().contains(secret_key)
+            && !viewer_body.to_string().contains(redis_integrity_key),
         "viewer response leaked plugin secret: {viewer_body:?}"
     );
 
@@ -451,16 +461,25 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
         get_json(&base, "/plugins/config/read-plugin-secret", &operator).await;
     assert_eq!(status, 200, "operator plugin get failed: {operator_body:?}");
     assert_eq!(operator_body["config"]["key"], "[REDACTED]");
+    assert_eq!(operator_body["config"]["redis_integrity_key"], "[REDACTED]");
     assert_eq!(operator_body["config"]["ramp"], true);
 
     let (status, admin_body) = get_json(&base, "/plugins/config/read-plugin-secret", &admin).await;
     assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
     assert_eq!(admin_body["config"]["key"], secret_key);
+    assert_eq!(
+        admin_body["config"]["redis_integrity_key"],
+        redis_integrity_key
+    );
     assert_eq!(admin_body["config"]["ramp"], true);
 
     let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+    assert_eq!(
+        list_body["data"][0]["config"]["redis_integrity_key"],
+        "[REDACTED]"
+    );
     assert_eq!(list_body["data"][0]["config"]["ramp"], true);
 }
 

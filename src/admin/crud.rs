@@ -2912,6 +2912,7 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
 
     let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
     normalized == "key"
+        || normalized == "redis_integrity_key"
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
