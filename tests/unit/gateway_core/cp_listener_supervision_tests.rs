@@ -177,3 +177,44 @@ async fn unsolicited_ok_exit_returns_err_and_drains_sibling() {
         "shared shutdown watch must flip after unsolicited listener exit"
     );
 }
+
+#[tokio::test]
+async fn remaining_failure_keeps_its_listener_name_after_first_handle_is_removed() {
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    shutdown_tx
+        .send(true)
+        .expect("shutdown receiver owned by helper must stay live");
+
+    let first = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+    let innocent = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Ok::<(), anyhow::Error>(())
+    });
+    let failing = tokio::spawn(async {
+        Err::<(), anyhow::Error>(anyhow::anyhow!("sentinel remaining failure"))
+    });
+
+    let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        vec![
+            ("first listener".to_string(), first),
+            ("innocent listener".to_string(), innocent),
+            ("failing listener".to_string(), failing),
+        ],
+        shutdown_tx,
+        Duration::from_millis(100),
+    )
+    .await;
+
+    let rendered = format!(
+        "{:#}",
+        result.expect_err("remaining listener failure must propagate")
+    );
+    assert!(
+        rendered.contains("failing listener"),
+        "failure must retain the matching listener name: {rendered}"
+    );
+    assert!(
+        !rendered.contains("innocent listener failed"),
+        "swap-removal must not misattribute the failure: {rendered}"
+    );
+}

@@ -2209,7 +2209,11 @@ async fn monitor_cp_listener_handles_until_exit(
     }
 
     let (first_join, idx, remaining_handles) = futures_util::future::select_all(handles).await;
-    let first_name = names.remove(idx);
+    // `select_all` removes the completed future with `swap_remove`, so mirror
+    // that operation on the parallel name vector. Order-preserving `remove`
+    // would misattribute later failures whenever the final handle is swapped
+    // into a non-final slot.
+    let first_name = names.swap_remove(idx);
     let shutdown_already_requested = *shutdown_tx.borrow();
     let first_error =
         classify_cp_listener_exit(&first_name, first_join, shutdown_already_requested);
