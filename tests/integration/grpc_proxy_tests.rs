@@ -4666,14 +4666,16 @@ fn grpc_retry_header_map_clone_preserves_duplicates_and_opaque_bytes() {
     let mut headers = hyper::HeaderMap::new();
     headers.append("x-md", hyper::header::HeaderValue::from_static("a"));
     headers.append("x-md", hyper::header::HeaderValue::from_static("b"));
+    // obs-text (0x80-0xFF) is legal opaque field-value material; control
+    // bytes like 0x01 are not and would fail HeaderValue construction.
     headers.insert(
         "x-bin",
-        hyper::header::HeaderValue::from_bytes(&[0xff, 0xfe, 0x01]).unwrap(),
+        hyper::header::HeaderValue::from_bytes(&[0xff, 0xfe, 0x80]).unwrap(),
     );
     let cloned = headers.clone();
     let md: Vec<_> = cloned.get_all("x-md").iter().collect();
     assert_eq!(md.len(), 2);
     assert_eq!(md[0].as_bytes(), b"a");
     assert_eq!(md[1].as_bytes(), b"b");
-    assert_eq!(cloned.get("x-bin").unwrap().as_bytes(), &[0xff, 0xfe, 0x01]);
+    assert_eq!(cloned.get("x-bin").unwrap().as_bytes(), &[0xff, 0xfe, 0x80]);
 }
