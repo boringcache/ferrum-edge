@@ -130,7 +130,8 @@ use crate::util::http_headers::{
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
-    ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport, RefreshCoalescer,
+    SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -6458,9 +6459,17 @@ impl ProxyState {
         probe_proxy
     }
 
+    /// Probe one target and build its fresh record.
+    ///
+    /// `previous` is the caller's pre-probe snapshot, taken once via
+    /// `BackendCapabilityRegistry::snapshot_for_probe` and reused as the
+    /// compare expectation when the result is committed. Re-reading the
+    /// registry here would split the merge input from the commit expectation
+    /// and reopen the window this design closes.
     async fn probe_backend_capabilities(
         &self,
         target: &BackendCapabilityProbeTarget,
+        previous: &BackendCapabilitySnapshot,
     ) -> BackendCapabilityRecord {
         let scheme = target.scheme();
         let mut record = BackendCapabilityRecord::default();
@@ -6476,12 +6485,12 @@ impl ProxyState {
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
-        let previous = self.backend_capabilities.get_by_key(&target.key);
-        let previous_hbone = previous.as_ref().map(|record| record.hbone);
-        let previous_h2_tls = previous.as_ref().map(|record| record.plain_http.h2_tls);
-        let previous_grpc_h2_tls = previous.as_ref().map(|record| record.grpc_transport.h2_tls);
-        let previous_h1 = previous.as_ref().map(|record| record.plain_http.h1);
-        let previous_h3 = previous.as_ref().map(|record| record.plain_http.h3);
+        let previous = previous.previous();
+        let previous_hbone = previous.map(|record| record.hbone);
+        let previous_h2_tls = previous.map(|record| record.plain_http.h2_tls);
+        let previous_grpc_h2_tls = previous.map(|record| record.grpc_transport.h2_tls);
+        let previous_h1 = previous.map(|record| record.plain_http.h1);
+        let previous_h3 = previous.map(|record| record.plain_http.h3);
 
         match scheme {
             BackendScheme::Http => {
@@ -6946,6 +6955,9 @@ impl ProxyState {
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
         let hbone_supported = Arc::new(AtomicU64::new(0));
+        // Probes whose write-back lost to newer registry state (a request-path
+        // downgrade, or a `retain_keys` eviction) during the probe window.
+        let conflicts = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -6955,6 +6967,7 @@ impl ProxyState {
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
                 let hbone_supported = hbone_supported.clone();
+                let conflicts = conflicts.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -6973,36 +6986,71 @@ impl ProxyState {
                             return;
                         }
                     };
-                    let previous_record = state.backend_capabilities.get_by_key(&target.key);
-                    let record = state.probe_backend_capabilities(&target).await;
-                    if let Some(previous) = previous_record.as_deref() {
-                        warn_capability_supported_regression(&target, previous, &record);
+                    // ONE pre-probe observation, used both as the merge input
+                    // (`previous_*` classifications inside the probe) and as
+                    // the compare expectation for the write-back below. A
+                    // second independent read would leave exactly the window
+                    // this protocol closes.
+                    let registry = &state.backend_capabilities;
+                    let snapshot = registry.snapshot_for_probe(&target.key);
+                    let record = state.probe_backend_capabilities(&target, &snapshot).await;
+                    // Compare-and-commit: the probe may replace only the
+                    // version it was computed against. A request-path
+                    // downgrade (`mark_h3_unsupported` /
+                    // `mark_h2_tls_unsupported` / `mark_hbone_unsupported`)
+                    // landing during the probe window publishes a new `Arc`,
+                    // so this write loses and the newer live record survives.
+                    let outcome = registry.commit_probe(target.key.clone(), &snapshot, record);
+                    let committed = match outcome {
+                        CapabilityCommitOutcome::Committed(committed) => committed,
+                        rejected => {
+                            // Counters and the summary line describe committed
+                            // registry state only — a discarded probe must not
+                            // be reported as this target's classification.
+                            conflicts.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                proxy_id = %target.proxy.id,
+                                backend_host = %target.host(),
+                                backend_port = target.port(),
+                                reason = rejected.reason(),
+                                "Backend capability probe result discarded; live registry state is newer"
+                            );
+                            return;
+                        }
+                    };
+                    if let Some(previous) = snapshot.previous() {
+                        warn_capability_supported_regression(&target, previous, &committed);
                     }
-                    if record.plain_http.h2_tls.is_supported() {
+                    if committed.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.plain_http.h3.is_supported() {
+                    if committed.plain_http.h3.is_supported() {
                         h3_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.grpc_transport.h2c.is_supported() {
+                    if committed.grpc_transport.h2c.is_supported() {
                         h2c_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.hbone.is_supported() {
+                    if committed.hbone.is_supported() {
                         hbone_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    state.backend_capabilities.upsert(target.key, record);
                     refreshed.fetch_add(1, Ordering::Relaxed);
                 }
             })
             .await;
 
+        // Every tally below is drawn from records this refresh actually
+        // committed. Targets whose probe lost the compare-and-commit are
+        // reported separately as `discarded` — they keep the newer live
+        // classification, so folding them into the protocol counts would
+        // misreport the registry.
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={})",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
             hbone_supported.load(Ordering::Relaxed),
+            conflicts.load(Ordering::Relaxed),
         );
     }
 
