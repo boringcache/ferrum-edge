@@ -7,8 +7,13 @@ under documented free-form maps (``additionalProperties`` not ``false``) and
 under arrays, so extension-map entries and list item payloads are not treated
 as schema-declared chart keys.
 
-Requires PyYAML (``pip install pyyaml``). CI installs it before invoking this
-script; no subprocess helpers are used so Cross automation policy stays clean.
+Requires PyYAML. Install the hash-pinned requirements next to this script::
+
+    python3 -m pip install --require-hashes \\
+      -r scripts/check_helm_values_schema_parity.requirements.txt
+
+CI creates a temp venv and installs the same pin before invoking this script.
+No subprocess helpers are used so Cross automation policy stays clean.
 """
 
 from __future__ import annotations
@@ -20,6 +25,9 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REQUIREMENTS = Path(__file__).with_name(
+    "check_helm_values_schema_parity.requirements.txt"
+)
 
 CHARTS = (
     ROOT / "charts" / "ferrum-gateway",
@@ -32,8 +40,9 @@ def load_yaml(path: Path) -> Any:
         import yaml  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "PyYAML is required to run check_helm_values_schema_parity.py "
-            "(pip install pyyaml)"
+            "PyYAML is required to run check_helm_values_schema_parity.py; "
+            "install the hash-pinned requirements with: "
+            f"python3 -m pip install --require-hashes -r {REQUIREMENTS}"
         ) from exc
 
     with path.open(encoding="utf-8") as handle:
