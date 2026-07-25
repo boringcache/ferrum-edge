@@ -169,12 +169,14 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config; or, in database or control-plane mode, a full
-        config load rejected by the runtime-config validation contract while the
-        backend is reachable — `config_rejected: true`, admin stays writable as
-        the in-band repair path, gated on any deferred schema migration applying
-        first). `config_rejected` is a sticky flag cleared only by an accepted
-        authoritative full reload; while the backend is unreachable
+        last known-good config; or, in database, control-plane, or file mode, a
+        full config load/reload rejected while the previous generation keeps
+        serving — `config_rejected: true`. In database/CP the admin API stays
+        writable as the in-band repair path, gated on any deferred schema
+        migration applying first; in file mode the admin API stays read-only and
+        operators repair by fixing the file and reloading). `config_rejected` is
+        a sticky flag cleared only by an accepted authoritative full reload
+        (Applied or Unchanged); while the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
         outage. In CP/DP/mesh modes, if a supervised serving
@@ -9930,24 +9932,27 @@ components:
         config_rejected:
           type: boolean
           description: |
-            Database and control-plane modes only, authenticated detail only.
-            Present and `true` when the latest **full** config load was rejected
-            by the runtime-config validation contract (a reachable backend served
-            a semantically-invalid snapshot). The gateway keeps serving the last
-            known-good config and, because the backend is reachable, keeps the
-            admin API writable (`admin_writes_enabled` stays `true`) so the
-            offending resource can be repaired in-band; `status` is forced to
-            `degraded`. Re-enabling writes is gated on any deferred schema
-            migration applying first, so a reachable backend with a still-pending
-            schema keeps writes blocked while this flag stays set. The flag is
-            sticky and clears only when an accepted authoritative **full** reload
-            proves the offending resource is gone (an accepted incremental poll
-            does not clear it). While the backend is unreachable
-            (`admin_writes_enabled` false) this detail is suppressed so it never
-            advertises the writable repair path during an outage, even though the
-            underlying flag remains set. A genuine connectivity failure is
-            reported via `admin_writes_enabled`/`status` instead and does not set
-            this flag.
+            Database, control-plane, and file modes, authenticated detail only.
+            Present and `true` when the latest **full** config load/reload was
+            rejected: in database/CP, by the runtime-config validation contract
+            (a reachable backend served a semantically-invalid snapshot); in file
+            mode, when a SIGHUP candidate fails read, parse, validation, or apply.
+            The gateway keeps serving the last known-good config. In database/CP,
+            because the backend is reachable, the admin API stays writable
+            (`admin_writes_enabled` stays `true`) so the offending resource can be
+            repaired in-band; `status` is forced to `degraded`. Re-enabling writes
+            is gated on any deferred schema migration applying first, so a
+            reachable backend with a still-pending schema keeps writes blocked
+            while this flag stays set. In file mode the admin API remains
+            read-only; operators repair by fixing the config file and reloading.
+            The flag is sticky and clears only when an accepted authoritative
+            **full** reload proves the candidate is valid again (Applied or
+            Unchanged; an accepted incremental poll in database/CP does not clear
+            it). While the backend is unreachable (`admin_writes_enabled` false)
+            this detail is suppressed so it never advertises the writable repair
+            path during an outage, even though the underlying flag remains set. A
+            genuine connectivity failure is reported via
+            `admin_writes_enabled`/`status` instead and does not set this flag.
         mesh:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
