@@ -726,6 +726,13 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// concurrent re-arm from starting the next generation while the prior pass is
 /// still mutating cells (overlapping generations / double-halving).
 ///
+/// Cold-path [`Self::reset`] (cache reload) joins the same protocol: it
+/// bounded-spins until it exclusively owns `age_owner`, then clears cells /
+/// cursor / pending state, then releases. It must never blindly
+/// `store(false)` on `age_owner` while another thread still owns a chunk —
+/// that would let a second owner acquire and allow the original owner to
+/// publish a stale nonzero `age_remaining` after the clear.
+///
 /// If a threshold fires while a pass is already draining, `age_pending` records
 /// that another full pass is owed and re-arms as soon as the cursor returns to
 /// idle — without double-halving any cell mid-pass or exceeding the per-lookup
@@ -753,7 +760,12 @@ struct CountMinSketch {
     age_pending: CachePadded<AtomicBool>,
     /// Exclusive non-blocking owner for one `age_step` chunk. Contended
     /// callers leave aging to the owner and return without blocking.
+    /// Cold-path `reset` acquires this with a bounded spin/yield instead.
     age_owner: CachePadded<AtomicBool>,
+    /// Test-only: CAS attempts inside [`Self::acquire_age_owner_blocking`], so
+    /// concurrency tests can observe a blocked reset without sleeping.
+    #[cfg(test)]
+    age_owner_acquire_spins: AtomicUsize,
 }
 
 impl CountMinSketch {
@@ -778,6 +790,36 @@ impl CountMinSketch {
             age_remaining: CachePadded::new(AtomicUsize::new(0)),
             age_pending: CachePadded::new(AtomicBool::new(false)),
             age_owner: CachePadded::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            age_owner_acquire_spins: AtomicUsize::new(0),
+        }
+    }
+
+    /// Non-blocking attempt to become the sole `age_step` / reset owner.
+    #[inline]
+    fn try_acquire_age_owner(&self) -> bool {
+        self.age_owner
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Release exclusive ownership. Only the current owner may call this.
+    #[inline]
+    fn release_age_owner(&self) {
+        self.age_owner.store(false, Ordering::Release);
+    }
+
+    /// Cold-path: spin/yield until this thread exclusively owns `age_owner`.
+    ///
+    /// Used by [`Self::reset`] (cache reload). Hot-path [`Self::age_step`] must
+    /// keep using [`Self::try_acquire_age_owner`] and return immediately on loss.
+    fn acquire_age_owner_blocking(&self) {
+        while !self.try_acquire_age_owner() {
+            #[cfg(test)]
+            self.age_owner_acquire_spins
+                .fetch_add(1, Ordering::Relaxed);
+            std::hint::spin_loop();
+            std::thread::yield_now();
         }
     }
 
@@ -835,18 +877,14 @@ impl CountMinSketch {
     /// and ages the first follow-up chunk in the same call (still within budget).
     #[inline]
     fn age_step(&self) {
-        if self
-            .age_owner
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        if !self.try_acquire_age_owner() {
             return;
         }
 
         let mut remaining = self.age_remaining.load(Ordering::Relaxed);
         if remaining == 0 {
             if !self.age_pending.swap(false, Ordering::Relaxed) {
-                self.age_owner.store(false, Ordering::Release);
+                self.release_age_owner();
                 return;
             }
             // Re-arm an owed follow-up pass. `arm_aging` may already have won
@@ -859,7 +897,7 @@ impl CountMinSketch {
             );
             remaining = self.age_remaining.load(Ordering::Relaxed);
             if remaining == 0 {
-                self.age_owner.store(false, Ordering::Release);
+                self.release_age_owner();
                 return;
             }
         }
@@ -870,7 +908,7 @@ impl CountMinSketch {
         // before the RMWs finish would let a concurrent caller consume
         // `age_pending`, re-arm, and overlap generations (double-halving).
         self.age_remaining.store(remaining - n, Ordering::Relaxed);
-        self.age_owner.store(false, Ordering::Release);
+        self.release_age_owner();
     }
 
     /// Right-shift cells in the flat `[row0 || row1]` index range `[start, end)`.
@@ -968,7 +1006,20 @@ impl CountMinSketch {
     }
 
     /// Reset all counters to zero (used on full cache rebuild).
+    ///
+    /// Synchronizes with the single-owner aging protocol before clearing:
+    /// bounded-spins until this thread exclusively owns `age_owner`, then
+    /// zeroes cells / totals / cursor / pending, then releases ownership.
+    /// Never clears another thread's ownership flag. Request-path
+    /// [`Self::age_step`] losers stay immediate/non-blocking; increments that
+    /// race a reload keep best-effort frequency semantics (no hot-path lock).
     fn reset(&self) {
+        // Cold reload path: wait for any in-flight `age_step` owner to finish
+        // publishing its cursor and releasing, then take exclusive ownership
+        // so we cannot free the flag under that owner (which would let a second
+        // thread acquire and let the original owner republish a stale cursor).
+        self.acquire_age_owner_blocking();
+
         for cell in &self.row0.0 {
             cell.store(0, Ordering::Relaxed);
         }
@@ -978,7 +1029,38 @@ impl CountMinSketch {
         self.total_increments.store(0, Ordering::Relaxed);
         self.age_remaining.store(0, Ordering::Relaxed);
         self.age_pending.store(false, Ordering::Relaxed);
-        self.age_owner.store(false, Ordering::Release);
+        self.release_age_owner();
+    }
+
+    /// Test helper: acquire ownership of an armed pass, pause at `acquired` /
+    /// `release_hold` barriers, then publish the reduced cursor and release.
+    ///
+    /// Mirrors the owned body of [`Self::age_step`] so concurrency tests can
+    /// hold the single-owner bit mid-chunk without sleeps or timing races.
+    #[cfg(test)]
+    fn age_step_with_hold_gates(
+        &self,
+        acquired: &std::sync::Barrier,
+        release_hold: &std::sync::Barrier,
+    ) {
+        assert!(
+            self.try_acquire_age_owner(),
+            "test helper expects an uncontended age_owner acquire"
+        );
+        let remaining = self.age_remaining.load(Ordering::Relaxed);
+        assert!(
+            remaining > 0,
+            "test helper expects an already-armed aging pass"
+        );
+        // Hold ownership before any cursor publish so a concurrent `reset` must
+        // either wait (correct) or blindly clear our flag (the race under test).
+        acquired.wait();
+        release_hold.wait();
+
+        let n = remaining.min(CMS_AGE_CHUNK);
+        self.age_cells_in_range(remaining - n, remaining);
+        self.age_remaining.store(remaining - n, Ordering::Relaxed);
+        self.release_age_owner();
     }
 }
 
@@ -3347,6 +3429,98 @@ mod tests {
         assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
         assert!(!cms.age_pending.load(Ordering::Relaxed));
         assert!(!cms.age_owner.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cms_reset_does_not_steal_age_owner_or_allow_stale_cursor() {
+        // Regression for blind `age_owner.store(false)` in `reset`: if reset
+        // clears the ownership flag while another thread still owns a mid-chunk
+        // `age_step`, that owner can later publish a stale nonzero
+        // `age_remaining` after the clear — violating single-owner and letting
+        // post-reload aging overlap. Correct reset waits to own `age_owner`
+        // before clearing, so the active owner's publish happens before the
+        // clear (or is finished under ownership) and the final cursor is 0.
+        use std::sync::{Arc, Barrier};
+
+        let width = 1024;
+        let total_cells = width * 2;
+        assert!(total_cells > CountMinSketch::AGE_CHUNK);
+
+        let cms = Arc::new(CountMinSketch::new(width, u64::MAX));
+        for cell in cms.row0.0.iter().chain(cms.row1.0.iter()) {
+            cell.store(8, Ordering::Relaxed);
+        }
+        cms.age_remaining.store(total_cells, Ordering::Relaxed);
+        cms.age_owner_acquire_spins.store(0, Ordering::Relaxed);
+
+        // 3-way ready: owner holds mid-chunk, reset + main are about to run.
+        let ready = Arc::new(Barrier::new(3));
+        // Owner stays mid-hold until main confirms reset has engaged.
+        let release_hold = Arc::new(Barrier::new(2));
+
+        let cms_owner = Arc::clone(&cms);
+        let ready_owner = Arc::clone(&ready);
+        let release_owner = Arc::clone(&release_hold);
+        let owner = std::thread::spawn(move || {
+            cms_owner.age_step_with_hold_gates(&ready_owner, &release_owner);
+        });
+
+        let cms_reset = Arc::clone(&cms);
+        let ready_reset = Arc::clone(&ready);
+        let reset = std::thread::spawn(move || {
+            ready_reset.wait();
+            cms_reset.reset();
+        });
+
+        ready.wait();
+        // Owner holds `age_owner` and has not published yet. Wait until reset
+        // either steals the flag / clears state (buggy blind store) or is
+        // observed spinning in `acquire_age_owner_blocking` (correct wait).
+        loop {
+            if !cms.age_owner.load(Ordering::Acquire) {
+                // Buggy reset released ownership under the active owner.
+                break;
+            }
+            if cms.age_owner_acquire_spins.load(Ordering::Relaxed) > 0 {
+                // Correct reset is blocked waiting for exclusive ownership.
+                assert!(
+                    cms.age_owner.load(Ordering::Acquire),
+                    "reset must not clear another thread's age_owner while spinning"
+                );
+                assert_eq!(
+                    cms.age_remaining.load(Ordering::Relaxed),
+                    total_cells,
+                    "reset must not clear the cursor until it owns age_owner"
+                );
+                break;
+            }
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+
+        release_hold.wait();
+        owner.join().expect("owner thread");
+        reset.join().expect("reset thread");
+
+        // If reset cleared ownership under the owner, the owner's post-hold
+        // publish leaves a stale nonzero cursor here. Correct reset clears only
+        // after owning, so the cursor ends idle.
+        assert_eq!(
+            cms.age_remaining.load(Ordering::Relaxed),
+            0,
+            "reset must leave age_remaining idle; a nonzero cursor after join \
+             means an owner republished a stale remaining after a stolen flag"
+        );
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
+        assert!(!cms.age_pending.load(Ordering::Relaxed));
+        assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
+        for cell in cms.row0.0.iter().chain(cms.row1.0.iter()) {
+            assert_eq!(
+                cell.load(Ordering::Relaxed),
+                0,
+                "reset must zero every cell once it exclusively owns aging"
+            );
+        }
     }
 
     #[test]
