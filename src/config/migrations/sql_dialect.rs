@@ -17,8 +17,8 @@
 //!   both diverge from the runtime's byte-keyed identity indexes. Hostnames
 //!   are pre-normalized to ASCII-lowercase by `normalize_fields()`, so
 //!   case-sensitivity is moot for those, but other identifiers benefit.
-//!   Floor is MySQL 8.0+; the
-//!   project test infra runs MySQL 8.
+//!   Floor is MySQL 8.0.17+ (`utf8mb4_0900_bin` was introduced then); the
+//!   project test infra runs MySQL 8.4.
 //! - columns whose code-side cap exceeds MySQL's `TEXT` (65,535 bytes) use
 //!   `MEDIUMTEXT` (16 MiB): `plugin_configs.config` (1 MiB cap),
 //!   `consumers.credentials` (64 KiB cap — off-by-one over `TEXT`),
@@ -1358,7 +1358,8 @@ mod tests {
     // keys). A UCA collation such as `utf8mb4_0900_as_cs` is accent-/case-
     // sensitive but still folds NFC/NFD equivalents, and the older
     // `utf8mb4_bin` ignores trailing spaces under `PAD SPACE` semantics.
-    // MySQL 8.0+ floor; hosted service-integration CI runs MySQL 8.4.
+    // MySQL 8.0.17+ floor (`utf8mb4_0900_bin` introduced then); hosted
+    // service-integration CI runs MySQL 8.4.
     // ------------------------------------------------------------------
 
     fn assert_columns_have_collation(sql: &str, table_label: &str, columns: &[&str]) {
