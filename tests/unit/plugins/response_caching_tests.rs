@@ -1,5 +1,10 @@
 //! Tests for response_caching plugin
 
+// These tests intentionally serialize complete async cache lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{

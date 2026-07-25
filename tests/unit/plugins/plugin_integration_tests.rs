@@ -1,6 +1,11 @@
 //! Integration tests for the plugin system
 //! Tests plugin creation, scope configuration, and error handling
 
+// Cache replay tests intentionally serialize complete async lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use ferrum_edge::config::types::{PluginConfig, PluginScope};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, available_plugins, create_plugin,

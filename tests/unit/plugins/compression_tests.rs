@@ -1,3 +1,8 @@
+// These tests intentionally serialize complete async cache lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
