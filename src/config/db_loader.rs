@@ -70,8 +70,19 @@ pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_ro
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
+    /// Runtime / poll full loads. Undecodable rows become
+    /// [`RowDecodeRejection`] so poll loops keep last-known-good config and
+    /// leave admin writes open for in-band repair (issue #2997 / #2158).
     Runtime,
+    /// Snapshot restore integrity path. Undecodable rows become
+    /// [`SnapshotDataIntegrityError`] (not a poll-repair marker).
     RestoreSnapshot,
+    /// Synchronous admin-write admission validation. Undecodable rows must
+    /// fail the write with the actionable decode reason, but must **not**
+    /// carry [`RowDecodeRejection`] — that marker means "keep admin writable
+    /// / keep last-known-good" for background poll loops, not for the
+    /// admission check that is already running inside an admin write.
+    AdmissionValidation,
 }
 
 impl FullLoadPurpose {
@@ -79,6 +90,7 @@ impl FullLoadPurpose {
         match self {
             Self::Runtime => "load_full_config",
             Self::RestoreSnapshot => "load_namespace_snapshot",
+            Self::AdmissionValidation => "validate_namespace_admission",
         }
     }
 
@@ -88,22 +100,29 @@ impl FullLoadPurpose {
         resource_id: Option<String>,
         error: anyhow::Error,
     ) -> anyhow::Error {
-        if self == Self::RestoreSnapshot {
-            anyhow::Error::new(SnapshotDataIntegrityError::new(
+        match self {
+            Self::RestoreSnapshot => anyhow::Error::new(SnapshotDataIntegrityError::new(
                 resource_type,
                 resource_id,
                 error,
-            ))
-        } else if is_proxy_plugin_association_load_error(&error)
-            || is_transient_database_error(&error)
-        {
-            // Association integrity markers and connectivity/driver faults must
-            // not be rebadged as RowDecodeRejection (issue #2997 precision).
-            error
-        } else {
-            // Runtime full loads tag undecodable rows so the DB/CP poll loop can
-            // keep admin writes open for in-band repair (issue #2997 / #2158).
-            mark_row_decode_rejection(resource_type, resource_id, error)
+            )),
+            Self::AdmissionValidation => {
+                // Peel any poll-loop marker attached by row_to_* wrappers so
+                // synchronous admission returns a plain decode failure.
+                demote_row_decode_rejection(error)
+            }
+            Self::Runtime => {
+                if is_proxy_plugin_association_load_error(&error)
+                    || is_transient_database_error(&error)
+                {
+                    // Association integrity markers and connectivity/driver
+                    // faults must not be rebadged as RowDecodeRejection
+                    // (issue #2997 precision).
+                    error
+                } else {
+                    mark_row_decode_rejection(resource_type, resource_id, error)
+                }
+            }
         }
     }
 }
@@ -117,10 +136,17 @@ impl FullLoadPurpose {
 /// last-known-good runtime config and leave admin writable after the migration
 /// gate — while startup still marks the load non-transient so backup bootstrap
 /// cannot mask a broken row (issue #2997).
+///
+/// `Display` includes the underlying decode/parse reason so operator-facing
+/// `to_string()` / `{}` sites (poll logs, admin surfaces that render the
+/// chain) keep the actionable detail without requiring `{:#}`. The reason is
+/// the prior error's Display text (parse/decode messages), never raw column
+/// bodies.
 #[derive(Debug)]
 pub(crate) struct RowDecodeRejection {
     pub resource_type: &'static str,
     pub resource_id: Option<String>,
+    pub reason: String,
 }
 
 impl std::fmt::Display for RowDecodeRejection {
@@ -128,10 +154,14 @@ impl std::fmt::Display for RowDecodeRejection {
         match &self.resource_id {
             Some(id) => write!(
                 f,
-                "SQL row decode rejected for {} '{}'",
-                self.resource_type, id
+                "SQL row decode rejected for {} '{}': {}",
+                self.resource_type, id, self.reason
             ),
-            None => write!(f, "SQL row decode rejected for {}", self.resource_type),
+            None => write!(
+                f,
+                "SQL row decode rejected for {}: {}",
+                self.resource_type, self.reason
+            ),
         }
     }
 }
@@ -140,13 +170,19 @@ impl std::error::Error for RowDecodeRejection {}
 
 /// Returns `true` when the error carries a [`RowDecodeRejection`] marker.
 ///
-/// The marker is attached with [`anyhow::Context`], whose context value is
-/// downcastable through [`anyhow::Error`] but is not a standard `source()` link.
+/// The marker is attached as the owned [`anyhow::Error`] payload (or as an
+/// anyhow context value) and is downcastable through the chain via
+/// [`anyhow::Error::is`].
 pub(crate) fn is_row_decode_rejection(err: &anyhow::Error) -> bool {
     err.is::<RowDecodeRejection>()
 }
 
 /// Attach a [`RowDecodeRejection`] marker unless one is already present.
+///
+/// Builds a self-contained marker via [`anyhow::Error::new`] (not
+/// `.context(...)`) so top-level `Display` / `to_string()` carry the decode
+/// reason without relying on the `{:#}` alternate formatter, and so `{:#}`
+/// does not duplicate the reason through a source link.
 pub(crate) fn mark_row_decode_rejection(
     resource_type: &'static str,
     resource_id: Option<String>,
@@ -155,10 +191,25 @@ pub(crate) fn mark_row_decode_rejection(
     if is_row_decode_rejection(&error) {
         error
     } else {
-        error.context(RowDecodeRejection {
+        let reason = error.to_string();
+        anyhow::Error::new(RowDecodeRejection {
             resource_type,
             resource_id,
+            reason,
         })
+    }
+}
+
+/// Drop a [`RowDecodeRejection`] marker, preserving the actionable decode
+/// reason. Used by synchronous admission validation so admin-write failures
+/// are not classified as poll-loop repairable rejections.
+fn demote_row_decode_rejection(error: anyhow::Error) -> anyhow::Error {
+    if !is_row_decode_rejection(&error) {
+        return error;
+    }
+    match error.downcast::<RowDecodeRejection>() {
+        Ok(rejection) => anyhow::Error::msg(rejection.reason),
+        Err(error) => error,
     }
 }
 
@@ -1195,10 +1246,10 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<GatewayConfig, anyhow::Error> {
         let proxies = self
-            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_proxies_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         let plugin_configs = self
-            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_plugin_configs_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         let mut candidate = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -1223,7 +1274,7 @@ impl DatabaseStore {
             return Ok(None);
         }
         candidate.consumers = self
-            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_consumers_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         candidate.normalize_fields();
         Ok(Some(candidate))
@@ -1312,7 +1363,7 @@ impl DatabaseStore {
             .load_namespace_admission_policy_candidate_tx(tx, namespace)
             .await?;
         candidate.upstreams = self
-            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_upstreams_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         candidate.normalize_fields();
         let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
@@ -9844,11 +9895,49 @@ mod row_decode_rejection_classification_tests {
         let err = anyhow::anyhow!("Consumer c-bad: failed to parse credentials JSON: EOF");
         let marked = mark_row_decode_rejection("consumer", Some("c-bad".into()), err);
         assert!(is_row_decode_rejection(&marked));
+        assert!(
+            marked
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "top-level Display must carry the decode reason for operator {} sites: {marked}"
+        );
         let mapped =
             FullLoadPurpose::Runtime.map_row_error("consumer", Some("c-bad".into()), marked);
         assert!(
             is_row_decode_rejection(&mapped),
             "undecodable rows must remain RowDecodeRejection: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn admission_validation_purpose_does_not_retain_row_decode_marker() {
+        // Admin-write admission shares load_*_tx helpers with runtime full
+        // loads, but must not leave RowDecodeRejection on the returned error:
+        // that marker means "poll: keep admin writable / last-known-good".
+        let err = anyhow::anyhow!(
+            "Consumer malformed: failed to parse credentials JSON: expected ident at line 1 column 2"
+        );
+        let marked = mark_row_decode_rejection("consumer", Some("malformed".into()), err);
+        assert!(is_row_decode_rejection(&marked));
+        let mapped = FullLoadPurpose::AdmissionValidation.map_row_error(
+            "consumer",
+            Some("malformed".into()),
+            marked,
+        );
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "admission must demote the poll marker: {mapped:#}"
+        );
+        assert!(
+            mapped
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "admission must still surface the decode reason: {mapped}"
+        );
+        assert!(
+            mapped.to_string().contains("malformed")
+                || mapped.to_string().contains("Consumer malformed"),
+            "admission must identify the offending consumer: {mapped}"
         );
     }
 

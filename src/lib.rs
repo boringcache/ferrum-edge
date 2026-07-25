@@ -2095,10 +2095,10 @@ pub mod _test_support {
         resource_id: Option<&str>,
         message: &str,
     ) -> anyhow::Error {
-        use anyhow::Context as _;
-        anyhow::anyhow!("{}", message).context(crate::config::db_loader::RowDecodeRejection {
+        anyhow::Error::new(crate::config::db_loader::RowDecodeRejection {
             resource_type,
             resource_id: resource_id.map(str::to_string),
+            reason: message.to_string(),
         })
     }
 

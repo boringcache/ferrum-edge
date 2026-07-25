@@ -1290,6 +1290,8 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
 
 #[tokio::test]
 async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
+    use ferrum_edge::_test_support::is_row_decode_rejection;
+
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("mtls_dns_policy_fast_path.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -1331,11 +1333,18 @@ async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
         })
         .await
         .expect_err("enabling san_dns must take the full Consumer validation path");
+    let message = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("failed to parse credentials JSON"),
-        "unexpected full-path error: {error:#}"
+        message.contains("failed to parse credentials JSON"),
+        "full-path admission must surface the credentials parse failure: {error:#}"
+    );
+    assert!(
+        message.contains("malformed"),
+        "full-path admission must identify the undecodable consumer id: {error:#}"
+    );
+    assert!(
+        !is_row_decode_rejection(&error),
+        "admin-write admission must not retain the poll-loop RowDecodeRejection marker: {error:#}"
     );
 }
 
