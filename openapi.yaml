@@ -228,6 +228,11 @@ paths:
         non-secret provenance, load state, parsed certificate metadata, and the
         runtime/config surfaces using each source. Inline PEM and private key
         bytes are never returned.
+
+        This endpoint collects live: every configured source is loaded on each
+        request (private keys are parse-checked and dropped immediately). The
+        Prometheus `/metrics` scrape path does not share that behavior — it reads
+        a cached, non-secret snapshot that never materializes private keys.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -1351,6 +1356,16 @@ paths:
         certificate rotation counters, source refresh outcomes, source fetch
         duration histograms, and bounded source fetch failure counters when
         those source watchers are active.
+        Certificate expiry/validity gauges are rendered from a cached,
+        non-secret TLS inventory snapshot: a scrape performs no filesystem,
+        Kubernetes, HSM, or cloud-secret I/O, never materializes private-key
+        bytes, and never blocks on a secret provider. The snapshot is produced
+        by a bounded single-flight background refresh governed by
+        `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300 seconds, `0`
+        disables it), and its freshness is exported explicitly as
+        `ferrum_tls_inventory_snapshot_timestamp_seconds` alongside the
+        configured bound `ferrum_tls_inventory_snapshot_max_age_seconds`.
+        Certificate gauges are absent until the first snapshot is published.
         Database mode adds bounded rejected-delta polling counters and gauges
         for validation rejections, retry backoff buckets, forced full reloads,
         and recoveries. These labels never include raw resource IDs.

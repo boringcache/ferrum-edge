@@ -7782,6 +7782,12 @@ impl ProxyState {
             self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
+        // Config publications can add, remove, or repoint certificate-family
+        // sources without producing a TLS source-watcher event. Invalidate the
+        // metrics-safe snapshot only after the validated epoch is published so
+        // the next scrape refreshes against the accepted config, while rejected
+        // and unchanged candidates leave the current snapshot undisturbed.
+        crate::tls::inventory_cache::mark_stale();
     }
 
     /// Record whether the serving mode actually started an H3 listener.
