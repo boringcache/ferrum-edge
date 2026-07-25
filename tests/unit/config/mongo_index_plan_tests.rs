@@ -190,7 +190,7 @@ fn classify_required_index_present_missing_mismatched() {
         )
         .build();
     assert_eq!(
-        classify_required_index(&required, &[matching.clone()]),
+        classify_required_index(&required, std::slice::from_ref(&matching)),
         IndexPresence::Present
     );
 
