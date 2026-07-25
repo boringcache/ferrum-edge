@@ -3346,8 +3346,23 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Issue #2939 — plain native-H3 streaming mid-body RST downgrades capability
-// so the next request bridges to TCP instead of repeating the truncation.
+// Issue #2939 — plain native-H3 streaming mid-body non-graceful abort
+// downgrades capability so the next request bridges to TCP instead of
+// repeating the truncation.
+//
+// Fault injection uses `CloseConnectionWithCode(0x10c)` (H3_REQUEST_CANCELLED)
+// after a partial body rather than `SendStreamReset`. On Linux the scripted
+// backend's end-of-script drop can race ahead of RESET_STREAM and surface as
+// `ApplicationClose: H3_NO_ERROR` at `recv_data`; that trips
+// `is_h3_graceful_close` and correctly suppresses the downgrade — so a
+// SendStreamReset-only fixture can falsely fail this assertion even when
+// production behavior is right. The scaffolding still holds the connection
+// open after `SendStreamReset` to shrink that race for other tests; this
+// case uses the explicit non-graceful close that
+// `h3_frontend_to_h3_backend_failure_downgrades_from_server_path` and
+// `retry_attempts_within_same_request_stay_on_h3_pool` already rely on.
+// The companion `h3_frontend_mid_body_graceful_goaway_keeps_capability_supported`
+// pins the negative side of the same guard.
 // ────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
@@ -3384,7 +3399,7 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
         ]))
         .step(H3Step::RespondData(prefix))
         .step(H3Step::StallFor(Duration::from_millis(50)))
-        .step(H3Step::SendStreamReset(0x10c))
+        .step(H3Step::CloseConnectionWithCode(0x10c))
         .spawn()
         .expect("spawn h3");
 
@@ -3409,8 +3424,8 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
     if downgraded.is_none() {
         let logs = harness.captured_combined().unwrap_or_default();
         panic!(
-            "mid-body stream RST on the plain H3 streaming path must mark h3=unsupported; \
-             entry: {:?}\n--- logs ---\n{logs}",
+            "mid-body non-graceful H3 abort on the plain streaming path must \
+             mark h3=unsupported; entry: {:?}\n--- logs ---\n{logs}",
             fetch_capability_entry(&harness).await
         );
     }
