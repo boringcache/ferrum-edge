@@ -639,15 +639,13 @@ fn append_namespace_resources_from(
     source: &GatewayConfig,
     namespace: &str,
 ) {
-    target
-        .proxies
-        .extend(
-            source
-                .proxies
-                .iter()
-                .filter(|p| p.namespace == namespace)
-                .cloned(),
-        );
+    target.proxies.extend(
+        source
+            .proxies
+            .iter()
+            .filter(|p| p.namespace == namespace)
+            .cloned(),
+    );
     target.consumers.extend(
         source
             .consumers
@@ -921,9 +919,7 @@ fn publish_cp_full_reload(
     broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
     dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
     cp_scope: &CpScope,
-    mesh_update_tx: &tokio::sync::broadcast::Sender<
-        crate::grpc::mesh_server::MeshConfigBroadcast,
-    >,
+    mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
 ) {
     let published = cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);

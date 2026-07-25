@@ -119,7 +119,8 @@ fn full_db_reload_reapplies_k8s_overlay_and_mesh() {
     // #2982: DB-only snapshot must not wipe the independently owned overlay.
     let overlay_slot = empty_k8s_overlay_slot();
     let mut k8s = GatewayConfig::default();
-    k8s.proxies.push(make_proxy("gwapi-route-httpbin", "ferrum"));
+    k8s.proxies
+        .push(make_proxy("gwapi-route-httpbin", "ferrum"));
     k8s.mesh = Some(mesh_with_service("overlay-svc"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
     store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed);
@@ -132,10 +133,7 @@ fn full_db_reload_reapplies_k8s_overlay_and_mesh() {
         cas_publish_db_snapshot_with_k8s_overlay_for_test(&config_arc, &overlay_slot, db_reload);
 
     assert!(
-        published
-            .proxies
-            .iter()
-            .any(|p| p.id == "db-proxy"),
+        published.proxies.iter().any(|p| p.id == "db-proxy"),
         "DB resources must survive publication"
     );
     assert!(
@@ -208,7 +206,8 @@ fn concurrent_poll_and_reconcile_cas_preserves_both_sources() {
 
     let overlay_slot = empty_k8s_overlay_slot();
     let mut k8s = GatewayConfig::default();
-    k8s.proxies.push(make_proxy("gwapi-route-overlay", "ferrum"));
+    k8s.proxies
+        .push(make_proxy("gwapi-route-overlay", "ferrum"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
     store_accepted_k8s_overlay(&overlay_slot, k8s.clone(), managed.clone());
 
@@ -261,7 +260,8 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
     let config_arc = Arc::new(ArcSwap::from_pointee(base));
 
     let mut k8s = GatewayConfig::default();
-    k8s.proxies.push(make_proxy("gwapi-route-overlay", "ferrum"));
+    k8s.proxies
+        .push(make_proxy("gwapi-route-overlay", "ferrum"));
     let managed = BTreeSet::from(["ferrum".to_string()]);
     let _ = swap_merged_k8s_translation(config_arc.as_ref(), &k8s, &managed);
 
