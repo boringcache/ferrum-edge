@@ -719,14 +719,21 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// [`CMS_AGE_CHUNK`] cells. That keeps route-lookup latency bounded even while
 /// the thread-local `CACHE_KEY_BUF` borrow is held on the hit path.
 ///
+/// Chunk mutation is single-owner and non-blocking: `age_step` CASes an
+/// `age_owner` flag; losers return immediately. The owner halves a chunk, then
+/// publishes the reduced `age_remaining` cursor — so `age_remaining == 0` is
+/// never visible until that chunk's cell RMWs have finished. That prevents a
+/// concurrent re-arm from starting the next generation while the prior pass is
+/// still mutating cells (overlapping generations / double-halving).
+///
 /// If a threshold fires while a pass is already draining, `age_pending` records
 /// that another full pass is owed and re-arms as soon as the cursor returns to
 /// idle — without double-halving any cell mid-pass or exceeding the per-lookup
 /// chunk budget.
 ///
 /// Memory: `2 * width` bytes + 64-byte alignment padding plus `CachePadded`
-/// atomics for the increment counter, aging cursor, and pending-pass flag (no
-/// extra heap allocation for aging).
+/// atomics for the increment counter, aging cursor, pending-pass flag, and
+/// single-owner bit (no extra heap allocation for aging).
 struct CountMinSketch {
     row0: AlignedCounterRow,
     row1: AlignedCounterRow,
@@ -736,13 +743,17 @@ struct CountMinSketch {
     /// Age (halve all counters) after this many increments. Always ≥ 1.
     age_threshold: u64,
     /// Cells left to halve in the current aging pass (`0` = idle).
-    /// Also acts as the exclusive high-water index into the flat `[row0||row1]`
-    /// layout: claiming `n` cells ages the half-open range
-    /// `[remaining - n, remaining)`.
+    /// High-water index into the flat `[row0||row1]` layout: an owned step of
+    /// `n` cells ages `[remaining - n, remaining)` and only then stores
+    /// `remaining - n`. Idle (`0`) is therefore published only after the last
+    /// chunk's cell updates complete.
     age_remaining: CachePadded<AtomicUsize>,
     /// Set when a threshold crosses while a pass is already in progress.
     /// Consumed to re-arm exactly one follow-up pass after the cursor drains.
     age_pending: CachePadded<AtomicBool>,
+    /// Exclusive non-blocking owner for one `age_step` chunk. Contended
+    /// callers leave aging to the owner and return without blocking.
+    age_owner: CachePadded<AtomicBool>,
 }
 
 impl CountMinSketch {
@@ -766,6 +777,7 @@ impl CountMinSketch {
             age_threshold: age_threshold.max(1),
             age_remaining: CachePadded::new(AtomicUsize::new(0)),
             age_pending: CachePadded::new(AtomicBool::new(false)),
+            age_owner: CachePadded::new(AtomicBool::new(false)),
         }
     }
 
@@ -797,8 +809,9 @@ impl CountMinSketch {
     ///
     /// Concurrent callers racing at the threshold: at most one wins the CAS and
     /// starts the pass. A threshold that fires while a pass is already running
-    /// sets [`Self::age_pending`] so a follow-up pass is re-armed after the
-    /// cursor drains (multiple mid-pass hits collapse to one owed pass).
+    /// (including while an owner still holds the last chunk before publishing
+    /// idle) sets [`Self::age_pending`] so a follow-up pass is re-armed after
+    /// the cursor drains (multiple mid-pass hits collapse to one owed pass).
     #[inline]
     fn arm_aging(&self) {
         if self
@@ -812,42 +825,52 @@ impl CountMinSketch {
 
     /// Halve at most [`CMS_AGE_CHUNK`] cells of an in-progress aging pass.
     ///
-    /// Lock-free: contested claims retry the CAS. Per-call work is capped at
-    /// `CMS_AGE_CHUNK` atomic RMWs regardless of sketch width. When the cursor
-    /// is idle and a pass is pending, re-arms and ages the first chunk of the
-    /// follow-up pass in the same call (still within the chunk budget).
+    /// Non-blocking single-owner protocol: only one thread mutates cells at a
+    /// time. Contended callers fail the `age_owner` CAS and return immediately
+    /// (no mutex, spawn, or allocation). The owner halves up to one chunk, then
+    /// publishes the reduced cursor — so a new generation cannot observe idle
+    /// and re-arm until every claimed chunk from the prior generation has
+    /// finished its cell RMWs. Per-call work stays ≤ `CMS_AGE_CHUNK` regardless
+    /// of sketch width. When the cursor is idle and a pass is pending, re-arms
+    /// and ages the first follow-up chunk in the same call (still within budget).
     #[inline]
     fn age_step(&self) {
-        loop {
-            let remaining = self.age_remaining.load(Ordering::Relaxed);
-            if remaining == 0 {
-                if !self.age_pending.swap(false, Ordering::Relaxed) {
-                    return;
-                }
-                // Re-arm an owed follow-up pass. If another thread already
-                // armed, the CAS fails and we loop to claim from its cursor.
-                let _ = self.age_remaining.compare_exchange(
-                    0,
-                    self.total_cells(),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                continue;
+        if self
+            .age_owner
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let mut remaining = self.age_remaining.load(Ordering::Relaxed);
+        if remaining == 0 {
+            if !self.age_pending.swap(false, Ordering::Relaxed) {
+                self.age_owner.store(false, Ordering::Release);
+                return;
             }
-            let n = remaining.min(CMS_AGE_CHUNK);
-            match self.age_remaining.compare_exchange(
-                remaining,
-                remaining - n,
+            // Re-arm an owed follow-up pass. `arm_aging` may already have won
+            // the CAS; either way the cursor is non-zero before we mutate.
+            let _ = self.age_remaining.compare_exchange(
+                0,
+                self.total_cells(),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.age_cells_in_range(remaining - n, remaining);
-                    return;
-                }
-                Err(_) => continue,
+            );
+            remaining = self.age_remaining.load(Ordering::Relaxed);
+            if remaining == 0 {
+                self.age_owner.store(false, Ordering::Release);
+                return;
             }
         }
+
+        let n = remaining.min(CMS_AGE_CHUNK);
+        self.age_cells_in_range(remaining - n, remaining);
+        // Publish the cursor only after cell updates complete. Publishing idle
+        // before the RMWs finish would let a concurrent caller consume
+        // `age_pending`, re-arm, and overlap generations (double-halving).
+        self.age_remaining.store(remaining - n, Ordering::Relaxed);
+        self.age_owner.store(false, Ordering::Release);
     }
 
     /// Right-shift cells in the flat `[row0 || row1]` index range `[start, end)`.
@@ -894,9 +917,10 @@ impl CountMinSketch {
 
         // Arm a new aging cycle on the threshold, then advance at most one chunk.
         // Ordering matters: arm before step so the threshold-crossing call does
-        // bounded work immediately. Mid-cycle threshold hits set `age_pending`
-        // instead of resetting the cursor (no double-halving; follow-up pass
-        // re-arms only after the cursor drains).
+        // bounded work immediately when it wins ownership. Mid-cycle threshold
+        // hits set `age_pending` instead of resetting the cursor (follow-up
+        // re-arms only after the owned cursor drains to idle). Contended
+        // `age_step` losers return without blocking; the owner performs the RMWs.
         let total = self.total_increments.fetch_add(1, Ordering::Relaxed) + 1;
         if total.is_multiple_of(self.age_threshold) {
             self.arm_aging();
@@ -921,17 +945,23 @@ impl CountMinSketch {
     /// Completes any in-progress incremental pass first, then runs a fresh full
     /// pass via the same chunked helper used on the hot path. Not used by
     /// production `increment` (which only arms + steps); kept for tests and any
-    /// explicit full-refresh callers.
+    /// explicit full-refresh callers. Spins on `age_step` until the single
+    /// owner publishes an idle cursor (non-blocking for the hot path; this
+    /// helper is off the route-lookup path).
     fn age(&self) {
         // Ignore owed follow-up passes: this helper forces exactly one full
         // refresh after draining the current cursor.
         self.age_pending.store(false, Ordering::Relaxed);
-        while self.age_remaining.load(Ordering::Relaxed) > 0 {
+        while self.age_remaining.load(Ordering::Relaxed) > 0
+            || self.age_owner.load(Ordering::Acquire)
+        {
             self.age_step();
         }
         self.age_remaining
             .store(self.total_cells(), Ordering::Relaxed);
-        while self.age_remaining.load(Ordering::Relaxed) > 0 {
+        while self.age_remaining.load(Ordering::Relaxed) > 0
+            || self.age_owner.load(Ordering::Acquire)
+        {
             self.age_step();
         }
         self.age_pending.store(false, Ordering::Relaxed);
@@ -948,6 +978,7 @@ impl CountMinSketch {
         self.total_increments.store(0, Ordering::Relaxed);
         self.age_remaining.store(0, Ordering::Relaxed);
         self.age_pending.store(false, Ordering::Relaxed);
+        self.age_owner.store(false, Ordering::Release);
     }
 }
 
@@ -3315,6 +3346,81 @@ mod tests {
         assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
         assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
         assert!(!cms.age_pending.load(Ordering::Relaxed));
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cms_concurrent_aging_generations_do_not_overlap() {
+        // Regression for the claim-before-mutate race: publishing
+        // `age_remaining == 0` before the last chunk's cell RMWs finish lets a
+        // concurrent caller consume `age_pending`, re-arm, and double-halve.
+        // Seed every cell to 8, arm one pass with an owed follow-up, then hammer
+        // `age_step` from many threads. Exactly two completed generations must
+        // leave every cell at 2 (8 >> 2); overlapping gens would push some ≤ 1.
+        use std::sync::{Arc, Barrier};
+
+        let width = 1024;
+        let total_cells = width * 2;
+        let steps_per_pass = total_cells.div_ceil(CountMinSketch::AGE_CHUNK);
+        assert!(steps_per_pass > 2);
+
+        let cms = Arc::new(CountMinSketch::new(width, u64::MAX));
+        for cell in cms.row0.0.iter().chain(cms.row1.0.iter()) {
+            cell.store(8, Ordering::Relaxed);
+        }
+
+        cms.arm_aging();
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), total_cells);
+        // Owed follow-up so the idle→re-arm race is on the critical path the
+        // moment the first pass's last chunk completes.
+        cms.age_pending.store(true, Ordering::Relaxed);
+
+        let threads = 8usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        // Each thread runs enough steps to cover both passes several times over
+        // even if most CAS attempts lose ownership.
+        let steps_per_thread = steps_per_pass * 4;
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let cms = Arc::clone(&cms);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..steps_per_thread {
+                    cms.age_step();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("aging worker thread");
+        }
+
+        // Finish any leftover owned chunk / pending re-arm on this thread.
+        let mut guard = 0usize;
+        while cms.age_remaining.load(Ordering::Relaxed) > 0
+            || cms.age_pending.load(Ordering::Relaxed)
+            || cms.age_owner.load(Ordering::Acquire)
+        {
+            cms.age_step();
+            guard += 1;
+            assert!(
+                guard <= steps_per_pass * 4,
+                "drain must complete within a bounded number of steps"
+            );
+        }
+
+        assert!(!cms.age_pending.load(Ordering::Relaxed));
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
+
+        for cell in cms.row0.0.iter().chain(cms.row1.0.iter()) {
+            assert_eq!(
+                cell.load(Ordering::Relaxed),
+                2,
+                "each cell must be halved exactly twice (8→4→2); \
+                 a smaller value means overlapping generations double-halved"
+            );
+        }
     }
 
     #[test]
