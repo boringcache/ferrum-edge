@@ -438,7 +438,7 @@ pub fn build_admin_metrics(
             if let Some(entry) = AdminMetricsUnhealthyTarget::from_passive_cache_key(
                 proxy_key,
                 target_entry.key().clone(),
-                *target_entry.value(),
+                target_entry.value().ejected_at_ms,
             ) {
                 unhealthy_targets.push(entry);
             }

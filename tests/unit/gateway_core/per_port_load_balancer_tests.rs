@@ -790,7 +790,15 @@ fn per_port_passive_health_threshold_differs_from_upstream_level() {
 
     let checker = HealthChecker::default();
     let selected = target("a", 8080);
-    checker.report_response("ferrum", "p1", &selected, 500, false, Some(port_passive));
+    checker.report_response(
+        "ferrum",
+        "p1",
+        "test-upstream",
+        &selected,
+        500,
+        false,
+        Some(port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("ferrum|p1")
@@ -835,19 +843,51 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("ferrum", "p1", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response(
+        "ferrum",
+        "p1",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&port_passive),
+    );
+    checker.report_response(
+        "ferrum",
+        "p1",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("ferrum|p1")
         .expect("passive health state created")
         .clone();
-    proxy_state
-        .unhealthy
-        .insert(target_host_port_key(&targets[0]), 100);
-    proxy_state
-        .unhealthy
-        .insert(target_host_port_key(&targets[1]), 200);
+    proxy_state.unhealthy.insert(
+        target_host_port_key(&targets[0]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 100,
+            recover_at_ms: 100,
+            auto_recover: false,
+            upstream_id: "test-upstream".to_string(),
+            host: targets[0].host.clone(),
+            port: targets[0].port,
+        },
+    );
+    proxy_state.unhealthy.insert(
+        target_host_port_key(&targets[1]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 200,
+            recover_at_ms: 200,
+            auto_recover: false,
+            upstream_id: "test-upstream".to_string(),
+            host: targets[1].host.clone(),
+            port: targets[1].port,
+        },
+    );
 
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
     let health = HealthContext {
@@ -903,19 +943,51 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("ferrum", "p1", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("ferrum", "p1", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response(
+        "ferrum",
+        "p1",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&port_passive),
+    );
+    checker.report_response(
+        "ferrum",
+        "p1",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("ferrum|p1")
         .expect("passive health state created")
         .clone();
-    proxy_state
-        .unhealthy
-        .insert(target_host_port_key(&targets[0]), 100);
-    proxy_state
-        .unhealthy
-        .insert(target_host_port_key(&targets[1]), 200);
+    proxy_state.unhealthy.insert(
+        target_host_port_key(&targets[0]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 100,
+            recover_at_ms: 100,
+            auto_recover: false,
+            upstream_id: "test-upstream".to_string(),
+            host: targets[0].host.clone(),
+            port: targets[0].port,
+        },
+    );
+    proxy_state.unhealthy.insert(
+        target_host_port_key(&targets[1]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 200,
+            recover_at_ms: 200,
+            auto_recover: false,
+            upstream_id: "test-upstream".to_string(),
+            host: targets[1].host.clone(),
+            port: targets[1].port,
+        },
+    );
 
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
     let health = HealthContext {
@@ -1250,7 +1322,15 @@ fn passive_ctx_ejecting<'a>(
         ..PassiveHealthCheck::default()
     };
     for t in ejected {
-        checker.report_response("ferrum", "p1", t, 500, false, Some(&pasv));
+        checker.report_response(
+            "ferrum",
+            "p1",
+            "test-upstream",
+            t,
+            500,
+            false,
+            Some(&pasv),
+        );
     }
     let proxy_state = checker
         .passive_health
@@ -1260,9 +1340,18 @@ fn passive_ctx_ejecting<'a>(
     for (i, t) in ejected.iter().enumerate() {
         // Deterministic ascending eject timestamps so re-admission (oldest
         // first) is predictable.
-        proxy_state
-            .unhealthy
-            .insert(target_host_port_key(t), 100 + i as u64);
+        let ejected_at_ms = 100 + i as u64;
+        proxy_state.unhealthy.insert(
+            target_host_port_key(t),
+            ferrum_edge::health_check::PassiveEjection {
+                ejected_at_ms,
+                recover_at_ms: ejected_at_ms,
+                auto_recover: false,
+                upstream_id: "test-upstream".to_string(),
+                host: t.host.clone(),
+                port: t.port,
+            },
+        );
     }
     HealthContext {
         active_unhealthy,

@@ -713,6 +713,7 @@ pub(super) async fn handle_hbone_request(
         state.health_checker.report_response(
             &proxy.namespace,
             &proxy.id,
+            upstream_id,
             target,
             StatusCode::OK.as_u16(),
             false,

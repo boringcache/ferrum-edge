@@ -952,8 +952,6 @@ fn record_backend_outcome_inner(
     let backend_failure = connection_error || error_class_is_post_wire_backend_failure(error_class);
 
     if !client_side_no_backend_signal
-        && !backend_failure
-        && response_status < 500
         && let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), upstream_target)
     {
         let upstream =
@@ -964,8 +962,14 @@ fn record_backend_outcome_inner(
             .and_then(|hc| hc.active.as_ref())
             .is_some();
         if !has_active_hc && let Some(balancer) = selected_balancer {
-            let latency_us = backend_elapsed.as_micros() as u64;
-            balancer.record_latency(target, latency_us);
+            if backend_failure || response_status >= 500 {
+                // Failed attempts count toward warm-up exit with a penalty EWMA
+                // so a persistently failing target cannot remain biased-best.
+                balancer.record_failed_attempt(target);
+            } else if response_status < 500 {
+                let latency_us = backend_elapsed.as_micros() as u64;
+                balancer.record_latency(target, latency_us);
+            }
         }
     }
 
@@ -1007,6 +1011,7 @@ fn record_backend_outcome_inner(
         state.health_checker.report_response(
             &proxy.namespace,
             &proxy.id,
+            upstream_id,
             target,
             response_status,
             backend_failure,
@@ -1811,6 +1816,7 @@ mod tests {
         state.health_checker.report_response(
             &proxy.namespace,
             &proxy.id,
+            "test-upstream",
             &first_target,
             500,
             false,
@@ -1819,6 +1825,7 @@ mod tests {
         state.health_checker.report_response(
             &proxy.namespace,
             &proxy.id,
+            "test-upstream",
             &second_target,
             500,
             false,

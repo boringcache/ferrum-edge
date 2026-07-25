@@ -247,8 +247,24 @@ fn health_check_prune_removes_only_matching_namespace() {
         split_external_local_origin_errors: None,
     };
 
-    checker.report_response("prod", "shared", &target, 500, false, Some(&passive));
-    checker.report_response("staging", "shared", &target, 500, false, Some(&passive));
+    checker.report_response(
+        "prod",
+        "shared",
+        "shared-upstream",
+        &target,
+        500,
+        false,
+        Some(&passive),
+    );
+    checker.report_response(
+        "staging",
+        "shared",
+        "shared-upstream",
+        &target,
+        500,
+        false,
+        Some(&passive),
+    );
     assert_eq!(checker.passive_health.len(), 2);
 
     checker.prune_removed_proxies(&[NamespacedResourceId::new("staging", "shared")]);
