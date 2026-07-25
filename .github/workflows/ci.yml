@@ -1457,11 +1457,7 @@ jobs:
             "ferrum-mesh-east-west" \
             "ferrum-mesh-ambient" \
             "ferrum-mesh-node-agent"; do
-            block="$(awk -v n="$kind_name" '
-              $0 ~ "name: " n {found=1}
-              found {print}
-              found && /^---$/ {exit}
-            ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+            block="$(awk -v n="$kind_name" 'BEGIN{pat="name: " n} index($0,pat){found=1} found{print} found&&/^---$/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
             if ! grep -q 'startupProbe:' <<<"$block" ||
               ! grep -q 'livenessProbe:' <<<"$block" ||
               ! grep -q 'readinessProbe:' <<<"$block"; then
