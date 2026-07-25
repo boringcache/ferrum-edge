@@ -1196,10 +1196,16 @@ pub struct EnvConfig {
     pub mongo_replica_set: Option<String>,
     /// MongoDB auth mechanism override (e.g. "SCRAM-SHA-256", "MONGODB-X509").
     pub mongo_auth_mechanism: Option<String>,
-    /// MongoDB server selection timeout in seconds. Default: 30.
-    pub mongo_server_selection_timeout_seconds: u64,
-    /// MongoDB connection timeout in seconds. Default: 10.
-    pub mongo_connect_timeout_seconds: u64,
+    /// Explicit MongoDB server selection timeout in seconds.
+    ///
+    /// `None` (unset) preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL`
+    /// or the driver default. When set, overrides the URI value.
+    pub mongo_server_selection_timeout_seconds: Option<u64>,
+    /// Explicit MongoDB connection timeout in seconds.
+    ///
+    /// `None` (unset) preserves `connectTimeoutMS` from `FERRUM_DB_URL` or the
+    /// driver default. When set, overrides the URI value.
+    pub mongo_connect_timeout_seconds: Option<u64>,
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
@@ -2371,8 +2377,8 @@ impl Default for EnvConfig {
             mongo_app_name: None,
             mongo_replica_set: None,
             mongo_auth_mechanism: None,
-            mongo_server_selection_timeout_seconds: 30,
-            mongo_connect_timeout_seconds: 10,
+            mongo_server_selection_timeout_seconds: None,
+            mongo_connect_timeout_seconds: None,
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
@@ -2719,8 +2725,8 @@ impl EnvConfig {
             mongo_app_name: Option<String> = "FERRUM_MONGO_APP_NAME";
             mongo_replica_set: Option<String> = "FERRUM_MONGO_REPLICA_SET";
             mongo_auth_mechanism: Option<String> = "FERRUM_MONGO_AUTH_MECHANISM";
-            mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
-            mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
+            mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
+            mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
             .as_deref()
