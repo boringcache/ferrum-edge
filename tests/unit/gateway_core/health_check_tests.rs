@@ -7,6 +7,11 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 
 const TEST_PROXY: &str = "test-proxy";
 
@@ -802,5 +807,354 @@ async fn test_restart_when_all_upstreams_removed() {
     assert!(
         checker.active_unhealthy_targets.is_empty(),
         "active unhealthy entries must be pruned when no upstreams remain"
+    );
+}
+
+// ─── Production start → take → restart ownership (issue #2383) ───────────────
+
+/// TCP accept counter used to observe whether a drained startup generation
+/// keeps probing after reload.
+async fn counting_tcp_server() -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicU64::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            count_task.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (addr, count)
+}
+
+async fn wait_for_min_probes(count: &AtomicU64, min: u64, timeout: Duration) {
+    let started = Instant::now();
+    loop {
+        if count.load(Ordering::SeqCst) >= min {
+            return;
+        }
+        if started.elapsed() > timeout {
+            panic!(
+                "timed out waiting for {min} probes; saw {}",
+                count.load(Ordering::SeqCst)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn make_upstream_with_active_probe_tls(
+    id: &str,
+    targets: Vec<UpstreamTarget>,
+    interval_seconds: u64,
+    use_tls: bool,
+) -> Upstream {
+    let mut upstream = make_upstream_with_active_probe(id, targets, interval_seconds);
+    if let Some(hc) = upstream.health_checks.as_mut()
+        && let Some(active) = hc.active.as_mut()
+    {
+        active.use_tls = use_tls;
+    }
+    upstream
+}
+
+fn make_upstream_with_passive_recovery(
+    id: &str,
+    targets: Vec<UpstreamTarget>,
+    healthy_after_seconds: u64,
+) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: Some(format!("upstream-{}", id)),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: Some(HealthCheckConfig {
+            active: None,
+            passive: Some(PassiveHealthCheck {
+                unhealthy_status_codes: vec![500],
+                unhealthy_threshold: 2,
+                unhealthy_window_seconds: 60,
+                healthy_after_seconds,
+                max_ejection_percent: None,
+                gateway_error_codes: None,
+                split_external_local_origin_errors: None,
+            }),
+        }),
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_take_retains_cancel_visibility_for_reload() {
+    // Production ownership: ProxyState::new starts tasks then immediately
+    // drains JoinHandles. Cancel ownership must remain with HealthChecker.
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-take",
+        vec![make_target("take-host", 9400)],
+        60,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must not hide the startup generation from reload/drop cancel"
+    );
+    assert!(
+        !taken[0].is_finished(),
+        "drained JoinHandle must remain awaitable for graceful shutdown"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_stops_probes_for_removed_target() {
+    // Reproduces the production sequence that previously orphaned the
+    // startup generation: start_with_shutdown → take → restart.
+    let (addr_keep, count_keep) = counting_tcp_server().await;
+    let (addr_remove, count_remove) = counting_tcp_server().await;
+
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![
+        make_upstream_with_active_probe(
+            "up-keep",
+            vec![make_target(&addr_keep.ip().to_string(), addr_keep.port())],
+            1,
+        ),
+        make_upstream_with_active_probe(
+            "up-remove",
+            vec![make_target(
+                &addr_remove.ip().to_string(),
+                addr_remove.port(),
+            )],
+            1,
+        ),
+    ]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 2);
+
+    wait_for_min_probes(&count_keep, 1, Duration::from_secs(5)).await;
+    wait_for_min_probes(&count_remove, 1, Duration::from_secs(5)).await;
+
+    let after_remove = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-keep",
+        vec![make_target(&addr_keep.ip().to_string(), addr_keep.port())],
+        1,
+    )]);
+    checker.restart_with_shutdown(&after_remove, None);
+
+    // Allow abort to propagate to drained startup tasks.
+    for _ in 0..20 {
+        if taken.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        taken.iter().all(|h| h.is_finished()),
+        "restart must abort the drained startup generation"
+    );
+    assert_eq!(checker.active_task_count(), 1);
+
+    let remove_baseline = count_remove.load(Ordering::SeqCst);
+    let keep_baseline = count_keep.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+
+    assert_eq!(
+        count_remove.load(Ordering::SeqCst),
+        remove_baseline,
+        "removed target must not receive probes from an orphaned startup generation"
+    );
+    assert!(
+        count_keep.load(Ordering::SeqCst) > keep_baseline,
+        "kept target must still be probed by the replacement generation"
+    );
+    assert!(
+        !checker
+            .active_unhealthy_targets
+            .contains_key(&format!("up-remove::{}:{}", addr_remove.ip(), addr_remove.port())),
+        "stale unhealthy state for the removed upstream must be pruned"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_picks_up_interval_change() {
+    // Same target, slower interval after reload. If the drained 1s generation
+    // survived, accepts would keep arriving every second.
+    let (addr, count) = counting_tcp_server().await;
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-iv",
+        vec![make_target(&addr.ip().to_string(), addr.port())],
+        1,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    wait_for_min_probes(&count, 1, Duration::from_secs(5)).await;
+
+    let after_change = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-iv",
+        vec![make_target(&addr.ip().to_string(), addr.port())],
+        3600,
+    )]);
+    checker.restart_with_shutdown(&after_change, None);
+
+    for _ in 0..20 {
+        if taken.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(taken.iter().all(|h| h.is_finished()));
+
+    // Replacement generation fires one immediate interval tick, then sleeps
+    // for 3600s. An orphaned 1s generation would add ~2 more probes here.
+    let baseline = count.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let after = count.load(Ordering::SeqCst);
+    assert!(
+        after <= baseline + 1,
+        "interval change must retire the drained 1s generation; baseline={baseline} after={after}"
+    );
+    assert_eq!(checker.active_task_count(), 1);
+}
+
+#[tokio::test]
+async fn test_take_then_restart_picks_up_tls_policy_change() {
+    // use_tls flip must abort the drained generation and spawn a replacement
+    // under the new probe client policy (same host/port).
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe_tls(
+        "up-tls",
+        vec![make_target("tls-host", 9443)],
+        60,
+        false,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let after_tls = config_with_upstreams(vec![make_upstream_with_active_probe_tls(
+        "up-tls",
+        vec![make_target("tls-host", 9443)],
+        60,
+        true,
+    )]);
+    checker.restart_with_shutdown(&after_tls, None);
+
+    for _ in 0..20 {
+        if taken.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        taken.iter().all(|h| h.is_finished()),
+        "TLS policy reload must abort the drained startup probe task"
+    );
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "replacement generation must own exactly one probe task"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_stops_stale_passive_recovery() {
+    // Drained passive-recovery timer must not mutate health after reload
+    // removes recovery (healthy_after_seconds=0) for the same target.
+    let checker = HealthChecker::new();
+    let target = make_target("passive-host", 9500);
+    let passive_cfg = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 2,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 1,
+        max_ejection_percent: None,
+        gateway_error_codes: None,
+        split_external_local_origin_errors: None,
+    };
+
+    for _ in 0..2 {
+        checker.report_response(TEST_PROXY, &target, 500, false, Some(&passive_cfg));
+    }
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "passive-host:9500"));
+
+    // Make the cooldown already elapsed so a surviving timer would recover
+    // on its next tick.
+    let past_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        - 5_000;
+    {
+        let proxy_state = checker.passive_health.get(TEST_PROXY).unwrap();
+        *proxy_state
+            .unhealthy
+            .get_mut("passive-host:9500")
+            .unwrap() = past_ms;
+    }
+
+    let initial = config_with_upstreams(vec![make_upstream_with_passive_recovery(
+        "up-passive",
+        vec![target.clone()],
+        1,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1, "passive recovery timer must be spawned");
+
+    let after = config_with_upstreams(vec![make_upstream_with_passive_recovery(
+        "up-passive",
+        vec![target.clone()],
+        0, // no recovery timer in the replacement generation
+    )]);
+    checker.restart_with_shutdown(&after, None);
+
+    for _ in 0..20 {
+        if taken.iter().all(|h| h.is_finished()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        taken.iter().all(|h| h.is_finished()),
+        "reload must abort the drained passive-recovery timer"
+    );
+    assert_eq!(
+        checker.active_task_count(),
+        0,
+        "healthy_after_seconds=0 must not spawn a replacement recovery timer"
+    );
+
+    // Give a surviving stale timer time to tick and mutate state.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "passive-host:9500"),
+        "stale passive-recovery generation must not clear unhealthy state after policy removal"
     );
 }
