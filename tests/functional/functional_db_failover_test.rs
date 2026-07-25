@@ -115,11 +115,6 @@ async fn wait_for_health(admin_port: u16) -> bool {
     }
 }
 
-async fn wait_for_health_once(admin_port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
-    matches!(reqwest::get(&url).await, Ok(r) if r.status().is_success())
-}
-
 /// Kill the child process and reap its zombie before any retry re-binds ports.
 fn kill_child(mut child: Child) {
     let _ = child.kill();
@@ -481,13 +476,6 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
         let temp_dir = TempDir::new().expect("temp dir");
         let backup_path: PathBuf = temp_dir.path().join("backup-invalid.json");
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
         // Two proxies share the same catch-all listen_path — accepted by JSON
         // deserialize/normalize but rejected by collect_rejecting_runtime_config_errors.
         let backup_json = json!({
@@ -530,8 +518,11 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
             )
             .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
-            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            // Both listeners are irrelevant to this pre-serving rejection
+            // path. Disabling them avoids introducing a bind/drop/rebind race
+            // into a test whose sole success condition is a non-zero exit.
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
             .env("FERRUM_LOG_LEVEL", "info")
@@ -541,16 +532,11 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
             .spawn()
             .expect("spawn gateway");
 
-        // Race health against exit: an invalid backup must never become healthy
-        // and should fail closed with a non-zero status once the unreachable
-        // primary pool times out and the backup rejection path runs.
+        // An invalid backup should fail closed with a non-zero status once the
+        // unreachable primary pool times out and the backup rejection path
+        // runs. If the process keeps running, it accepted the invalid snapshot.
         let deadline = SystemTime::now() + Duration::from_secs(25);
-        let mut became_healthy = false;
         let status = loop {
-            if wait_for_health_once(admin_port).await {
-                became_healthy = true;
-                break None;
-            }
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) if SystemTime::now() < deadline => {
@@ -564,17 +550,11 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
             }
         };
 
-        if became_healthy {
-            last_err = format!(
-                "attempt {}: gateway became healthy from an invalid backup",
-                attempt
-            );
-            eprintln!("  {}", last_err);
-            kill_child(child);
-            if attempt < MAX_ATTEMPTS {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            continue;
+        // stderr is a pipe: reading it while a timed-out child is still alive
+        // can block forever waiting for EOF. Terminate and reap first.
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
 
         let stderr = child
@@ -608,9 +588,8 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
                 );
             }
             None => {
-                kill_child(child);
                 last_err = format!(
-                    "attempt {}: gateway neither became healthy nor exited after invalid backup\nstderr:\n{}",
+                    "attempt {}: gateway did not exit after accepting an invalid backup\nstderr:\n{}",
                     attempt, stderr
                 );
             }
