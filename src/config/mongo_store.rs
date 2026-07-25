@@ -1716,13 +1716,46 @@ mod inner {
             Ok(leases)
         }
 
+        /// Releases every admission lease, reporting the first cleanup error.
+        ///
+        /// The loop always drains the whole vector. Returning early would
+        /// leave the remaining guards holding `InFlightOrUncertain` mutation
+        /// state, so their `Drop` would strand both the non-expiring lock
+        /// document and this process's connection-generation pin even though
+        /// the protected mutation outcome is already settled.
         async fn release_mtls_dns_admission_leases(
             leases: &mut Vec<MongoLockGuard>,
         ) -> Result<(), anyhow::Error> {
+            let mut first_error: Option<anyhow::Error> = None;
             while let Some(mut lease) = leases.pop() {
-                lease.release().await?;
+                if let Err(error) = lease.release().await && first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
-            Ok(())
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        /// Post-commit lease cleanup for a confirmed durable write.
+        ///
+        /// Once the guarded mutation has committed, releasing the admission
+        /// leases can no longer change the stored result. Propagating a
+        /// cleanup failure here would turn a committed batch into a failed
+        /// admin response and invite an identical retry that collides with
+        /// the rows just created, so cleanup trouble is logged (namespace and
+        /// lock label only) and the confirmed success is returned. Guards
+        /// whose explicit release failed are already settled, so their `Drop`
+        /// still performs owner-qualified majority cleanup and releases the
+        /// local generation pin.
+        async fn release_mtls_dns_admission_leases_after_commit(leases: &mut Vec<MongoLockGuard>) {
+            if let Err(error) = Self::release_mtls_dns_admission_leases(leases).await {
+                error!(
+                    "MongoDB mTLS DNS admission lease cleanup failed after a committed write; \
+                     the durable result stands and is reported as success: {error}"
+                );
+            }
         }
 
         fn mark_mtls_dns_mutations_started(leases: &mut [MongoLockGuard]) {
@@ -8457,7 +8490,7 @@ mod inner {
                 })
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(counts)
         }
 
@@ -8572,7 +8605,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -8918,7 +8951,7 @@ mod inner {
             Ok(count)
                 })
                 .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -9042,7 +9075,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -9151,7 +9184,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -10360,7 +10393,7 @@ mod inner {
                 Ok(())
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
@@ -10579,7 +10612,7 @@ mod inner {
                 Ok(())
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
@@ -10669,7 +10702,7 @@ mod inner {
                     Ok(())
                 })
                 .await?;
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+                Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
                 return Ok(());
             }
 
@@ -11157,7 +11190,7 @@ mod inner {
             Ok(())
                 })
                 .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 

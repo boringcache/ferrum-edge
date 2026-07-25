@@ -659,3 +659,75 @@ fn mongo_consumer_identity_keys_remain_raw_byte_strings() {
         "Mongo identity keys must not Unicode-normalize (already byte-exact)"
     );
 }
+
+/// PR #3162 follow-up: `POST /batch` is all-or-nothing, so a confirmed commit
+/// must be reported as success. Admission-lease cleanup runs *after* the graph
+/// is durable and can therefore never decide the response: a cleanup error
+/// would tell the caller the batch failed and invite an identical retry that
+/// collides with the rows it just created.
+#[test]
+fn committed_batch_graph_release_cannot_fail_the_response() {
+    let atomic = mongo_method("batch_create_config_graph_atomically(");
+    assert!(
+        atomic.contains("release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;"),
+        "the atomic batch graph must use the post-commit (infallible) lease release"
+    );
+    assert!(
+        !atomic.contains("release_mtls_dns_admission_leases(&mut mtls_leases).await?"),
+        "post-commit lease cleanup must not be able to turn a committed graph into an error"
+    );
+
+    // Every guarded write path that releases its leases only after the
+    // protected mutation returned Ok has the same contract.
+    assert!(
+        !MONGO_STORE_SOURCE.contains("release_mtls_dns_admission_leases(&mut mtls_leases).await?"),
+        "no post-commit call site may propagate admission-lease cleanup failure"
+    );
+
+    let after_commit = mongo_method("release_mtls_dns_admission_leases_after_commit(");
+    let after_commit = &after_commit[..after_commit
+        .find("fn mark_mtls_dns_mutations_started")
+        .unwrap_or(after_commit.len())];
+    assert!(
+        !after_commit.contains("-> Result"),
+        "the post-commit release helper must not return an error to its caller"
+    );
+    assert!(
+        after_commit.contains("error!("),
+        "post-commit cleanup trouble must still be logged loudly for operators"
+    );
+    assert!(
+        !after_commit.contains("owner") && !after_commit.contains("secret"),
+        "post-commit cleanup logging must stay redacted (namespace/lock label only)"
+    );
+}
+
+/// A release loop that stops at the first failure would leave the remaining
+/// guards with `InFlightOrUncertain` mutation state, so their `Drop` would
+/// strand both the non-expiring lock document and this process's connection
+/// generation pin even though the protected outcome is already settled.
+#[test]
+fn admission_lease_release_drains_every_guard_before_reporting() {
+    let release = mongo_method("release_mtls_dns_admission_leases(");
+    assert!(
+        !release.contains("lease.release().await?"),
+        "the release loop must not return early and strand later guards"
+    );
+    assert!(
+        release.contains("while let Some(mut lease) = leases.pop()")
+            && release.contains("first_error"),
+        "the release loop must drain the vector and report the first failure"
+    );
+
+    // Fail-closed pre-commit behavior is unchanged: a definitively failed
+    // mutation still surfaces an error to the caller.
+    let run = mongo_method("run_mtls_dns_mutations(");
+    assert!(
+        run.contains("mongo_mutation_outcome_is_uncertain(&error) => Err(error)"),
+        "an uncertain mutation outcome must still retain its leases and fail closed"
+    );
+    assert!(
+        run.contains("Self::release_mtls_dns_admission_leases(leases).await?;"),
+        "a definitively failed mutation must still release and return an error"
+    );
+}

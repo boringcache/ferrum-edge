@@ -292,6 +292,12 @@ when owner-qualified mutex cleanup fails or loses its acknowledgement. The
 durable document remains fail-closed when it still exists, cleanup status is
 logged for operator recovery, and reconnect/failover can recover the process;
 only an uncertain protected mutation retains both the fence and local pin.
+Cleanup that runs *after* a confirmed commit never changes the response: the
+release is logged (namespace and lock label only) and the durable result is
+still reported as success, so an all-or-nothing `POST /batch` cannot answer
+"failed" for a graph that exists and invite a colliding retry. Every remaining
+mutex in that batch is released in the same pass, so one failed release cannot
+strand the others' locks or connection pins.
 A restore keeps one pin and owner from its pre-clear rollback snapshot through
 the clear, all import batches, and any compensating replay. Credential endpoints
 likewise acquire that owner before reading the Consumer and borrow it for the
