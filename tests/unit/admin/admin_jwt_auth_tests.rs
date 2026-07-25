@@ -898,7 +898,9 @@ fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
     );
 
     env.set("FERRUM_ADMIN_JWT_SECRET", "");
-    let empty_err = create_jwt_manager_from_env().expect_err("explicit empty secret must fail");
+    let Err(empty_err) = create_jwt_manager_from_env() else {
+        panic!("explicit empty secret must fail");
+    };
     assert!(
         matches!(empty_err, JwtError::VerificationFailed(_)),
         "explicit empty secret must not be treated as NotConfigured: {empty_err:?}"
@@ -910,7 +912,9 @@ fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
 
     // 20 chars — below MIN_JWT_SECRET_LENGTH (32).
     env.set("FERRUM_ADMIN_JWT_SECRET", "short-secret-20-chars");
-    let short_err = create_jwt_manager_from_env().expect_err("short secret must fail");
+    let Err(short_err) = create_jwt_manager_from_env() else {
+        panic!("short secret must fail");
+    };
     assert!(
         matches!(short_err, JwtError::VerificationFailed(_)),
         "short secret must not be treated as NotConfigured: {short_err:?}"
@@ -927,8 +931,9 @@ fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
     // Related setting present-but-invalid even when the secret is unset.
     env.unset("FERRUM_ADMIN_JWT_SECRET");
     env.set("FERRUM_ADMIN_JWT_MAX_TTL", "not-a-number");
-    let ttl_err = create_jwt_manager_from_env()
-        .expect_err("invalid max TTL must fail even when secret is unset");
+    let Err(ttl_err) = create_jwt_manager_from_env() else {
+        panic!("invalid max TTL must fail even when secret is unset");
+    };
     assert!(
         matches!(ttl_err, JwtError::VerificationFailed(_)),
         "invalid max TTL must not be NotConfigured: {ttl_err:?}"
