@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -70,16 +70,31 @@ const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
-/// Versioned on-disk namespace metadata for managed chargeback spool trees.
+/// Versioned on-disk ownership format for managed chargeback spool trees.
 const SPOOL_FORMAT_VERSION: u32 = 1;
 const SPOOL_META_FILENAME: &str = "spool.meta.json";
+const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool-owner\0";
+/// Hex characters of the ownership digest kept in the namespace path component.
+const SPOOL_OWNER_DIGEST_LEN: usize = 32;
+/// Hex characters of the ownership digest embedded in every managed filename.
+const SPOOL_OWNER_TAG_LEN: usize = 16;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
+const SPOOL_CLAIM_MARKER: &str = ".claim-";
+const SPOOL_WRITE_MARKER: &str = ".write-";
+const SPOOL_TMP_SUFFIX: &str = ".tmp";
 /// Bound recursive spool walks (day dirs + namespace depth headroom).
 const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
 /// Hard cap on files visited in one scan/reconcile/replay listing.
 const MAX_SPOOL_TRAVERSAL_FILES: usize = 100_000;
-/// Production age before an unowned/crash-left temp may be reconciled.
+/// Production age before a foreign or unattributable temp may be reconciled.
 const STALE_TEMP_AGE_SECS: u64 = 300;
+/// Floor/ceiling for the in-flight replay claim lease derived from the
+/// configured ClickHouse delivery budget.
+const SPOOL_CLAIM_LEASE_MIN_SECS: u64 = 300;
+const SPOOL_CLAIM_LEASE_MAX_SECS: u64 = 3_600;
+/// Safety multiplier applied to the worst-case delivery budget so an expiring
+/// lease cannot overtake a delivery that is still legitimately in progress.
+const SPOOL_CLAIM_LEASE_BUDGET_FACTOR: u64 = 4;
 
 fn default_buffer_max_bytes() -> usize {
     DEFAULT_BUFFER_MAX_BYTES
@@ -109,13 +124,15 @@ const WAIT_FOR_ASYNC_INSERT_PARAM: &str = "wait_for_async_insert";
 /// Standalone / validation constructors that omit a plugin-config resource id.
 /// Production `PluginCache` always supplies the configured resource id.
 const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
+/// Ledger identity used when a caller supplies no Ferrum namespace.
+const DEFAULT_FERRUM_NAMESPACE: &str = "ferrum";
 
 /// Accepted active sinks published after PluginCache commit. Keyed by stable
 /// plugin-config ID so sibling configurations coexist while a newly accepted
 /// generation atomically replaces the prior generation for the same ID. Drop
 /// removes an entry only when it still points at that exact runtime.
 static ACTIVE_SINKS: OnceLock<ArcSwap<BTreeMap<String, Arc<SinkRuntime>>>> = OnceLock::new();
-static ACTIVE_SNAPSHOT_GENERATIONS: OnceLock<Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>>> =
+static ACTIVE_SNAPSHOT_FINALIZATIONS: OnceLock<Mutex<BTreeMap<u64, PendingSnapshotFinalization>>> =
     OnceLock::new();
 static STATUS_CACHE: OnceLock<ArcSwap<Option<(Instant, String)>>> = OnceLock::new();
 static NEXT_SINK_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -134,39 +151,224 @@ fn invalidate_status_cache() {
     status_cache().store(Arc::new(None));
 }
 
-fn active_snapshot_generations() -> &'static Mutex<BTreeMap<u64, Arc<SnapshotLifecycle>>> {
-    ACTIVE_SNAPSHOT_GENERATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn active_snapshot_finalizations() -> &'static Mutex<BTreeMap<u64, PendingSnapshotFinalization>> {
+    ACTIVE_SNAPSHOT_FINALIZATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Failed or in-progress snapshot finalization retained for bounded retry.
+#[derive(Clone)]
+enum PendingSnapshotFinalization {
+    /// Full sink generation still owning accumulator/runtime state.
+    Full(Arc<SnapshotLifecycle>),
+    /// Compact durable-recovery payload after the heavy generation was released.
+    Compact(Arc<CompactSnapshotRecovery>),
+}
+
+impl PendingSnapshotFinalization {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.generation,
+            Self::Compact(recovery) => recovery.generation,
+        }
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.retained_finalization_bytes(),
+            Self::Compact(recovery) => recovery.retained_bytes as u64,
+        }
+    }
+
+    fn age_secs(&self, now: Instant) -> u64 {
+        match self {
+            Self::Full(lifecycle) => lifecycle.closed_age_secs(now),
+            Self::Compact(recovery) => now.saturating_duration_since(recovery.closed_at).as_secs(),
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        match self {
+            Self::Full(lifecycle) => {
+                lifecycle.committed.load(Ordering::Acquire)
+                    && !lifecycle.accepting.load(Ordering::Acquire)
+                    && !lifecycle.finalized.load(Ordering::Acquire)
+            }
+            Self::Compact(_) => true,
+        }
+    }
+}
+
+/// Compact recovery state for a failed snapshot finalization.
+///
+/// Retains only the pending terminal deltas and the spool handle needed to
+/// retry durable handoff, instead of the full accumulator/runtime generation.
+struct CompactSnapshotRecovery {
+    generation: u64,
+    plugin_config_id: Arc<str>,
+    events: Mutex<Vec<ChargeEvent>>,
+    retained_bytes: usize,
+    closed_at: Instant,
+    spool: Option<Arc<SpoolManager>>,
+    metrics: Arc<SinkMetrics>,
+}
+
+impl CompactSnapshotRecovery {
+    fn try_spool(&self) -> bool {
+        let events = {
+            let guard = match self.events.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.clone()
+        };
+        if events.is_empty() {
+            return true;
+        }
+        let Some(spool) = self.spool.as_ref() else {
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                "compact snapshot recovery requires an available spool",
+            );
+            return false;
+        };
+        if let Err(error) = spool.write_events(&events) {
+            self.metrics.spool_available.store(false, Ordering::Release);
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                format!("compact snapshot recovery spool handoff failed: {error}"),
+            );
+            warn!(
+                plugin = PLUGIN_NAME,
+                generation = self.generation,
+                plugin_config_id = %self.plugin_config_id,
+                error = %error,
+                "Chargeback sink compact snapshot recovery could not spool pending deltas"
+            );
+            return false;
+        }
+        self.metrics
+            .snapshot_emits_total
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
+        true
+    }
 }
 
 fn register_snapshot_generation(lifecycle: Arc<SnapshotLifecycle>) {
-    let mut generations = match active_snapshot_generations().lock() {
-        Ok(generations) => generations,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    generations.entry(lifecycle.generation).or_insert(lifecycle);
-}
-
-fn unregister_snapshot_generation(generation: u64) {
-    let mut generations = match active_snapshot_generations().lock() {
-        Ok(generations) => generations,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    generations.remove(&generation);
-}
-
-fn pending_snapshot_finalizations() -> usize {
-    let generations = match active_snapshot_generations().lock() {
+    let mut generations = match active_snapshot_finalizations().lock() {
         Ok(generations) => generations,
         Err(poisoned) => poisoned.into_inner(),
     };
     generations
-        .values()
-        .filter(|lifecycle| {
-            lifecycle.committed.load(Ordering::Acquire)
-                && !lifecycle.accepting.load(Ordering::Acquire)
-                && !lifecycle.finalized.load(Ordering::Acquire)
-        })
-        .count()
+        .entry(lifecycle.generation)
+        .or_insert(PendingSnapshotFinalization::Full(lifecycle));
+}
+
+fn unregister_full_snapshot_generation(generation: u64) {
+    let mut generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Full finalizers must never remove a Compact recovery that now owns the
+    // generation's pending deltas after compaction.
+    if matches!(
+        generations.get(&generation),
+        Some(PendingSnapshotFinalization::Full(_))
+    ) {
+        generations.remove(&generation);
+    }
+}
+
+fn unregister_compact_snapshot_generation(generation: u64) {
+    let mut generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if matches!(
+        generations.get(&generation),
+        Some(PendingSnapshotFinalization::Compact(_))
+    ) {
+        generations.remove(&generation);
+    }
+}
+
+fn compact_recovery_for_generation(generation: u64) -> Option<Arc<CompactSnapshotRecovery>> {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Compact(recovery)) => Some(Arc::clone(recovery)),
+        _ => None,
+    }
+}
+
+/// Retry compact recovery synchronously from non-async disposal paths.
+fn try_finalize_compact_recovery_without_await(generation: u64) -> bool {
+    let Some(recovery) = compact_recovery_for_generation(generation) else {
+        // Compact already drained or never published.
+        return true;
+    };
+    if recovery.try_spool() {
+        unregister_compact_snapshot_generation(generation);
+        invalidate_status_cache();
+        true
+    } else {
+        false
+    }
+}
+
+/// Retry compact recovery without blocking an async runtime worker on spool I/O.
+async fn try_finalize_compact_recovery(generation: u64) -> bool {
+    let Some(recovery) = compact_recovery_for_generation(generation) else {
+        // Compact already drained or never published.
+        return true;
+    };
+    let durable = tokio::task::spawn_blocking({
+        let recovery = Arc::clone(&recovery);
+        move || recovery.try_spool()
+    })
+    .await
+    .unwrap_or(false);
+    if durable {
+        unregister_compact_snapshot_generation(generation);
+        invalidate_status_cache();
+    }
+    durable
+}
+
+fn pending_snapshot_finalization_stats() -> (usize, u64, u64, usize, u64) {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    let mut pending = 0usize;
+    let mut bytes = 0u64;
+    let mut oldest_age = 0u64;
+    let mut full = 0usize;
+    let mut compact_bytes = 0u64;
+    for entry in generations.values() {
+        if !entry.is_pending() {
+            continue;
+        }
+        pending = pending.saturating_add(1);
+        let retained = entry.retained_bytes();
+        bytes = bytes.saturating_add(retained);
+        oldest_age = oldest_age.max(entry.age_secs(now));
+        match entry {
+            PendingSnapshotFinalization::Full(_) => full = full.saturating_add(1),
+            PendingSnapshotFinalization::Compact(_) => {
+                compact_bytes = compact_bytes.saturating_add(retained);
+            }
+        }
+    }
+    (pending, bytes, oldest_age, full, compact_bytes)
+}
+
+fn pending_finalization_budget_exceeded() -> bool {
+    let (pending, _bytes, _age, _full, compact_bytes) = pending_snapshot_finalization_stats();
+    pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS
+        || compact_bytes >= MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES as u64
 }
 
 /// Stop snapshot admission and durably spool every generation's final delta.
@@ -174,19 +376,14 @@ fn pending_snapshot_finalizations() -> usize {
 /// Serving modes call this after request/connection drain. Reload disposal
 /// follows the same exact-once lifecycle from [`Drop for ApiChargebackSink`].
 pub async fn finalize_all_snapshot_generations() {
-    let generations: Vec<Arc<SnapshotLifecycle>> = {
-        let generations = match active_snapshot_generations().lock() {
+    let generations: Vec<PendingSnapshotFinalization> = {
+        let generations = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
         generations.values().cloned().collect()
     };
-    futures_util::future::join_all(
-        generations
-            .iter()
-            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
-    )
-    .await;
+    futures_util::future::join_all(generations.iter().map(finalize_pending_snapshot)).await;
 }
 
 /// Finalize the generation being retired and retry every older generation
@@ -194,30 +391,188 @@ pub async fn finalize_all_snapshot_generations() {
 /// later reload prevents a persistent spool outage from accumulating
 /// never-revisited generations until process shutdown.
 async fn finalize_snapshot_generation_and_pending(current: Arc<SnapshotLifecycle>) {
-    let mut generations = vec![Arc::clone(&current)];
+    let mut pending = Vec::new();
     {
-        let registered = match active_snapshot_generations().lock() {
+        let registered = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
-        generations.extend(
+        // Prefer the registry mapping: a prior failed finalization may already
+        // have compacted this generation to Compact recovery state. Always
+        // wrapping as Full would skip Compact and can later clear it.
+        match registered.get(&current.generation) {
+            Some(entry) => pending.push(entry.clone()),
+            None if !current.compacted.load(Ordering::Acquire)
+                && !current.finalized.load(Ordering::Acquire) =>
+            {
+                pending.push(PendingSnapshotFinalization::Full(Arc::clone(&current)));
+            }
+            None => {}
+        }
+        pending.extend(
             registered
                 .values()
-                .filter(|lifecycle| {
-                    lifecycle.generation != current.generation
-                        && lifecycle.committed.load(Ordering::Acquire)
-                        && !lifecycle.accepting.load(Ordering::Acquire)
-                        && !lifecycle.finalized.load(Ordering::Acquire)
-                })
+                .filter(|entry| entry.generation() != current.generation && entry.is_pending())
                 .cloned(),
         );
     }
-    futures_util::future::join_all(
-        generations
-            .iter()
-            .map(|generation| generation.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT)),
-    )
-    .await;
+    futures_util::future::join_all(pending.iter().map(finalize_pending_snapshot)).await;
+
+    // Full→Compact can occur while we still hold a Full handle from the local
+    // pending snapshot taken above. Retry Compact ownership for this generation.
+    if current.compacted.load(Ordering::Acquire)
+        || compact_recovery_for_generation(current.generation).is_some()
+    {
+        let _ = try_finalize_compact_recovery(current.generation).await;
+    }
+}
+
+async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> bool {
+    match pending {
+        PendingSnapshotFinalization::Full(lifecycle) => {
+            lifecycle.finalize_within(SNAPSHOT_FINALIZE_TIMEOUT).await
+        }
+        PendingSnapshotFinalization::Compact(recovery) => {
+            try_finalize_compact_recovery(recovery.generation).await
+        }
+    }
+}
+
+/// Reduce a Full snapshot generation to compact durable recovery, but never
+/// while an admitted terminal hook or queued overflow delivery can still
+/// mutate the accumulator.
+///
+/// Losslessness takes precedence over meeting a smaller full-generation count:
+/// admission is closed first and, until both terminal-hook admission and async
+/// overflow-delivery ownership are observably zero, the Full generation is
+/// retained untouched (returns `false`) so a later compaction pass — the next
+/// reload or shutdown — can retry after drain. The budget gate is checked
+/// against the current retained estimate *before* any staged overflow is
+/// drained, so a refused compaction never loses events.
+fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
+    // Stop new admissions and require the admitted set to drain before touching
+    // full-generation state. `admit()`'s double-checked `accepting` flag means
+    // that once we observe `accepting == false`, `in_flight == 0`, and no
+    // overflow delivery ownership, no guard or stage-back job can mutate the
+    // accumulator.
+    lifecycle.mark_admission_closed();
+    if lifecycle.in_flight.load(Ordering::Acquire) > 0
+        || lifecycle.accumulator.overflow_deliveries_in_flight() > 0
+    {
+        return false;
+    }
+
+    let estimated_bytes = lifecycle.accumulator.retained_bytes();
+    let (pending, _bytes, _age, full, compact_bytes) = pending_snapshot_finalization_stats();
+    if (compact_bytes.saturating_add(estimated_bytes as u64)
+        > MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES as u64
+        || pending >= MAX_PENDING_SNAPSHOT_FINALIZATIONS)
+        && full <= 1
+    {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            retained_bytes = estimated_bytes,
+            "Chargeback sink cannot compact failed finalization; pending recovery budget exhausted"
+        );
+        return false;
+    }
+
+    // Admission is closed and drained; preparing the pending deltas is now
+    // race-free against the request path.
+    let Some(events) = lifecycle.prepare_compaction_events() else {
+        // Serialize failure: keep the Full generation intact and retry later.
+        return false;
+    };
+
+    // Stop the periodic emitter for this generation regardless of outcome.
+    let _ = lifecycle.shutdown_tx.send(true);
+    {
+        let mut task = match lifecycle.task.lock() {
+            Ok(task) => task,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task) = task.take() {
+            task.abort();
+        }
+    }
+
+    if events.is_empty() {
+        // Nothing pending to hand off; the generation is already durable. Retire
+        // it as a successful finalization rather than leaking a Full entry.
+        lifecycle.finalized.store(true, Ordering::Release);
+        unregister_full_snapshot_generation(lifecycle.generation);
+        enforce_full_pending_finalization_bound(lifecycle.generation);
+        invalidate_status_cache();
+        return true;
+    }
+
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    let recovery = Arc::new(CompactSnapshotRecovery {
+        generation: lifecycle.generation,
+        plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
+        events: Mutex::new(events),
+        retained_bytes,
+        closed_at: Instant::now(),
+        spool: lifecycle.runtime.spool.clone(),
+        metrics: Arc::clone(&lifecycle.runtime.metrics),
+    });
+    // Publish Compact ownership before clearing Full state so a concurrent Full
+    // finalizer cannot observe an empty accumulator and unregister the generation
+    // while pending deltas exist only in this stack frame.
+    {
+        let mut generations = match active_snapshot_finalizations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        generations.insert(
+            lifecycle.generation,
+            PendingSnapshotFinalization::Compact(Arc::clone(&recovery)),
+        );
+    }
+    lifecycle.compacted.store(true, Ordering::Release);
+    lifecycle.accumulator.clear_for_compaction();
+    enforce_full_pending_finalization_bound(lifecycle.generation);
+    invalidate_status_cache();
+    true
+}
+
+fn enforce_full_pending_finalization_bound(keep_generation: u64) {
+    let overflow: Vec<Arc<SnapshotLifecycle>> = {
+        let generations = match active_snapshot_finalizations().lock() {
+            Ok(generations) => generations,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut full: Vec<Arc<SnapshotLifecycle>> = generations
+            .values()
+            .filter_map(|entry| match entry {
+                PendingSnapshotFinalization::Full(lifecycle)
+                    if entry.is_pending() && lifecycle.generation != keep_generation =>
+                {
+                    Some(Arc::clone(lifecycle))
+                }
+                _ => None,
+            })
+            .collect();
+        if full.len() < MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS {
+            return;
+        }
+        full.sort_by_key(|lifecycle| lifecycle.generation);
+        let remove_count = full
+            .len()
+            .saturating_add(1)
+            .saturating_sub(MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS);
+        full.into_iter().take(remove_count).collect()
+    };
+    for lifecycle in overflow {
+        // compact_snapshot_lifecycle closes admission and refuses (retaining the
+        // Full generation) until its own in_flight drains, so an admitted hook
+        // can never race the accumulator clear here.
+        let _ = compact_snapshot_lifecycle(&lifecycle);
+    }
 }
 
 fn register_active_sink(runtime: Arc<SinkRuntime>) {
@@ -348,6 +703,24 @@ fn default_snapshot_cleanup_interval_secs() -> u64 {
 fn default_snapshot_stale_entry_ttl_secs() -> u64 {
     3_600
 }
+
+fn default_snapshot_max_entries() -> usize {
+    100_000
+}
+
+fn default_snapshot_max_retained_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+/// Ceiling on full failed-finalization generations retained in memory.
+/// Additional failures compact to [`CompactSnapshotRecovery`] instead.
+const MAX_FULL_PENDING_SNAPSHOT_FINALIZATIONS: usize = 2;
+/// Ceiling on compact + full pending finalizations retained for retry.
+const MAX_PENDING_SNAPSHOT_FINALIZATIONS: usize = 64;
+/// Aggregate retained-byte budget for compact recovery payloads.
+const MAX_COMPACT_SNAPSHOT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+/// Operator-facing recovery policy for pending snapshot finalizations.
+const SNAPSHOT_FINALIZATION_RECOVERY_POLICY: &str = "restore_spool_writability; compact recoveries retry on reload and shutdown; new snapshot generations fail closed while pending recovery count or bytes exceed budget";
 
 fn default_clickhouse_database() -> String {
     "ferrum".to_string()
@@ -521,6 +894,12 @@ pub struct SnapshotSettings {
     pub cleanup_interval_secs: u64,
     #[serde(default = "default_snapshot_stale_entry_ttl_secs")]
     pub stale_entry_ttl_secs: u64,
+    /// Hard ceiling on distinct accumulator identities retained in memory.
+    #[serde(default = "default_snapshot_max_entries")]
+    pub max_entries: usize,
+    /// Hard ceiling on estimated retained bytes for accumulator identities.
+    #[serde(default = "default_snapshot_max_retained_bytes")]
+    pub max_retained_bytes: usize,
 }
 
 impl Default for SnapshotSettings {
@@ -530,6 +909,8 @@ impl Default for SnapshotSettings {
             emit_zero_deltas: false,
             cleanup_interval_secs: default_snapshot_cleanup_interval_secs(),
             stale_entry_ttl_secs: default_snapshot_stale_entry_ttl_secs(),
+            max_entries: default_snapshot_max_entries(),
+            max_retained_bytes: default_snapshot_max_retained_bytes(),
         }
     }
 }
@@ -596,7 +977,9 @@ pub struct ChargeEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grpc_status: Option<u32>,
     pub protocol: String,
-    pub call_count: u32,
+    /// Lossless call/session count. Snapshot deltas and ClickHouse DDL use u64
+    /// so intervals that exceed `u32::MAX` never clamp while the baseline advances.
+    pub call_count: u64,
     pub charge_call: f64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
@@ -659,6 +1042,10 @@ pub struct ApiChargebackSink {
     /// observability. Production cache supplies `PluginConfig.id`; standalone
     /// constructors fall back to [`DEFAULT_PLUGIN_CONFIG_ID`].
     plugin_config_id: Arc<str>,
+    /// Ferrum namespace (billing ledger) this instance was built for. Part of
+    /// the durable spool ownership identity so two ledgers can never share a
+    /// managed spool namespace.
+    ferrum_namespace: Arc<str>,
     /// Shared gateway client retained for dedicated ClickHouse client build at start.
     http_client: PluginHttpClient,
     /// Live sink runtime after [`Plugin::start_background_tasks`].
@@ -694,6 +1081,110 @@ struct QueuedChargeEvent {
 
 enum SpoolJob {
     Events(Vec<QueuedChargeEvent>),
+    /// Snapshot cardinality/byte overflow charges. On durable write success the
+    /// worker advances the overflow-spooled counters; on write/cancellation
+    /// failure it re-stages the exact events into the accumulator's bounded
+    /// overflow so a Tokio worker never blocks on compression/write/fsync.
+    SnapshotOverflow(SnapshotOverflowJob),
+}
+
+/// Owned snapshot-overflow delivery.
+///
+/// The queued form preserves byte leases without copying events. Once a worker
+/// starts a blocking write, `recovery_events` keeps an `Arc` to the exact
+/// payload. Dropping this owner before durable success (queue teardown, worker
+/// abort, or a failed blocking task) re-stages the payload and always releases
+/// the lifecycle's delivery count.
+struct SnapshotOverflowJob {
+    queued_events: Vec<QueuedChargeEvent>,
+    recovery_events: Option<Arc<Vec<ChargeEvent>>>,
+    accumulator: Arc<SnapshotAccumulator>,
+    generation: u64,
+    metrics: Arc<SinkMetrics>,
+    pending_jobs: Arc<AtomicUsize>,
+    pending_events: Arc<AtomicUsize>,
+    event_count: usize,
+    durable: bool,
+}
+
+impl SnapshotOverflowJob {
+    fn new(
+        events: Vec<QueuedChargeEvent>,
+        accumulator: Arc<SnapshotAccumulator>,
+        generation: u64,
+        metrics: Arc<SinkMetrics>,
+        pending_jobs: Arc<AtomicUsize>,
+        pending_events: Arc<AtomicUsize>,
+    ) -> Self {
+        let event_count = events.len();
+        Self {
+            queued_events: events,
+            recovery_events: None,
+            accumulator,
+            generation,
+            metrics,
+            pending_jobs,
+            pending_events,
+            event_count,
+            durable: false,
+        }
+    }
+
+    fn event_count(&self) -> usize {
+        self.event_count
+    }
+
+    fn prepare_write(&mut self) -> (Arc<Vec<ChargeEvent>>, Vec<Arc<ByteLease>>) {
+        let queued_events = std::mem::take(&mut self.queued_events);
+        let (events, leases): (Vec<_>, Vec<_>) = queued_events
+            .into_iter()
+            .map(|queued| (queued.event, queued.lease))
+            .unzip();
+        let events = Arc::new(events);
+        self.recovery_events = Some(Arc::clone(&events));
+        (events, leases)
+    }
+
+    fn mark_durable(&mut self) {
+        self.durable = true;
+        self.recovery_events = None;
+    }
+
+    fn restage(&mut self) {
+        if self.durable {
+            return;
+        }
+        let events = if !self.queued_events.is_empty() {
+            std::mem::take(&mut self.queued_events)
+                .into_iter()
+                .map(|queued| queued.event)
+                .collect()
+        } else if let Some(events) = self.recovery_events.take() {
+            match Arc::try_unwrap(events) {
+                Ok(events) => events,
+                Err(events) => events.as_ref().clone(),
+            }
+        } else {
+            self.metrics.record_failure(
+                FailureReason::Serialize,
+                "snapshot overflow delivery lost internal payload ownership",
+            );
+            self.durable = true;
+            return;
+        };
+        stage_overflow_events_or_reject(&self.accumulator, &self.metrics, self.generation, events);
+        self.durable = true;
+    }
+}
+
+impl Drop for SnapshotOverflowJob {
+    fn drop(&mut self) {
+        self.restage();
+        self.pending_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.pending_events
+            .fetch_sub(self.event_count, Ordering::Relaxed);
+        self.accumulator.finish_overflow_delivery();
+    }
 }
 
 /// Bounded async handoff for spool compression/write/fsync work.
@@ -741,6 +1232,58 @@ impl SpoolDelivery {
                 self.metrics
                     .record_spool_job_loss(event_count as u64, "delivery queue closed");
                 false
+            }
+        }
+    }
+
+    /// Enqueue snapshot overflow events for durable async spooling. The bounded
+    /// queue owns compression/write/fsync and preserves the byte leases until
+    /// the blocking write finishes. Admission refusal returns the exact events
+    /// to the caller; after delivery ownership begins, a full/closed queue or
+    /// worker teardown re-stages them before releasing that ownership.
+    fn try_enqueue_snapshot_overflow(
+        &self,
+        events: Vec<QueuedChargeEvent>,
+        accumulator: Arc<SnapshotAccumulator>,
+        generation: u64,
+    ) -> Result<(), Vec<QueuedChargeEvent>> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let event_count = events.len();
+        let Some(_admission) = self.worker.try_admit() else {
+            return Err(events);
+        };
+        accumulator.begin_overflow_delivery();
+        self.pending_jobs.fetch_add(1, Ordering::Relaxed);
+        self.pending_events
+            .fetch_add(event_count, Ordering::Relaxed);
+        let job = SnapshotOverflowJob::new(
+            events,
+            accumulator,
+            generation,
+            Arc::clone(&self.metrics),
+            Arc::clone(&self.pending_jobs),
+            Arc::clone(&self.pending_events),
+        );
+        match self.sender.try_send(SpoolJob::SnapshotOverflow(job)) {
+            Ok(()) => {
+                self.metrics
+                    .spool_jobs_enqueued_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                match error.into_inner() {
+                    SpoolJob::SnapshotOverflow(mut job) => {
+                        // Stage back while this job still owns the lifecycle's
+                        // delivery count. Drop releases ownership only after the
+                        // accumulator mutation is complete.
+                        job.restage();
+                        Ok(())
+                    }
+                    SpoolJob::Events(events) => Err(events),
+                }
             }
         }
     }
@@ -843,6 +1386,61 @@ fn start_spool_delivery(
                             pending_events_for_loop
                                 .fetch_sub(event_count, Ordering::Relaxed);
                         }
+                        Some(SpoolJob::SnapshotOverflow(mut job)) => {
+                            let event_count = job.event_count();
+                            let generation = job.generation;
+                            let (events, leases) = job.prepare_write();
+                            let spool = Arc::clone(&spool);
+                            let metrics = Arc::clone(&metrics_for_worker);
+                            let events_for_write = Arc::clone(&events);
+                            drop(events);
+                            let write_result = tokio::task::spawn_blocking(move || {
+                                let result = spool.write_events(events_for_write.as_slice());
+                                // Leases stay charged across the blocking write
+                                // even if its async waiter is cancelled mid-drain.
+                                drop(leases);
+                                result
+                            })
+                            .await;
+                            match write_result {
+                                Ok(Ok(_)) => {
+                                    job.mark_durable();
+                                    metrics
+                                        .spool_jobs_written_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    metrics
+                                        .snapshot_overflow_spooled_total
+                                        .fetch_add(event_count as u64, Ordering::Relaxed);
+                                    metrics
+                                        .snapshot_emits_total
+                                        .fetch_add(event_count as u64, Ordering::Relaxed);
+                                    invalidate_status_cache();
+                                }
+                                Ok(Err(error)) => {
+                                    metrics.spool_available.store(false, Ordering::Release);
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        generation,
+                                        error = %error,
+                                        "Chargeback sink async snapshot overflow spool write failed; staging in bounded overflow"
+                                    );
+                                    job.restage();
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        plugin = PLUGIN_NAME,
+                                        generation,
+                                        error = %error,
+                                        "Chargeback sink async snapshot overflow spool task failed"
+                                    );
+                                    metrics.record_spool_job_loss(
+                                        event_count as u64,
+                                        "snapshot overflow spool task failed",
+                                    );
+                                    job.restage();
+                                }
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -875,6 +1473,11 @@ struct SnapshotLifecycle {
     in_flight: AtomicUsize,
     committed: AtomicBool,
     finalized: AtomicBool,
+    /// Set when this generation's pending deltas were transferred to
+    /// [`PendingSnapshotFinalization::Compact`]. Full finalize paths must not
+    /// treat the cleared accumulator as an empty successful finalization.
+    compacted: AtomicBool,
+    closed_at_secs: AtomicI64,
     shutdown_tx: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<bool>>>,
     emission_lock: Arc<Mutex<()>>,
@@ -910,6 +1513,61 @@ impl SnapshotLifecycle {
         self.committed.store(true, Ordering::Release);
     }
 
+    fn mark_admission_closed(&self) {
+        if self.accepting.swap(false, Ordering::AcqRel) {
+            self.closed_at_secs
+                .store(unix_timestamp_seconds(), Ordering::Release);
+            invalidate_status_cache();
+        }
+    }
+
+    fn closed_age_secs(&self, _now: Instant) -> u64 {
+        let closed = self.closed_at_secs.load(Ordering::Acquire);
+        if closed <= 0 {
+            return 0;
+        }
+        unix_timestamp_seconds().saturating_sub(closed) as u64
+    }
+
+    fn retained_finalization_bytes(&self) -> u64 {
+        self.accumulator.retained_bytes() as u64
+    }
+
+    fn prepare_compaction_events(&self) -> Option<Vec<ChargeEvent>> {
+        let _emission_guard = match self.emission_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let snapshot_id = new_ulid();
+        let received_at = unix_timestamp_nanos();
+        let mut events = self.accumulator.peek_overflow_pending();
+        match self.accumulator.prepare_deltas(
+            &self.config,
+            &self.node_id,
+            received_at,
+            &snapshot_id,
+        ) {
+            Ok(prepared) => {
+                events.extend(prepared.events);
+                // Compaction owns these events going forward; drop staged
+                // overflow so they are not double-emitted if a later compact
+                // retry races a resurrected full lifecycle.
+                if !self.accumulator.peek_overflow_pending().is_empty() {
+                    let _ = self.accumulator.take_overflow_pending();
+                }
+                Some(events)
+            }
+            Err(error) => {
+                self.runtime
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error);
+                // Keep the full generation intact: compacting only the staged
+                // overflow would clear accumulator totals that failed to serialize.
+                None
+            }
+        }
+    }
+
     async fn finalize_attempt(&self, deadline: Instant) -> bool {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -919,13 +1577,21 @@ impl SnapshotLifecycle {
             Ok(guard) => guard,
             Err(_) => return false,
         };
+        if self.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(self.generation).is_some()
+        {
+            self.compacted.store(true, Ordering::Release);
+            return try_finalize_compact_recovery(self.generation).await;
+        }
         if self.finalized.load(Ordering::Acquire) {
-            unregister_snapshot_generation(self.generation);
+            unregister_full_snapshot_generation(self.generation);
             return true;
         }
 
-        self.accepting.store(false, Ordering::Release);
-        while self.in_flight.load(Ordering::Acquire) > 0 {
+        self.mark_admission_closed();
+        while self.in_flight.load(Ordering::Acquire) > 0
+            || self.accumulator.overflow_deliveries_in_flight() > 0
+        {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 invalidate_status_cache();
@@ -994,8 +1660,15 @@ impl SnapshotLifecycle {
             None => true,
         };
         if durable {
+            // A concurrent compaction may have published Compact while this Full
+            // path observed an emptied accumulator. Never finalize away Compact.
+            if compact_recovery_for_generation(self.generation).is_some() {
+                self.compacted.store(true, Ordering::Release);
+                invalidate_status_cache();
+                return try_finalize_compact_recovery(self.generation).await;
+            }
             self.finalized.store(true, Ordering::Release);
-            unregister_snapshot_generation(self.generation);
+            unregister_full_snapshot_generation(self.generation);
         }
         invalidate_status_cache();
         durable
@@ -1013,20 +1686,57 @@ impl SnapshotLifecycle {
                     plugin = PLUGIN_NAME,
                     generation = self.generation,
                     timeout_ms = timeout.as_millis(),
-                    "Chargeback sink final snapshot handoff timed out; generation state retained"
+                    "Chargeback sink final snapshot handoff timed out; compacting generation state"
                 );
-                return false;
+                self.compact_failed_finalization();
+                // Ownership may now be Compact; retry that recovery once here so
+                // a single finalize_within call does not leave Compact untouched.
+                return try_finalize_compact_recovery(self.generation).await;
             }
             tokio::time::sleep(remaining.min(SNAPSHOT_FINALIZE_RETRY_INTERVAL)).await;
         }
     }
 
-    fn finalize_without_await(&self) {
-        if self.finalized.load(Ordering::Acquire) {
-            unregister_snapshot_generation(self.generation);
+    fn compact_failed_finalization(&self) {
+        if self.finalized.load(Ordering::Acquire)
+            || self.compacted.load(Ordering::Acquire)
+            || !self.committed.load(Ordering::Acquire)
+        {
             return;
         }
-        self.accepting.store(false, Ordering::Release);
+        // Already compacted by a concurrent finalizer.
+        {
+            let generations = match active_snapshot_finalizations().lock() {
+                Ok(generations) => generations,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if matches!(
+                generations.get(&self.generation),
+                Some(PendingSnapshotFinalization::Compact(_))
+            ) {
+                self.compacted.store(true, Ordering::Release);
+                return;
+            }
+        }
+        // compact_snapshot_lifecycle owns the whole gated sequence: it closes
+        // admission, refuses (leaving the Full generation for a later retry)
+        // until in_flight drains, then prepares and compacts the pending deltas.
+        let _ = compact_snapshot_lifecycle(self);
+    }
+
+    fn finalize_without_await(&self) {
+        if self.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(self.generation).is_some()
+        {
+            self.compacted.store(true, Ordering::Release);
+            let _ = try_finalize_compact_recovery_without_await(self.generation);
+            return;
+        }
+        if self.finalized.load(Ordering::Acquire) {
+            unregister_full_snapshot_generation(self.generation);
+            return;
+        }
+        self.mark_admission_closed();
         let _ = self.shutdown_tx.send(true);
         let task = {
             let mut task = match self.task.lock() {
@@ -1050,8 +1760,16 @@ impl SnapshotLifecycle {
             true
         };
         if durable {
-            self.finalized.store(true, Ordering::Release);
-            unregister_snapshot_generation(self.generation);
+            if compact_recovery_for_generation(self.generation).is_some() {
+                self.compacted.store(true, Ordering::Release);
+                let _ = try_finalize_compact_recovery_without_await(self.generation);
+            } else {
+                self.finalized.store(true, Ordering::Release);
+                unregister_full_snapshot_generation(self.generation);
+            }
+        } else if self.committed.load(Ordering::Acquire) {
+            self.compact_failed_finalization();
+            let _ = try_finalize_compact_recovery_without_await(self.generation);
         }
         invalidate_status_cache();
     }
@@ -1083,7 +1801,15 @@ struct SinkMetrics {
     spool_jobs_written_total: AtomicU64,
     spool_jobs_lost_total: AtomicU64,
     spool_events_lost_total: AtomicU64,
+    /// Retained spool records this identity does not own: pre-namespace layouts
+    /// and namespaces orphaned by a destination/configuration change. Never
+    /// replayed, never deleted; reported so operators can reconcile them.
+    spool_unbound_files: AtomicU64,
+    spool_unbound_namespaces: AtomicU64,
     snapshot_emits_total: AtomicU64,
+    snapshot_overflow_spooled_total: AtomicU64,
+    snapshot_overflow_pending_total: AtomicU64,
+    snapshot_cardinality_rejections_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
     last_replay_at: AtomicI64,
@@ -1108,7 +1834,12 @@ impl Default for SinkMetrics {
             spool_jobs_written_total: AtomicU64::new(0),
             spool_jobs_lost_total: AtomicU64::new(0),
             spool_events_lost_total: AtomicU64::new(0),
+            spool_unbound_files: AtomicU64::new(0),
+            spool_unbound_namespaces: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
+            snapshot_overflow_spooled_total: AtomicU64::new(0),
+            snapshot_overflow_pending_total: AtomicU64::new(0),
+            snapshot_cardinality_rejections_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_replay_at: AtomicI64::new(0),
@@ -1296,7 +2027,7 @@ impl ApiChargebackSink {
     pub fn new_with_config_id(
         raw_config: &Value,
         http_client: PluginHttpClient,
-        _namespace: &str,
+        namespace: &str,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
         if !raw_config.is_object() {
@@ -1342,11 +2073,18 @@ impl ApiChargebackSink {
             http_client.backend_allow_ips(),
         )?;
 
+        let ferrum_namespace = if namespace.trim().is_empty() {
+            Arc::<str>::from(DEFAULT_FERRUM_NAMESPACE)
+        } else {
+            Arc::<str>::from(namespace.trim())
+        };
+
         Ok(Self {
             pricing,
             config: Arc::new(config),
             node_id: Arc::<str>::from(resolve_node_id()),
             plugin_config_id,
+            ferrum_namespace,
             http_client,
             runtime: OnceLock::new(),
             snapshot_accumulator: OnceLock::new(),
@@ -1377,19 +2115,26 @@ impl ApiChargebackSink {
         let metrics = Arc::new(SinkMetrics::default());
         let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
-            let identity = SpoolIdentity::new(
+            // Ownership binds the stable plugin-config id, the Ferrum namespace
+            // (ledger), the sanitized ClickHouse endpoint, and the destination
+            // schema. `endpoint` is credential-free by construction, so nothing
+            // secret reaches a path, a manifest, or a log line.
+            let owner = SpoolOwner::new(
                 Arc::clone(&self.plugin_config_id),
+                Arc::clone(&self.ferrum_namespace),
                 endpoint.clone(),
                 self.config.clickhouse.database.clone(),
                 self.config.clickhouse.table.clone(),
+                Arc::clone(&self.node_id),
             );
             Some(Arc::new(SpoolManager::new(
                 self.config.spool.clone(),
-                Arc::clone(&self.node_id),
-                identity,
+                owner,
                 generation,
                 Arc::clone(&metrics),
                 STALE_TEMP_AGE_SECS,
+                spool_claim_lease_secs(&self.config),
+                SpoolFsOps::REAL,
             )?))
         } else {
             None
@@ -1541,7 +2286,15 @@ impl ApiChargebackSink {
         }
 
         let snapshot_lifecycle = if self.config.mode == SinkMode::Snapshot {
-            let accumulator = Arc::new(SnapshotAccumulator::new());
+            if pending_finalization_budget_exceeded() {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing new snapshot generation while pending finalization recovery budget is exhausted ({SNAPSHOT_FINALIZATION_RECOVERY_POLICY})"
+                ));
+            }
+            let accumulator = Arc::new(SnapshotAccumulator::with_limits(
+                self.config.snapshot.max_entries,
+                self.config.snapshot.max_retained_bytes,
+            ));
             let emission_lock = Arc::new(Mutex::new(()));
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let task = start_snapshot_task(
@@ -1567,6 +2320,8 @@ impl ApiChargebackSink {
                 in_flight: AtomicUsize::new(0),
                 committed: AtomicBool::new(false),
                 finalized: AtomicBool::new(false),
+                compacted: AtomicBool::new(false),
+                closed_at_secs: AtomicI64::new(0),
                 shutdown_tx,
                 task: Mutex::new(Some(task)),
                 emission_lock,
@@ -1709,15 +2464,35 @@ impl ApiChargebackSink {
     #[allow(dead_code)]
     pub(crate) fn snapshot_generation_registered_for_tests(&self) -> Option<bool> {
         let lifecycle = self.snapshot_lifecycle.get()?;
-        let generations = match active_snapshot_generations().lock() {
+        let generations = match active_snapshot_finalizations().lock() {
             Ok(generations) => generations,
             Err(poisoned) => poisoned.into_inner(),
         };
-        Some(
-            generations
-                .get(&lifecycle.generation)
-                .is_some_and(|registered| Arc::ptr_eq(registered, lifecycle)),
-        )
+        Some(match generations.get(&lifecycle.generation) {
+            Some(PendingSnapshotFinalization::Full(registered)) => {
+                Arc::ptr_eq(registered, lifecycle)
+            }
+            Some(PendingSnapshotFinalization::Compact(_)) => false,
+            None => false,
+        })
+    }
+
+    /// Force Full→Compact transfer for adversarial recovery tests.
+    #[allow(dead_code)]
+    pub(crate) fn force_compact_snapshot_finalization_for_tests(&self) -> bool {
+        let Some(lifecycle) = self.snapshot_lifecycle.get() else {
+            return false;
+        };
+        lifecycle.compact_failed_finalization();
+        lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some()
+    }
+
+    /// True when this generation is retained as compact durable recovery.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_compact_recovery_registered_for_tests(&self) -> Option<bool> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        Some(compact_recovery_for_generation(lifecycle.generation).is_some())
     }
 
     #[allow(dead_code)]
@@ -1730,6 +2505,92 @@ impl ApiChargebackSink {
             &lifecycle.node_id,
             &lifecycle.emission_lock,
         ))
+    }
+
+    /// Drive one snapshot cardinality overflow charge through the non-blocking
+    /// delivery path for tests. Returns false when no snapshot lifecycle exists.
+    #[allow(dead_code)]
+    pub(crate) fn spool_snapshot_overflow_for_tests(&self, event: ChargeEvent) -> bool {
+        let Some(lifecycle) = self.snapshot_lifecycle.get() else {
+            return false;
+        };
+        spool_snapshot_overflow_event(lifecycle, event);
+        true
+    }
+
+    /// Abort the owned spool-delivery worker so tests can prove queued snapshot
+    /// overflow ownership re-stages on teardown before durable processing.
+    #[allow(dead_code)]
+    pub(crate) fn abort_spool_delivery_for_tests(&self) -> bool {
+        let Some(runtime) = self.runtime.get() else {
+            return false;
+        };
+        let Some(delivery) = runtime.spool_delivery.as_ref() else {
+            return false;
+        };
+        delivery.worker.abort();
+        true
+    }
+
+    /// Snapshot overflow counters `(spooled, pending, cardinality_rejections)`
+    /// for the live generation; lets tests poll async durable-handoff outcomes.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_overflow_counters_for_tests(&self) -> Option<(u64, u64, u64)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        let metrics = &lifecycle.runtime.metrics;
+        Some((
+            metrics
+                .snapshot_overflow_spooled_total
+                .load(Ordering::Relaxed),
+            metrics
+                .snapshot_overflow_pending_total
+                .load(Ordering::Relaxed),
+            metrics
+                .snapshot_cardinality_rejections_total
+                .load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Prove compaction refuses while an admission guard is held and succeeds
+    /// after the admitted hook drains. Returns
+    /// `(refused_while_admitted, compacted_after_drain)`.
+    #[allow(dead_code)]
+    pub(crate) fn compact_refuses_while_admitted_then_succeeds_for_tests(
+        &self,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        let refused_while_held = {
+            let _admission = lifecycle.admit()?;
+            lifecycle.compact_failed_finalization();
+            !lifecycle.compacted.load(Ordering::Acquire)
+                && compact_recovery_for_generation(lifecycle.generation).is_none()
+        };
+        // Admission guard dropped; in_flight is now zero. Retry compaction.
+        lifecycle.compact_failed_finalization();
+        let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some();
+        Some((refused_while_held, compacted_after_drain))
+    }
+
+    /// Prove Full→Compact refuses while an async overflow delivery can still
+    /// stage back into the accumulator, then succeeds after delivery ownership
+    /// drains.
+    #[allow(dead_code)]
+    pub(crate) fn compact_refuses_while_overflow_delivery_then_succeeds_for_tests(
+        &self,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        lifecycle.accumulator.begin_overflow_delivery();
+        lifecycle.compact_failed_finalization();
+        let refused_while_held = !lifecycle.compacted.load(Ordering::Acquire)
+            && compact_recovery_for_generation(lifecycle.generation).is_none();
+        lifecycle.accumulator.finish_overflow_delivery();
+        lifecycle.compact_failed_finalization();
+        let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
+            || compact_recovery_for_generation(lifecycle.generation).is_some();
+        Some((refused_while_held, compacted_after_drain))
     }
 }
 
@@ -1845,9 +2706,26 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_http(summary, consumer, outcome, charge);
+                    .record_http(summary, consumer, outcome, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_http_summary(
+                                summary,
+                                consumer,
+                                outcome,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1877,9 +2755,25 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_stream(summary, consumer, charge);
+                    .record_stream(summary, consumer, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_stream_summary(
+                                summary,
+                                consumer,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1912,9 +2806,25 @@ impl Plugin for ApiChargebackSink {
             if let Some(lifecycle) = self.snapshot_lifecycle.get()
                 && let Some(_admission) = lifecycle.admit()
             {
-                lifecycle
+                match lifecycle
                     .accumulator
-                    .record_websocket(summary, consumer, charge);
+                    .record_websocket(summary, consumer, charge)
+                {
+                    SnapshotRecordOutcome::Accumulated => {}
+                    SnapshotRecordOutcome::OverflowImmediate => {
+                        spool_snapshot_overflow_event(
+                            lifecycle,
+                            event_from_ws_summary(
+                                summary,
+                                consumer,
+                                charge,
+                                &self.config,
+                                &self.node_id,
+                                None,
+                            ),
+                        );
+                    }
+                }
             }
             return;
         }
@@ -1948,7 +2858,7 @@ pub fn render_status_json() -> String {
 
     let body = serde_json::to_string(&aggregate_status_snapshot(&active_sinks().load_full()))
         .unwrap_or_else(|_| {
-            "{\"enabled\":false,\"instance_count\":0,\"snapshot_finalizations_pending\":0,\"totals\":{},\"instances\":[]}".to_string()
+            "{\"enabled\":false,\"instance_count\":0,\"snapshot_finalizations_pending\":0,\"snapshot_finalizations_pending_bytes\":0,\"snapshot_finalizations_oldest_age_secs\":0,\"snapshot_finalization_recovery_policy\":\"restore_spool_writability\",\"totals\":{},\"instances\":[]}".to_string()
         });
 
     cache.store(Arc::new(Some((Instant::now(), body.clone()))));
@@ -1957,18 +2867,29 @@ pub fn render_status_json() -> String {
 
 pub fn render_prometheus() -> String {
     let sinks = active_sinks().load_full();
-    let pending_finalizations = pending_snapshot_finalizations();
+    let (pending_finalizations, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     if sinks.is_empty() && pending_finalizations == 0 {
         return String::new();
     }
-    render_prometheus_for_sinks(sinks.as_ref(), pending_finalizations)
+    render_prometheus_for_sinks(
+        sinks.as_ref(),
+        pending_finalizations,
+        pending_bytes,
+        oldest_age,
+    )
 }
 
 fn disabled_status_snapshot() -> Value {
+    let (pending, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     serde_json::json!({
         "enabled": false,
         "instance_count": 0,
-        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
+        "snapshot_finalizations_pending": pending,
+        "snapshot_finalizations_pending_bytes": pending_bytes,
+        "snapshot_finalizations_oldest_age_secs": oldest_age,
+        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
             "spool": {
@@ -2005,6 +2926,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut spool_bytes = 0u64;
     let mut spool_drops = 0u64;
     let mut spool_prepare_failures = 0u64;
+    let mut spool_unbound_files = 0u64;
+    let mut spool_unbound_namespaces = 0u64;
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut events_enqueued = 0u64;
@@ -2041,6 +2964,13 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
         );
         spool_drops =
             spool_drops.saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+        let unbound_files = runtime.metrics.spool_unbound_files.load(Ordering::Relaxed);
+        spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
+        let unbound_ns = runtime
+            .metrics
+            .spool_unbound_namespaces
+            .load(Ordering::Relaxed);
+        spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
             let stats = spool.scan_stats().unwrap_or_default();
@@ -2052,10 +2982,15 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
         }
     }
 
+    let (pending, pending_bytes, oldest_age, _full, _compact) =
+        pending_snapshot_finalization_stats();
     serde_json::json!({
         "enabled": true,
         "instance_count": sinks.len(),
-        "snapshot_finalizations_pending": pending_snapshot_finalizations(),
+        "snapshot_finalizations_pending": pending,
+        "snapshot_finalizations_pending_bytes": pending_bytes,
+        "snapshot_finalizations_oldest_age_secs": oldest_age,
+        "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
             "queue": {
                 "depth": queue_depth,
@@ -2067,6 +3002,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
                 "bytes": spool_bytes,
                 "drops_total": spool_drops,
                 "prepare_failures_total": spool_prepare_failures,
+                "unbound_files": spool_unbound_files,
+                "unbound_namespaces": spool_unbound_namespaces,
                 "available": spool_enabled_any && spool_all_available
             },
             "export": {
@@ -2094,6 +3031,7 @@ impl SinkRuntime {
             .read()
             .ok()
             .and_then(|guard| guard.clone());
+        let snapshot = snapshot_accumulator_status(self.generation);
         serde_json::json!({
             "plugin_config_id": self.plugin_config_id.as_ref(),
             "generation": self.generation,
@@ -2125,6 +3063,7 @@ impl SinkRuntime {
                     .queue_byte_budget_exhausted_total
                     .load(Ordering::Relaxed),
             },
+            "snapshot": snapshot,
             "spool": {
                 "enabled": spool_enabled,
                 "available": spool_enabled && self.metrics.spool_available.load(Ordering::Acquire),
@@ -2132,6 +3071,8 @@ impl SinkRuntime {
                 "files": spool_files,
                 "bytes": spool_bytes,
                 "drops_total": self.metrics.spool_drops_total.load(Ordering::Relaxed),
+                "unbound_files": self.metrics.spool_unbound_files.load(Ordering::Relaxed),
+                "unbound_namespaces": self.metrics.spool_unbound_namespaces.load(Ordering::Relaxed),
                 "delivery_queue_depth": self
                     .spool_delivery
                     .as_ref()
@@ -2155,9 +3096,65 @@ impl SinkRuntime {
     }
 }
 
+fn snapshot_accumulator_gauges(generation: u64) -> Option<(u64, u64)> {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Full(lifecycle)) => Some((
+            lifecycle.accumulator.entry_count() as u64,
+            lifecycle.accumulator.retained_bytes() as u64,
+        )),
+        Some(PendingSnapshotFinalization::Compact(recovery)) => {
+            Some((0, recovery.retained_bytes as u64))
+        }
+        None => None,
+    }
+}
+
+fn snapshot_accumulator_status(generation: u64) -> Value {
+    let generations = match active_snapshot_finalizations().lock() {
+        Ok(generations) => generations,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match generations.get(&generation) {
+        Some(PendingSnapshotFinalization::Full(lifecycle)) => serde_json::json!({
+            "entries": lifecycle.accumulator.entry_count(),
+            "retained_bytes": lifecycle.accumulator.retained_bytes(),
+            "max_entries": lifecycle.accumulator.max_entries,
+            "max_retained_bytes": lifecycle.accumulator.max_retained_bytes,
+            "overflow_spooled_total": lifecycle.runtime.metrics.snapshot_overflow_spooled_total.load(Ordering::Relaxed),
+            "overflow_pending_total": lifecycle.runtime.metrics.snapshot_overflow_pending_total.load(Ordering::Relaxed),
+            "cardinality_rejections_total": lifecycle.runtime.metrics.snapshot_cardinality_rejections_total.load(Ordering::Relaxed),
+        }),
+        Some(PendingSnapshotFinalization::Compact(recovery)) => serde_json::json!({
+            "entries": 0,
+            "retained_bytes": recovery.retained_bytes,
+            "max_entries": 0,
+            "max_retained_bytes": 0,
+            "overflow_spooled_total": recovery.metrics.snapshot_overflow_spooled_total.load(Ordering::Relaxed),
+            "overflow_pending_total": recovery.metrics.snapshot_overflow_pending_total.load(Ordering::Relaxed),
+            "cardinality_rejections_total": recovery.metrics.snapshot_cardinality_rejections_total.load(Ordering::Relaxed),
+            "recovery": "compact",
+        }),
+        None => serde_json::json!({
+            "entries": 0,
+            "retained_bytes": 0,
+            "max_entries": 0,
+            "max_retained_bytes": 0,
+            "overflow_spooled_total": 0,
+            "overflow_pending_total": 0,
+            "cardinality_rejections_total": 0,
+        }),
+    }
+}
+
 fn render_prometheus_for_sinks(
     sinks: &BTreeMap<String, Arc<SinkRuntime>>,
     pending_finalizations: usize,
+    pending_finalization_bytes: u64,
+    pending_finalization_oldest_age_secs: u64,
 ) -> String {
     let mut output = String::with_capacity(4096 * sinks.len().max(1));
 
@@ -2183,11 +3180,18 @@ fn render_prometheus_for_sinks(
     let mut spool_jobs_written = 0u64;
     let mut spool_jobs_lost = 0u64;
     let mut spool_events_lost = 0u64;
+    let mut spool_unbound_files = 0u64;
+    let mut spool_unbound_namespaces = 0u64;
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
     let mut queue_byte_budget_exhausted = 0u64;
     let mut snapshot_emits = 0u64;
+    let mut snapshot_entries = 0u64;
+    let mut snapshot_retained_bytes = 0u64;
+    let mut snapshot_overflow_spooled = 0u64;
+    let mut snapshot_overflow_pending = 0u64;
+    let mut snapshot_cardinality_rejections = 0u64;
     let mut any_snapshot = false;
     let mut latency_counts: Vec<u64> = Vec::new();
     let mut latency_sum = 0.0f64;
@@ -2224,6 +3228,10 @@ fn render_prometheus_for_sinks(
             spool_jobs_lost.saturating_add(metrics.spool_jobs_lost_total.load(Ordering::Relaxed));
         spool_events_lost = spool_events_lost
             .saturating_add(metrics.spool_events_lost_total.load(Ordering::Relaxed));
+        let unbound_files = metrics.spool_unbound_files.load(Ordering::Relaxed);
+        spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
+        let unbound_ns = metrics.spool_unbound_namespaces.load(Ordering::Relaxed);
+        spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         queue_retained_bytes =
             queue_retained_bytes.saturating_add(runtime.byte_budget.used() as u64);
         queue_byte_budget_exhausted = queue_byte_budget_exhausted.saturating_add(
@@ -2248,6 +3256,25 @@ fn render_prometheus_for_sinks(
             any_snapshot = true;
             snapshot_emits =
                 snapshot_emits.saturating_add(metrics.snapshot_emits_total.load(Ordering::Relaxed));
+            snapshot_overflow_spooled = snapshot_overflow_spooled.saturating_add(
+                metrics
+                    .snapshot_overflow_spooled_total
+                    .load(Ordering::Relaxed),
+            );
+            snapshot_overflow_pending = snapshot_overflow_pending.saturating_add(
+                metrics
+                    .snapshot_overflow_pending_total
+                    .load(Ordering::Relaxed),
+            );
+            snapshot_cardinality_rejections = snapshot_cardinality_rejections.saturating_add(
+                metrics
+                    .snapshot_cardinality_rejections_total
+                    .load(Ordering::Relaxed),
+            );
+            if let Some(status) = snapshot_accumulator_gauges(runtime.generation) {
+                snapshot_entries = snapshot_entries.saturating_add(status.0);
+                snapshot_retained_bytes = snapshot_retained_bytes.saturating_add(status.1);
+            }
         }
         if latency_buckets.is_empty() {
             latency_buckets = metrics.latency.buckets;
@@ -2296,6 +3323,50 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_snapshot_finalizations_pending {}\n",
         pending_finalizations
     ));
+    output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending_bytes Estimated retained bytes for pending snapshot finalization recovery state.\n");
+    output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending_bytes gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_snapshot_finalizations_pending_bytes {}\n",
+        pending_finalization_bytes
+    ));
+    output.push_str("# HELP chargeback_sink_snapshot_finalizations_oldest_age_seconds Age in seconds of the oldest pending snapshot finalization recovery.\n");
+    output.push_str("# TYPE chargeback_sink_snapshot_finalizations_oldest_age_seconds gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_snapshot_finalizations_oldest_age_seconds {}\n",
+        pending_finalization_oldest_age_secs
+    ));
+    if any_snapshot || pending_finalizations > 0 {
+        output.push_str("# HELP chargeback_sink_snapshot_entries Snapshot accumulator identities retained in memory.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_entries gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_entries {}\n",
+            snapshot_entries
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_retained_bytes Estimated snapshot accumulator retained bytes under configured max_retained_bytes.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_retained_bytes gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_retained_bytes {}\n",
+            snapshot_retained_bytes
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_spooled_total Snapshot charges durably spooled through the bounded async delivery worker after accumulator cardinality or byte budget overflow.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_overflow_spooled_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_overflow_spooled_total {}\n",
+            snapshot_overflow_spooled
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_overflow_pending_total Snapshot overflow charges staged for the next durable emission when async spool handoff was unavailable or its write failed.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_overflow_pending_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_overflow_pending_total {}\n",
+            snapshot_overflow_pending
+        ));
+        output.push_str("# HELP chargeback_sink_snapshot_cardinality_rejections_total Snapshot charges that could not be accumulated or overflow-spooled under hard budgets.\n");
+        output.push_str("# TYPE chargeback_sink_snapshot_cardinality_rejections_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_snapshot_cardinality_rejections_total {}\n",
+            snapshot_cardinality_rejections
+        ));
+    }
     output.push_str(
         "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).\n",
     );
@@ -2327,6 +3398,18 @@ fn render_prometheus_for_sinks(
     output.push_str(&format!(
         "chargeback_sink_spool_prepare_failures_total {}\n",
         spool_prepare_failures
+    ));
+    output.push_str("# HELP chargeback_sink_spool_unbound_files Retained spool records not bound to a live destination identity (pre-namespace layouts or namespaces orphaned by a destination/config change). Never replayed or deleted.\n");
+    output.push_str("# TYPE chargeback_sink_spool_unbound_files gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_unbound_files {}\n",
+        spool_unbound_files
+    ));
+    output.push_str("# HELP chargeback_sink_spool_unbound_namespaces Managed spool namespaces still holding records for a destination identity no live instance owns.\n");
+    output.push_str("# TYPE chargeback_sink_spool_unbound_namespaces gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_unbound_namespaces {}\n",
+        spool_unbound_namespaces
     ));
     output.push_str(
         "# HELP chargeback_sink_spool_jobs_enqueued_total Chargeback sink jobs accepted by the async spool delivery worker.\n",
@@ -2604,7 +3687,7 @@ fn classify_clickhouse_delivery(
             .record_failure(FailureReason::Http4xx, message.clone());
         return DeliveryOutcome::PayloadTooLarge { message };
     }
-    if code == 408 || code == 429 || status.is_server_error() {
+    if code == 401 || code == 403 || code == 408 || code == 429 || status.is_server_error() {
         let reason = if status.is_server_error() {
             FailureReason::Http5xx
         } else {
@@ -2856,6 +3939,23 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     if config.snapshot.stale_entry_ttl_secs == 0 {
         return Err(format!(
             "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be at least 1"
+        ));
+    }
+    if config.snapshot.stale_entry_ttl_secs < config.snapshot.interval_secs {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.stale_entry_ttl_secs must be >= snapshot.interval_secs so idle keys cannot expire before their first durable emission window"
+        ));
+    }
+    if config.snapshot.max_entries == 0 || config.snapshot.max_entries > MAX_BUFFER_CAPACITY {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.max_entries must be between 1 and {MAX_BUFFER_CAPACITY}"
+        ));
+    }
+    if config.snapshot.max_retained_bytes < MAX_CHARGE_EVENT_BYTES
+        || config.snapshot.max_retained_bytes > HARD_MAX_BUFFER_MAX_BYTES
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: snapshot.max_retained_bytes must be between {MAX_CHARGE_EVENT_BYTES} and {HARD_MAX_BUFFER_MAX_BYTES}"
         ));
     }
     if config
@@ -3155,15 +4255,22 @@ pub struct SpoolStats {
     pub bytes: u64,
 }
 
-/// Versioned durable identity for one managed chargeback spool namespace.
+/// Versioned durable ownership record for one managed chargeback spool namespace.
 ///
-/// Paths are partitioned by safe node component, plugin-config identity, and
-/// ClickHouse destination/schema identity. Replay validates this metadata
-/// before mutating any billing file.
+/// Binds the whole namespace to the accepted plugin-config identity, the Ferrum
+/// namespace/ledger, the node identity, and the ClickHouse destination/schema it
+/// was produced for. It holds no credentials: `destination_endpoint` is the
+/// sanitized `scheme://host:port` form and the ClickHouse password is
+/// deliberately excluded so neither the record nor the derived digest is
+/// credential-derived. Replay validates this record before touching any billing
+/// file, and every individual file additionally carries [`SpoolOwner::tag`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SpoolNamespaceMeta {
     version: u32,
+    owner_digest: String,
+    owner_tag: String,
     plugin_config_id: String,
+    ferrum_namespace: String,
     destination_endpoint: String,
     database: String,
     table: String,
@@ -3171,114 +4278,279 @@ struct SpoolNamespaceMeta {
     created_at_unix: i64,
 }
 
+/// Stable, validated, non-secret spool ownership identity.
 #[derive(Debug, Clone)]
-struct SpoolIdentity {
+struct SpoolOwner {
     plugin_config_id: Arc<str>,
+    ferrum_namespace: Arc<str>,
     destination_endpoint: Arc<str>,
     database: Arc<str>,
     table: Arc<str>,
+    node_id: Arc<str>,
+    /// Full hex digest over the complete ownership tuple.
+    digest: Arc<str>,
+    /// Digest prefix embedded in every managed filename.
+    tag: Arc<str>,
 }
 
-impl SpoolIdentity {
+impl SpoolOwner {
     fn new(
         plugin_config_id: impl Into<Arc<str>>,
+        ferrum_namespace: impl Into<Arc<str>>,
         destination_endpoint: impl Into<Arc<str>>,
         database: impl Into<Arc<str>>,
         table: impl Into<Arc<str>>,
+        node_id: impl Into<Arc<str>>,
     ) -> Self {
+        let plugin_config_id = plugin_config_id.into();
+        let ferrum_namespace = ferrum_namespace.into();
+        let destination_endpoint = destination_endpoint.into();
+        let database = database.into();
+        let table = table.into();
+        let node_id = node_id.into();
+        let digest = spool_owner_digest(&[
+            plugin_config_id.as_ref(),
+            ferrum_namespace.as_ref(),
+            destination_endpoint.as_ref(),
+            database.as_ref(),
+            table.as_ref(),
+            node_id.as_ref(),
+        ]);
+        let tag = digest[..SPOOL_OWNER_TAG_LEN].to_string();
         Self {
-            plugin_config_id: plugin_config_id.into(),
-            destination_endpoint: destination_endpoint.into(),
-            database: database.into(),
-            table: table.into(),
+            plugin_config_id,
+            ferrum_namespace,
+            destination_endpoint,
+            database,
+            table,
+            node_id,
+            digest: Arc::<str>::from(digest),
+            tag: Arc::<str>::from(tag),
         }
     }
 
-    fn to_meta(&self, node_id: &str, created_at_unix: i64) -> SpoolNamespaceMeta {
+    fn to_meta(&self, created_at_unix: i64) -> SpoolNamespaceMeta {
         SpoolNamespaceMeta {
             version: SPOOL_FORMAT_VERSION,
+            owner_digest: self.digest.to_string(),
+            owner_tag: self.tag.to_string(),
             plugin_config_id: self.plugin_config_id.to_string(),
+            ferrum_namespace: self.ferrum_namespace.to_string(),
             destination_endpoint: self.destination_endpoint.to_string(),
             database: self.database.to_string(),
             table: self.table.to_string(),
-            node_id: node_id.to_string(),
+            node_id: self.node_id.to_string(),
             created_at_unix,
         }
     }
 
-    fn matches_meta(&self, meta: &SpoolNamespaceMeta, node_id: &str) -> bool {
+    fn matches_meta(&self, meta: &SpoolNamespaceMeta) -> bool {
         meta.version == SPOOL_FORMAT_VERSION
+            && meta.owner_digest == self.digest.as_ref()
+            && meta.owner_tag == self.tag.as_ref()
             && meta.plugin_config_id == self.plugin_config_id.as_ref()
+            && meta.ferrum_namespace == self.ferrum_namespace.as_ref()
             && meta.destination_endpoint == self.destination_endpoint.as_ref()
             && meta.database == self.database.as_ref()
             && meta.table == self.table.as_ref()
-            && meta.node_id == node_id
+            && meta.node_id == self.node_id.as_ref()
     }
 }
 
-/// Test-only fault points for durable spool write sequencing.
+/// Domain-separated, length-prefixed ownership digest.
+///
+/// Length prefixes keep two different tuples from colliding by shifting text
+/// across a field boundary (`db="a", table="bc"` versus `db="ab", table="c"`).
+fn spool_owner_digest(fields: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(SPOOL_OWNER_DIGEST_DOMAIN);
+    hasher.update(u64::from(SPOOL_FORMAT_VERSION).to_be_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let digest = hasher.finalize();
+    hex::encode(&digest[..])
+}
+
+/// Durable-write step a test asks one spool manager to fail at.
+///
+/// Fault selection is per-[`SpoolManager`] state supplied at construction, not a
+/// process-global switch, so no production sink can be steered away from the
+/// real filesystem calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum SpoolFsFault {
-    None = 0,
-    FileSync = 1,
-    Rename = 2,
-    DirOpen = 3,
-    DirSync = 4,
+    None,
+    FileSync,
+    Rename,
+    DirOpen,
+    DirSync,
 }
 
-static SPOOL_FS_FAULT: AtomicU8 = AtomicU8::new(0);
-static LIVE_SPOOL_GENERATIONS: OnceLock<Mutex<HashMap<PathBuf, HashSet<u64>>>> = OnceLock::new();
-
-fn live_spool_generations() -> &'static Mutex<HashMap<PathBuf, HashSet<u64>>> {
-    LIVE_SPOOL_GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Injectable durable-write steps for the atomic spool publish sequence.
+///
+/// Parent-directory fsync is a Unix-only step, so the two directory hooks are
+/// unread on other targets.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct SpoolFsOps {
+    sync_file: fn(&File, &Path) -> Result<(), String>,
+    rename: fn(&Path, &Path) -> Result<(), String>,
+    open_dir: fn(&Path) -> Result<File, String>,
+    sync_dir: fn(&File, &Path) -> Result<(), String>,
 }
 
-fn register_live_spool_generation(namespace_root: &Path, generation: u64) {
-    let Ok(mut live) = live_spool_generations().lock() else {
-        return;
+impl SpoolFsOps {
+    const REAL: Self = Self {
+        sync_file: real_sync_spool_file,
+        rename: real_rename_spool_file,
+        open_dir: real_open_spool_dir,
+        sync_dir: real_sync_spool_dir,
     };
-    live.entry(namespace_root.to_path_buf())
-        .or_default()
-        .insert(generation);
-}
 
-fn unregister_live_spool_generation(namespace_root: &Path, generation: u64) {
-    let Ok(mut live) = live_spool_generations().lock() else {
-        return;
-    };
-    if let Some(set) = live.get_mut(namespace_root) {
-        set.remove(&generation);
-        if set.is_empty() {
-            live.remove(namespace_root);
+    fn with_fault(fault: SpoolFsFault) -> Self {
+        let mut ops = Self::REAL;
+        match fault {
+            SpoolFsFault::None => {}
+            SpoolFsFault::FileSync => ops.sync_file = fail_sync_spool_file,
+            SpoolFsFault::Rename => ops.rename = fail_rename_spool_file,
+            SpoolFsFault::DirOpen => ops.open_dir = fail_open_spool_dir,
+            SpoolFsFault::DirSync => ops.sync_dir = fail_sync_spool_dir,
         }
+        ops
     }
 }
 
-fn live_generations_for_root(namespace_root: &Path) -> HashSet<u64> {
-    let Ok(live) = live_spool_generations().lock() else {
-        return HashSet::new();
+fn real_sync_spool_file(file: &File, path: &Path) -> Result<(), String> {
+    file.sync_all().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to fsync spool temp file '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn real_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to rename spool temp file '{}' to '{}': {error}",
+            from.display(),
+            to.display()
+        )
+    })
+}
+
+fn real_open_spool_dir(path: &Path) -> Result<File, String> {
+    File::open(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to open spool parent directory '{}' after rename: {error}",
+            path.display()
+        )
+    })
+}
+
+fn real_sync_spool_dir(dir: &File, path: &Path) -> Result<(), String> {
+    dir.sync_all().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to fsync spool parent directory '{}' after rename: {error}",
+            path.display()
+        )
+    })
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to fsync spool temp file '{}'",
+        path.display()
+    ))
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to rename spool temp file '{}' to '{}'",
+        from.display(),
+        to.display()
+    ))
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to open spool parent directory '{}' after rename",
+        path.display()
+    ))
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_sync_spool_dir(_dir: &File, path: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to fsync spool parent directory '{}' after rename",
+        path.display()
+    ))
+}
+
+static SPOOL_PROCESS_TAG: OnceLock<String> = OnceLock::new();
+static LIVE_SPOOL_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Per-process instance tag embedded in every temp and in-flight claim name.
+///
+/// Distinguishes this process's live files from those left behind by a crashed
+/// or restarted process sharing the same persistent volume: a restart always
+/// draws a fresh tag, so leftovers are recovered through the lease path instead
+/// of being mistaken for live work.
+fn spool_process_tag() -> &'static str {
+    SPOOL_PROCESS_TAG
+        .get_or_init(|| {
+            let nonce = uuid::Uuid::new_v4();
+            hex::encode(&nonce.as_bytes()[..4])
+        })
+        .as_str()
+}
+
+/// Managed paths this process is actively writing or delivering.
+///
+/// Shared by every [`SpoolManager`] in the process so an overlapping accepted
+/// generation, or a replacement generation created by a reload, can never
+/// reconcile or reclaim a live peer's temp or in-flight claim.
+fn live_spool_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    LIVE_SPOOL_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_live_spool_path(path: &Path) -> bool {
+    let live = match live_spool_paths().lock() {
+        Ok(live) => live,
+        Err(poisoned) => poisoned.into_inner(),
     };
-    live.get(namespace_root).cloned().unwrap_or_default()
+    live.contains(path)
 }
 
-#[doc(hidden)]
-pub fn set_spool_fs_fault_for_tests(fault: SpoolFsFault) {
-    SPOOL_FS_FAULT.store(fault as u8, Ordering::SeqCst);
+/// RAII lease keeping one managed path registered as live for this process.
+pub struct LiveSpoolPathGuard {
+    path: PathBuf,
 }
 
-#[doc(hidden)]
-pub fn clear_spool_fs_fault_for_tests() {
-    SPOOL_FS_FAULT.store(SpoolFsFault::None as u8, Ordering::SeqCst);
+impl LiveSpoolPathGuard {
+    fn new(path: PathBuf) -> Self {
+        let mut live = match live_spool_paths().lock() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live.insert(path.clone());
+        drop(live);
+        Self { path }
+    }
 }
 
-fn current_spool_fs_fault() -> SpoolFsFault {
-    match SPOOL_FS_FAULT.load(Ordering::SeqCst) {
-        1 => SpoolFsFault::FileSync,
-        2 => SpoolFsFault::Rename,
-        3 => SpoolFsFault::DirOpen,
-        4 => SpoolFsFault::DirSync,
-        _ => SpoolFsFault::None,
+impl Drop for LiveSpoolPathGuard {
+    fn drop(&mut self) {
+        let mut live = match live_spool_paths().lock() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live.remove(&self.path);
     }
 }
 
@@ -3349,31 +4621,50 @@ fn encode_spool_path_component(raw: &str, prefix: &str) -> Result<String, String
     Ok(format!("{prefix}_{}", short_spool_hash(trimmed)))
 }
 
-fn spool_destination_component(endpoint: &str, database: &str, table: &str) -> String {
-    format!(
-        "d_{}",
-        short_spool_hash(&format!("{endpoint}\0{database}\0{table}"))
-    )
+/// Managed path components for one owner: `<safe_node>/<safe_plugin>/o<digest>`.
+///
+/// The readable node/plugin components keep operator navigation possible; the
+/// `o<digest>` component is what actually partitions ownership, because it also
+/// covers the Ferrum namespace/ledger and the ClickHouse destination/schema.
+struct SpoolNamespaceComponents {
+    node: String,
+    plugin: String,
+    owner: String,
 }
 
-fn build_namespace_root(
-    spool_dir: &Path,
-    node_id: &str,
-    identity: &SpoolIdentity,
-) -> Result<PathBuf, String> {
-    let node_component = encode_spool_path_component(node_id, "n")?;
-    let plugin_component = encode_spool_path_component(identity.plugin_config_id.as_ref(), "p")?;
-    let dest_component = spool_destination_component(
-        identity.destination_endpoint.as_ref(),
-        identity.database.as_ref(),
-        identity.table.as_ref(),
-    );
+fn spool_namespace_components(owner: &SpoolOwner) -> Result<SpoolNamespaceComponents, String> {
+    Ok(SpoolNamespaceComponents {
+        node: encode_spool_path_component(owner.node_id.as_ref(), "n")?,
+        plugin: encode_spool_path_component(owner.plugin_config_id.as_ref(), "p")?,
+        owner: format!("o{}", &owner.digest[..SPOOL_OWNER_DIGEST_LEN]),
+    })
+}
+
+fn build_namespace_root(spool_dir: &Path, owner: &SpoolOwner) -> Result<PathBuf, String> {
+    let components = spool_namespace_components(owner)?;
     let root = spool_dir
-        .join(node_component)
-        .join(plugin_component)
-        .join(dest_component);
+        .join(&components.node)
+        .join(&components.plugin)
+        .join(&components.owner);
     ensure_path_within_root(spool_dir, &root)?;
     Ok(root)
+}
+
+/// Derive the in-flight claim lease from the configured worst-case delivery
+/// budget so a lease cannot expire while a legitimate delivery is still running.
+fn spool_claim_lease_secs(config: &ApiChargebackSinkConfig) -> u64 {
+    let attempts = u64::from(config.retry.max_attempts.max(1));
+    let attempt_budget_ms = config.clickhouse.timeout_ms.saturating_mul(attempts);
+    let delay_budget_ms = worst_case_inter_attempt_delay_ms(
+        config.retry.max_attempts,
+        config.retry.initial_delay_ms,
+        config.retry.max_delay_ms,
+    );
+    attempt_budget_ms
+        .saturating_add(delay_budget_ms)
+        .div_ceil(1_000)
+        .saturating_mul(SPOOL_CLAIM_LEASE_BUDGET_FACTOR)
+        .clamp(SPOOL_CLAIM_LEASE_MIN_SECS, SPOOL_CLAIM_LEASE_MAX_SECS)
 }
 
 fn ensure_path_within_root(root: &Path, candidate: &Path) -> Result<(), String> {
@@ -3408,49 +4699,45 @@ fn ensure_path_within_root(root: &Path, candidate: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn path_is_within_canonical_root(root: &Path, candidate: &Path) -> Result<(), String> {
-    ensure_path_within_root(root, candidate)?;
-    let Ok(canon_root) = fs::canonicalize(root) else {
-        // Root may not exist yet during shape checks; lexical check already ran.
-        return Ok(());
-    };
-    match fs::canonicalize(candidate) {
-        Ok(canon_candidate) => {
-            if !canon_candidate.starts_with(&canon_root) {
-                return Err(format!(
-                    "{PLUGIN_NAME}: canonical spool path '{}' escapes root '{}'",
-                    canon_candidate.display(),
-                    canon_root.display()
-                ));
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Parent must still resolve under the root when the leaf is new.
-            if let Some(parent) = candidate.parent() {
-                if parent.exists() {
-                    let canon_parent = fs::canonicalize(parent).map_err(|err| {
-                        format!(
-                            "{PLUGIN_NAME}: failed to canonicalize spool parent '{}': {err}",
-                            parent.display()
-                        )
-                    })?;
-                    if !canon_parent.starts_with(&canon_root) {
-                        return Err(format!(
-                            "{PLUGIN_NAME}: canonical spool parent '{}' escapes root '{}'",
-                            canon_parent.display(),
-                            canon_root.display()
-                        ));
-                    }
-                } else {
-                    ensure_path_within_root(root, parent)?;
-                }
-            }
-            Ok(())
-        }
+/// Prove one existing directory resolves beneath the canonical managed root.
+///
+/// Used once per prepare for the namespace root itself and once per directory
+/// descended during a walk. Individual files do not need this: every managed
+/// file path is built by joining validated components onto the namespace root,
+/// and every walk rejects symlinks with `symlink_metadata` at every level, so no
+/// reachable file can resolve outside the canonical root.
+fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Result<(), String> {
+    let canonical_dir = fs::canonicalize(dir).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to canonicalize spool directory '{}': {error}",
+            dir.display()
+        )
+    })?;
+    if !canonical_dir.starts_with(canonical_root) {
+        return Err(format!(
+            "{PLUGIN_NAME}: canonical spool directory '{}' escapes root '{}'",
+            canonical_dir.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a managed path that is itself a symlink.
+///
+/// Spool maintenance must operate on the real file it enumerated, never on a
+/// link planted by a same-UID process pointing outside the managed tree.
+fn reject_symlinked_spool_path(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{PLUGIN_NAME}: refusing to operate on symlinked spool path '{}'",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
-            "{PLUGIN_NAME}: failed to canonicalize spool path '{}': {error}",
-            candidate.display()
+            "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
+            path.display()
         )),
     }
 }
@@ -3480,139 +4767,194 @@ fn dir_identity(_meta: &fs::Metadata) -> Option<DirIdentity> {
     None
 }
 
-pub struct SpoolManager {
-    cfg: SpoolSettings,
-    /// Operator-facing node identity retained for charge events / metadata.
-    node_id: Arc<str>,
-    identity: SpoolIdentity,
-    generation: u64,
-    namespace_root: PathBuf,
-    metrics: Arc<SinkMetrics>,
-    last_drop_warn_at: AtomicI64,
-    live_storage_prepared: AtomicBool,
-    write_lock: Mutex<()>,
-    /// Temp path currently owned by an in-progress atomic write for this generation.
-    active_write_tmp: Mutex<Option<PathBuf>>,
-    /// Temp files older than this (seconds) may be reconciled when unowned.
-    stale_temp_age_secs: u64,
+/// Test-facing description of one spool owner identity.
+///
+/// Mirrors the fields production derives from the accepted plugin config so
+/// external tests can build sibling instances without a live ClickHouse.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // constructed only by the test-only entry points below
+pub struct SpoolOwnerSpec<'a> {
+    pub node_id: &'a str,
+    pub plugin_config_id: &'a str,
+    pub ferrum_namespace: &'a str,
+    pub destination_endpoint: &'a str,
+    pub database: &'a str,
+    pub table: &'a str,
 }
 
-impl Drop for SpoolManager {
-    fn drop(&mut self) {
-        unregister_live_spool_generation(&self.namespace_root, self.generation);
+impl SpoolOwnerSpec<'_> {
+    fn to_owner(&self) -> SpoolOwner {
+        SpoolOwner::new(
+            self.plugin_config_id.to_string(),
+            self.ferrum_namespace.to_string(),
+            self.destination_endpoint.to_string(),
+            self.database.to_string(),
+            self.table.to_string(),
+            self.node_id.to_string(),
+        )
     }
+}
+
+pub struct SpoolManager {
+    cfg: SpoolSettings,
+    owner: SpoolOwner,
+    generation: u64,
+    namespace_root: PathBuf,
+    /// Canonicalized namespace root, resolved once the tree exists.
+    canonical_root: OnceLock<PathBuf>,
+    metrics: Arc<SinkMetrics>,
+    last_drop_warn_at: AtomicI64,
+    last_unbound_warn_at: AtomicI64,
+    live_storage_prepared: AtomicBool,
+    write_lock: Mutex<()>,
+    /// Foreign or unattributable temps are reconciled only once this old.
+    stale_temp_age_secs: u64,
+    /// Lifetime of an in-flight replay claim before another owner may recover it.
+    claim_lease_secs: u64,
+    /// Durable-write steps; production always uses [`SpoolFsOps::REAL`].
+    fs_ops: SpoolFsOps,
 }
 
 impl SpoolManager {
     fn new(
         cfg: SpoolSettings,
-        node_id: Arc<str>,
-        identity: SpoolIdentity,
+        owner: SpoolOwner,
         generation: u64,
         metrics: Arc<SinkMetrics>,
         stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+        fs_ops: SpoolFsOps,
     ) -> Result<Self, String> {
-        let namespace_root = build_namespace_root(&cfg.dir, node_id.as_ref(), &identity)?;
-        register_live_spool_generation(&namespace_root, generation);
+        let namespace_root = build_namespace_root(&cfg.dir, &owner)?;
         Ok(Self {
             cfg,
-            node_id,
-            identity,
+            owner,
             generation,
             namespace_root,
+            canonical_root: OnceLock::new(),
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
+            last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
-            active_write_tmp: Mutex::new(None),
             stale_temp_age_secs,
+            claim_lease_secs,
+            fs_ops,
         })
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
-        Self::for_tests_with_identity(
-            cfg,
-            node_id,
-            "test-plugin",
-            "http://127.0.0.1:8123",
-            "ferrum",
-            "charges_raw",
-            1,
-        )
+        Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
     }
 
     #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn for_tests_with_identity(
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner(
         cfg: SpoolSettings,
-        node_id: &str,
-        plugin_config_id: &str,
-        destination_endpoint: &str,
-        database: &str,
-        table: &str,
+        spec: &SpoolOwnerSpec<'_>,
         generation: u64,
     ) -> Result<Self, String> {
-        let identity = SpoolIdentity::new(
-            plugin_config_id.to_string(),
-            destination_endpoint.to_string(),
-            database.to_string(),
-            table.to_string(),
-        );
-        let manager = Self::new(
-            cfg,
-            Arc::<str>::from(node_id.to_string()),
-            identity,
-            generation,
-            Arc::new(SinkMetrics::default()),
-            // Tests treat any non-live temp as immediately reconciliable unless a
-            // live writer lease protects it.
-            0,
-        )?;
-        manager.prepare_live_storage()?;
-        Ok(manager)
+        Self::for_tests_with_owner_and_faults(cfg, spec, generation, SpoolFsFault::None)
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner_and_faults(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fault: SpoolFsFault,
+    ) -> Result<Self, String> {
+        let manager = Self::new(
+            cfg,
+            spec.to_owner(),
+            generation,
+            Arc::new(SinkMetrics::default()),
+            // Tests treat a foreign temp as immediately reconcilable unless a
+            // live in-process writer lease protects it.
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+            SpoolFsOps::REAL,
+        )?;
+        // Test callers model a committed/live sink and retain the historical
+        // eager startup validation contract. The managed tree is prepared with
+        // the real filesystem so an injected fault applies only to the durable
+        // writes actually under test.
+        manager.prepare_live_storage()?;
+        Ok(Self {
+            fs_ops: SpoolFsOps::with_fault(fault),
+            ..manager
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_for_tests(&self) -> &Path {
         &self.namespace_root
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn owner_tag_for_tests(&self) -> &str {
+        self.owner.tag.as_ref()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn generation_for_tests(&self) -> u64 {
         self.generation
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn prepare_live_storage_for_tests(&self) -> Result<(), String> {
         self.prepare_live_storage()
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn namespace_root_path_for_tests(
         spool_dir: &Path,
-        node_id: &str,
-        plugin_config_id: &str,
-        destination_endpoint: &str,
-        database: &str,
-        table: &str,
+        spec: &SpoolOwnerSpec<'_>,
     ) -> Result<PathBuf, String> {
-        let identity = SpoolIdentity::new(
-            plugin_config_id.to_string(),
-            destination_endpoint.to_string(),
-            database.to_string(),
-            table.to_string(),
-        );
-        build_namespace_root(spool_dir, node_id, &identity)
+        build_namespace_root(spool_dir, &spec.to_owner())
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn owner_tag_of_spec_for_tests(spec: &SpoolOwnerSpec<'_>) -> String {
+        spec.to_owner().tag.to_string()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn encode_spool_path_component_for_tests(raw: &str) -> Result<String, String> {
         encode_spool_path_component(raw, "n")
     }
 
+    /// Claim one replay candidate, returning `None` when another owner,
+    /// generation, or process won the atomic rename first.
     #[doc(hidden)]
-    pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<PathBuf, String> {
+    #[allow(dead_code)] // external unit tests only
+    pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<Option<PathBuf>, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        Ok(self
+            .claim_replay_file_locked(path)?
+            .map(|claim| claim.path().to_path_buf()))
+    }
+
+    /// Claim one replay candidate and keep the live-path lease held for the
+    /// caller so tests can model an in-flight delivery across other operations.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn hold_replay_claim_for_tests(
+        &self,
+        path: &Path,
+    ) -> Result<Option<SpoolClaimHandle>, String> {
         let _guard = self
             .write_lock
             .lock()
@@ -3621,32 +4963,54 @@ impl SpoolManager {
     }
 
     #[doc(hidden)]
-    pub fn release_inflight_file_for_tests(&self, inflight: &Path) -> Result<PathBuf, String> {
+    #[allow(dead_code)] // external unit tests only
+    pub fn release_inflight_file_for_tests(
+        &self,
+        inflight: &Path,
+    ) -> Result<Option<PathBuf>, String> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
-        self.release_inflight_file_locked(inflight)
+        self.release_claim_locked(inflight)
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_owned_spool_files()
     }
 
     #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn list_replayable_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_replayable_spool_files()
     }
 
+    /// Register one managed path as live for this process, as an in-progress
+    /// write or delivery would.
     #[doc(hidden)]
-    pub fn set_active_write_tmp_for_tests(&self, path: Option<PathBuf>) -> Result<(), String> {
-        let mut active = self
-            .active_write_tmp
-            .lock()
-            .map_err(|_| format!("{PLUGIN_NAME}: spool active-write lock is poisoned"))?;
-        *active = path;
-        Ok(())
+    #[allow(dead_code)] // external unit tests only
+    pub fn hold_live_spool_path_for_tests(path: &Path) -> LiveSpoolPathGuard {
+        LiveSpoolPathGuard::new(path.to_path_buf())
+    }
+
+    /// Build the generation-owned temp name `write_events` would use.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn write_temp_path_for_tests(&self, final_path: &Path) -> Result<PathBuf, String> {
+        spool_write_temp_path(final_path, self.generation)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn unbound_record_counts_for_tests(&self) -> (u64, u64) {
+        (
+            self.metrics.spool_unbound_files.load(Ordering::Relaxed),
+            self.metrics
+                .spool_unbound_namespaces
+                .load(Ordering::Relaxed),
+        )
     }
 
     pub fn write_events(&self, events: &[ChargeEvent]) -> Result<PathBuf, String> {
@@ -3670,36 +5034,26 @@ impl SpoolManager {
         self.evict_until_can_admit(incoming_len)?;
         let day = Utc::now().format("%Y%m%d").to_string();
         let dir = self.namespace_root.join(day);
-        path_is_within_canonical_root(&self.namespace_root, &dir)?;
+        self.assert_managed_path(&dir)?;
         ensure_private_dir(&dir)?;
-        let id = new_ulid();
-        let final_path = dir.join(format!("{}.{}", id, self.cfg.compression.extension()));
-        let tmp_name = format!(
-            "{}.g{}.tmp",
-            final_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?,
-            self.generation
-        );
-        let tmp_path = final_path.with_file_name(tmp_name);
-        path_is_within_canonical_root(&self.namespace_root, &final_path)?;
-        path_is_within_canonical_root(&self.namespace_root, &tmp_path)?;
-        {
-            let mut active = self
-                .active_write_tmp
-                .lock()
-                .map_err(|_| format!("{PLUGIN_NAME}: spool active-write lock is poisoned"))?;
-            *active = Some(tmp_path.clone());
-        }
-        let write_result = write_private_file_atomically(&tmp_path, &final_path, &bytes);
-        {
-            let mut active = self
-                .active_write_tmp
-                .lock()
-                .map_err(|_| format!("{PLUGIN_NAME}: spool active-write lock is poisoned"))?;
-            *active = None;
-        }
+        // Every file carries the owner tag, so a record can be attributed to its
+        // intended plugin config / namespace / destination / schema even if it is
+        // later moved between directories.
+        let final_path = dir.join(format!(
+            "{}.{}.{}",
+            new_ulid(),
+            self.owner.tag,
+            self.cfg.compression.extension()
+        ));
+        let tmp_path = spool_write_temp_path(&final_path, self.generation)?;
+        self.assert_managed_path(&final_path)?;
+        self.assert_managed_path(&tmp_path)?;
+        // Hold the live-path lease across the whole atomic write so no peer
+        // generation in this process can reconcile the temp mid-write.
+        let write_result = {
+            let _live = LiveSpoolPathGuard::new(tmp_path.clone());
+            write_private_file_atomically_with_ops(&tmp_path, &final_path, &bytes, self.fs_ops)
+        };
         write_result?;
         invalidate_status_cache();
         Ok(final_path)
@@ -3735,24 +5089,63 @@ impl SpoolManager {
     }
 
     fn prepare_live_storage_locked_inner(&self) -> Result<(), String> {
-        path_is_within_canonical_root(&self.cfg.dir, &self.namespace_root)?;
+        ensure_path_within_root(&self.cfg.dir, &self.namespace_root)?;
         if self.live_storage_prepared.load(Ordering::Acquire)
             && self.cfg.dir.is_dir()
             && self.namespace_root.is_dir()
         {
             self.validate_namespace_meta()?;
-            // Always reclaim crash-left in-flight files, even on the prepared
-            // fast path, so a later prepare/replay tick recovers them.
-            self.recover_inflight_files()?;
+            // Recover only claims whose owning process/generation is demonstrably
+            // gone or whose lease expired; a live delivery keeps its claim.
+            self.recover_expired_claims()?;
             return Ok(());
         }
         ensure_private_dir(&self.cfg.dir)?;
         ensure_private_dir(&self.namespace_root)?;
+        self.resolve_canonical_root()?;
         self.persist_or_validate_namespace_meta()?;
-        warn_on_sibling_spool_dirs(&self.cfg.dir, &self.namespace_root);
-        self.recover_inflight_files()?;
+        self.scan_unbound_records();
+        self.recover_expired_claims()?;
         self.reconcile_stale_temp_files()?;
         self.live_storage_prepared.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Canonicalize the managed root once and prove it resolves under the
+    /// configured `spool.dir`, so later walks only need lexical containment plus
+    /// symlink rejection.
+    fn resolve_canonical_root(&self) -> Result<(), String> {
+        if self.canonical_root.get().is_some() {
+            return Ok(());
+        }
+        let canonical_dir = fs::canonicalize(&self.cfg.dir).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize spool.dir '{}': {error}",
+                self.cfg.dir.display()
+            )
+        })?;
+        directory_is_within_canonical_root(&canonical_dir, &self.namespace_root)?;
+        let canonical_root = fs::canonicalize(&self.namespace_root).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize managed spool namespace '{}': {error}",
+                self.namespace_root.display()
+            )
+        })?;
+        let _ = self.canonical_root.set(canonical_root);
+        Ok(())
+    }
+
+    /// Prove one path is a managed, non-symlinked node of this namespace before
+    /// any create, rename, or unlink.
+    fn assert_managed_path(&self, path: &Path) -> Result<(), String> {
+        ensure_path_within_root(&self.namespace_root, path)?;
+        reject_symlinked_spool_path(path)?;
+        if let Some(canonical_root) = self.canonical_root.get()
+            && let Some(parent) = path.parent()
+            && parent.is_dir()
+        {
+            directory_is_within_canonical_root(canonical_root, parent)?;
+        }
         Ok(())
     }
 
@@ -3762,21 +5155,22 @@ impl SpoolManager {
 
     fn persist_or_validate_namespace_meta(&self) -> Result<(), String> {
         let path = self.meta_path();
-        path_is_within_canonical_root(&self.namespace_root, &path)?;
+        self.assert_managed_path(&path)?;
         if path.exists() {
             return self.validate_namespace_meta();
         }
-        let meta = self
-            .identity
-            .to_meta(self.node_id.as_ref(), unix_timestamp_seconds());
+        let meta = self.owner.to_meta(unix_timestamp_seconds());
         let bytes = serde_json::to_vec_pretty(&meta).map_err(|error| {
             format!("{PLUGIN_NAME}: failed to serialize spool namespace metadata: {error}")
         })?;
         let tmp = path.with_extension("json.tmp");
-        write_private_file_atomically(&tmp, &path, &bytes)?;
-        Ok(())
+        self.assert_managed_path(&tmp)?;
+        let _live = LiveSpoolPathGuard::new(tmp.clone());
+        write_private_file_atomically_with_ops(&tmp, &path, &bytes, self.fs_ops)
     }
 
+    /// Fail closed when the on-disk ownership record does not name this exact
+    /// sink identity. Nothing is deleted, replayed, or rerouted on mismatch.
     fn validate_namespace_meta(&self) -> Result<(), String> {
         let path = self.meta_path();
         if !path.exists() {
@@ -3785,6 +5179,7 @@ impl SpoolManager {
                 path.display()
             ));
         }
+        reject_symlinked_spool_path(&path)?;
         let bytes = fs::read(&path).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to read spool namespace metadata '{}': {error}",
@@ -3797,9 +5192,9 @@ impl SpoolManager {
                 path.display()
             )
         })?;
-        if !self.identity.matches_meta(&meta, self.node_id.as_ref()) {
+        if !self.owner.matches_meta(&meta) {
             return Err(format!(
-                "{PLUGIN_NAME}: spool namespace metadata at '{}' does not match this sink identity (plugin_config_id/destination/schema/node)",
+                "{PLUGIN_NAME}: spool namespace metadata at '{}' does not match this sink identity (format version/plugin_config_id/ferrum namespace/destination/schema/node)",
                 path.display()
             ));
         }
@@ -3829,11 +5224,16 @@ impl SpoolManager {
         Ok(stats)
     }
 
-    /// Drop oldest owned spool files until `owned_bytes + incoming_len <= max_bytes`.
+    /// Drop oldest evictable owned spool files until
+    /// `owned_bytes + incoming_len <= max_bytes`.
     ///
     /// Owned bytes include active data files, crash-left temps, corrupt
-    /// quarantine, metadata-only dead-letter (`.rejected.meta`) files, and
-    /// in-flight replay claims. Eviction never selects in-flight claims.
+    /// quarantine, metadata-only dead-letter (`.rejected.meta`) files, in-flight
+    /// replay claims, and any unattributable record still occupying the tree.
+    /// Eviction never selects an in-flight claim or a record whose owner tag is
+    /// not ours: deleting either would destroy another owner's or another
+    /// delivery's billing data. When only such files remain the write fails
+    /// closed instead of over-admitting or stealing them.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
@@ -3846,17 +5246,19 @@ impl SpoolManager {
             if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 return Ok(());
             }
-            let Some(oldest) = self
-                .list_owned_spool_files()?
-                .into_iter()
-                .find(|path| !is_spool_inflight_file(path))
+            let owned = self.list_owned_spool_files()?;
+            let Some(oldest) = owned
+                .iter()
+                .find(|path| self.is_evictable_owned_file(path.as_path()))
+                .cloned()
             else {
+                let protected = owned.len();
                 return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}) after eviction",
+                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight or owned by another identity and are never evicted",
                     self.cfg.max_bytes
                 ));
             };
-            path_is_within_canonical_root(&self.namespace_root, &oldest)?;
+            self.assert_managed_path(&oldest)?;
             match fs::remove_file(&oldest) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -3888,68 +5290,65 @@ impl SpoolManager {
         }
     }
 
-    fn active_write_tmp_path(&self) -> Option<PathBuf> {
-        self.active_write_tmp
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+    /// Whether one owned file may be dropped to make room for a new batch.
+    fn is_evictable_owned_file(&self, path: &Path) -> bool {
+        if is_spool_inflight_file(path) {
+            return false;
+        }
+        match spool_file_owner_tag(path) {
+            // Untagged retained artifacts (legacy temps, dead-letter metadata for
+            // pre-tag files) belong to this namespace and stay evictable.
+            None => true,
+            Some(tag) => tag == self.owner.tag.as_ref(),
+        }
     }
 
+    fn collect(&self, files: &mut Vec<PathBuf>, class: SpoolFileClass) -> Result<(), String> {
+        let mut walk = SpoolWalk::new(self.namespace_root.as_path(), class);
+        walk.run(&self.namespace_root, files)
+    }
+
+    /// Reconcile abandoned atomic-write temps.
+    ///
+    /// A temp is removed only when this process demonstrably owns it and is no
+    /// longer writing it, or when it is foreign/unattributable and older than
+    /// `stale_temp_age_secs`. A reloaded generation therefore cannot unlink the
+    /// active temp of an older accepted generation or of a peer process sharing
+    /// the volume.
     fn reconcile_stale_temp_files(&self) -> Result<(), String> {
         let mut temps = Vec::new();
-        collect_spool_files(
-            &self.namespace_root,
-            &self.namespace_root,
-            &mut temps,
-            SpoolFileClass::Temp,
-            0,
-            &mut 0,
-            &mut HashSet::new(),
-        )?;
-        let live = live_generations_for_root(&self.namespace_root);
-        let active_tmp = self.active_write_tmp_path();
+        self.collect(&mut temps, SpoolFileClass::Temp)?;
         let now = SystemTime::now();
         for path in temps {
-            path_is_within_canonical_root(&self.namespace_root, &path)?;
-            if active_tmp.as_ref().is_some_and(|active| active == &path) {
+            self.assert_managed_path(&path)?;
+            if is_live_spool_path(&path) {
+                // A live writer in this process owns it, whichever generation.
                 continue;
             }
-            let Some(generation) = spool_temp_generation(&path) else {
-                // Unparseable temp names are treated as foreign/unowned and only
-                // removed once demonstrably stale by mtime.
-                if !spool_temp_is_stale(&path, now, self.stale_temp_age_secs)? {
-                    continue;
-                }
-                self.remove_stale_temp(&path)?;
-                continue;
-            };
-            if live.contains(&generation) && generation != self.generation {
-                // Another live generation owns this temp; never delete it.
-                continue;
-            }
-            if generation == self.generation {
-                // Our generation: only reconcile when not actively writing and
-                // the temp is demonstrably stale (or age is zero in tests).
-                if !spool_temp_is_stale(&path, now, self.stale_temp_age_secs)? {
-                    continue;
-                }
-                self.remove_stale_temp(&path)?;
+            let owned_by_this_process = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_spool_write_temp)
+                .is_some_and(|temp| temp.process_tag == spool_process_tag());
+            if owned_by_this_process {
+                self.remove_stale_temp(&path, "interrupted write in this process")?;
                 continue;
             }
             if spool_temp_is_stale(&path, now, self.stale_temp_age_secs)? {
-                self.remove_stale_temp(&path)?;
+                self.remove_stale_temp(&path, "stale unattributed temp")?;
             }
         }
         Ok(())
     }
 
-    fn remove_stale_temp(&self, path: &Path) -> Result<(), String> {
+    fn remove_stale_temp(&self, path: &Path, reason: &'static str) -> Result<(), String> {
         match fs::remove_file(path) {
             Ok(()) => {
                 warn!(
                     plugin = PLUGIN_NAME,
                     path = %path.display(),
                     generation = self.generation,
+                    reason,
                     "Chargeback sink removed a stale spool temp file left by an interrupted write"
                 );
                 Ok(())
@@ -3962,73 +5361,127 @@ impl SpoolManager {
         }
     }
 
-    fn recover_inflight_files(&self) -> Result<(), String> {
-        let mut inflight = Vec::new();
-        collect_spool_files(
-            &self.namespace_root,
-            &self.namespace_root,
-            &mut inflight,
-            SpoolFileClass::Inflight,
-            0,
-            &mut 0,
-            &mut HashSet::new(),
-        )?;
-        for path in inflight {
-            path_is_within_canonical_root(&self.namespace_root, &path)?;
-            let restored = inflight_to_replayable_path(&path)?;
-            path_is_within_canonical_root(&self.namespace_root, &restored)?;
-            match fs::rename(&path, &restored) {
-                Ok(()) => {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        path = %path.display(),
-                        restored = %restored.display(),
-                        "Chargeback sink recovered an in-flight spool file after crash/restart"
-                    );
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to recover in-flight spool file '{}' to '{}': {error}",
-                        path.display(),
-                        restored.display()
-                    ));
-                }
+    /// Return crash-left in-flight claims to their durable replayable names.
+    ///
+    /// Live claims held by this process are skipped outright. A claim written by
+    /// another process (or by an earlier run of this one) is recovered only after
+    /// its lease deadline passes, so two owners can never deliver the same file
+    /// concurrently.
+    fn recover_expired_claims(&self) -> Result<(), String> {
+        let mut claims = Vec::new();
+        self.collect(&mut claims, SpoolFileClass::Inflight)?;
+        let now = unix_timestamp_seconds();
+        let wall_clock = SystemTime::now();
+        for path in claims {
+            self.assert_managed_path(&path)?;
+            if is_live_spool_path(&path) {
+                continue;
             }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let reason = match parse_spool_claim(name) {
+                Some(claim) if claim.process_tag == spool_process_tag() => {
+                    // Our process, no live lease: the owning replay task was
+                    // aborted or its generation was dropped mid-delivery.
+                    "aborted delivery in this process"
+                }
+                Some(claim) if now >= claim.lease_deadline_unix => "expired peer claim lease",
+                Some(_) => continue,
+                None => {
+                    // Unparseable claim marker: treat conservatively as a peer's
+                    // and wait out a full lease horizon by mtime.
+                    if !spool_temp_is_stale(&path, wall_clock, self.claim_lease_secs)? {
+                        continue;
+                    }
+                    "expired unattributed claim"
+                }
+            };
+            let Some(restored) = self.restore_claim_path(&path)? else {
+                continue;
+            };
+            warn!(
+                plugin = PLUGIN_NAME,
+                path = %path.display(),
+                restored = %restored.display(),
+                generation = self.generation,
+                reason,
+                "Chargeback sink recovered an in-flight spool claim"
+            );
         }
         Ok(())
+    }
+
+    /// Rename one claim back to its durable replayable name.
+    ///
+    /// `Ok(None)` means the claim disappeared (already recovered or finalized by
+    /// its owner) and is not an error.
+    fn restore_claim_path(&self, claim: &Path) -> Result<Option<PathBuf>, String> {
+        let restored = spool_claim_restore_path(claim)?;
+        self.assert_managed_path(&restored)?;
+        match fs::rename(claim, &restored) {
+            Ok(()) => Ok(Some(restored)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to restore in-flight spool claim '{}' to '{}': {error}",
+                claim.display(),
+                restored.display()
+            )),
+        }
     }
 
     fn list_owned_spool_files(&self) -> Result<Vec<PathBuf>, String> {
         self.validate_namespace_meta_if_present()?;
         let mut files = Vec::new();
-        collect_spool_files(
-            &self.namespace_root,
-            &self.namespace_root,
-            &mut files,
-            SpoolFileClass::Owned,
-            0,
-            &mut 0,
-            &mut HashSet::new(),
-        )?;
+        self.collect(&mut files, SpoolFileClass::Owned)?;
         files.sort();
         Ok(files)
     }
 
+    /// Replay candidates owned by this exact identity.
+    ///
+    /// Ownership metadata is validated first, then every candidate must carry
+    /// this owner's tag. A data file whose tag names a different owner is never
+    /// read, delivered, deleted, or dead-lettered here; it is only counted and
+    /// surfaced so operators can reconcile it.
     fn list_replayable_spool_files(&self) -> Result<Vec<PathBuf>, String> {
         self.validate_namespace_meta()?;
+        let mut candidates = Vec::new();
+        self.collect(&mut candidates, SpoolFileClass::Replayable)?;
+        let mine = self.owner.tag.as_ref();
         let mut files = Vec::new();
-        collect_spool_files(
-            &self.namespace_root,
-            &self.namespace_root,
-            &mut files,
-            SpoolFileClass::Replayable,
-            0,
-            &mut 0,
-            &mut HashSet::new(),
-        )?;
+        let mut foreign = 0u64;
+        for path in candidates {
+            if spool_file_owner_tag(&path).is_some_and(|tag| tag == mine) {
+                files.push(path);
+            } else {
+                foreign = foreign.saturating_add(1);
+            }
+        }
+        if foreign > 0 {
+            self.warn_unbound_records(foreign, 0);
+        }
         files.sort();
         Ok(files)
+    }
+
+    /// Records inside this managed namespace whose owner tag names a different
+    /// identity. Reachable only by tampering or a hand-moved file; counted so
+    /// quota reporting stays honest, and never replayed, evicted, or deleted.
+    fn count_foreign_tagged_records(&self) -> u64 {
+        let mut candidates = Vec::new();
+        let class = SpoolFileClass::Replayable;
+        if self.collect(&mut candidates, class).is_err() {
+            return 0;
+        }
+        let mine = self.owner.tag.as_ref();
+        let mut foreign = 0u64;
+        for path in &candidates {
+            if !spool_file_owner_tag(path).is_some_and(|tag| tag == mine) {
+                foreign = foreign.saturating_add(1);
+            }
+        }
+        foreign
     }
 
     fn validate_namespace_meta_if_present(&self) -> Result<(), String> {
@@ -4038,38 +5491,150 @@ impl SpoolManager {
         Ok(())
     }
 
-    fn claim_replay_file_locked(&self, path: &Path) -> Result<PathBuf, String> {
-        path_is_within_canonical_root(&self.namespace_root, path)?;
+    /// Atomically claim one replay candidate.
+    ///
+    /// The rename is the mutual-exclusion primitive: on a shared volume exactly
+    /// one accepted generation or process can win it. `Ok(None)` means somebody
+    /// else won, and the caller must simply move on.
+    fn claim_replay_file_locked(&self, path: &Path) -> Result<Option<SpoolClaimHandle>, String> {
+        self.assert_managed_path(path)?;
         if !is_spool_data_file(path) {
             return Err(format!(
                 "{PLUGIN_NAME}: refusing to claim non-replayable spool file '{}'",
                 path.display()
             ));
         }
-        let inflight = replayable_to_inflight_path(path)?;
-        path_is_within_canonical_root(&self.namespace_root, &inflight)?;
-        fs::rename(path, &inflight).map_err(|error| {
-            format!(
+        match spool_file_owner_tag(path) {
+            Some(tag) if tag == self.owner.tag.as_ref() => {}
+            _ => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing to claim spool file '{}' owned by another identity",
+                    path.display()
+                ));
+            }
+        }
+        let lease_deadline = unix_timestamp_seconds().saturating_add(self.claim_lease_secs as i64);
+        let claim_path = spool_claim_path(path, self.generation, lease_deadline)?;
+        self.assert_managed_path(&claim_path)?;
+        // Register the live lease before the rename so a concurrent prepare in
+        // this process can never see the claim as orphaned.
+        let guard = LiveSpoolPathGuard::new(claim_path.clone());
+        match fs::rename(path, &claim_path) {
+            Ok(()) => Ok(Some(SpoolClaimHandle {
+                path: claim_path,
+                _live: guard,
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
                 "{PLUGIN_NAME}: failed to claim spool file '{}' as in-flight '{}': {error}",
                 path.display(),
-                inflight.display()
-            )
-        })?;
-        Ok(inflight)
+                claim_path.display()
+            )),
+        }
     }
 
-    fn release_inflight_file_locked(&self, inflight: &Path) -> Result<PathBuf, String> {
-        path_is_within_canonical_root(&self.namespace_root, inflight)?;
-        let restored = inflight_to_replayable_path(inflight)?;
-        path_is_within_canonical_root(&self.namespace_root, &restored)?;
-        fs::rename(inflight, &restored).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to release in-flight spool file '{}' to '{}': {error}",
-                inflight.display(),
-                restored.display()
-            )
-        })?;
-        Ok(restored)
+    /// Release a claim back to its durable replayable name after a retryable
+    /// delivery failure. `Ok(None)` means the claim was already recovered.
+    fn release_claim_locked(&self, claim: &Path) -> Result<Option<PathBuf>, String> {
+        self.assert_managed_path(claim)?;
+        self.restore_claim_path(claim)
+    }
+
+    /// Remove a claim whose rows were fully delivered.
+    fn remove_delivered_claim(&self, claim: &Path) -> Result<(), String> {
+        self.assert_managed_path(claim)?;
+        match fs::remove_file(claim) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %claim.display(),
+                    generation = self.generation,
+                    "Chargeback sink delivered a spool claim that another owner had already recovered"
+                );
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
+                claim.display()
+            )),
+        }
+    }
+
+    /// Count records under this node/plugin subtree that no accepted generation
+    /// owns: pre-namespace layouts and namespaces left behind by a destination
+    /// or configuration change. These are never replayed, deleted, or rerouted.
+    fn scan_unbound_records(&self) {
+        let components = match spool_namespace_components(&self.owner) {
+            Ok(components) => components,
+            Err(_) => return,
+        };
+        let root = self.namespace_root.as_path();
+        let dir = self.cfg.dir.as_path();
+        let (orphaned, namespaces) = count_unbound_spool_records(dir, &components, root);
+        let files = orphaned.saturating_add(self.count_foreign_tagged_records());
+        self.metrics
+            .spool_unbound_files
+            .store(files, Ordering::Relaxed);
+        self.metrics
+            .spool_unbound_namespaces
+            .store(namespaces, Ordering::Relaxed);
+        if files > 0 || namespaces > 0 {
+            self.warn_unbound_records(files, namespaces);
+        }
+    }
+
+    fn warn_unbound_records(&self, files: u64, namespaces: u64) {
+        let now = unix_timestamp_seconds();
+        let last = self.last_unbound_warn_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SPOOL_WARN_INTERVAL_SECS
+            || self
+                .last_unbound_warn_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = self.generation,
+            unbound_files = files,
+            unbound_namespaces = namespaces,
+            spool_dir = %self.cfg.dir.display(),
+            managed_namespace = %self.namespace_root.display(),
+            "Chargeback sink found spool records that are not bound to this destination identity; they are never replayed or deleted and must be reconciled or removed by an operator (rate-limited)"
+        );
+    }
+}
+
+/// One in-flight replay claim plus the live-path lease that protects it.
+pub struct SpoolClaimHandle {
+    path: PathBuf,
+    _live: LiveSpoolPathGuard,
+}
+
+impl SpoolClaimHandle {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn claim_path_for_tests(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Default owner identity used by the simple test constructor.
+#[allow(dead_code)] // external unit tests only
+fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
+    SpoolOwnerSpec {
+        node_id,
+        plugin_config_id: "test-plugin",
+        ferrum_namespace: "ferrum",
+        destination_endpoint: "http://127.0.0.1:8123",
+        database: "ferrum",
+        table: "charges_raw",
     }
 }
 
@@ -4096,192 +5661,335 @@ fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bo
     Ok(elapsed >= Duration::from_secs(age_secs))
 }
 
-fn spool_temp_generation(path: &Path) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    // Expect: <ulid>.ndjson.g<gen>.tmp or <ulid>.ndjson.zst.g<gen>.tmp
-    // Also dead-letter: <name>.rejected.meta.g<gen>.tmp is not used; meta temps
-    // keep the historical suffix without generation and are age-reconciled only.
-    let (stem, _) = name.strip_suffix(".tmp")?.rsplit_once(".g")?;
-    let _ = stem;
-    name.strip_suffix(".tmp")?
-        .rsplit_once(".g")?
-        .1
-        .parse()
-        .ok()
+/// Parsed generation-owned atomic-write temp marker.
+struct SpoolWriteTemp<'a> {
+    process_tag: &'a str,
+    #[allow(dead_code)] // retained for diagnostics and future lease policy
+    generation: u64,
 }
 
-fn replayable_to_inflight_path(path: &Path) -> Result<PathBuf, String> {
+/// `<data-name>.write-<process_tag>-<generation>.tmp`
+fn spool_write_temp_path(final_path: &Path, generation: u64) -> Result<PathBuf, String> {
+    let name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    Ok(final_path.with_file_name(format!(
+        "{name}{SPOOL_WRITE_MARKER}{}-{generation}{SPOOL_TMP_SUFFIX}",
+        spool_process_tag()
+    )))
+}
+
+fn parse_spool_write_temp(name: &str) -> Option<SpoolWriteTemp<'_>> {
+    let marker = name.strip_suffix(SPOOL_TMP_SUFFIX)?;
+    let (_, attribution) = marker.rsplit_once(SPOOL_WRITE_MARKER)?;
+    let (process_tag, generation) = attribution.rsplit_once('-')?;
+    if process_tag.is_empty() {
+        return None;
+    }
+    Some(SpoolWriteTemp {
+        process_tag,
+        generation: generation.parse().ok()?,
+    })
+}
+
+/// Parsed in-flight replay claim marker.
+struct SpoolClaim<'a> {
+    process_tag: &'a str,
+    #[allow(dead_code)] // retained for diagnostics and future lease policy
+    generation: u64,
+    lease_deadline_unix: i64,
+}
+
+/// `<data-name>.claim-<process_tag>-<generation>-<lease_deadline_unix>.inflight`
+fn spool_claim_path(
+    path: &Path,
+    generation: u64,
+    lease_deadline_unix: i64,
+) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    Ok(path.with_file_name(format!("{name}{SPOOL_INFLIGHT_SUFFIX}")))
+    Ok(path.with_file_name(format!(
+        "{name}{SPOOL_CLAIM_MARKER}{}-{generation}-{lease_deadline_unix}{SPOOL_INFLIGHT_SUFFIX}",
+        spool_process_tag()
+    )))
 }
 
-fn inflight_to_replayable_path(path: &Path) -> Result<PathBuf, String> {
-    let name = path
+fn parse_spool_claim(name: &str) -> Option<SpoolClaim<'_>> {
+    let marker = name.strip_suffix(SPOOL_INFLIGHT_SUFFIX)?;
+    let (_, attribution) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
+    let mut parts = attribution.split('-');
+    let process_tag = parts.next()?;
+    let generation = parts.next()?.parse().ok()?;
+    let lease_deadline_unix = parts.next()?.parse().ok()?;
+    if process_tag.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(SpoolClaim {
+        process_tag,
+        generation,
+        lease_deadline_unix,
+    })
+}
+
+/// Strip a claim marker back to the durable replayable name.
+fn spool_claim_restore_path(claim: &Path) -> Result<PathBuf, String> {
+    let name = claim
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let restored = name.strip_suffix(SPOOL_INFLIGHT_SUFFIX).ok_or_else(|| {
+    let base = spool_claim_base_name(name).ok_or_else(|| {
         format!(
-            "{PLUGIN_NAME}: in-flight spool path '{}' is missing {SPOOL_INFLIGHT_SUFFIX} suffix",
-            path.display()
+            "{PLUGIN_NAME}: in-flight spool path '{}' is missing a claim marker",
+            claim.display()
         )
     })?;
-    Ok(path.with_file_name(restored))
+    Ok(claim.with_file_name(base))
 }
 
-fn warn_on_sibling_spool_dirs(root: &Path, namespace_root: &Path) {
-    let Ok(canon_ns) = fs::canonicalize(namespace_root) else {
-        return;
-    };
-    let Some(node_dir) = namespace_root.parent().and_then(|p| p.parent()) else {
-        return;
-    };
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if let Ok(canon) = fs::canonicalize(&path)
-            && canon == canon_ns
-        {
-            continue;
-        }
-        // Warn only for sibling top-level node components under spool.dir.
-        if path.parent() == Some(root) {
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let expected = node_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            if name != expected {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    node_component = expected,
-                    sibling_node_component = %name,
-                    spool_dir = %root.display(),
-                    "Chargeback sink found a sibling spool directory; use a stable FERRUM_NODE_ID when spool.dir is backed by persistent storage"
-                );
-            }
-        }
+fn spool_claim_base_name(name: &str) -> Option<&str> {
+    let marker = name.strip_suffix(SPOOL_INFLIGHT_SUFFIX)?;
+    let (base, _) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
+    Some(base)
+}
+
+/// Managed base name of any derived artifact (claim or temp).
+fn spool_artifact_base_name(name: &str) -> &str {
+    if let Some(base) = spool_claim_base_name(name) {
+        return base;
+    }
+    if let Some(marker) = name.strip_suffix(SPOOL_TMP_SUFFIX)
+        && let Some((base, _)) = marker.rsplit_once(SPOOL_WRITE_MARKER)
+    {
+        return base;
+    }
+    name
+}
+
+/// Owner tag embedded in `<ULID>.<owner_tag>.ndjson[.zst]`, including derived
+/// claim, temp, corrupt, and dead-letter artifacts of that name.
+fn spool_file_owner_tag(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    spool_owner_tag_of_name(spool_artifact_base_name(name))
+}
+
+fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
+    // Peel retained-artifact suffixes outermost-first so a dead-letter temp
+    // (`....ndjson.rejected.meta.tmp`) still resolves back to its data name.
+    let mut rest = name;
+    for suffix in [".tmp", ".rejected.meta", ".corrupt"] {
+        rest = rest.strip_suffix(suffix).unwrap_or(rest);
+    }
+    let stem = rest
+        .strip_suffix(".ndjson.zst")
+        .or_else(|| rest.strip_suffix(".ndjson"))?;
+    let (_, tag) = stem.rsplit_once('.')?;
+    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(tag)
+    } else {
+        None
     }
 }
 
-#[derive(Clone, Copy)]
+/// Count spool records under this node/plugin subtree that no accepted
+/// generation owns.
+///
+/// Two shapes matter: the pre-namespace layout that wrote directly under
+/// `<spool.dir>/<node>/<day>/`, and sibling owner namespaces left behind when
+/// the ClickHouse destination, database, table, plugin id, or Ferrum namespace
+/// changed. Both are reported, never replayed and never deleted, so an operator
+/// decides whether the records still belong to the new destination.
+fn count_unbound_spool_records(
+    spool_dir: &Path,
+    components: &SpoolNamespaceComponents,
+    namespace_root: &Path,
+) -> (u64, u64) {
+    let node_dir = spool_dir.join(&components.node);
+    let plugin_dir = node_dir.join(&components.plugin);
+    let mut files = 0u64;
+    let mut namespaces = 0u64;
+
+    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/*.ndjson[.zst]`.
+    // Only day-shaped directories are inspected so a sibling plugin config's own
+    // managed subtree is never counted against this instance.
+    for day_dir in child_dirs(&node_dir, is_spool_day_component) {
+        files = files.saturating_add(count_records_in(&day_dir));
+    }
+
+    // Sibling owner namespaces under this node/plugin: what a destination,
+    // database, table, ledger, or plugin-id change leaves behind.
+    for owner_dir in child_dirs(&plugin_dir, |name| name.starts_with('o')) {
+        if owner_dir == namespace_root {
+            continue;
+        }
+        let records = count_records_in(&owner_dir);
+        if records > 0 {
+            namespaces = namespaces.saturating_add(1);
+            files = files.saturating_add(records);
+        }
+    }
+    (files, namespaces)
+}
+
+fn is_spool_day_component(name: &str) -> bool {
+    name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Non-symlink child directories of `dir` whose name passes `accept`.
+fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if accept(name) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+fn count_records_in(dir: &Path) -> u64 {
+    let mut records = Vec::new();
+    let mut walk = SpoolWalk::new(dir, SpoolFileClass::AnyRecord);
+    match walk.run(dir, &mut records) {
+        Ok(()) => records.len() as u64,
+        Err(_) => 0,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SpoolFileClass {
     /// Active data, crash-left temps, corrupt quarantine, metadata-only
     /// dead-letter files, and in-flight replay claims — quota/status.
     Owned,
-    /// Only durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
+    /// Durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
     Replayable,
     /// Interrupted atomic-write temps.
     Temp,
     /// Atomically claimed replay files.
     Inflight,
+    /// Any durable record shape, whether or not it carries an owner tag; used
+    /// only by the unbound/legacy reconciliation scan.
+    AnyRecord,
 }
 
-fn collect_spool_files(
-    namespace_root: &Path,
-    dir: &Path,
-    files: &mut Vec<PathBuf>,
+/// Bounded, symlink-free, cycle-free walk of one managed subtree.
+struct SpoolWalk<'a> {
+    root: &'a Path,
     class: SpoolFileClass,
-    depth: u32,
-    file_count: &mut usize,
-    visited: &mut HashSet<DirIdentity>,
-) -> Result<(), String> {
-    if depth > MAX_SPOOL_TRAVERSAL_DEPTH {
-        return Err(format!(
-            "{PLUGIN_NAME}: spool traversal exceeded max depth ({MAX_SPOOL_TRAVERSAL_DEPTH}) under '{}'",
-            namespace_root.display()
-        ));
+    file_count: usize,
+    visited: HashSet<DirIdentity>,
+    canonical_root: Option<PathBuf>,
+}
+
+impl<'a> SpoolWalk<'a> {
+    fn new(root: &'a Path, class: SpoolFileClass) -> Self {
+        Self {
+            root,
+            class,
+            file_count: 0,
+            visited: HashSet::new(),
+            canonical_root: fs::canonicalize(root).ok(),
+        }
     }
-    path_is_within_canonical_root(namespace_root, dir)?;
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
+
+    fn run(&mut self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        self.walk(dir, files, 0)
+    }
+
+    fn walk(&mut self, dir: &Path, files: &mut Vec<PathBuf>, depth: u32) -> Result<(), String> {
+        if depth > MAX_SPOOL_TRAVERSAL_DEPTH {
             return Err(format!(
-                "{PLUGIN_NAME}: failed to read spool directory '{}': {error}",
-                dir.display()
+                "{PLUGIN_NAME}: spool traversal exceeded max depth ({MAX_SPOOL_TRAVERSAL_DEPTH}) under '{}'",
+                self.root.display()
             ));
         }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read spool directory entry '{}': {error}",
-                dir.display()
-            )
-        })?;
-        let path = entry.path();
-        path_is_within_canonical_root(namespace_root, &path)?;
-        // Never follow symlinks for scan/replay/eviction/quarantine/temp cleanup.
-        let meta = fs::symlink_metadata(&path).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
-                path.display()
-            )
-        })?;
-        let file_type = meta.file_type();
-        if file_type.is_symlink() {
-            warn!(
-                plugin = PLUGIN_NAME,
-                path = %path.display(),
-                "Chargeback sink ignored a symlink under the managed spool namespace"
-            );
-            continue;
+        ensure_path_within_root(self.root, dir)?;
+        if let Some(canonical_root) = self.canonical_root.as_deref() {
+            directory_is_within_canonical_root(canonical_root, dir)?;
         }
-        if file_type.is_dir() {
-            if let Some(identity) = dir_identity(&meta)
-                && !visited.insert(identity)
-            {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to read spool directory '{}': {error}",
+                    dir.display()
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to read spool directory entry '{}': {error}",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            ensure_path_within_root(self.root, &path)?;
+            // Never follow symlinks for scan, replay, eviction, quarantine, or
+            // temp cleanup: the entry must be the real node we enumerated.
+            let meta = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
+                    path.display()
+                )
+            })?;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
                 warn!(
                     plugin = PLUGIN_NAME,
                     path = %path.display(),
-                    "Chargeback sink skipped a spool directory cycle"
+                    "Chargeback sink ignored a symlink under the managed spool namespace"
                 );
                 continue;
             }
-            collect_spool_files(
-                namespace_root,
-                &path,
-                files,
-                class,
-                depth + 1,
-                file_count,
-                visited,
-            )?;
-            continue;
+            if file_type.is_dir() {
+                if let Some(identity) = dir_identity(&meta)
+                    && !self.visited.insert(identity)
+                {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "Chargeback sink skipped a spool directory cycle"
+                    );
+                    continue;
+                }
+                self.walk(&path, files, depth + 1)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(SPOOL_META_FILENAME) {
+                continue;
+            }
+            if self.file_count >= MAX_SPOOL_TRAVERSAL_FILES {
+                return Err(format!(
+                    "{PLUGIN_NAME}: spool traversal exceeded max file count ({MAX_SPOOL_TRAVERSAL_FILES}) under '{}'",
+                    self.root.display()
+                ));
+            }
+            self.file_count = self.file_count.saturating_add(1);
+            if spool_file_matches(&path, self.class) {
+                files.push(path);
+            }
         }
-        if !file_type.is_file() {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str()) == Some(SPOOL_META_FILENAME) {
-            continue;
-        }
-        if *file_count >= MAX_SPOOL_TRAVERSAL_FILES {
-            return Err(format!(
-                "{PLUGIN_NAME}: spool traversal exceeded max file count ({MAX_SPOOL_TRAVERSAL_FILES}) under '{}'",
-                namespace_root.display()
-            ));
-        }
-        *file_count = file_count.saturating_add(1);
-        if spool_file_matches(&path, class) {
-            files.push(path);
-        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
@@ -4289,9 +5997,8 @@ fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let base = name
-        .strip_suffix(SPOOL_INFLIGHT_SUFFIX)
-        .unwrap_or(name);
+    // Quarantine under the durable data name so the owner tag survives.
+    let base = spool_artifact_base_name(name);
     let quarantine_path = path.with_file_name(format!("{base}.corrupt"));
     fs::rename(path, &quarantine_path).map_err(|error| {
         format!(
@@ -4340,9 +6047,9 @@ fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let base = name
-        .strip_suffix(SPOOL_INFLIGHT_SUFFIX)
-        .unwrap_or(name);
+    // Name the record after the durable data file, not after the claim marker,
+    // so the dead letter keeps the owner tag and stays attributable.
+    let base = spool_artifact_base_name(name);
     let meta_path = path.with_file_name(format!("{base}.rejected.meta"));
     let tmp_path = path.with_file_name(format!("{base}.rejected.meta.tmp"));
     Ok((tmp_path, meta_path))
@@ -4361,9 +6068,9 @@ fn write_dead_letter_meta(
         .write_lock
         .lock()
         .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
-    path_is_within_canonical_root(&spool.namespace_root, &meta_path)?;
-    path_is_within_canonical_root(&spool.namespace_root, &tmp_path)?;
-    path_is_within_canonical_root(&spool.namespace_root, source_path)?;
+    spool.assert_managed_path(&meta_path)?;
+    spool.assert_managed_path(&tmp_path)?;
+    spool.assert_managed_path(source_path)?;
     match fs::remove_file(&meta_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4374,7 +6081,8 @@ fn write_dead_letter_meta(
             ));
         }
     }
-    write_private_file_atomically(&tmp_path, &meta_path, &bytes)?;
+    let _live = LiveSpoolPathGuard::new(tmp_path.clone());
+    write_private_file_atomically_with_ops(&tmp_path, &meta_path, &bytes, spool.fs_ops)?;
     if let Err(error) = fs::remove_file(source_path) {
         let cleanup_error = fs::remove_file(&meta_path).err();
         return Err(format!(
@@ -4398,6 +6106,7 @@ fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
         SpoolFileClass::Replayable => is_spool_data_file(path),
         SpoolFileClass::Temp => is_spool_temp_file(path),
         SpoolFileClass::Inflight => is_spool_inflight_file(path),
+        SpoolFileClass::AnyRecord => is_spool_data_file(path),
     }
 }
 
@@ -4406,7 +6115,7 @@ fn is_spool_data_file(path: &Path) -> bool {
         return false;
     };
     if name.ends_with(SPOOL_INFLIGHT_SUFFIX)
-        || name.ends_with(".tmp")
+        || name.ends_with(SPOOL_TMP_SUFFIX)
         || name.ends_with(".corrupt")
         || name.ends_with(".rejected")
         || name.ends_with(".meta")
@@ -4420,19 +6129,23 @@ fn is_spool_temp_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.tmp")
+    if !name.ends_with(SPOOL_TMP_SUFFIX) {
+        return false;
+    }
+    // Generation/process-attributed temps written by this format, plus the
+    // pre-attribution shapes and dead-letter metadata temps that a prior
+    // release could have left behind.
+    parse_spool_write_temp(name).is_some()
+        || name.ends_with(".ndjson.tmp")
         || name.ends_with(".ndjson.zst.tmp")
-        || name.contains(".ndjson.g") && name.ends_with(".tmp")
-        || name.contains(".ndjson.zst.g") && name.ends_with(".tmp")
-        || name.ends_with(".ndjson.rejected.meta.tmp")
-        || name.ends_with(".ndjson.zst.rejected.meta.tmp")
+        || name.ends_with(".rejected.meta.tmp")
 }
 
 fn is_spool_inflight_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.inflight") || name.ends_with(".ndjson.zst.inflight")
+    name.ends_with(SPOOL_INFLIGHT_SUFFIX)
 }
 
 fn is_spool_corrupt_file(path: &Path) -> bool {
@@ -4551,7 +6264,7 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
     match status {
         200 | 204 => "delivered",
         413 => "payload_too_large",
-        408 | 429 => "retryable",
+        401 | 403 | 408 | 429 => "retryable",
         code if (500..600).contains(&code) => "retryable",
         code if (400..500).contains(&code) => "permanent",
         _ => "retryable",
@@ -4616,19 +6329,38 @@ pub fn write_private_file_atomically_for_tests(
     final_path: &Path,
     bytes: &[u8],
 ) -> Result<(), String> {
-    write_private_file_atomically(tmp_path, final_path, bytes)
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, SpoolFsOps::REAL)
 }
 
-fn write_private_file_atomically(
+/// Exercise the durable-write contract with one step forced to fail.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn write_private_file_atomically_with_fault_for_tests(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    fault: SpoolFsFault,
 ) -> Result<(), String> {
-    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes);
+    write_private_file_atomically_with_ops(
+        tmp_path,
+        final_path,
+        bytes,
+        SpoolFsOps::with_fault(fault),
+    )
+}
+
+fn write_private_file_atomically_with_ops(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+    ops: SpoolFsOps,
+) -> Result<(), String> {
+    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
     if result.is_err() {
-        // Keep quota accounting honest after a failed write/rename/dir-sync: a
-        // leftover *.tmp or a rename that landed without durable directory
-        // persistence must not remain as a silently published batch.
+        // Keep quota accounting honest and the publish atomic after a failed
+        // write, rename, or directory sync: a leftover `*.tmp`, or a rename that
+        // landed without a durable directory entry, must never remain visible as
+        // a committed batch that the caller was told did not commit.
         let _ = fs::remove_file(tmp_path);
         let _ = fs::remove_file(final_path);
     }
@@ -4639,6 +6371,7 @@ fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    ops: SpoolFsOps,
 ) -> Result<(), String> {
     if let Some(parent) = tmp_path.parent() {
         ensure_private_dir(parent)?;
@@ -4672,68 +6405,30 @@ fn write_private_file_atomically_inner(
             tmp_path.display()
         )
     })?;
-    if current_spool_fs_fault() == SpoolFsFault::FileSync {
-        return Err(format!(
-            "{PLUGIN_NAME}: injected failure: fsync spool temp file '{}'",
-            tmp_path.display()
-        ));
-    }
-    file.sync_all().map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to fsync spool temp file '{}': {error}",
-            tmp_path.display()
-        )
-    })?;
+    (ops.sync_file)(&file, tmp_path)?;
     drop(file);
-    if current_spool_fs_fault() == SpoolFsFault::Rename {
-        return Err(format!(
-            "{PLUGIN_NAME}: injected failure: rename spool temp file '{}' to '{}'",
-            tmp_path.display(),
-            final_path.display()
-        ));
-    }
-    fs::rename(tmp_path, final_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to rename spool temp file '{}' to '{}': {error}",
-            tmp_path.display(),
-            final_path.display()
-        )
-    })?;
-    // Durably persist the rename itself. On Unix, parent-directory open/fsync
-    // failure is a write failure before any snapshot baseline commit. Platforms
-    // that cannot fsync directories (notably Windows) treat successful file sync +
-    // rename as the portability durability boundary and document that limit;
-    // fault-injection still exercises the failure contract on every platform.
-    if current_spool_fs_fault() == SpoolFsFault::DirOpen {
-        let parent = final_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-        return Err(format!(
-            "{PLUGIN_NAME}: injected failure: open spool parent directory '{parent}'"
-        ));
-    }
-    if current_spool_fs_fault() == SpoolFsFault::DirSync {
-        let parent = final_path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-        return Err(format!(
-            "{PLUGIN_NAME}: injected failure: fsync spool parent directory '{parent}'"
-        ));
-    }
+    (ops.rename)(tmp_path, final_path)?;
+    // Durably persist the rename itself. The file contents were fsynced above,
+    // but the directory entry pointing at them is only guaranteed after an fsync
+    // of the containing directory. On Unix a parent-directory open or fsync
+    // failure is therefore a write failure: it is reported to the caller and the
+    // publish is rolled back, before any snapshot baseline can advance.
+    //
+    // Directory fsync is a Unix concept. On platforms without it (notably
+    // Windows) a successful file sync plus rename is the durability boundary
+    // this plugin can offer, and the documentation states that limit rather than
+    // claiming a guarantee the platform does not provide. Both platforms run the
+    // same fault-injection contract tests.
     #[cfg(unix)]
     {
         let Some(parent) = final_path.parent() else {
             return Ok(());
         };
-        let dir = File::open(parent).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to open spool parent directory '{}' after rename: {error}",
-                parent.display()
-            )
-        })?;
-        dir.sync_all().map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to fsync spool parent directory '{}' after rename: {error}",
-                parent.display()
-            )
-        })?;
+        let dir = (ops.open_dir)(parent)?;
+        (ops.sync_dir)(&dir, parent)?;
     }
+    #[cfg(not(unix))]
+    let _ = ops;
     Ok(())
 }
 
@@ -4808,6 +6503,14 @@ fn start_spool_replayer(
     })
 }
 
+/// Replay one tick of this owner's durable spool files.
+///
+/// Each candidate is atomically claimed before it is read or delivered, so an
+/// overlapping accepted generation, a reloaded replacement generation, or a peer
+/// process sharing the volume can never deliver or destroy the same file. Losing
+/// the claim race is normal and simply skips that file. Quota eviction never
+/// selects a claimed file, so a retryable failure can always release the claim
+/// back to a durable name.
 async fn replay_spool_once(
     spool: &SpoolManager,
     flush_config: &ClickHouseFlushConfig,
@@ -4815,13 +6518,18 @@ async fn replay_spool_once(
 ) -> Result<(), String> {
     let files = spool.list_replayable_spool_files()?;
     for file in files {
-        let inflight = {
+        let claim = {
             let _guard = spool
                 .write_lock
                 .lock()
                 .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
-            spool.claim_replay_file_locked(&file)?
+            match spool.claim_replay_file_locked(&file)? {
+                Some(claim) => claim,
+                // Another accepted generation or process won the atomic claim.
+                None => continue,
+            }
         };
+        let inflight = claim.path().to_path_buf();
         let body = match decode_spool_file(&inflight) {
             Ok(body) => body,
             Err(error) => {
@@ -4857,12 +6565,7 @@ async fn replay_spool_once(
             .map(str::to_owned)
             .collect();
         if lines.is_empty() {
-            fs::remove_file(&inflight).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to remove empty spool file '{}': {error}",
-                    inflight.display()
-                )
-            })?;
+            spool.remove_delivered_claim(&inflight)?;
             continue;
         }
 
@@ -4876,13 +6579,14 @@ async fn replay_spool_once(
                 invalidate_status_cache();
             }
             Err(error) => {
-                // Retryable delivery failure: release the in-flight claim back to a
-                // durable replayable name and stop the tick so ordering is preserved.
+                // Retryable delivery failure: release the claim back to a durable
+                // replayable name and stop the tick so ordering is preserved
+                // across transient outages.
                 let _guard = spool
                     .write_lock
                     .lock()
                     .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
-                spool.release_inflight_file_locked(&inflight)?;
+                spool.release_claim_locked(&inflight)?;
                 return Err(error);
             }
         }
@@ -4952,12 +6656,7 @@ fn finalize_replayed_spool_file(
     dead_letters: Vec<DeadLetterChunk>,
 ) -> Result<(), String> {
     if dead_letters.is_empty() {
-        fs::remove_file(file).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
-                file.display()
-            )
-        })?;
+        spool.remove_delivered_claim(file)?;
         return Ok(());
     }
 
@@ -5086,9 +6785,18 @@ impl Default for SnapshotAtomicTotals {
 }
 
 impl SnapshotAtomicTotals {
-    fn add(&self, charge: ChargeComputation) {
-        self.call_count
-            .fetch_add(charge.call_count as u64, Ordering::Relaxed);
+    fn try_add(&self, charge: ChargeComputation) -> Result<(), String> {
+        let added_calls = charge.call_count as u64;
+        let previous =
+            self.call_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(added_calls)
+                });
+        if previous.is_err() {
+            return Err(format!(
+                "{PLUGIN_NAME}: snapshot call_count overflowed u64 while accumulating"
+            ));
+        }
         add_f64_atomic(&self.charge_call_bits, charge.charge_call);
         self.bytes_sent
             .fetch_add(charge.bytes_sent, Ordering::Relaxed);
@@ -5100,6 +6808,7 @@ impl SnapshotAtomicTotals {
             charge.charge_bytes_received,
         );
         add_f64_atomic(&self.charge_total_bits, charge.charge_total);
+        Ok(())
     }
 
     fn snapshot(&self) -> SnapshotTotals {
@@ -5129,6 +6838,8 @@ struct SnapshotEntry {
     /// revision and only evicts when that exact revision is still present, so a
     /// same-key refresh that races after the stale check cannot be deleted.
     revision: AtomicU64,
+    /// Estimated retained bytes charged against `max_retained_bytes` at insert.
+    retained_bytes: usize,
 }
 
 /// Baseline emitted for one accumulator generation of a snapshot identity.
@@ -5145,10 +6856,40 @@ struct PreparedSnapshot {
 #[cfg(test)]
 type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Outcome of attempting to accumulate one charge under cardinality/byte budgets.
+#[derive(Debug)]
+enum SnapshotRecordOutcome {
+    Accumulated,
+    /// New identity exceeded the hard budget; caller must durably spool this event.
+    OverflowImmediate,
+}
+
 pub struct SnapshotAccumulator {
     entries: DashMap<SnapshotMetadata, SnapshotEntry>,
     last_emitted: DashMap<SnapshotMetadata, LastEmitted>,
     next_generation: AtomicU64,
+    max_entries: usize,
+    max_retained_bytes: usize,
+    /// Authoritative identity-slot reservation gate. Reserved before a new key
+    /// is published and released on eviction or a lost publish race, so the
+    /// hard `max_entries` ceiling holds under concurrent inserts without a
+    /// global request-path lock. Tracks `entries.len()` up to transient
+    /// same-key reservation windows that only ever reject conservatively.
+    reserved_entries: AtomicUsize,
+    /// Combined retained-byte reservation (accumulator entries plus staged
+    /// overflow). Both entry insertion and overflow staging CAS against this
+    /// single counter so the combined hard ceiling cannot be exceeded even when
+    /// they race.
+    retained_bytes: AtomicUsize,
+    overflow_pending: Mutex<Vec<ChargeEvent>>,
+    /// Overflow subset of `retained_bytes`, tracked separately so `take`/`clear`
+    /// release exactly the staged portion from the combined counter.
+    overflow_pending_bytes: AtomicUsize,
+    /// Async snapshot-overflow jobs that can still re-stage an event after a
+    /// durable spool failure. Full→Compact and finalization must wait for these
+    /// jobs as well as terminal-hook admission guards before transferring or
+    /// clearing accumulator state.
+    overflow_deliveries_in_flight: AtomicUsize,
     /// Test-only callback invoked after a key is selected as a stale candidate
     /// and before conditional eviction. Production leaves this unset.
     #[cfg(test)]
@@ -5157,13 +6898,109 @@ pub struct SnapshotAccumulator {
 
 impl SnapshotAccumulator {
     pub fn new() -> Self {
+        Self::with_limits(
+            default_snapshot_max_entries(),
+            default_snapshot_max_retained_bytes(),
+        )
+    }
+
+    pub fn with_limits(max_entries: usize, max_retained_bytes: usize) -> Self {
         Self {
             entries: DashMap::new(),
             last_emitted: DashMap::new(),
             next_generation: AtomicU64::new(1),
+            max_entries: max_entries.max(1),
+            max_retained_bytes: max_retained_bytes.max(1),
+            reserved_entries: AtomicUsize::new(0),
+            retained_bytes: AtomicUsize::new(0),
+            overflow_pending: Mutex::new(Vec::new()),
+            overflow_pending_bytes: AtomicUsize::new(0),
+            overflow_deliveries_in_flight: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_after_stale_check_hook: Mutex::new(None),
         }
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Combined retained bytes (accumulator entries plus staged overflow).
+    /// `retained_bytes` already tracks both, so the accessor is a single load.
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    fn begin_overflow_delivery(&self) {
+        self.overflow_deliveries_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_overflow_delivery(&self) {
+        self.overflow_deliveries_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn overflow_deliveries_in_flight(&self) -> usize {
+        self.overflow_deliveries_in_flight.load(Ordering::Acquire)
+    }
+
+    // External adversarial tests assert the hard byte ceiling is never crossed;
+    // the binary target compiles this module separately and cannot observe them.
+    #[allow(dead_code)]
+    pub fn retained_bytes_for_tests(&self) -> usize {
+        self.retained_bytes()
+    }
+
+    /// Reserve one identity slot and its retained bytes against the hard
+    /// ceilings before a new key is published. Returns `false` when either
+    /// ceiling would be exceeded so the caller durably spools the charge. On a
+    /// byte-ceiling refusal the already-taken slot reservation is released.
+    fn try_reserve_identity(&self, entry_bytes: usize) -> bool {
+        if self
+            .reserved_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.max_entries).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if self.try_reserve_bytes(entry_bytes) {
+            true
+        } else {
+            self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
+    }
+
+    /// Reserve `bytes` against the combined retained-byte ceiling. Shared by
+    /// entry insertion and overflow staging so their combined footprint can
+    /// never exceed `max_retained_bytes` under concurrency.
+    fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        self.retained_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_retained_bytes)
+            })
+            .is_ok()
+    }
+
+    /// Release a previously reserved identity slot and its retained bytes.
+    fn release_identity(&self, entry_bytes: usize) {
+        self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+        self.retained_bytes.fetch_sub(entry_bytes, Ordering::AcqRel);
+    }
+
+    fn clear_for_compaction(&self) {
+        self.entries.clear();
+        self.last_emitted.clear();
+        self.reserved_entries.store(0, Ordering::Release);
+        self.retained_bytes.store(0, Ordering::Release);
+        if let Ok(mut pending) = self.overflow_pending.lock() {
+            pending.clear();
+        }
+        self.overflow_pending_bytes.store(0, Ordering::Release);
     }
 
     fn record_http(
@@ -5172,7 +7009,7 @@ impl SnapshotAccumulator {
         consumer: &str,
         outcome: HttpBillingOutcome,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         let meta = SnapshotMetadata {
@@ -5187,7 +7024,7 @@ impl SnapshotAccumulator {
             grpc_status: outcome.grpc_status.map(normalize_snapshot_grpc_status),
             protocol: infer_http_protocol(summary),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
     fn record_stream(
@@ -5195,7 +7032,7 @@ impl SnapshotAccumulator {
         summary: &StreamTransactionSummary,
         consumer: &str,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
             namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
             consumer_id: bound_string(consumer, MAX_FIELD_LEN),
@@ -5211,7 +7048,7 @@ impl SnapshotAccumulator {
             grpc_status: None,
             protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
     fn record_websocket(
@@ -5219,7 +7056,7 @@ impl SnapshotAccumulator {
         summary: &WsDisconnectContext,
         consumer: &str,
         charge: ChargeComputation,
-    ) {
+    ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
             namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
             consumer_id: bound_string(consumer, MAX_FIELD_LEN),
@@ -5235,31 +7072,132 @@ impl SnapshotAccumulator {
             grpc_status: None,
             protocol: "ws".to_string(),
         };
-        self.record(meta, charge);
+        self.record(meta, charge)
     }
 
-    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) {
-        self.record_at(meta, charge, unix_timestamp_seconds());
+    fn record(&self, meta: SnapshotMetadata, charge: ChargeComputation) -> SnapshotRecordOutcome {
+        self.record_at(meta, charge, unix_timestamp_seconds())
     }
 
-    fn record_at(&self, meta: SnapshotMetadata, charge: ChargeComputation, now: i64) {
-        // Use the typed metadata value itself as the key. A delimiter-encoded
-        // string would allow hostile or ordinary `|` characters in route/name
-        // dimensions to collide and recreate mixed attribution.
+    fn record_at(
+        &self,
+        meta: SnapshotMetadata,
+        charge: ChargeComputation,
+        now: i64,
+    ) -> SnapshotRecordOutcome {
         let key = meta.clone();
-        let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
-            meta,
-            totals: SnapshotAtomicTotals::default(),
-            last_seen_at: AtomicI64::new(now),
-            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
-            revision: AtomicU64::new(0),
-        });
-        // Refresh under the DashMap entry guard so a concurrent same-key
-        // `remove_if` either observes the bumped revision or runs entirely
-        // before this refresh (in which case this `entry` insert recreates).
-        entry.last_seen_at.store(now, Ordering::Relaxed);
-        entry.revision.fetch_add(1, Ordering::Relaxed);
-        entry.totals.add(charge);
+        // Fast path: refresh an already-published identity in place. No new
+        // admission is charged for a same-key refresh.
+        if let Some(entry) = self.entries.get(&key) {
+            entry.last_seen_at.store(now, Ordering::Relaxed);
+            entry.revision.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = entry.totals.try_add(charge) {
+                warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                return SnapshotRecordOutcome::OverflowImmediate;
+            }
+            return SnapshotRecordOutcome::Accumulated;
+        }
+
+        let entry_bytes = snapshot_metadata_retained_bytes(&meta);
+        // Reserve the identity slot and its retained bytes against the hard
+        // ceilings *before* publishing the key. Because the reservation is
+        // atomic, concurrent new-key inserts can never publish state above
+        // `max_entries`/`max_retained_bytes`, and the old publish-then-recheck
+        // overshoot window (which could pin an over-budget entry when a same-key
+        // refresh raced the recheck) no longer exists.
+        if !self.try_reserve_identity(entry_bytes) {
+            return SnapshotRecordOutcome::OverflowImmediate;
+        }
+
+        let mut created = false;
+        let refresh_result = {
+            let entry = self.entries.entry(key.clone()).or_insert_with(|| {
+                created = true;
+                SnapshotEntry {
+                    meta,
+                    totals: SnapshotAtomicTotals::default(),
+                    last_seen_at: AtomicI64::new(now),
+                    generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+                    revision: AtomicU64::new(0),
+                    retained_bytes: entry_bytes,
+                }
+            });
+            entry.last_seen_at.store(now, Ordering::Relaxed);
+            entry.revision.fetch_add(1, Ordering::Relaxed);
+            entry.totals.try_add(charge)
+        };
+
+        if !created {
+            // Lost the publish race: another inserter already owns the single
+            // reservation for this identity. Release ours exactly once so the
+            // budget stays exact, and keep the winner's refresh above.
+            self.release_identity(entry_bytes);
+        }
+
+        match refresh_result {
+            Ok(()) => SnapshotRecordOutcome::Accumulated,
+            Err(error) => {
+                warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink rejected impossible snapshot call_count overflow");
+                if created {
+                    // The freshly created identity could not accept the charge
+                    // and still holds zero totals. Roll it back (releasing its
+                    // reservation) unless a concurrent refresh already attached
+                    // real totals, in which case its reservation is legitimate.
+                    self.remove_pristine_entry(&key);
+                }
+                SnapshotRecordOutcome::OverflowImmediate
+            }
+        }
+    }
+
+    /// Remove a just-created identity that never accepted a charge, releasing
+    /// its reservation. A concurrent same-key refresh that attached real totals
+    /// keeps the entry (and the single reservation that backs it).
+    fn remove_pristine_entry(&self, key: &SnapshotMetadata) {
+        if let Some((_, evicted)) = self.entries.remove_if(key, |_, live| {
+            live.totals.snapshot().is_zero() && live.revision.load(Ordering::Relaxed) <= 1
+        }) {
+            self.release_identity(evicted.retained_bytes);
+        }
+    }
+
+    fn stage_overflow_event(&self, event: ChargeEvent) -> bool {
+        let bytes = charge_event_retained_bytes(&event);
+        // Reserve against the combined retained-byte ceiling shared with entry
+        // insertion, so concurrent staging and new-key admission can never push
+        // the accumulator over `max_retained_bytes`.
+        if !self.try_reserve_bytes(bytes) {
+            return false;
+        }
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.push(event);
+        // Track the staged portion of the combined reservation so `take`/`clear`
+        // release exactly these bytes.
+        self.overflow_pending_bytes
+            .fetch_add(bytes, Ordering::AcqRel);
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn stage_overflow_event_for_tests(&self, event: ChargeEvent) -> bool {
+        self.stage_overflow_event(event)
+    }
+
+    fn take_overflow_pending(&self) -> Vec<ChargeEvent> {
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let drained = std::mem::take(&mut *pending);
+        // Release exactly the staged overflow portion from the combined
+        // retained-byte counter while holding the lock so a concurrent stage
+        // cannot have its bytes released out from under it.
+        let released = self.overflow_pending_bytes.swap(0, Ordering::AcqRel);
+        self.retained_bytes.fetch_sub(released, Ordering::AcqRel);
+        drained
     }
 
     // External integration tests exercise the public accumulator contract;
@@ -5319,6 +7257,14 @@ impl SnapshotAccumulator {
         })
     }
 
+    fn peek_overflow_pending(&self) -> Vec<ChargeEvent> {
+        let pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.clone()
+    }
+
     fn commit_prepared(&self, prepared: &PreparedSnapshot) {
         for (key, generation, current) in &prepared.emitted_totals {
             // Publish the baseline only while this generation is still live so
@@ -5339,6 +7285,21 @@ impl SnapshotAccumulator {
                     },
                 );
             }
+        }
+    }
+
+    fn entry_has_uncommitted_delta(&self, entry: &SnapshotEntry) -> bool {
+        let current = entry.totals.snapshot();
+        let last = self
+            .last_emitted
+            .get(&entry.meta)
+            .filter(|value| value.generation == entry.generation)
+            .map(|value| value.totals)
+            .unwrap_or_default();
+        match current.delta_since(last) {
+            Ok(delta) => !delta.is_zero(),
+            // Fail closed: non-finite/regressed state must not be deleted.
+            Err(_) => true,
         }
     }
 
@@ -5369,13 +7330,16 @@ impl SnapshotAccumulator {
     fn cleanup_stale(&self, now: i64, stale_entry_ttl_secs: u64) -> usize {
         let cutoff = now.saturating_sub(stale_entry_ttl_secs.min(i64::MAX as u64) as i64);
         // Candidate scan is best-effort. Eviction re-validates generation,
-        // revision, and staleness atomically under the DashMap shard lock so a
-        // same-key refresh cannot be deleted, and unrelated keys stay
-        // non-blocking (no global request-path lock).
+        // revision, staleness, and pending-delta state atomically under the
+        // DashMap shard lock so a same-key refresh cannot be deleted, unemitted
+        // totals survive TTL, and unrelated keys stay non-blocking.
         let candidates: Vec<(SnapshotMetadata, u64, u64)> = self
             .entries
             .iter()
-            .filter(|entry| entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff)
+            .filter(|entry| {
+                entry.value().last_seen_at.load(Ordering::Relaxed) <= cutoff
+                    && !self.entry_has_uncommitted_delta(entry.value())
+            })
             .map(|entry| {
                 (
                     entry.key().clone(),
@@ -5392,6 +7356,7 @@ impl SnapshotAccumulator {
                 entry.generation == observed_generation
                     && entry.revision.load(Ordering::Relaxed) == observed_revision
                     && entry.last_seen_at.load(Ordering::Relaxed) <= cutoff
+                    && !self.entry_has_uncommitted_delta(entry)
             }) {
                 // Drop the baseline only for the generation that was actually
                 // evicted. A concurrent reinsert+emit for a newer generation
@@ -5399,6 +7364,7 @@ impl SnapshotAccumulator {
                 self.last_emitted.remove_if(&key, |_, baseline| {
                     baseline.generation == evicted.generation
                 });
+                self.release_identity(evicted.retained_bytes);
                 removed += 1;
             }
         }
@@ -5417,7 +7383,7 @@ impl SnapshotAccumulator {
         protocol: &str,
         charge: ChargeComputation,
     ) {
-        self.record_at(
+        let _ = self.record_at(
             SnapshotMetadata {
                 namespace: namespace.to_string(),
                 consumer_id: consumer.to_string(),
@@ -5435,6 +7401,52 @@ impl SnapshotAccumulator {
         );
     }
 
+    /// Record a charge and report whether it was accumulated (`true`) or spilled
+    /// to durable overflow (`false`). Adversarial concurrency tests tally the
+    /// two outcomes to prove no charge is double-counted or silently dropped.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_accumulated_for_test(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol: &str,
+        charge: ChargeComputation,
+    ) -> bool {
+        matches!(
+            self.record_at(
+                SnapshotMetadata {
+                    namespace: namespace.to_string(),
+                    consumer_id: consumer.to_string(),
+                    consumer_name: None,
+                    proxy_id: proxy_id.to_string(),
+                    proxy_name: proxy_name.to_string(),
+                    route_id: None,
+                    status_code,
+                    http_status_code: (protocol == "http").then_some(status_code),
+                    grpc_status: None,
+                    protocol: protocol.to_string(),
+                },
+                charge,
+                unix_timestamp_seconds(),
+            ),
+            SnapshotRecordOutcome::Accumulated
+        )
+    }
+
+    /// Sum of accumulated `call_count` across every live identity. Equals the
+    /// number of accumulated records in a test that seeds one call per record.
+    #[allow(dead_code)]
+    pub fn total_call_count_for_tests(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.value().totals.call_count.load(Ordering::Relaxed))
+            .fold(0u64, u64::saturating_add)
+    }
+
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn record_http_for_test(
@@ -5443,7 +7455,56 @@ impl SnapshotAccumulator {
         consumer: &str,
         charge: ChargeComputation,
     ) {
-        self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+        let _ = self.record_http(summary, consumer, http_billing_outcome(summary), charge);
+    }
+
+    /// Seed a single identity with an arbitrary `call_count` for boundary tests.
+    #[doc(hidden)]
+    // External boundary tests need every identity dimension explicit.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn seed_call_count_for_test(
+        &self,
+        namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol: &str,
+        call_count: u64,
+    ) {
+        let meta = SnapshotMetadata {
+            namespace: namespace.to_string(),
+            consumer_id: consumer.to_string(),
+            consumer_name: None,
+            proxy_id: proxy_id.to_string(),
+            proxy_name: proxy_name.to_string(),
+            route_id: None,
+            status_code,
+            http_status_code: (protocol == "http").then_some(status_code),
+            grpc_status: None,
+            protocol: protocol.to_string(),
+        };
+        let entry_bytes = snapshot_metadata_retained_bytes(&meta);
+        let key = meta.clone();
+        let entry = self.entries.entry(key).or_insert_with(|| SnapshotEntry {
+            meta,
+            totals: SnapshotAtomicTotals::default(),
+            last_seen_at: AtomicI64::new(unix_timestamp_seconds()),
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            revision: AtomicU64::new(0),
+            retained_bytes: entry_bytes,
+        });
+        if entry.totals.call_count.load(Ordering::Relaxed) == 0
+            && entry.revision.load(Ordering::Relaxed) == 0
+        {
+            self.reserved_entries.fetch_add(1, Ordering::AcqRel);
+            self.retained_bytes.fetch_add(entry_bytes, Ordering::AcqRel);
+        }
+        entry.totals.call_count.store(call_count, Ordering::Relaxed);
+        entry.revision.fetch_add(1, Ordering::Relaxed);
+        entry
+            .last_seen_at
+            .store(unix_timestamp_seconds(), Ordering::Relaxed);
     }
 }
 
@@ -5630,7 +7691,10 @@ fn emit_periodic_snapshot(
             return Err(error);
         }
     };
-    let event_count = prepared.events.len();
+    let mut events = accumulator.peek_overflow_pending();
+    let overflow_count = events.len();
+    events.extend(prepared.events.iter().cloned());
+    let event_count = events.len();
     if event_count == 0 {
         return Ok(0);
     }
@@ -5641,7 +7705,7 @@ fn emit_periodic_snapshot(
             .record_failure(FailureReason::Serialize, error.clone());
         return Err(error);
     };
-    if let Err(error) = spool.write_events(&prepared.events) {
+    if let Err(error) = spool.write_events(&events) {
         runtime
             .metrics
             .spool_available
@@ -5663,12 +7727,15 @@ fn emit_periodic_snapshot(
     // as a low-latency delivery attempt. A reload racing this point can abort the
     // queue worker without losing or double-charging the snapshot: replay is
     // idempotent on event_id.
+    if overflow_count > 0 {
+        let _ = accumulator.take_overflow_pending();
+    }
     accumulator.commit_prepared(&prepared);
     runtime
         .metrics
         .snapshot_emits_total
         .fetch_add(event_count as u64, Ordering::Relaxed);
-    for event in prepared.events {
+    for event in events {
         enqueue_charge_event(runtime, event);
     }
     invalidate_status_cache();
@@ -5711,7 +7778,10 @@ fn emit_final_snapshot_to_spool(
             return false;
         }
     };
-    if prepared.events.is_empty() {
+    let mut events = accumulator.peek_overflow_pending();
+    let overflow_count = events.len();
+    events.extend(prepared.events.iter().cloned());
+    if events.is_empty() {
         return true;
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -5721,7 +7791,7 @@ fn emit_final_snapshot_to_spool(
         );
         return false;
     };
-    if let Err(error) = spool.write_events(&prepared.events) {
+    if let Err(error) = spool.write_events(&events) {
         runtime
             .metrics
             .spool_available
@@ -5738,11 +7808,14 @@ fn emit_final_snapshot_to_spool(
         );
         return false;
     }
+    if overflow_count > 0 {
+        let _ = accumulator.take_overflow_pending();
+    }
     accumulator.commit_prepared(&prepared);
     runtime
         .metrics
         .snapshot_emits_total
-        .fetch_add(prepared.events.len() as u64, Ordering::Relaxed);
+        .fetch_add(events.len() as u64, Ordering::Relaxed);
     invalidate_status_cache();
     true
 }
@@ -5777,7 +7850,7 @@ fn event_from_http_summary(
         http_status_code: Some(outcome.http_status_code),
         grpc_status: outcome.grpc_status,
         protocol: infer_http_protocol(summary),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -5833,7 +7906,7 @@ fn event_from_stream_summary(
         http_status_code: None,
         grpc_status: None,
         protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -5889,7 +7962,7 @@ fn event_from_ws_summary(
         http_status_code: None,
         grpc_status: None,
         protocol: "ws".to_string(),
-        call_count: charge.call_count,
+        call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
         bytes_received: charge.bytes_received,
@@ -5941,7 +8014,7 @@ fn event_from_snapshot(
         http_status_code: meta.http_status_code,
         grpc_status: meta.grpc_status,
         protocol: meta.protocol.clone(),
-        call_count: saturating_u64_to_u32(totals.call_count),
+        call_count: totals.call_count,
         charge_call: totals.charge_call,
         bytes_sent: totals.bytes_sent,
         bytes_received: totals.bytes_received,
@@ -5976,6 +8049,105 @@ fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
         .find_map(|key| metadata.get(*key))
         .map(|value| bound_string(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
+}
+
+/// Durably record a snapshot cardinality/byte overflow charge without ever
+/// blocking the calling Tokio worker on compression/write/fsync.
+///
+/// The event is handed to the owned, bounded [`SpoolDelivery`] worker (charged
+/// against the export byte budget until the worker's blocking write finishes),
+/// which advances the durable-success counters only after the write genuinely
+/// lands. If the bounded queue is full or closed, or the byte budget is
+/// exhausted, the exact event is staged in the accumulator's bounded overflow
+/// instead; only when durable handoff *and* bounded staging both fail is a
+/// genuine cardinality loss recorded.
+fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEvent) {
+    let runtime = &lifecycle.runtime;
+    let metrics = &runtime.metrics;
+    // Prefer the bounded async delivery worker so terminal hooks never run spool
+    // I/O inline. Recover the exact event when it cannot be handed off.
+    let event = match runtime.spool_delivery.as_ref() {
+        Some(delivery) => {
+            let retained = charge_event_retained_bytes(&event);
+            match runtime.byte_budget.try_acquire(retained) {
+                Some(lease) => {
+                    let queued = QueuedChargeEvent { event, lease };
+                    match delivery.try_enqueue_snapshot_overflow(
+                        vec![queued],
+                        Arc::clone(&lifecycle.accumulator),
+                        lifecycle.generation,
+                    ) {
+                        Ok(()) => {
+                            // Durable-success/overflow counters advance on the
+                            // delivery worker after the write genuinely lands.
+                            invalidate_status_cache();
+                            return;
+                        }
+                        // Queue full/closed: recover the event (the lease drops
+                        // here, releasing its export-queue byte reservation) and
+                        // fall through to bounded in-memory staging.
+                        Err(mut returned) => match returned.pop() {
+                            Some(queued) => queued.event,
+                            None => return,
+                        },
+                    }
+                }
+                // Export byte budget exhausted: stage the original event below.
+                None => event,
+            }
+        }
+        None => event,
+    };
+    stage_overflow_events_or_reject(
+        &lifecycle.accumulator,
+        metrics,
+        lifecycle.generation,
+        vec![event],
+    );
+}
+
+/// Stage overflow charges into bounded pending state, or record a genuine
+/// cardinality loss for any that the retained-byte budget cannot hold.
+fn stage_overflow_events_or_reject(
+    accumulator: &SnapshotAccumulator,
+    metrics: &SinkMetrics,
+    generation: u64,
+    events: Vec<ChargeEvent>,
+) {
+    let mut rejected = 0u64;
+    for event in events {
+        if accumulator.stage_overflow_event(event) {
+            metrics
+                .snapshot_overflow_pending_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            rejected = rejected.saturating_add(1);
+        }
+    }
+    if rejected > 0 {
+        metrics
+            .snapshot_cardinality_rejections_total
+            .fetch_add(rejected, Ordering::Relaxed);
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation,
+            rejected,
+            "Chargeback sink snapshot cardinality budget exhausted and overflow could not be staged; restore spool capacity"
+        );
+    }
+    invalidate_status_cache();
+}
+
+fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {
+    let mut total = 128usize;
+    total = total.saturating_add(meta.namespace.len());
+    total = total.saturating_add(meta.consumer_id.len());
+    total = total.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(meta.proxy_id.len());
+    total = total.saturating_add(meta.proxy_name.len());
+    total = total.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
+    total = total.saturating_add(meta.protocol.len());
+    total
 }
 
 fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
@@ -6053,14 +8225,6 @@ fn non_negative_delta(current: f64, last: f64, field: &str) -> Result<f64, Strin
         ));
     }
     Ok(current - last)
-}
-
-fn saturating_u64_to_u32(value: u64) -> u32 {
-    if value > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        value as u32
-    }
 }
 
 fn add_f64_atomic(slot: &AtomicU64, delta: f64) {

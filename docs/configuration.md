@@ -45,7 +45,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_PKCS11_MODULE_PATH` | No | — | Default PKCS#11 module path used by frontend/admin/backend mTLS `pkcs11://` key sources when the URI omits `?module=` and `?module_env=`. Requires the `pkcs11` Cargo feature |
 | `FERRUM_PKCS11_PIN` | No | — | Optional example token user PIN variable for `pkcs11://...?pin_env=FERRUM_PKCS11_PIN`. Ferrum only reads it when a PKCS#11 key source references it, and never logs the value |
 | `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
-| `FERRUM_NODE_ID` | No | `$HOSTNAME`, then `/etc/hostname`, then `unknown` | Stable node identity written onto exported charge events and encoded as a single safe path component under the `api_chargeback_sink` managed spool namespace (`<spool.dir>/<safe_node>/<plugin_seg>/<dest_seg>/`). Absolute/parent/separator/NUL/drive/UNC forms are hashed rather than joined raw. Values longer than 512 characters are truncated for event provenance. When `spool.dir` is on persistent storage, set a stable identity such as a StatefulSet ordinal so restarts do not orphan sibling namespaces from a previous identity |
+| `FERRUM_NODE_ID` | No | `$HOSTNAME`, then `/etc/hostname`, then `unknown` | Stable node identity written onto exported charge events and part of the `api_chargeback_sink` spool ownership identity (`<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/`). It is encoded as a single safe path component: absolute/parent/separator/drive/UNC forms are hashed rather than joined raw, and NUL is rejected. Values longer than 512 characters are truncated for event provenance. When `spool.dir` is on persistent storage, set a stable identity such as a StatefulSet ordinal; changing it produces a fresh managed namespace and leaves the previous records reported as unbound (never replayed or deleted automatically) |
 
 Process-log admission always needs one maximum-record reservation while a new
 record is serialized. After serialization, diagnostics report the actual bytes
@@ -102,7 +102,9 @@ value.
 > (`file`/`dp`/`mesh`) emit a high-severity warning instead of failing. (Note:
 > `file`/`mesh` fall back to a random, unguessable admin JWT secret when
 > `FERRUM_ADMIN_JWT_SECRET` is unset, so externally-minted tokens cannot validate
-> there; `dp` requires the secret and aborts startup if it is missing. Either way,
+> there; an explicitly supplied but invalid admin JWT setting — short secret or
+> malformed `FERRUM_ADMIN_JWT_MAX_TTL` — fails startup instead of replacing that
+> intent. `dp` requires the secret and aborts startup if it is missing. Either way,
 > if you bind a plaintext admin listener beyond loopback, prefer an allowlist or
 > TLS.) The `node_agent` admin listener also defaults to loopback.
 
@@ -122,7 +124,7 @@ value.
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_TLS_KEY_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_ADMIN_TLS_KEY_PATH`; accepts path, `file://`, inline PEM, provider URI, or `pkcs11://` RSA signer URI when built with the `pkcs11` feature |
 | `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` | No | — | Source for DER OCSP response bytes to staple on admin TLS handshakes. File/provider-backed sources are watched when frontend/admin TLS live reload is enabled |
-| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed |
+| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed. In `file`/`mesh`/`node_agent`, omitting the secret generates a random read-only secret at startup; setting a short or otherwise invalid value fails startup |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | No | — | Optional expected `aud` (audience) claim for Admin API JWT tokens. When set, tokens must carry a matching `aud`. When unset (default), tokens without `aud` pass but tokens carrying `aud` are rejected (RFC 7519 strict audience handling) |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (seconds) for externally minted Admin API JWTs, enforced against verifier time so future-shifted timestamps cannot extend real validity. The nominal lifetime (`exp - iat`) must be positive and within this value; `iat` must not be later than verifier time plus the 60-second clock-skew leeway; the remaining lifetime (`exp - now`) must be within this value **plus that same 60-second leeway** (one skew window, so an issuer whose clock runs fast can still mint full-length tokens); and `exp` must still be in the future at verifier time, with no additional expiry grace. Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`. `0` intentionally disables the lifetime cap; a value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited |
@@ -223,19 +225,26 @@ bundle that may need them is alive.
 
 #### MySQL minimum version
 
-MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
-`COLLATE utf8mb4_0900_as_cs` on identifier columns (`id`, `namespace`, `name`,
+MySQL backends require **MySQL 8.0.17+**. The V001 schema applies an explicit
+`COLLATE utf8mb4_0900_bin` on identifier columns (`id`, `namespace`, `name`,
 `username`, `custom_id`, `plugin_name`, `proxy_id`, `upstream_id`,
 `upstream_subset`, `api_spec_id`, `content_hash`, `spec_version`,
-`backend_host`, `backend_tls_sni`), which is only available on MySQL 8.0 and
-later. This makes uniqueness on `(namespace, name)`, `(namespace, username)`,
-etc. **byte-exact** rather than the case-insensitive default — so `Alpha` and
-`alpha` are distinct identifiers on MySQL just as they are on PostgreSQL and
-SQLite. Operators upgrading a populated 5.x MySQL deployment must run the
-matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
-utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
-compatibility policy of folding schema changes into the V001 baseline rather
-than shipping incremental migrations.
+`backend_host`, `backend_tls_sni`). This binary, `NO PAD` collation — introduced
+in MySQL 8.0.17 — makes uniqueness on `(namespace, name)`,
+`(namespace, username)`, etc. **byte-exact** — matching PostgreSQL and SQLite —
+so case variants (`Alpha` vs `alpha`), Unicode canonical equivalents (NFC
+`café` vs NFD `cafe\u{0301}`), and values that differ only by trailing spaces
+remain distinct. Servers older than 8.0.17 reject the baseline schema DDL
+because the required collation is unavailable. The older `utf8mb4_bin` binary
+collation uses `PAD SPACE` semantics, while a UCA collation such as
+`utf8mb4_0900_as_cs` still folds canonically equivalent sequences; either
+would diverge from the runtime's byte-keyed identity indexes. Operators
+upgrading a populated deployment that still uses one of those collations (or
+an older case-insensitive default) must run the matching
+`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
+themselves; this is consistent with the build-out compatibility policy of
+folding schema changes into the V001 baseline rather than shipping
+incremental migrations.
 
 MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
 server or session default is weaker, Ferrum rejects the candidate full load and
@@ -276,7 +285,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | No | `300` | Max SQL connection lifetime |
-| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max TCP connect time for new database connections; `0` disables |
+| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max time for each PostgreSQL/MySQL pool connect attempt (initial, failover, replica, reconnect, migrate); `0` disables. Enforced around sqlx pool creation — not a DSN query parameter |
 | `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; `0` disables |
 
 ### MongoDB
@@ -289,8 +298,8 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
 | `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 
@@ -299,6 +308,23 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
+
+File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation.
+
+File-mode configuration documents are limited to 64 MiB; larger files fail before allocation and parsing.
+
+**Publish updates with an atomic replace.** Write a temporary file beside the target, `fsync` it, then `rename(2)` over `FERRUM_FILE_CONFIG_PATH` (Kubernetes ConfigMap symlink swaps are equivalent). Avoid editor save-in-place, shell `>` redirection, or `cp` onto the live path: those create a torn-write window where a truncated-but-still-valid YAML document (commonly cutting a trailing `plugin_configs` list after item N-1) can parse and pass validators while silently dropping auth/ACL plugins.
+
+Optional top-level `resource_counts` is a defense-in-depth seal for that trailing-section hazard. Place it near the top of the document (before the resource lists). When present it is validated against the file's pre-namespace-filter lengths and is stripped before `GatewayConfig` deserialization:
+
+```yaml
+version: "1"
+resource_counts:
+  proxies: 1
+  consumers: 0
+  plugin_configs: 2
+  upstreams: 0
+```
 
 ### Control Plane / Data Plane
 
@@ -598,9 +624,9 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Capped at 86400s (1 day) |
-| `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses. Capped at 86400s (1 day) |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
+| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Also caps failed-entry lifetime and error-TTL backoff. Capped at 86400s (1 day) |
+| `FERRUM_DNS_ERROR_TTL` | No | `5` | Base TTL (seconds) for errors/empty responses; doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL`. Capped at 86400s (1 day) |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries. Over-capacity eviction prefers error entries over live success entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
@@ -608,7 +634,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes and per-cycle failed-DNS retry work (selection + resolve concurrency). Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
@@ -741,12 +767,12 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
-| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
+| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, circuit-breaker cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
 | `FERRUM_MAX_REQUESTS` | No | `0` | Max concurrent in-flight requests/streams; `0` = unlimited |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | No | `0` | Per-client-IP concurrent request cap; `0` disables |
 | `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | No | `60` | Cleanup interval for per-IP request counters |
-| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries (`proxy_id` or `proxy_id::host:port`). Concurrent same-key creates share one breaker; new distinct keys are refused admission once full and receive a transient (uncached) breaker so overflow traffic still proceeds without growing or splitting cached state. Existing keys remain replaceable at capacity when config changes |
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | No | `200` | Max distinct HTTP status code counter entries |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores, `1` = single listener. Parallelizes kernel-level connection intake independently of worker threads. Unix only (Linux 3.9+, macOS, BSDs); non-Unix platforms warn and run one accept loop |
@@ -900,7 +926,18 @@ A reference `ferrum.conf` with all available fields and descriptions is included
 
 Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
+Publish replacements atomically (temp file + `rename`, or an equivalent ConfigMap symlink swap). See [File Mode](#file-mode) for the loader's stability contract and optional `resource_counts` seal.
+
 ```yaml
+version: "1"
+# Optional integrity seal — validated before namespace filtering. Declaring
+# plugin_configs: 2 rejects a torn truncation that drops the trailing item.
+resource_counts:
+  proxies: 1
+  consumers: 1
+  plugin_configs: 2
+  upstreams: 0
+
 proxies:
   - id: "my-api"
     name: "My Backend API"
@@ -920,6 +957,7 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "log-plugin"
+      - plugin_config_id: "key-auth"
 
 consumers:
   - id: "user-1"
@@ -932,6 +970,11 @@ consumers:
 plugin_configs:
   - id: "log-plugin"
     plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+  - id: "key-auth"
+    plugin_name: "key_auth"
     config: {}
     scope: global
     enabled: true

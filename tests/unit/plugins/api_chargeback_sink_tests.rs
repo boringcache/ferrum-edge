@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolFsFault, SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
-    classify_clickhouse_http_status_for_tests, clear_spool_fs_fault_for_tests,
+    SpoolFsFault, SpoolManager, SpoolOwnerSpec, SpoolSettings,
+    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    set_spool_fs_fault_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -438,7 +438,7 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
     }
 
     let mut per_event = sample_event("maximum-price-per-event");
-    per_event.call_count = http_charge.call_count;
+    per_event.call_count = u64::from(http_charge.call_count);
     per_event.charge_call = http_charge.charge_call;
     per_event.bytes_sent = http_charge.bytes_sent;
     per_event.bytes_received = http_charge.bytes_received;
@@ -1028,16 +1028,40 @@ fn encoded_event_len(event: &ChargeEvent, compression: SpoolCompression) -> u64 
         .len() as u64
 }
 
+fn spool_settings(dir: &Path, max_bytes: u64) -> SpoolSettings {
+    SpoolSettings {
+        enabled: true,
+        dir: dir.to_path_buf(),
+        max_bytes,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    }
+}
+
+/// Owner identity matching `SpoolManager::for_tests`.
+fn test_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
+    SpoolOwnerSpec {
+        node_id,
+        plugin_config_id: "test-plugin",
+        ferrum_namespace: "ferrum",
+        destination_endpoint: "http://127.0.0.1:8123",
+        database: "ferrum",
+        table: "charges_raw",
+    }
+}
+
 fn default_test_namespace_root(spool_dir: &Path) -> std::path::PathBuf {
-    SpoolManager::namespace_root_path_for_tests(
-        spool_dir,
-        "node-a",
-        "test-plugin",
-        "http://127.0.0.1:8123",
-        "ferrum",
-        "charges_raw",
-    )
-    .unwrap()
+    SpoolManager::namespace_root_path_for_tests(spool_dir, &test_owner_spec("node-a")).unwrap()
+}
+
+fn default_test_owner_tag() -> String {
+    SpoolManager::owner_tag_of_spec_for_tests(&test_owner_spec("node-a"))
+}
+
+/// Durable spool file name for the default test owner.
+fn owned_data_name(ulid: &str) -> String {
+    format!("{ulid}.{}.ndjson", default_test_owner_tag())
 }
 
 fn find_spool_namespace_root(spool_dir: &Path) -> Option<std::path::PathBuf> {
@@ -1084,13 +1108,13 @@ fn disk_owned_bytes(root: &Path) -> u64 {
             if name == "spool.meta.json" {
                 continue;
             }
+            let is_temp = name.ends_with(".tmp")
+                && (name.contains(".write-")
+                    || name.ends_with(".ndjson.tmp")
+                    || name.ends_with(".ndjson.zst.tmp")
+                    || name.ends_with(".rejected.meta.tmp"));
             let owned = name.ends_with(".inflight")
-                || name.ends_with(".ndjson.tmp")
-                || name.ends_with(".ndjson.zst.tmp")
-                || (name.contains(".ndjson.g") && name.ends_with(".tmp"))
-                || (name.contains(".ndjson.zst.g") && name.ends_with(".tmp"))
-                || name.ends_with(".ndjson.rejected.meta.tmp")
-                || name.ends_with(".ndjson.zst.rejected.meta.tmp")
+                || is_temp
                 || name.ends_with(".ndjson.corrupt")
                 || name.ends_with(".ndjson.zst.corrupt")
                 || name.ends_with(".ndjson.rejected.meta")
@@ -1640,7 +1664,8 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let corrupt_dir = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&corrupt_dir).unwrap();
-    let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson");
+    let corrupt_name = owned_data_name("00000000000000000000000000");
+    let corrupt = corrupt_dir.join(&corrupt_name);
     fs::write(&corrupt, [0xff, 0xfe, 0xfd]).unwrap();
     let valid = spool.write_events(&[sample_event("evt-good")]).unwrap();
 
@@ -1654,9 +1679,9 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
     );
     assert!(
         corrupt
-            .with_file_name("00000000000000000000000000.ndjson.corrupt")
+            .with_file_name(format!("{corrupt_name}.corrupt"))
             .exists(),
-        "corrupt spool file should be quarantined"
+        "corrupt spool file should be quarantined under its durable data name"
     );
     let requests = wait_for_requests(&server, 1).await;
     assert_eq!(requests.len(), 1);
@@ -1880,7 +1905,7 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
             let events = emit_acc
                 .compute_deltas(&emit_cfg, "node-a", snap as i64, &format!("stress-{snap}"))
                 .expect("delta arithmetic must stay finite under stress");
-            let calls: u64 = events.iter().map(|event| u64::from(event.call_count)).sum();
+            let calls: u64 = events.iter().map(|event| event.call_count).sum();
             emit_calls.fetch_add(calls, Ordering::Relaxed);
             emit_iterations.fetch_add(1, Ordering::Relaxed);
         }
@@ -1909,10 +1934,7 @@ fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
     let final_events = accumulator
         .compute_deltas(&config, "node-a", 9_999, "stress-final")
         .expect("final delta");
-    let final_calls: u64 = final_events
-        .iter()
-        .map(|event| u64::from(event.call_count))
-        .sum();
+    let final_calls: u64 = final_events.iter().map(|event| event.call_count).sum();
     emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
 
     let recorded = recorded_calls.load(Ordering::Relaxed);
@@ -2185,8 +2207,8 @@ fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
     assert_eq!(classify_clickhouse_http_status_for_tests(200), "delivered");
     assert_eq!(classify_clickhouse_http_status_for_tests(204), "delivered");
     assert_eq!(classify_clickhouse_http_status_for_tests(400), "permanent");
-    assert_eq!(classify_clickhouse_http_status_for_tests(401), "permanent");
-    assert_eq!(classify_clickhouse_http_status_for_tests(403), "permanent");
+    assert_eq!(classify_clickhouse_http_status_for_tests(401), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(403), "retryable");
     assert_eq!(classify_clickhouse_http_status_for_tests(408), "retryable");
     assert_eq!(
         classify_clickhouse_http_status_for_tests(413),
@@ -2455,28 +2477,8 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
 }
 
 #[tokio::test]
-async fn replay_dead_letters_permanent_401_and_403() {
-    for status in [401u16, 403u16] {
-        let server = MockServer::start().await;
-        mount_status_sequence(&server, &[status]).await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let spool = test_spool(&temp);
-        let path = spool
-            .write_events(&[sample_event(&format!("evt-{status}"))])
-            .unwrap();
-
-        replay_spool_once_for_tests(&spool, &server.uri())
-            .await
-            .unwrap();
-
-        assert_rejected_sidecar(&path, status, "permanent_http");
-    }
-}
-
-#[tokio::test]
-async fn replay_stops_on_retryable_redirect_408_429_and_5xx_without_removing_file() {
-    for status in [302u16, 408u16, 429u16, 500u16, 503u16] {
+async fn replay_stops_on_retryable_redirect_auth_408_429_and_5xx_without_removing_file() {
+    for status in [302u16, 401u16, 403u16, 408u16, 429u16, 500u16, 503u16] {
         let server = MockServer::start().await;
         mount_status_sequence(&server, &[status]).await;
 
@@ -2851,66 +2853,169 @@ fn spool_path_component_rejects_or_encodes_escape_forms() {
 }
 
 #[test]
-fn spool_namespaces_partition_by_plugin_and_destination() {
+fn hostile_node_ids_stay_inside_the_configured_spool_root() {
     let temp = tempfile::tempdir().unwrap();
-    let settings = SpoolSettings {
-        enabled: true,
-        dir: temp.path().to_path_buf(),
-        max_bytes: 1024 * 1024,
-        replay_interval_secs: 60,
-        delivery_queue_capacity: 4096,
-        compression: SpoolCompression::None,
+    let hostile = [
+        "../../escape",
+        "/etc",
+        "C:\\Windows\\Temp",
+        "\\\\server\\share",
+        "//?/C:/x",
+    ];
+    for node_id in hostile {
+        let settings = spool_settings(temp.path(), 1024 * 1024);
+        let spool = SpoolManager::for_tests(settings, node_id)
+            .unwrap_or_else(|err| panic!("hostile node id {node_id:?} must be encoded: {err}"));
+        let root = spool.namespace_root_for_tests().to_path_buf();
+        assert!(
+            root.starts_with(temp.path()),
+            "namespace {} escaped {}",
+            root.display(),
+            temp.path().display()
+        );
+        let written = spool.write_events(&[sample_event("evt-node")]).unwrap();
+        assert!(written.starts_with(temp.path()));
+        let relative = root.strip_prefix(temp.path()).unwrap();
+        for component in relative.components() {
+            let text = component.as_os_str().to_string_lossy().to_string();
+            assert!(!text.contains('/'), "component leaked a separator: {text}");
+            assert!(!text.contains('\\'), "component leaked a separator: {text}");
+            assert_ne!(text, "..", "component escaped the root");
+        }
+    }
+}
+
+#[test]
+fn sibling_instances_never_share_a_spool_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let sink_a = SpoolOwnerSpec {
+        node_id: "node-a",
+        plugin_config_id: "plugin-a",
+        ferrum_namespace: "tenant-a",
+        destination_endpoint: "http://ch-a:8123",
+        database: "ledger_a",
+        table: "charges_a",
     };
-    let a = SpoolManager::for_tests_with_identity(
-        settings.clone(),
-        "node-a",
-        "plugin-a",
-        "http://ch-a:8123",
-        "ferrum",
-        "charges_a",
-        1,
-    )
-    .unwrap();
-    let b = SpoolManager::for_tests_with_identity(
-        settings,
-        "node-a",
-        "plugin-b",
-        "http://ch-b:8123",
-        "ferrum",
-        "charges_b",
-        2,
-    )
-    .unwrap();
-    let path_a = a.write_events(&[sample_event("evt-a")]).unwrap();
-    let path_b = b.write_events(&[sample_event("evt-b")]).unwrap();
+    let sink_b = SpoolOwnerSpec {
+        node_id: "node-a",
+        plugin_config_id: "plugin-b",
+        ferrum_namespace: "tenant-b",
+        destination_endpoint: "http://ch-b:8123",
+        database: "ledger_b",
+        table: "charges_b",
+    };
+    let settings_a = spool_settings(temp.path(), 1024 * 1024);
+    let settings_b = spool_settings(temp.path(), 1024 * 1024);
+    let a = SpoolManager::for_tests_with_owner(settings_a, &sink_a, 1).unwrap();
+    let b = SpoolManager::for_tests_with_owner(settings_b, &sink_b, 2).unwrap();
+
     assert_ne!(
         a.namespace_root_for_tests(),
         b.namespace_root_for_tests(),
-        "distinct plugin/destination identities must not share a namespace"
+        "distinct plugin/ledger/destination identities must not share a namespace"
     );
+    assert_ne!(a.owner_tag_for_tests(), b.owner_tag_for_tests());
+
+    let path_a = a.write_events(&[sample_event("evt-a")]).unwrap();
+    let path_b = b.write_events(&[sample_event("evt-b")]).unwrap();
     assert!(path_a.starts_with(a.namespace_root_for_tests()));
     assert!(path_b.starts_with(b.namespace_root_for_tests()));
-    assert!(
-        !path_a.starts_with(b.namespace_root_for_tests()),
-        "sink B must not own sink A files"
-    );
 
-    // Replay metadata validation: B must refuse A's namespace files even if planted.
-    let foreign = b.namespace_root_for_tests().join("20260524");
-    fs::create_dir_all(&foreign).unwrap();
-    let planted = foreign.join("00000000000000000000000000.ndjson");
-    fs::copy(&path_a, &planted).unwrap();
-    // Swap meta to A's identity under B's root should fail closed on list/replay.
-    let meta_path = b.namespace_root_for_tests().join("spool.meta.json");
-    let mut meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-    meta["plugin_config_id"] = json!("plugin-a");
+    // Neither instance can see, replay, or evict the other's records.
+    let replayable_a = a.list_replayable_spool_files_for_tests().unwrap();
+    let replayable_b = b.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable_a, vec![path_a.clone()]);
+    assert_eq!(replayable_b, vec![path_b.clone()]);
+    assert!(path_a.exists());
+    assert!(path_b.exists());
+}
+
+#[test]
+fn only_the_ferrum_namespace_differing_still_partitions_the_spool() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ledger_a = test_owner_spec("node-a");
+    ledger_a.ferrum_namespace = "tenant-a";
+    let mut ledger_b = test_owner_spec("node-a");
+    ledger_b.ferrum_namespace = "tenant-b";
+
+    let root_a = SpoolManager::namespace_root_path_for_tests(temp.path(), &ledger_a).unwrap();
+    let root_b = SpoolManager::namespace_root_path_for_tests(temp.path(), &ledger_b).unwrap();
+    assert_ne!(
+        root_a, root_b,
+        "two ledgers on one node/plugin/destination must not share a namespace"
+    );
+    let tag_a = SpoolManager::owner_tag_of_spec_for_tests(&ledger_a);
+    let tag_b = SpoolManager::owner_tag_of_spec_for_tests(&ledger_b);
+    assert_ne!(tag_a, tag_b, "per-file owner tags must differ per ledger");
+}
+
+#[test]
+fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-owned")]).unwrap();
+
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let raw = fs::read_to_string(&meta_path).unwrap();
+    let mut meta: Value = serde_json::from_str(&raw).unwrap();
+    meta["table"] = json!("someone_elses_table");
     fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-    let err = b
+
+    let err = spool
         .list_replayable_spool_files_for_tests()
-        .expect_err("mismatched namespace metadata must fail closed");
+        .expect_err("mismatched ownership metadata must fail closed");
     assert!(
         err.contains("does not match this sink identity"),
         "unexpected error: {err}"
+    );
+    assert!(
+        record.exists(),
+        "a failed ownership check must never delete billing records"
+    );
+
+    // Restoring the record makes replay listing work again.
+    fs::write(&meta_path, raw).unwrap();
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable, vec![record]);
+}
+
+#[test]
+fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-own");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+
+    // A record carrying a different owner tag, planted inside our namespace.
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let foreign = day.join("00000000000000000000000000.0123456789abcdef.ndjson");
+    fs::write(&foreign, vec![b'x'; encoded_len as usize]).unwrap();
+
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a foreign-owned record must never enter the replay set"
+    );
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.contains(&foreign),
+        "a foreign-owned record still counts toward the quota"
+    );
+
+    // Quota pressure must fail closed rather than delete another owner's data.
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("eviction must not be able to reclaim another owner's bytes");
+    assert!(
+        err.contains("owned by another identity"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        foreign.exists(),
+        "a foreign-owned record must survive quota pressure"
     );
 }
 
@@ -2921,14 +3026,7 @@ fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
     let outside_file = outside.path().join("secret.ndjson");
     fs::write(&outside_file, b"{\"event_id\":\"leaked\"}\n").unwrap();
 
-    let settings = SpoolSettings {
-        enabled: true,
-        dir: temp.path().to_path_buf(),
-        max_bytes: 1024 * 1024,
-        replay_interval_secs: 60,
-        delivery_queue_capacity: 4096,
-        compression: SpoolCompression::None,
-    };
+    let settings = spool_settings(temp.path(), 1024 * 1024);
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
     let link = spool.namespace_root_for_tests().join("escape-link");
     #[cfg(unix)]
@@ -2937,8 +3035,9 @@ fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
     std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
 
     let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
     assert!(
-        owned.iter().all(|path| path.starts_with(spool.namespace_root_for_tests())),
+        owned.iter().all(|path| path.starts_with(&root)),
         "owned listing must stay inside the managed namespace"
     );
     assert!(
@@ -2947,56 +3046,112 @@ fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
     );
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert!(replayable.is_empty());
+    assert!(
+        outside_file.exists(),
+        "maintenance must never delete through a symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn spool_scan_survives_directory_cycles_and_bounds_depth() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
+
+    // Self-referential loop: the walk must terminate instead of recursing.
+    let loop_dir = root.join("20260524");
+    fs::create_dir_all(&loop_dir).unwrap();
+    std::os::unix::fs::symlink(&root, loop_dir.join("loop")).unwrap();
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(owned.iter().all(|path| path.starts_with(&root)));
+
+    // Depth beyond the traversal bound is reported, never followed silently.
+    let mut deep = root.clone();
+    for index in 0..12 {
+        deep = deep.join(format!("d{index}"));
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let record = deep.join(owned_data_name("00000000000000000000000009"));
+    fs::write(&record, b"{}\n").unwrap();
+    let err = spool
+        .list_owned_spool_files_for_tests()
+        .expect_err("traversal beyond the depth bound must fail closed");
+    assert!(err.contains("max depth"), "unexpected error: {err}");
 }
 
 #[test]
-fn reload_generation_does_not_delete_active_temp_of_live_peer() {
+fn reload_generation_does_not_delete_a_live_peer_temp() {
     let temp = tempfile::tempdir().unwrap();
-    let settings = SpoolSettings {
-        enabled: true,
-        dir: temp.path().to_path_buf(),
-        max_bytes: 1024 * 1024,
-        replay_interval_secs: 60,
-        delivery_queue_capacity: 4096,
-        compression: SpoolCompression::None,
-    };
-    let gen1 = Arc::new(
-        SpoolManager::for_tests_with_identity(
-            settings.clone(),
-            "node-a",
-            "plugin-race",
-            "http://127.0.0.1:8123",
-            "ferrum",
-            "charges_raw",
-            11,
-        )
-        .unwrap(),
-    );
+    let spec = test_owner_spec("node-a");
+    let gen1 =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 11).unwrap();
+
     let day = gen1.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let active_tmp = day.join("01ARZ3NDEKTSV4RRFFQ69G5FAV.ndjson.g11.tmp");
+    let final_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    let active_tmp = gen1.write_temp_path_for_tests(&final_path).unwrap();
     fs::write(&active_tmp, b"partial").unwrap();
-    gen1.set_active_write_tmp_for_tests(Some(active_tmp.clone()))
-        .unwrap();
+    // Model generation 11 mid-write: its temp path is leased for this process.
+    let lease = SpoolManager::hold_live_spool_path_for_tests(&active_tmp);
 
-    let gen2 = SpoolManager::for_tests_with_identity(
-        settings,
-        "node-a",
-        "plugin-race",
-        "http://127.0.0.1:8123",
-        "ferrum",
-        "charges_raw",
-        12,
-    )
-    .unwrap();
-    gen2.prepare_live_storage_for_tests().unwrap();
+    // A replacement generation runs first-prepare reconciliation while the older
+    // accepted generation is still mid-write.
+    let gen2 =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 12).unwrap();
     assert!(
         active_tmp.exists(),
-        "replacement generation must not delete another live generation's active temp"
+        "a replacement generation must not unlink a live peer's active temp"
     );
-    gen1.set_active_write_tmp_for_tests(None).unwrap();
     drop(gen2);
+
+    // Once the writer releases the lease, a later generation reconciles it.
+    drop(lease);
     drop(gen1);
+    let gen3 =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 13).unwrap();
+    assert!(
+        !active_tmp.exists(),
+        "an abandoned same-process temp must be reconciled once no writer holds it"
+    );
+    drop(gen3);
+}
+
+#[test]
+fn peer_process_temp_is_quota_owned_and_never_a_replay_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    // A peer process's in-progress temp: a different process tag.
+    let peer_tmp = day.join(format!(
+        "{}.write-deadbeef-7.tmp",
+        owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FAW")
+    ));
+    fs::write(&peer_tmp, b"peer-partial").unwrap();
+
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.contains(&peer_tmp),
+        "a peer temp still counts toward the quota"
+    );
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "an in-progress temp is never a replay candidate"
+    );
+
+    // Test managers use a zero stale age, so a later generation's first prepare
+    // reconciles the foreign temp instead of leaving it forever.
+    let next = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    assert!(
+        !peer_tmp.exists(),
+        "a stale peer temp is reconciled once past the stale age"
+    );
+    drop(next);
 }
 
 #[test]
@@ -3004,97 +3159,253 @@ fn atomic_spool_write_fault_injection_surfaces_before_success() {
     let temp = tempfile::tempdir().unwrap();
     let final_path = temp.path().join("batch.ndjson");
     let tmp_path = temp.path().join("batch.ndjson.tmp");
-    for fault in [
-        SpoolFsFault::FileSync,
-        SpoolFsFault::Rename,
-        SpoolFsFault::DirOpen,
-        SpoolFsFault::DirSync,
-    ] {
+    let mut faults = vec![SpoolFsFault::FileSync, SpoolFsFault::Rename];
+    if cfg!(unix) {
+        faults.push(SpoolFsFault::DirOpen);
+        faults.push(SpoolFsFault::DirSync);
+    }
+    for fault in faults {
         let _ = fs::remove_file(&tmp_path);
         let _ = fs::remove_file(&final_path);
-        set_spool_fs_fault_for_tests(fault);
-        let err = write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n")
-            .expect_err("injected fault must fail the durable write");
-        clear_spool_fs_fault_for_tests();
+        let err = write_private_file_atomically_with_fault_for_tests(
+            &tmp_path,
+            &final_path,
+            b"{\"ok\":true}\n",
+            fault,
+        )
+        .expect_err("an injected durable-write fault must fail the write");
         assert!(
-            err.contains("injected failure") || err.contains("failed to"),
+            err.contains("injected fault"),
             "unexpected error for {fault:?}: {err}"
         );
-        assert!(!final_path.exists(), "faulted write must not publish {fault:?}");
+        assert!(
+            !final_path.exists(),
+            "a faulted write must not publish for {fault:?}"
+        );
         assert!(
             !tmp_path.exists(),
-            "faulted write must clean leftover temp for {fault:?}"
+            "a faulted write must clean its temp for {fault:?}"
         );
     }
+    // The unfaulted path still publishes durably.
+    write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n").unwrap();
+    assert!(final_path.exists());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_inflight_claim_survives_eviction_for_retryable_and_recovers() {
-    let server = MockServer::start().await;
-    mount_status_sequence(&server, &[503]).await;
-
+#[test]
+fn injected_file_sync_failure_keeps_the_spool_batch_uncommitted() {
     let temp = tempfile::tempdir().unwrap();
-    let probe = sample_event("evt-00");
-    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
-    let settings = SpoolSettings {
-        enabled: true,
-        dir: temp.path().to_path_buf(),
-        max_bytes: encoded_len.saturating_mul(2),
-        replay_interval_secs: 60,
-        delivery_queue_capacity: 4096,
-        compression: SpoolCompression::None,
-    };
-    let spool = Arc::new(SpoolManager::for_tests(settings, "node-a").unwrap());
-    let oldest = spool.write_events(&[sample_event("evt-old")]).unwrap();
-    let newer = spool.write_events(&[sample_event("evt-new")]).unwrap();
-    assert!(oldest.exists());
-    assert!(newer.exists());
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 21, SpoolFsFault::FileSync)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-not-durable")])
+        .expect_err("a failed durable handoff must be reported to the caller");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
 
-    let claimed = spool.claim_replay_file_for_tests(&oldest).unwrap();
-    assert!(claimed.exists());
-    assert!(!oldest.exists());
-    assert!(
-        claimed
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap()
-            .ends_with(".inflight")
+    let root = default_test_namespace_root(temp.path());
+    assert_eq!(
+        disk_owned_bytes(&root),
+        0,
+        "a write that reported failure must leave no committed or leftover bytes"
     );
+    let replayable = faulted.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a failed write must not publish a replay candidate"
+    );
+}
 
-    // Quota pressure while the oldest file is claimed must not delete it.
-    let overflow = spool
-        .write_events(&[sample_event("evt-overflow")])
-        .unwrap();
-    assert!(
-        claimed.exists(),
-        "in-flight claim must be excluded from eviction"
+#[test]
+fn injected_rename_failure_keeps_the_spool_batch_uncommitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 23, SpoolFsFault::Rename)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-no-rename")])
+        .expect_err("a failed rename must be reported to the caller");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "a failed rename must leave no committed or leftover bytes"
     );
-    assert!(
-        !newer.exists() || overflow.exists(),
-        "eviction may drop a non-inflight owned file under pressure"
-    );
+}
 
-    let err = replay_spool_once_for_tests(&spool, &server.uri())
-        .await
-        .expect_err("503 must remain retryable");
-    assert!(err.contains("503") || err.to_lowercase().contains("retry") || !err.is_empty());
-
-    // Crash-recovery path: leave an inflight, drop manager state via prepare.
-    let recovered_src = spool.write_events(&[sample_event("evt-recover")]).unwrap();
-    let recovered_inflight = spool.claim_replay_file_for_tests(&recovered_src).unwrap();
-    spool.prepare_live_storage_for_tests().unwrap();
-    assert!(
-        !recovered_inflight.exists(),
-        "prepare must recover inflight files"
+#[cfg(unix)]
+#[test]
+fn injected_directory_open_failure_rolls_back_the_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 24, SpoolFsFault::DirOpen)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-dir-open")])
+        .expect_err("a directory-open failure must not be reported as a durable commit");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "an unpersisted rename must be rolled back, not left as a phantom batch"
     );
-    assert!(
-        recovered_src.exists(),
-        "recovered inflight must return to the durable replayable name"
+}
+
+#[cfg(unix)]
+#[test]
+fn injected_directory_sync_failure_rolls_back_the_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 22, SpoolFsFault::DirSync)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-dir-sync")])
+        .expect_err("a directory-sync failure must not be reported as a durable commit");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "an unpersisted rename must be rolled back, not left as a phantom batch"
     );
 }
 
 #[tokio::test]
-async fn replay_inflight_delivered_and_permanent_outcomes() {
+async fn replay_claim_is_excluded_from_eviction_and_released_on_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[503]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let probe = sample_event("evt-old");
+    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let oldest = spool.write_events(std::slice::from_ref(&probe)).unwrap();
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&oldest)
+        .unwrap()
+        .expect("an uncontended claim must succeed");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    assert!(claim_path.exists());
+    assert!(!oldest.exists());
+    let claim_name = claim_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_string();
+    assert!(claim_name.ends_with(".inflight"));
+
+    // Quota pressure while the file is claimed must fail closed, never evict it.
+    let err = spool
+        .write_events(&[sample_event("evt-new")])
+        .expect_err("an in-flight claim is never an eviction candidate");
+    assert!(err.contains("in-flight"), "unexpected error: {err}");
+    assert!(claim_path.exists(), "in-flight claim must survive eviction");
+    drop(claim);
+
+    // Retryable delivery releases the claim back to a durable replayable name.
+    let released = spool.release_inflight_file_for_tests(&claim_path).unwrap();
+    assert_eq!(released.as_deref(), Some(oldest.as_path()));
+    assert!(oldest.exists());
+    assert!(!claim_path.exists());
+
+    let err = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("503 must remain retryable");
+    assert!(!err.is_empty());
+    assert!(
+        oldest.exists(),
+        "a retryable failure must leave the record durable and replayable"
+    );
+}
+
+#[test]
+fn contended_claim_returns_none_instead_of_stealing() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let old_gen =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 31).unwrap();
+    let new_gen =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 32).unwrap();
+
+    let record = old_gen.write_events(&[sample_event("evt-handoff")]).unwrap();
+    // Both accepted generations see the same candidate.
+    assert_eq!(
+        old_gen.list_replayable_spool_files_for_tests().unwrap(),
+        new_gen.list_replayable_spool_files_for_tests().unwrap()
+    );
+
+    let winner = old_gen
+        .hold_replay_claim_for_tests(&record)
+        .unwrap()
+        .expect("the first claimer wins");
+    let loser = new_gen.hold_replay_claim_for_tests(&record).unwrap();
+    assert!(
+        loser.is_none(),
+        "a second accepted generation must not be able to claim the same file"
+    );
+
+    // The winner's live claim survives the peer generation's maintenance.
+    new_gen.prepare_live_storage_for_tests().unwrap();
+    let claim_path = winner.claim_path_for_tests().to_path_buf();
+    assert!(
+        claim_path.exists(),
+        "peer maintenance must not reclaim a live claim"
+    );
+
+    // After the winner disappears, the peer recovers the record for delivery.
+    drop(winner);
+    new_gen.prepare_live_storage_for_tests().unwrap();
+    assert!(!claim_path.exists(), "an orphaned claim must be recovered");
+    assert_eq!(
+        new_gen.list_replayable_spool_files_for_tests().unwrap(),
+        vec![record],
+        "safe handoff returns the record to the surviving generation"
+    );
+}
+
+#[test]
+fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let live_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB1");
+    let expired_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB2");
+    // 2100-01-01T00:00:00Z, comfortably beyond any test clock.
+    let far_future = 4_102_444_800i64;
+    let live_claim = day.join(format!("{live_name}.claim-deadbeef-9-{far_future}.inflight"));
+    let expired_claim = day.join(format!("{expired_name}.claim-deadbeef-9-1.inflight"));
+    fs::write(&live_claim, b"{}\n").unwrap();
+    fs::write(&expired_claim, b"{}\n").unwrap();
+
+    spool.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        live_claim.exists(),
+        "a peer process's unexpired lease must not be reclaimed"
+    );
+    assert!(
+        !expired_claim.exists(),
+        "an expired peer lease must be recovered"
+    );
+    assert!(
+        day.join(&expired_name).exists(),
+        "recovery restores the durable replayable name"
+    );
+}
+
+#[tokio::test]
+async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
 
@@ -3107,7 +3418,12 @@ async fn replay_inflight_delivered_and_permanent_outcomes() {
     replay_spool_once_for_tests(&spool, &server_ok.uri())
         .await
         .unwrap();
-    assert!(!delivered.exists(), "delivered claim must be removed");
+    assert!(!delivered.exists(), "a delivered claim must be removed");
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.is_empty(),
+        "a delivered replay must leave no claim behind: {owned:?}"
+    );
 
     let server_perm = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3119,4 +3435,876 @@ async fn replay_inflight_delivered_and_permanent_outcomes() {
         .await
         .unwrap();
     assert_rejected_sidecar(&poison, 400, "permanent_http");
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a permanently rejected record must leave the replay set"
+    );
+}
+
+#[test]
+fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
+    let plugin_dir = root.parent().unwrap().to_path_buf();
+    let node_dir = plugin_dir.parent().unwrap().to_path_buf();
+
+    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/<ULID>.ndjson`.
+    let legacy_day = node_dir.join("20260101");
+    fs::create_dir_all(&legacy_day).unwrap();
+    let legacy = legacy_day.join("00000000000000000000000000.ndjson");
+    fs::write(&legacy, b"{\"event_id\":\"legacy\"}\n").unwrap();
+
+    // A namespace orphaned by a destination change.
+    let orphan_ns = plugin_dir.join("o00000000000000000000000000000000");
+    let orphan_day = orphan_ns.join("20260102");
+    fs::create_dir_all(&orphan_day).unwrap();
+    let orphan = orphan_day.join("00000000000000000000000001.ndjson");
+    fs::write(&orphan, b"{\"event_id\":\"old-destination\"}\n").unwrap();
+
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let (files, namespaces) = spool.unbound_record_counts_for_tests();
+    assert_eq!(files, 2, "both unbound records must be reported");
+    assert_eq!(namespaces, 1, "the orphaned namespace must be reported");
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "unbound records must never be replayed to the newly configured destination"
+    );
+
+    // Writing under the new identity leaves the unbound records untouched.
+    spool.write_events(&[sample_event("evt-new")]).unwrap();
+    assert!(legacy.exists(), "legacy records must never be deleted");
+    assert!(orphan.exists(), "orphaned records must never be deleted");
+}
+
+#[test]
+fn destination_change_moves_to_a_fresh_namespace_without_rerouting() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut before = test_owner_spec("node-a");
+    before.table = "charges_v1";
+    let mut after = test_owner_spec("node-a");
+    after.table = "charges_v2";
+
+    let old =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &before, 1).unwrap();
+    let stranded = old.write_events(&[sample_event("evt-v1")]).unwrap();
+    drop(old);
+
+    let new =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &after, 2).unwrap();
+    assert!(
+        !stranded.starts_with(new.namespace_root_for_tests()),
+        "a destination change must move to a fresh managed namespace"
+    );
+    let replayable = new.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "records for the previous destination must not be replayed to the new one"
+    );
+    let (files, namespaces) = new.unbound_record_counts_for_tests();
+    assert_eq!(files, 1);
+    assert_eq!(namespaces, 1);
+    assert!(
+        stranded.exists(),
+        "the stranded record is retained for the operator"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn staged_and_rejected_generations_never_touch_the_spool() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+
+    // Stage a candidate without committing it: nothing may be created on disk.
+    let staged = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    staged.start_background_tasks().unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let entries: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "a staged, never-accepted generation must not create spool state: {entries:?}"
+    );
+    assert!(
+        !staged.owns_active_sink(),
+        "staging must not publish an accepted sink"
+    );
+
+    // Dropping without commit models a rejected plugin-cache generation.
+    drop(staged);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        after.is_empty(),
+        "a rejected generation must leave no spool side effects: {after:?}"
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "a rejected generation must never deliver externally"
+    );
+}
+
+#[test]
+fn snapshot_call_count_preserves_values_above_u32_max() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.seed_call_count_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        u32::MAX as u64,
+    );
+    let at_max = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-u32-max")
+        .unwrap();
+    assert_eq!(at_max.len(), 1);
+    assert_eq!(at_max[0].call_count, u32::MAX as u64);
+
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.seed_call_count_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        (u32::MAX as u64) + 1,
+    );
+    let above = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-u32-plus-one")
+        .unwrap();
+    assert_eq!(above.len(), 1);
+    assert_eq!(above[0].call_count, (u32::MAX as u64) + 1);
+
+    let encoded = serialize_json_each_row(&above).unwrap();
+    assert!(
+        encoded.contains(&format!("\"call_count\":{}", (u32::MAX as u64) + 1)),
+        "JSONEachRow must serialize lossless u64 call_count: {encoded}"
+    );
+}
+
+#[test]
+fn snapshot_cleanup_preserves_pending_unemitted_totals() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    // First-tick / never-emitted: TTL zero must not discard pending totals.
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 0);
+    let first = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-pending")
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].call_count, 1);
+
+    // After durable baseline commit, idle cleanup may remove the entry.
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 1);
+}
+
+#[test]
+fn snapshot_cleanup_preserves_pending_during_spool_outage_baseline() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    let _ = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-1")
+        .unwrap();
+    // Additional charge after baseline: simulates failed spool leaving baseline
+    // unadvanced while traffic stops.
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    assert_eq!(
+        accumulator.cleanup_stale_for_tests(0),
+        0,
+        "pending delta above durable baseline must survive stale cleanup"
+    );
+    let second = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].call_count, 1);
+}
+
+#[test]
+fn config_validation_rejects_stale_ttl_shorter_than_snapshot_interval() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["mode"] = json!("snapshot");
+    config["snapshot"] = json!({
+        "interval_secs": 300,
+        "cleanup_interval_secs": 1,
+        "stale_entry_ttl_secs": 2
+    });
+    let err = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("ttl shorter than interval must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("stale_entry_ttl_secs must be >= snapshot.interval_secs"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimensions() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 10 * 1024 * 1024,
+        replay_interval_secs: 3600,
+        delivery_queue_capacity: 128,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let accumulator = SnapshotAccumulator::with_limits(1, 16 * 1024 * 1024);
+    let charge = unit_call_charge(0.01);
+
+    // Occupy the sole accumulator slot with an HTTP identity.
+    accumulator.record_for_test("ferrum", "alice", "proxy-http", "HTTP", 200, "http", charge);
+    assert_eq!(accumulator.entry_count(), 1);
+
+    // Additional distinct identities must not expand cardinality.
+    accumulator.record_for_test(
+        "ferrum",
+        "bob",
+        "proxy-http-2",
+        "HTTP2",
+        200,
+        "http",
+        charge,
+    );
+    assert_eq!(
+        accumulator.entry_count(),
+        1,
+        "hard max_entries must reject new identities into the map"
+    );
+
+    // Durable overflow staging preserves the billable event without merging.
+    let overflow = sample_event("overflow-http");
+    assert!(accumulator.stage_overflow_event_for_tests(overflow.clone()));
+    spool.write_events(&[overflow]).unwrap();
+    let files = spool.scan_stats().unwrap();
+    assert!(files.files >= 1, "overflow must be durably spooled");
+
+    // Stream and websocket dimensions stay distinct when under budget.
+    let config = snapshot_test_config();
+    let wide = SnapshotAccumulator::with_limits(10, 16 * 1024 * 1024);
+    wide.record_for_test("ferrum", "s1", "proxy-s", "Stream", 0, "tcp", charge);
+    wide.record_for_test("ferrum", "w1", "proxy-w", "WS", 0, "ws", charge);
+    let mut events = wide
+        .compute_deltas(&config, "node-a", 100, "snap-dims")
+        .unwrap();
+    events.sort_by(|a, b| a.protocol.cmp(&b.protocol));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].protocol, "tcp");
+    assert_eq!(events[1].protocol, "ws");
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn repeated_reload_under_permanent_spool_failure_bounds_full_generations() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_finalize_snapshot_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    // Point spool at a path that cannot accept durable writes after commit by
+    // using a regular file where a directory is required.
+    let blocked = temp.path().join("not-a-dir");
+    fs::write(&blocked, b"blocked").unwrap();
+
+    let mut plugins = Vec::new();
+    for idx in 0..4 {
+        let mut config = valid_config(temp.path());
+        config["mode"] = json!("snapshot");
+        config["spool"]["dir"] = json!(blocked.to_string_lossy());
+        config["snapshot"] = json!({
+            "interval_secs": 30,
+            "cleanup_interval_secs": 300,
+            "stale_entry_ttl_secs": 3600,
+            "max_entries": 1000,
+            "max_retained_bytes": 1_048_576
+        });
+        config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+        // Unique plugin-config ids so each activation is a distinct generation.
+        let plugin = ApiChargebackSink::new_with_config_id(
+            &config,
+            PluginHttpClient::default(),
+            "ferrum",
+            Some(&format!("cfg-{idx}")),
+        );
+        // Construction is shape-only; live spool prepare happens at start.
+        match plugin {
+            Ok(plugin) => {
+                if plugin.start_background_tasks().is_err() {
+                    // Fail-closed when spool cannot be prepared is acceptable.
+                    continue;
+                }
+                plugin.commit_background_tasks();
+                if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+                    acc.record_for_test(
+                        "ferrum",
+                        "alice",
+                        "proxy-a",
+                        "Payments",
+                        200,
+                        "http",
+                        unit_call_charge(0.01),
+                    );
+                }
+                let _ = api_chargeback_sink_finalize_snapshot_for_test(&plugin).await;
+                plugins.push(plugin);
+            }
+            Err(_) => {
+                // Fail-closed admission when pending recovery budget is exhausted
+                // is an acceptable outcome of repeated permanent spool failure.
+            }
+        }
+    }
+
+    let status: Value = serde_json::from_str(&render_status_json()).unwrap();
+    let pending = status["snapshot_finalizations_pending"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        pending <= 64,
+        "pending finalizations must stay count-bounded: {status}"
+    );
+    assert!(
+        status["snapshot_finalization_recovery_policy"]
+            .as_str()
+            .unwrap_or("")
+            .contains("restore_spool_writability"),
+        "status must expose explicit recovery policy: {status}"
+    );
+    assert!(
+        status.get("snapshot_finalizations_pending_bytes").is_some(),
+        "status must expose pending recovery bytes: {status}"
+    );
+    drop(plugins);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compact_recovery_survives_subsequent_full_finalize_after_mapping() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_finalize_snapshot_for_test,
+        api_chargeback_sink_force_compact_snapshot_finalization_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+
+    let mut config = valid_config(temp.path());
+    config["mode"] = json!("snapshot");
+    config["spool"]["dir"] = json!(spool_dir.to_string_lossy());
+    config["snapshot"] = json!({
+        "interval_secs": 30,
+        "cleanup_interval_secs": 300,
+        "stale_entry_ttl_secs": 3600,
+        "max_entries": 1000,
+        "max_retained_bytes": 1_048_576
+    });
+    config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compact-mapping"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        acc.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    // Permanent write failure after admission: replace the spool directory with a
+    // regular file so Compact retries cannot drain recovery state.
+    fs::remove_dir_all(&spool_dir).unwrap();
+    fs::write(&spool_dir, b"blocked").unwrap();
+
+    // Transfer pending deltas to Compact while the Full handle remains alive.
+    assert!(
+        api_chargeback_sink_force_compact_snapshot_finalization_for_test(&plugin),
+        "failed finalization must compact to durable recovery state"
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test(&plugin),
+        Some(true),
+        "Compact recovery must own the generation after mapping"
+    );
+
+    let status_before: Value = serde_json::from_str(&render_status_json()).unwrap();
+    let pending_before = status_before["snapshot_finalizations_pending"]
+        .as_u64()
+        .unwrap_or(0);
+    let bytes_before = status_before["snapshot_finalizations_pending_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        pending_before >= 1 && bytes_before > 0,
+        "compact recovery must remain observable: {status_before}"
+    );
+
+    // A later Full finalize against the cleared accumulator must not unregister
+    // Compact or claim empty success that drops billable recovery state.
+    let _ = api_chargeback_sink_finalize_snapshot_for_test(&plugin).await;
+    assert_eq!(
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test(&plugin),
+        Some(true),
+        "Full finalize after compaction must preserve Compact ownership while spool remains unwritable"
+    );
+
+    let status_after: Value = serde_json::from_str(&render_status_json()).unwrap();
+    assert!(
+        status_after["snapshot_finalizations_pending"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "pending compact recovery must survive Full remapping attempts: {status_after}"
+    );
+    assert!(
+        status_after["snapshot_finalizations_pending_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "compact retained bytes must survive Full remapping attempts: {status_after}"
+    );
+    drop(plugin);
+}
+
+fn snapshot_sink_config(spool_dir: &Path, max_entries: usize) -> Value {
+    let mut config = valid_config(spool_dir);
+    config["mode"] = json!("snapshot");
+    config["spool"]["dir"] = json!(spool_dir.to_string_lossy());
+    config["snapshot"] = json!({
+        "interval_secs": 30,
+        "cleanup_interval_secs": 300,
+        "stale_entry_ttl_secs": 3600,
+        "max_entries": max_entries,
+        "max_retained_bytes": 16_777_216
+    });
+    config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+    config
+}
+
+/// Issue #1: overflow delivery is bounded, owned, non-blocking, and only counts
+/// a durable success after the async worker's blocking write genuinely lands.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_is_nonblocking_and_durably_acknowledged() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Route a cardinality overflow charge through the non-blocking delivery path.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-1")
+    ));
+
+    // Durable-success counters advance only after the worker's blocking write.
+    let mut spooled = 0u64;
+    for _ in 0..200 {
+        let (s, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(rejections, 0, "a writable spool must never record a loss");
+        assert_eq!(
+            pending, 0,
+            "a writable spool must not stage bounded overflow"
+        );
+        if s >= 1 {
+            spooled = s;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        spooled, 1,
+        "overflow charge must be durably spooled via the bounded async worker"
+    );
+    assert!(
+        disk_owned_bytes(&spool_dir) > 0,
+        "durable overflow acknowledgement must leave a spool file on disk"
+    );
+    drop(plugin);
+}
+
+/// Issue #1: when the async spool write fails, the exact overflow event is
+/// re-staged in bounded overflow (not silently lost) and no cardinality loss is
+/// recorded while bounded staging still has room.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async-fallback"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Make every spool write fail by replacing the directory with a file.
+    fs::remove_dir_all(&spool_dir).unwrap();
+    fs::write(&spool_dir, b"blocked").unwrap();
+
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-fallback-1")
+    ));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(
+            spooled, 0,
+            "a failed write must not count a durable success"
+        );
+        assert_eq!(
+            rejections, 0,
+            "bounded staging still has room, so no cardinality loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "a failed async write must re-stage the exact event in bounded overflow"
+    );
+    drop(plugin);
+}
+
+/// A queued overflow owns its recovery payload until durable success. Aborting
+/// an uncommitted delivery worker must re-stage that payload before releasing
+/// lifecycle delivery ownership.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_queue_abort_restages_before_delivery_release() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_abort_spool_delivery_for_test,
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-abort-recovery"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+
+    // Leave the worker behind its commit gate so the event is certainly queued
+    // when abort drops the receiver.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-abort-recovery-1")
+    ));
+    assert!(api_chargeback_sink_abort_spool_delivery_for_test(&plugin));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(spooled, 0, "an uncommitted worker cannot spool the event");
+        assert_eq!(
+            rejections, 0,
+            "bounded recovery has room and must not record loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "worker abort must re-stage its queued snapshot overflow payload"
+    );
+    drop(plugin);
+}
+
+/// Issue #2: compaction refuses to clear full-generation state while an
+/// admission guard is held and succeeds on retry once the admitted hook drains.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Seed a pending delta so compaction has real state to transfer.
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        acc.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    let (refused_while_admitted, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(&plugin)
+            .expect("snapshot lifecycle must exist");
+    assert!(
+        refused_while_admitted,
+        "compaction must refuse to clear full state while an admission guard is held"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction must succeed once the admitted hook has drained"
+    );
+    drop(plugin);
+}
+
+#[tokio::test]
+async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-delivery-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        assert!(acc.stage_overflow_event_for_tests(sample_event("delivery-pending")));
+    }
+
+    let (refused_while_delivery, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(&plugin)
+            .expect("snapshot lifecycle");
+    assert!(
+        refused_while_delivery,
+        "compaction must retain Full ownership while a delivery can stage back"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction should succeed after overflow delivery ownership drains"
+    );
+    drop(plugin);
+}
+
+/// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
+/// staging never push the accumulator past its hard entry/byte ceilings, and no
+/// charge is double-counted or silently dropped.
+#[test]
+fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() {
+    const MAX_ENTRIES: usize = 64;
+    // Small enough that the retained-byte ceiling also binds before max_entries.
+    const MAX_BYTES: usize = 8 * 1024;
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4_000;
+    // More distinct identities than the entry ceiling forces overflow, and
+    // reusing them across all threads forces new-key/refresh races on hot keys.
+    const DISTINCT_KEYS: usize = 200;
+
+    let accumulator = Arc::new(SnapshotAccumulator::with_limits(MAX_ENTRIES, MAX_BYTES));
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let accumulated = Arc::new(AtomicU64::new(0));
+    let overflowed = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let acc = Arc::clone(&accumulator);
+        let barrier = Arc::clone(&barrier);
+        let accumulated = Arc::clone(&accumulated);
+        let overflowed = Arc::clone(&overflowed);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..PER_THREAD {
+                let key = (i + t) % DISTINCT_KEYS;
+                let consumer = format!("consumer-{key}");
+                let accepted = acc.record_accumulated_for_test(
+                    "ferrum",
+                    &consumer,
+                    "proxy",
+                    "Proxy",
+                    200,
+                    "http",
+                    unit_call_charge(0.01),
+                );
+                if accepted {
+                    accumulated.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    overflowed.fetch_add(1, Ordering::Relaxed);
+                }
+                // Race overflow staging against entry admission on the shared
+                // combined byte ceiling from some threads.
+                if t % 2 == 0 && i % 8 == 0 {
+                    let _ =
+                        acc.stage_overflow_event_for_tests(sample_event(&format!("ov-{t}-{i}")));
+                }
+                // Hard ceilings must hold at every observation.
+                assert!(
+                    acc.entry_count() <= MAX_ENTRIES,
+                    "entry count exceeded the hard ceiling"
+                );
+                assert!(
+                    acc.retained_bytes_for_tests() <= MAX_BYTES,
+                    "combined retained bytes exceeded the hard ceiling"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total = (THREADS * PER_THREAD) as u64;
+    let accumulated = accumulated.load(Ordering::Relaxed);
+    let overflowed = overflowed.load(Ordering::Relaxed);
+    assert_eq!(
+        accumulated + overflowed,
+        total,
+        "every record must be accumulated or overflowed exactly once"
+    );
+    assert!(
+        overflowed > 0,
+        "the test must actually exercise the overflow path"
+    );
+    // No double-count and no silent drop: one call per accumulated record means
+    // the summed call_count across live entries must equal the accumulated count.
+    assert_eq!(
+        accumulator.total_call_count_for_tests(),
+        accumulated,
+        "accumulated call_count must equal the accumulated record count"
+    );
+    assert!(accumulator.entry_count() <= MAX_ENTRIES);
+    assert!(accumulator.retained_bytes_for_tests() <= MAX_BYTES);
 }

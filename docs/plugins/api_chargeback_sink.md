@@ -66,9 +66,21 @@ since the last snapshot. Use this when event volume dominates ingest cost and
 aggregate reconciliation is sufficient. Snapshot mode requires
 `spool.enabled: true` because the accumulator advances only after a delta is
 written to the spool; the queue is an additional low-latency delivery attempt,
-not the durability boundary. Idle snapshot keys are evicted after
-`snapshot.stale_entry_ttl_secs` and checked every
-`snapshot.cleanup_interval_secs`.
+not the durability boundary. Idle snapshot keys are eligible for eviction after
+`snapshot.stale_entry_ttl_secs` (which must be `>= snapshot.interval_secs`) and
+are checked every `snapshot.cleanup_interval_secs`, but cleanup never removes a
+key whose current totals still exceed its last durable baseline. Pending or
+never-emitted charges therefore survive first-tick races and prolonged spool
+outages. Hard `snapshot.max_entries` and `snapshot.max_retained_bytes` budgets
+bound accumulator memory; new identities beyond those budgets are spooled as
+per-event rows through the bounded async spool delivery worker (never inline on
+the terminal hook), or staged within the same retained-byte budget for the next
+durable emission, rather than merged into unrelated keys. The overflow-spooled
+counter advances only after the delivery worker's blocking write genuinely
+lands; a full/closed delivery queue or a failed write re-stages the exact event
+within the retained-byte budget. If both durable handoff and bounded staging are
+exhausted, the sink records an explicit cardinality rejection counter instead of
+growing memory without bound.
 
 ### Snapshot concurrency contract
 
@@ -76,12 +88,22 @@ Request-path `record`, periodic delta emission, and stale cleanup share the
 accumulator without a global request-path lock (per-key DashMap shard locking
 only):
 
+- A new identity reserves one entry slot and its estimated retained bytes
+  against the hard `max_entries`/`max_retained_bytes` ceilings (atomic CAS, no
+  global lock) **before** the key is published. Retained bytes are a single
+  combined counter shared with staged overflow, so concurrent identity admission
+  and overflow staging can never exceed the byte ceiling. A losing same-key
+  inserter releases its reservation and refreshes the winner exactly once, so a
+  new-key/refresh race can never pin state above the configured ceilings or
+  double-charge a slot.
 - Each accumulator slot has a stable **generation** (assigned at insert) and a
   **revision** that bumps on every refresh. Stale cleanup may scan candidates
   first, but eviction is a single conditional `remove_if`: the entry is removed
-  only when generation, revision, and `last_seen_at` still match the stale
-  observation. A same-key refresh that races after the stale check wins and
-  remains available for the next snapshot.
+  only when generation, revision, `last_seen_at`, and a zero pending delta
+  (current totals equal the last durable baseline for that generation) still
+  match the stale observation. A same-key refresh that races after the stale
+  check wins and remains available for the next snapshot. Unemitted or
+  uncommitted totals are never TTL-evicted.
 - `last_emitted` baselines are tagged with the entry generation. Cleanup drops a
   baseline only for the generation that was actually evicted, so a concurrent
   reinsert cannot lose a newer baseline. Delta emission ignores a baseline whose
@@ -121,11 +143,25 @@ delta and successful duplicate delivery cannot double-charge it. Repeated
 finalization is idempotent, and record hooks arriving after admission closes
 are ignored.
 
-Spool write failure leaves the generation unfinalized and retains its
-accumulator in the process-wide lifecycle registry. Every later multi-threaded
-reload retries all older retained generations concurrently with the generation
-being retired, and graceful shutdown retries the complete registry. Each retry
-is bounded. The failure is reported through the sink
+Spool write failure leaves the generation unfinalized. After the bounded
+finalization deadline the sink reduces failed generations to a compact recovery
+payload (pending terminal deltas plus a spool handle) instead of retaining the
+full accumulator/runtime indefinitely. Compaction never clears, replaces, or
+unregisters a full generation until admission is closed and every already
+admitted terminal hook has released its guard (`in_flight == 0`); until that
+drain is observed the Full generation is retained untouched and a later
+compaction pass retries, so an in-flight record can never race the accumulator
+clear. Once mapped, Compact owns that
+generation's recovery: later Full finalize/Drop paths must follow the registry
+mapping and must not treat a cleared accumulator as an empty successful
+finalization that unregisters Compact. Every later multi-threaded reload retries
+all older retained full and compact recoveries concurrently with the generation
+being retired, and graceful shutdown retries the complete registry. Pending
+recovery count/bytes and oldest age are exposed on
+`GET /charges/sink/status` and Prometheus, together with an explicit recovery
+policy: restore spool writability; compact recoveries retry on reload/shutdown;
+new snapshot generations fail closed while the pending recovery budget is
+exhausted. The failure is also reported through the sink
 failure/spool-availability metrics and status. Because snapshot mode requires
 the spool, operators should treat an unwritable or exhausted spool as a
 billing-durability incident and restore it before terminating the process.
@@ -188,11 +224,12 @@ clickhouse-client < migrations/clickhouse/0001_charges.sql
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
-`charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
-events are deduplicated before rollup aggregation. Monetary `charge` columns in
-those views are grouped by `currency` and `pricing_version` (in addition to
-namespace/consumer/proxy/time) so mixed-currency or multi-generation sinks never
-produce unitless rollups.
+`charges_raw FINAL`. `call_count` is `UInt64` so snapshot deltas that exceed
+`UInt32` capacity remain lossless. The views trade query cost for correctness:
+duplicate raw events are deduplicated before rollup aggregation. Monetary
+`charge` columns in those views are grouped by `currency` and `pricing_version`
+(in addition to namespace/consumer/proxy/time) so mixed-currency or
+multi-generation sinks never produce unitless rollups.
 
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
@@ -240,6 +277,8 @@ bucket.
       "interval_secs": 30,
       "cleanup_interval_secs": 300,
       "stale_entry_ttl_secs": 3600,
+      "max_entries": 100000,
+      "max_retained_bytes": 67108864,
       "emit_zero_deltas": false
     },
     "pricing_version": "2026-01-rev3",
@@ -285,23 +324,38 @@ handed to the spool (when enabled) instead of being dropped.
 
 ## Spool And Replay
 
-Spool files are written under a **managed namespace** that partitions by stable
-node identity, plugin-config identity, and ClickHouse destination/schema
+Spool files are written under a **managed namespace** owned by exactly one sink
 identity:
 
 ```text
-<spool.dir>/<safe_node>/<plugin_seg>/<dest_seg>/spool.meta.json
-<spool.dir>/<safe_node>/<plugin_seg>/<dest_seg>/<YYYYMMDD>/<ULID>.ndjson.zst
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/spool.meta.json
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst
 ```
 
-`safe_node` / `plugin_seg` are single safe path components derived from
-`FERRUM_NODE_ID` (and the plugin-config id). Absolute paths, parent segments,
-separators, NUL, drive letters, UNC, and Windows device prefixes are rejected or
-hashed so they cannot escape `spool.dir`. `dest_seg` is a hash of the sanitized
-ClickHouse endpoint plus database and table. Versioned `spool.meta.json` is
-persisted at prepare time and validated before every replay listing so one sink
-instance cannot replay, delete, or quarantine another destination's billing
-files.
+### Spool ownership identity
+
+The owner identity is the tuple
+
+`(plugin config id, Ferrum namespace/ledger, sanitized ClickHouse endpoint,
+database, table, node id)`.
+
+`owner_digest` is a domain-separated, length-prefixed SHA-256 over that tuple
+(first 32 hex characters in the path); `owner_tag` is its first 16 hex
+characters and is embedded in **every** managed filename. The endpoint is the
+sanitized `scheme://host:port` form and the ClickHouse password is deliberately
+excluded, so neither the path, the manifest, nor the digest is credential
+derived. `safe_node` and `safe_plugin` stay human-readable when the source value
+is already a safe component; absolute paths, parent segments, separators, NUL,
+drive letters, UNC, and Windows device prefixes are hashed into one safe
+component instead of being joined, and NUL is rejected outright.
+
+Versioned `spool.meta.json` records the whole tuple plus `owner_digest`,
+`owner_tag`, and the format version. It is written at prepare time and validated
+before every replay listing. On mismatch the sink **fails closed**: nothing is
+read, delivered, deleted, dead-lettered, or evicted, `spool.available` goes to
+`false`, and `chargeback_sink_spool_prepare_failures_total` increments. The
+per-file `owner_tag` binds each record individually, so a record moved between
+directories is still attributable and is never replayed by a different owner.
 
 The sink writes failed batches and queue high-water overflow to an async spool
 delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
@@ -309,25 +363,54 @@ terminal hooks only enqueue to that worker; compression, directory scans, writes
 and fsync never run inline on those hooks. Saturation of the delivery queue is
 counted (`chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
-created with private permissions, written as generation-owned `*.g<generation>.tmp`
-temps, fsynced, renamed into place, then directory-fsynced on Unix. A Unix
-parent-directory open/fsync failure is a write failure (the publish is rolled
-back) before any snapshot baseline commit. On platforms that cannot fsync
-directories (notably Windows), successful file sync + rename is the documented
-portability durability boundary—there is no silent “best-effort” success after a
-failed directory sync on Unix.
+created with private permissions, written as process/generation-attributed
+`*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
+directory-fsynced on Unix. A Unix parent-directory open or fsync failure is a
+**write failure**: the publish is rolled back and the error is returned before
+any snapshot baseline commit. On platforms that cannot fsync directories (notably
+Windows) a successful file sync plus rename is the durability boundary this
+plugin can offer, and that limit is stated rather than claimed away — there is no
+silent "best-effort" success after a failed directory sync on Unix.
 
 Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
-and stale-temp cleanup use non-following metadata), enforces path containment
-under the managed namespace, bounds traversal depth/file count, and skips
-directory cycles.
+and stale-temp cleanup use non-following metadata), proves the managed root
+resolves under the canonical `spool.dir`, enforces containment for every path it
+creates, renames, or unlinks, bounds traversal depth and file count, and skips
+directory cycles by device/inode identity.
+
+### Claim and lease protocol
 
 The background replayer scans durable data files (`*.ndjson` / `*.ndjson.zst`)
-in lexicographic order, then **atomically claims** each candidate by renaming it
-to `*.inflight` before ClickHouse delivery. In-flight files count toward
-`spool.max_bytes` but are excluded from eviction. Retryable delivery releases the
-claim back to the durable name; crash recovery renames leftover `*.inflight`
-files back during live prepare.
+carrying **its own** `owner_tag`, in lexicographic order, then **atomically
+claims** each candidate by renaming it to
+
+```text
+<ULID>.<owner_tag>.ndjson.claim-<process_tag>-<generation>-<lease_deadline>.inflight
+```
+
+before any ClickHouse delivery. The rename is the mutual-exclusion primitive: on
+a shared volume exactly one accepted generation or process can win it, and the
+loser simply moves on to the next file. `process_tag` is a per-process nonce
+drawn at startup, so a restart never mistakes a crashed run's claim for live
+work. The lease deadline is derived from the configured worst-case delivery
+budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry backoff
+schedule, ×4, clamped to 300–3600 seconds).
+
+Claim disposition:
+
+- **Delivered** — the claim is removed.
+- **Retryable** — the claim is released back to its durable replayable name and
+  the tick stops so ordering is preserved.
+- **Permanent / 413 single row** — the claim is replaced by safe dead-letter
+  metadata named after the durable data file.
+- **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
+
+In-flight claims count toward `spool.max_bytes` but are **never** eviction
+candidates; when only claimed or foreign-owned files remain, an admission that
+cannot fit fails closed instead of destroying them. Recovery at prepare time
+returns a claim to its durable name only when this process demonstrably abandoned
+it (same `process_tag`, no live lease) or when a peer's lease deadline has
+passed, so two owners can never deliver the same file concurrently.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
@@ -342,9 +425,9 @@ split, or skip a file:
 | Outcome | Status / cause | Replay behavior |
 | --- | --- | --- |
 | Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
-| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 401, 403, 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
 | Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 401, 403), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
 
 Logs and error strings for these outcomes carry only safe metadata (plugin name,
 HTTP status code, reason class, row count, acknowledgement byte length class,
@@ -363,16 +446,41 @@ fields are never logged.
   payload, response bodies, credentials, or charge-record PII. If the metadata
   write fails, the original file remains replayable; successfully inserted
   rows may be retried with their unchanged `event_id` idempotency identity.
-- Stale generation-owned `*.g<generation>.tmp` files left by an interrupted
-  atomic write are reconciled only when demonstrably stale and not leased by a
-  live generation sharing the managed root. A reloaded generation must not
-  delete another live generation's active temp.
-- In-flight replay claims (`*.inflight`) are recovered to durable replayable
-  names during live prepare after crash/restart.
+- Temps left by an interrupted atomic write are reconciled only when this process
+  demonstrably owns them (matching `process_tag`) and no live writer holds the
+  path, or when they are foreign/unattributable **and** older than the stale-temp
+  age (300 s). A reloaded generation therefore cannot unlink the active temp of
+  an older accepted generation or of a peer process sharing the volume.
+- In-flight replay claims are recovered to durable replayable names during live
+  prepare, subject to the lease rules above.
 
 Dead-letter metadata, corrupt files, temps, and in-flight claims remain under
 the managed namespace and count toward `spool.max_bytes` until eviction drops the
-oldest **evictable** owned file (in-flight claims are skipped).
+oldest **evictable** owned file. In-flight claims and records carrying another
+owner's tag are never evictable.
+
+### Migration and destination changes
+
+Ferrum never silently replays records it does not own to a newly configured
+destination. Two shapes are recognized and reported instead:
+
+- **Pre-namespace (legacy) records** written directly under
+  `<spool.dir>/<node>/<YYYYMMDD>/`, which carry no ownership binding.
+- **Orphaned namespaces**: a sibling `o<owner_digest>` directory left behind when
+  the plugin config id, Ferrum namespace/ledger, ClickHouse endpoint, database,
+  table, or node identity changed.
+
+Both are counted when the managed namespace is prepared (process start, or the
+first tick after storage recovers) into `spool.unbound_files` /
+`spool.unbound_namespaces` in the status JSON, exported as
+`chargeback_sink_spool_unbound_files` and
+`chargeback_sink_spool_unbound_namespaces`, and logged with a rate-limited
+warning naming the counts and directories. They are **never** replayed, deleted,
+evicted, or rerouted. Reconciling them is an explicit operator action: either
+re-point the sink at the original destination so the records become owned again,
+or export/remove them out of band. A record whose `owner_tag` names a different
+identity but sits inside this namespace (only reachable by tampering or a
+hand-moved file) is treated the same way: counted, reported, never touched.
 
 Offline validation and candidate-generation staging do not create, chmod, or
 probe `spool.dir`. After cache publication, the committed replayer prepares and
@@ -386,7 +494,7 @@ sink under its managed namespace (after compression when `compression` is
 `zstd`). The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
-- in-progress atomic-write temps (generation-owned `*.g<generation>.tmp` and
+- in-progress atomic-write temps (`*.write-<process_tag>-<generation>.tmp` and
   dead-letter metadata `*.rejected.meta.tmp` files)
 - in-flight replay claims (`*.inflight`)
 - corrupt quarantine (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
@@ -396,11 +504,13 @@ sink under its managed namespace (after compression when `compression` is
 Pending writes are serialized/compressed and sized **before** quota admission.
 Admission holds the spool write lock with eviction so concurrent writers cannot
 over-admit. Existing owned bytes plus the incoming encoded file must stay within
-`max_bytes`; when space is short, the oldest owned file is dropped and
-`chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
-still cannot fit after eviction (including on an empty spool), the write is
+`max_bytes`; when space is short, the oldest **evictable** owned file is dropped
+and `chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
+still cannot fit after eviction (including on an empty spool, or when every
+retained file is an in-flight claim or owned by another identity), the write is
 **rejected** and the batch/event follows the existing spool-failure path
-(warned and not durably retained). The sink never silently exceeds the ceiling.
+(warned and not durably retained). The sink never silently exceeds the ceiling
+and never reclaims bytes by destroying an in-flight or foreign-owned record.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb, using **encoded** average event size (and headroom for retained
@@ -415,10 +525,13 @@ stable identity such as a StatefulSet ordinal (see
 [configuration.md](../configuration.md) and `ferrum.conf`). The value is
 length-bounded for charge-event provenance and encoded into a single safe path
 component for the managed namespace (hostile absolute/parent/separator/NUL/drive
-forms are hashed rather than joined raw). Resolution order is `FERRUM_NODE_ID`,
-then `HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node component
-changes across restarts, the sink logs a warning when it finds sibling spool
-directories that may contain events from an older identity.
+forms are hashed rather than joined raw). It is also part of the spool ownership
+digest, so a node-identity change produces a fresh managed namespace. Resolution
+order is `FERRUM_NODE_ID`, then `HOSTNAME`, then `/etc/hostname`, then
+`unknown`. If the node identity changes across restarts, records under the
+previous identity become unbound: they are reported through
+`spool.unbound_files` / `chargeback_sink_spool_unbound_files` and a rate-limited
+warning, and are never replayed or deleted automatically.
 
 ## Reconciliation Queries
 
