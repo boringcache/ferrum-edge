@@ -6479,9 +6479,7 @@ impl ProxyState {
         let previous = self.backend_capabilities.get_by_key(&target.key);
         let previous_hbone = previous.as_ref().map(|record| record.hbone);
         let previous_h2_tls = previous.as_ref().map(|record| record.plain_http.h2_tls);
-        let previous_grpc_h2_tls = previous
-            .as_ref()
-            .map(|record| record.grpc_transport.h2_tls);
+        let previous_grpc_h2_tls = previous.as_ref().map(|record| record.grpc_transport.h2_tls);
         let previous_h1 = previous.as_ref().map(|record| record.plain_http.h1);
         let previous_h3 = previous.as_ref().map(|record| record.plain_http.h3);
 
