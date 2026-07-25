@@ -6,9 +6,10 @@
 //! `FERRUM_MESH_WORKLOAD_API_SOCKET`.
 //!
 //! The client exposes:
-//! - [`WorkloadApiClient::fetch_x509_svid_stream`] — long-lived bidirectional
-//!   stream returning fresh [`SvidBundle`] every time the agent rotates the
-//!   SVID or a federated bundle changes.
+//! - [`WorkloadApiClient::fetch_x509_svid_stream`] — long-lived stream
+//!   returning fresh [`SvidBundle`] values through a capacity-one /
+//!   latest-wins relay (slow consumers coalesce to newest state) plus a
+//!   oneshot that fires when the first bundle is ready.
 //! - [`WorkloadApiClient::fetch_x509_svid_once`] — convenience helper that
 //!   returns the FIRST bundle from the stream and drops the connection.
 
@@ -18,10 +19,9 @@ use hyper_util::rt::TokioIo;
 use std::time::Duration;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
@@ -33,6 +33,7 @@ use tower::service_fn;
 use tracing::info;
 use tracing::{debug, warn};
 
+use super::latest_wins;
 use super::proto::X509svidRequest;
 use super::proto::spiffe_workload_api_client::SpiffeWorkloadApiClient;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -120,16 +121,18 @@ impl WorkloadApiClient {
     /// Open the streaming `FetchX509SVID` RPC and translate each agent
     /// response into a [`SvidBundle`].
     ///
-    /// Returns a `Stream` plus a oneshot signal that fires once the FIRST
-    /// SvidBundle has been observed — useful for startup paths that need to
-    /// "wait for an SVID to be ready" before proceeding.
+    /// Returns a capacity-one / latest-wins `Stream` plus a oneshot that fires
+    /// once the FIRST SvidBundle has been observed — useful for startup paths
+    /// that need to "wait for an SVID to be ready" before proceeding. Slow
+    /// consumers coalesce to the newest decoded bundle; superseded
+    /// private-key-bearing payloads are dropped without FIFO retention.
     pub async fn fetch_x509_svid_stream(
         &mut self,
         expected_spiffe_id: Option<SpiffeId>,
     ) -> Result<
         (
             impl Stream<Item = Result<SvidBundle, WorkloadApiClientError>> + Send + 'static,
-            mpsc::UnboundedReceiver<()>,
+            oneshot::Receiver<()>,
         ),
         WorkloadApiClientError,
     > {
@@ -138,22 +141,38 @@ impl WorkloadApiClient {
             .fetch_x509svid(workload_request(X509svidRequest {}))
             .await
             .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
-        let mut inbound = response.into_inner();
+        Ok(Self::relay_x509_svid_stream(
+            response.into_inner(),
+            expected_spiffe_id,
+        ))
+    }
 
-        // Inner channel relays decoded bundles. Notify channel fires once
-        // when the FIRST bundle arrives so callers can do "wait for ready"
-        // synchronisation independently of consuming the stream.
-        let (out_tx, out_rx) =
-            mpsc::unbounded_channel::<Result<SvidBundle, WorkloadApiClientError>>();
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel::<()>();
+    /// Decode an inbound `FetchX509SVID` response stream into coalesced
+    /// [`SvidBundle`] updates.
+    ///
+    /// Shared by the live gRPC client and unit tests that drive synthetic
+    /// inbound frames without a Unix-socket transport.
+    pub fn relay_x509_svid_stream<S>(
+        inbound: S,
+        expected_spiffe_id: Option<SpiffeId>,
+    ) -> (
+        impl Stream<Item = Result<SvidBundle, WorkloadApiClientError>> + Send + 'static,
+        oneshot::Receiver<()>,
+    )
+    where
+        S: Stream<Item = Result<super::proto::X509svidResponse, tonic::Status>> + Send + 'static,
+    {
+        let mut inbound = Box::pin(inbound);
+        let (out_tx, out_rx) = latest_wins::channel();
+        let (notify_tx, notify_rx) = oneshot::channel();
 
         tokio::spawn(async move {
-            let mut sent_first = false;
+            let mut notify_tx = Some(notify_tx);
             while let Some(msg_result) = inbound.next().await {
                 let msg = match msg_result {
                     Ok(m) => m,
                     Err(e) => {
-                        let _ = out_tx.send(Err(WorkloadApiClientError::Rpc(format!(
+                        let _ = out_tx.publish(Err(WorkloadApiClientError::Rpc(format!(
                             "Workload API stream error: {e}"
                         ))));
                         return;
@@ -165,17 +184,19 @@ impl WorkloadApiClient {
                 }
                 let bundle_res = svid_response_to_bundle(msg, expected_spiffe_id.as_ref());
                 let was_ok = bundle_res.is_ok();
-                if out_tx.send(bundle_res).is_err() {
+                if !out_tx.publish(bundle_res) {
                     return;
                 }
-                if was_ok && !sent_first {
-                    let _ = notify_tx.send(());
-                    sent_first = true;
+                if was_ok {
+                    if let Some(notify) = notify_tx.take() {
+                        let _ = notify.send(());
+                    }
                 }
             }
+            // Sender drop ends the stream after any final pending value.
         });
 
-        Ok((UnboundedReceiverStream::new(out_rx), notify_rx))
+        (out_rx.into_stream(), notify_rx)
     }
 
     /// Helper for callers that just want to grab the first SvidBundle and
