@@ -94,6 +94,15 @@ fn rr_selection_counters_are_sharded_and_padded_in_source() {
         "selection counters must be constructed via new_selection_counters()"
     );
     assert!(
+        source.contains("SELECTION_COUNTER_PHASE_STRIDE")
+            && source.contains("wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE)"),
+        "selection counter shards must initialize with distinct phase offsets"
+    );
+    assert!(
+        !source.contains("All shards start at `0`"),
+        "all-zero shard init must not return (causes first-wave lockstep)"
+    );
+    assert!(
         source.contains("fn selection_counter_ticket("),
         "hot-path advances must go through selection_counter_ticket()"
     );
@@ -152,20 +161,133 @@ fn selection_counter_shards_do_not_share_cache_lines() {
 }
 
 #[test]
-fn round_robin_single_worker_ticket_stream_matches_shared_counter() {
-    // All shards start at 0, so one worker's picks are identical to the
-    // historical shared AtomicU64 sequence regardless of shard assignment.
+fn round_robin_single_worker_is_deterministic_cycle_within_shard() {
+    // Phase offsets mean the first pick depends on the thread's shard, but a
+    // single worker stays on one shard and must still walk a full RR cycle.
     let targets = make_targets(3);
     let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
     let observed: Vec<_> = (0..9)
         .map(|_| lb.select("", None).expect("selection").target.host.clone())
         .collect();
-    assert_eq!(
-        observed,
+    let indices: Vec<usize> = observed
+        .iter()
+        .map(|host| {
+            host.strip_prefix("host")
+                .expect("hostN")
+                .parse()
+                .expect("index")
+        })
+        .collect();
+    assert_eq!(indices.len(), 9);
+    for window in indices.windows(2) {
+        assert_eq!(
+            (window[0] + 1) % 3,
+            window[1],
+            "single-shard RR must advance by one target each pick; got {indices:?}"
+        );
+    }
+    let mut counts = [0u64; 3];
+    for idx in indices {
+        counts[idx] += 1;
+    }
+    assert_eq!(counts, [3, 3, 3], "long-run single-worker RR ratios must stay even");
+}
+
+#[test]
+fn round_robin_first_wave_across_shards_is_not_lockstep() {
+    // All-zero shard init would send every first pick to host0 on a 2-target
+    // lane. Distinct phases must decorrelate the synchronized first wave.
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &targets, None);
+
+    let phases = lb.selection_counter_phases_for_test();
+    assert!(
+        phases.iter().any(|&p| p != phases[0]),
+        "selection counter shards must not share one starting phase; got {phases:?}"
+    );
+
+    let first_wave: Vec<_> = (0..16)
+        .map(|shard| {
+            lb.select_round_robin_from_shard_for_test(shard)
+                .expect("shard pick")
+                .host
+                .clone()
+        })
+        .collect();
+    let all_same = first_wave.windows(2).all(|w| w[0] == w[1]);
+    assert!(
+        !all_same,
+        "first-wave RR across shards must not lockstep on one target; got {first_wave:?}"
+    );
+    assert!(
+        first_wave.iter().any(|h| h == "host0") && first_wave.iter().any(|h| h == "host1"),
+        "decorrelated first wave should touch both targets; got {first_wave:?}"
+    );
+}
+
+#[test]
+fn random_first_wave_across_shards_is_not_identical_sequence() {
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    let first_wave: Vec<_> = (0..16)
+        .map(|shard| {
+            lb.select_random_from_shard_for_test(shard)
+                .expect("shard pick")
+                .host
+                .clone()
+        })
+        .collect();
+    let all_same = first_wave.windows(2).all(|w| w[0] == w[1]);
+    assert!(
+        !all_same,
+        "first-wave Random across shards must not share one seeded pick; got {first_wave:?}"
+    );
+}
+
+#[test]
+fn locality_distribute_first_wave_buckets_are_not_lockstep() {
+    let mut to = BTreeMap::new();
+    to.insert("us-west".to_string(), 80);
+    to.insert("us-east".to_string(), 20);
+    let setting = UpstreamLocalityLbSetting {
+        enabled: true,
+        distribute: vec![LocalityDistribute {
+            from: "us-west/us-west-1/a".to_string(),
+            to,
+        }],
+        failover: Vec::new(),
+    };
+    let up = upstream_with_locality_lb(
+        "us-west/us-west-1/a",
         vec![
-            "host0", "host1", "host2", "host0", "host1", "host2", "host0", "host1", "host2"
-        ]
+            locality_target("west-a", "us-west/us-west-1/a"),
+            locality_target("west-b", "us-west/us-west-1/b"),
+            locality_target("east-a", "us-east/us-east-1/a"),
+        ],
+        setting,
+    );
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![up],
+        ..GatewayConfig::default()
+    });
+    let lb = cache
+        .load()
+        .get_balancer("u1")
+        .expect("balancer")
+        .clone();
+
+    // Weighted total is 100; all-zero phases would map every shard to the same
+    // first bucket via golden_ratio_hash(0) % 100.
+    let mods = lb
+        .distribute_first_wave_bucket_mods_for_test(100)
+        .expect("distribute phases");
+    assert_eq!(mods.len(), 16);
+    let all_same = mods.windows(2).all(|w| w[0] == w[1]);
+    assert!(
+        !all_same,
+        "first-wave distribute bucket picks must not lockstep; got {mods:?}"
     );
 }
 

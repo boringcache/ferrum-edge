@@ -370,16 +370,32 @@ fn wrr_counter_shard() -> usize {
 /// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
 type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
 
+/// Odd multiplicative stride (golden-ratio fraction of 2^64) giving each
+/// selection-counter shard a distinct starting phase at construction.
+///
+/// Matches the non-zero WRR schedule seed stride in [`WrrSchedule::with_seed`]:
+/// an all-zero init would remove cache-line contention but leave every shard
+/// lockstep on the same first-wave target / random sequence / distribute bucket.
+/// The constant is odd (invertible mod 2^64); under wrapping multiplication the
+/// per-shard phases do not collapse onto one residue for the small target counts
+/// and weighted bucket totals exercised on these paths (e.g. mod 2 they alternate).
+const SELECTION_COUNTER_PHASE_STRIDE: u64 = 0x9E3779B97F4A7C15;
+
 /// Fresh selection-counter shards for a parent, port, or locality-distribute lane.
 ///
-/// All shards start at `0` (unlike zero-weight WRR phase strides) so a single
-/// worker's ticket stream matches the historical shared `AtomicU64` sequence,
-/// independent of which shard [`wrr_counter_shard`] assigned this thread.
-/// Contention avoidance comes from per-shard [`CachePadded`] ownership; long-run
-/// ratios stay even because each shard is itself a full RR / random walk.
+/// Each shard starts at `i × SELECTION_COUNTER_PHASE_STRIDE` so concurrent
+/// workers that begin a wave together do not all pick the same RR offset,
+/// Random hash seed, or locality-distribute bucket. Contention avoidance still
+/// comes from per-shard [`CachePadded`] ownership; long-run ratios stay even
+/// because each shard is itself a full RR / random / weighted-bucket walk.
+/// Within one shard the ticket stream remains deterministic.
 #[inline]
 fn new_selection_counters() -> SelectionCounterShards {
-    std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0)))
+    std::array::from_fn(|i| {
+        CachePadded::new(AtomicU64::new(
+            (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+        ))
+    })
 }
 
 /// Advance the calling thread's selection-counter shard and return the ticket.
@@ -2635,6 +2651,65 @@ impl LoadBalancer {
     /// amortization. Neither counter is touched on the steady-state cache-hit path.
     pub fn wrr_parent_schedule_counters(&self) -> (u64, u64) {
         self.wrr_state.schedule_counters()
+    }
+
+    /// Snapshot parent selection-counter shard phases (init offsets + any advances).
+    ///
+    /// Test harness only: lets coverage assert distinct construction-time phases
+    /// without depending on OS thread → shard assignment.
+    pub fn selection_counter_phases_for_test(&self) -> [u64; 16] {
+        std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
+    }
+
+    /// One RoundRobin pick driven by an explicit counter shard.
+    ///
+    /// Test harness only: bypasses [`wrr_counter_shard`] so first-wave
+    /// correlation across shards is asserted without barriers or scheduling.
+    pub fn select_round_robin_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket = self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)]
+            .fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(
+            &self.targets[(ticket as usize) % self.targets.len()],
+        ))
+    }
+
+    /// One Random pick driven by an explicit counter shard (same golden-ratio
+    /// mapping as the production Random path).
+    ///
+    /// Test harness only: see [`Self::select_round_robin_from_shard_for_test`].
+    pub fn select_random_from_shard_for_test(&self, shard: usize) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket = self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)]
+            .fetch_add(1, Ordering::Relaxed);
+        let hash = golden_ratio_hash(ticket) as usize;
+        Some(Arc::clone(&self.targets[hash % self.targets.len()]))
+    }
+
+    /// First-wave locality-distribute bucket moduli across shards for `total`.
+    ///
+    /// Test harness only: peeks each distribute-counter phase and applies the
+    /// same `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
+    pub fn distribute_first_wave_bucket_mods_for_test(&self, total: u64) -> Option<Vec<u64>> {
+        if total == 0 {
+            return None;
+        }
+        let state = self.locality_lb.as_ref()?;
+        Some(
+            (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let raw = state.distribute_counter[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(raw) % total
+                })
+                .collect(),
+        )
     }
 
     /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
@@ -5377,6 +5452,54 @@ mod tests {
                 .any(|c| c.load(Ordering::Relaxed) != first),
             "zero-weight shards must be phase-distributed"
         );
+    }
+
+    #[test]
+    fn selection_counter_shards_use_golden_phase_stride() {
+        let counters = new_selection_counters();
+        for (i, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+                "shard {i} phase"
+            );
+        }
+        let first = counters[0].load(Ordering::Relaxed);
+        assert!(
+            counters
+                .iter()
+                .any(|c| c.load(Ordering::Relaxed) != first),
+            "selection counter shards must be phase-distributed"
+        );
+    }
+
+    #[test]
+    fn selection_counter_phase_stride_avoids_small_modulo_lockstep() {
+        // Independently check RR target counts and weighted-bucket totals used
+        // on the hot path: an all-zero init collapses every shard onto residue 0.
+        let counters = new_selection_counters();
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| counters[i].load(Ordering::Relaxed) % modulus)
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
+        // Random / distribute consume golden_ratio_hash(ticket) before modulo.
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let ticket = counters[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(ticket) % modulus
+                })
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "hashed phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
     }
 
     #[test]
