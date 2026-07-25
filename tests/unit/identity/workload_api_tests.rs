@@ -199,9 +199,7 @@ impl Attestor for CountingAttestor {
 /// Used to model revocation and identity remapping across rotation epochs.
 struct ScriptedAttestor {
     outcomes: Arc<
-        std::sync::Mutex<
-            Vec<Result<SpiffeId, ferrum_edge::identity::attestation::AttestError>>,
-        >,
+        std::sync::Mutex<Vec<Result<SpiffeId, ferrum_edge::identity::attestation::AttestError>>>,
     >,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -754,10 +752,7 @@ async fn fetch_x509svid_rotation_reattests_retained_peer_identity() {
         .clone();
     assert_eq!(
         seen,
-        vec![
-            Some(expected_bearer.clone()),
-            Some(expected_bearer.clone())
-        ],
+        vec![Some(expected_bearer.clone()), Some(expected_bearer.clone())],
         "each rotation epoch must re-attest the retained peer bearer identity"
     );
 }
