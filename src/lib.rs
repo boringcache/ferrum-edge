@@ -1928,6 +1928,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
+    pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
