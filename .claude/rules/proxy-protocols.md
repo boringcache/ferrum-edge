@@ -68,7 +68,7 @@ paths:
 - HTTP/3: quinn/h3 standalone server to `Http3ConnectionPool` or cross-protocol bridge; streaming through the shared H3 coalescer.
 - gRPC: hyper H2 direct through `GrpcConnectionPool`, not reqwest, to preserve trailers.
 - WebSocket: hyper upgrade or H2/H3 Extended CONNECT to backend WebSocket transport; persistent and frame-by-frame.
-- TCP: `TcpListener` to `TcpStream::connect`; splice on Linux unconditionally for plain-to-plain (and for TLS frontends when kTLS install succeeds), else userspace copy. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` inline via per-direction watermarks — there is no eligibility gate based on timeout configuration.
+- TCP: `TcpListener` to `TcpStream::connect`; splice on Linux unconditionally for plain-to-plain (and for TLS frontends when kTLS install succeeds), else userspace copy. Buffered tokio-rustls frontend handshakes currently refuse kTLS handoff (issue #2955 — inbound deframer alignment is not observable on the public buffered API); plaintext-to-plaintext splice is unaffected. The splice loops enforce `tcp_idle_timeout_seconds`, `tcp_half_close_max_wait_seconds`, `backend_read_timeout_ms`, and `backend_write_timeout_ms` inline via per-direction watermarks — there is no eligibility gate based on timeout configuration.
 - UDP: `UdpSocket` per session; GSO-batched send on Linux.
 - `Proxy.dispatch_kind` is precomputed at config load by `GatewayConfig::resolve_dispatch_kind()`.
 - Buffer only when a plugin requires request/response body buffering or retry needs replay. SSE always streams.

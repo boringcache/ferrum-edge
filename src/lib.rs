@@ -1330,6 +1330,17 @@ pub mod _test_support {
         Ok((handshake.stream, proto))
     }
 
+    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
+    /// for kTLS. Always returns `false`: the public buffered API cannot prove
+    /// that the inbound deframer is empty and record-aligned (issue #2955).
+    /// The shared borrow is part of the contract — external tests use it to
+    /// pin that the refusal leaves every staged application byte readable.
+    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
+        server_conn: &rustls::ServerConnection,
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.
