@@ -1,0 +1,179 @@
+//! External coverage for control-plane listener supervision (issue #2367).
+//!
+//! Asserts the *mode result* (`Ok` / `Err`) after draining siblings — not only
+//! that shutdown was signaled.
+
+use std::time::{Duration, Instant};
+
+use ferrum_edge::_test_support::wait_for_cp_listeners_until_shutdown_or_exit_for_test;
+
+#[tokio::test]
+async fn pending_sibling_plus_listener_error_returns_err() {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    let mut sibling_rx = shutdown_tx.subscribe();
+    let sibling = tokio::spawn(async move {
+        while !*sibling_rx.borrow() {
+            if sibling_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let failing = tokio::spawn(async {
+        Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed"))
+    });
+
+    let started = Instant::now();
+    let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        vec![
+            ("CP admin HTTP listener".to_string(), sibling),
+            ("CP gRPC server".to_string(), failing),
+        ],
+        shutdown_tx,
+        Duration::from_secs(2),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("listener serve error must propagate as Err");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("accept loop failed"),
+        "error should include serve failure cause; got {rendered}",
+    );
+    assert!(
+        rendered.contains("CP gRPC server"),
+        "error should name the failing listener; got {rendered}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pending sibling must drain via shutdown trigger; took {elapsed:?}",
+    );
+}
+
+#[tokio::test]
+async fn pending_sibling_plus_listener_panic_returns_err() {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    let mut sibling_rx = shutdown_tx.subscribe();
+    let sibling = tokio::spawn(async move {
+        while !*sibling_rx.borrow() {
+            if sibling_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let panicking = tokio::spawn(async {
+        panic!("simulated CP listener panic");
+    });
+
+    let started = Instant::now();
+    let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        vec![
+            ("CP admin HTTPS listener".to_string(), sibling),
+            ("CP admin HTTP listener".to_string(), panicking),
+        ],
+        shutdown_tx,
+        Duration::from_secs(2),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    let err = result.expect_err("listener panic must propagate as Err");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("panicked"),
+        "error should report panic; got {rendered}",
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pending sibling must drain via shutdown trigger; took {elapsed:?}",
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_returns_ok() {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    let mut admin_rx = shutdown_tx.subscribe();
+    let admin = tokio::spawn(async move {
+        while !*admin_rx.borrow() {
+            if admin_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut grpc_rx = shutdown_tx.subscribe();
+    let grpc = tokio::spawn(async move {
+        while !*grpc_rx.borrow() {
+            if grpc_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    shutdown_tx
+        .send(true)
+        .expect("watch send must succeed with live receivers");
+
+    let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        vec![
+            ("CP admin HTTP listener".to_string(), admin),
+            ("CP gRPC server".to_string(), grpc),
+        ],
+        shutdown_tx,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    result.expect("SIGINT/SIGTERM-driven shutdown must return Ok");
+}
+
+#[tokio::test]
+async fn unsolicited_ok_exit_returns_err_and_drains_sibling() {
+    let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+
+    let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+    let mut sibling_rx = shutdown_tx.subscribe();
+    let sibling = tokio::spawn(async move {
+        while !*sibling_rx.borrow() {
+            if sibling_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        vec![
+            ("CP admin HTTP listener".to_string(), sibling),
+            ("CP gRPC server".to_string(), exited),
+        ],
+        shutdown_tx,
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let err = result.expect_err("Ok exit without shutdown request must be Err");
+    assert!(
+        format!("{err:#}").contains("exited unexpectedly"),
+        "error should report unsolicited exit; got {err:#}",
+    );
+
+    observed_shutdown
+        .changed()
+        .await
+        .expect("unsolicited exit should trigger shutdown for siblings");
+    assert!(
+        *observed_shutdown.borrow(),
+        "shared shutdown watch must flip after unsolicited listener exit"
+    );
+}

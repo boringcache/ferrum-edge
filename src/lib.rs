@@ -3515,4 +3515,19 @@ pub mod _test_support {
             }
         }
     }
+
+    /// Drive CP listener supervision the same way `control_plane::run` does,
+    /// so external tests can assert Ok/Err without constructing a full CP.
+    pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        listener_handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::control_plane::wait_for_cp_listeners_until_shutdown_or_exit(
+            listener_handles,
+            shutdown_tx,
+            drain_timeout,
+        )
+        .await
+    }
 }
