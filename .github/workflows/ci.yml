@@ -1573,6 +1573,27 @@ jobs:
             echo "::error title=Node-agent port 0 still ready::admin port 0 must omit readinessProbe"
             exit 1
           fi
+          # Node-agent admin bind addresses shift probe --host (toYaml bare strings).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.bindAddress=::1 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-ipv6-bind.yaml"
+          na_ipv6_probe="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-ipv6-bind.yaml")"
+          if ! grep -q -- '- ::1' <<<"$na_ipv6_probe"; then
+            echo "::error title=Node-agent IPv6 probe host::bindAddress=::1 must render --host ::1"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.bindAddress=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-wildcard-bind.yaml"
+          na_wild_probe="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-wildcard-bind.yaml")"
+          if ! grep -q -- '- 127.0.0.1' <<<"$na_wild_probe"; then
+            echo "::error title=Node-agent wildcard probe host::bindAddress=0.0.0.0 must render --host 127.0.0.1"
+            exit 1
+          fi
           # NodeWaypoint ambient still renders admin health readiness.
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set ambient.enabled=true \
