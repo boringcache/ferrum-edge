@@ -194,17 +194,20 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         )
         .await?;
 
-        let entries = store.index_migration_status().await?;
+        let status = store.migration_status().await?;
         use crate::config::mongo_index_plan::IndexPresence;
 
         println!("=== Ferrum Edge Migration Status (MongoDB) ===\n");
         println!("MongoDB uses idempotent index creation instead of versioned migrations.");
-        println!("Compared live indexes to the canonical plan (listIndexes only; no mutations).\n");
+        println!(
+            "Compared live indexes and guard collections to the canonical plan \
+             (listIndexes/listCollections only; no mutations).\n"
+        );
 
         let mut present = 0usize;
         let mut missing = 0usize;
         let mut mismatched = 0usize;
-        for entry in &entries {
+        for entry in &status.indexes {
             match &entry.presence {
                 IndexPresence::Present => {
                     present += 1;
@@ -224,15 +227,30 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
             }
         }
 
+        let mut guard_collections_present = 0usize;
+        let mut guard_collections_missing = 0usize;
+        println!("\nRequired guard collections:");
+        for entry in &status.guard_collections {
+            if entry.present {
+                guard_collections_present += 1;
+                println!("  [present]    {}", entry.collection);
+            } else {
+                guard_collections_missing += 1;
+                println!("  [missing]    {}", entry.collection);
+            }
+        }
+
         println!(
-            "\nSummary: {present} present, {missing} missing, {mismatched} mismatched \
-             (of {} required).",
-            entries.len()
+            "\nSummary: indexes: {present} present, {missing} missing, {mismatched} mismatched \
+             (of {} required); guard collections: {guard_collections_present} present, \
+             {guard_collections_missing} missing (of {} required).",
+            status.indexes.len(),
+            status.guard_collections.len()
         );
-        if missing > 0 || mismatched > 0 {
-            println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure all indexes exist.");
+        if missing > 0 || mismatched > 0 || guard_collections_missing > 0 {
+            println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure the full plan exists.");
         } else {
-            println!("All required indexes are present with matching options.");
+            println!("All required indexes and guard collections are present.");
         }
         return Ok(());
     }

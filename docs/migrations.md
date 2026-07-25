@@ -544,8 +544,9 @@ creates indexes from the canonical plan in
 Running the same migration multiple times is safe — `createIndex` is a no-op if
 the full index spec (keys + options) already matches. Migrate dry-run prints
 that same plan without connecting; migrate status connects, runs `listIndexes`,
-and reports each required index as present, missing, or mismatched (connectivity
-or authentication failures return nonzero).
+and reports each required index as present, missing, or mismatched, plus whether
+the required guard-collection shells exist (connectivity or authentication
+failures return nonzero).
 
 ### What Gets Created
 

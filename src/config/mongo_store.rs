@@ -85,8 +85,9 @@ mod inner {
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
     use crate::config::mongo_index_plan::{
-        HMAC_SECRET_HASHES_FIELD, REQUIRED_GUARD_COLLECTIONS, RequiredMongoIndex,
-        classify_plan_against_live, default_index_name, required_mongo_indexes,
+        HMAC_SECRET_HASHES_FIELD, MongoMigrationStatus, REQUIRED_GUARD_COLLECTIONS,
+        RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
+        default_index_name, required_mongo_indexes,
     };
     use regex::escape as regex_escape;
 
@@ -1523,11 +1524,10 @@ mod inner {
         /// Non-mutating comparison of live indexes against the canonical plan.
         ///
         /// Connects/authenticates were already proven by [`Self::connect`]'s
-        /// ping. This only issues `listIndexes` (plus treating missing
-        /// collections as empty). Never creates, drops, or alters indexes.
-        pub async fn index_migration_status(
-            &self,
-        ) -> Result<Vec<crate::config::mongo_index_plan::IndexStatusEntry>, anyhow::Error> {
+        /// ping. This issues only `listIndexes` and `listCollections`, treating
+        /// missing index-owning collections as empty. Never creates, drops, or
+        /// alters indexes or collections.
+        pub async fn migration_status(&self) -> Result<MongoMigrationStatus, anyhow::Error> {
             use std::collections::{HashMap, HashSet};
 
             let plan = required_mongo_indexes();
@@ -1543,7 +1543,18 @@ mod inner {
                 }
             }
 
-            Ok(classify_plan_against_live(&live_by_collection))
+            let live_collection_names: HashSet<String> = self
+                .db()
+                .list_collection_names()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to list MongoDB collections: {err}"))?
+                .into_iter()
+                .collect();
+
+            Ok(MongoMigrationStatus {
+                indexes: classify_plan_against_live(&live_by_collection),
+                guard_collections: classify_guard_collections(&live_collection_names),
+            })
         }
 
         async fn list_collection_indexes(

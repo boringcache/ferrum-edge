@@ -405,7 +405,8 @@ FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
 
 `FERRUM_MIGRATE_ACTION=status` connects and compares live indexes with that
 plan via `listIndexes` (present / missing / mismatched) without mutating;
-unreachable or unauthorized MongoDB fails the status command.
+it also reports required guard-collection shells. Unreachable or unauthorized
+MongoDB fails the status command.
 `FERRUM_MIGRATE_DRY_RUN=true` prints the same plan without connecting.
 
 Index creation is idempotent (`createIndex` is a no-op if the full index spec

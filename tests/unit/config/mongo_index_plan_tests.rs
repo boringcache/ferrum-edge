@@ -4,13 +4,14 @@
 //! present / missing / mismatched classification without a live MongoDB.
 
 use ferrum_edge::config::mongo_index_plan::{
-    IndexPresence, REQUIRED_GUARD_COLLECTIONS, classify_plan_against_live, classify_required_index,
-    default_index_name, dry_run_lines, required_mongo_indexes, summarize_index,
+    IndexPresence, REQUIRED_GUARD_COLLECTIONS, classify_guard_collections,
+    classify_plan_against_live, classify_required_index, default_index_name, dry_run_lines,
+    required_mongo_indexes, summarize_index,
 };
 use mongodb::IndexModel;
 use mongodb::bson::doc;
 use mongodb::options::IndexOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
@@ -114,16 +115,16 @@ fn run_migrations_and_status_consume_canonical_plan() {
         "run_migrations must apply indexes through ensure_planned_index"
     );
     assert!(
-        MONGO_STORE_SOURCE.contains("index_migration_status"),
-        "MongoStore must expose non-mutating index_migration_status"
+        MONGO_STORE_SOURCE.contains("migration_status"),
+        "MongoStore must expose non-mutating migration_status"
     );
     assert!(
         MONGO_STORE_SOURCE.contains("list_indexes"),
         "status path must use list_indexes"
     );
     assert!(
-        MIGRATE_SOURCE.contains("index_migration_status"),
-        "migrate status must call index_migration_status"
+        MIGRATE_SOURCE.contains("migration_status"),
+        "migrate status must call migration_status"
     );
 
     let status_arm = MIGRATE_SOURCE
@@ -139,8 +140,12 @@ fn run_migrations_and_status_consume_canonical_plan() {
         "mongodb status must connect before reporting"
     );
     assert!(
-        status_body.contains("listIndexes only") || status_body.contains("index_migration_status"),
-        "mongodb status must compare via index_migration_status"
+        status_body.contains("listIndexes only") || status_body.contains("migration_status"),
+        "mongodb status must compare via migration_status"
+    );
+    assert!(
+        MONGO_STORE_SOURCE.contains("classify_guard_collections"),
+        "MongoDB status must classify the canonical guard-collection plan"
     );
 
     // Orphan-reconcile documentation stays on the migration path.
@@ -159,6 +164,32 @@ fn run_migrations_and_status_consume_canonical_plan() {
     assert!(
         !migrations.contains("reconcile_orphaned_consumer_identity_reservations"),
         "startup migrations must not reclaim reservations from point-read consumer absence"
+    );
+}
+
+#[test]
+fn guard_collection_status_uses_the_canonical_collection_plan() {
+    let live = HashSet::from([
+        "proxy_route_locks".to_string(),
+        "mtls_dns_admission_locks".to_string(),
+    ]);
+
+    let status = classify_guard_collections(&live);
+    assert_eq!(status.len(), REQUIRED_GUARD_COLLECTIONS.len());
+    assert!(
+        status
+            .iter()
+            .any(|entry| entry.collection == "proxy_route_locks" && entry.present)
+    );
+    assert!(
+        status
+            .iter()
+            .any(|entry| entry.collection == "upstream_ref_guards" && !entry.present)
+    );
+    assert!(
+        status
+            .iter()
+            .any(|entry| entry.collection == "mtls_dns_admission_locks" && entry.present)
     );
 }
 

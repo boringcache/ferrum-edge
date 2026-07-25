@@ -48,6 +48,21 @@ pub struct IndexStatusEntry {
     pub presence: IndexPresence,
 }
 
+/// One required empty-shell collection in a status report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardCollectionStatusEntry {
+    pub collection: &'static str,
+    pub present: bool,
+}
+
+/// Complete non-mutating comparison of the live database against the
+/// canonical MongoDB migration plan.
+#[derive(Clone, Debug)]
+pub struct MongoMigrationStatus {
+    pub indexes: Vec<IndexStatusEntry>,
+    pub guard_collections: Vec<GuardCollectionStatusEntry>,
+}
+
 /// Build the baseline index plan. This is the single source of truth for
 /// `up`, dry-run, and status.
 pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
@@ -271,6 +286,19 @@ pub fn classify_plan_against_live(
                 summary: summarize_index(&entry.model),
                 presence,
             }
+        })
+        .collect()
+}
+
+/// Classify every required guard collection against live collection names.
+pub fn classify_guard_collections(
+    live_collection_names: &std::collections::HashSet<String>,
+) -> Vec<GuardCollectionStatusEntry> {
+    REQUIRED_GUARD_COLLECTIONS
+        .iter()
+        .map(|collection| GuardCollectionStatusEntry {
+            collection: *collection,
+            present: live_collection_names.contains(*collection),
         })
         .collect()
 }
