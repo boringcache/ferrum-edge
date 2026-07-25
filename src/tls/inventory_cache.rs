@@ -78,16 +78,24 @@ impl TlsInventorySnapshot {
 
 struct InventoryCache {
     snapshot: ArcSwap<Option<Arc<TlsInventorySnapshot>>>,
-    collector: ArcSwap<Option<Arc<dyn TlsInventoryCollector>>>,
+    /// Collector and its serving-cycle generation are published together.
+    /// Loading them separately would allow a refresh racing replacement to
+    /// pair the prior cycle's collector with the new cycle's generation.
+    collector: ArcSwap<Option<Arc<CollectorRegistration>>>,
     refresh_in_flight: AtomicBool,
     stale_requested: AtomicBool,
     generation: AtomicU64,
-    collector_generation: AtomicU64,
+    next_collector_generation: AtomicU64,
     collector_pinned: AtomicBool,
     /// Registration is cold-path only (admin serving-cycle startup and test
     /// setup). Serialize install/replace/pin so a pinned test collector cannot
     /// be overwritten by a racing fallback or serving-cycle registration.
     collector_registration: Mutex<()>,
+}
+
+struct CollectorRegistration {
+    collector: Arc<dyn TlsInventoryCollector>,
+    generation: u64,
 }
 
 static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
@@ -96,10 +104,22 @@ static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
     refresh_in_flight: AtomicBool::new(false),
     stale_requested: AtomicBool::new(false),
     generation: AtomicU64::new(0),
-    collector_generation: AtomicU64::new(1),
+    next_collector_generation: AtomicU64::new(0),
     collector_pinned: AtomicBool::new(false),
     collector_registration: Mutex::new(()),
 });
+
+fn new_collector_registration(
+    collector: Arc<dyn TlsInventoryCollector>,
+) -> Arc<CollectorRegistration> {
+    Arc::new(CollectorRegistration {
+        collector,
+        generation: CACHE
+            .next_collector_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1,
+    })
+}
 
 /// Install the process-wide collector. First installation wins.
 ///
@@ -122,7 +142,9 @@ pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
     }
     // Racing installers converge on one collector: both produce the same
     // metrics-safe inventory, so a lost race is not a correctness problem.
-    CACHE.collector.store(Arc::new(Some(collector)));
+    CACHE
+        .collector
+        .store(Arc::new(Some(new_collector_registration(collector))));
     true
 }
 
@@ -145,8 +167,9 @@ pub fn replace_collector_for_serving_cycle(collector: Arc<dyn TlsInventoryCollec
     if CACHE.collector_pinned.load(Ordering::Acquire) {
         return false;
     }
-    CACHE.collector.store(Arc::new(Some(collector)));
-    CACHE.collector_generation.fetch_add(1, Ordering::AcqRel);
+    CACHE
+        .collector
+        .store(Arc::new(Some(new_collector_registration(collector))));
     CACHE.snapshot.store(Arc::new(None));
     mark_stale();
     true
@@ -166,8 +189,9 @@ pub fn pin_collector(collector: Arc<dyn TlsInventoryCollector>) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     CACHE.collector_pinned.store(true, Ordering::Release);
-    CACHE.collector.store(Arc::new(Some(collector)));
-    CACHE.collector_generation.fetch_add(1, Ordering::AcqRel);
+    CACHE
+        .collector
+        .store(Arc::new(Some(new_collector_registration(collector))));
     CACHE.snapshot.store(Arc::new(None));
     mark_stale();
 }
@@ -180,11 +204,13 @@ pub fn collector_installed() -> bool {
 /// Lock-free read of the published snapshot. Never performs source I/O.
 pub fn snapshot() -> Option<Arc<TlsInventorySnapshot>> {
     loop {
-        let generation_before = CACHE.collector_generation.load(Ordering::Acquire);
+        let collector_before = CACHE.collector.load_full();
         let snapshot = CACHE.snapshot.load().as_ref().clone();
-        let generation_after = CACHE.collector_generation.load(Ordering::Acquire);
-        if generation_before == generation_after {
-            return snapshot.filter(|snapshot| snapshot.collector_generation == generation_after);
+        let collector_after = CACHE.collector.load_full();
+        if Arc::ptr_eq(&collector_before, &collector_after) {
+            let collector_generation = collector_after.as_ref()?.generation;
+            return snapshot
+                .filter(|snapshot| snapshot.collector_generation == collector_generation);
         }
     }
 }
@@ -218,10 +244,9 @@ pub fn schedule_refresh_if_due(ttl: Duration) -> bool {
     if !refresh_is_due(ttl) {
         return false;
     }
-    let Some(collector) = CACHE.collector.load().as_ref().clone() else {
+    let Some(registration) = CACHE.collector.load().as_ref().clone() else {
         return false;
     };
-    let collector_generation = CACHE.collector_generation.load(Ordering::Acquire);
     let Some(guard) = RefreshGuard::try_acquire() else {
         return false;
     };
@@ -235,7 +260,10 @@ pub fn schedule_refresh_if_due(ttl: Duration) -> bool {
     CACHE.stale_requested.store(false, Ordering::Relaxed);
     handle.spawn_blocking(move || {
         let _guard = guard;
-        publish(collector.collect_public_metadata(), collector_generation);
+        publish(
+            registration.collector.collect_public_metadata(),
+            registration.generation,
+        );
     });
     true
 }
