@@ -2913,7 +2913,9 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     // wait this out on the success path.
     config["clickhouse"]["timeout_ms"] = json!(60_000);
     config["batch"]["size"] = json!(1);
-    config["batch"]["flush_interval_ms"] = json!(3_600_000);
+    // Use the maximum admitted interval; the held export socket, not this
+    // timer, is what deterministically occupies the flush worker.
+    config["batch"]["flush_interval_ms"] = json!(600_000);
     config["batch"]["buffer_capacity"] = json!(1);
     config["retry"]["max_attempts"] = json!(1);
     config["spool"]["delivery_queue_capacity"] = json!(8);
