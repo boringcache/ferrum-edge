@@ -218,6 +218,20 @@ pub mod _test_support {
         crate::PluginCache::with_http_client(config, http_client)
     }
 
+    /// Prepend a plugin onto one proxy's resolved list for external tests.
+    ///
+    /// Used to inject a gated `on_stream_connect` admission seam into a live
+    /// DTLS frontend listener without widening the production plugin catalog.
+    /// Build the request epoch after calling this so the published snapshot
+    /// includes the injected plugin.
+    pub fn prepend_proxy_plugin_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        plugin: Arc<dyn Plugin>,
+    ) -> Result<(), String> {
+        cache.prepend_proxy_plugin_for_test(proxy_id, plugin)
+    }
+
     /// Deterministic allocator helper for proxy lifecycle ownership generations.
     pub fn build_proxy_lifecycle_generations_for_test(
         previous: &HashMap<String, u64>,
