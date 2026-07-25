@@ -9000,21 +9000,33 @@ fn row_to_proxy(
             .try_get::<i64, _>("backend_write_timeout_ms")
             .map(|v| v.max(0) as u64)
             .unwrap_or(30000),
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Propagate decode errors — silently defaulting to None would disable
+        // backend mTLS (client cert/key) or swap the trust anchor from a custom
+        // CA to the global bundle/webpki. `Option<String>` already represents
+        // SQL NULL, so `?` is safe for the expected nullable case.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
-        dns_override: row.try_get("dns_override").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        // DNS override redirects egress; silently dropping it can send traffic
+        // to an unintended resolved address.
+        dns_override: row.try_get::<Option<String>, _>("dns_override")?,
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
             .ok()
             .map(|v| v as u64),
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
-        upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+        // Propagate decode errors — silently defaulting to None would detach
+        // the proxy from its load-balanced upstream and fall back to
+        // `backend_host`, changing routing behavior.
+        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
         circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
             Ok(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
@@ -9097,7 +9109,9 @@ fn row_to_proxy(
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.
         pool_http1_max_pending_requests: None,
-        upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
+        // Subset selection is routing-sensitive; silently mapping a decode
+        // failure to None would broaden traffic across all upstream targets.
+        upstream_subset: row.try_get::<Option<String>, _>("upstream_subset")?,
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -9166,11 +9180,31 @@ fn row_to_proxy(
 }
 
 /// Parse a consumer row into a Consumer struct.
+fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyhow::Error> {
+    match row.try_get::<String, _>(column) {
+        Ok(value) => Ok(value),
+        Err(text_error) => {
+            // sqlx Any maps MySQL TEXT-family wire types (including
+            // MEDIUMTEXT) to its generic BLOB type. Decode those bytes
+            // explicitly, but still reject invalid UTF-8 rather than hiding a
+            // corrupt JSON/config value behind a default.
+            let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
+                anyhow::anyhow!(
+                    "column '{column}' could not be decoded as SQL text ({text_error}) \
+                     or bytes ({blob_error})"
+                )
+            })?;
+            String::from_utf8(bytes)
+                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
+        }
+    }
+}
+
 fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
-    let creds_str: String = row.try_get("credentials").map_err(|e| {
+    let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to read credentials column: {}",
             id_preview,
@@ -9185,7 +9219,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         )
     })?;
 
-    let acl_groups_str: String = row.try_get("acl_groups").unwrap_or_else(|_| "[]".into());
+    let acl_groups_str = required_utf8_text_column(row, "acl_groups").map_err(|e| {
+        anyhow::anyhow!(
+            "Consumer {}: failed to read acl_groups column: {}",
+            id_preview,
+            e
+        )
+    })?;
     let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse acl_groups JSON for consumer: {} (raw: {})",
@@ -9390,10 +9430,15 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // writes, so SQL rows always start `false`.
         locality_lb_strict: false,
         locality_lb_setting: None,
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Same trust/mTLS contract as `row_to_proxy`: reject non-NULL decode
+        // failures instead of silently disabling custom CA / client identity.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh

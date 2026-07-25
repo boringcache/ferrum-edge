@@ -2049,3 +2049,82 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
         "no row from the first page may reappear after the cursor"
     );
 }
+
+/// Source-level drift guard for issue #3000: trust/routing nullable columns in
+/// `row_to_proxy` / `row_to_upstream` must use `try_get::<Option<_>>(...)?`
+/// so a non-NULL decode failure rejects the candidate load instead of silently
+/// becoming `None` (trust downgrade, mTLS disable, or upstream detach).
+#[test]
+fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+
+    let row_to_proxy = source
+        .split("fn row_to_proxy(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn row_to_consumer(").next())
+        .expect("row_to_proxy body");
+    let row_to_upstream = source
+        .split("fn row_to_upstream(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("fn strip_api_spec_id_from_runtime_config(")
+                .next()
+        })
+        .expect("row_to_upstream body");
+
+    // Already-hardened contrast cases that established this contract.
+    assert!(
+        row_to_proxy.contains("try_get::<Option<String>, _>(\"listen_path\")?"),
+        "listen_path must keep the strict Option decode that motivated this fix"
+    );
+    assert!(
+        row_to_proxy.contains("try_get::<Option<i32>, _>(\"stream_proxy_protocol\")?"),
+        "stream_proxy_protocol must keep the strict Option decode"
+    );
+
+    let proxy_columns = [
+        "backend_tls_client_cert_path",
+        "backend_tls_client_key_path",
+        "backend_tls_server_ca_cert_path",
+        "dns_override",
+        "upstream_id",
+        "upstream_subset",
+    ];
+    for column in proxy_columns {
+        assert_strict_nullable_string_decode(row_to_proxy, "row_to_proxy", column);
+    }
+
+    let upstream_columns = [
+        "backend_tls_client_cert_path",
+        "backend_tls_client_key_path",
+        "backend_tls_server_ca_cert_path",
+    ];
+    for column in upstream_columns {
+        assert_strict_nullable_string_decode(row_to_upstream, "row_to_upstream", column);
+    }
+
+    // SNI was already fail-closed; keep that contract pinned.
+    assert!(
+        row_to_upstream.contains("backend_tls_sni")
+            && !row_to_upstream.contains("\"backend_tls_sni\").ok()"),
+        "row_to_upstream must not swallow backend_tls_sni decode errors with .ok()"
+    );
+}
+
+fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) {
+    let strict = format!("try_get::<Option<String>, _>(\"{column}\")?");
+    assert!(
+        body.contains(&strict),
+        "{mapper} must decode `{column}` with `{strict}` so NULL stays None and \
+         non-NULL decode failures reject the load"
+    );
+    // Reject the historical silent-downgrade shapes.
+    assert!(
+        !body.contains(&format!("try_get(\"{column}\").ok()")),
+        "{mapper} must not use try_get(\"{column}\").ok()"
+    );
+    assert!(
+        !body.contains(&format!("try_get::<String, _>(\"{column}\").ok()")),
+        "{mapper} must not use try_get::<String, _>(\"{column}\").ok()"
+    );
+}

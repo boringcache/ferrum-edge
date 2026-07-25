@@ -18877,9 +18877,13 @@ async fn handle_proxy_request_inner(
         HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
-    let initial_response_header_policy_plugins = epoch
-        .plugin_cache
-        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+    let plugin_cache_view = if grpc_web_request {
+        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+    } else {
+        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+    };
+    let initial_response_header_policy_plugins =
+        plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
@@ -18914,10 +18918,7 @@ async fn handle_proxy_request_inner(
         // native gRPC reshapes the client-visible HTTP status to trailers-only
         // 200 + grpc-status.
         record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
-        let logging_plugins = epoch
-            .plugin_cache
-            .request_view(&proxy.id, request_protocol)
-            .plugins();
+        let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
@@ -19003,10 +19004,10 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Load plugin-cache values once for this request. Every plugin list,
-    // capability bitset, and buffering flag below is derived from the same
-    // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
+    // Use the same request-scoped cache view selected above for normal request
+    // handling. gRPC-Web is framed HTTP, so it uses the composed gRPC-Web view
+    // that keeps HTTP guardrail plugins while retaining native gRPC policies
+    // that explicitly opt in.
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
