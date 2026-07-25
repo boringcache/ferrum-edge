@@ -160,6 +160,10 @@ pub struct PluginHttpClient {
     /// construction. Defaults keep both supported codecs enabled.
     compression_gzip_enabled: bool,
     compression_brotli_enabled: bool,
+    /// Process-wide request body ceiling used to cross-check compression
+    /// `max_decompressed_request_size`. `0` means unlimited at the wire layer;
+    /// the compression hard maximum still applies.
+    max_request_body_size_bytes: usize,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -179,6 +183,10 @@ impl std::fmt::Debug for PluginHttpClient {
             .field(
                 "compression_brotli_enabled",
                 &self.compression_brotli_enabled,
+            )
+            .field(
+                "max_request_body_size_bytes",
+                &self.max_request_body_size_bytes,
             )
             .finish()
     }
@@ -269,6 +277,16 @@ impl PluginTlsPosture {
 /// redirects and ambient proxies disabled and applies the caller's TLS posture.
 /// If that cannot be constructed either, drop custom TLS posture but retain
 /// those two non-negotiable egress controls.
+fn env_flag_default_true(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
+}
+
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
@@ -472,6 +490,7 @@ impl PluginHttpClient {
             pool_shard_amount,
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
+            max_request_body_size_bytes: 0,
         }
     }
 
@@ -527,6 +546,7 @@ impl PluginHttpClient {
             pool_shard_amount: 0,
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
+            max_request_body_size_bytes: 0,
         }
     }
 
@@ -602,12 +622,41 @@ impl PluginHttpClient {
         self
     }
 
+    /// Carry the process-wide request body ceiling into compression plugin
+    /// construction so `max_decompressed_request_size` cannot exceed the
+    /// gateway's admitted upload bound.
+    pub(crate) fn with_max_request_body_size_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_request_body_size_bytes = max_bytes;
+        self
+    }
+
+    /// Apply process-wide compression codec gates and the gateway request-body
+    /// ceiling from environment defaults.
+    ///
+    /// Admin/file/CP validation clients that do not inherit a live `ProxyState`
+    /// plugin client must call this so compression admission matches the serving
+    /// plugin cache (including `max_decompressed_request_size` cross-checks).
+    pub(crate) fn with_process_compression_admission_policy(self) -> Self {
+        let gzip_enabled = env_flag_default_true("FERRUM_COMPRESSION_GZIP_ENABLED");
+        let brotli_enabled = env_flag_default_true("FERRUM_COMPRESSION_BROTLI_ENABLED");
+        let max_request_body_size_bytes = std::env::var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10_485_760);
+        self.with_compression_algorithms(gzip_enabled, brotli_enabled)
+            .with_max_request_body_size_bytes(max_request_body_size_bytes)
+    }
+
     pub(crate) fn compression_gzip_enabled(&self) -> bool {
         self.compression_gzip_enabled
     }
 
     pub(crate) fn compression_brotli_enabled(&self) -> bool {
         self.compression_brotli_enabled
+    }
+
+    pub(crate) fn max_request_body_size_bytes(&self) -> usize {
+        self.max_request_body_size_bytes
     }
 
     /// Carry the configured gateway CRL source for non-rustls sinks. Only a
