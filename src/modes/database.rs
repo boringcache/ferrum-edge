@@ -3213,9 +3213,8 @@ mod tests {
     fn startup_backup_seeds_config_rejection_before_first_poll() {
         let source = include_str!("database.rs");
         assert!(
-            source.contains(
-                "crate::config::validation_pipeline::is_config_validation_rejection(&e)"
-            ),
+            source
+                .contains("crate::config::validation_pipeline::is_config_validation_rejection(&e)"),
             "backup startup must classify ONLY ConfigValidationRejection (not row-decode) \
              so decode failures stay fail-loud / non-transient at startup"
         );

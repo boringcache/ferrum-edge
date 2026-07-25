@@ -669,11 +669,12 @@ mod tests {
     }
 
     fn row_decode_rejection_error() -> anyhow::Error {
-        anyhow::anyhow!("Consumer bad: failed to parse credentials JSON: EOF")
-            .context(crate::config::db_loader::RowDecodeRejection {
+        anyhow::anyhow!("Consumer bad: failed to parse credentials JSON: EOF").context(
+            crate::config::db_loader::RowDecodeRejection {
                 resource_type: "consumer",
                 resource_id: Some("bad".to_string()),
-            })
+            },
+        )
     }
 
     #[test]
