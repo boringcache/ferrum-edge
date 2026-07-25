@@ -138,9 +138,12 @@ impl std::fmt::Display for RowDecodeRejection {
 
 impl std::error::Error for RowDecodeRejection {}
 
-/// Returns `true` when any link in the error chain is a [`RowDecodeRejection`].
+/// Returns `true` when the error carries a [`RowDecodeRejection`] marker.
+///
+/// The marker is attached with [`anyhow::Context`], whose context value is
+/// downcastable through [`anyhow::Error`] but is not a standard `source()` link.
 pub(crate) fn is_row_decode_rejection(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| cause.is::<RowDecodeRejection>())
+    err.is::<RowDecodeRejection>()
 }
 
 /// Attach a [`RowDecodeRejection`] marker unless one is already present.
