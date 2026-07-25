@@ -1458,7 +1458,9 @@ jobs:
             "ferrum-mesh-east-west" \
             "ferrum-mesh-ambient" \
             "ferrum-mesh-node-agent"; do
-            block="$(awk -v n="$kind_name" 'BEGIN{pat="name: " n} index($0,pat){found=1} found{print} found&&/^---$/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+            # Exact metadata.name match (two-space indent) — substring index()
+            # falsely hits ClusterRole suffixes (-ferrum) and label values.
+            block="$(awk -v n="$kind_name" '$0 == "  name: " n {found=1} found{print} found&&/^---$/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
             if ! grep -q 'startupProbe:' <<<"$block" ||
               ! grep -q 'livenessProbe:' <<<"$block" ||
               ! grep -q 'readinessProbe:' <<<"$block"; then
@@ -1467,19 +1469,19 @@ jobs:
             fi
           done
           cp_liveness="$(awk '
-            /name: ferrum-mesh-control-plane/ {found=1}
+            $0 == "  name: ferrum-mesh-control-plane" {found=1}
             found && /livenessProbe:/ {p=1}
             p {print}
             p && /periodSeconds:/ {exit}
           ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
           cp_startup="$(awk '
-            /name: ferrum-mesh-control-plane/ {found=1}
+            $0 == "  name: ferrum-mesh-control-plane" {found=1}
             found && /startupProbe:/ {p=1}
             p {print}
             p && /periodSeconds:/ {exit}
           ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
           cp_readiness="$(awk '
-            /name: ferrum-mesh-control-plane/ {found=1}
+            $0 == "  name: ferrum-mesh-control-plane" {found=1}
             found && /readinessProbe:/ {p=1}
             p {print}
             p && /periodSeconds:/ {exit}
@@ -1497,13 +1499,13 @@ jobs:
             exit 1
           fi
           injector_ready="$(awk '
-            /name: ferrum-mesh-injector/ {found=1}
+            $0 == "  name: ferrum-mesh-injector" {found=1}
             found && /readinessProbe:/ {p=1}
             p {print}
             p && /periodSeconds:/ {exit}
           ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
           eastwest_ready="$(awk '
-            /name: ferrum-mesh-east-west/ {found=1}
+            $0 == "  name: ferrum-mesh-east-west" {found=1}
             found && /readinessProbe:/ {p=1}
             p {print}
             p && /periodSeconds:/ {exit}
@@ -1573,15 +1575,16 @@ jobs:
             echo "::error title=Node-agent port 0 still ready::admin port 0 must omit readinessProbe"
             exit 1
           fi
-          # Node-agent admin bind addresses shift probe --host (toYaml bare strings).
+          # Node-agent admin bind addresses shift probe --host. Chart emits quoted
+          # argv (same contract as tests/k8s/node_waypoint_ebpf_live/run.sh).
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set nodeAgent.enabled=true \
             --set nodeAgent.admin.enabled=true \
             --set-string nodeAgent.admin.bindAddress=::1 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-ipv6-bind.yaml"
           na_ipv6_probe="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-ipv6-bind.yaml")"
-          if ! grep -q -- '- ::1' <<<"$na_ipv6_probe"; then
-            echo "::error title=Node-agent IPv6 probe host::bindAddress=::1 must render --host ::1"
+          if ! grep -q -- '- "::1"' <<<"$na_ipv6_probe"; then
+            echo "::error title=Node-agent IPv6 probe host::bindAddress=::1 must render --host \"::1\""
             exit 1
           fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
@@ -1590,8 +1593,8 @@ jobs:
             --set-string nodeAgent.admin.bindAddress=0.0.0.0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-wildcard-bind.yaml"
           na_wild_probe="$(awk '/^[[:space:]]+readinessProbe:/{f=1} f{print} f&&/periodSeconds:/{exit}' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-wildcard-bind.yaml")"
-          if ! grep -q -- '- 127.0.0.1' <<<"$na_wild_probe"; then
-            echo "::error title=Node-agent wildcard probe host::bindAddress=0.0.0.0 must render --host 127.0.0.1"
+          if ! grep -q -- '- "127.0.0.1"' <<<"$na_wild_probe"; then
+            echo "::error title=Node-agent wildcard probe host::bindAddress=0.0.0.0 must render --host \"127.0.0.1\""
             exit 1
           fi
           # NodeWaypoint ambient still renders admin health readiness.
@@ -1606,9 +1609,9 @@ jobs:
             --set-string nodeAgent.admin.port=19090 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
           ambient_block="$(awk '
-            /name: ferrum-mesh-ambient/ { in_ambient = 1 }
+            $0 == "  name: ferrum-mesh-ambient" { in_ambient = 1 }
             in_ambient { print }
-            /name: ferrum-mesh-node-agent/ && in_ambient { exit }
+            $0 == "  name: ferrum-mesh-node-agent" && in_ambient { exit }
           ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml")"
           if ! grep -q 'readinessProbe:' <<<"$ambient_block" ||
             ! grep -A20 'readinessProbe:' <<<"$ambient_block" | grep -q -- '- "19091"' ||

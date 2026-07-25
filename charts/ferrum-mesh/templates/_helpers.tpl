@@ -185,6 +185,11 @@ defaults (9000 / 127.0.0.1). Returns a dict with keys port, bind, probeHost.
 Build the process-only (/live) and dependency-aware (/health) exec handlers for
 workloads that expose the admin listener. Liveness/startup MUST use --live so an
 alive-but-degraded process is not restart-looped.
+
+Command argv is kept as a Helm list here; `ferrum-mesh.renderProbeHandler` emits
+each item with `| quote` so hosts like `::1` / `127.0.0.1` and ports stay
+double-quoted in the rendered manifest (go-yaml's plain `toYaml` leaves those
+bare, which breaks frozen NodeWaypoint chart assertions).
 */}}
 {{- define "ferrum-mesh.adminHealthHandlers" -}}
 {{- $port := toString .port -}}
@@ -192,6 +197,24 @@ alive-but-degraded process is not restart-looped.
 {{- $liveCmd := list "/app/ferrum-edge" "health" "--live" "-p" $port "--host" $host -}}
 {{- $readyCmd := list "/app/ferrum-edge" "health" "-p" $port "--host" $host -}}
 {{- dict "live" (dict "exec" (dict "command" $liveCmd)) "ready" (dict "exec" (dict "command" $readyCmd)) | toYaml -}}
+{{- end -}}
+
+{{/*
+Render one probe handler. Exec command lists are emitted item-by-item with
+`| quote` so IPv6/IPv4 probe hosts and numeric ports match the quoted spelling
+required by tests/k8s/node_waypoint_ebpf_live/run.sh. Non-exec handlers
+(tcpSocket, httpGet overrides, …) still use toYaml.
+*/}}
+{{- define "ferrum-mesh.renderProbeHandler" -}}
+{{- if and .exec .exec.command -}}
+exec:
+  command:
+{{- range .exec.command }}
+  - {{ . | quote }}
+{{- end }}
+{{- else -}}
+{{- toYaml . }}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -213,19 +236,19 @@ Required dict keys:
             {{- /* Startup shares the process-only liveness handler. Pointing it
                    at dependency-aware readiness would kill a pod that boots but
                    stays legitimately unready (cert/config/CP wait). */}}
-            {{- toYaml $liveHandler | nindent 12 }}
+            {{- include "ferrum-mesh.renderProbeHandler" $liveHandler | nindent 12 }}
             failureThreshold: {{ $startup.failureThreshold }}
             periodSeconds: {{ $startup.periodSeconds }}
 {{- end }}
 {{- if and ($liveness.enabled | default false) $liveHandler }}
           livenessProbe:
-            {{- toYaml $liveHandler | nindent 12 }}
+            {{- include "ferrum-mesh.renderProbeHandler" $liveHandler | nindent 12 }}
             initialDelaySeconds: {{ $liveness.initialDelaySeconds }}
             periodSeconds: {{ $liveness.periodSeconds }}
 {{- end }}
 {{- if and ($readiness.enabled | default false) $readyHandler }}
           readinessProbe:
-            {{- toYaml $readyHandler | nindent 12 }}
+            {{- include "ferrum-mesh.renderProbeHandler" $readyHandler | nindent 12 }}
             initialDelaySeconds: {{ $readiness.initialDelaySeconds }}
             periodSeconds: {{ $readiness.periodSeconds }}
 {{- end }}
