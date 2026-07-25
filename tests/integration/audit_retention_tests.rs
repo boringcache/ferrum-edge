@@ -11,6 +11,13 @@ use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use serde_json::json;
 use tempfile::TempDir;
 
+fn disabled_retention() -> AuditRetentionPolicy {
+    AuditRetentionPolicy {
+        retention_days: None,
+        max_rows_per_namespace: None,
+    }
+}
+
 async fn sqlite_store_with_retention(policy: AuditRetentionPolicy) -> (DatabaseStore, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("audit_retention_test.db");
@@ -59,7 +66,7 @@ async fn age_prune_is_namespace_isolated_and_respects_cutoff() {
 
     // Insert without piggyback prune so we can assert an explicit prune call.
     // Disable retention, insert, then re-enable and prune.
-    store.set_audit_retention_policy(AuditRetentionPolicy::default());
+    store.set_audit_retention_policy(disabled_retention());
     store
         .insert_audit_event(&event_at("ns-a", "old-a", 10, "1"))
         .await
@@ -117,7 +124,7 @@ async fn age_prune_is_namespace_isolated_and_respects_cutoff() {
 
 #[tokio::test]
 async fn max_rows_cap_keeps_newest_by_ts_id_and_preserves_other_namespace() {
-    let (mut store, _tmp) = sqlite_store_with_retention(AuditRetentionPolicy::default()).await;
+    let (mut store, _tmp) = sqlite_store_with_retention(disabled_retention()).await;
 
     for minutes in [5, 4, 3, 2, 1] {
         store
@@ -168,7 +175,7 @@ async fn max_rows_cap_keeps_newest_by_ts_id_and_preserves_other_namespace() {
 
 #[tokio::test]
 async fn pagination_remains_correct_across_prune_boundary() {
-    let (mut store, _tmp) = sqlite_store_with_retention(AuditRetentionPolicy::default()).await;
+    let (mut store, _tmp) = sqlite_store_with_retention(disabled_retention()).await;
 
     for minutes in (1..=6).rev() {
         store

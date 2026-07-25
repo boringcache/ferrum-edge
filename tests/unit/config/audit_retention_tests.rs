@@ -5,8 +5,8 @@
 //! validation and SQL/Mongo source parity for the shared retention contract.
 
 use ferrum_edge::admin::audit::{
-    AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP, AUDIT_RETENTION_PRUNE_BATCH_SIZE,
-    AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditRetentionPolicy,
+    AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP, AUDIT_RETENTION_MAX_ROWS_DEFAULT,
+    AUDIT_RETENTION_PRUNE_BATCH_SIZE, AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditRetentionPolicy,
 };
 use ferrum_edge::config::EnvConfig;
 
@@ -33,11 +33,14 @@ const DB_LOADER_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 
 #[test]
-fn audit_retention_policy_defaults_disabled() {
+fn audit_retention_policy_defaults_to_a_namespace_cap() {
     let policy = AuditRetentionPolicy::default();
-    assert!(!policy.is_enabled());
+    assert!(policy.is_enabled());
     assert_eq!(policy.retention_days, None);
-    assert_eq!(policy.max_rows_per_namespace, None);
+    assert_eq!(
+        policy.max_rows_per_namespace,
+        Some(AUDIT_RETENTION_MAX_ROWS_DEFAULT)
+    );
 }
 
 #[test]
@@ -100,6 +103,24 @@ fn env_config_parses_audit_retention_knobs() {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.audit_retention_days, Some(30));
             assert_eq!(config.audit_retention_max_rows, Some(5000));
+        },
+    );
+}
+
+#[test]
+fn env_config_defaults_to_bounded_audit_retention() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.audit_retention_days, None);
+            assert_eq!(
+                config.audit_retention_max_rows,
+                Some(AUDIT_RETENTION_MAX_ROWS_DEFAULT)
+            );
         },
     );
 }
