@@ -156,12 +156,7 @@ fn round_robin_single_worker_ticket_stream_matches_shared_counter() {
     // All shards start at 0, so one worker's picks are identical to the
     // historical shared AtomicU64 sequence regardless of shard assignment.
     let targets = make_targets(3);
-    let lb = LoadBalancer::new(
-        UPSTREAM,
-        LoadBalancerAlgorithm::RoundRobin,
-        &targets,
-        None,
-    );
+    let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
     let observed: Vec<_> = (0..9)
         .map(|_| lb.select("", None).expect("selection").target.host.clone())
@@ -270,13 +265,8 @@ fn locality_distribute_weighted_bucket_pick_stays_proportional() {
     let mut west = 0u64;
     let mut east = 0u64;
     for i in 0..5_000 {
-        let sel = LoadBalancerCache::select_target_from(
-            &snapshot,
-            "u1",
-            &format!("d-{i}"),
-            None,
-        )
-        .expect("distribute selection");
+        let sel = LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("d-{i}"), None)
+            .expect("distribute selection");
         match sel.target.host.as_str() {
             "west-a" | "west-b" => west += 1,
             "east-a" => east += 1,
@@ -293,12 +283,7 @@ fn locality_distribute_weighted_bucket_pick_stays_proportional() {
 #[test]
 fn single_target_round_robin_is_stable() {
     let targets = make_targets(1);
-    let lb = LoadBalancer::new(
-        UPSTREAM,
-        LoadBalancerAlgorithm::RoundRobin,
-        &targets,
-        None,
-    );
+    let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &targets, None);
     for _ in 0..32 {
         let sel = lb.select("", None).expect("selection");
         assert_eq!(sel.target.host, "host0");
