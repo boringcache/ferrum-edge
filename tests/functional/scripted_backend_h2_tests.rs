@@ -2514,8 +2514,15 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
 
 /// With `FERRUM_ADD_FORWARDED_HEADER=true`, the direct-H2 builder must strip a
 /// spoofed client `Forwarded` and emit exactly one gateway-owned element.
-/// Capability warmup must classify `h2_tls=supported` first so this cannot
-/// silently fall back to the reqwest arm.
+///
+/// Fixture notes (hosted job 89647762460): the capability probe calls
+/// `http2_pool.get_sender()` against this backend and parks a live H2
+/// connection in the direct pool without ever opening a stream. A one-shot
+/// `ExpectHeaders` script on that same connection then races the ownership
+/// GET and surfaces as a fast 502 `Backend unavailable`. Give the probe its
+/// own connection script that finishes without needing a stream, and reserve
+/// a second happy-path script for the real GET (same split the H3 ownership
+/// fixture gets from colocated TCP vs UDP backends).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
@@ -2523,19 +2530,33 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
-        .expect("h2 tls backend")
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
-        .step(H2Step::DrainRequestBody)
-        .step(H2Step::RespondHeaders(vec![
+    let happy_path = vec![
+        H2Step::ExpectHeaders(MatchHeaders::any()),
+        H2Step::DrainRequestBody,
+        H2Step::RespondHeaders(vec![
             (":status", "200".into()),
             ("content-type", "text/plain".into()),
             ("content-length", "2".into()),
-        ]))
-        .step(H2Step::RespondData {
+        ]),
+        H2Step::RespondData {
             data: Bytes::from_static(b"ok"),
             end_stream: true,
-        })
+        },
+    ];
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .connection_scripts([
+            // Connection 0: capability-probe dial. Finish without waiting for a
+            // client stream so the pooled probe sender is not left paired with
+            // a permanently blocked ExpectHeaders script.
+            vec![
+                H2Step::Sleep(Duration::from_millis(50)),
+                H2Step::DropConnection,
+            ],
+            // Connection 1+: ownership GET after the pool replaces the dropped
+            // probe connection.
+            happy_path,
+        ])
         .spawn()
         .expect("spawn backend");
 
@@ -2550,10 +2571,13 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
     );
     let harness = GatewayHarness::builder()
         .file_config(yaml)
-        .log_level("warn")
-        .pool_warmup_enabled(true)
-        .env("FERRUM_ADD_FORWARDED_HEADER", "true")
+        .log_level("info")
         .capture_output()
+        // Initial capability refresh only — avoid pool-warmup HEAD traffic
+        // against the scripted H2 fixture (same contract as the H3 ownership
+        // regression).
+        .pool_warmup_enabled(false)
+        .env("FERRUM_ADD_FORWARDED_HEADER", "true")
         .spawn()
         .await
         .expect("spawn gateway");
@@ -2566,6 +2590,10 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         Some("supported"),
         "precondition: direct-H2 ownership coverage requires h2_tls=supported; entry: {entry:#?}"
     );
+    // The probe script sleeps briefly then drops. Wait past that tail so the
+    // ownership GET cannot land on connection 0 mid-Sleep (queued stream would
+    // be discarded by DropConnection → 502).
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     let response = reqwest::Client::builder()
         .http1_only()
@@ -2580,11 +2608,13 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .expect("gateway response");
     let status = response.status();
     let body = response.text().await.expect("response body");
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "direct-H2 ownership request must succeed; body={body}"
-    );
+    if status != StatusCode::OK {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "direct-H2 ownership request must succeed; status={status} body={body}\n\
+             --- registry: {entry:#?}\n--- logs ---\n{logs}"
+        );
+    }
     assert_eq!(
         body, "ok",
         "direct-H2 ownership path must reach the scripted backend"
