@@ -21,6 +21,7 @@ mod istio_docs_capability_parity_tests;
 mod mesh_types_tests;
 mod mesh_validation_tests;
 mod migration_runner_tests;
+mod mongo_index_plan_tests;
 mod mongo_store_tests;
 mod peer_auth_mtls_tests;
 mod plugin_migration_split_tests;
