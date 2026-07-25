@@ -971,6 +971,17 @@ const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
 /// receive a fair share of exploration traffic to establish a baseline.
 const LATENCY_WARMUP_EXPLORE_PERMILLE: u64 = 100; // 10%
 
+/// Whether a mixed-warm-up selection ticket should explore an unwarmed peer.
+///
+/// Uses a golden-ratio scramble of `ticket` so short observation windows
+/// still see ~`LATENCY_WARMUP_EXPLORE_PERMILLE` rate. A contiguous
+/// `ticket % 1000 < permille` test fails that contract: the first 200
+/// selections after a zeroed counter would explore 50% of the time.
+#[inline]
+fn should_explore_unwarmed(ticket: u64) -> bool {
+    (golden_ratio_hash(ticket) % 1000) < LATENCY_WARMUP_EXPLORE_PERMILLE
+}
+
 /// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
 /// attempt. Counts toward the warm-up threshold and penalizes the target so
 /// a target that fails every request exits warm-up with a poor score instead
@@ -5038,7 +5049,7 @@ impl LoadBalancer {
         // otherwise pick the best warmed EWMA.
         if !all_warmed_up {
             let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
-            let explore = (ticket % 1000) < LATENCY_WARMUP_EXPLORE_PERMILLE;
+            let explore = should_explore_unwarmed(ticket);
             if explore {
                 // Round-robin among unwarmed healthy targets only.
                 let mut skip = (ticket / 1000) as usize % unwarmed_count.max(1);
@@ -5255,7 +5266,7 @@ impl LoadBalancer {
 
         if !all_warmed_up {
             let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
-            let explore = (ticket % 1000) < LATENCY_WARMUP_EXPLORE_PERMILLE;
+            let explore = should_explore_unwarmed(ticket);
             if explore {
                 let mut skip = (ticket / 1000) as usize % unwarmed_count.max(1);
                 for candidate in candidates {

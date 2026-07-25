@@ -760,8 +760,14 @@ impl HealthChecker {
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
     /// whose stored deadline has elapsed, scoped to that proxy entry only.
     ///
-    /// Used by the background scanner and by deterministic external tests
-    /// (tests may backdate `recover_at_ms` then call this without sleeping).
+    /// Deterministic external unit tests backdate `recover_at_ms` and call this
+    /// without sleeping the background scanner. The scanner itself invokes
+    /// [`recover_due_passive_ejections_inner`] on cloned `Arc`s because the
+    /// spawned task cannot hold `&self`. The binary target still treats unused
+    /// `pub` methods as dead code, hence the narrow allow (same pattern as
+    /// [`Self::active_task_count`]).
+    #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn recover_due_passive_ejections(&self) {
         recover_due_passive_ejections_inner(&self.passive_health, self.lb_cache.as_ref());
     }
