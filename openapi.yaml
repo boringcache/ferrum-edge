@@ -10593,7 +10593,6 @@ components:
             RFC3339 timestamp of the most recently normally completed poll
             attempt, including empty success. Panic/abort/cancellation do not
             advance it. Absent until the first poll finishes.
-          nullable: true
         degraded:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
