@@ -34,6 +34,8 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 }
 
 const DB_LOADER_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
+const MONGO_INDEX_PLAN_SOURCE: &str =
+    include_str!("../../../src/config/mongo_index_plan.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
 
@@ -328,8 +330,8 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
         "Mongo list/cap boundary must use deterministic (ts, id) order"
     );
     assert!(
-        MONGO_STORE_SOURCE.contains("\"namespace\": 1, \"ts\": -1, \"id\": -1"),
-        "Mongo baseline index must include id for (ts, id) parity"
+        MONGO_INDEX_PLAN_SOURCE.contains("\"namespace\": 1, \"ts\": -1, \"id\": -1"),
+        "Mongo canonical plan baseline index must include id for (ts, id) parity"
     );
     assert_eq!(AUDIT_RETENTION_PRUNE_BATCH_SIZE, 1_000);
     assert_eq!(AUDIT_RETENTION_PRUNE_MAX_BATCHES, 8);
