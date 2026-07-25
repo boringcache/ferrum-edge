@@ -2951,7 +2951,8 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
 
-    let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
     plugin.start_background_tasks().expect("chargeback start");
     plugin.commit_background_tasks();
 
@@ -2985,9 +2986,16 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
 
     // While spool I/O remains blocked, another logging overflow must return
     // after a non-blocking try_enqueue (second job waits behind the first).
-    plugin
-        .log(&billable_summary("overflow-while-blocked"))
-        .await;
+    let plugin_for_bounded_log = Arc::clone(&plugin);
+    let bounded_log = tokio::spawn(async move {
+        plugin_for_bounded_log
+            .log(&billable_summary("overflow-while-blocked"))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), bounded_log)
+        .await
+        .expect("logging hook must return without waiting for blocked spool I/O")
+        .expect("bounded logging task must not panic");
 
     let (enqueued_after_hook, written_after_hook, lost_after_hook) = spool_delivery_totals();
     assert!(
