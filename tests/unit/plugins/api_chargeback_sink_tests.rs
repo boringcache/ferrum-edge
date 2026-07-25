@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, SpoolWriteHookPoint, classify_clickhouse_acknowledgement_for_tests,
-    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
-    decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
-    render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    serialize_json_each_row, set_spool_write_hook_for_tests, write_private_file_atomically_for_tests,
+    SpoolManager, SpoolSettings, SpoolWriteHookPoint,
+    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
+    clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
+    set_spool_write_hook_for_tests, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -2984,7 +2985,9 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
 
     // While spool I/O remains blocked, another logging overflow must return
     // after a non-blocking try_enqueue (second job waits behind the first).
-    plugin.log(&billable_summary("overflow-while-blocked")).await;
+    plugin
+        .log(&billable_summary("overflow-while-blocked"))
+        .await;
 
     let (enqueued_after_hook, written_after_hook, lost_after_hook) = spool_delivery_totals();
     assert!(
