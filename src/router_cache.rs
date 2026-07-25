@@ -803,12 +803,7 @@ impl CountMinSketch {
     fn arm_aging(&self) {
         if self
             .age_remaining
-            .compare_exchange(
-                0,
-                self.total_cells(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(0, self.total_cells(), Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
             self.age_pending.store(true, Ordering::Relaxed);
