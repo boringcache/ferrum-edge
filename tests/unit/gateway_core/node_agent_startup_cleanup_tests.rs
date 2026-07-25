@@ -14,7 +14,10 @@ use ferrum_edge::_test_support::{
 fn post_load_programs_failure_calls_cleanup_all_once() {
     let probe = node_agent_post_load_init_failure_cleanup_probe_for_test();
 
-    assert!(!probe.ok, "post-load capture-config failure must abort init");
+    assert!(
+        !probe.ok,
+        "post-load capture-config failure must abort init"
+    );
     let error = probe
         .error
         .expect("post-load failure must surface an error");
@@ -57,7 +60,11 @@ fn kubernetes_client_style_late_failure_calls_cleanup_all_once() {
 fn normal_shutdown_calls_cleanup_all_exactly_once() {
     let probe = node_agent_normal_shutdown_cleanup_once_probe_for_test();
 
-    assert!(probe.ok, "normal shutdown probe must succeed: {:?}", probe.error);
+    assert!(
+        probe.ok,
+        "normal shutdown probe must succeed: {:?}",
+        probe.error
+    );
     assert!(probe.cleaned_up);
     assert_eq!(
         probe.cleanup_all_calls, 1,
@@ -71,9 +78,7 @@ fn cleanup_failure_preserves_original_error() {
     let probe = node_agent_cleanup_failure_preserves_original_error_probe_for_test();
 
     assert!(!probe.ok);
-    let error = probe
-        .error
-        .expect("original error must still be returned");
+    let error = probe.error.expect("original error must still be returned");
     assert!(
         error.contains("original injected startup failure"),
         "cleanup failure must not hide the original cause: {error}"

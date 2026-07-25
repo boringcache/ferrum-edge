@@ -3636,12 +3636,11 @@ pub mod _test_support {
         }
     }
 
-    pub type NodeAgentStartupCleanupProbe =
-        crate::modes::node_agent::NodeAgentStartupCleanupProbe;
+    pub type NodeAgentStartupCleanupProbe = crate::modes::node_agent::NodeAgentStartupCleanupProbe;
 
     /// Post-`load_programs` initialization failure must roll back BPF state.
-    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test()
-    -> NodeAgentStartupCleanupProbe {
+    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
         crate::modes::node_agent::probe_post_load_init_failure_cleanup_for_test()
     }
 
@@ -3652,7 +3651,8 @@ pub mod _test_support {
     }
 
     /// Normal shutdown must invoke `cleanup_all` exactly once.
-    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe {
+    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
         crate::modes::node_agent::probe_normal_shutdown_cleanup_once_for_test()
     }
 

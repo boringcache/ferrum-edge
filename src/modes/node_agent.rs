@@ -5782,9 +5782,7 @@ impl InitializedBackendOwner {
         self.backend
             .as_mut()
             .map(|backend| backend.as_mut())
-            .expect(
-                "invariant: InitializedBackendOwner.backend is present until Drop or test take",
-            )
+            .expect("invariant: InitializedBackendOwner.backend is present until Drop or test take")
     }
 
     /// Detach enrolled pods and invoke `cleanup_all` exactly once (normal
@@ -5982,15 +5980,14 @@ pub(crate) fn probe_k8s_client_style_late_failure_cleanup_for_test() -> NodeAgen
         };
     }
     let owner = InitializedBackendOwner::new(Box::new(backend));
-    let (err, _backend) =
-        owner.fail_with_for_test(anyhow::anyhow!("injected kubernetes client construction failure"));
+    let (err, _backend) = owner.fail_with_for_test(anyhow::anyhow!(
+        "injected kubernetes client construction failure"
+    ));
     NodeAgentStartupCleanupProbe {
         ok: false,
         error: Some(err.to_string()),
         cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch
-            .cleaned_up
-            .load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
         programs_loaded: true,
         capture_config_set: false,
     }
@@ -6023,9 +6020,7 @@ pub(crate) fn probe_normal_shutdown_cleanup_once_for_test() -> NodeAgentStartupC
         ok: true,
         error: None,
         cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch
-            .cleaned_up
-            .load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
         programs_loaded: true,
         capture_config_set: false,
     }
@@ -6059,9 +6054,7 @@ pub(crate) fn probe_cleanup_failure_preserves_original_error_for_test()
         ok: false,
         error: Some(err.to_string()),
         cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch
-            .cleaned_up
-            .load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
         programs_loaded: true,
         capture_config_set: false,
     }
