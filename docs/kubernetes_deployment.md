@@ -294,15 +294,18 @@ dependency-aware readiness.
 
 | Workload | Liveness / startup default | Readiness default |
 | --- | --- | --- |
-| `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 until ready / while degraded) |
+| `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
 | `ambient`, `nodeAgent` | same admin `--live` exec when admin is enabled and port ≠ `0` | same admin `/health` exec; omitted when admin is disabled or port is `0` (NodeWaypoint still requires a non-zero ambient admin port) |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
 | `eastWest` | `tcpSocket` on the `tls-passthru` port | `tcpSocket` on the `tls-passthru` port |
 
 Liveness and startup share the process-only handler so an alive-but-degraded
-workload is removed from endpoints (or stays NotReady) instead of being
-restart-looped. Per-probe `override` maps replace only that probe's handler;
-a shared `probes.override` is rejected by `values.schema.json`.
+workload is not restart-looped. Readiness uses dependency-aware `/health`:
+starting/unavailable fail readiness (HTTP 503), while ready-but-degraded
+remains HTTP 200 / Ready with degradation observable in the JSON body (the
+built-in `ferrum-edge health` command evaluates HTTP status). Per-probe
+`override` maps replace only that probe's handler; a shared `probes.override`
+is rejected by `values.schema.json`.
 
 Example: disable control-plane probes, or replace injector readiness with HTTPS:
 

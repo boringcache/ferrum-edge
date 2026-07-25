@@ -86,8 +86,9 @@ controlPlane:
       valueFrom: {}
   # Independently configurable probes. Liveness/startup run
   # `ferrum-edge health --live` (GET /live: process + admin up). Readiness runs
-  # `ferrum-edge health` (GET /health: 503 until ready / while degraded). Do NOT
-  # point liveness at /health — that restart-loops an alive-but-unready CP.
+  # `ferrum-edge health` (GET /health: 503 while starting/unavailable; ready-but-
+  # degraded stays HTTP 200 with JSON status "degraded"). Do NOT point liveness
+  # at /health — that restart-loops an alive-but-unready CP.
   # failureThreshold*periodSeconds covers cert/config/DB startup (~3 min).
   probes:
     startup:
