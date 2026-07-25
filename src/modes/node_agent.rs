@@ -5888,6 +5888,7 @@ fn detach_enrolled_pods(
     }
 }
 
+#[cfg(test)]
 fn cleanup_all_pods(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
