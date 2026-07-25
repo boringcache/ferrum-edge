@@ -253,11 +253,9 @@ pub fn plan_istio_status_updates(
                     options.mesh_sidecar_ingress_enforced,
                 ),
                 "Telemetry" => telemetry_status(object, result.as_ref()),
-                "ProxyConfig" => proxy_config_status(
-                    object,
-                    result.as_ref(),
-                    &options.istio_root_namespace,
-                ),
+                "ProxyConfig" => {
+                    proxy_config_status(object, result.as_ref(), &options.istio_root_namespace)
+                }
                 _ => return None,
             };
             if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
