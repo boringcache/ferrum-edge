@@ -807,6 +807,33 @@ pub mod _test_support {
         crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
     }
 
+    pub async fn finalize_plugin_rejection_without_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -955,6 +982,15 @@ pub mod _test_support {
         content_type: &str,
     ) -> Result<String, String> {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
+    /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
+    /// request-time fallback computes)`. Cached nodes are filled once per
+    /// registered schema during ConversionPlan compile (#3024).
+    pub fn openapi_validator_schema_type_cache_stats_for_test(
+        plugin: &crate::plugins::openapi_validator::OpenapiValidator,
+    ) -> (usize, usize) {
+        plugin.schema_type_cache_stats_for_test()
     }
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
@@ -1921,8 +1957,21 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
-    pub fn db_append_connect_timeout(url: &str, db_type: &str, timeout: u64) -> String {
-        crate::config::db_loader::DatabaseStore::append_connect_timeout(url, db_type, timeout)
+    pub async fn await_pool_connect_with_timeout<F, T>(
+        timeout_seconds: u64,
+        connect: F,
+    ) -> Result<T, sqlx::Error>
+    where
+        F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    {
+        crate::config::db_loader::await_pool_connect_with_timeout(timeout_seconds, connect).await
+    }
+
+    pub fn effective_pool_connect_timeout_seconds(db_type: &str, configured_seconds: u64) -> u64 {
+        crate::config::db_loader::effective_pool_connect_timeout_seconds(
+            db_type,
+            configured_seconds,
+        )
     }
 
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
@@ -3393,6 +3442,13 @@ pub mod _test_support {
             fatal_send_failed,
             drain_round_exhausted,
         )
+    }
+
+    /// External regression coverage for issue #2959 (DTLS demux identity-aware
+    /// session removal). See
+    /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
+    pub fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String> {
+        crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
