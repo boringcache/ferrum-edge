@@ -106,10 +106,8 @@ pub fn record_unexpected_cp_poll_task_exit(
 ///
 /// Uses [`DATABASE_POLL_RESPAWN_DELAY`] between unexpected exits and the next
 /// spawn. See [`supervise_database_mode_poll_task_with_delay`].
-pub async fn supervise_database_mode_poll_task<F>(
-    spawn_poll: F,
-    shutdown_rx: watch::Receiver<bool>,
-) where
+pub async fn supervise_database_mode_poll_task<F>(spawn_poll: F, shutdown_rx: watch::Receiver<bool>)
+where
     F: FnMut() -> JoinHandle<()>,
 {
     supervise_database_mode_poll_task_with_delay(

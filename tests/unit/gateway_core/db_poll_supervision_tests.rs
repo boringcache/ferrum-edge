@@ -110,13 +110,8 @@ async fn ordinary_cp_shutdown_does_not_degrade() {
         let startup_ready = startup_ready.clone();
         let serving_degraded = serving_degraded.clone();
         async move {
-            supervise_control_plane_poll_task(
-                handle,
-                startup_ready,
-                serving_degraded,
-                shutdown_rx,
-            )
-            .await;
+            supervise_control_plane_poll_task(handle, startup_ready, serving_degraded, shutdown_rx)
+                .await;
         }
     });
 
@@ -240,11 +235,7 @@ async fn database_mode_supervisor_rate_limits_repeated_unexpected_exits() {
         .await;
     });
 
-    yield_until(
-        || spawn_count.load(Ordering::Acquire) >= 1,
-        "first spawn",
-    )
-    .await;
+    yield_until(|| spawn_count.load(Ordering::Acquire) >= 1, "first spawn").await;
     assert_eq!(spawn_count.load(Ordering::Acquire), 1);
     for _ in 0..32 {
         tokio::task::yield_now().await;
@@ -262,11 +253,7 @@ async fn database_mode_supervisor_rate_limits_repeated_unexpected_exits() {
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
-    yield_until(
-        || spawn_count.load(Ordering::Acquire) >= 2,
-        "second spawn",
-    )
-    .await;
+    yield_until(|| spawn_count.load(Ordering::Acquire) >= 2, "second spawn").await;
     assert_eq!(spawn_count.load(Ordering::Acquire), 2);
     for _ in 0..32 {
         tokio::task::yield_now().await;
@@ -284,11 +271,7 @@ async fn database_mode_supervisor_rate_limits_repeated_unexpected_exits() {
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
-    yield_until(
-        || spawn_count.load(Ordering::Acquire) >= 3,
-        "third spawn",
-    )
-    .await;
+    yield_until(|| spawn_count.load(Ordering::Acquire) >= 3, "third spawn").await;
 
     shutdown_tx.send(true).expect("shutdown");
     // Allow the supervisor to observe shutdown if it re-entered the delay sleep.
@@ -320,18 +303,16 @@ async fn database_mode_shutdown_interrupts_respawn_wait_without_another_generati
         .await;
     });
 
-    yield_until(
-        || spawn_count.load(Ordering::Acquire) >= 1,
-        "first spawn",
-    )
-    .await;
+    yield_until(|| spawn_count.load(Ordering::Acquire) >= 1, "first spawn").await;
     // Let the supervisor enter the respawn delay after unexpected completion.
     for _ in 0..32 {
         tokio::task::yield_now().await;
     }
     assert_eq!(spawn_count.load(Ordering::Acquire), 1);
 
-    shutdown_tx.send(true).expect("shutdown during respawn wait");
+    shutdown_tx
+        .send(true)
+        .expect("shutdown during respawn wait");
     supervisor.await.expect("supervisor join");
     assert_eq!(
         spawn_count.load(Ordering::Acquire),
@@ -353,18 +334,13 @@ enum SimulatedPollExit {
     MidAttemptDrop,
 }
 
-async fn run_simulated_poll_attempt(
-    metrics: &DatabaseDeltaPollMetrics,
-    exit: SimulatedPollExit,
-) {
+async fn run_simulated_poll_attempt(metrics: &DatabaseDeltaPollMetrics, exit: SimulatedPollExit) {
     match exit {
-        SimulatedPollExit::FallthroughSuccess
-        | SimulatedPollExit::FallthroughEmpty => {
+        SimulatedPollExit::FallthroughSuccess | SimulatedPollExit::FallthroughEmpty => {
             // Work completes; stamp at normal fallthrough.
             metrics.record_poll_completed();
         }
-        SimulatedPollExit::HandledRejectionContinue
-        | SimulatedPollExit::HandledErrorContinue => {
+        SimulatedPollExit::HandledRejectionContinue | SimulatedPollExit::HandledErrorContinue => {
             // Production records immediately before each handled `continue`.
             metrics.record_poll_completed();
         }
@@ -393,10 +369,7 @@ async fn last_poll_completed_at_advances_on_every_normal_completion_exit_class()
         std::thread::sleep(Duration::from_millis(2));
         run_simulated_poll_attempt(metrics.as_ref(), exit).await;
         let stamped = metrics.last_poll_completed_at_unix_ms();
-        assert!(
-            stamped > 0,
-            "{exit:?} must stamp last_poll_completed_at"
-        );
+        assert!(stamped > 0, "{exit:?} must stamp last_poll_completed_at");
         assert!(
             stamped >= previous,
             "{exit:?} must advance or retain freshness (prev={previous}, now={stamped})"
@@ -482,10 +455,7 @@ fn poll_tick_body<'a>(source: &'a str, shutdown_marker: &str) -> &'a str {
     let tick = source
         .find("_ = interval.tick() => {")
         .expect("poll tick arm");
-    let shutdown = source[tick..]
-        .find(shutdown_marker)
-        .expect("shutdown arm")
-        + tick;
+    let shutdown = source[tick..].find(shutdown_marker).expect("shutdown arm") + tick;
     &source[tick..shutdown]
 }
 

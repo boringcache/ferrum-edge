@@ -2415,9 +2415,7 @@ impl MetricsRegistry {
             output.push_str(
                 "# HELP ferrum_database_poll_last_completed_timestamp_seconds Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).\n",
             );
-            output.push_str(
-                "# TYPE ferrum_database_poll_last_completed_timestamp_seconds gauge\n",
-            );
+            output.push_str("# TYPE ferrum_database_poll_last_completed_timestamp_seconds gauge\n");
             let last_poll_secs = snapshot.last_poll_completed_at_unix_ms / 1000;
             render_process_counter(
                 &mut output,
