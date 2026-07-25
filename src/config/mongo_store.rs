@@ -68,8 +68,8 @@ mod inner {
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
     use mongodb::options::{
-        ClientOptions, FindOptions, IndexOptions, ReadConcern, ReadPreference, ReturnDocument,
-        SelectionCriteria, Tls, TlsOptions, WriteConcern,
+        ClientOptions, FindOptions, ReadConcern, ReadPreference, ReturnDocument, SelectionCriteria,
+        Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -9180,7 +9180,7 @@ mod inner {
                 // NamespaceExists (code 48) is tolerated for idempotent
                 // multi-instance startup.
                 for lock_collection in REQUIRED_GUARD_COLLECTIONS {
-                    match self.db().create_collection(lock_collection).await {
+                    match self.db().create_collection(*lock_collection).await {
                         Ok(()) => {}
                         Err(e) if is_namespace_exists(&e) => {}
                         Err(e) => return Err(e.into()),
