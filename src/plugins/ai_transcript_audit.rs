@@ -1426,14 +1426,12 @@ impl AiTranscriptAudit {
         let request_excerpt = staging.and_then(|s| s.request_excerpt.clone());
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
-        // `model` and `tool_names` are copied straight out of the user request
-        // body, so they bypass the body-excerpt redaction path. Protected modes
-        // already redact-then-bound at extraction (so a PII span straddling the
-        // 256/128-byte ceiling cannot leak as an unmatched raw prefix); re-run
-        // the redactor here as defense in depth. `full_body` keeps the bounded
-        // raw prefix by explicit opt-in. Length/count bounds already applied;
-        // never re-expand.
-        let redact_request_derived = self.mode != AuditMode::FullBody;
+        // Request-derived model/tool values were already redacted over their
+        // full observed strings and then bounded while staging (or while
+        // harvesting `ai_model`). Do not run the redactor again here: custom
+        // replacements may expand an already-bounded value and violate the
+        // queued-record memory contract. `full_body` deliberately staged the
+        // bounded raw value instead.
         let (
             tool_names,
             tool_names_truncated,
@@ -1444,14 +1442,6 @@ impl AiTranscriptAudit {
             let tool_names_truncated = staging.map(|s| s.tool_names_truncated).unwrap_or(false);
             let tool_names_omitted = staging.map(|s| s.tool_names_omitted).unwrap_or(0);
             let tool_names_hash = staging.and_then(|s| s.tool_names_hash.clone());
-            let tool_names = if redact_request_derived {
-                tool_names
-                    .iter()
-                    .map(|name| self.redactor.redact(name))
-                    .collect()
-            } else {
-                tool_names
-            };
             (
                 tool_names,
                 tool_names_truncated,
@@ -1477,11 +1467,6 @@ impl AiTranscriptAudit {
                         harvest.model_hash,
                     )
                 };
-            let model = if redact_request_derived {
-                model.map(|value| self.redactor.redact(&value))
-            } else {
-                model
-            };
             (model, model_truncated, model_hash)
         } else {
             (None, false, None)

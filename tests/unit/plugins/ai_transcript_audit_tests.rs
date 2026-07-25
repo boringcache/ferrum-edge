@@ -5619,6 +5619,58 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
     assert_eq!(records[0]["tool_names_truncated"], true);
 }
 
+#[tokio::test]
+async fn custom_redaction_expansion_is_not_reapplied_after_bounding() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let placeholder = "X".repeat(MAX_MODEL_BYTES * 2);
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "metadata_only",
+                "capture": { "tool_calls": true },
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [{ "name": "every_char", "regex": "." }],
+                    "placeholder": placeholder,
+                    "hash_redacted_values": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid expanding redactor");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "m",
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name":"t"}}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let model = records[0]["model"].as_str().expect("model");
+    let tool = records[0]["tool_names"][0].as_str().expect("tool");
+    assert_eq!(model.len(), MAX_MODEL_BYTES);
+    assert_eq!(tool.len(), MAX_TOOL_NAME_BYTES);
+    assert!(model.bytes().all(|byte| byte == b'X'));
+    assert!(tool.bytes().all(|byte| byte == b'X'));
+    assert_eq!(records[0]["model_truncated"], true);
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
 #[test]
 fn retained_record_contract_matches_documented_formula() {
     assert_eq!(
