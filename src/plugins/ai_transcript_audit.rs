@@ -1124,14 +1124,17 @@ impl AiTranscriptAudit {
         // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
         // staged, so they stay on the native-H3 path.
+        let redact_before_bound = self.mode != AuditMode::FullBody;
         let bounded_model = parsed
             .as_ref()
-            .map(|json| extract_model_bounded(json, &self.redactor))
+            .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
             .unwrap_or_default();
         let bounded_tools = if self.capture.tool_calls {
             parsed
                 .as_ref()
-                .map(|json| extract_tool_names_bounded(json, &self.redactor))
+                .map(|json| {
+                    extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
+                })
                 .unwrap_or_default()
         } else {
             BoundedToolNames::default()
@@ -1196,9 +1199,10 @@ impl AiTranscriptAudit {
             staged.request_excerpt = request_excerpt;
             staged.request_truncated = request_truncated;
             staged.request_hash = Some(request_hash.clone());
+            let redact_before_bound = self.mode != AuditMode::FullBody;
             let bounded_model = parsed
                 .as_ref()
-                .map(|json| extract_model_bounded(json, &self.redactor))
+                .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
                 .unwrap_or_default();
             staged.request_model = bounded_model.value;
             staged.request_model_truncated = bounded_model.truncated;
@@ -1206,7 +1210,9 @@ impl AiTranscriptAudit {
             if self.capture.tool_calls {
                 let bounded_tools = parsed
                     .as_ref()
-                    .map(|json| extract_tool_names_bounded(json, &self.redactor))
+                    .map(|json| {
+                        extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
+                    })
                     .unwrap_or_default();
                 staged.tool_names = bounded_tools.names;
                 staged.tool_names_truncated = bounded_tools.truncated;
@@ -1356,7 +1362,14 @@ impl AiTranscriptAudit {
             match key.as_str() {
                 "ai_model" => {
                     // Bound before retaining: metadata values can be attacker-shaped.
-                    let bounded = bound_model_str(value, &self.redactor);
+                    // Protected modes redact the full observed string first so a
+                    // PII span straddling the model ceiling cannot leak as a raw
+                    // prefix; `full_body` keeps the bounded raw prefix.
+                    let bounded = bound_model_str(
+                        value,
+                        &self.redactor,
+                        self.mode != AuditMode::FullBody,
+                    );
                     harvest.model = bounded.value;
                     harvest.model_truncated = bounded.truncated;
                     harvest.model_hash = bounded.hash;
@@ -1414,11 +1427,12 @@ impl AiTranscriptAudit {
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
         // `model` and `tool_names` are copied straight out of the user request
-        // body, so they bypass the body-excerpt redaction path. Run them through
-        // the same redactor before export in every mode except the explicit
-        // `full_body` raw-capture opt-in — a PII-bearing "model" string must not
-        // leak through the metadata side door in redacted/metadata/hash modes.
-        // Length/count bounds already applied at extraction; never re-expand.
+        // body, so they bypass the body-excerpt redaction path. Protected modes
+        // already redact-then-bound at extraction (so a PII span straddling the
+        // 256/128-byte ceiling cannot leak as an unmatched raw prefix); re-run
+        // the redactor here as defense in depth. `full_body` keeps the bounded
+        // raw prefix by explicit opt-in. Length/count bounds already applied;
+        // never re-expand.
         let redact_request_derived = self.mode != AuditMode::FullBody;
         let (
             tool_names,
@@ -2900,16 +2914,55 @@ fn is_guardrail_key(key: &str) -> bool {
     PREFIXES.iter().any(|prefix| key.starts_with(prefix))
 }
 
-fn extract_model_bounded(json: &Value, redactor: &PiiRedactor) -> BoundedModel {
+fn extract_model_bounded(
+    json: &Value,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+) -> BoundedModel {
     let Some(raw) = json.get("model").and_then(Value::as_str) else {
         return BoundedModel::default();
     };
-    bound_model_str(raw, redactor)
+    bound_model_str(raw, redactor, redact_before_bound)
 }
 
-fn bound_model_str(raw: &str, redactor: &PiiRedactor) -> BoundedModel {
+/// Bound a request-derived model string for staging/export.
+///
+/// Ordering matters for every mode except the explicit `full_body` raw-capture
+/// opt-in: redaction runs over the FULL observed string first and the retained
+/// UTF-8-safe prefix is selected afterwards, so a sensitive token straddling
+/// the `MAX_MODEL_BYTES` ceiling can never leak as an unmatched raw prefix.
+/// Truncation evidence always hashes the original unredacted value; staging
+/// never retains raw excess bytes. `full_body` deliberately keeps the bounded
+/// raw prefix.
+fn bound_model_str(
+    raw: &str,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+) -> BoundedModel {
     if raw.is_empty() {
         return BoundedModel::default();
+    }
+    if redact_before_bound {
+        // Temporary full-string redaction is request-scoped; the retained
+        // value below is hard-bounded for staging and queued records.
+        let redacted = redactor.redact(raw);
+        let mut truncated = raw.len() > MAX_MODEL_BYTES;
+        let retained = if redacted.len() > MAX_MODEL_BYTES {
+            truncated = true;
+            truncate_str_ref(&redacted, MAX_MODEL_BYTES).to_string()
+        } else {
+            redacted
+        };
+        let hash = if truncated {
+            Some(redactor.keyed_hash_hex(raw.as_bytes()))
+        } else {
+            None
+        };
+        return BoundedModel {
+            value: Some(retained),
+            truncated,
+            hash,
+        };
     }
     if raw.len() <= MAX_MODEL_BYTES {
         return BoundedModel {
@@ -2934,7 +2987,17 @@ fn bound_short_metadata(raw: &str) -> String {
     truncate_str_ref(raw, MAX_MODEL_BYTES).to_string()
 }
 
-fn extract_tool_names_bounded(json: &Value, redactor: &PiiRedactor) -> BoundedToolNames {
+/// Bound request-derived tool/function names for staging/export.
+///
+/// Same redact-then-bound ordering as [`bound_model_str`] for protected modes:
+/// each observed name is redacted in full before the per-name / aggregate
+/// UTF-8-safe admit decision, while truncation evidence hashes the original
+/// unredacted names. `full_body` retains bounded raw prefixes.
+fn extract_tool_names_bounded(
+    json: &Value,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+) -> BoundedToolNames {
     let mut hasher = redactor.keyed_hasher();
     let mut names = Vec::new();
     let mut aggregate_bytes = 0usize;
@@ -2961,11 +3024,24 @@ fn extract_tool_names_bounded(json: &Value, redactor: &PiiRedactor) -> BoundedTo
             hasher.update(name.as_bytes());
             hasher.update(&[0]);
 
-            let (admitted, _name_truncated) = if name.len() > MAX_TOOL_NAME_BYTES {
+            // Protected modes: redact the full name first (temporary), then
+            // select the retained UTF-8-safe prefix. full_body keeps raw.
+            // Truncation evidence is driven by the original unredacted length.
+            if name.len() > MAX_TOOL_NAME_BYTES {
                 truncated = true;
-                (truncate_str_ref(name, MAX_TOOL_NAME_BYTES), true)
+            }
+            let redacted;
+            let candidate = if redact_before_bound {
+                redacted = redactor.redact(name);
+                redacted.as_str()
             } else {
-                (name, false)
+                name
+            };
+            let admitted = if candidate.len() > MAX_TOOL_NAME_BYTES {
+                truncated = true;
+                truncate_str_ref(candidate, MAX_TOOL_NAME_BYTES)
+            } else {
+                candidate
             };
 
             if names.len() >= MAX_TOOL_NAMES

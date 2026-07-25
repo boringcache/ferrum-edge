@@ -5492,6 +5492,133 @@ async fn metadata_only_mode_still_bounds_model_and_tools() {
     assert_eq!(records[0]["tool_names_truncated"], true);
 }
 
+#[tokio::test]
+async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
+    // Pad so the SSN straddles the model/tool ceilings: truncate-then-redact
+    // would export the unmatched raw prefix ("123-45"). Protected modes must
+    // redact the full observed string first; full_body may keep the raw prefix.
+    let ssn = "123-45-6789";
+    let model_pad = MAX_MODEL_BYTES - 6;
+    let tool_pad = MAX_TOOL_NAME_BYTES - 6;
+    let huge_model = format!("{}{ssn}", "m".repeat(model_pad));
+    let huge_tool = format!("{}{ssn}", "t".repeat(tool_pad));
+    assert_eq!(&huge_model[..MAX_MODEL_BYTES], format!("{}123-45", "m".repeat(model_pad)));
+    assert_eq!(&huge_tool[..MAX_TOOL_NAME_BYTES], format!("{}123-45", "t".repeat(tool_pad)));
+
+    let body = json!({
+        "model": huge_model.clone(),
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name": huge_tool.clone()}}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let secret = "fleet-stable-hmac-key";
+
+    for mode in [
+        json!({ "mode": "redacted_body" }),
+        json!({ "mode": "metadata_only" }),
+    ] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let mut overrides = mode.clone();
+        if let Some(obj) = overrides.as_object_mut() {
+            obj.insert("capture".to_string(), json!({ "tool_calls": true }));
+            obj.insert(
+                "redaction".to_string(),
+                json!({ "hash_secret": secret }),
+            );
+        }
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, overrides.clone()),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "overrides: {overrides}");
+
+        let model = records[0]["model"].as_str().expect("model");
+        assert!(
+            model.len() <= MAX_MODEL_BYTES,
+            "model must stay hard-bounded ({overrides}): len={}",
+            model.len()
+        );
+        assert!(
+            !model.contains("123-45") && !model.contains("123-4"),
+            "raw SSN prefix leaked through model after bound ({overrides}): {model}"
+        );
+        assert_eq!(records[0]["model_truncated"], true);
+        assert_eq!(
+            records[0]["model_hash"].as_str().expect("model_hash"),
+            keyed_reference(secret).keyed_hash_hex(huge_model.as_bytes()),
+            "truncation hash must cover the full original model ({overrides})"
+        );
+
+        let tool = records[0]["tool_names"][0].as_str().expect("tool name");
+        assert!(
+            tool.len() <= MAX_TOOL_NAME_BYTES,
+            "tool name must stay hard-bounded ({overrides}): len={}",
+            tool.len()
+        );
+        assert!(
+            !tool.contains("123-45") && !tool.contains("123-4"),
+            "raw SSN prefix leaked through tool name after bound ({overrides}): {tool}"
+        );
+        assert_eq!(records[0]["tool_names_truncated"], true);
+        assert!(records[0]["tool_names_hash"].as_str().is_some());
+    }
+
+    // full_body keeps the bounded raw prefix (explicit opt-in), including the
+    // unmatched SSN fragment that protected modes must not export.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "capture": { "tool_calls": true },
+                "redaction": { "hash_secret": secret }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let model = records[0]["model"].as_str().expect("model");
+    assert_eq!(model, &huge_model[..MAX_MODEL_BYTES]);
+    assert!(model.ends_with("123-45"));
+    assert_eq!(records[0]["model_truncated"], true);
+    assert_eq!(
+        records[0]["model_hash"].as_str().expect("model_hash"),
+        keyed_reference(secret).keyed_hash_hex(huge_model.as_bytes())
+    );
+    let tool = records[0]["tool_names"][0].as_str().expect("tool name");
+    assert_eq!(tool, &huge_tool[..MAX_TOOL_NAME_BYTES]);
+    assert!(tool.ends_with("123-45"));
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
 #[test]
 fn retained_record_contract_matches_documented_formula() {
     assert_eq!(
