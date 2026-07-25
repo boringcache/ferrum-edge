@@ -2085,18 +2085,18 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     let source = include_str!("../../../src/config/db_loader.rs");
 
     let row_to_proxy = source
-        .split("fn row_to_proxy(")
+        .split("fn row_to_proxy_inner(")
         .nth(1)
         .and_then(|rest| rest.split("fn row_to_consumer(").next())
-        .expect("row_to_proxy body");
+        .expect("row_to_proxy_inner body");
     let row_to_upstream = source
-        .split("fn row_to_upstream(")
+        .split("fn row_to_upstream_inner(")
         .nth(1)
         .and_then(|rest| {
             rest.split("fn strip_api_spec_id_from_runtime_config(")
                 .next()
         })
-        .expect("row_to_upstream body");
+        .expect("row_to_upstream_inner body");
 
     // Already-hardened contrast cases that established this contract.
     assert!(
