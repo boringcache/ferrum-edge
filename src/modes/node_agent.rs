@@ -873,7 +873,7 @@ async fn run_with_backend(
 /// drive the node-agent watcher loop against an injected finite (or pending)
 /// pod-event stream without a live Kubernetes API. CNI is disabled; callers
 /// may seed already-attached pods to assert BPF detach/cleanup side effects.
-pub async fn run_with_pod_stream_for_test<S, I>(
+pub(crate) async fn run_with_pod_stream_for_test<S, I>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
@@ -977,17 +977,19 @@ where
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
 
-    let mut exit_reason = PodWatcherLoopExit::ShutdownRequested;
-    loop {
+    let exit_reason = loop {
         if *shutdown_rx.borrow() {
-            exit_reason = PodWatcherLoopExit::ShutdownRequested;
-            break;
+            break PodWatcherLoopExit::ShutdownRequested;
         }
         tokio::select! {
+            // Prefer an operator-requested shutdown when it becomes ready in
+            // the same poll as watcher exhaustion. The None arm rechecks the
+            // watch value as well, closing the race where shutdown arrives
+            // after this arm was polled but before the stream is polled.
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    exit_reason = PodWatcherLoopExit::ShutdownRequested;
-                    break;
+                    break PodWatcherLoopExit::ShutdownRequested;
                 }
             }
             event = pod_stream.next() => {
@@ -1045,9 +1047,11 @@ where
                         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     None => {
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
+                        }
                         warn!("Pod watcher ended unexpectedly");
-                        exit_reason = PodWatcherLoopExit::WatcherExhausted;
-                        break;
+                        break PodWatcherLoopExit::WatcherExhausted;
                     }
                 }
             }
@@ -1134,7 +1138,7 @@ where
                 );
             }
         }
-    }
+    };
 
     // Same finally-style path for both exit reasons: stop background CNI work,
     // detach BPF / maps, then await the listener. Watcher exhaustion must not

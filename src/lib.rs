@@ -3517,5 +3517,31 @@ pub mod _test_support {
     }
 
     // ── modes/node_agent watcher exit (#2369) ────────────────────────────────
-    pub use crate::modes::node_agent::run_with_pod_stream_for_test;
+    pub type NodeAgentPodWatcherEventForTest = Result<
+        kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Pod>,
+        kube::runtime::watcher::Error,
+    >;
+
+    pub async fn run_with_pod_stream_for_test<S, I>(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: Arc<crate::ebpf::NodeAgentMetrics>,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        pod_stream: S,
+        seed_pods: I,
+    ) -> Result<(), anyhow::Error>
+    where
+        S: futures_util::Stream<Item = NodeAgentPodWatcherEventForTest> + Unpin,
+        I: IntoIterator<Item = crate::ebpf::PodAttachmentState>,
+    {
+        crate::modes::node_agent::run_with_pod_stream_for_test(
+            backend,
+            config,
+            metrics,
+            shutdown_tx,
+            pod_stream,
+            seed_pods,
+        )
+        .await
+    }
 }

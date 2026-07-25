@@ -11,7 +11,8 @@ use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentMetrics, PodAttachmentState,
 };
-use ferrum_edge::modes::node_agent::{NodeAgentConfig, run_with_pod_stream_for_test};
+use ferrum_edge::_test_support::run_with_pod_stream_for_test;
+use ferrum_edge::modes::node_agent::NodeAgentConfig;
 use futures::stream;
 use k8s_openapi::api::core::v1::Pod;
 use kube::runtime::watcher::{Error as WatcherError, Event};
@@ -76,6 +77,34 @@ async fn shutdown_requested_cleans_up_and_returns_ok() {
         "shutdown path must run backend.cleanup_all"
     );
     assert_eq!(backend.detached_pods, vec!["pod-shutdown".to_string()]);
+}
+
+#[tokio::test]
+async fn shutdown_requested_wins_over_an_already_exhausted_stream() {
+    let mut backend = MockEbpfBackend::default();
+    let metrics = Arc::new(NodeAgentMetrics::default());
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(true);
+    let empty = stream::empty::<Result<Event<Pod>, WatcherError>>();
+
+    let result = run_with_pod_stream_for_test(
+        &mut backend,
+        &test_config(),
+        metrics,
+        &shutdown_tx,
+        empty,
+        [seeded_attached_pod("pod-shutdown-race")],
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "requested shutdown must win over stream exhaustion, got {result:?}"
+    );
+    assert!(backend.cleaned_up);
+    assert_eq!(
+        backend.detached_pods,
+        vec!["pod-shutdown-race".to_string()]
+    );
 }
 
 #[tokio::test]
