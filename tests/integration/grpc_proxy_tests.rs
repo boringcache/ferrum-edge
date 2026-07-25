@@ -4654,9 +4654,7 @@ fn grpc_retry_loop_clones_real_header_map_not_string_rebuild() {
     // The old rebuild loop turned ctx.headers entries back into HeaderValues,
     // comma-joining duplicates and dropping non-UTF-8 opaque values.
     assert!(
-        !src.contains(
-            "let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {"
-        ),
+        !src.contains("let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {"),
         "must not rebuild retry headers from stringified ctx.headers"
     );
 }

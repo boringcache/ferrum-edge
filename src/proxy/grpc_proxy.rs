@@ -4132,9 +4132,7 @@ mod tests {
             "the request-scoped typed deadline must be the sole absolute source"
         );
         assert!(
-            body.contains(
-                "apply_remaining_grpc_timeout_header(&mut headers, deadline)"
-            ),
+            body.contains("apply_remaining_grpc_timeout_header(&mut headers, deadline)"),
             "each attempt must forward a decremented remaining grpc-timeout"
         );
         assert!(

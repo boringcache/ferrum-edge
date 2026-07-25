@@ -185,10 +185,7 @@ impl ScriptedGrpcBackendBuilder {
     /// Supply connection-indexed scripts. Connection 0 receives the first
     /// script, connection 1 the second, and so on. Later connections reuse
     /// the last script when the list is shorter than the accept count.
-    pub fn connection_scripts(
-        mut self,
-        scripts: impl IntoIterator<Item = Vec<GrpcStep>>,
-    ) -> Self {
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<GrpcStep>>) -> Self {
         let h2_scripts = scripts.into_iter().map(|steps| {
             steps
                 .into_iter()

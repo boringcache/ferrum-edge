@@ -27139,9 +27139,7 @@ fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
     if status_code == 504 {
         r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()
     } else {
-        r#"{"error":"Backend response body read failed"}"#
-            .as_bytes()
-            .to_vec()
+        r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec()
     }
 }
 
