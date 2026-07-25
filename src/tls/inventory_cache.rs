@@ -208,7 +208,7 @@ pub fn snapshot() -> Option<Arc<TlsInventorySnapshot>> {
         let snapshot = CACHE.snapshot.load().as_ref().clone();
         let collector_after = CACHE.collector.load_full();
         if Arc::ptr_eq(&collector_before, &collector_after) {
-            let collector_generation = collector_after.as_ref()?.generation;
+            let collector_generation = collector_after.as_ref().as_ref()?.generation;
             return snapshot
                 .filter(|snapshot| snapshot.collector_generation == collector_generation);
         }
