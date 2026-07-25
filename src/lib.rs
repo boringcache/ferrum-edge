@@ -3515,4 +3515,7 @@ pub mod _test_support {
             }
         }
     }
+
+    // ── modes/node_agent watcher exit (#2369) ────────────────────────────────
+    pub use crate::modes::node_agent::run_with_pod_stream_for_test;
 }

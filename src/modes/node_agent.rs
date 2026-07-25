@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self as kube_watcher, Event};
@@ -830,6 +830,18 @@ fn create_backend(
     }
 }
 
+/// Why the node-agent pod-watcher select loop stopped.
+///
+/// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
+/// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
+/// `Err` so supervisors that restart only on nonzero exit will relaunch the
+/// agent (#2369).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodWatcherLoopExit {
+    ShutdownRequested,
+    WatcherExhausted,
+}
+
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
@@ -838,16 +850,90 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
-    initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
-
-    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-
-    let mut shutdown_rx = shutdown_tx.subscribe();
     let client = build_node_agent_kube_client().await?;
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
-    let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    run_with_pod_stream(
+        backend.as_mut(),
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        Some(client),
+        pod_stream,
+        std::iter::empty(),
+    )
+    .await
+}
+
+/// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
+/// drive the node-agent watcher loop against an injected finite (or pending)
+/// pod-event stream without a live Kubernetes API. CNI is disabled; callers
+/// may seed already-attached pods to assert BPF detach/cleanup side effects.
+pub async fn run_with_pod_stream_for_test<S, I>(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let cni_config = CniListenerConfig {
+        enabled: false,
+        socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+    };
+    run_with_pod_stream(
+        backend,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        None,
+        pod_stream,
+        seed_pods,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_pod_stream<S, I>(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
+    kube_client: Option<Client>,
+    mut pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    initialize_backend(backend, config, metrics.as_ref())?;
+
+    if cni_config.enabled && kube_client.is_none() {
+        anyhow::bail!(
+            "CNI plugin listener requires a Kubernetes client for pod metadata lookups"
+        );
+    }
+
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    for state in seed_pods {
+        pod_states.insert(state.pod_uid.clone(), state);
+    }
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
     let mut init_seen: Option<HashSet<String>> = None;
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
@@ -891,13 +977,16 @@ async fn run_with_backend(
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
 
+    let mut exit_reason = PodWatcherLoopExit::ShutdownRequested;
     loop {
         if *shutdown_rx.borrow() {
+            exit_reason = PodWatcherLoopExit::ShutdownRequested;
             break;
         }
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
+                    exit_reason = PodWatcherLoopExit::ShutdownRequested;
                     break;
                 }
             }
@@ -905,7 +994,7 @@ async fn run_with_backend(
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
                         handle_kube_pod_applied(
-                            backend.as_mut(),
+                            backend,
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -914,7 +1003,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                            handle_pod_removed(backend, &pod_states, config, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -922,7 +1011,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
-                            backend.as_mut(),
+                            backend,
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -935,13 +1024,13 @@ async fn run_with_backend(
                         if let Some(seen) = init_seen.take() {
                             let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                                handle_pod_removed(backend, &pod_states, config, metrics.as_ref(), &uid);
                             }
                             // Also remove pods whose owned failure snapshots
                             // vanished across the relist; otherwise the retry
                             // loop replays them indefinitely (see helper docs).
                             prune_failed_enrollments_from_relist(
-                                backend.as_mut(),
+                                backend,
                                 &pod_states,
                                 config,
                                 &metrics,
@@ -957,6 +1046,7 @@ async fn run_with_backend(
                     }
                     None => {
                         warn!("Pod watcher ended unexpectedly");
+                        exit_reason = PodWatcherLoopExit::WatcherExhausted;
                         break;
                     }
                 }
@@ -964,12 +1054,20 @@ async fn run_with_backend(
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
+                        let Some(client) = kube_client.as_ref() else {
+                            // Unreachable when CNI is enabled (gated at entry).
+                            // Respond fail-closed so the CNI binary cannot hang.
+                            let _ = work.respond.send(CniRpcResponse::Error {
+                                reason: "node-agent Kubernetes client unavailable".to_string(),
+                            });
+                            continue;
+                        };
                         let enrolled_uid = process_cni_work_item(
-                            backend.as_mut(),
+                            backend,
                             &pod_states,
                             config,
                             metrics.as_ref(),
-                            &client,
+                            client,
                             work,
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
@@ -989,37 +1087,37 @@ async fn run_with_backend(
                 // that would otherwise keep capture partially attached. Cheap
                 // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     false,
                 );
                 retry_pending_pod_detaches(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_pod_ip_removals(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_updates(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_removals(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_cgroup_map_removals(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1027,7 +1125,7 @@ async fn run_with_backend(
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness_with_sync_state(
-                    backend.as_mut(),
+                    backend,
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1038,14 +1136,21 @@ async fn run_with_backend(
         }
     }
 
+    // Same finally-style path for both exit reasons: stop background CNI work,
+    // detach BPF / maps, then await the listener. Watcher exhaustion must not
+    // skip this and must not hang waiting for a CNI task that never sees
+    // shutdown.
+    let _ = shutdown_tx.send(true);
+
     info!(
+        exit_reason = ?exit_reason,
         pods_enrolled = metrics.pods_enrolled.load(Ordering::Relaxed),
         pods_unenrolled = metrics.pods_unenrolled.load(Ordering::Relaxed),
         attach_errors = metrics.attach_errors.load(Ordering::Relaxed),
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    cleanup_all_pods(backend.as_mut(), &pod_states, config);
+    cleanup_all_pods(backend, &pod_states, config);
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -1053,7 +1158,12 @@ async fn run_with_backend(
         warn!(error = %err, "Node agent CNI listener task panicked");
     }
 
-    Ok(())
+    match exit_reason {
+        PodWatcherLoopExit::ShutdownRequested => Ok(()),
+        PodWatcherLoopExit::WatcherExhausted => {
+            Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
+        }
+    }
 }
 
 fn watcher_init_stale_uids(
