@@ -41,9 +41,10 @@ pub const AUDIT_RETENTION_PRUNE_MAX_BATCHES: u32 = 8;
 /// Finding the excess boundary requires newest-first `OFFSET max_rows`, which
 /// is O(max_rows) index work. Steady-state inserts therefore skip that scan
 /// until this many additional inserts (per gateway instance, per namespace)
-/// have landed since the last verified at-or-under-cap check — unless a prior
-/// prune hit the per-call batch budget and left `drain_pending` set. Equals
-/// the prune batch size so soft overshoot stays small and deterministic.
+/// have landed since the last verified at-or-under-cap check — unless the
+/// namespace has not been checked yet or a prior prune hit the per-call batch
+/// budget. Equals the prune batch size so soft overshoot stays small and
+/// deterministic.
 pub const AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL: u64 = AUDIT_RETENTION_PRUNE_BATCH_SIZE;
 
 static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(DashMap::new);
@@ -54,21 +55,32 @@ static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(Das
 /// at-or-under-cap observation, one gateway instance may admit up to
 /// [`audit_retention_max_rows_check_interval`] further inserts for that
 /// namespace before the next O(max_rows) boundary scan. When a scan finds
-/// excess and the bounded delete budget is exhausted, `drain_pending` keeps
-/// subsequent inserts pruning immediately so backlog drains promptly. Explicit
-/// `prune_audit_events` calls always force a scan. Multiple gateway instances
-/// each keep their own gate, so worst-case soft overshoot scales with instance
-/// count × interval; deletes remain namespace-scoped and idempotent.
-#[derive(Debug, Default, Clone)]
+/// excess and the bounded delete budget is exhausted, `scan_pending` keeps
+/// subsequent inserts pruning immediately so backlog drains promptly. A new
+/// gate also starts pending so the first successful insert checks any backlog
+/// that predates this process. Explicit `prune_audit_events` calls always force
+/// a scan. Multiple gateway instances each keep their own gate, so worst-case
+/// soft overshoot scales with instance count × interval; deletes remain
+/// namespace-scoped and idempotent.
+#[derive(Debug, Clone)]
 pub struct AuditMaxRowsPruneGate {
     inserts_since_check: u64,
-    drain_pending: bool,
+    scan_pending: bool,
+}
+
+impl Default for AuditMaxRowsPruneGate {
+    fn default() -> Self {
+        Self {
+            inserts_since_check: 0,
+            scan_pending: true,
+        }
+    }
 }
 
 impl AuditMaxRowsPruneGate {
     /// Whether this insert (or forced prune) should run the max-rows boundary scan.
     pub fn should_run_max_rows_prune(&mut self, max_rows: u64, force: bool) -> bool {
-        if force || self.drain_pending {
+        if force || self.scan_pending {
             return true;
         }
         self.inserts_since_check = self.inserts_since_check.saturating_add(1);
@@ -79,7 +91,7 @@ impl AuditMaxRowsPruneGate {
     /// resume soft-cap cadence or keep draining.
     pub fn note_max_rows_prune_result(&mut self, hit_batch_budget: bool) {
         self.inserts_since_check = 0;
-        self.drain_pending = hit_batch_budget;
+        self.scan_pending = hit_batch_budget;
     }
 }
 

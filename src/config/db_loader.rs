@@ -8121,12 +8121,10 @@ impl DatabaseStore {
                 gate.should_run_max_rows_prune(max_rows, force_max_rows)
             };
             if should_run {
-                let batch_deleted = self
+                let (batch_deleted, hit_budget) = self
                     .prune_audit_events_by_max_rows(namespace, max_rows)
                     .await?;
                 deleted = deleted.saturating_add(batch_deleted);
-                let hit_budget =
-                    crate::admin::audit::audit_retention_hit_prune_batch_budget(batch_deleted);
                 if let Some(mut gate) = self.audit_max_rows_prune_gates.get_mut(namespace) {
                     gate.note_max_rows_prune_result(hit_budget);
                 }
@@ -8164,7 +8162,7 @@ impl DatabaseStore {
         &self,
         namespace: &str,
         max_rows: u64,
-    ) -> Result<u64, anyhow::Error> {
+    ) -> Result<(u64, bool), anyhow::Error> {
         // Newest-first OFFSET max_rows is O(max_rows); insert-path callers gate
         // this behind AuditMaxRowsPruneGate so steady state is not per-insert.
         let offset = i64::try_from(max_rows).unwrap_or(i64::MAX);
@@ -8176,7 +8174,7 @@ impl DatabaseStore {
             .fetch_optional(&self.pool())
             .await?;
         let Some(boundary) = boundary else {
-            return Ok(0);
+            return Ok((0, false));
         };
         let boundary_ts: String = boundary.try_get("ts")?;
         let boundary_id: String = boundary.try_get("id")?;
@@ -8196,7 +8194,9 @@ impl DatabaseStore {
                 break;
             }
         }
-        Ok(total)
+        let hit_batch_budget =
+            crate::admin::audit::audit_retention_hit_prune_batch_budget(total);
+        Ok((total, hit_batch_budget))
     }
 
     fn audit_age_delete_sql(&self) -> String {

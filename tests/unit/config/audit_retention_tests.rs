@@ -171,6 +171,11 @@ fn max_rows_soft_cap_gate_skips_steady_state_scans_until_interval() {
     );
 
     let mut gate = AuditMaxRowsPruneGate::default();
+    assert!(
+        gate.should_run_max_rows_prune(max_rows, false),
+        "the first insert must scan for a backlog that predates this process"
+    );
+    gate.note_max_rows_prune_result(false);
     for _ in 1..interval {
         assert!(
             !gate.should_run_max_rows_prune(max_rows, false),
@@ -200,12 +205,12 @@ fn max_rows_soft_cap_gate_keeps_draining_after_batch_budget() {
     gate.note_max_rows_prune_result(true);
     assert!(
         gate.should_run_max_rows_prune(100_000, false),
-        "drain_pending must prune on every subsequent insert"
+        "a budget-exhausted scan must prune on every subsequent insert"
     );
     gate.note_max_rows_prune_result(false);
     assert!(
         !gate.should_run_max_rows_prune(100_000, false),
-        "clearing drain_pending must restore the soft-cap cadence"
+        "a completed scan must restore the soft-cap cadence"
     );
 }
 

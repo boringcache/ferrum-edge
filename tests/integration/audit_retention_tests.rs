@@ -244,7 +244,7 @@ async fn insert_piggyback_applies_soft_max_rows_without_failing_insert() {
     // Soft cap: after a verified under-cap check, up to `interval` further
     // inserts may land before the next boundary scan. Insert enough that the
     // piggyback path must scan while over the configured target.
-    let total_inserts = max_rows + interval;
+    let total_inserts = 1 + interval;
     for minutes in (1..=total_inserts).rev() {
         store
             .insert_audit_event(&event_ordered(
@@ -270,4 +270,45 @@ async fn insert_piggyback_applies_soft_max_rows_without_failing_insert() {
     assert_eq!(listed.total, max_rows as i64);
     assert_eq!(listed.items[0].id, "g-1");
     assert_eq!(listed.items[1].id, "g-2");
+}
+
+#[tokio::test]
+async fn first_insert_prunes_backlog_that_predates_retention_gate() {
+    let max_rows = 2u64;
+    let (mut store, _tmp) = sqlite_store_with_retention(disabled_retention()).await;
+
+    for minutes in (1..=4).rev() {
+        store
+            .insert_audit_event(&event_ordered(
+                "existing-backlog",
+                &format!("old-{minutes}"),
+                minutes,
+            ))
+            .await
+            .unwrap();
+    }
+
+    store.set_audit_retention_policy(AuditRetentionPolicy {
+        retention_days: None,
+        max_rows_per_namespace: Some(max_rows),
+    });
+    store
+        .insert_audit_event(&event_ordered("existing-backlog", "new", 0))
+        .await
+        .unwrap();
+
+    let listed = store
+        .list_audit_events(
+            "existing-backlog",
+            &AuditListFilter {
+                limit: 50,
+                offset: 0,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.total, max_rows as i64);
+    assert_eq!(listed.items[0].id, "new");
+    assert_eq!(listed.items[1].id, "old-1");
 }

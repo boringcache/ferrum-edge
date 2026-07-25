@@ -11450,12 +11450,10 @@ mod inner {
                     gate.should_run_max_rows_prune(max_rows, force_max_rows)
                 };
                 if should_run {
-                    let batch_deleted = self
+                    let (batch_deleted, hit_budget) = self
                         .prune_audit_events_by_max_rows(namespace, max_rows)
                         .await?;
                     deleted = deleted.saturating_add(batch_deleted);
-                    let hit_budget =
-                        crate::admin::audit::audit_retention_hit_prune_batch_budget(batch_deleted);
                     if let Some(mut gate) = self.audit_max_rows_prune_gates.get_mut(namespace) {
                         gate.note_max_rows_prune_result(hit_budget);
                     }
@@ -11501,10 +11499,11 @@ mod inner {
                     break;
                 }
                 let batch_len = ids.len() as u64;
-                self.audit_events()
+                let result = self
+                    .audit_events()
                     .delete_many(doc! { "_id": { "$in": ids } })
                     .await?;
-                total = total.saturating_add(batch_len);
+                total = total.saturating_add(result.deleted_count);
                 if batch_len < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
                     break;
                 }
@@ -11516,7 +11515,7 @@ mod inner {
             &self,
             namespace: &str,
             max_rows: u64,
-        ) -> Result<u64, anyhow::Error> {
+        ) -> Result<(u64, bool), anyhow::Error> {
             // Newest-first skip(max_rows) is O(max_rows); insert-path callers
             // gate this behind AuditMaxRowsPruneGate so steady state is not
             // per-insert.
@@ -11536,7 +11535,7 @@ mod inner {
             } else {
                 None
             }) else {
-                return Ok(0);
+                return Ok((0, false));
             };
             let boundary_ts = boundary
                 .get("ts")
@@ -11549,7 +11548,8 @@ mod inner {
                 .ok_or_else(|| anyhow::anyhow!("audit_events retention boundary missing id"))?;
 
             let mut total = 0u64;
-            for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+            let mut hit_batch_budget = false;
+            for batch_index in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
                 let options = FindOptions::builder()
                     .sort(doc! { "ts": 1, "id": 1 })
                     .limit(Some(
@@ -11579,15 +11579,18 @@ mod inner {
                     break;
                 }
                 let batch_len = ids.len() as u64;
-                self.audit_events()
+                let result = self
+                    .audit_events()
                     .delete_many(doc! { "_id": { "$in": ids } })
                     .await?;
-                total = total.saturating_add(batch_len);
+                total = total.saturating_add(result.deleted_count);
                 if batch_len < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
                     break;
                 }
+                hit_batch_budget =
+                    batch_index + 1 == crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES;
             }
-            Ok(total)
+            Ok((total, hit_batch_budget))
         }
 
         async fn load_full_proxies_opt_session(
