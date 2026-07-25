@@ -5,7 +5,10 @@
 //! atomicity contract (byte-identical consecutive probes; rejects torn
 //! in-place updates), validated, and atomically swapped into the running
 //! gateway without dropping connections. Unstable or invalid candidates
-//! keep the last known-good live generation.
+//! keep the last known-good live generation and raise the shared
+//! [`AdminState::config_rejected`] signal so authenticated `/health`
+//! reports `degraded` (issue #2979). A later Applied or Unchanged reload
+//! clears that signal.
 //!
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
@@ -120,6 +123,51 @@ pub struct ServeOptions {
     pub background_drain_timeout: Option<Duration>,
 }
 
+/// Apply a file-mode config reload candidate and update the shared
+/// [`AdminState::config_rejected`] signal (issue #2979).
+///
+/// On load failure or [`proxy::ConfigApplyOutcome::Rejected`], the last
+/// known-good runtime config is retained and `config_rejected` is raised so
+/// authenticated `/health` reports `degraded`. [`proxy::ConfigApplyOutcome::Applied`]
+/// and [`proxy::ConfigApplyOutcome::Unchanged`] clear the flag. Ordering is
+/// apply-then-observe: the flag flips only after `update_config` (or a failed
+/// load) has decided whether the live generation changed.
+pub fn apply_file_config_candidate(
+    proxy_state: &ProxyState,
+    config_rejected: &AtomicBool,
+    candidate: Result<GatewayConfig, anyhow::Error>,
+) {
+    match candidate {
+        Ok(new_config) => match proxy_state.update_config(new_config) {
+            proxy::ConfigApplyOutcome::Applied => {
+                info!("Configuration reloaded successfully");
+                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                    config_rejected,
+                    "file reload",
+                );
+            }
+            proxy::ConfigApplyOutcome::Unchanged => {
+                info!("Configuration reload valid but unchanged");
+                crate::modes::clear_config_rejected_after_accepted_full_reload(
+                    config_rejected,
+                    "file reload",
+                );
+            }
+            proxy::ConfigApplyOutcome::Rejected { .. } => {
+                error!("Configuration reload rejected, keeping previous config");
+                config_rejected.store(true, Ordering::Relaxed);
+            }
+        },
+        Err(e) => {
+            error!(
+                "Configuration reload failed, keeping previous config: {}",
+                e
+            );
+            config_rejected.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Handles returned by [`serve`].
 ///
 /// The caller can:
@@ -132,6 +180,11 @@ pub struct ServeOptions {
 pub struct ServeHandles {
     /// Shared proxy state. Tests can read metrics, swap config, etc.
     pub proxy_state: ProxyState,
+    /// File-mode reload-rejection signal shared with
+    /// [`AdminState::config_rejected`] (issue #2979). Raised on SIGHUP
+    /// load/apply failure; cleared on Applied/Unchanged. Lock-free reads
+    /// via [`AtomicBool`].
+    pub config_rejected: Arc<AtomicBool>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
@@ -559,6 +612,7 @@ pub async fn run(
     // SIGHUP-driven config reload (Unix only). On non-Unix this future just
     // waits on shutdown so the join order is unchanged.
     let proxy_state_reload = handles.proxy_state.clone();
+    let config_rejected_reload = handles.config_rejected.clone();
     let config_path_owned = config_path;
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
@@ -590,36 +644,18 @@ pub async fn run(
                 tokio::select! {
                     _ = sighup.recv() => {
                         info!("SIGHUP received, reloading configuration...");
-                        match file_loader::reload_config_from_file_off_thread(
+                        let loaded = file_loader::reload_config_from_file_off_thread(
                             config_path_owned.clone(),
                             reload_cert_expiry_warning_days,
                             reload_backend_allow_ips.clone(),
                             reload_namespace.clone(),
                         )
-                        .await
-                        {
-                            Ok(new_config) => {
-                                match proxy_state_reload.update_config(new_config) {
-                                    proxy::ConfigApplyOutcome::Applied => {
-                                        info!("Configuration reloaded successfully");
-                                    }
-                                    proxy::ConfigApplyOutcome::Unchanged => {
-                                        info!("Configuration reload valid but unchanged");
-                                    }
-                                    proxy::ConfigApplyOutcome::Rejected { .. } => {
-                                        error!(
-                                            "Configuration reload rejected, keeping previous config"
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Configuration reload failed, keeping previous config: {}",
-                                    e
-                                );
-                            }
-                        }
+                        .await;
+                        apply_file_config_candidate(
+                            &proxy_state_reload,
+                            &config_rejected_reload,
+                            loaded,
+                        );
                     }
                     _ = sighup_shutdown.changed() => {
                         info!("SIGHUP listener shutting down");
@@ -1028,6 +1064,7 @@ pub async fn serve(
             }
         }
     };
+    let config_rejected = Arc::new(AtomicBool::new(false));
     let admin_state = AdminState {
         db: None,
         jwt_manager,
@@ -1043,7 +1080,7 @@ pub async fn serve(
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
-        config_rejected: None,
+        config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports,
@@ -1474,6 +1511,7 @@ pub async fn serve(
     // accumulate orphan listeners holding sockets across attempts.
     let serve_handles = ServeHandles {
         proxy_state: proxy_state.clone(),
+        config_rejected,
         bound,
         listener_handles: handles,
         background_handles,
