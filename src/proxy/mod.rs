@@ -722,6 +722,16 @@ struct H3ProbeOutcome {
     error: Option<String>,
 }
 
+struct H2TlsProbeTarget<'a> {
+    probe_proxy: &'a Proxy,
+    probe_timeout: Duration,
+    host: &'a str,
+    port: u16,
+    previous_h2_tls: Option<ProtocolSupport>,
+    previous_grpc_h2_tls: Option<ProtocolSupport>,
+    previous_h1: Option<ProtocolSupport>,
+}
+
 struct HboneProbeTarget<'a> {
     host: &'a str,
     dial_host: &'a str,
@@ -6510,13 +6520,15 @@ impl ProxyState {
                     .connection_pool
                     .get_tls_config_for_backend(&probe_proxy);
                 let h2_fut = self.probe_h2_tls(
-                    &probe_proxy,
-                    probe_timeout,
-                    host,
-                    port,
-                    previous_h2_tls,
-                    previous_grpc_h2_tls,
-                    previous_h1,
+                    H2TlsProbeTarget {
+                        probe_proxy: &probe_proxy,
+                        probe_timeout,
+                        host,
+                        port,
+                        previous_h2_tls,
+                        previous_grpc_h2_tls,
+                        previous_h1,
+                    },
                     &mut record,
                 );
                 let h3_fut = Self::probe_h3(
@@ -6630,15 +6642,18 @@ impl ProxyState {
     /// evidence that may downgrade a prior `Supported` entry.
     async fn probe_h2_tls(
         &self,
-        probe_proxy: &Proxy,
-        probe_timeout: Duration,
-        host: &str,
-        port: u16,
-        previous_h2_tls: Option<ProtocolSupport>,
-        previous_grpc_h2_tls: Option<ProtocolSupport>,
-        previous_h1: Option<ProtocolSupport>,
+        target: H2TlsProbeTarget<'_>,
         record: &mut BackendCapabilityRecord,
     ) {
+        let H2TlsProbeTarget {
+            probe_proxy,
+            probe_timeout,
+            host,
+            port,
+            previous_h2_tls,
+            previous_grpc_h2_tls,
+            previous_h1,
+        } = target;
         match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
             Ok(Ok(_)) => {
                 record.plain_http.h2_tls = ProtocolSupport::Supported;
