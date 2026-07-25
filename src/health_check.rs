@@ -448,10 +448,9 @@ impl HealthChecker {
         // host:port sets cannot honor per-port/subset-only policies, SD-only
         // targets, or independent cooldowns for proxies sharing an endpoint.
         if config_needs_passive_recovery(config) {
-            new_handles.push(self.start_passive_recovery_scanner(
-                shutdown_rx.clone(),
-                recovery_generation,
-            ));
+            new_handles.push(
+                self.start_passive_recovery_scanner(shutdown_rx.clone(), recovery_generation),
+            );
         }
 
         match self.active_check_handles.lock() {
@@ -1893,11 +1892,7 @@ fn recover_due_passive_ejections_inner(
                 locality: None,
                 path: None,
             };
-            reset_latency_after_passive_recovery_inner(
-                lb_cache,
-                &current.upstream_id,
-                &recovered,
-            );
+            reset_latency_after_passive_recovery_inner(lb_cache, &current.upstream_id, &recovered);
         }
     }
 }

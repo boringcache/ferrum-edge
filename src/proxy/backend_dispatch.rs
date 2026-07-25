@@ -1773,12 +1773,18 @@ mod tests {
             path: None,
         };
         state.health_checker.report_response(
-            &proxy.id, "test-upstream", &first_target, 500,
+            &proxy.id,
+            "test-upstream",
+            &first_target,
+            500,
             false,
             Some(&port_passive),
         );
         state.health_checker.report_response(
-            &proxy.id, "test-upstream", &second_target, 500,
+            &proxy.id,
+            "test-upstream",
+            &second_target,
+            500,
             false,
             Some(&port_passive),
         );

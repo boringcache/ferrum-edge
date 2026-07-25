@@ -738,7 +738,14 @@ fn per_port_passive_health_threshold_differs_from_upstream_level() {
 
     let checker = HealthChecker::default();
     let selected = target("a", 8080);
-    checker.report_response("p1", "test-upstream", &selected, 500, false, Some(port_passive));
+    checker.report_response(
+        "p1",
+        "test-upstream",
+        &selected,
+        500,
+        false,
+        Some(port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("p1")
@@ -783,8 +790,22 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("p1", "test-upstream", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("p1", "test-upstream", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response(
+        "p1",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&port_passive),
+    );
+    checker.report_response(
+        "p1",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("p1")
@@ -845,8 +866,22 @@ fn port_passive_ejection_cap_uses_only_targets_on_selected_port_vec_path() {
     let snapshot = cache.load();
 
     let checker = HealthChecker::new();
-    checker.report_response("p1", "test-upstream", &targets[0], 500, false, Some(&port_passive));
-    checker.report_response("p1", "test-upstream", &targets[1], 500, false, Some(&port_passive));
+    checker.report_response(
+        "p1",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&port_passive),
+    );
+    checker.report_response(
+        "p1",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&port_passive),
+    );
     let proxy_state = checker
         .passive_health
         .get("p1")

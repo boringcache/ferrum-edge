@@ -1856,7 +1856,14 @@ fn test_passive_health_filters_targets() {
     };
 
     // Mark host1 as passively unhealthy
-    checker.report_response("test-proxy", "test-upstream", &targets[1], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
 
     let active: DashMap<String, u64> = DashMap::new();
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
@@ -1909,50 +1916,65 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
     };
 
     // Eject 3 targets (host0, host1, host2) — exceeds 50% cap (max 2)
-    checker.report_response("test-proxy", "test-upstream", &targets[0], 500, false, Some(&config));
-    checker.report_response("test-proxy", "test-upstream", &targets[1], 500, false, Some(&config));
-    checker.report_response("test-proxy", "test-upstream", &targets[2], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[2],
+        500,
+        false,
+        Some(&config),
+    );
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
     let proxy_passive = proxy_passive.expect("passive state should be created");
-    proxy_passive
-        .unhealthy
-        .insert(
-            target_host_port_key(&targets[0]),
-            ferrum_edge::health_check::PassiveEjection {
-                ejected_at_ms: 100,
-                recover_at_ms: 100,
-                auto_recover: false,
-                upstream_id: TEST_UPSTREAM.to_string(),
-                host: targets[0].host.clone(),
-                port: targets[0].port,
-            },
-        );
-    proxy_passive
-        .unhealthy
-        .insert(
-            target_host_port_key(&targets[1]),
-            ferrum_edge::health_check::PassiveEjection {
-                ejected_at_ms: 200,
-                recover_at_ms: 200,
-                auto_recover: false,
-                upstream_id: TEST_UPSTREAM.to_string(),
-                host: targets[1].host.clone(),
-                port: targets[1].port,
-            },
-        );
-    proxy_passive
-        .unhealthy
-        .insert(
-            target_host_port_key(&targets[2]),
-            ferrum_edge::health_check::PassiveEjection {
-                ejected_at_ms: 300,
-                recover_at_ms: 300,
-                auto_recover: false,
-                upstream_id: TEST_UPSTREAM.to_string(),
-                host: targets[2].host.clone(),
-                port: targets[2].port,
-            },
-        );
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[0]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 100,
+            recover_at_ms: 100,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[0].host.clone(),
+            port: targets[0].port,
+        },
+    );
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[1]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 200,
+            recover_at_ms: 200,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[1].host.clone(),
+            port: targets[1].port,
+        },
+    );
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[2]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 300,
+            recover_at_ms: 300,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[2].host.clone(),
+            port: targets[2].port,
+        },
+    );
 
     let active: DashMap<String, u64> = DashMap::new();
 
@@ -2066,7 +2088,14 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
     };
-    checker.report_response("test-proxy", "test-upstream", &targets[1], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
 
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
 
@@ -2768,12 +2797,14 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
         ps.unhealthy.get_mut("host1:8080").unwrap().recover_at_ms = 1;
     }
     checker.recover_due_passive_ejections();
-    assert!(!checker
-        .passive_health
-        .get("p1")
-        .unwrap()
-        .unhealthy
-        .contains_key("host1:8080"));
+    assert!(
+        !checker
+            .passive_health
+            .get("p1")
+            .unwrap()
+            .unhealthy
+            .contains_key("host1:8080")
+    );
 
     // Post-recovery: B must participate as a warmed peer (sample count seeded),
     // not as biased-best warm-up. With no real latency yet it shares A's min EWMA

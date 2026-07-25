@@ -55,7 +55,14 @@ fn test_passive_health_marks_unhealthy() {
     };
 
     for _ in 0..3 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -76,11 +83,25 @@ fn test_passive_health_recovers() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -99,7 +120,14 @@ fn test_success_does_not_mark_unhealthy() {
     };
 
     for _ in 0..100 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 200, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            200,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -120,7 +148,14 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 502, true, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            502,
+            true,
+            Some(&config),
+        );
     }
 
     assert!(
@@ -144,11 +179,25 @@ fn test_connection_error_recovery_on_success() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 502, true, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            502,
+            true,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -168,8 +217,22 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target1, 500, false, Some(&config));
-        checker.report_response(TEST_PROXY, "test-upstream", &target2, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
@@ -196,7 +259,14 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
@@ -220,8 +290,22 @@ fn test_remove_stale_targets_no_op_when_all_present() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target1, 500, false, Some(&config));
-        checker.report_response(TEST_PROXY, "test-upstream", &target2, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[target1, target2]);
@@ -246,7 +330,14 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
 
     // Proxy-A sends large payloads → backend returns 500s
     for _ in 0..2 {
-        checker.report_response("proxy-a", "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy-a",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(
@@ -259,7 +350,14 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
     );
 
     // Proxy-B sends small payloads → backend returns 200s
-    checker.report_response("proxy-b", "test-upstream", &target, 200, false, Some(&config));
+    checker.report_response(
+        "proxy-b",
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
 
     assert!(
         is_passive_unhealthy(&checker, "proxy-a", "shared-backend:8080"),
@@ -287,7 +385,14 @@ fn test_active_and_passive_health_are_independent() {
     };
 
     for _ in 0..2 {
-        checker.report_response("proxy-a", "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy-a",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, "proxy-a", "backend1:8080"));
     assert!(checker.active_unhealthy_targets.is_empty());
@@ -347,9 +452,30 @@ fn test_prune_removed_proxies() {
 
     // Insert passive health state for 3 proxies by reporting responses
     for _ in 0..2 {
-        checker.report_response("proxy1", "test-upstream", &target, 500, false, Some(&config));
-        checker.report_response("proxy2", "test-upstream", &target, 500, false, Some(&config));
-        checker.report_response("proxy3", "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy1",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            "proxy2",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            "proxy3",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert_eq!(checker.passive_health.len(), 3);
 
@@ -396,8 +522,22 @@ fn test_passive_window_only_counts_recent_failures() {
     };
 
     // Record 2 failures (under threshold)
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should not be unhealthy with only 2 failures"
@@ -407,7 +547,14 @@ fn test_passive_window_only_counts_recent_failures() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     // Record 1 more failure — the old 2 should have expired from the window
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Old failures outside window should not count toward threshold"
@@ -429,11 +576,32 @@ fn test_passive_window_failures_within_window_accumulate() {
     };
 
     // All 3 failures within the 60s window
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should be unhealthy after 3 failures within window"
@@ -454,7 +622,14 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         split_external_local_origin_errors: None,
     };
 
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 502, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        502,
+        false,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Threshold of 1 should mark unhealthy on first failure"
@@ -478,7 +653,14 @@ fn test_connection_error_ignores_status_code_list() {
     };
 
     // Status code 200 with connection_error=true should still count as failure
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 200, true, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        true,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Connection errors should trigger failure regardless of status code"
@@ -503,8 +685,22 @@ fn test_passive_health_per_target_isolation() {
     };
 
     // Fail target_a only
-    checker.report_response(TEST_PROXY, "test-upstream", &target_a, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, "test-upstream", &target_a, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target_a,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target_a,
+        500,
+        false,
+        Some(&config),
+    );
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend-a:8080"));
     assert!(
@@ -531,24 +727,59 @@ fn test_recovery_clears_failures_then_re_threshold() {
 
     // Mark unhealthy
     for _ in 0..3 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     // Recover with a success
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     // Now it should take a full 3 failures again to mark unhealthy
     // (failure history was cleared on recovery)
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should need full threshold after recovery"
     );
 
-    checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -849,7 +1080,13 @@ fn make_upstream_passive_only(
     }
 }
 
-fn eject_once(checker: &HealthChecker, proxy: &str, upstream: &str, target: &UpstreamTarget, healthy_after: u64) {
+fn eject_once(
+    checker: &HealthChecker,
+    proxy: &str,
+    upstream: &str,
+    target: &UpstreamTarget,
+    healthy_after: u64,
+) {
     let config = PassiveHealthCheck {
         unhealthy_threshold: 1,
         healthy_after_seconds: healthy_after,
@@ -890,8 +1127,19 @@ fn per_port_only_passive_policy_recovers_via_entry_deadline() {
         "per-port-only healthy_after>0 must spawn the recovery scanner"
     );
 
-    checker.report_response("proxy-port", "up1", &target, 500, false, Some(&port_passive));
-    assert!(is_passive_unhealthy(&checker, "proxy-port", "10.0.0.8:8443"));
+    checker.report_response(
+        "proxy-port",
+        "up1",
+        &target,
+        500,
+        false,
+        Some(&port_passive),
+    );
+    assert!(is_passive_unhealthy(
+        &checker,
+        "proxy-port",
+        "10.0.0.8:8443"
+    ));
 
     // Backdate the entry deadline and recover synchronously (deterministic).
     {
@@ -930,7 +1178,14 @@ fn subset_only_passive_policy_recovers_via_entry_deadline() {
     checker.start_with_shutdown(&config_with_upstreams(vec![upstream]), None);
     assert_eq!(checker.active_task_count(), 1);
 
-    checker.report_response("proxy-sub", "up-sub", &target, 500, false, Some(&subset_passive));
+    checker.report_response(
+        "proxy-sub",
+        "up-sub",
+        &target,
+        500,
+        false,
+        Some(&subset_passive),
+    );
     assert!(is_passive_unhealthy(&checker, "proxy-sub", "10.0.0.9:8080"));
 
     {
@@ -939,7 +1194,11 @@ fn subset_only_passive_policy_recovers_via_entry_deadline() {
         entry.recover_at_ms = 1;
     }
     checker.recover_due_passive_ejections();
-    assert!(!is_passive_unhealthy(&checker, "proxy-sub", "10.0.0.9:8080"));
+    assert!(!is_passive_unhealthy(
+        &checker,
+        "proxy-sub",
+        "10.0.0.9:8080"
+    ));
 }
 
 #[test]
@@ -1049,7 +1308,10 @@ fn service_discovery_only_target_recovers_after_passive_ejection() {
 
     {
         let ps = checker.passive_health.get(TEST_PROXY).unwrap();
-        ps.unhealthy.get_mut("sd-only-b:8080").unwrap().recover_at_ms = 1;
+        ps.unhealthy
+            .get_mut("sd-only-b:8080")
+            .unwrap()
+            .recover_at_ms = 1;
     }
     checker.recover_due_passive_ejections();
     assert!(
