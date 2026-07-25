@@ -103,6 +103,14 @@ The cause/direction mappers walk the chain via `find_stream_setup_error()` — `
 
 Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retry.rs)'s typed `io::Error::raw_os_error == EADDRNOTAVAIL` walk works on every gRPC dispatch path — not just the message-substring fallback.
 
+## Response body-read failures
+
+A body-read failure after the response headers arrived is always post-wire: `connection_error` stays `false` and `retry_on_connect_failure` can never replay a request the backend already processed.
+
+The eager-buffer path (`buffered_backend_response_from_body_read` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) classifies through `classify_reqwest_error` rather than hardcoding one class. Because reqwest's per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`) covers through body completion, a stalled backend surfaces here as `ReadWriteTimeout` and is reported as **504**, matching the direct-H2 arm's `HyperBodyCollectError::ReadTimeout` and the native-H3 read-timeout arm. Every other class keeps the 502. Identical backend behavior therefore produces the same status and `error_class` on every transport, so `TransactionSummary`, operator dashboards, and circuit-breaker `failure_status_codes` matching cannot diverge by dispatch path.
+
+A pre-wire class is impossible on that path (`classify_reqwest_error` only returns connect-class verdicts under `e.is_connect()`), but one is coerced to `ConnectionReset` anyway so the `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes.
+
 ## WebSocket graceful close
 
 [`classify_boxed_error`](../src/retry.rs) downcasts `tokio_tungstenite::tungstenite::Error::ConnectionClosed` and `Error::AlreadyClosed` to `ErrorClass::GracefulRemoteClose`. These represent an orderly RFC 6455 close (the peer sent a Close frame, or we wrote after observing one) and must NOT inflate transport-failure metrics. `Error::Protocol(_)` maps to `ErrorClass::ProtocolError`.

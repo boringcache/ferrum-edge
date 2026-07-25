@@ -4635,23 +4635,27 @@ async fn grpc_timeout_without_deadline_plugin_is_one_anchored_budget_across_retr
 fn grpc_retry_loop_clones_real_header_map_not_string_rebuild() {
     let src = include_str!("../../src/proxy/mod.rs");
     assert!(
-        src.contains("let grpc_replay_headers = if grpc_has_retry"),
-        "retry-enabled gRPC paths must clone the collected HeaderMap"
+        src.contains("let mut grpc_replay_headers = hyper::HeaderMap::new();"),
+        "the gRPC dispatch must reserve a real HeaderMap slot for retry replay"
+    );
+    assert!(
+        src.contains("grpc_replay_headers = grpc_headers.clone();"),
+        "the retry-capable dispatch branches must capture the collected \
+         HeaderMap before it moves into attempt 1"
     );
     assert!(
         src.contains("let grpc_req_headers = grpc_replay_headers;"),
-        "retry loop must reuse the cloned HeaderMap"
+        "retry loop must reuse the captured HeaderMap"
     );
     assert!(
-        src.contains(
-            "Retry attempts reuse the real collected HeaderMap (cloned above when"
-        ),
+        src.contains("Retry attempts reuse the real collected HeaderMap"),
         "document why we keep the real HeaderMap across retries"
     );
-    // The old rebuild loop used HeaderValue::from_str over ctx.headers entries.
+    // The old rebuild loop turned ctx.headers entries back into HeaderValues,
+    // comma-joining duplicates and dropping non-UTF-8 opaque values.
     assert!(
         !src.contains(
-            "// Only build retry parts when retries are configured\n        let grpc_method = hyper::Method::POST; // gRPC always uses POST\n        let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {\n            let mut hm = hyper::HeaderMap::new();\n            for (k, v) in owned_proxy_headers_ref.unwrap_or(&ctx.headers)"
+            "let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {"
         ),
         "must not rebuild retry headers from stringified ctx.headers"
     );
@@ -4662,14 +4666,8 @@ fn grpc_retry_header_map_clone_preserves_duplicates_and_opaque_bytes() {
     // Mirrors the clone the retry loop now performs: duplicates stay as
     // separate field lines, and non-UTF-8 opaque values survive.
     let mut headers = hyper::HeaderMap::new();
-    headers.append(
-        "x-md",
-        hyper::header::HeaderValue::from_static("a"),
-    );
-    headers.append(
-        "x-md",
-        hyper::header::HeaderValue::from_static("b"),
-    );
+    headers.append("x-md", hyper::header::HeaderValue::from_static("a"));
+    headers.append("x-md", hyper::header::HeaderValue::from_static("b"));
     headers.insert(
         "x-bin",
         hyper::header::HeaderValue::from_bytes(&[0xff, 0xfe, 0x01]).unwrap(),

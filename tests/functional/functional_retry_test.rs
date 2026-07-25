@@ -1270,3 +1270,172 @@ async fn retry_rotation_across_mixed_capability_targets_recomputes_dispatch() {
          to A — the test is meaningless because the recompute path wasn't exercised."
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test — a streamed response that succeeds on a NON-final retry attempt is
+// still released incrementally (#2949).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The retry loop used to pass `should_stream && is_last_attempt` to
+// `proxy_to_backend_retry`, so any attempt before the last one was forced into
+// the buffered arm — which has no `is_streaming_content_type` exemption, and
+// which falls back to an unbounded `response.bytes()` when
+// `max_response_body_size_bytes == 0`. An SSE endpoint that returned one 503
+// (deploy blip) and then served the stream on attempt 1 of 2 was therefore
+// collected whole: the client saw a dead connection until the read timeout or
+// the response cap turned a healthy backend into a 502.
+//
+// Fixture: connection-indexed scripts. Connection 0 answers 503 and closes
+// (forcing the retry onto a fresh connection); connection 1 serves
+// `text/event-stream`, emits one event immediately, then holds the stream open
+// well past the first-event deadline. `max_retries: 2` makes the successful
+// attempt index 1 — deliberately NOT the last attempt.
+//
+// Observable: the first SSE event reaches the client promptly. Pre-fix the
+// gateway would sit on the buffered collection for the whole `STREAM_HOLD`
+// window (`backend_read_timeout_ms: 0` disables the read-timeout escape) and
+// the timeout below would fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_streams_sse_that_succeeds_on_a_non_final_attempt() {
+    const FIRST_EVENT: &str = "data: {\"part\":1}\n\n";
+    const STREAM_HOLD: Duration = Duration::from_secs(6);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_secs(3);
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .connection_scripts([
+            // Attempt 0 — retryable 503, then close so the retry cannot reuse
+            // this connection and lands on script index 1.
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+                HttpStep::CloseAfterHeaders {
+                    status: 503,
+                    reason: "Service Unavailable".into(),
+                    headers: vec![("content-length".into(), "0".into())],
+                },
+            ],
+            // Attempt 1 — healthy SSE stream. NOT the last attempt
+            // (max_retries: 2), which is exactly the case the old
+            // `is_last_attempt` gate mishandled.
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+                HttpStep::RespondStatus {
+                    status: 200,
+                    reason: "OK".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Type".into(),
+                    value: "text/event-stream".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Cache-Control".into(),
+                    value: "no-cache".into(),
+                },
+                HttpStep::RespondBodyChunk(FIRST_EVENT.as_bytes().to_vec()),
+                HttpStep::Sleep(STREAM_HOLD),
+                HttpStep::RespondBodyEnd,
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "retry-sse-non-final",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "response_body_mode": "stream",
+            "backend_connect_timeout_ms": 2000,
+            // The SSE fixture holds the response open. Zero disables the
+            // backend read timeout, so a buffered collection would stall
+            // until the backend finishes rather than 504-ing early — the
+            // pre-fix failure this test must be able to observe.
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 5000,
+            "retry": {
+                "max_retries": 2,
+                "retryable_status_codes": [503],
+                "retryable_methods": ["GET"],
+                "retry_on_connect_failure": true,
+                "backoff": { "fixed": { "delay_ms": 1 } },
+            },
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&config).expect("yaml serialize");
+
+    let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: a warmup probe would consume
+        // connection script 0 and the 503 would never be served to a request.
+        .mode_in_process()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+
+    let started = std::time::Instant::now();
+    let (response, first_chunk) = tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
+        let mut response = client
+            .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .expect("gateway returns SSE response headers");
+        let first_chunk = response
+            .chunk()
+            .await
+            .expect("read first SSE chunk")
+            .expect("stream must not end before the first event");
+        (response, first_chunk)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
+             (elapsed {:?}) — a response that succeeded on a NON-final retry \
+             attempt was buffered instead of streamed (#2949)",
+            started.elapsed()
+        )
+    });
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream"),
+        "the retried attempt must keep the SSE content type"
+    );
+    assert!(
+        String::from_utf8_lossy(&first_chunk).contains("\"part\":1"),
+        "first chunk must carry the immediately-emitted event; got {:?}",
+        String::from_utf8_lossy(&first_chunk)
+    );
+
+    // Two connections prove the 503 attempt happened and the SSE stream came
+    // from the RETRY (script index 1), not from a first attempt that somehow
+    // skipped the failure injection.
+    assert_eq!(
+        backend.accepted_connections(),
+        2,
+        "expected one 503 attempt plus one retried SSE attempt"
+    );
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "the backend must have seen the initial attempt and exactly one retry"
+    );
+    backend.assert_no_matcher_mismatches().await;
+}

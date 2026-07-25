@@ -227,7 +227,7 @@ The retry system handles request bodies as follows:
 
 - **Connection failures**: The request body was never sent to the backend, so it is safely replayed on retry.
 - **HTTP status failures**: The request body is retained (buffered) and replayed on each retry attempt.
-- **Final attempt**: On the last retry attempt, the response streams directly to the client if the proxy is configured for streaming (no additional buffering).
+- **Every attempt**: The response streaming decision is *not* attempt-positional. If the proxy is configured for streaming (and no plugin requires a buffered response body), every retry attempt streams — not only the last one. The retry decision consults status and headers, both available before the body is read, so a streamed response that turns out to be retryable is simply dropped and the next attempt dispatches. This is what keeps an SSE endpoint that succeeds on a non-final attempt (for example after a single 503 deploy blip) from being collected whole and stalling the client until the read timeout or the response size cap fires. Native-HTTP/3 backend retries remain the exception: they stream only on the final attempt.
 
 ## Examples
 

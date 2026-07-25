@@ -1415,7 +1415,6 @@ fn test_pooled_h2_send_request_classifier_is_public_for_dispatch_sites() {
 #[tokio::test]
 async fn test_remaining_grpc_timeout_header_decrements_across_attempts() {
     use ferrum_edge::_test_support::apply_remaining_grpc_timeout_header_for_test;
-    use std::time::Duration;
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     let mut headers = hyper::HeaderMap::new();
@@ -1452,5 +1451,98 @@ async fn test_remaining_grpc_timeout_header_decrements_across_attempts() {
         second_ms < first_ms,
         "second attempt must forward a strictly smaller remaining timeout \
          (first={first_ms}m second={second_ms}m) — never re-arm the original"
+    );
+}
+
+#[test]
+fn test_eager_buffer_body_read_timeout_maps_to_504_read_write_timeout() {
+    // #2953: the per-request `backend_read_timeout_ms` covers through body
+    // completion in reqwest, so a read timeout during eager buffering lands in
+    // `buffered_backend_response_from_body_read`. It must classify as
+    // `read_write_timeout`/504 — the pair the direct-H2 arm already emits via
+    // `HyperBodyCollectError::ReadTimeout` — instead of the hardcoded
+    // `connection_reset`/502 that made one backend fault report two different
+    // ways depending on which transport served the request.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+
+    let (status, class) = classify(ErrorClass::ReadWriteTimeout);
+    assert_eq!(status, 504);
+    assert_eq!(class, ErrorClass::ReadWriteTimeout);
+}
+
+#[test]
+fn test_eager_buffer_body_read_preserves_post_wire_classes_with_502() {
+    // Every other post-wire class keeps the 502 and its own label, so the
+    // reqwest arm no longer flattens reset / closed / protocol faults into one
+    // bucket.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+
+    for class in [
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::GracefulRemoteClose,
+        ErrorClass::ClientDisconnect,
+        ErrorClass::RequestError,
+    ] {
+        let (status, mapped) = classify(class);
+        assert_eq!(status, 502, "{class:?} keeps 502");
+        assert_eq!(mapped, class, "{class:?} keeps its class");
+    }
+}
+
+#[test]
+fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
+    // Response headers have already arrived at every call site, so the caller
+    // pins `connection_error: false`. A pre-wire class would then violate
+    // `connection_error == !request_reached_wire(error_class)` and could let
+    // `retry_on_connect_failure` replay a non-idempotent request whose body the
+    // backend already processed. Pre-wire verdicts are coerced to the post-wire
+    // `ConnectionReset`, and every emitted class must be post-wire.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+    use ferrum_edge::retry::request_reached_wire;
+
+    let coerced = ErrorClass::ConnectionReset;
+    for class in [
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::PortExhaustion,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let (status, mapped) = classify(class);
+        assert_eq!(status, 502, "{class:?} must stay 502");
+        assert_eq!(mapped, coerced, "{class:?} must be coerced");
+    }
+    for class in [
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::RequestError,
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let (_, mapped) = classify(class);
+        assert!(request_reached_wire(mapped), "{class:?} -> {mapped:?}");
+    }
+}
+
+#[test]
+fn test_retry_loop_streaming_decision_is_not_attempt_positional() {
+    // #2949 structural guard. `proxy_to_backend_retry` must receive the
+    // caller's `should_stream` on EVERY attempt. Gating on the last attempt
+    // pushed a response that succeeded mid-loop into the buffered arm, which
+    // has no `is_streaming_content_type` exemption and collects an unbounded
+    // body when `max_response_body_size_bytes == 0`.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        !src.contains("should_stream && is_last_attempt"),
+        "the reqwest retry attempt must not gate streaming on the last attempt"
+    );
+    assert!(
+        src.contains("// The streaming decision is NOT attempt-positional"),
+        "keep the rationale next to the retry dispatch so the gate is not reintroduced"
     );
 }

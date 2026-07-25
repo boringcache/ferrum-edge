@@ -2561,6 +2561,9 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // Force a single pooled sender so the second RPC reuses the GOAWAY'd
         // connection instead of landing on a healthy sibling shard.
         .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "1")
+        // `accepted_connections()` is asserted below, so warmup must not add
+        // an extra dial to the count.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .capture_output()
         .spawn()
         .await
@@ -2576,7 +2579,11 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
         .await
         .expect("first RPC");
-    assert_eq!(first.grpc_status(), Some(0), "warmup RPC must succeed: {first:?}");
+    assert_eq!(
+        first.grpc_status(),
+        Some(0),
+        "warmup RPC must succeed: {first:?}"
+    );
 
     // Brief pause so the scripted GOAWAY lands while the pooled sender is idle.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2657,7 +2664,19 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
         }],
     });
     let yaml = serde_yaml::to_string(&config).expect("serialize yaml");
-    let harness = spawn_grpc_harness(yaml).await;
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Warmup would dial both targets at startup and advance the
+        // round-robin counter, so attempt 1 could land on the LIVE target and
+        // the retry path would never run — the assertion below would then
+        // pass against the un-fixed code.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
     let gw_port = harness
         .proxy_base_url()
         .rsplit_once(':')
@@ -2674,6 +2693,19 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
         .await
         .expect("RPC response");
     assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+
+    // Prove the observed stream came from a RETRY, not from a first attempt
+    // that happened to select the live target. Without this the duplicate-
+    // metadata assertion is satisfied by the (always-correct) initial attempt.
+    let saw_grpc_retry = |logs: &str| logs.contains("Retrying gRPC backend request");
+    let logs = harness
+        .wait_for_log_contains(&saw_grpc_retry, Duration::from_secs(5))
+        .await;
+    assert!(
+        saw_grpc_retry(&logs),
+        "the gRPC retry loop must have fired (attempt 1 hit the refused port); \
+         without a retry this test cannot observe retry headers"
+    );
 
     let streams = backend.received_streams().await;
     assert_eq!(streams.len(), 1, "only the live target should see the RPC");

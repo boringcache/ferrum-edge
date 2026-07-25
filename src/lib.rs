@@ -221,6 +221,12 @@ pub mod _test_support {
         crate::proxy::direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
     }
 
+    pub fn eager_buffer_body_read_status_and_class_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (u16, crate::retry::ErrorClass) {
+        crate::proxy::eager_buffer_body_read_status_and_class(class)
+    }
+
     pub fn set_grpc_deadline_budget_for_test(
         ctx: &mut crate::plugins::RequestContext,
         budget_ms: Option<u64>,

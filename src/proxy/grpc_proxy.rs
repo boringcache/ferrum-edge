@@ -3301,45 +3301,30 @@ pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
 ///
 /// Call once per backend attempt (including the first). Retries must forward
 /// the decremented remaining timeout rather than re-arming the client's
-/// original relative value. Uses millisecond units when they fit the gRPC
-/// 8-digit wire limit; otherwise coarsens to seconds/minutes/hours.
+/// original relative value. Formatting (millisecond precision when it fits the
+/// gRPC 8-digit wire limit, otherwise coarsened to seconds/minutes/hours) is
+/// shared with the `grpc_deadline` plugin so the two cannot drift.
+///
+/// An already-expired deadline forwards the minimum legal value `1m` rather
+/// than the invalid `0m`; the gateway's own `timeout_at` guards still terminate
+/// the RPC, so this only avoids handing the backend a malformed header.
 pub(crate) fn apply_remaining_grpc_timeout_header(
     headers: &mut hyper::HeaderMap,
     deadline: tokio::time::Instant,
 ) {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let ms = crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1);
-    let timeout_val = format_remaining_grpc_timeout_ms(ms);
+    let timeout_val = crate::plugins::grpc_deadline::format_grpc_timeout_ms(ms.max(1));
     match hyper::header::HeaderValue::from_str(&timeout_val) {
         Ok(value) => {
             headers.insert("grpc-timeout", value);
         }
         Err(_) => {
-            // Unreachable for the bounded formatter below; keep the prior
-            // header rather than panicking on the hot path.
+            // Unreachable: the shared formatter only emits ASCII digits plus
+            // one unit letter. Keep the prior header rather than panicking on
+            // the request path.
         }
     }
-}
-
-fn format_remaining_grpc_timeout_ms(ms: u64) -> String {
-    const MAX_DIGITS: u64 = 99_999_999;
-    let candidates = [
-        ('m', 1_u64),
-        ('S', 1_000_u64),
-        ('M', 60_000_u64),
-        ('H', 3_600_000_u64),
-    ];
-    for (unit, divisor) in candidates {
-        let value = ms.div_ceil(divisor).max(1);
-        if value <= MAX_DIGITS {
-            let mut timeout = value.to_string();
-            timeout.push(unit);
-            return timeout;
-        }
-    }
-    let mut timeout = MAX_DIGITS.to_string();
-    timeout.push('H');
-    timeout
 }
 
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
@@ -4032,7 +4017,9 @@ mod tests {
             "the request-scoped typed deadline must be the sole absolute source"
         );
         assert!(
-            body.contains("apply_remaining_grpc_timeout_header(&mut headers, deadline)"),
+            body.contains(
+                "apply_remaining_grpc_timeout_header(&mut headers, deadline)"
+            ),
             "each attempt must forward a decremented remaining grpc-timeout"
         );
         assert!(

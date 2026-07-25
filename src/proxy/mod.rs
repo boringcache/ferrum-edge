@@ -2474,20 +2474,20 @@ pub(crate) fn direct_h2_send_request_error_response(
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     let error_class = http2_pool::classify_pooled_h2_send_request_error(&e);
-    error!(proxy_id = %proxy_id, error = %e, "HTTP/2 backend request failed");
-    retry::BackendResponse {
-        status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
-        headers: HashMap::new(),
-        connection_error: !retry::request_reached_wire(error_class),
-        backend_resolved_ip: resolved_ip,
-        error_class: Some(error_class),
-    }
+    error!(
+        proxy_id = %proxy_id,
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %e,
+        "HTTP/2 backend request failed"
+    );
+    direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
 }
 
-/// Build a direct-H2 send_request failure response from an already-classified
-/// error class. Test helper surface for the
-/// `connection_error == !request_reached_wire(error_class)` invariant.
+/// Build a direct-H2 `send_request` failure response from an already-classified
+/// error class. This is the single place the
+/// `connection_error == !request_reached_wire(error_class)` boundary is applied
+/// for that dispatch site, so unit tests can assert the invariant across every
+/// class the classifier can emit without driving a live H2 backend.
 pub(crate) fn direct_h2_send_request_error_response_for_class(
     error_class: retry::ErrorClass,
     resolved_ip: Option<String>,
@@ -21170,11 +21170,17 @@ async fn handle_proxy_request_inner(
         // coupling ownership to the response lifecycle is defense-in-depth,
         // while the raw client still handles the legal residual reset (#2057).
         let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
-        let (
-            mut grpc_result,
-            grpc_body_bytes,
-            grpc_replay_headers,
-        ) = if grpc_needs_request_body_hooks {
+        // Header map replayed by the gRPC retry loop (#2934). It must be the
+        // REAL collected `HeaderMap` the first attempt dispatched: rebuilding
+        // it from the stringified plugin `ctx.headers` map comma-joins legal
+        // duplicate gRPC metadata (`x-md: a`, `x-md: b`) into one value and
+        // silently drops opaque/non-UTF-8 field values, so attempt 2 would send
+        // a different request than attempt 1. Each dispatch branch below fills
+        // this in before it moves `grpc_headers` into the first attempt, and
+        // only when a retry policy exists so the clone is never paid for
+        // otherwise.
+        let mut grpc_replay_headers = hyper::HeaderMap::new();
+        let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
                 ClientRequestBody::Streaming(request) => {
@@ -21426,14 +21432,11 @@ async fn handle_proxy_request_inner(
                 upstream_balancer.clone(),
             ));
             grpc_backend_admission_started_at = Instant::now();
-            // Clone the real HeaderMap for retries BEFORE moving it into the
-            // first attempt. Rebuilding from stringified `ctx.headers` would
-            // comma-join duplicates and drop non-UTF-8 opaque values.
-            let grpc_replay_headers = if grpc_has_retry {
-                grpc_headers.clone()
-            } else {
-                hyper::HeaderMap::new()
-            };
+            // Capture the real HeaderMap for retries BEFORE it moves into the
+            // first attempt (#2934).
+            if grpc_has_retry {
+                grpc_replay_headers = grpc_headers.clone();
+            }
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -21448,7 +21451,7 @@ async fn handle_proxy_request_inner(
                 ctx.grpc_deadline_at(),
             )
             .await;
-            (result, grpc_req_body, grpc_replay_headers)
+            (result, grpc_req_body)
         } else {
             // Fast path: no plugin body hooks needed
             let grpc_request_was_buffered =
@@ -21605,7 +21608,7 @@ async fn handle_proxy_request_inner(
                     &mut held_frontend_grpc_upload,
                 )
                 .await;
-                (result, Bytes::new(), hyper::HeaderMap::new())
+                (result, Bytes::new())
             } else {
                 // Mixed path: collect request body up-front (required for
                 // retry replay), or reuse an earlier bounded prebuffer, but
@@ -21686,11 +21689,11 @@ async fn handle_proxy_request_inner(
                             upstream_balancer.clone(),
                         ));
                         grpc_backend_admission_started_at = Instant::now();
-                        let grpc_replay_headers = if grpc_has_retry {
-                            grpc_headers.clone()
-                        } else {
-                            hyper::HeaderMap::new()
-                        };
+                        // Capture the real HeaderMap for retries BEFORE it
+                        // moves into the first attempt (#2934).
+                        if grpc_has_retry {
+                            grpc_replay_headers = grpc_headers.clone();
+                        }
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
                             grpc_headers,
@@ -21705,7 +21708,7 @@ async fn handle_proxy_request_inner(
                             ctx.grpc_deadline_at(),
                         )
                         .await;
-                        (result, grpc_req_body, grpc_replay_headers)
+                        (result, grpc_req_body)
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
                         // As in the split path, the armed RAII guard performs the
@@ -21741,7 +21744,7 @@ async fn handle_proxy_request_inner(
                         .await);
                     }
                     Err(grpc_proxy::GrpcRequestBodyCollectError::Proxy(error)) => {
-                        (Err(error), Bytes::new(), hyper::HeaderMap::new())
+                        (Err(error), Bytes::new())
                     }
                 }
             }
@@ -24387,8 +24390,6 @@ async fn handle_proxy_request_inner(
 
             // Replay the original request body on retry. On connection failures
             // the body was never sent, so replaying is correct and safe.
-            // The final retry attempt uses streaming if configured.
-            let is_last_attempt = attempt >= retry_config.max_retries;
             let h3_retry_stream_response =
                 should_stream_h3_retry_response(should_stream, attempt, retry_config.max_retries);
             // `current_dispatch_h3` was either kept from the prior attempt
@@ -24421,7 +24422,21 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    should_stream && is_last_attempt,
+                    // The streaming decision is NOT attempt-positional
+                    // (#2949). `should_retry` consults only status/headers,
+                    // both available before the body is consumed, so a
+                    // retryable streamed response is simply dropped (exactly
+                    // what the initial attempt already does) and the next
+                    // attempt dispatches. Gating on the LAST attempt made a
+                    // response that succeeded mid-loop fall into the buffered
+                    // arm — which has no `is_streaming_content_type`
+                    // exemption — so an SSE stream served on attempt 1 of 2
+                    // was collected whole: the client saw nothing until
+                    // `backend_read_timeout_ms` or the response cap turned a
+                    // healthy backend into a 502, and with
+                    // `max_response_body_size_bytes = 0` the collection was
+                    // unbounded.
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -27043,18 +27058,69 @@ fn buffered_backend_response_from_body_read(
             error_class: None,
         },
         Err(e) => {
-            warn!("Failed to read backend response body: {}", e);
+            let (status_code, error_class) =
+                eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(&e));
+            warn!(
+                error_kind = retry::error_class_log_kind(error_class),
+                error = %e,
+                "Failed to read backend response body"
+            );
             retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
-                ),
+                status_code,
+                body: ResponseBody::Buffered(eager_buffer_body_read_error_body(status_code)),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ConnectionReset),
+                error_class: Some(error_class),
             }
         }
+    }
+}
+
+/// Status + `ErrorClass` for a reqwest body-read failure on an eager-buffering
+/// path, given the classifier's verdict for the underlying error (#2953).
+///
+/// The per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`)
+/// covers through body completion in reqwest, so a read **timeout** during
+/// eager buffering lands here. Hardcoding `ConnectionReset`/502 made the same
+/// backend fault surface as 502/`connection_reset` over reqwest and
+/// 504/`read_write_timeout` over direct H2 (`HyperBodyCollectError::ReadTimeout`)
+/// — a transport-dependent split in `TransactionSummary.error_class`, operator
+/// dashboards, and circuit-breaker `failure_status_codes` matching. Map
+/// `ReadWriteTimeout` to 504 for parity with the H2/H3 arms; everything else
+/// keeps the 502.
+///
+/// Response headers have already arrived at every call site, so the fault is
+/// post-wire by construction and callers keep `connection_error: false`. A
+/// pre-wire label is therefore impossible here (`classify_reqwest_error` only
+/// returns connect-class verdicts under `e.is_connect()`); coerce one anyway to
+/// `ConnectionReset` so the documented
+/// `connection_error == !request_reached_wire(error_class)` boundary cannot be
+/// violated by a future classifier change, and so `retry_on_connect_failure`
+/// can never replay a non-idempotent request whose body the backend already
+/// processed.
+pub(crate) fn eager_buffer_body_read_status_and_class(
+    class: retry::ErrorClass,
+) -> (u16, retry::ErrorClass) {
+    if !retry::request_reached_wire(class) {
+        return (502, retry::ErrorClass::ConnectionReset);
+    }
+    if class == retry::ErrorClass::ReadWriteTimeout {
+        return (504, class);
+    }
+    (502, class)
+}
+
+/// Error body paired with [`eager_buffer_body_read_status_and_class`]. The 504
+/// wording matches the direct-H2 read-timeout arm so operators see one string
+/// per fault regardless of transport.
+fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
+    if status_code == 504 {
+        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()
+    } else {
+        r#"{"error":"Backend response body read failed"}"#
+            .as_bytes()
+            .to_vec()
     }
 }
 
