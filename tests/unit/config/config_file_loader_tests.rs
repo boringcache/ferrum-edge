@@ -2666,9 +2666,17 @@ fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {
 
 #[test]
 fn file_loader_normalizes_mixed_case_hosts_sni_san_and_blank_optional_ids() {
-    // Parity seam for issue #2402: file-mode loading must produce the same
-    // canonical forms restore persists for mixed-case hosts/SNI/SAN and blank
-    // optional identifiers.
+    // Parity seam for issue #2402: after file-mode normalize_fields(), mixed-case
+    // hosts/SNI/DNS-SAN and blank consumer custom_id match the canonical forms
+    // restore persists.
+    //
+    // File mode intentionally validates fields BEFORE normalize_fields() (see
+    // file_loader::load_config_from_file and Proxy::validate_fields_inner). A
+    // wire `proxy_id: ""` on a global plugin is therefore Some("") at field
+    // validation and fails with "scope 'global' must not have proxy_id" before
+    // PluginConfig::normalize_fields can clear blank → None. Omit proxy_id here
+    // (the admitted form); blank custom_id still proves optional-id clearing
+    // because validate_string_field accepts whitespace-only values.
     let yaml = r#"
 version: "1"
 consumers:
@@ -2699,7 +2707,6 @@ plugin_configs:
   - id: "norm-plugin"
     plugin_name: "rate_limiting"
     scope: global
-    proxy_id: ""
     enabled: true
     config:
       limits:

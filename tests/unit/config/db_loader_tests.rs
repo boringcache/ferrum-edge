@@ -574,10 +574,16 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
 }
 
 /// SQL writers bind the payload they receive directly. Mixed-case hosts /
-/// SNI / SAN values and blank optional identifiers therefore survive in the
+/// SNI / SAN values and blank consumer `custom_id` therefore survive in the
 /// durable rows unless restore/CRUD admission normalizes before persistence
 /// (issue #2402). Assert against raw columns because `get_*` re-normalizes on
 /// read and would hide a write-path miss.
+///
+/// Blank plugin `proxy_id` is deliberately not part of the wire-form proof:
+/// `plugin_configs.proxy_id` has `REFERENCES proxies(id)`, so `Some("")` is a
+/// non-NULL FK value that cannot match any proxy row (SQLite 787). That is
+/// exactly why restore/CRUD must clear blank `proxy_id` → None before SQL
+/// insert — not evidence that SQL itself domain-normalizes identifiers.
 #[tokio::test]
 async fn sql_create_persists_wire_form_without_domain_normalization() {
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -603,10 +609,9 @@ async fn sql_create_persists_wire_form_without_domain_normalization() {
         "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
     ];
 
-    let mut plugin = make_global_tcp_throttle("mixed-plugin");
-    // Bypass PluginConfig::normalize_fields() so the store is handed a blank
-    // optional identifier the same way a broken restore path would.
-    plugin.proxy_id = Some(String::new());
+    // Global plugin with proxy_id omitted (None). Handing SQL Some("") would
+    // fail the proxies(id) FK before any domain-normalization question arises.
+    let plugin = make_global_tcp_throttle("mixed-plugin");
 
     store.create_proxy(&proxy).await.expect("proxy create");
     store
@@ -621,6 +626,18 @@ async fn sql_create_persists_wire_form_without_domain_normalization() {
         .create_plugin_config(&plugin)
         .await
         .expect("plugin create");
+
+    let mut blank_proxy_id = make_global_tcp_throttle("blank-proxy-id-plugin");
+    blank_proxy_id.proxy_id = Some(String::new());
+    let blank_err = store
+        .create_plugin_config(&blank_proxy_id)
+        .await
+        .expect_err("blank proxy_id string must fail proxies(id) FK");
+    let blank_msg = blank_err.to_string();
+    assert!(
+        blank_msg.contains("FOREIGN KEY") || blank_msg.contains("787"),
+        "empty-string proxy_id must be an FK failure, not silent persist: {blank_msg}"
+    );
 
     let hosts: String = sqlx::query_scalar("SELECT hosts FROM proxies WHERE id = 'mixed-proxy'")
         .fetch_one(&store.pool())
@@ -676,7 +693,10 @@ async fn sql_create_persists_wire_form_without_domain_normalization() {
             .fetch_one(&store.pool())
             .await
             .unwrap();
-    assert_eq!(proxy_id.as_deref(), Some(""));
+    assert!(
+        proxy_id.is_none(),
+        "global plugin without proxy_id must persist NULL, not empty string: {proxy_id:?}"
+    );
 }
 
 #[tokio::test]
