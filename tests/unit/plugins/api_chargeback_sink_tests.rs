@@ -2771,10 +2771,9 @@ fn billable_summary(request_id: &str) -> TransactionSummary {
         bytes_received: 200,
         ..TransactionSummary::default()
     };
-    summary.metadata.insert(
-        REQUEST_ID_METADATA_KEY.to_string(),
-        request_id.to_string(),
-    );
+    summary
+        .metadata
+        .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.to_string());
     summary
 }
 
