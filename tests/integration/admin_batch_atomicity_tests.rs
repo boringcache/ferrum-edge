@@ -423,8 +423,7 @@ async fn duplicate_resource_rejects_whole_graph_without_committing_earlier_famil
         "a rejected graph must not report created counts: {body:?}"
     );
 
-    let (status, consumer) =
-        get_ns(&base, "/consumers/atomic-duplicate-consumer", namespace).await;
+    let (status, consumer) = get_ns(&base, "/consumers/atomic-duplicate-consumer", namespace).await;
     assert_eq!(
         status, 404,
         "the consumer ahead of the duplicate must not survive: {consumer:?}"

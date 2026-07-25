@@ -1728,7 +1728,9 @@ mod inner {
         ) -> Result<(), anyhow::Error> {
             let mut first_error: Option<anyhow::Error> = None;
             while let Some(mut lease) = leases.pop() {
-                if let Err(error) = lease.release().await && first_error.is_none() {
+                if let Err(error) = lease.release().await
+                    && first_error.is_none()
+                {
                     first_error = Some(error);
                 }
             }

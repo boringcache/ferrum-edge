@@ -5855,8 +5855,14 @@ impl DatabaseStore {
                 self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
-            self.record_config_change_tx(&mut *tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
-                .await?;
+            self.record_config_change_tx(
+                &mut *tx,
+                &pc.namespace,
+                "plugin_config",
+                &pc.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(pc.namespace.clone());
         }
 
@@ -6133,8 +6139,9 @@ impl DatabaseStore {
             "SELECT 1 FROM config_admission_locks \
              WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}{for_update}"
         ));
-        let generation = i64::try_from(lease.generation)
-            .map_err(|_| anyhow::anyhow!("namespace config admission generation is out of range"))?;
+        let generation = i64::try_from(lease.generation).map_err(|_| {
+            anyhow::anyhow!("namespace config admission generation is out of range")
+        })?;
         let held = sqlx::query(&sql)
             .bind(namespace)
             .bind(lease.owner)

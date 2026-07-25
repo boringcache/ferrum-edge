@@ -25,9 +25,9 @@ use ferrum_edge::_test_support::{
     set_atomic_batch_fault_for_test,
 };
 use ferrum_edge::config::batch_atomicity::{
-    ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph,
-    AtomicBatchUnsupported, BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost,
-    atomic_batch_test_overrides, atomic_batch_unsupported, is_batch_admission_lease_lost,
+    ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, atomic_batch_test_overrides,
+    atomic_batch_unsupported, is_batch_admission_lease_lost,
 };
 use ferrum_edge::config::types::{Consumer, PluginConfig, Proxy, Upstream};
 use serde_json::json;
@@ -243,8 +243,12 @@ fn sql_atomic_batch_uses_a_single_transaction_for_every_phase() {
         "the atomic batch graph write must commit exactly once"
     );
     // Dependency order inside that single transaction.
-    let consumers = body.find("insert_consumers_in_tx").expect("consumers phase");
-    let upstreams = body.find("insert_upstreams_in_tx").expect("upstreams phase");
+    let consumers = body
+        .find("insert_consumers_in_tx")
+        .expect("consumers phase");
+    let upstreams = body
+        .find("insert_upstreams_in_tx")
+        .expect("upstreams phase");
     let proxies = body.find("insert_proxies_in_tx").expect("proxies phase");
     let plugins = body
         .find("insert_plugin_configs_in_tx")
@@ -358,7 +362,9 @@ fn mongo_atomic_batch_refuses_standalone_and_uses_one_session_transaction() {
         );
     }
     assert_eq!(
-        writer.matches(".chunks(plan.chunk_size).enumerate()").count(),
+        writer
+            .matches(".chunks(plan.chunk_size).enumerate()")
+            .count(),
         4,
         "consumers, upstreams, proxies, and plugin configs must all be chunked in-session"
     );
@@ -488,8 +494,7 @@ fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
     };
     let sql = &SQL_STORE_SOURCE[sql_start..sql_end];
     assert!(
-        sql.contains("self.config_admission_lease_now_sql()")
-            && sql.contains("expires_at > {now}"),
+        sql.contains("self.config_admission_lease_now_sql()") && sql.contains("expires_at > {now}"),
         "the SQL lease gate must compare expires_at against the database's current time"
     );
 }
