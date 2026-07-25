@@ -195,7 +195,11 @@ fn round_robin_single_worker_is_deterministic_cycle_within_shard() {
     for idx in indices {
         counts[idx] += 1;
     }
-    assert_eq!(counts, [3, 3, 3], "long-run single-worker RR ratios must stay even");
+    assert_eq!(
+        counts,
+        [3, 3, 3],
+        "long-run single-worker RR ratios must stay even"
+    );
 }
 
 #[test]
@@ -276,11 +280,7 @@ fn locality_distribute_first_wave_buckets_are_not_lockstep() {
         upstreams: vec![up],
         ..GatewayConfig::default()
     });
-    let lb = cache
-        .load()
-        .get_balancer("u1")
-        .expect("balancer")
-        .clone();
+    let lb = cache.load().get_balancer("u1").expect("balancer").clone();
 
     // Weighted total is 100; all-zero phases would map every shard to the same
     // first bucket via golden_ratio_hash(0) % 100.

@@ -2674,8 +2674,8 @@ impl LoadBalancer {
         if self.targets.is_empty() {
             return None;
         }
-        let ticket = self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)]
-            .fetch_add(1, Ordering::Relaxed);
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
         Some(Arc::clone(
             &self.targets[(ticket as usize) % self.targets.len()],
         ))
@@ -2692,8 +2692,8 @@ impl LoadBalancer {
         if self.targets.is_empty() {
             return None;
         }
-        let ticket = self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)]
-            .fetch_add(1, Ordering::Relaxed);
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
         let hash = golden_ratio_hash(ticket) as usize;
         Some(Arc::clone(&self.targets[hash % self.targets.len()]))
     }
@@ -5475,9 +5475,7 @@ mod tests {
         }
         let first = counters[0].load(Ordering::Relaxed);
         assert!(
-            counters
-                .iter()
-                .any(|c| c.load(Ordering::Relaxed) != first),
+            counters.iter().any(|c| c.load(Ordering::Relaxed) != first),
             "selection counter shards must be phase-distributed"
         );
     }
