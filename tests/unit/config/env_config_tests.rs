@@ -4523,8 +4523,8 @@ fn test_mongo_timeouts_custom_values() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mongo_server_selection_timeout_seconds, 60);
-            assert_eq!(config.mongo_connect_timeout_seconds, 5);
+            assert_eq!(config.mongo_server_selection_timeout_seconds, Some(60));
+            assert_eq!(config.mongo_connect_timeout_seconds, Some(5));
         },
     );
 }
@@ -4537,9 +4537,17 @@ fn test_mongo_timeouts_default_values() {
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
         ],
         || {
+            remove_var("FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS");
+            remove_var("FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mongo_server_selection_timeout_seconds, 30);
-            assert_eq!(config.mongo_connect_timeout_seconds, 10);
+            assert_eq!(
+                config.mongo_server_selection_timeout_seconds, None,
+                "unset timeout env must stay None so URI values are preserved"
+            );
+            assert_eq!(
+                config.mongo_connect_timeout_seconds, None,
+                "unset timeout env must stay None so URI values are preserved"
+            );
         },
     );
 }
