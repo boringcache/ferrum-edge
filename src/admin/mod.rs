@@ -1408,6 +1408,9 @@ pub async fn handle_admin_request(
             health_status["kafka_logging"] =
                 serde_json::to_value(crate::plugins::kafka_logging::snapshots())
                     .unwrap_or_default();
+            health_status["ai_transcript_audit"] =
+                serde_json::to_value(crate::plugins::ai_transcript_audit::snapshots())
+                    .unwrap_or_default();
         }
 
         let response_code = if !ready {
