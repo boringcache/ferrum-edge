@@ -2585,7 +2585,10 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         StatusCode::OK,
         "direct-H2 ownership request must succeed; body={body}"
     );
-    assert_eq!(body, "ok", "direct-H2 ownership path must reach the scripted backend");
+    assert_eq!(
+        body, "ok",
+        "direct-H2 ownership path must reach the scripted backend"
+    );
 
     let streams = backend.received_streams().await;
     let stream = streams
