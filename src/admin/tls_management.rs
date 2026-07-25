@@ -237,7 +237,9 @@ pub(super) async fn handle_update_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) =
+        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Certificate)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match certificate_record_from_request(Some(id), request, true) {
@@ -313,7 +315,7 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle) {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {
@@ -389,7 +391,7 @@ pub(super) async fn handle_update_crl(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Crl) {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match crl_record_from_request(Some(id), request, true) {
@@ -465,7 +467,9 @@ pub(super) async fn handle_update_ocsp_response(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) =
+        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::OcspResponse)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match ocsp_response_record_from_request(Some(id), request, true) {
@@ -977,7 +981,7 @@ pub(super) async fn handle_update_jwks(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Jwks) {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match jwks_record_from_request(Some(id), request, true) {
@@ -1567,6 +1571,26 @@ fn managed_store_response()
     })
 }
 
+/// Typed PUT requires an existing record whose kind matches the route collection.
+///
+/// IDs are globally unique across managed TLS collections; a cross-kind hit is a
+/// stable `409 Conflict` (`KindConflict`), matching create-with-overwrite.
+fn require_existing_managed_kind(
+    store: &crate::tls::managed::ManagedTlsStore,
+    id: &str,
+    kind: ManagedTlsMaterialKind,
+) -> Result<(), ManagedTlsError> {
+    let existing = store.get(id)?;
+    if existing.kind != kind {
+        return Err(ManagedTlsError::KindConflict {
+            id: id.to_string(),
+            existing_kind: existing.kind.as_str(),
+            requested_kind: kind.as_str(),
+        });
+    }
+    Ok(())
+}
+
 fn acme_certificate_store_response()
 -> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
     crate::tls::acme::global_certificate_store().map_err(|error| {
@@ -1600,7 +1624,9 @@ fn acme_account_store_response()
 fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
     let status = match &error {
         ManagedTlsError::NotFound(_) => StatusCode::NOT_FOUND,
-        ManagedTlsError::AlreadyExists(_) => StatusCode::CONFLICT,
+        ManagedTlsError::AlreadyExists(_) | ManagedTlsError::KindConflict { .. } => {
+            StatusCode::CONFLICT
+        }
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
@@ -1632,6 +1658,10 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
 }
 
 fn request_managed_source_reloads() {
+    // Same-kind replacement keeps `managed://{collection}/{id}` references valid.
+    // Admission already validated PEM/DER/JWKS before the store write; watchers
+    // rebuild from the new fingerprint and retain the previous runtime config on
+    // failed activation (TLS live-reload contract).
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
 }
 

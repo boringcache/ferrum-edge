@@ -653,7 +653,11 @@ paths:
     post:
       operationId: createManagedTlsCertificate
       summary: Upload an admin-managed TLS certificate and private key
-      description: Private key bytes are persisted in the managed store but are never returned in responses.
+      description: |
+        Private key bytes are persisted in the managed store but are never returned
+        in responses. Managed TLS record IDs are globally unique across certificates,
+        CA bundles, CRLs, OCSP responses, and JWKS. Create with `allow_overwrite=true`
+        rejects a cross-kind ID collision with `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -691,6 +695,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -700,6 +706,12 @@ paths:
     put:
       operationId: updateManagedTlsCertificate
       summary: Rotate an admin-managed TLS certificate and private key
+      description: |
+        Same-kind replacement only. Because managed TLS IDs are globally unique,
+        updating an ID that already stores a different material kind returns
+        `409 Conflict` with a stable kind-collision error. Admission validates
+        the new PEM before persistence; watchers atomically activate or retain
+        the previous runtime config.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -724,6 +736,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -766,6 +780,10 @@ paths:
     post:
       operationId: createManagedTlsCaBundle
       summary: Upload an admin-managed TLS CA bundle
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -803,6 +821,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -812,6 +832,10 @@ paths:
     put:
       operationId: updateManagedTlsCaBundle
       summary: Rotate an admin-managed TLS CA bundle
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
+        Admission validates the CA PEM before persistence; watchers atomically
+        activate or retain the previous runtime config.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -836,6 +860,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -878,6 +904,10 @@ paths:
     post:
       operationId: createManagedTlsCrl
       summary: Upload an admin-managed TLS CRL bundle
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -915,6 +945,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -924,6 +956,8 @@ paths:
     put:
       operationId: updateManagedTlsCrl
       summary: Rotate an admin-managed TLS CRL bundle
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -948,6 +982,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -990,6 +1026,10 @@ paths:
     post:
       operationId: createManagedTlsOcspResponse
       summary: Upload an admin-managed DER OCSP response
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -1027,6 +1067,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1036,6 +1078,8 @@ paths:
     put:
       operationId: updateManagedTlsOcspResponse
       summary: Rotate an admin-managed DER OCSP response
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1060,6 +1104,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1102,6 +1148,10 @@ paths:
     post:
       operationId: createManagedTlsJwks
       summary: Upload an admin-managed JWKS document
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -1139,6 +1189,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1148,6 +1200,8 @@ paths:
     put:
       operationId: updateManagedTlsJwks
       summary: Rotate an admin-managed JWKS document
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1172,6 +1226,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -5337,7 +5393,11 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Resource already exists, conflicts with an existing resource, or the mutation would make mTLS DNS identities ambiguous
+      description: >
+        Resource already exists, conflicts with an existing resource, a managed TLS
+        ID collides across material kinds, the mutation would invalidate an active
+        managed TLS reference on delete, or the mutation would make mTLS DNS
+        identities ambiguous
       content:
         application/json:
           schema:
@@ -5841,6 +5901,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5864,6 +5928,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5887,6 +5955,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsOcspResponseRequest:
       type: object
@@ -5904,6 +5976,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsJwksRequest:
       type: object
@@ -5921,6 +5997,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     TlsInventoryListResponse:
       type: object
