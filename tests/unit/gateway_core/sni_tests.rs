@@ -1,6 +1,6 @@
 use ferrum_edge::proxy::sni::{
     DtlsSniResult, extract_sni_from_client_hello, extract_sni_from_dtls_client_hello,
-    extract_sni_from_tcp_stream, resolve_proxy_by_sni,
+    extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity, resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
@@ -1166,6 +1166,46 @@ async fn test_extract_sni_from_tcp_stream_oversized_split_across_records() {
     assert!(
         elapsed < std::time::Duration::from_secs(2),
         "oversized multi-record peek stalled until handshake timeout: {elapsed:?}"
+    );
+}
+
+/// Lazy peek-buffer sizing: ordinary small ClientHellos must not grow the
+/// buffer to the 16 KiB hard cap. The accept path starts at the historical
+/// 4 KiB floor and only steps up when the initial buffer is full.
+#[test]
+fn peek_buffer_starts_small_and_grows_lazily_toward_hard_cap() {
+    let initial = initial_peek_capacity();
+    assert_eq!(
+        initial,
+        4 * 1024,
+        "initial peek floor must stay at the historical 4 KiB size so ordinary \
+         connections do not pay the 16 KiB hard-cap allocation"
+    );
+    assert!(
+        initial < 16 * 1024,
+        "initial peek capacity must be strictly below the 16 KiB hard cap"
+    );
+    // An ordinary small ClientHello (~200-600 bytes) must not trigger growth.
+    assert_eq!(
+        next_peek_capacity(512),
+        initial,
+        "small observed prefix must keep capacity at the initial floor"
+    );
+    assert_eq!(
+        next_peek_capacity(initial - 1),
+        initial,
+        "partial fill of the initial buffer must not grow toward the hard cap"
+    );
+    // Growth happens only once the initial buffer is full.
+    assert_eq!(
+        next_peek_capacity(initial),
+        16 * 1024,
+        "full initial buffer grows to the hard cap in one step"
+    );
+    assert_eq!(
+        next_peek_capacity(16 * 1024),
+        16 * 1024,
+        "capacity must never exceed the hard peek bound"
     );
 }
 

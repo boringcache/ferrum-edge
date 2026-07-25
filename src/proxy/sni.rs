@@ -10,15 +10,48 @@
 /// large ALPN/cert-compression lists routinely push past 4 KiB. Extension order
 /// is client-chosen, so SNI can land after those fat extensions. Cap at 16 KiB
 /// (one max TLS record) so valid oversized hellos still yield SNI for
-/// passthrough routing; the peek buffer is transient per connection. Hostile
-/// length fields cannot request more than this hard memory bound.
+/// passthrough routing. The peek buffer starts at
+/// [`INITIAL_CLIENT_HELLO_PEEK_LEN`] and grows toward this hard bound only when
+/// more bytes are needed; hostile length fields cannot request more than this
+/// hard memory bound.
 const MAX_CLIENT_HELLO_LEN: usize = 16 * 1024;
+
+/// Initial peek buffer size for ClientHello SNI extraction.
+///
+/// Matches the historical 4 KiB floor so ordinary connections (typical
+/// ClientHellos are 200-600 bytes; most modern stacks stay under 4 KiB) do not
+/// pay a zeroed 16 KiB allocation on the pre-auth accept path. Oversized hellos
+/// grow toward [`MAX_CLIENT_HELLO_LEN`] lazily via [`next_peek_capacity`].
+const INITIAL_CLIENT_HELLO_PEEK_LEN: usize = 4 * 1024;
 
 /// Polling interval between peeks while waiting for the rest of a partially
 /// arrived ClientHello (mirrors `STREAM_FIRST_BYTES_PEEK_RETRY_INTERVAL` in
 /// `tcp_proxy.rs` — `peek()` returns as soon as ≥1 byte is readable, so
 /// back-to-back peeks would busy-loop).
 const SNI_PEEK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Initial capacity of the TCP ClientHello peek buffer.
+///
+/// Pure sizing seam so external tests can lock the lazy-allocation floor
+/// without observing live buffer capacity through the async peek path.
+pub fn initial_peek_capacity() -> usize {
+    INITIAL_CLIENT_HELLO_PEEK_LEN
+}
+
+/// Next peek-buffer capacity after `have` bytes have already been observed and
+/// the wire-span parser still needs more data.
+///
+/// Growth is a single step from the initial 4 KiB floor to the 16 KiB hard cap
+/// once the initial buffer is full (`have >=` initial). While `have` is still
+/// below the initial size the capacity stays at the floor — the peer simply has
+/// not delivered more bytes yet, so growing would not help.
+pub fn next_peek_capacity(have: usize) -> usize {
+    if have >= INITIAL_CLIENT_HELLO_PEEK_LEN {
+        MAX_CLIENT_HELLO_LEN
+    } else {
+        INITIAL_CLIENT_HELLO_PEEK_LEN
+    }
+}
 
 /// Extract the SNI hostname from a TLS ClientHello by peeking at a TCP stream.
 ///
@@ -30,10 +63,15 @@ const SNI_PEEK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// internal callers that have already enforced a deadline elsewhere; passthrough
 /// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
 /// so a peer that opens a TCP connection and sends nothing cannot park a
-/// connection-handler task indefinitely.
+/// connection-handler task indefinitely. The no-deadline path peeks once into
+/// the initial (4 KiB) buffer — enough for ordinary ClientHellos.
 ///
-/// When a deadline is set, the peek LOOPS until the full first TLS record
-/// (`5 + record_len` bytes, capped at [`MAX_CLIENT_HELLO_LEN`]) is buffered.
+/// When a deadline is set, the peek LOOPS until the full ClientHello handshake
+/// (`5 + record_len` bytes across records, capped at [`MAX_CLIENT_HELLO_LEN`])
+/// is buffered. The peek buffer starts at [`initial_peek_capacity`] and grows
+/// toward the hard cap only when the wire-span parser reports more bytes are
+/// needed and the current buffer is full. `peek()` re-reads from byte 0 of the
+/// socket receive buffer on every call, so growing between iterations is safe.
 /// `peek()` returns as soon as ≥1 byte is readable, so a single peek sees a
 /// truncated ClientHello whenever it spans multiple TCP segments — routine for
 /// modern ~1.7 KB post-quantum ClientHellos — and a truncated parse silently
@@ -46,10 +84,12 @@ pub async fn extract_sni_from_tcp_stream(
     stream: &tokio::net::TcpStream,
     handshake_timeout: Option<std::time::Duration>,
 ) -> Option<String> {
-    let mut buf = vec![0u8; MAX_CLIENT_HELLO_LEN];
+    let mut buf = vec![0u8; initial_peek_capacity()];
     let Some(d) = handshake_timeout else {
         // No deadline: take a single peek and never loop, so a stalled peer
         // cannot park the task waiting for a record that never completes.
+        // Initial capacity covers typical ClientHellos; callers that need the
+        // multi-segment / oversized path pass a handshake deadline.
         let n = stream.peek(&mut buf).await.ok()?;
         return extract_sni_from_client_hello(&buf[..n]);
     };
@@ -113,7 +153,21 @@ pub async fn extract_sni_from_tcp_stream(
             WireSpan::Span(_) | WireSpan::NeedMore if have >= MAX_CLIENT_HELLO_LEN => {
                 return extract_sni_from_client_hello(&buf[..have]);
             }
-            WireSpan::Span(_) | WireSpan::NeedMore => {}
+            WireSpan::Span(_) | WireSpan::NeedMore => {
+                // Grow lazily only when the current buffer is full and the
+                // parser still needs more wire bytes. `peek()` always re-reads
+                // from byte 0 of the socket receive buffer, so resizing here is
+                // safe: the next peek fills the larger slice from the start and
+                // replaces `have`. If we grew, retry immediately — more bytes
+                // may already be sitting in the socket buffer.
+                if have >= buf.len() {
+                    let want = next_peek_capacity(have);
+                    if want > buf.len() {
+                        buf.resize(want, 0);
+                        continue;
+                    }
+                }
+            }
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
