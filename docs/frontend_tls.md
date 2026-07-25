@@ -436,6 +436,19 @@ The frontend/admin live-reload poller atomically swaps a validated `rustls::Serv
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
 
+### TLS Inventory Visibility and Metrics
+
+`GET /admin/tls/inventory` collects live: it loads every configured source on each request, including private keys (parse-checked and dropped immediately), so an operator request may reach the filesystem, the Kubernetes API, and secret managers.
+
+Prometheus `/metrics` deliberately does not. Its `ferrum_tls_cert_expiry_seconds` / `ferrum_tls_cert_not_before_seconds` gauges are rendered from a cached, non-secret inventory snapshot, so a scrape performs **zero** certificate, private-key, Kubernetes, HSM, or cloud-secret I/O and never blocks on a secret provider (a Prometheus fleet cannot amplify a secret-backend incident, and an allowed scraper cannot drive private-key materialization outside the reload lifecycle).
+
+The snapshot is produced off the request path by a bounded, single-flight background refresh:
+
+- It reads only public certificate-family material — certificate, CA bundle, CRL. Private-key, JWKS, and OCSP sources are never materialized for metrics; those entries report health from the owning validated config/reload state (startup and every reload validate a source before adopting it, and a recorded watcher load/rebuild failure downgrades the entry without re-reading a byte).
+- A scrape refreshes nothing itself. When the snapshot is older than `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300; `0` disables the refresh and leaves the gauges absent) the scrape only schedules the refresh, and at most one refresh runs process-wide at a time.
+- Validated rotation and reload outcomes mark the snapshot stale, so a rotated certificate is picked up on the next scrape instead of at the end of the TTL window.
+- Freshness is explicit: `ferrum_tls_inventory_snapshot_timestamp_seconds` carries the snapshot's collection time and `ferrum_tls_inventory_snapshot_max_age_seconds` carries the configured bound. Alert on `time() - ferrum_tls_inventory_snapshot_timestamp_seconds` exceeding that bound rather than assuming scrape-time collection.
+
 ### Backend Connection Pool and TLS Paths
 
 For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-to-backend), each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate `reqwest::Client` pool entry**. Two proxies with different cert paths targeting the same backend host will not share connections. For rustls-based paths (gRPC pool, HTTP/2 direct pool), the TLS config is built per-connection rather than per-pool-entry, but the same isolation principle applies — different cert paths produce different TLS configurations.
