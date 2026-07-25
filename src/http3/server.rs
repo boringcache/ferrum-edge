@@ -5328,14 +5328,17 @@ async fn handle_h3_request(
                                 // capability-downgrade signal — same rule as the
                                 // native gRPC streaming and refined-buffered
                                 // paths. Excludes client disconnect, size
-                                // errors, graceful close, and read timeouts.
-                                if crate::proxy::is_h3_transport_error_class(class) {
+                                // errors, and read timeouts by class, plus
+                                // `H3_NO_ERROR` / GOAWAY explicitly: a graceful
+                                // teardown before the declared body completed
+                                // still fails the request, but it is never
+                                // evidence the backend lost QUIC.
+                                if !crate::http3::client::is_h3_graceful_close(&e)
+                                    && crate::proxy::is_h3_transport_error_class(class)
+                                {
                                     state
                                         .backend_capabilities
-                                        .mark_h3_unsupported(
-                                            &proxy,
-                                            upstream_target.as_deref(),
-                                        );
+                                        .mark_h3_unsupported(&proxy, upstream_target.as_deref());
                                 }
                                 body_error_class = Some(class);
                                 break 'outer;
@@ -5421,8 +5424,11 @@ async fn handle_h3_request(
                         crate::http3::stream_util::abort_response_stream(&mut stream);
                         let class = crate::http3::client::classify_http3_error(&err);
                         // Trailer-boundary transport faults are the same
-                        // capability signal as mid-body resets (issue #2939).
-                        if crate::proxy::is_h3_transport_error_class(class) {
+                        // capability signal as mid-body resets (issue #2939),
+                        // and carry the same graceful-close exclusion.
+                        if !crate::http3::client::is_h3_graceful_close(&err)
+                            && crate::proxy::is_h3_transport_error_class(class)
+                        {
                             state
                                 .backend_capabilities
                                 .mark_h3_unsupported(&proxy, upstream_target.as_deref());
@@ -6604,6 +6610,17 @@ async fn handle_h3_request(
         // replacement below.
         let mut response_body_rejected = false;
 
+        // Response-body plugins cannot inspect or transform trailers today, so
+        // a chain that actually processes this response body must not forward
+        // backend-controlled trailer fields it never saw. The gate is the same
+        // two-tier response-body-buffering predicate that chose this path — NOT
+        // chain-emptiness: an auth/logging-only proxy never reads the body and
+        // keeps the backend's trailers (issue #2941). Body-mutating phases
+        // below additionally clear the trailers when they replace the bytes.
+        if crate::proxy::response_body_plugins_process_body(&plugins, &ctx) {
+            response_trailers = None;
+        }
+
         // on_response_body hooks — only for buffered responses when plugins exist.
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
@@ -6867,11 +6884,10 @@ async fn handle_h3_request(
             bytes_received = response_body_bytes;
         }
 
-        // Backend trailers remain valid whenever the body bytes on the wire
-        // still match what the backend sent. Mutation / reject / normalize
-        // arms above already clear `response_trailers` when the body pipeline
-        // replaces those bytes. Auth/logging-only plugins must not wipe
-        // trailers merely because the plugin chain is nonempty (issue #2941).
+        // Backend trailers survive to here only when no response-body plugin
+        // phase processed this response (gate above) and no mutation / reject /
+        // normalize arm replaced the bytes. Auth/logging-only plugins must not
+        // wipe trailers merely because the plugin chain is nonempty (#2941).
 
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
@@ -8455,7 +8471,10 @@ async fn stream_h3_open_response_to_client(
                             let class = crate::http3::client::classify_http3_error(&error);
                             // Mid-stream transport fault → capability downgrade
                             // (parity with gRPC / refined-buffered; issue #2939).
-                            if crate::proxy::is_h3_transport_error_class(class) {
+                            // `H3_NO_ERROR` / GOAWAY is never that signal.
+                            if !crate::http3::client::is_h3_graceful_close(&error)
+                                && crate::proxy::is_h3_transport_error_class(class)
+                            {
                                 state
                                     .backend_capabilities
                                     .mark_h3_unsupported(proxy, upstream_target);
@@ -8517,8 +8536,11 @@ async fn stream_h3_open_response_to_client(
                     crate::http3::stream_util::abort_response_stream(h3_stream);
                     let class = crate::http3::client::classify_http3_error(&err);
                     // Trailer-boundary transport faults downgrade like mid-body
-                    // resets (issue #2939).
-                    if crate::proxy::is_h3_transport_error_class(class) {
+                    // resets (issue #2939), with the same graceful-close
+                    // exclusion.
+                    if !crate::http3::client::is_h3_graceful_close(&err)
+                        && crate::proxy::is_h3_transport_error_class(class)
+                    {
                         state
                             .backend_capabilities
                             .mark_h3_unsupported(proxy, upstream_target);
@@ -9585,9 +9607,14 @@ async fn dispatch_grpc_native_h3(
                             // otherwise subsequent gRPC requests keep taking the
                             // native H3 path and repeat the failure until the next
                             // refresh. `is_h3_transport_error_class` excludes client
-                            // disconnects, size errors, graceful close, and read
-                            // timeouts.
-                            if crate::proxy::is_h3_transport_error_class(class) {
+                            // disconnects, size errors, and read timeouts; graceful
+                            // close needs the explicit check because the raw stream
+                            // classifier maps an `H3_NO_ERROR` teardown to
+                            // `ConnectionClosed` (only the pool's `classify_h3_error`
+                            // has the typed `GracefulRemoteClose` signal).
+                            if !crate::http3::client::is_h3_graceful_close(&error)
+                                && crate::proxy::is_h3_transport_error_class(class)
+                            {
                                 state
                                     .backend_capabilities
                                     .mark_h3_unsupported(proxy, upstream_target);
@@ -10415,7 +10442,10 @@ async fn proxy_to_backend_h3_streaming(
                             let class = crate::http3::client::classify_http3_error(&e);
                             // Mid-stream transport fault → capability downgrade
                             // (parity with gRPC streaming; issue #2939).
-                            if crate::proxy::is_h3_transport_error_class(class) {
+                            // `H3_NO_ERROR` / GOAWAY is never that signal.
+                            if !crate::http3::client::is_h3_graceful_close(&e)
+                                && crate::proxy::is_h3_transport_error_class(class)
+                            {
                                 state
                                     .backend_capabilities
                                     .mark_h3_unsupported(proxy, upstream_target);
@@ -10479,8 +10509,11 @@ async fn proxy_to_backend_h3_streaming(
                     crate::http3::stream_util::abort_response_stream(h3_stream);
                     let class = crate::http3::client::classify_http3_error(&err);
                     // Trailer-boundary transport faults downgrade like mid-body
-                    // resets (issue #2939).
-                    if crate::proxy::is_h3_transport_error_class(class) {
+                    // resets (issue #2939), with the same graceful-close
+                    // exclusion.
+                    if !crate::http3::client::is_h3_graceful_close(&err)
+                        && crate::proxy::is_h3_transport_error_class(class)
+                    {
                         state
                             .backend_capabilities
                             .mark_h3_unsupported(proxy, upstream_target);
@@ -10549,10 +10582,11 @@ struct H3BufferedDispatchResult {
     body: Vec<u8>,
     headers: HashMap<String, String>,
     /// Backend response trailers (issue #1630), still unsanitized. The buffered
-    /// native-H3 send path forwards them when the body pipeline did not
-    /// invalidate them (auth/logging-only plugins keep trailers; mutation /
-    /// reject / normalize arms drop them). Otherwise it strips
-    /// response-direction hop-by-hop names before forwarding. `None` on every
+    /// native-H3 send path forwards them only when no response-body plugin
+    /// phase processed the response and no phase replaced the bytes
+    /// (auth/logging-only plugins keep trailers; body-inspecting, mutating,
+    /// rejecting, and normalizing phases drop them). Surviving trailers get
+    /// response-direction hop-by-hop names stripped before forwarding. `None` on every
     /// gateway-synthesized error/reject below (no backend trailers to forward),
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,

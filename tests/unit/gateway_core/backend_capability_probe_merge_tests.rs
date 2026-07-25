@@ -1,8 +1,8 @@
 //! External coverage for periodic capability-probe merge semantics (issue #2940).
 //!
-//! Transient DNS/connect/refused/timeout failures must preserve a previously
-//! `Supported` (or `Unsupported`) classification and never invent an
-//! `Unsupported` verdict from a reachability blip alone.
+//! A transient DNS/connect/refused/timeout failure must preserve an existing
+//! classification instead of wiping a proven `Supported` entry, while a first
+//! probe with nothing to protect still records a definitive verdict.
 
 use ferrum_edge::proxy::backend_capabilities::{
     ProtocolSupport, merge_protocol_probe_classification,
@@ -32,10 +32,27 @@ fn transient_probe_preserves_unsupported_across_timeout() {
 }
 
 #[test]
-fn transient_probe_without_prior_record_stays_unknown() {
-    let merged =
-        merge_protocol_probe_classification(None, ProtocolSupport::Unsupported, true);
-    assert_eq!(merged, ProtocolSupport::Unknown);
+fn transient_probe_without_prior_record_takes_the_probe_verdict() {
+    // Nothing to protect on a first probe: a QUIC connect timeout is
+    // indistinguishable from "no QUIC listener", so preserving Unknown here
+    // would leave every non-QUIC HTTPS backend permanently unclassified.
+    assert_eq!(
+        merge_protocol_probe_classification(None, ProtocolSupport::Unsupported, true),
+        ProtocolSupport::Unsupported
+    );
+    assert_eq!(
+        merge_protocol_probe_classification(None, ProtocolSupport::Unknown, true),
+        ProtocolSupport::Unknown
+    );
+    // A prior `Unknown` is not a verdict either.
+    assert_eq!(
+        merge_protocol_probe_classification(
+            Some(ProtocolSupport::Unknown),
+            ProtocolSupport::Unsupported,
+            true,
+        ),
+        ProtocolSupport::Unsupported
+    );
 }
 
 #[test]
@@ -74,7 +91,7 @@ fn h3_probe_outcome_apply_always_writes_merged_classification() {
 }
 
 #[test]
-fn probe_h3_stamps_last_probe_error_on_transient_failures() {
+fn probe_h3_merges_and_surfaces_failures_against_a_supported_record() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let probe = source
         .split("async fn probe_h3(")
@@ -93,10 +110,26 @@ fn probe_h3_stamps_last_probe_error_on_transient_failures() {
     );
     assert!(
         probe.contains("HTTP/3 probe timed out for"),
-        "probe_h3 timeout must stamp an operator-visible error"
+        "probe_h3 must build an operator-visible timeout message"
     );
     assert!(
-        probe.contains("HTTP/3 probe failed for"),
-        "probe_h3 Ok(Err) must stamp last_probe_error even when preserving"
+        probe.matches("h3_probe_failure_error(").count() >= 2,
+        "both the Ok(Err) and timeout arms must route through the \
+         previously-Supported visibility gate"
+    );
+
+    // The gate itself: only a target previously classified Supported turns a
+    // probe failure into `last_probe_error`, so a healthy non-QUIC backend
+    // does not report a phantom error on every refresh.
+    let gate = source
+        .split("fn h3_probe_failure_error(")
+        .nth(1)
+        .expect("h3_probe_failure_error")
+        .split("\n}\n")
+        .next()
+        .expect("bounded gate body");
+    assert!(
+        gate.contains("Some(ProtocolSupport::Supported)"),
+        "the probe-error gate must key off a previously Supported classification"
     );
 }

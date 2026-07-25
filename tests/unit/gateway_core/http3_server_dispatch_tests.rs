@@ -1454,6 +1454,10 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
             && inline_body.contains("mark_h3_unsupported("),
         "plain inline streaming body transport faults must downgrade H3 capability"
     );
+    assert!(
+        inline_body.contains("!crate::http3::client::is_h3_graceful_close(&e)"),
+        "an H3_NO_ERROR / GOAWAY teardown must never downgrade H3 capability"
+    );
 
     // Inline trailer-finish Backend arm.
     let inline_trailer = src
@@ -1468,6 +1472,10 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
             && inline_trailer.contains("mark_h3_unsupported("),
         "plain inline streaming trailer transport faults must downgrade H3 capability"
     );
+    assert!(
+        inline_trailer.contains("!crate::http3::client::is_h3_graceful_close(&err)"),
+        "a graceful trailer-boundary teardown must never downgrade H3 capability"
+    );
 
     // Refined streaming body fault.
     let refined_body = src
@@ -1481,6 +1489,10 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
         refined_body.contains("is_h3_transport_error_class(class)")
             && refined_body.contains("mark_h3_unsupported("),
         "refined streaming body transport faults must downgrade H3 capability"
+    );
+    assert!(
+        refined_body.contains("!crate::http3::client::is_h3_graceful_close(&error)"),
+        "refined streaming must exclude graceful close from the downgrade signal"
     );
 
     // Buffered-request streaming body fault (second "during streaming" after
@@ -1500,24 +1512,43 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
                 >= 2,
         "buffered-request streaming body and trailer transport faults must downgrade"
     );
+    assert!(
+        buffered_req.matches("is_h3_graceful_close(&").count() >= 3,
+        "buffered-request streaming must exclude graceful close at the body \
+         recovery check and at both downgrade sites"
+    );
 }
 
 #[test]
-fn buffered_h3_path_does_not_drop_trailers_for_nonempty_plugin_chain() {
+fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
     let src = include_str!("../../../src/http3/server.rs");
+    let gate = src
+        .split("        let mut response_body_rejected = false;")
+        .nth(1)
+        .expect("buffered response body phases")
+        .split("// on_response_body hooks")
+        .next()
+        .expect("bounded trailer gate");
+    assert!(
+        gate.contains("crate::proxy::response_body_plugins_process_body(&plugins, &ctx)")
+            && gate.contains("response_trailers = None;"),
+        "buffered H3 must drop trailers exactly when a response-body plugin phase \
+         processes this response"
+    );
+    assert!(
+        !gate.contains("if !plugins.is_empty()"),
+        "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
+    );
+
     let send = src
-        .split("// Backend trailers remain valid whenever the body bytes on the wire")
+        .split("// Backend trailers survive to here only when no response-body plugin")
         .nth(1)
         .expect("buffered trailer retention comment")
         .split("// Forward backend response trailers, if any (issue #1630).")
         .next()
-        .expect("bounded trailer gate");
+        .expect("bounded trailer forward comment");
     assert!(
-        !send.contains("if !plugins.is_empty()"),
-        "buffered H3 path must not wipe trailers merely because plugins is nonempty"
-    );
-    assert!(
-        send.contains("Auth/logging-only plugins must not wipe"),
+        send.contains("Auth/logging-only plugins must not"),
         "retention rationale for auth/logging-only plugins must remain documented"
     );
 }

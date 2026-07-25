@@ -2307,6 +2307,20 @@ pub(crate) fn is_transient_capability_probe_failure(class: retry::ErrorClass) ->
     )
 }
 
+/// Decide whether an H3 probe failure is worth surfacing in
+/// `last_probe_error`.
+///
+/// A failure against a target previously classified `Supported` is always
+/// operator-relevant: either the classification was just downgraded, or it was
+/// preserved across a transient fault and the cached record is now stale. Every
+/// other outcome is the expected "this HTTPS backend has no QUIC listener"
+/// case, which must stay silent so `GET /backend-capabilities` does not report
+/// a phantom error for every healthy non-QUIC backend on every refresh
+/// (documented in `openapi.yaml` / `docs/admin_api.md`).
+fn h3_probe_failure_error(previous: Option<ProtocolSupport>, message: String) -> Option<String> {
+    matches!(previous, Some(ProtocolSupport::Supported)).then_some(message)
+}
+
 pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
     allowed_origins
         .iter()
@@ -6448,11 +6462,12 @@ impl ProxyState {
         let scheme = target.scheme();
         let mut record = BackendCapabilityRecord::default();
         // Accumulates *unexpected* probe failures only — connection errors on
-        // TLS backends and TLS-config setup errors. Expected "backend doesn't
-        // speak protocol X" outcomes (e.g., h2c not deployed on a plaintext
-        // backend, QUIC not deployed on a TLS backend) drop to debug and
-        // record a definitive `Unsupported`, which keeps operators from
-        // chasing phantom errors on every refresh cycle.
+        // TLS backends, TLS-config setup errors, and any probe failure against
+        // a protocol this target was already proven to support. Expected
+        // "backend doesn't speak protocol X" outcomes (e.g., h2c not deployed
+        // on a plaintext backend, QUIC not deployed on a TLS backend) drop to
+        // debug and record a definitive `Unsupported`, which keeps operators
+        // from chasing phantom errors on every refresh cycle.
         let mut errors = Vec::new();
         let probe_proxy = Self::build_backend_capability_probe_proxy(&target.proxy);
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
@@ -6632,11 +6647,12 @@ impl ProxyState {
                 // function merges this into the combined error string.
                 let class = http2_pool::classify_http2_pool_error(&err);
                 let preserve = is_transient_capability_probe_failure(class);
-                record.plain_http.h2_tls = backend_capabilities::merge_protocol_probe_classification(
-                    previous_h2_tls,
-                    ProtocolSupport::Unknown,
-                    preserve,
-                );
+                record.plain_http.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_h2_tls,
+                        ProtocolSupport::Unknown,
+                        preserve,
+                    );
                 record.grpc_transport.h2_tls =
                     backend_capabilities::merge_protocol_probe_classification(
                         previous_grpc_h2_tls,
@@ -6654,13 +6670,15 @@ impl ProxyState {
                 );
             }
             Err(_) => {
-                // Timeout is always a transient reachability fault — preserve
-                // any prior Supported/Unsupported/Unknown classification.
-                record.plain_http.h2_tls = backend_capabilities::merge_protocol_probe_classification(
-                    previous_h2_tls,
-                    ProtocolSupport::Unknown,
-                    true,
-                );
+                // Timeout is always a transient reachability fault — carry any
+                // prior Supported/Unsupported verdict forward instead of
+                // resetting this target to Unknown for a whole refresh cycle.
+                record.plain_http.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_h2_tls,
+                        ProtocolSupport::Unknown,
+                        true,
+                    );
                 record.grpc_transport.h2_tls =
                     backend_capabilities::merge_protocol_probe_classification(
                         previous_grpc_h2_tls,
@@ -6784,10 +6802,18 @@ impl ProxyState {
     /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
     /// without aliasing `self`.
     ///
-    /// Transient DNS/connect/refused/timeout failures preserve
-    /// `previous_h3` (HBONE merge contract) and always stamp an operator-
-    /// visible probe error. Only non-transient transport/protocol evidence
-    /// downgrades the cached classification to `Unsupported`.
+    /// Transient DNS/connect/refused/timeout failures preserve an existing
+    /// `previous_h3` classification (HBONE merge contract); only non-transient
+    /// transport/protocol evidence downgrades a cached verdict to
+    /// `Unsupported`. A first probe with no prior verdict still classifies
+    /// definitively, so a plain HTTPS backend that never speaks QUIC keeps
+    /// recording `Unsupported` instead of an unclassifiable `Unknown`.
+    ///
+    /// A probe failure against a target previously classified `Supported`
+    /// stamps an operator-visible `last_probe_error` — that is either a real
+    /// downgrade or a preserved-but-stale record, and both are worth seeing in
+    /// `GET /backend-capabilities`. Expected "this backend has no QUIC
+    /// listener" outcomes stay silent (see `probe_backend_capabilities`).
     async fn probe_h3(
         h3_pool: &Arc<Http3ConnectionPool>,
         probe_proxy: &Proxy,
@@ -6832,20 +6858,23 @@ impl ProxyState {
                     ProtocolSupport::Unsupported,
                     preserve,
                 );
-                if preserve {
+                if preserve && matches!(h3, ProtocolSupport::Supported) {
                     debug!(
                         "HTTP/3 probe for {}:{} transient failure ({:?}); preserving {:?}: {}",
                         host, port, class, h3, err
                     );
                 } else {
                     debug!(
-                        "HTTP/3 probe for {}:{} classified unsupported: {}",
-                        host, port, err
+                        "HTTP/3 probe for {}:{} classified {:?}: {}",
+                        host, port, h3, err
                     );
                 }
                 H3ProbeOutcome {
                     h3,
-                    error: Some(format!("HTTP/3 probe failed for {host}:{port}: {err}")),
+                    error: h3_probe_failure_error(
+                        previous_h3,
+                        format!("HTTP/3 probe failed for {host}:{port}: {err}"),
+                    ),
                 }
             }
             Err(_) => {
@@ -6855,15 +6884,18 @@ impl ProxyState {
                     true,
                 );
                 debug!(
-                    "HTTP/3 probe for {}:{} timed out after {}ms; preserving {:?}",
+                    "HTTP/3 probe for {}:{} timed out after {}ms; classified {:?}",
                     host, port, probe_proxy.backend_connect_timeout_ms, h3
                 );
                 H3ProbeOutcome {
                     h3,
-                    error: Some(format!(
-                        "HTTP/3 probe timed out for {}:{} after {}ms",
-                        host, port, probe_proxy.backend_connect_timeout_ms
-                    )),
+                    error: h3_probe_failure_error(
+                        previous_h3,
+                        format!(
+                            "HTTP/3 probe timed out for {}:{} after {}ms",
+                            host, port, probe_proxy.backend_connect_timeout_ms
+                        ),
+                    ),
                 }
             }
         }
@@ -15221,9 +15253,31 @@ fn should_apply_synthetic_response_body_hooks(
         && governed_synthetic_status
         && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
         && !response_body.is_empty()
-        && plugins.iter().any(|plugin| {
-            plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
-        })
+        && response_body_plugins_process_body(plugins, ctx)
+}
+
+/// Whether a response-body-capable plugin phase actually processes THIS
+/// response.
+///
+/// The two-tier gate every buffered response path uses: a plugin's per-request
+/// `should_buffer_response_body(ctx)` refinement is consulted only when that
+/// plugin advertised the config-time `requires_response_body_buffering()`
+/// upper bound (the documented precondition on
+/// [`Plugin::should_buffer_response_body`]).
+///
+/// Callers use this to answer "did the response-body pipeline see these
+/// bytes?" — notably the buffered native-H3 path, which must drop backend
+/// trailers a body-inspecting plugin could not see, while an auth/logging-only
+/// chain keeps them (issue #2941).
+///
+/// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
+pub(crate) fn response_body_plugins_process_body(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    plugins.iter().any(|plugin| {
+        plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
+    })
 }
 
 /// Run the governed synthetic short-circuit response-body hook pipeline

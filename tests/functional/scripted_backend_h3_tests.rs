@@ -3391,21 +3391,17 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
 
     let _first = h3_get(&harness, "/api/midbody").await;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut downgraded = false;
-    while std::time::Instant::now() < deadline {
-        if let Ok(Some(entry)) = fetch_capability_entry(&harness).await
-            && entry["plain_http"]["h3"].as_str() == Some("unsupported")
-        {
-            downgraded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let downgraded = wait_for_h3_class(&harness, "unsupported", Duration::from_secs(10))
+        .await
+        .expect("capability lookup");
+    if downgraded.is_none() {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "mid-body stream RST on the plain H3 streaming path must mark h3=unsupported; \
+             entry: {:?}\n--- logs ---\n{logs}",
+            fetch_capability_entry(&harness).await
+        );
     }
-    assert!(
-        downgraded,
-        "mid-body stream RST on the plain H3 streaming path must mark h3=unsupported"
-    );
 
     let client = Http3Client::insecure().expect("h3 client");
     let url = format!("https://127.0.0.1:{https_port}/api/bridged");
@@ -3437,6 +3433,85 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Issue #2939 (negative case) — a graceful `H3_NO_ERROR` / GOAWAY teardown
+// mid-body still fails the request but must NEVER downgrade H3 capability.
+// The raw stream classifier maps that teardown to `ConnectionClosed`, which is
+// inside `is_h3_transport_error_class`, so only the explicit
+// `is_h3_graceful_close` exclusion keeps the classification intact.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_frontend_mid_body_graceful_goaway_keeps_capability_supported() {
+    let ca = TestCa::new("h3-midbody-goaway-keep").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Declares 64 bytes, sends 8, then tears the connection down gracefully —
+    // an incomplete body, so the streaming recovery gate cannot treat it as a
+    // success, and the downgrade guard is the only thing under test.
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", "64".to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]))
+            .step(H3Step::RespondData(bytes::Bytes::from_static(b"partial-")))
+            .step(H3Step::StallFor(Duration::from_millis(50)))
+            .step(H3Step::SendGoaway(0))
+            .spawn()
+            .expect("spawn h3");
+
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(
+        pre["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "precondition: h3=supported; entry: {pre:#?}"
+    );
+
+    let _first = h3_get(&harness, "/api/goaway").await;
+
+    // Give any (incorrect) downgrade time to land before asserting it did not.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let post = fetch_capability_entry(&harness)
+        .await
+        .expect("post-entry")
+        .expect("registry entry still present");
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        post["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "a graceful mid-body teardown must not downgrade H3 capability; \
+         entry: {post:#?}\n--- gateway logs ---\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Issue #2937 — H3 frontend buffered retry recomputes native-H3 eligibility
 // when LB rotation moves onto an H2-only target.
 // ────────────────────────────────────────────────────────────────────────────
@@ -3462,18 +3537,18 @@ async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
     .spawn()
     .expect("spawn A tls");
 
-    let h3_a =
-        ScriptedH3Backend::builder(udp_a.into_socket(), H3TlsConfig::new(cert.clone(), key.clone()))
-            .step(H3Step::AcceptStream)
-            .step(H3Step::RespondHeaders(vec![
-                (":status", "503".to_string()),
-                ("content-length", "5".to_string()),
-                ("content-type", "text/plain".to_string()),
-            ]))
-            .step(H3Step::RespondData(bytes::Bytes::from_static(b"retry")))
-            .step(H3Step::StallFor(Duration::from_millis(50)))
-            .spawn()
-            .expect("spawn A h3");
+    let h3_a_tls = H3TlsConfig::new(cert.clone(), key.clone());
+    let h3_a = ScriptedH3Backend::builder(udp_a.into_socket(), h3_a_tls)
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "503".to_string()),
+            ("content-length", "5".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"retry")))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        .spawn()
+        .expect("spawn A h3");
 
     let tcp_b = reserve_port().await.expect("target B port");
     let target_b_port = tcp_b.port;

@@ -39,23 +39,31 @@ impl ProtocolSupport {
 /// value.
 ///
 /// When `preserve_previous` is set (transient DNS/connect/refused/timeout
-/// failures), keep the prior classification so a blip during periodic refresh
-/// cannot wipe a proven `Supported` entry for up to the full refresh interval.
-/// With no prior record the result stays `Unknown` rather than inventing an
-/// `Unsupported` verdict from a reachability fault alone.
+/// failures), an existing classification is carried forward so a blip during
+/// periodic refresh cannot wipe a proven `Supported` entry for up to the full
+/// refresh interval.
+///
+/// A transient failure with **no** prior classification (or a prior `Unknown`)
+/// still takes `probed`: there is no verdict to protect, and the first probe is
+/// the only chance to record the definitive `Unsupported` that a backend which
+/// simply does not speak the protocol should carry. Since the H3/QUIC "port has
+/// no listener" case is indistinguishable from a connect timeout on the wire,
+/// preserving `Unknown` there would leave every non-QUIC HTTPS backend
+/// permanently unclassified.
 ///
 /// Non-preserving probes (successful handshake, ALPN/protocol evidence that
-/// the target lacks the protocol) take `probed` as authoritative.
+/// the target lacks the protocol) always take `probed` as authoritative.
 #[inline]
 pub fn merge_protocol_probe_classification(
     previous: Option<ProtocolSupport>,
     probed: ProtocolSupport,
     preserve_previous: bool,
 ) -> ProtocolSupport {
-    if preserve_previous {
-        previous.unwrap_or(ProtocolSupport::Unknown)
-    } else {
-        probed
+    match previous {
+        Some(previous) if preserve_previous && !matches!(previous, ProtocolSupport::Unknown) => {
+            previous
+        }
+        _ => probed,
     }
 }
 
