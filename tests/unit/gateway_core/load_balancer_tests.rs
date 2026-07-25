@@ -897,6 +897,36 @@ fn test_least_latency_unsampled_target_gets_bounded_exploration_not_pin() {
 }
 
 #[test]
+fn test_least_latency_exploration_reaches_multiple_unsampled_targets() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
+
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 1_500);
+    }
+
+    let mut host1_hits = 0usize;
+    let mut host2_hits = 0usize;
+    for _ in 0..400 {
+        let selected = lb.select("", None).unwrap();
+        match selected.target.host.as_str() {
+            "host1" => host1_hits += 1,
+            "host2" => host2_hits += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        host1_hits > 0 && host2_hits > 0,
+        "bounded exploration must reach every unsampled peer (host1={host1_hits}, host2={host2_hits})"
+    );
+}
+
+#[test]
 fn test_least_latency_failed_attempts_exit_warmup_without_pinning() {
     // A never-successful peer that accumulates failure penalties must leave
     // warm-up and stop receiving exploration-driven preference.

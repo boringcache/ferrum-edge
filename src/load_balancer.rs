@@ -971,15 +971,25 @@ const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
 /// receive a fair share of exploration traffic to establish a baseline.
 const LATENCY_WARMUP_EXPLORE_PERMILLE: u64 = 100; // 10%
 
-/// Whether a mixed-warm-up selection ticket should explore an unwarmed peer.
+/// Select an unwarmed peer slot for a mixed-warm-up ticket.
 ///
 /// Uses a golden-ratio scramble of `ticket` so short observation windows
-/// still see ~`LATENCY_WARMUP_EXPLORE_PERMILLE` rate. A contiguous
+/// still see ~`LATENCY_WARMUP_EXPLORE_PERMILLE` rate and distribute those
+/// selections across every unwarmed peer. A contiguous
 /// `ticket % 1000 < permille` test fails that contract: the first 200
-/// selections after a zeroed counter would explore 50% of the time.
+/// selections after a zeroed counter would explore 50% of the time, while
+/// deriving the peer slot from `ticket / 1000` would send that whole window to
+/// one late joiner.
 #[inline]
-fn should_explore_unwarmed(ticket: u64) -> bool {
-    (golden_ratio_hash(ticket) % 1000) < LATENCY_WARMUP_EXPLORE_PERMILLE
+fn unwarmed_explore_slot(ticket: u64, unwarmed_count: usize) -> Option<usize> {
+    if unwarmed_count == 0 {
+        return None;
+    }
+    let scrambled = golden_ratio_hash(ticket);
+    if (scrambled % 1000) >= LATENCY_WARMUP_EXPLORE_PERMILLE {
+        return None;
+    }
+    Some(((scrambled / 1000) % unwarmed_count as u64) as usize)
 }
 
 /// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
@@ -5049,10 +5059,8 @@ impl LoadBalancer {
         // otherwise pick the best warmed EWMA.
         if !all_warmed_up {
             let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
-            let explore = should_explore_unwarmed(ticket);
-            if explore {
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 // Round-robin among unwarmed healthy targets only.
-                let mut skip = (ticket / 1000) as usize % unwarmed_count.max(1);
                 for i in 0..self.targets.len() {
                     if !healthy.contains(i) {
                         continue;
@@ -5266,9 +5274,7 @@ impl LoadBalancer {
 
         if !all_warmed_up {
             let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
-            let explore = should_explore_unwarmed(ticket);
-            if explore {
-                let mut skip = (ticket / 1000) as usize % unwarmed_count.max(1);
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 for candidate in candidates {
                     let samples = self
                         .latency_sample_count
