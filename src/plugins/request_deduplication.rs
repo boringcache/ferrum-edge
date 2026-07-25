@@ -120,6 +120,7 @@ struct CachedResponse {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    response_policy_fingerprint: [u8; 32],
 }
 
 impl CachedResponse {
@@ -566,6 +567,13 @@ impl RequestDeduplication {
     }
 
     fn replay_response(&self, ctx: &mut RequestContext, cached: &CachedResponse) -> PluginResult {
+        if cached.response_policy_fingerprint != ctx.pin_response_policy_stamp().fingerprint() {
+            return PluginResult::Reject {
+                status_code: 409,
+                body: r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#.to_string(),
+                headers: HashMap::new(),
+            };
+        }
         // Stored bytes have already passed the final response-body lifecycle.
         // Suppress ordinary presentation transforms on this synthetic replay;
         // current inspection/final validation still runs, and a new redaction
@@ -803,6 +811,7 @@ impl RequestDeduplication {
                     headers: s.headers,
                     body: Bytes::from(s.body),
                     inserted_at: Instant::now(), // Not meaningful for Redis entries
+                    response_policy_fingerprint: s.response_policy_fingerprint,
                 })
             }
             Ok(_) => RedisDeduplicationAction::Conflict,
@@ -931,6 +940,7 @@ impl RequestDeduplication {
 
         let serializable = SerializableCachedResponse {
             fingerprint: fingerprint.to_string(),
+            response_policy_fingerprint: response.response_policy_fingerprint,
             status_code: response.status_code,
             headers: response.headers.clone(),
             body: response.body.to_vec(),
@@ -983,6 +993,8 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            response_policy_fingerprint:
+                crate::plugins::response_transformer::runtime_overlay::policy_stamp().fingerprint(),
         };
         match self.redis_payload_for_response("test-fingerprint", &response) {
             RedisPayloadAdmission::Admitted(payload) => Some(payload),
@@ -998,6 +1010,7 @@ impl RequestDeduplication {
         candidate: LocalCompletionCandidate<'_>,
         retain_inflight_on_skip: bool,
         retain_inflight_on_eviction: bool,
+        response_policy_fingerprint: [u8; 32],
     ) -> LocalCompletionAction {
         let LocalCompletionCandidate {
             status_code,
@@ -1042,6 +1055,7 @@ impl RequestDeduplication {
                     headers,
                     body: Bytes::copy_from_slice(body),
                     inserted_at: Instant::now(),
+                    response_policy_fingerprint,
                 })
             } else {
                 if !retain_inflight_on_skip {
@@ -1072,6 +1086,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            response_policy_fingerprint,
         };
         let redis_copy = cached.clone();
         entry.insert(DeduplicationEntry::Completed {
@@ -1428,6 +1443,7 @@ enum CompletedSequenceRemoval {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SerializableCachedResponse {
     fingerprint: String,
+    response_policy_fingerprint: [u8; 32],
     status_code: u16,
     headers: HashMap<String, String>,
     #[serde(
@@ -1831,6 +1847,11 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
 
+        // Idempotent responses are finalized representations. Pin the policy
+        // before any response-side gate can be read so replay provenance can
+        // be validated without reapplying non-idempotent transforms.
+        let _ = ctx.pin_response_policy_stamp();
+
         let (key, fingerprint) = {
             // Get idempotency key from headers. Keep the borrow scoped so no
             // header-map borrow survives across Redis/cache awaits below.
@@ -2092,6 +2113,15 @@ impl Plugin for RequestDeduplication {
         let local_inflight_owner_token = state.local_inflight_owner_token;
         let redis_lock_token = state.redis_lock_token;
 
+        let response_policy_fingerprint = ctx.pin_response_policy_stamp().fingerprint();
+        if !ctx.response_policy_stamp_stable() {
+            // The final representation may have straddled a policy
+            // publication, so it is unsafe to persist. Keep the in-flight
+            // ownership until its bounded TTL rather than allowing a retry to
+            // repeat a possibly completed external side effect.
+            return PluginResult::Continue;
+        }
+
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
         // marked in-flight is then short-circuited by a LATER `before_proxy`
         // plugin (e.g. a 2xx `fault_injection`/`mesh_route_dispatch` abort,
@@ -2174,6 +2204,7 @@ impl Plugin for RequestDeduplication {
             },
             retain_inflight_on_storage_skip,
             retain_inflight_on_storage_skip || redis_lock_token.is_some(),
+            response_policy_fingerprint,
         ) {
             LocalCompletionAction::Published {
                 cached,

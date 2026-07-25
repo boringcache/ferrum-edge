@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use sha2::{Digest, Sha256};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
 
@@ -34,11 +35,29 @@ pub type BoolGateMap = HashMap<String, bool>;
 pub struct GatePolicyStamp(Arc<GatePublication>);
 
 #[derive(Debug)]
-struct GatePublication;
+struct GatePublication {
+    fingerprint: [u8; 32],
+}
 
 impl GatePolicyStamp {
-    fn new() -> Self {
-        Self(Arc::new(GatePublication))
+    fn new(gates: &BoolGateMap) -> Self {
+        let mut entries: Vec<_> = gates.iter().collect();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut digest = Sha256::new();
+        for (scope, enabled) in entries {
+            digest.update((scope.len() as u64).to_be_bytes());
+            digest.update(scope.as_bytes());
+            digest.update([u8::from(*enabled)]);
+        }
+        Self(Arc::new(GatePublication {
+            fingerprint: digest.finalize().into(),
+        }))
+    }
+
+    /// Stable, content-only identity suitable for provenance stored outside
+    /// this process. It reveals no scope names or gate values.
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.0.fingerprint
     }
 }
 
@@ -66,7 +85,7 @@ impl BoolGateState {
     fn new(gates: BoolGateMap) -> Self {
         Self {
             gates,
-            stamp: GatePolicyStamp::new(),
+            stamp: GatePolicyStamp::new(&gates),
         }
     }
 }

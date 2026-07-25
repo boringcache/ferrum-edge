@@ -689,6 +689,55 @@ async fn test_first_request_passes_then_replay() {
 }
 
 #[tokio::test]
+async fn replay_is_rejected_after_response_policy_changes() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+    let plugin = make_plugin(json!({}));
+    let mut first_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "policy-change".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.redaction.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    let mut replay_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let result = plugin
+        .before_proxy(&mut replay_ctx, &mut first_headers)
+        .await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+    assert!(!replay_ctx.finalized_response_replay);
+    runtime_overlay::reset_for_test();
+}
+
+#[tokio::test]
 async fn committed_replay_skips_second_response_body_transform() {
     let dedup = make_plugin(json!({}));
     let mut first_ctx = RequestContext::new(
@@ -4304,10 +4353,10 @@ fn test_legacy_redis_cached_response_without_fingerprint_is_rejected() {
 }
 
 #[test]
-fn test_legacy_redis_cached_response_byte_array_body_is_accepted() {
+fn test_redis_cached_response_without_policy_provenance_is_rejected() {
     let legacy = br#"{"fingerprint":"sha256-test","status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
 
-    assert!(request_deduplication_redis_cached_response_payload_is_valid(legacy));
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(legacy));
 }
 
 #[test]
