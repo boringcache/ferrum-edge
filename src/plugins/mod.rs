@@ -127,6 +127,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use self::utils::runtime_bool_gate::GatePolicyStamp;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
     ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
@@ -1600,6 +1601,38 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
+/// Exclusive compression codec admission permit held on a request context.
+///
+/// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
+/// permit is unique and must be transferred with `take()` / `mem::take` when a
+/// compatibility clone needs to own the reserved slot.
+#[derive(Default)]
+struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+
+impl std::fmt::Debug for HeldCodecPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldCodecPermit")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl Clone for HeldCodecPermit {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl HeldCodecPermit {
+    fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.0 = Some(permit);
+    }
+
+    fn take(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.take()
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1869,6 +1902,17 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot suppress transforms or inspection,
     /// and unrelated synthetic short-circuits cannot opt into the skip.
     pub(crate) finalized_response_replay: bool,
+    /// Response-side runtime-overlay gate provenance, pinned once for this
+    /// request (see [`GatePolicyStamp`]).
+    ///
+    /// Plugins that persist a client-visible representation across requests
+    /// (today `response_caching`) stamp this value onto the stored entry and
+    /// refuse to replay an entry stamped with a different policy, so a
+    /// representation produced under one runtime-overlay policy can never be
+    /// replayed under another. Pinning once per request — rather than reading
+    /// the gates again at storage time — is what makes the stamp provenance
+    /// rather than a guess. Kept private so request metadata cannot forge one.
+    pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -1923,6 +1967,34 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
+    /// Process-local compression instance that reserved response codec admission
+    /// in `before_proxy`, before the response-buffer decision. First-wins across
+    /// sibling instances so at most one response permit is held per request. The
+    /// reservation is what bounds the population of response bodies admitted onto
+    /// the compression-only buffered path; `after_proxy` consumes this instance's
+    /// reserved permit rather than acquiring a fresh one on the hot path.
+    compression_response_admission_owner: Option<u64>,
+    /// Set when `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission. The response then streams identity (or
+    /// fails closed with 406 when identity is prohibited) instead of buffering
+    /// for a compression it cannot run; `after_proxy` must not reacquire.
+    compression_response_admission_declined: bool,
+    /// Reserved codec CPU admission permit for gateway response compression.
+    /// Reserved in `before_proxy` before the response-buffer decision and moved
+    /// into the `spawn_blocking` closure during the body transform. Drop
+    /// releases the slot if the transform never runs (cancellation). Clones
+    /// do not duplicate the exclusive permit.
+    compression_response_codec_permit: HeldCodecPermit,
+    /// Validated plaintext staged by the rare buffered request-decode fallback
+    /// (headers stripped in `before_proxy` without a mutable body view). The
+    /// owning transform must emit these bytes so the backend never sees a
+    /// compressed body without `Content-Encoding`.
+    compression_staged_request_plaintext: Option<Vec<u8>>,
+    /// Set when the response-encode owner cannot produce bytes that match a
+    /// previously committed gateway `Content-Encoding`. Shared transform loops
+    /// must restore an identity representation (or otherwise fail closed)
+    /// instead of forwarding plaintext under a coded header.
+    compression_response_encode_aborted: bool,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2301,6 +2373,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
+            response_policy_stamp: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -2312,6 +2385,11 @@ impl RequestContext {
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
+            compression_response_admission_owner: None,
+            compression_response_admission_declined: false,
+            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_staged_request_plaintext: None,
+            compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -2574,6 +2652,81 @@ impl RequestContext {
 
     pub(crate) fn owns_compression_response_encode(&self, owner: u64) -> bool {
         self.compression_response_encode_owner == Some(owner)
+    }
+
+    pub(crate) fn has_compression_response_admission_owner(&self) -> bool {
+        self.compression_response_admission_owner.is_some()
+    }
+
+    pub(crate) fn claim_compression_response_admission(&mut self, owner: u64) -> bool {
+        if self.compression_response_admission_owner.is_some() {
+            return false;
+        }
+        self.compression_response_admission_owner = Some(owner);
+        // A held permit supersedes any earlier sibling's decline: the request now
+        // has bounded admission, so the response is no longer stream-only. (Once
+        // an owner exists, siblings skip reservation, so `declined` cannot be set
+        // again afterward, which keeps `owner.is_some()` implying `!declined`.)
+        self.compression_response_admission_declined = false;
+        true
+    }
+
+    pub(crate) fn owns_compression_response_admission(&self, owner: u64) -> bool {
+        self.compression_response_admission_owner == Some(owner)
+    }
+
+    pub(crate) fn mark_compression_response_admission_declined(&mut self) {
+        self.compression_response_admission_declined = true;
+    }
+
+    pub(crate) fn compression_response_admission_declined(&self) -> bool {
+        self.compression_response_admission_declined
+    }
+
+    /// Drop this request's reserved response codec admission (permit + owner)
+    /// when `instance_id` is the reserving instance. A no-op for siblings so a
+    /// non-owner declining to compress never releases another instance's slot.
+    pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+            let _ = self.compression_response_codec_permit.take();
+        }
+    }
+
+    pub(crate) fn set_compression_response_codec_permit(
+        &mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        self.compression_response_codec_permit.set(permit);
+    }
+
+    pub(crate) fn take_compression_response_codec_permit(
+        &mut self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.compression_response_codec_permit.take()
+    }
+
+    pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
+        self.compression_staged_request_plaintext = Some(plaintext);
+    }
+
+    pub(crate) fn take_compression_staged_request_plaintext(&mut self) -> Option<Vec<u8>> {
+        self.compression_staged_request_plaintext.take()
+    }
+
+    pub(crate) fn mark_compression_response_encode_aborted(&mut self) {
+        self.compression_response_encode_aborted = true;
+    }
+
+    pub(crate) fn take_compression_response_encode_aborted(&mut self) -> bool {
+        std::mem::take(&mut self.compression_response_encode_aborted)
+    }
+
+    pub(crate) fn clear_gateway_response_compression(&mut self) {
+        self.gateway_response_compression_algorithm = None;
+        self.compression_response_encode_owner = None;
+        self.compression_response_admission_owner = None;
+        let _ = self.compression_response_codec_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -2986,6 +3139,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
+            response_policy_stamp: self.response_policy_stamp.clone(),
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -3010,6 +3164,21 @@ impl RequestContext {
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
+            compression_response_admission_owner: self.compression_response_admission_owner,
+            compression_response_admission_declined: self.compression_response_admission_declined,
+            // The reserved response codec permit stays on the donor (live)
+            // context: this compatibility clone runs only the request-body hooks,
+            // never the response-body transform that consumes the permit. Moving
+            // it here would drop the slot when this short-lived clone is dropped
+            // (only `metadata`/WAF/AI state is copied back), releasing admission
+            // while the live context still owns the response encode.
+            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_staged_request_plaintext: std::mem::take(
+                &mut self.compression_staged_request_plaintext,
+            ),
+            compression_response_encode_aborted: std::mem::take(
+                &mut self.compression_response_encode_aborted,
+            ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -3064,6 +3233,28 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
+    }
+
+    /// Pin (once) and return this request's response-side policy stamp.
+    ///
+    /// One ArcSwap load on first call, then a memoized opaque identity. Callers
+    /// pin as early as possible on the request path so the pinned value covers
+    /// every gate read the response pipeline will later perform.
+    pub(crate) fn pin_response_policy_stamp(&mut self) -> &GatePolicyStamp {
+        self.response_policy_stamp
+            .get_or_insert_with(response_transformer::runtime_overlay::policy_stamp)
+    }
+
+    /// Whether no response-side gate publication happened since this request
+    /// pinned its stamp.
+    ///
+    /// A `false` result means some gate read during this request may have used
+    /// a different policy than the pinned stamp describes, so any
+    /// representation produced by this request has unprovable provenance and
+    /// must not be persisted for later replay.
+    pub(crate) fn response_policy_stamp_stable(&mut self) -> bool {
+        let current = response_transformer::runtime_overlay::policy_stamp();
+        self.pin_response_policy_stamp() == &current
     }
 
     pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
@@ -4519,9 +4710,13 @@ pub struct MirrorResponseMeta {
     /// before a response was received or was dropped/cancelled (DNS, connect,
     /// timeout, task, and concurrency errors).
     pub mirror_response_status_code: Option<u16>,
-    /// Response body size in bytes from the mirror target. Derived from
-    /// `content-length` header when present, otherwise from reading the body.
+    /// Response body size in bytes observed after a bounded drain of the
+    /// mirror response (or the truncated count when the drain cap fired).
     pub mirror_response_size_bytes: Option<u64>,
+    /// Advertised `Content-Length` from the mirror response when present.
+    /// Recorded independently of [`Self::mirror_response_size_bytes`] so
+    /// operators can compare advertised vs observed after bounded drain.
+    pub mirror_response_advertised_size_bytes: Option<u64>,
     /// Wall-clock latency of the mirror request in milliseconds.
     pub mirror_latency_ms: f64,
     /// Human-readable error message when the mirror request failed.
@@ -4955,6 +5150,7 @@ impl TransactionSummary {
             "mirror_error",
             "mirror_plugin_id",
             "response_size_bytes",
+            "mirror_response_advertised_size_bytes",
         ] {
             mirror.metadata.remove(key);
         }
@@ -4967,6 +5163,12 @@ impl TransactionSummary {
             mirror
                 .metadata
                 .insert("response_size_bytes".to_string(), size.to_string());
+        }
+        if let Some(advertised) = result.mirror_response_advertised_size_bytes {
+            mirror.metadata.insert(
+                "mirror_response_advertised_size_bytes".to_string(),
+                advertised.to_string(),
+            );
         }
         if let Some(err) = result.mirror_error {
             mirror.metadata.insert("mirror_error".to_string(), err);
@@ -5424,7 +5626,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995), ai_semantic_cache (2996) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
@@ -5484,13 +5686,13 @@ pub mod priority {
     /// `ai_federation` so disallowed tool schemas are screened before caching or
     /// federation routing.
     pub const AI_TOOL_GOVERNOR: u16 = 2978;
-    pub const AI_SEMANTIC_CACHE: u16 = 2980;
     /// `ai_stream_router`: claims streaming (`"stream": true`) OpenAI Chat
     /// Completions requests, rewrites `route_override_*` to the matched provider,
     /// and normalizes provider-native SSE to OpenAI `chat.completion.chunk` SSE.
-    /// Runs after `ai_semantic_cache` and before `ai_federation` (now in the
-    /// response band at 4060) so the non-streaming federation path can defer to
-    /// it via the `ai_stream_router_claimed` marker.
+    /// Runs before `ai_semantic_cache` (and before `ai_federation` at 4060) so
+    /// cache lookup observes the effective provider destination for streaming
+    /// claims while the non-streaming federation path can still defer via the
+    /// `ai_stream_router_claimed` marker.
     pub const AI_STREAM_ROUTER: u16 = 2984;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.
@@ -5500,9 +5702,16 @@ pub mod priority {
     pub const A2A_GATEWAY: u16 = 2993;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
-    /// Runs after admission plugins and immediately before request-transform
-    /// plugins; backend dispatch applies the override after `before_proxy`.
+    /// Runs after admission plugins and immediately before `ai_semantic_cache`
+    /// so cache identity can bind the post-routing effective destination;
+    /// backend dispatch applies the override after `before_proxy`.
     pub const MESH_ROUTE_DISPATCH: u16 = 2995;
+    /// `ai_semantic_cache`: exact/semantic LLM response cache. Runs after
+    /// route-dispatch plugins (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`,
+    /// `mesh_route_dispatch`) so exact and semantic keys include the canonical
+    /// route/operation identity and the effective destination/provider that
+    /// will serve a miss, and before request transformers / `ai_federation`.
+    pub const AI_SEMANTIC_CACHE: u16 = 2996;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;
@@ -7128,7 +7337,11 @@ pub trait Plugin: Send + Sync {
 /// identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
-    create_plugin_with_http_client(name, config, PluginHttpClient::default())
+    create_plugin_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Create a plugin instance with a shared HTTP client for outbound calls.
@@ -7248,15 +7461,13 @@ pub fn create_plugin_with_http_client_and_config_id(
         "compression" => {
             let gzip_enabled = http_client.compression_gzip_enabled();
             let brotli_enabled = http_client.compression_brotli_enabled();
-            let plugin = if gzip_enabled && brotli_enabled {
-                compression::CompressionPlugin::new(config)?
-            } else {
-                compression::CompressionPlugin::new_with_algorithm_support(
-                    config,
-                    gzip_enabled,
-                    brotli_enabled,
-                )?
-            };
+            let max_request_body_size_bytes = http_client.max_request_body_size_bytes();
+            let plugin = compression::CompressionPlugin::new_with_algorithm_support_and_body_limit(
+                config,
+                gzip_enabled,
+                brotli_enabled,
+                max_request_body_size_bytes,
+            )?;
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
@@ -7521,7 +7732,11 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
-    validate_plugin_config_with_http_client(name, config, PluginHttpClient::default())
+    validate_plugin_config_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Validate a plugin configuration with a caller-supplied HTTP policy without
@@ -7569,7 +7784,8 @@ pub fn validate_plugin_config_with_policy(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+        .with_process_compression_admission_policy();
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }
