@@ -1,410 +1,289 @@
-//! Deterministic coverage for the rustls→kTLS handoff gate
+//! Deterministic coverage for the rustls -> kTLS handoff gate
 //! ([issue #2955](https://github.com/ferrum-edge/ferrum-edge/issues/2955)).
 //!
-//! When a client coalesces post-handshake application data with its Finished
-//! flight, rustls decrypts those bytes into `received_plaintext` during the
-//! handshake. Installing kTLS and resuming from the raw socket would silently
-//! discard them. A partial inbound TLS record in rustls's private deframer is
-//! the second loss/desync case — and that state is **not** observable through
-//! the public buffered `ServerConnection` API.
+//! `try_ktls_splice` consumes the tokio-rustls `TlsStream` and resumes
+//! decryption from the raw socket. rustls's `dangerous_into_kernel_connection`
+//! refuses only when *outbound* TLS records are still buffered, so two classes
+//! of inbound state were dropped silently:
 //!
-//! These tests pin that:
-//! - a clean buffered handshake is **not** treated as handoff-safe (alignment
-//!   is not proven);
-//! - complete buffered plaintext and abbreviated/coalesced cases refuse
-//!   handoff while leaving the `ServerConnection` readable.
+//! 1. plaintext rustls had already decrypted but the gateway had not read, and
+//! 2. residual bytes in rustls's private deframer — the head of a partial TLS
+//!    record — which desynchronize the kernel record layer.
+//!
+//! Class (1) is observable through the public buffered API. Class (2) is not:
+//! a session holding a partial inbound record is byte-for-byte
+//! indistinguishable, through every public accessor, from a completely idle
+//! one. These tests pin that the gate therefore refuses unconditionally, and
+//! that refusing never disturbs the session — every application byte stays
+//! readable for the userspace relay that takes over.
+//!
+//! The transport is in memory (`Vec<u8>` pumped between two rustls
+//! connections) so record coalescing is exact and nothing depends on socket or
+//! thread timing.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
 
 use ferrum_edge::tls::NoVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 
 const OPENING: &[u8] = b"OPENING-CMD-2955";
+const CERT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.crt");
+const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.key");
 
-fn load_test_certs() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let cert_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.crt");
-    let key_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs/server.key");
-    let cert_pem = std::fs::read(cert_path).expect("test cert");
-    let key_pem = std::fs::read(key_path).expect("test key");
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
+/// Bytes withheld from the final application record in the partial-record test.
+const WITHHELD_TAIL: usize = 8;
+
+/// Ferrum's production handoff gate, reached through the crate test surface.
+fn handoff_allowed(server: &ServerConnection) -> bool {
+    ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(server)
+}
+
+fn test_certs() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    let cert_pem = std::fs::read(CERT_PATH).expect("read test certificate");
+    let key_pem = std::fs::read(KEY_PATH).expect("read test private key");
+    let certs = rustls_pemfile::certs(&mut &cert_pem[..])
         .collect::<Result<Vec<_>, _>>()
-        .expect("parse certs");
+        .expect("parse test certificate chain");
     let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .expect("parse key")
-        .expect("key present");
+        .expect("parse test private key")
+        .expect("test private key present");
     (certs, key)
 }
 
+/// TLS 1.2 only: that is the sole version `try_ktls_splice` ever hands off, and
+/// its abbreviated handshake is what lets a client coalesce Finished with
+/// application data.
 fn tls12_server_config() -> Arc<ServerConfig> {
-    let (certs, key) = load_test_certs();
-    let provider = rustls::crypto::ring::default_provider();
-    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
+    let (certs, key) = test_certs();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
-        .expect("TLS 1.2")
+        .expect("TLS 1.2 is a supported protocol version")
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .expect("server cert");
-    config.session_storage = Arc::new(rustls::server::ServerSessionMemoryCache::new(128));
+        .expect("test server certificate and key");
+    // Session-ID resumption backs the abbreviated-handshake test below.
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
     Arc::new(config)
 }
 
 fn tls12_client_config() -> Arc<ClientConfig> {
-    let provider = rustls::crypto::ring::default_provider();
-    let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS12])
-        .expect("TLS 1.2")
+        .expect("TLS 1.2 is a supported protocol version")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
-    config.resumption = rustls::client::Resumption::in_memory_sessions(128);
+    config.resumption = rustls::client::Resumption::in_memory_sessions(32);
     Arc::new(config)
 }
 
-fn write_tls(conn: &mut ClientConnection, sock: &mut TcpStream) -> std::io::Result<()> {
-    while conn.wants_write() {
-        conn.write_tls(sock)?;
+fn tls12_pair_from(
+    client_config: Arc<ClientConfig>,
+    server_config: Arc<ServerConfig>,
+) -> (ClientConnection, ServerConnection) {
+    let name = ServerName::try_from("localhost").expect("static DNS name");
+    let client = ClientConnection::new(client_config, name).expect("client connection");
+    let server = ServerConnection::new(server_config).expect("server connection");
+    (client, server)
+}
+
+/// Drain every TLS record the client currently wants to send.
+fn take_client_records(client: &mut ClientConnection) -> Vec<u8> {
+    let mut out = Vec::new();
+    while client.wants_write() {
+        client.write_tls(&mut out).expect("client write_tls");
     }
-    sock.flush()?;
-    Ok(())
+    out
 }
 
-fn write_tls_server(conn: &mut ServerConnection, sock: &mut TcpStream) -> std::io::Result<()> {
-    while conn.wants_write() {
-        conn.write_tls(sock)?;
+/// Drain every TLS record the server currently wants to send.
+fn take_server_records(server: &mut ServerConnection) -> Vec<u8> {
+    let mut out = Vec::new();
+    while server.wants_write() {
+        server.write_tls(&mut out).expect("server write_tls");
     }
-    sock.flush()?;
-    Ok(())
+    out
 }
 
-fn read_tls(conn: &mut ClientConnection, sock: &mut TcpStream) -> std::io::Result<()> {
-    if conn.wants_read() {
-        conn.read_tls(sock)?;
-        conn.process_new_packets()
-            .map_err(std::io::Error::other)?;
+fn feed_client(client: &mut ClientConnection, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let read = client.read_tls(&mut bytes).expect("client read_tls");
+        assert!(read > 0, "client read_tls stalled");
+        client.process_new_packets().expect("client packets");
     }
-    Ok(())
 }
 
-fn read_tls_server(conn: &mut ServerConnection, sock: &mut TcpStream) -> std::io::Result<()> {
-    if conn.wants_read() {
-        conn.read_tls(sock)?;
-        conn.process_new_packets()
-            .map_err(std::io::Error::other)?;
+/// Deliver `bytes` to the server as one logical arrival, then let rustls
+/// process whatever became complete. Passing a concatenated handshake flight
+/// plus application record reproduces the TCP coalescing from issue #2955.
+fn feed_server(server: &mut ServerConnection, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let read = server.read_tls(&mut bytes).expect("server read_tls");
+        assert!(read > 0, "server read_tls stalled");
+        server.process_new_packets().expect("server packets");
     }
-    Ok(())
 }
 
-fn set_timeouts(sock: &mut TcpStream) {
-    sock.set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    sock.set_write_timeout(Some(Duration::from_secs(5)))
-        .expect("write timeout");
-}
-
-/// Block until rustls has at least `min_bytes` of decrypted plaintext, reading
-/// from the socket as needed. Avoids races between the client writer thread and
-/// the server handoff inspection.
-fn wait_for_plaintext(
-    server: &mut ServerConnection,
-    sock: &mut TcpStream,
-    min_bytes: usize,
-) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let io = server
-            .process_new_packets()
-            .expect("process_new_packets while waiting for plaintext");
-        if io.plaintext_bytes_to_read() >= min_bytes {
+/// Pump both directions until neither side is handshaking.
+fn drive_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+    for _ in 0..16 {
+        let to_server = take_client_records(client);
+        if !to_server.is_empty() {
+            feed_server(server, &to_server);
+        }
+        let to_client = take_server_records(server);
+        if !to_client.is_empty() {
+            feed_client(client, &to_client);
+        }
+        if !client.is_handshaking() && !server.is_handshaking() {
             return;
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for {min_bytes} plaintext bytes \
-                 (have {})",
-                io.plaintext_bytes_to_read()
-            );
-        }
-        match server.read_tls(sock) {
-            Ok(0) => panic!(
-                "EOF before plaintext arrived (have {})",
-                io.plaintext_bytes_to_read()
-            ),
-            Ok(_) => {
-                server
-                    .process_new_packets()
-                    .expect("process after read_tls");
-            }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => panic!("read_tls while waiting for plaintext: {e}"),
+        if to_server.is_empty() && to_client.is_empty() {
+            break;
         }
     }
+    panic!("TLS 1.2 handshake did not converge");
 }
 
-fn assert_opening_bytes_still_readable(server: &mut ServerConnection) {
-    let mut got = vec![0u8; OPENING.len()];
-    server
-        .reader()
-        .read_exact(&mut got)
-        .expect("opening bytes must remain readable after the handoff gate");
-    assert_eq!(got, OPENING);
+/// Buffer application bytes on the client's plaintext writer. Before the
+/// handshake completes rustls stages them and flushes them into the same
+/// outbound record burst as the client Finished.
+fn stage_app_data(client: &mut ClientConnection, data: &[u8]) {
+    let mut writer = client.writer();
+    writer.write_all(data).expect("stage application data");
 }
 
-/// Drive a clean TLS 1.2 full handshake with no application data.
-fn complete_tls12_handshake_clean(
-) -> (ServerConnection, TcpStream, thread::JoinHandle<()>) {
-    let server_config = tls12_server_config();
-    let client_config = tls12_client_config();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-
-    let client_thread = thread::spawn(move || {
-        let mut sock = TcpStream::connect(addr).expect("connect");
-        set_timeouts(&mut sock);
-
-        let server_name = ServerName::try_from("localhost").expect("dns name");
-        let mut client =
-            ClientConnection::new(client_config, server_name).expect("client connection");
-
-        write_tls(&mut client, &mut sock).expect("client hello write");
-        while client.is_handshaking() {
-            read_tls(&mut client, &mut sock).expect("client read");
-            write_tls(&mut client, &mut sock).expect("client write");
-        }
-        // Hold the socket open until the server finishes inspecting handoff state.
-        thread::sleep(Duration::from_millis(250));
-    });
-
-    let (mut server_sock, _) = listener.accept().expect("accept");
-    set_timeouts(&mut server_sock);
-
-    let mut server = ServerConnection::new(server_config).expect("server connection");
-    while server.is_handshaking() {
-        read_tls_server(&mut server, &mut server_sock).expect("server read");
-        write_tls_server(&mut server, &mut server_sock).expect("server write");
-    }
-    // Flush any post-handshake records (e.g. tickets) so the outbound buffer
-    // is empty — matching a completed tokio-rustls accept() before kTLS handoff.
-    write_tls_server(&mut server, &mut server_sock).expect("flush post-hs writes");
-
-    (server, server_sock, client_thread)
+fn read_plaintext(server: &mut ServerConnection, len: usize) -> Vec<u8> {
+    let mut got = vec![0u8; len];
+    let mut reader = server.reader();
+    reader.read_exact(&mut got).expect("read staged plaintext");
+    got
 }
 
-/// Full TLS 1.2 handshake, then deliver opening application data so it sits in
-/// rustls `received_plaintext` before any kTLS handoff decision — the buffer
-/// state the gate must refuse. (True TCP coalescing with Finished is covered by
-/// the abbreviated-handshake test below.)
-fn complete_tls12_handshake_with_buffered_app(
-    app_data: &'static [u8],
-) -> (ServerConnection, TcpStream, thread::JoinHandle<()>) {
-    let server_config = tls12_server_config();
-    let client_config = tls12_client_config();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-
-    let client_thread = thread::spawn(move || {
-        let mut sock = TcpStream::connect(addr).expect("connect");
-        set_timeouts(&mut sock);
-
-        let server_name = ServerName::try_from("localhost").expect("dns name");
-        let mut client =
-            ClientConnection::new(client_config, server_name).expect("client connection");
-
-        write_tls(&mut client, &mut sock).expect("client hello write");
-        while client.is_handshaking() {
-            read_tls(&mut client, &mut sock).expect("client read");
-            write_tls(&mut client, &mut sock).expect("client write");
-        }
-        client.writer().write_all(app_data).expect("stage app data");
-        write_tls(&mut client, &mut sock).expect("write app data");
-        thread::sleep(Duration::from_millis(250));
-    });
-
-    let (mut server_sock, _) = listener.accept().expect("accept");
-    set_timeouts(&mut server_sock);
-
-    let mut server = ServerConnection::new(server_config).expect("server connection");
-    while server.is_handshaking() {
-        read_tls_server(&mut server, &mut server_sock).expect("server read");
-        write_tls_server(&mut server, &mut server_sock).expect("server write");
-    }
-    write_tls_server(&mut server, &mut server_sock).expect("flush post-hs writes");
-    wait_for_plaintext(&mut server, &mut server_sock, app_data.len());
-
-    (server, server_sock, client_thread)
-}
-
-/// Abbreviated TLS 1.2 handshake: warm the session cache, then resume and stage
-/// Finished + application data into one client `write_tls` flush so the server
-/// decrypts opening bytes during handshake processing.
-fn complete_tls12_abbreviated_handshake_with_coalesced_app(
-    app_data: &'static [u8],
-) -> (ServerConnection, TcpStream, thread::JoinHandle<()>) {
-    let server_config = tls12_server_config();
-    let client_config = tls12_client_config();
-
-    // ── Warmup (full handshake) to populate session caches ──────────────
-    {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("warmup bind");
-        let addr = listener.local_addr().expect("warmup addr");
-        let client_config = Arc::clone(&client_config);
-        let warmup_client = thread::spawn(move || {
-            let mut sock = TcpStream::connect(addr).expect("warmup connect");
-            set_timeouts(&mut sock);
-            let name = ServerName::try_from("localhost").expect("dns name");
-            let mut client = ClientConnection::new(client_config, name).expect("warmup client");
-            write_tls(&mut client, &mut sock).expect("warmup hello");
-            while client.is_handshaking() {
-                read_tls(&mut client, &mut sock).expect("warmup read");
-                write_tls(&mut client, &mut sock).expect("warmup write");
-            }
-            let _ = client.send_close_notify();
-            let _ = write_tls(&mut client, &mut sock);
-        });
-        let (mut server_sock, _) = listener.accept().expect("warmup accept");
-        set_timeouts(&mut server_sock);
-        let mut server =
-            ServerConnection::new(Arc::clone(&server_config)).expect("warmup server");
-        while server.is_handshaking() {
-            read_tls_server(&mut server, &mut server_sock).expect("warmup server read");
-            write_tls_server(&mut server, &mut server_sock).expect("warmup server write");
-        }
-        warmup_client.join().expect("warmup client");
-    }
-
-    // ── Resumed connection with coalesced opening bytes ─────────────────
-    let listener = TcpListener::bind("127.0.0.1:0").expect("resume bind");
-    let addr = listener.local_addr().expect("resume addr");
-    let client_thread = thread::spawn(move || {
-        let mut sock = TcpStream::connect(addr).expect("resume connect");
-        set_timeouts(&mut sock);
-        let name = ServerName::try_from("localhost").expect("dns name");
-        let mut client = ClientConnection::new(client_config, name).expect("resume client");
-
-        // ClientHello (with session id from warmup).
-        write_tls(&mut client, &mut sock).expect("resume hello");
-
-        let mut staged = false;
-        while client.is_handshaking() {
-            read_tls(&mut client, &mut sock).expect("resume read");
-            // After ServerHello+CCS+Finished on an abbreviated handshake, the
-            // client can emit CCS+Finished and application data together.
-            // Stage app data before write_tls so they share one flush.
-            if !staged {
-                match client.writer().write_all(app_data) {
-                    Ok(()) => staged = true,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => panic!("unexpected app-data stage error: {e}"),
-                }
-            }
-            write_tls(&mut client, &mut sock).expect("resume write");
-        }
-        if !staged {
-            client.writer().write_all(app_data).expect("post-hs stage");
-            write_tls(&mut client, &mut sock).expect("post-hs app write");
-        }
-        thread::sleep(Duration::from_millis(250));
-    });
-
-    let (mut server_sock, _) = listener.accept().expect("resume accept");
-    set_timeouts(&mut server_sock);
-    let mut server = ServerConnection::new(server_config).expect("resume server");
-    while server.is_handshaking() {
-        read_tls_server(&mut server, &mut server_sock).expect("resume server read");
-        write_tls_server(&mut server, &mut server_sock).expect("resume server write");
-    }
-    write_tls_server(&mut server, &mut server_sock).expect("flush post-hs writes");
-    // Coalesced app data may already be plaintext after the handshake read;
-    // otherwise wait for the client's post-handshake write.
-    wait_for_plaintext(&mut server, &mut server_sock, app_data.len());
-
-    (server, server_sock, client_thread)
+/// A completed TLS 1.2 handshake with nothing left on either side — the state a
+/// tokio-rustls `accept()` hands to `try_ktls_splice`.
+fn completed_tls12_pair() -> (ClientConnection, ServerConnection) {
+    let client_cfg = tls12_client_config();
+    let server_cfg = tls12_server_config();
+    let (mut client, mut server) = tls12_pair_from(client_cfg, server_cfg);
+    drive_handshake(&mut client, &mut server);
+    (client, server)
 }
 
 #[test]
-fn handoff_refused_for_buffered_api_even_when_no_plaintext_visible() {
-    let (mut server, _sock, client) = complete_tls12_handshake_clean();
-    let io = server.process_new_packets().expect("io state");
-    assert_eq!(
-        io.plaintext_bytes_to_read(),
-        0,
-        "clean handshake must not buffer application plaintext"
-    );
-    assert_eq!(
-        io.tls_bytes_to_write(),
-        0,
-        "clean handshake flush must leave no outbound TLS records"
-    );
-    // A clean IoState is necessary but not sufficient: the buffered API
-    // cannot prove the private inbound deframer is empty, so handoff must
-    // stay refused until an unbuffered WriteTraffic path exists.
-    assert!(
-        !ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(&mut server),
-        "buffered ServerConnection must not be treated as kTLS-safe without \
-         proven record alignment"
-    );
-    let _ = client.join();
+fn clean_buffered_handshake_is_not_treated_as_kernel_handoff_safe() {
+    let (_client, mut server) = completed_tls12_pair();
+
+    let io = server.process_new_packets().expect("server packets");
+    assert_eq!(io.plaintext_bytes_to_read(), 0);
+    assert_eq!(io.tls_bytes_to_write(), 0);
+    assert!(server.wants_read());
+    assert!(!server.wants_write());
+    let version = server.protocol_version();
+    assert_eq!(version, Some(rustls::ProtocolVersion::TLSv1_2));
+
+    // A clean IoState is necessary but not sufficient. Nothing observable here
+    // proves rustls's private inbound deframer is empty and record-aligned, so
+    // the gate must still refuse.
+    assert!(!handoff_allowed(&server));
 }
 
 #[test]
-fn handoff_unsafe_when_post_handshake_app_data_buffered() {
-    let (mut server, _sock, client) = complete_tls12_handshake_with_buffered_app(OPENING);
+fn plaintext_buffered_after_handshake_refuses_handoff_and_survives() {
+    let (mut client, mut server) = completed_tls12_pair();
 
-    let io = server.process_new_packets().expect("io state");
-    assert!(
-        io.plaintext_bytes_to_read() >= OPENING.len(),
-        "test setup must leave decrypted opening bytes in rustls \
-         (got plaintext_bytes_to_read = {})",
-        io.plaintext_bytes_to_read()
-    );
+    stage_app_data(&mut client, OPENING);
+    let record = take_client_records(&mut client);
+    feed_server(&mut server, &record);
 
-    assert!(
-        !ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(&mut server),
-        "buffered plaintext must force userspace fallback"
-    );
+    let io = server.process_new_packets().expect("server packets");
+    assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
+    assert!(!server.wants_read());
 
-    assert_opening_bytes_still_readable(&mut server);
-    let _ = client.join();
+    assert!(!handoff_allowed(&server));
+    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
 }
 
 #[test]
-fn handoff_unsafe_when_abbreviated_handshake_coalesces_app_data() {
-    let (mut server, _sock, client) =
-        complete_tls12_abbreviated_handshake_with_coalesced_app(OPENING);
+fn resumed_handshake_coalescing_finished_with_app_data_refuses_handoff() {
+    let client_cfg = tls12_client_config();
+    let server_cfg = tls12_server_config();
 
-    let io = server.process_new_packets().expect("io state");
-    assert!(
-        io.plaintext_bytes_to_read() >= OPENING.len(),
-        "abbreviated handshake setup must leave coalesced plaintext buffered \
-         (got plaintext_bytes_to_read = {})",
-        io.plaintext_bytes_to_read()
-    );
-    assert_eq!(
-        server.protocol_version(),
-        Some(rustls::ProtocolVersion::TLSv1_2)
-    );
-    assert!(
-        matches!(
-            server.handshake_kind(),
-            Some(rustls::HandshakeKind::Resumed)
-        ),
-        "expected TLS 1.2 session resumption, got {:?}",
-        server.handshake_kind()
-    );
+    // Warm-up full handshake so both sides cache a resumable TLS 1.2 session.
+    let warm_pair = tls12_pair_from(client_cfg.clone(), server_cfg.clone());
+    let (mut warm_client, mut warm_server) = warm_pair;
+    drive_handshake(&mut warm_client, &mut warm_server);
 
-    assert!(
-        !ferrum_edge::_test_support::ktls_rustls_buffers_safe_for_kernel_handoff(&mut server),
-        "resumed coalesced plaintext must force userspace fallback"
-    );
+    // Abbreviated handshake: the server sends CCS+Finished first, so the
+    // client's single reply flight carries CCS, Finished and the opening
+    // application record together — the coalescing described in issue #2955.
+    let (mut client, mut server) = tls12_pair_from(client_cfg, server_cfg);
+    let hello = take_client_records(&mut client);
+    feed_server(&mut server, &hello);
+    let server_flight = take_server_records(&mut server);
+    stage_app_data(&mut client, OPENING);
+    feed_client(&mut client, &server_flight);
+    assert!(!client.is_handshaking());
+    let client_flight = take_client_records(&mut client);
+    feed_server(&mut server, &client_flight);
 
-    assert_opening_bytes_still_readable(&mut server);
-    let _ = client.join();
+    let kind = server.handshake_kind();
+    assert_eq!(kind, Some(rustls::HandshakeKind::Resumed));
+    let io = server.process_new_packets().expect("server packets");
+    assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
+
+    // Handing off here is exactly the silent-truncation bug: the kernel would
+    // resume from the socket and these bytes would never reach the backend.
+    assert!(!handoff_allowed(&server));
+    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+}
+
+#[test]
+fn partial_inbound_record_looks_idle_yet_handoff_is_refused() {
+    let (mut client, mut server) = completed_tls12_pair();
+
+    stage_app_data(&mut client, OPENING);
+    let record = take_client_records(&mut client);
+    assert!(record.len() > WITHHELD_TAIL, "expected a full record");
+
+    // Deliver all but the tail of the record. rustls keeps the fragment in its
+    // private deframer, which no public accessor reports.
+    let split = record.len() - WITHHELD_TAIL;
+    feed_server(&mut server, &record[..split]);
+
+    // Observably identical to the clean, idle connection above.
+    let io = server.process_new_packets().expect("server packets");
+    assert_eq!(io.plaintext_bytes_to_read(), 0);
+    assert_eq!(io.tls_bytes_to_write(), 0);
+    assert!(server.wants_read());
+    assert!(!server.wants_write());
+
+    // Handing off would strand the fragment and desynchronize the kernel
+    // record layer, so the gate refuses on this indistinguishable state too.
+    assert!(!handoff_allowed(&server));
+
+    // The refusal left the session intact: the record completes normally.
+    feed_server(&mut server, &record[split..]);
+    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
+}
+
+#[test]
+fn handoff_gate_never_consumes_staged_plaintext() {
+    let (mut client, mut server) = completed_tls12_pair();
+
+    stage_app_data(&mut client, OPENING);
+    let record = take_client_records(&mut client);
+    feed_server(&mut server, &record);
+
+    for _ in 0..4 {
+        assert!(!handoff_allowed(&server));
+        let io = server.process_new_packets().expect("server packets");
+        assert_eq!(io.plaintext_bytes_to_read(), OPENING.len());
+    }
+
+    assert_eq!(read_plaintext(&mut server, OPENING.len()), OPENING);
 }

@@ -1332,11 +1332,11 @@ pub mod _test_support {
 
     /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
     /// for kTLS. Always returns `false`: the public buffered API cannot prove
-    /// inbound deframer emptiness / record alignment (issue #2955). External
-    /// tests use this to pin fail-closed behavior and that coalesced
-    /// plaintext remains readable on the intact connection.
+    /// that the inbound deframer is empty and record-aligned (issue #2955).
+    /// The shared borrow is part of the contract — external tests use it to
+    /// pin that the refusal leaves every staged application byte readable.
     pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
-        server_conn: &mut rustls::ServerConnection,
+        server_conn: &rustls::ServerConnection,
     ) -> bool {
         crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
     }
