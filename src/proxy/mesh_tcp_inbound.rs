@@ -317,7 +317,9 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         client_ip = %client_ip,
         "Relaying captured sidecar raw-TCP inbound connection to loopback app"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         backend_stream,
@@ -329,6 +331,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     )
     .await;
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend
@@ -445,7 +448,9 @@ async fn relay_to_loopback(
         client_ip = %client_ip,
         "Relaying captured sidecar raw-TCP inbound connection to loopback app"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         backend_stream,
@@ -457,6 +462,7 @@ async fn relay_to_loopback(
     )
     .await;
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend

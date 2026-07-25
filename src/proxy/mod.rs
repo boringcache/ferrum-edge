@@ -7431,11 +7431,14 @@ impl ProxyState {
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
-        let old_route_indexed: HashMap<&str, &Proxy> = old_config
+        // Keyed by `(namespace, id)`: a bare-id index would let one tenant's
+        // same-id proxy stand in for another's, masking a real projected
+        // route-content change (or inventing one that never happened).
+        let old_route_indexed: HashMap<(&str, &str), &Proxy> = old_config
             .proxies
             .iter()
             .filter(|proxy| !proxy.dispatch_kind.is_stream())
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect();
 
         new_config
@@ -7444,7 +7447,7 @@ impl ProxyState {
             .filter(|proxy| !proxy.dispatch_kind.is_stream())
             .any(|new_proxy| {
                 old_route_indexed
-                    .get(new_proxy.id.as_str())
+                    .get(&(new_proxy.namespace.as_str(), new_proxy.id.as_str()))
                     .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
             })
             || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
@@ -7935,11 +7938,16 @@ impl ProxyState {
                 });
             }
 
-            // Prune adaptive buffer state for removed proxies.
+            // Prune adaptive buffer state for removed proxies. Identity is the
+            // `(namespace, id)` pair so removing one tenant's proxy leaves a
+            // same-id proxy in another namespace untouched.
             {
-                let active_ids: Vec<&str> =
-                    new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-                self.adaptive_buffer.prune_missing(&active_ids);
+                let active_proxies: Vec<(&str, &str)> = new_config
+                    .proxies
+                    .iter()
+                    .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                    .collect();
+                self.adaptive_buffer.prune_missing(&active_proxies);
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -8192,10 +8200,16 @@ impl ProxyState {
             });
         }
 
-        // Prune adaptive buffer state for removed proxies.
+        // Prune adaptive buffer state for removed proxies. Identity is the
+        // `(namespace, id)` pair so removing one tenant's proxy leaves a
+        // same-id proxy in another namespace untouched.
         {
-            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-            self.adaptive_buffer.prune_missing(&active_ids);
+            let active_proxies: Vec<(&str, &str)> = new_config
+                .proxies
+                .iter()
+                .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                .collect();
+            self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -8383,18 +8397,22 @@ impl ProxyState {
         // Upsert added/modified resources using HashMap index for O(1) lookups
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
+        // Upsert keys are the `(namespace, id)` pair, matching consumers below.
+        // A bare-id index would let one tenant's point update overwrite another
+        // tenant's identically-named resource row.
         if !result.added_or_modified_proxies.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (p.id.clone(), i))
+                .map(|(i, p)| ((p.namespace.clone(), p.id.clone()), i))
                 .collect();
             for proxy in result.added_or_modified_proxies {
-                if let Some(&pos) = idx.get(&proxy.id) {
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.proxies[pos] = proxy;
                 } else {
-                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
             }
@@ -8419,34 +8437,36 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_plugin_configs.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .plugin_configs
                 .iter()
                 .enumerate()
-                .map(|(i, pc)| (pc.id.clone(), i))
+                .map(|(i, pc)| ((pc.namespace.clone(), pc.id.clone()), i))
                 .collect();
             for pc in result.added_or_modified_plugin_configs {
-                if let Some(&pos) = idx.get(&pc.id) {
+                let key = (pc.namespace.clone(), pc.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.plugin_configs[pos] = pc;
                 } else {
-                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    idx.insert(key, new_config.plugin_configs.len());
                     new_config.plugin_configs.push(pc);
                 }
             }
         }
 
         if !result.added_or_modified_upstreams.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .upstreams
                 .iter()
                 .enumerate()
-                .map(|(i, u)| (u.id.clone(), i))
+                .map(|(i, u)| ((u.namespace.clone(), u.id.clone()), i))
                 .collect();
             for upstream in result.added_or_modified_upstreams {
-                if let Some(&pos) = idx.get(&upstream.id) {
+                let key = (upstream.namespace.clone(), upstream.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.upstreams[pos] = upstream;
                 } else {
-                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    idx.insert(key, new_config.upstreams.len());
                     new_config.upstreams.push(upstream);
                 }
             }
@@ -8662,10 +8682,16 @@ impl ProxyState {
             });
         }
 
-        // Prune adaptive buffer state for removed proxies.
+        // Prune adaptive buffer state for removed proxies. Identity is the
+        // `(namespace, id)` pair so removing one tenant's proxy leaves a
+        // same-id proxy in another namespace untouched.
         {
-            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-            self.adaptive_buffer.prune_missing(&active_ids);
+            let active_proxies: Vec<(&str, &str)> = new_config
+                .proxies
+                .iter()
+                .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                .collect();
+            self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -12254,7 +12280,11 @@ where
                 error = %message,
                 "WebSocket tunnel residual forward failed"
             );
-            adaptive_buffer.record_connection(proxy_id, recovered_backend_bytes_written);
+            adaptive_buffer.record_connection(
+                &session_meta.namespace,
+                proxy_id,
+                recovered_backend_bytes_written,
+            );
             fire_ws_tunnel_disconnect_hooks(
                 &ws_disconnect_plugins,
                 proxy_id,
@@ -12266,7 +12296,7 @@ where
             .await;
             return Ok(());
         }
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_buffer_size(&session_meta.namespace, proxy_id);
         // With the WebSocket idle timeout disabled, pass a non-zero relay cap
         // so the shared TCP relay uses its direction-tracking path instead of
         // Tokio's opaque fast path. That preserves per-direction byte counters
@@ -12287,6 +12317,7 @@ where
         )
         .await;
         adaptive_buffer.record_connection(
+            &session_meta.namespace,
             proxy_id,
             copy_result.bytes_client_to_backend.saturating_add(
                 copy_result

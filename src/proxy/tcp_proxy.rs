@@ -2488,7 +2488,7 @@ async fn handle_tcp_connection_inner(
         );
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -2539,6 +2539,7 @@ async fn handle_tcp_connection_inner(
         // gate only affects buffer-size adaptation.
         if copy_result.first_failure.is_none() {
             adaptive_buffer.record_connection(
+                &proxy.namespace,
                 proxy_id,
                 copy_result
                     .bytes_client_to_backend
@@ -3114,7 +3115,7 @@ async fn handle_tcp_connection_inner(
     let copy_result = match client_stream {
         ClientRelayStream::Tls(tls_stream) => {
             let tls_stream = *tls_stream;
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     bidirectional_copy(
@@ -3222,7 +3223,7 @@ async fn handle_tcp_connection_inner(
             }
         }
         ClientRelayStream::Plain(client_stream) => {
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     used_splice = false;
@@ -3296,6 +3297,7 @@ async fn handle_tcp_connection_inner(
     // outage bursts.
     if copy_result.first_failure.is_none() {
         adaptive_buffer.record_connection(
+            &proxy.namespace,
             proxy_id,
             copy_result
                 .bytes_client_to_backend

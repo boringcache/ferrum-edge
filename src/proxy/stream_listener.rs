@@ -1502,6 +1502,17 @@ impl StreamListenerManager {
             let rebound_proxy_ids = sni_ids.clone().unwrap_or_else(|| vec![proxy_id.clone()]);
             remove_bind_failures(&self.async_bind_failures, &rebound_proxy_ids);
             let proxy_id_owned = proxy_id.clone();
+            // Owning namespace for this listener's proxy. Runtime state keyed by
+            // proxy identity (the adaptive batch-limit EWMA) must be
+            // namespace-qualified so a same-id proxy in another tenant cannot
+            // share or prune it. Stream `listen_port` values are unique across
+            // the config, so `(id, port)` resolves exactly one proxy.
+            let proxy_namespace_owned = current_config
+                .proxies
+                .iter()
+                .find(|p| p.id.as_str() == proxy_id.as_str() && p.listen_port == Some(port_val))
+                .map(|p| p.namespace.clone())
+                .unwrap_or_else(crate::config::types::default_namespace);
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
             let request_epoch = self.request_epoch.clone();
@@ -1602,6 +1613,7 @@ impl StreamListenerManager {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
+                        proxy_namespace: proxy_namespace_owned,
                         dns_cache,
                         request_epoch,
                         health_checker,

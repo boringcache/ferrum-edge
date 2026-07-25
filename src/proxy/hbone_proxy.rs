@@ -734,7 +734,7 @@ pub(super) async fn handle_hbone_request(
     let relay_backend_connect_ms = backend_elapsed.as_secs_f64() * 1000.0;
     let relay_plugin_execution_ns = plugin_execution_ns;
     let adaptive_buffer = Arc::clone(&state.adaptive_buffer);
-    let relay_buffer_size = adaptive_buffer.get_buffer_size(&proxy.id);
+    let relay_buffer_size = adaptive_buffer.get_buffer_size(&proxy.namespace, &proxy.id);
     let relay_idle_timeout = proxy_idle_timeout(proxy, &state.env_config);
     let relay_half_close_cap = proxy_half_close_cap(&state.env_config);
     let relay_read_timeout = backend_read_timeout(proxy);
@@ -759,6 +759,7 @@ pub(super) async fn handle_hbone_request(
                 .await;
                 bytes_sent_observed.fetch_add(result.bytes_client_to_backend, Ordering::Release);
                 adaptive_buffer.record_connection(
+                    &relay_proxy.namespace,
                     &relay_proxy.id,
                     result
                         .bytes_client_to_backend

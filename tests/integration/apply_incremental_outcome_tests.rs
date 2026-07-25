@@ -2560,3 +2560,113 @@ async fn apply_incremental_upstream_only_tls_change_reconciles_stream_listeners(
 
     state.stream_listener_manager.shutdown_all().await;
 }
+
+// ── Same-id proxies across namespaces ──────────────────────────────────────
+//
+// Proxy identity in the runtime caches is the `(namespace, id)` pair. Two
+// tenants may legitimately reuse the same proxy id, so the incremental apply
+// path must neither cross-match them when deciding whether the route table can
+// be reused nor let one tenant's point update overwrite the other's row.
+
+fn shared_id_tenant_proxy(namespace: &str, listen_path: &str, backend_host: &str) -> Proxy {
+    let mut proxy = test_proxy("shared-proxy", listen_path);
+    proxy.namespace = namespace.to_string();
+    proxy.name = Some(format!("{namespace} shared proxy"));
+    proxy.hosts = vec![format!("{namespace}.example.com")];
+    proxy.backend_host = backend_host.to_string();
+    proxy
+}
+
+fn resolved_route(state: &ProxyState, host: &str, path: &str) -> Arc<Proxy> {
+    state
+        .router_cache
+        .find_proxy(Some(host), path)
+        .unwrap_or_else(|| panic!("route {host}{path} must resolve"))
+        .proxy
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_only_delta_reuses_route_table_for_same_id_proxies_in_two_namespaces() {
+    let tenant_a = shared_id_tenant_proxy("team-a", "/a", "tenant-a.local");
+    let tenant_b = shared_id_tenant_proxy("team-b", "/b", "tenant-b.local");
+    let mut plugin = test_plugin_config("shared-policy", true);
+
+    let state = proxy_state_with_config(GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![tenant_a, tenant_b],
+        plugin_configs: vec![plugin.clone()],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    });
+
+    let before_a = resolved_route(&state, "team-a.example.com", "/a");
+    let before_b = resolved_route(&state, "team-b.example.com", "/b");
+    assert_eq!(before_a.namespace, "team-a");
+    assert_eq!(before_b.namespace, "team-b");
+
+    // No proxy changed, so route-table reuse is decided purely by the projected
+    // route-content comparison. Keyed by bare id, tenant A's proxy would be
+    // compared against tenant B's same-id entry and every plugin-only poll
+    // would rebuild and republish the whole route table.
+    plugin.enabled = false;
+    plugin.updated_at = Utc::now() + Duration::milliseconds(1);
+    let outcome = state
+        .apply_incremental(delta_with_plugin(plugin, Utc::now()))
+        .await;
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    assert!(
+        Arc::ptr_eq(&before_a, &resolved_route(&state, "team-a.example.com", "/a")),
+        "plugin-only delta must reuse the route table for tenant A"
+    );
+    assert!(
+        Arc::ptr_eq(&before_b, &resolved_route(&state, "team-b.example.com", "/b")),
+        "plugin-only delta must reuse the route table for tenant B"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
+    let tenant_a = shared_id_tenant_proxy("team-a", "/a", "tenant-a.local");
+    let tenant_b = shared_id_tenant_proxy("team-b", "/b", "tenant-b.local");
+
+    // Tenant B is stored FIRST so a bare-id upsert index would resolve the
+    // shared id to tenant A's slot and overwrite the wrong tenant's row.
+    let state = proxy_state_with_config(GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![tenant_b.clone(), tenant_a],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    });
+
+    let mut updated_b = tenant_b;
+    updated_b.backend_host = "tenant-b-v2.local".to_string();
+    updated_b.updated_at = Utc::now() + Duration::milliseconds(1);
+    let outcome = state
+        .apply_incremental(delta_with_proxy(updated_b, Utc::now()))
+        .await;
+    assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+    let after_a = resolved_route(&state, "team-a.example.com", "/a");
+    let after_b = resolved_route(&state, "team-b.example.com", "/b");
+    assert_eq!(after_a.namespace, "team-a");
+    assert_eq!(
+        after_a.backend_host, "tenant-a.local",
+        "tenant B's update must not overwrite tenant A's same-id proxy"
+    );
+    assert_eq!(after_b.namespace, "team-b");
+    assert_eq!(after_b.backend_host, "tenant-b-v2.local");
+
+    let shared: Vec<_> = state
+        .config
+        .load()
+        .proxies
+        .iter()
+        .map(|proxy| proxy.namespace.clone())
+        .collect();
+    assert_eq!(
+        shared.len(),
+        2,
+        "both namespaces must keep their own proxy row: {shared:?}"
+    );
+}

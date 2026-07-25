@@ -385,7 +385,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
         client_ip = %remote_addr.ip(),
         "Relaying captured raw-TCP connection over mesh CONNECT tunnel"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         tunnel,
@@ -400,6 +402,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
         observability.complete_tcp(&result);
     }
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend

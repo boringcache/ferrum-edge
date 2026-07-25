@@ -564,6 +564,7 @@ async fn try_spawn_udp_listener(
         port: listen_port,
         bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_id: format!("{PROXY_ID}-udp"),
+        proxy_namespace: ferrum_edge::config::types::default_namespace(),
         dns_cache,
         request_epoch,
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),

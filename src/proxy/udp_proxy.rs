@@ -978,6 +978,10 @@ pub struct UdpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id`. Runtime state keyed by proxy identity —
+    /// notably the adaptive batch-limit EWMA — must be qualified by this so a
+    /// same-id proxy in another namespace never shares or prunes it.
+    pub proxy_namespace: String,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
     pub health_checker: Arc<HealthChecker>,
@@ -1064,6 +1068,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
+        proxy_namespace,
         dns_cache,
         request_epoch,
         health_checker,
@@ -1279,7 +1284,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     let mut batch_bytes_in: u64 = 0;
                     let mut batch_dgrams_out: u64 = 0;
                     let mut batch_bytes_out: u64 = 0;
-                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
 
                     use std::os::fd::AsRawFd;
                     let fd = frontend_socket.as_raw_fd();
@@ -1402,7 +1407,11 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     }
 
                     if batch_dgrams_in > 0 {
-                        adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
+                        adaptive_buffer.record_batch_cycle(
+                            &proxy_namespace,
+                            &proxy_id,
+                            batch_dgrams_in,
+                        );
                         metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
                         metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
                         metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
@@ -1479,7 +1488,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 // Drain additional pending datagrams without yielding to the runtime.
                 // On Linux, uses recvmmsg to batch multiple datagrams per syscall.
                 // On other platforms, falls back to individual try_recv_from calls.
-                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
 
                 #[cfg(target_os = "linux")]
                 {
@@ -1664,7 +1673,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 }
 
                 // Record batch cycle for adaptive batch limit tuning.
-                adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
+                adaptive_buffer.record_batch_cycle(&proxy_namespace, &proxy_id, batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
                 metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
@@ -3914,7 +3923,8 @@ async fn create_session(
                 let Some(ref sock) = backend_socket else {
                     break;
                 };
-                let batch_limit = reply_adaptive_buffer.get_batch_limit(&reply_proxy_id);
+                let batch_limit =
+                    reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
                 for _ in 0..batch_limit {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
