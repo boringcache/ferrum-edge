@@ -87,16 +87,10 @@ pub async fn extract_sni_from_tcp_stream(
     let Some(d) = handshake_timeout else {
         // No deadline: take a single peek and never loop, so a stalled peer
         // cannot park the task waiting for a record that never completes.
-        //
-        // This path sizes straight to the hard cap rather than the lazy floor.
-        // Lazy growth exists to bound memory held ACROSS the peek loop while a
-        // slow peer dribbles bytes; here the buffer is allocated, peeked once,
-        // and dropped on return, so it cannot accumulate across connections.
-        // Starting at the floor would instead silently cap SNI extraction at
-        // 4 KiB whenever the frontend handshake timeout is disabled
-        // (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`), which is exactly
-        // the oversized-ClientHello misrouting issue #2962 set out to fix.
-        let mut buf = vec![0u8; MAX_CLIENT_HELLO_LEN];
+        // Keep the buffer at the historical floor: it remains allocated while
+        // an idle peer leaves this await suspended indefinitely. Callers that
+        // need lazy growth for oversized ClientHellos must provide a deadline.
+        let mut buf = vec![0u8; initial_peek_capacity()];
         let n = stream.peek(&mut buf).await.ok()?;
         return extract_sni_from_client_hello(&buf[..n]);
     };
