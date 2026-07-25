@@ -12,6 +12,7 @@ use mongodb::bson::doc;
 use mongodb::options::IndexOptions;
 use mongodb::IndexModel;
 use std::collections::HashMap;
+use std::time::Duration;
 
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 const MIGRATE_SOURCE: &str = include_str!("../../../src/modes/migrate.rs");
@@ -207,6 +208,45 @@ fn classify_required_index_present_missing_mismatched() {
             );
         }
         other => panic!("expected mismatched for legacy unique-only index, got {other:?}"),
+    }
+
+    let matching_after_mismatch = IndexModel::builder()
+        .keys(doc! { "namespace": 1, "proxy_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! { "proxy_id": { "$type": "string" } })
+                .build(),
+        )
+        .build();
+    let mismatched_first = IndexModel::builder()
+        .keys(doc! { "namespace": 1, "proxy_id": 1 })
+        .options(IndexOptions::builder().unique(true).build())
+        .build();
+    assert_eq!(
+        classify_required_index(&required, &[mismatched_first, matching_after_mismatch]),
+        IndexPresence::Present,
+        "any exact same-key candidate must satisfy the canonical plan"
+    );
+
+    let unexpected_ttl = IndexModel::builder()
+        .keys(doc! { "namespace": 1, "proxy_id": 1 })
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(doc! { "proxy_id": { "$type": "string" } })
+                .expire_after(Duration::from_secs(60))
+                .build(),
+        )
+        .build();
+    match classify_required_index(&required, &[unexpected_ttl]) {
+        IndexPresence::Mismatched { detail } => {
+            assert!(
+                detail.contains("expireAfterSeconds"),
+                "semantic TTL drift must be reported: {detail}"
+            );
+        }
+        other => panic!("expected mismatched for unexpected TTL index, got {other:?}"),
     }
 
     let wrong_keys = IndexModel::builder()

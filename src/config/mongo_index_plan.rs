@@ -280,12 +280,23 @@ pub fn classify_plan_against_live(
 
 /// Compare one required index model to a live `listIndexes` snapshot.
 pub fn classify_required_index(required: &IndexModel, live: &[IndexModel]) -> IndexPresence {
-    let Some(candidate) = live.iter().find(|idx| idx.keys == required.keys) else {
+    let candidates = live
+        .iter()
+        .filter(|idx| idx.keys == required.keys)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
         return IndexPresence::Missing;
-    };
-    match compare_index_options(required.options.as_ref(), candidate.options.as_ref()) {
-        Ok(()) => IndexPresence::Present,
-        Err(detail) => IndexPresence::Mismatched { detail },
+    }
+
+    let mut mismatches = Vec::new();
+    for candidate in candidates {
+        match compare_index_options(required.options.as_ref(), candidate.options.as_ref()) {
+            Ok(()) => return IndexPresence::Present,
+            Err(detail) => mismatches.push(detail),
+        }
+    }
+    IndexPresence::Mismatched {
+        detail: mismatches.join("; "),
     }
 }
 
@@ -404,16 +415,72 @@ fn compare_index_options(
     let req_partial = required.and_then(|o| o.partial_filter_expression.as_ref());
     let live_partial = live.and_then(|o| o.partial_filter_expression.as_ref());
     match (req_partial, live_partial) {
-        (None, None) => Ok(()),
-        (Some(expected), Some(found)) if expected == found => Ok(()),
-        (Some(expected), Some(found)) => Err(format!(
-            "partialFilterExpression expected={expected} found={found}"
-        )),
-        (Some(expected), None) => Err(format!(
-            "partialFilterExpression expected={expected} found=<none>"
-        )),
-        (None, Some(found)) => Err(format!(
-            "partialFilterExpression expected=<none> found={found}"
-        )),
+        (None, None) => {}
+        (Some(expected), Some(found)) if expected == found => {}
+        (Some(expected), Some(found)) => {
+            return Err(format!(
+                "partialFilterExpression expected={expected} found={found}"
+            ));
+        }
+        (Some(expected), None) => {
+            return Err(format!(
+                "partialFilterExpression expected={expected} found=<none>"
+            ));
+        }
+        (None, Some(found)) => {
+            return Err(format!(
+                "partialFilterExpression expected=<none> found={found}"
+            ));
+        }
     }
+
+    let req_expire = required.and_then(|o| o.expire_after);
+    let live_expire = live.and_then(|o| o.expire_after);
+    if req_expire != live_expire {
+        return Err(format!(
+            "expireAfterSeconds expected={req_expire:?} found={live_expire:?}"
+        ));
+    }
+
+    let req_hidden = required.map(|o| effective_bool(o.hidden)).unwrap_or(false);
+    let live_hidden = live.map(|o| effective_bool(o.hidden)).unwrap_or(false);
+    if req_hidden != live_hidden {
+        return Err(format!(
+            "hidden expected={req_hidden} found={live_hidden}"
+        ));
+    }
+
+    let req_wildcard = required.and_then(|o| o.wildcard_projection.as_ref());
+    let live_wildcard = live.and_then(|o| o.wildcard_projection.as_ref());
+    if req_wildcard != live_wildcard {
+        return Err(format!(
+            "wildcardProjection expected={req_wildcard:?} found={live_wildcard:?}"
+        ));
+    }
+
+    let req_weights = required.and_then(|o| o.weights.as_ref());
+    let live_weights = live.and_then(|o| o.weights.as_ref());
+    if req_weights != live_weights {
+        return Err(format!(
+            "weights expected={req_weights:?} found={live_weights:?}"
+        ));
+    }
+
+    let req_collation = required
+        .and_then(|o| o.collation.as_ref())
+        .map(mongodb::bson::to_bson)
+        .transpose()
+        .map_err(|error| format!("failed to encode required collation: {error}"))?;
+    let live_collation = live
+        .and_then(|o| o.collation.as_ref())
+        .map(mongodb::bson::to_bson)
+        .transpose()
+        .map_err(|error| format!("failed to encode live collation: {error}"))?;
+    if req_collation != live_collation {
+        return Err(format!(
+            "collation expected={req_collation:?} found={live_collation:?}"
+        ));
+    }
+
+    Ok(())
 }
