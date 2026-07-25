@@ -1921,8 +1921,21 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
-    pub fn db_append_connect_timeout(url: &str, db_type: &str, timeout: u64) -> String {
-        crate::config::db_loader::DatabaseStore::append_connect_timeout(url, db_type, timeout)
+    pub async fn await_pool_connect_with_timeout<F, T>(
+        timeout_seconds: u64,
+        connect: F,
+    ) -> Result<T, sqlx::Error>
+    where
+        F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    {
+        crate::config::db_loader::await_pool_connect_with_timeout(timeout_seconds, connect).await
+    }
+
+    pub fn effective_pool_connect_timeout_seconds(db_type: &str, configured_seconds: u64) -> u64 {
+        crate::config::db_loader::effective_pool_connect_timeout_seconds(
+            db_type,
+            configured_seconds,
+        )
     }
 
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
