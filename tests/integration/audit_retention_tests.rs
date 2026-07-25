@@ -232,16 +232,27 @@ async fn pagination_remains_correct_across_prune_boundary() {
 }
 
 #[tokio::test]
-async fn insert_piggyback_applies_max_rows_without_failing_insert() {
+async fn insert_piggyback_applies_soft_max_rows_without_failing_insert() {
+    let max_rows = 2u64;
+    let interval =
+        ferrum_edge::admin::audit::audit_retention_max_rows_check_interval(max_rows);
     let (store, _tmp) = sqlite_store_with_retention(AuditRetentionPolicy {
         retention_days: None,
-        max_rows_per_namespace: Some(2),
+        max_rows_per_namespace: Some(max_rows),
     })
     .await;
 
-    for minutes in [3, 2, 1] {
+    // Soft cap: after a verified under-cap check, up to `interval` further
+    // inserts may land before the next boundary scan. Insert enough that the
+    // piggyback path must scan while over the configured target.
+    let total_inserts = max_rows + interval;
+    for minutes in (1..=total_inserts).rev() {
         store
-            .insert_audit_event(&event_ordered("piggy", &format!("g-{minutes}"), minutes))
+            .insert_audit_event(&event_ordered(
+                "piggy",
+                &format!("g-{minutes}"),
+                minutes as i64,
+            ))
             .await
             .unwrap();
     }
@@ -257,7 +268,7 @@ async fn insert_piggyback_applies_max_rows_without_failing_insert() {
         )
         .await
         .unwrap();
-    assert_eq!(listed.total, 2);
+    assert_eq!(listed.total, max_rows as i64);
     assert_eq!(listed.items[0].id, "g-1");
     assert_eq!(listed.items[1].id, "g-2");
 }

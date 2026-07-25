@@ -859,6 +859,10 @@ mod inner {
         cert_expiry_warning_days: u64,
         backend_allow_ips: crate::config::BackendEgressPolicy,
         audit_retention: crate::admin::audit::AuditRetentionPolicy,
+        /// Per-namespace soft-cap cadence for max-row boundary scans (shared
+        /// across store clones in this process).
+        audit_max_rows_prune_gates:
+            Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
         failover_urls: Vec<String>,
         replica_set_configured: Arc<AtomicBool>,
     }
@@ -944,6 +948,7 @@ mod inner {
                 cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
                 backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+                audit_max_rows_prune_gates: Arc::new(DashMap::new()),
                 failover_urls: Vec::new(),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
@@ -11328,7 +11333,9 @@ mod inner {
                 .await?;
             self.check_slow_query("insert_audit_event", start);
             if self.audit_retention.is_enabled()
-                && let Err(error) = self.prune_audit_events(&event.namespace).await
+                && let Err(error) = self
+                    .prune_audit_events_with_mode(&event.namespace, /* force_max_rows */ false)
+                    .await
             {
                 warn!(
                     namespace = %event.namespace,
@@ -11411,7 +11418,19 @@ mod inner {
 
     impl MongoStore {
         /// Chunked, namespace-scoped audit retention (parity with SQL).
+        /// Explicit calls always evaluate the max-row soft cap; insert-path
+        /// piggyback uses [`AuditMaxRowsPruneGate`] so steady-state inserts do
+        /// not pay an O(max_rows) boundary scan on every write.
         pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+            self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
+                .await
+        }
+
+        async fn prune_audit_events_with_mode(
+            &self,
+            namespace: &str,
+            force_max_rows: bool,
+        ) -> Result<u64, anyhow::Error> {
             if !self.audit_retention.is_enabled() {
                 return Ok(0);
             }
@@ -11422,10 +11441,24 @@ mod inner {
                     deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
             }
             if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
-                deleted = deleted.saturating_add(
-                    self.prune_audit_events_by_max_rows(namespace, max_rows)
-                        .await?,
-                );
+                let should_run = {
+                    let mut gate = self
+                        .audit_max_rows_prune_gates
+                        .entry(namespace.to_string())
+                        .or_default();
+                    gate.should_run_max_rows_prune(max_rows, force_max_rows)
+                };
+                if should_run {
+                    let batch_deleted = self
+                        .prune_audit_events_by_max_rows(namespace, max_rows)
+                        .await?;
+                    deleted = deleted.saturating_add(batch_deleted);
+                    let hit_budget =
+                        crate::admin::audit::audit_retention_hit_prune_batch_budget(batch_deleted);
+                    if let Some(mut gate) = self.audit_max_rows_prune_gates.get_mut(namespace) {
+                        gate.note_max_rows_prune_result(hit_budget);
+                    }
+                }
             }
             self.check_slow_query("prune_audit_events", start);
             Ok(deleted)
@@ -11483,6 +11516,9 @@ mod inner {
             namespace: &str,
             max_rows: u64,
         ) -> Result<u64, anyhow::Error> {
+            // Newest-first skip(max_rows) is O(max_rows); insert-path callers
+            // gate this behind AuditMaxRowsPruneGate so steady state is not
+            // per-insert.
             let options = FindOptions::builder()
                 .sort(doc! { "ts": -1, "id": -1 })
                 .skip(Some(max_rows))
@@ -12975,6 +13011,7 @@ mod inner {
                 cert_expiry_warning_days: 30,
                 backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+                audit_max_rows_prune_gates: std::sync::Arc::new(DashMap::new()),
                 failover_urls,
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,

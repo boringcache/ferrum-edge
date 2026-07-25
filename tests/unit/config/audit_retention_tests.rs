@@ -5,8 +5,10 @@
 //! validation and SQL/Mongo source parity for the shared retention contract.
 
 use ferrum_edge::admin::audit::{
-    AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP, AUDIT_RETENTION_MAX_ROWS_DEFAULT,
-    AUDIT_RETENTION_PRUNE_BATCH_SIZE, AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditRetentionPolicy,
+    AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP, AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL,
+    AUDIT_RETENTION_MAX_ROWS_DEFAULT, AUDIT_RETENTION_PRUNE_BATCH_SIZE,
+    AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditMaxRowsPruneGate, AuditRetentionPolicy,
+    audit_retention_hit_prune_batch_budget, audit_retention_max_rows_check_interval,
 };
 use ferrum_edge::config::EnvConfig;
 
@@ -31,6 +33,7 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 
 const DB_LOADER_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
+const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
 
 #[test]
 fn audit_retention_policy_defaults_to_a_namespace_cap() {
@@ -156,6 +159,55 @@ fn env_config_rejects_invalid_audit_retention() {
 }
 
 #[test]
+fn max_rows_soft_cap_gate_skips_steady_state_scans_until_interval() {
+    let max_rows = AUDIT_RETENTION_MAX_ROWS_DEFAULT;
+    let interval = audit_retention_max_rows_check_interval(max_rows);
+    assert_eq!(interval, AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL);
+    assert_eq!(
+        audit_retention_max_rows_check_interval(2),
+        2,
+        "small caps must tighten the soft-overshoot interval"
+    );
+
+    let mut gate = AuditMaxRowsPruneGate::default();
+    for _ in 1..interval {
+        assert!(
+            !gate.should_run_max_rows_prune(max_rows, false),
+            "steady-state inserts must not scan until the soft-cap interval"
+        );
+    }
+    assert!(gate.should_run_max_rows_prune(max_rows, false));
+    gate.note_max_rows_prune_result(false);
+    assert!(!gate.drain_pending());
+    assert!(
+        !gate.should_run_max_rows_prune(max_rows, false),
+        "after an under-cap check, soft cadence must reset"
+    );
+    assert!(
+        gate.should_run_max_rows_prune(max_rows, true),
+        "explicit prune must always force a max-rows scan"
+    );
+}
+
+#[test]
+fn max_rows_soft_cap_gate_keeps_draining_after_batch_budget() {
+    let mut gate = AuditMaxRowsPruneGate::default();
+    assert!(gate.should_run_max_rows_prune(100_000, true));
+    let full_budget =
+        AUDIT_RETENTION_PRUNE_BATCH_SIZE * u64::from(AUDIT_RETENTION_PRUNE_MAX_BATCHES);
+    assert!(audit_retention_hit_prune_batch_budget(full_budget));
+    assert!(!audit_retention_hit_prune_batch_budget(full_budget - 1));
+    gate.note_max_rows_prune_result(true);
+    assert!(gate.drain_pending());
+    assert!(
+        gate.should_run_max_rows_prune(100_000, false),
+        "drain_pending must prune on every subsequent insert"
+    );
+    gate.note_max_rows_prune_result(false);
+    assert!(!gate.drain_pending());
+}
+
+#[test]
 fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
     for source in [DB_LOADER_SOURCE, MONGO_STORE_SOURCE] {
         assert!(
@@ -171,6 +223,15 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
             "both backends must bound batches per prune call"
         );
         assert!(
+            source.contains("AuditMaxRowsPruneGate")
+                || source.contains("audit_max_rows_prune_gates"),
+            "both backends must cadence-gate insert-path max-row scans"
+        );
+        assert!(
+            source.contains("force_max_rows"),
+            "both backends must distinguish insert piggyback from forced prune"
+        );
+        assert!(
             source.contains("namespace"),
             "retention must stay namespace-scoped"
         );
@@ -180,6 +241,10 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
         );
     }
 
+    assert!(
+        AUDIT_SOURCE.contains("AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL"),
+        "soft-cap cadence constant must live with the retention policy"
+    );
     assert!(
         DB_LOADER_SOURCE.contains("ORDER BY ts ASC, id ASC"),
         "SQL age/cap deletes must use deterministic (ts, id) order"
@@ -199,4 +264,8 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
     );
     assert_eq!(AUDIT_RETENTION_PRUNE_BATCH_SIZE, 1_000);
     assert_eq!(AUDIT_RETENTION_PRUNE_MAX_BATCHES, 8);
+    assert_eq!(
+        AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL,
+        AUDIT_RETENTION_PRUNE_BATCH_SIZE
+    );
 }

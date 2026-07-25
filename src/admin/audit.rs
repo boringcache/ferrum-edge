@@ -36,19 +36,84 @@ pub const AUDIT_RETENTION_MAX_ROWS_DEFAULT: u64 = 100_000;
 pub const AUDIT_RETENTION_PRUNE_BATCH_SIZE: u64 = 1_000;
 /// Max DELETE batches per prune call so insert-path piggyback stays bounded.
 pub const AUDIT_RETENTION_PRUNE_MAX_BATCHES: u32 = 8;
+/// Soft-cap cadence for max-row boundary scans on the insert path.
+///
+/// Finding the excess boundary requires newest-first `OFFSET max_rows`, which
+/// is O(max_rows) index work. Steady-state inserts therefore skip that scan
+/// until this many additional inserts (per gateway instance, per namespace)
+/// have landed since the last verified at-or-under-cap check — unless a prior
+/// prune hit the per-call batch budget and left `drain_pending` set. Equals
+/// the prune batch size so soft overshoot stays small and deterministic.
+pub const AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL: u64 = AUDIT_RETENTION_PRUNE_BATCH_SIZE;
 
 static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(DashMap::new);
+
+/// Per-namespace insert-path gate for max-row retention scans.
+///
+/// `FERRUM_AUDIT_RETENTION_MAX_ROWS` is a soft cap: after a verified
+/// at-or-under-cap observation, one gateway instance may admit up to
+/// [`audit_retention_max_rows_check_interval`] further inserts for that
+/// namespace before the next O(max_rows) boundary scan. When a scan finds
+/// excess and the bounded delete budget is exhausted, `drain_pending` keeps
+/// subsequent inserts pruning immediately so backlog drains promptly. Explicit
+/// `prune_audit_events` calls always force a scan. Multiple gateway instances
+/// each keep their own gate, so worst-case soft overshoot scales with instance
+/// count × interval; deletes remain namespace-scoped and idempotent.
+#[derive(Debug, Default, Clone)]
+pub struct AuditMaxRowsPruneGate {
+    inserts_since_check: u64,
+    drain_pending: bool,
+}
+
+impl AuditMaxRowsPruneGate {
+    /// Whether this insert (or forced prune) should run the max-rows boundary scan.
+    pub fn should_run_max_rows_prune(&mut self, max_rows: u64, force: bool) -> bool {
+        if force || self.drain_pending {
+            return true;
+        }
+        self.inserts_since_check = self.inserts_since_check.saturating_add(1);
+        self.inserts_since_check >= audit_retention_max_rows_check_interval(max_rows)
+    }
+
+    /// Record the outcome of a max-rows prune so the next insert can either
+    /// resume soft-cap cadence or keep draining.
+    pub fn note_max_rows_prune_result(&mut self, hit_batch_budget: bool) {
+        self.inserts_since_check = 0;
+        self.drain_pending = hit_batch_budget;
+    }
+
+    pub fn drain_pending(&self) -> bool {
+        self.drain_pending
+    }
+}
+
+/// Soft-overshoot interval for a configured per-namespace max-row cap.
+pub fn audit_retention_max_rows_check_interval(max_rows: u64) -> u64 {
+    AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL.min(max_rows).max(1)
+}
+
+/// True when a prune deleted a full per-call budget and may still have excess.
+pub fn audit_retention_hit_prune_batch_budget(deleted: u64) -> bool {
+    deleted
+        >= AUDIT_RETENTION_PRUNE_BATCH_SIZE
+            .saturating_mul(u64::from(AUDIT_RETENTION_PRUNE_MAX_BATCHES))
+}
 
 /// Per-namespace audit-event retention policy from env/config.
 ///
 /// Distinct from delivery-loss hardening (#2421): this only bounds durable
 /// `audit_events` growth after successful inserts. Unset fields disable that
 /// half of the policy. When both are unset, stores skip prune work entirely.
+///
+/// Max-row retention is a soft cap enforced with a bounded per-instance insert
+/// cadence (see [`AuditMaxRowsPruneGate`]); age retention uses strict
+/// `ts < cutoff` on every piggybacked prune.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditRetentionPolicy {
     /// Delete events older than this many days (strict `ts < cutoff`).
     pub retention_days: Option<u64>,
-    /// Keep at most this many newest events per namespace, ordered by `(ts, id)`.
+    /// Soft per-namespace row cap: keep the newest N events by `(ts, id)`,
+    /// allowing a documented bounded overshoot between insert-path checks.
     pub max_rows_per_namespace: Option<u64>,
 }
 
