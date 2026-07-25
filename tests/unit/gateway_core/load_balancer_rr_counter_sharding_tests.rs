@@ -8,6 +8,10 @@
 
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
+use ferrum_edge::_test_support::{
+    distribute_first_wave_bucket_mods_for_test, select_random_from_shard_for_test,
+    select_round_robin_from_shard_for_test, selection_counter_phases_for_test,
+};
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, LocalityDistribute, Upstream, UpstreamLocalityLbSetting,
     UpstreamPortOverride, UpstreamTarget,
@@ -201,7 +205,7 @@ fn round_robin_first_wave_across_shards_is_not_lockstep() {
     let targets = make_targets(2);
     let lb = LoadBalancer::new(UPSTREAM, LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-    let phases = lb.selection_counter_phases_for_test();
+    let phases = selection_counter_phases_for_test(&lb);
     assert!(
         phases.iter().any(|&p| p != phases[0]),
         "selection counter shards must not share one starting phase; got {phases:?}"
@@ -209,7 +213,7 @@ fn round_robin_first_wave_across_shards_is_not_lockstep() {
 
     let first_wave: Vec<_> = (0..16)
         .map(|shard| {
-            lb.select_round_robin_from_shard_for_test(shard)
+            select_round_robin_from_shard_for_test(&lb, shard)
                 .expect("shard pick")
                 .host
                 .clone()
@@ -233,7 +237,7 @@ fn random_first_wave_across_shards_is_not_identical_sequence() {
 
     let first_wave: Vec<_> = (0..16)
         .map(|shard| {
-            lb.select_random_from_shard_for_test(shard)
+            select_random_from_shard_for_test(&lb, shard)
                 .expect("shard pick")
                 .host
                 .clone()
@@ -280,9 +284,7 @@ fn locality_distribute_first_wave_buckets_are_not_lockstep() {
 
     // Weighted total is 100; all-zero phases would map every shard to the same
     // first bucket via golden_ratio_hash(0) % 100.
-    let mods = lb
-        .distribute_first_wave_bucket_mods_for_test(100)
-        .expect("distribute phases");
+    let mods = distribute_first_wave_bucket_mods_for_test(&lb, 100).expect("distribute phases");
     assert_eq!(mods.len(), 16);
     let all_same = mods.windows(2).all(|w| w[0] == w[1]);
     assert!(

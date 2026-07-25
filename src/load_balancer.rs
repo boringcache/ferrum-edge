@@ -2655,17 +2655,19 @@ impl LoadBalancer {
 
     /// Snapshot parent selection-counter shard phases (init offsets + any advances).
     ///
-    /// Test harness only: lets coverage assert distinct construction-time phases
-    /// without depending on OS thread → shard assignment.
-    pub fn selection_counter_phases_for_test(&self) -> [u64; 16] {
+    /// Crate-private test seam (routed through `_test_support`): lets coverage
+    /// assert distinct construction-time phases without depending on OS thread →
+    /// shard assignment.
+    pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }
 
     /// One RoundRobin pick driven by an explicit counter shard.
     ///
-    /// Test harness only: bypasses [`wrr_counter_shard`] so first-wave
-    /// correlation across shards is asserted without barriers or scheduling.
-    pub fn select_round_robin_from_shard_for_test(
+    /// Crate-private test seam (routed through `_test_support`): bypasses
+    /// [`wrr_counter_shard`] so first-wave correlation across shards is asserted
+    /// without barriers or scheduling.
+    pub(crate) fn select_round_robin_from_shard_for_test(
         &self,
         shard: usize,
     ) -> Option<Arc<UpstreamTarget>> {
@@ -2682,8 +2684,11 @@ impl LoadBalancer {
     /// One Random pick driven by an explicit counter shard (same golden-ratio
     /// mapping as the production Random path).
     ///
-    /// Test harness only: see [`Self::select_round_robin_from_shard_for_test`].
-    pub fn select_random_from_shard_for_test(&self, shard: usize) -> Option<Arc<UpstreamTarget>> {
+    /// Crate-private test seam: see [`Self::select_round_robin_from_shard_for_test`].
+    pub(crate) fn select_random_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
         if self.targets.is_empty() {
             return None;
         }
@@ -2695,9 +2700,13 @@ impl LoadBalancer {
 
     /// First-wave locality-distribute bucket moduli across shards for `total`.
     ///
-    /// Test harness only: peeks each distribute-counter phase and applies the
-    /// same `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
-    pub fn distribute_first_wave_bucket_mods_for_test(&self, total: u64) -> Option<Vec<u64>> {
+    /// Crate-private test seam (routed through `_test_support`): peeks each
+    /// distribute-counter phase and applies the same
+    /// `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
+    pub(crate) fn distribute_first_wave_bucket_mods_for_test(
+        &self,
+        total: u64,
+    ) -> Option<Vec<u64>> {
         if total == 0 {
             return None;
         }
