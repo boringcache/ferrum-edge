@@ -11,6 +11,7 @@ mod admin_mesh_policy_denies_tests;
 mod admin_mesh_remote_clusters_tests;
 mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
+mod admin_metrics_tls_inventory_snapshot_tests;
 mod admin_namespace_claim_tests;
 mod admin_node_waypoint_identities_tests;
 mod admin_observability_auth_tests;
