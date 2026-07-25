@@ -8950,21 +8950,33 @@ fn row_to_proxy(
             .try_get::<i64, _>("backend_write_timeout_ms")
             .map(|v| v.max(0) as u64)
             .unwrap_or(30000),
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Propagate decode errors — silently defaulting to None would disable
+        // backend mTLS (client cert/key) or swap the trust anchor from a custom
+        // CA to the global bundle/webpki. `Option<String>` already represents
+        // SQL NULL, so `?` is safe for the expected nullable case.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
-        dns_override: row.try_get("dns_override").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        // DNS override redirects egress; silently dropping it can send traffic
+        // to an unintended resolved address.
+        dns_override: row.try_get::<Option<String>, _>("dns_override")?,
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
             .ok()
             .map(|v| v as u64),
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
-        upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+        // Propagate decode errors — silently defaulting to None would detach
+        // the proxy from its load-balanced upstream and fall back to
+        // `backend_host`, changing routing behavior.
+        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
         circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
             Ok(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
@@ -9047,7 +9059,9 @@ fn row_to_proxy(
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.
         pool_http1_max_pending_requests: None,
-        upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
+        // Subset selection is routing-sensitive; silently mapping a decode
+        // failure to None would broaden traffic across all upstream targets.
+        upstream_subset: row.try_get::<Option<String>, _>("upstream_subset")?,
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -9340,10 +9354,15 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // writes, so SQL rows always start `false`.
         locality_lb_strict: false,
         locality_lb_setting: None,
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Same trust/mTLS contract as `row_to_proxy`: reject non-NULL decode
+        // failures instead of silently disabling custom CA / client identity.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh
