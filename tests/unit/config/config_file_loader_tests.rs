@@ -2594,8 +2594,8 @@ fn test_oversized_config_rejected_before_read_and_parse() {
 #[cfg(unix)]
 #[test]
 fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     let dir = tempfile::TempDir::new().unwrap();
