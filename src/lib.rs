@@ -2021,6 +2021,27 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
+    // ── config/batch_atomicity ───────────────────────────────────────────────
+    pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
+
+    /// Install (or clear, with `None`) a deterministic failure point inside the
+    /// atomic `POST /batch` graph write for one namespace.
+    ///
+    /// Fault injection is how the all-or-nothing claim is actually exercised:
+    /// a duplicate key can only fail where the duplicate is, while these faults
+    /// reach every dependency phase and every chunk boundary. Keyed per
+    /// namespace so tests sharing a process cannot perturb each other. Always
+    /// clear the fault when the test finishes.
+    pub fn set_atomic_batch_fault_for_test(namespace: &str, fault: Option<AtomicBatchFault>) {
+        crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
+    }
+
+    /// Shrink the per-chunk write size for one namespace so a small fixture can
+    /// still cross a chunk boundary. `None` restores the backend default.
+    pub fn set_atomic_batch_chunk_size_for_test(namespace: &str, chunk_size: Option<usize>) {
+        crate::config::batch_atomicity::set_atomic_batch_chunk_size(namespace, chunk_size);
+    }
+
     pub async fn await_pool_connect_with_timeout<F, T>(
         timeout_seconds: u64,
         connect: F,

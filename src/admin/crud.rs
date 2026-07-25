@@ -221,6 +221,18 @@ impl NamespaceConfigAdmissionGuard {
         self.generation
     }
 
+    /// Identity a backend re-verifies inside the transaction it is about to
+    /// commit, so an operation that must not straddle a lease change (atomic
+    /// batch persistence) aborts instead of compensating afterwards.
+    pub(crate) fn lease_ref(
+        &self,
+    ) -> crate::config::db_backend::NamespaceConfigAdmissionLeaseRef<'_> {
+        crate::config::db_backend::NamespaceConfigAdmissionLeaseRef {
+            owner: &self.owner,
+            generation: self.generation,
+        }
+    }
+
     pub(crate) fn immediately_succeeds_generation(&self, previous: u64) -> bool {
         previous.checked_add(1) == Some(self.generation)
     }

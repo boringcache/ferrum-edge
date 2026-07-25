@@ -4,6 +4,11 @@
 //! polling are defined here. Each backend (sqlx, MongoDB) provides its own
 //! implementation. The trait is object-safe so it can be used as `Arc<dyn DatabaseBackend>`.
 
+pub use crate::config::batch_atomicity::{
+    ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
+    atomic_batch_unsupported, is_batch_admission_lease_lost,
+};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -1240,6 +1245,40 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // -----------------------------------------------------------------------
     // Batch operations
     // -----------------------------------------------------------------------
+
+    /// Whether this backend deployment can persist a whole batch graph
+    /// all-or-nothing right now.
+    ///
+    /// Callers must consult this **before** mutating anything so a deployment
+    /// that cannot provide the guarantee is refused rather than silently
+    /// applying a partial graph. Implementations that always support it keep
+    /// the default. Backends whose capability depends on live topology
+    /// (MongoDB replica set vs standalone) must re-check inside
+    /// [`DatabaseBackend::batch_create_config_graph_atomically`] so a reconnect
+    /// between the two cannot open a partial-commit window.
+    fn ensure_atomic_batch_supported(&self) -> Result<(), AtomicBatchUnsupported> {
+        Ok(())
+    }
+
+    /// Persist an entire validated batch graph in one transaction.
+    ///
+    /// Every dependency phase — consumers, upstreams, proxies, plugin configs,
+    /// proxy↔plugin associations — and every bounded chunk inside a phase share
+    /// one transaction and one commit. A failure anywhere, including a failure
+    /// after a chunk boundary, leaves nothing from the request durable, so a
+    /// retry of the identical payload is idempotent.
+    ///
+    /// The namespace config-admission lease in
+    /// [`AtomicBatchGraph::admission_lease`] is re-verified inside that same
+    /// transaction immediately before commit. A lapsed or stolen lease aborts
+    /// the transaction ([`BatchAdmissionLeaseLost`]) instead of committing a
+    /// graph another writer may have invalidated — there is no post-hoc
+    /// compensation to fail.
+    async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error>;
 
     async fn batch_create_proxies(
         &self,

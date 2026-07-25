@@ -2,9 +2,64 @@
 
 ## Overview
 
-The `POST /batch` endpoint enables bulk creation of gateway resources in a single request. Each resource type is inserted within a database transaction, eliminating per-row transaction overhead and dramatically improving write throughput at scale.
+The `POST /batch` endpoint enables bulk creation of gateway resources in a single request. The whole submitted graph is inserted in **one** database transaction, eliminating per-row transaction overhead and dramatically improving write throughput at scale.
 
 **Performance**: ~3,400-5,500 resources/s with batch API vs ~5-116 resources/s with individual API calls (47x-687x improvement).
+
+## Atomicity Guarantee
+
+**A batch is applied all-or-nothing.** Every dependency phase — consumers and
+upstreams, then proxies, then plugin configs, then the proxy↔plugin
+associations — and every internal 1,000-record chunk share one transaction and
+one commit.
+
+- If any part fails, **no resource from the request is durable**. The response
+  carries no `created` counts, and `"rollback": "not_needed"` records that there
+  was never a partial graph to compensate for.
+- Because a failed batch leaves nothing behind, **retrying the identical payload
+  is idempotent** — the resources from a failed attempt cannot conflict with the
+  retry.
+- The endpoint never returns a partial success. There is no `207 Multi-Status`
+  response.
+- The namespace config-admission lease that authorized the batch is re-verified
+  inside the persisting transaction. If it lapsed, the transaction is aborted
+  (`503`) rather than committing a graph another writer may have invalidated.
+
+The guarantee covers only the resources in the request. It does not roll back
+audit events (written after the commit) or unrelated resources that already
+existed in the namespace.
+
+### Backend support
+
+| Backend | Guarantee | Notes |
+|---------|-----------|-------|
+| PostgreSQL | Always | One `BEGIN`/`COMMIT` for the whole graph |
+| MySQL | Always | One `BEGIN`/`COMMIT` for the whole graph |
+| SQLite | Always | One transaction; the single-writer lock serializes batches |
+| MongoDB (replica set) | Always | One `ClientSession` transaction for the whole graph |
+| MongoDB (standalone) | **Not supported** | `POST /batch` returns `501` before any mutation |
+
+MongoDB multi-document transactions require a replica set (or a sharded cluster);
+`startTransaction` is rejected on a standalone `mongod`, and a config graph has
+no single-document representation to swap atomically instead. Rather than fall
+back to per-family writes that can strand half a graph, standalone deployments
+are refused up front:
+
+```json
+{
+  "error": "Atomic batch configuration is not supported by the configured database deployment",
+  "detail": "MongoDB multi-document transactions require a replica set; set FERRUM_MONGO_REPLICA_SET (or a ?replicaSet= URL option) so POST /batch can persist the whole graph in one transaction"
+}
+```
+
+Set `FERRUM_MONGO_REPLICA_SET` (or a `?replicaSet=` option on `FERRUM_DB_URL`) to
+enable the endpoint. Individual resource endpoints (`POST /proxies`,
+`POST /consumers`, …) are unaffected and continue to work on standalone MongoDB.
+
+Because a MongoDB transaction is bounded by the server's oplog entry size (16 MB
+by default) and `transactionLifetimeLimitSeconds`, very large single requests can
+exceed those limits. That failure is still atomic — nothing is applied — but
+split such imports into several smaller `POST /batch` requests.
 
 ## Endpoint
 
@@ -398,21 +453,16 @@ All resources created successfully:
 }
 ```
 
-### Partial Success (207 Multi-Status)
+### Failure (nothing applied)
 
-Some resource types failed while others succeeded:
+A batch that does not commit returns an error object with no `created` counts.
+Every resource in the request is absent, so the identical payload can be retried
+once the reported cause is addressed:
 
 ```json
 {
-  "created": {
-    "proxies": 2,
-    "consumers": 0,
-    "plugin_configs": 4,
-    "upstreams": 0
-  },
-  "errors": [
-    "consumers: duplicate key value violates unique constraint"
-  ]
+  "error": "Resource identity conflicts with an existing resource in the namespace",
+  "rollback": "not_needed"
 }
 ```
 
@@ -430,14 +480,27 @@ Each resource in the batch is validated before any database writes. If validatio
 
 ### Error Responses
 
-| Status | Condition |
-|--------|-----------|
-| 400 | Invalid JSON body |
-| 403 | Admin API is in read-only mode |
-| 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials |
-| 503 | No database available |
+| Status | Condition | Applied? |
+|--------|-----------|----------|
+| 201 | Whole graph committed | Yes, in full |
+| 400 | Invalid JSON body, or graph validation failed | No |
+| 403 | Admin API is in read-only mode | No |
+| 409 | A resource conflicts with an existing resource or with another resource in the same request (duplicate ID, name, listen path, or consumer identity) | No |
+| 500 | Server-side resource preparation failed, including a missing or weak `FERRUM_BASIC_AUTH_HMAC_SECRET` for plaintext Basic credentials | No |
+| 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — refused before any mutation | No |
+| 503 | No database available, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
+
+Every non-`201` status leaves the namespace exactly as it was, so retrying the
+same payload is safe.
 
 ## Chunking Strategy
+
+The atomicity guarantee is per request: one request is one transaction. Splitting
+a provisioning run across several requests therefore splits it across several
+transactions — each request is individually all-or-nothing, but an earlier
+request that already committed stays committed if a later one fails. Keep
+resources that must be installed together (a proxy, its upstream, and its
+plugins) in the same request.
 
 For large-scale provisioning, send resources in chunks rather than one massive request. A chunk size of 100 resources per request provides a good balance between throughput and memory usage:
 
@@ -497,7 +560,14 @@ request omitted `limit` — not the number of items in `data`.
 
 ## Database Considerations
 
-The batch API works with all supported databases (PostgreSQL, MySQL, SQLite). Large resource batches are committed in chunks of up to 1,000 rows, so a failure after an earlier chunk commits can leave a partially applied batch:
+The batch API works with PostgreSQL, MySQL, SQLite, and replica-set MongoDB (see [Backend support](#backend-support)). Resources are written in bounded chunks of up to 1,000 records, but every chunk shares the request's single transaction — a chunk boundary commits nothing, so a failure after one leaves nothing durable:
 
 - **PostgreSQL/MySQL**: Handles concurrent batch writes well. Recommended for production workloads with high write throughput.
 - **SQLite**: Single-writer lock means batch writes are serialized. Still significantly faster than individual API calls due to reduced transaction overhead, but PostgreSQL is preferred for write-heavy workloads.
+- **MongoDB**: Requires a replica set for `POST /batch`; a standalone `mongod` is refused with `501`.
+
+Concurrency: the request holds the namespace config-admission lease from
+validation through commit, and the backend re-verifies that lease inside the
+persisting transaction. Another admin writer therefore cannot interleave with the
+graph the request validated — it either commits before the batch's transaction
+opens (and the batch re-validates against it) or after the batch commits.

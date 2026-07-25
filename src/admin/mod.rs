@@ -37,7 +37,7 @@ use crate::admin::backup::{
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
-    BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
+    AtomicBatchGraph, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
     MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, NamespaceResourceCounts, PROXY_ROUTE_CONFLICT_ERROR,
     SnapshotDataIntegrityError, classify_atomic_clear_verification,
     is_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
@@ -3943,273 +3943,70 @@ async fn persist_payload_resources(
     (counts, errors, admission_unavailable)
 }
 
-/// Remove only resources that a failed batch could have inserted. Pre-existing
-/// IDs from the raw primary snapshot are never deleted, and API specs are not
-/// touched because batch create cannot mutate them.
-async fn rollback_failed_batch_create(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    batch: &RestorePayload,
-    snapshot: &RestorePayload,
-    protected_plugin_config_ids: &HashSet<String>,
-) -> Result<(), Vec<String>> {
-    let prior_proxy_ids: HashSet<&str> = snapshot
-        .proxies
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect();
-    let prior_consumer_ids: HashSet<&str> = snapshot
-        .consumers
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect();
-    let prior_plugin_config_ids: HashSet<&str> = snapshot
-        .plugin_configs
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect();
-    let prior_upstream_ids: HashSet<&str> = snapshot
-        .upstreams
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect();
-    let mut errors = Vec::new();
+/// Refuse `POST /batch` on a deployment that cannot persist a whole graph
+/// all-or-nothing.
+///
+/// `501 Not Implemented` rather than `503`: the request is well-formed and the
+/// server is healthy, but this endpoint's documented atomicity contract is not
+/// implementable against the configured database deployment, so retrying
+/// unchanged will never succeed. The detail names the configuration to change.
+fn atomic_batch_unsupported_response(
+    unsupported: &crate::config::db_backend::AtomicBatchUnsupported,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::NOT_IMPLEMENTED,
+        &json!({
+            "error": crate::config::db_backend::ATOMIC_BATCH_UNSUPPORTED_MESSAGE,
+            "detail": unsupported.detail(),
+        }),
+    )
+}
 
-    // Remove dependants before their plugin/upstream dependencies.
-    for proxy in &batch.proxies {
-        if !prior_proxy_ids.contains(proxy.id.as_str()) {
-            match db.get_proxy(namespace, &proxy.id).await {
-                Ok(Some(current)) if current.updated_at == proxy.updated_at => {
-                    if let Err(error) = db.delete_proxy(namespace, &proxy.id).await {
-                        errors.push(format!(
-                            "proxy '{}': {}",
-                            proxy.id,
-                            redacted_persistence_error_message(
-                                "batch_rollback_delete_proxy",
-                                &error
-                            )
-                        ));
-                    }
-                }
-                Ok(Some(_)) => errors.push(format!(
-                    "proxy '{}' changed after admission loss and was not deleted",
-                    proxy.id
-                )),
-                Ok(None) => {}
-                Err(error) => errors.push(format!(
-                    "proxy '{}': {}",
-                    proxy.id,
-                    redacted_persistence_error_message("batch_rollback_load_proxy", &error)
-                )),
-            }
-        }
+/// Map a failed atomic batch write onto a status code.
+///
+/// Nothing from the request is durable on any of these paths, so no `created`
+/// counts and no `207 Multi-Status` are ever reported: the caller can retry the
+/// identical payload.
+fn atomic_batch_persistence_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
+    if let Some(unsupported) = crate::config::db_backend::atomic_batch_unsupported(error) {
+        return atomic_batch_unsupported_response(unsupported);
     }
-    for plugin_config in &batch.plugin_configs {
-        if !prior_plugin_config_ids.contains(plugin_config.id.as_str()) {
-            if protected_plugin_config_ids.contains(&plugin_config.id) {
-                errors.push(format!(
-                    "plugin_config '{}' gained an intervening proxy association and was not deleted",
-                    plugin_config.id
-                ));
-                continue;
-            }
-            match db.get_plugin_config(namespace, &plugin_config.id).await {
-                Ok(Some(current)) if current.updated_at == plugin_config.updated_at => {
-                    if let Err(error) = db.delete_plugin_config(namespace, &plugin_config.id).await
-                    {
-                        errors.push(format!(
-                            "plugin_config '{}': {}",
-                            plugin_config.id,
-                            redacted_persistence_error_message(
-                                "batch_rollback_delete_plugin_config",
-                                &error,
-                            )
-                        ));
-                    }
-                }
-                Ok(Some(_)) => errors.push(format!(
-                    "plugin_config '{}' changed after admission loss and was not deleted",
-                    plugin_config.id
-                )),
-                Ok(None) => {}
-                Err(error) => {
-                    errors.push(format!(
-                        "plugin_config '{}': {}",
-                        plugin_config.id,
-                        redacted_persistence_error_message(
-                            "batch_rollback_load_plugin_config",
-                            &error,
-                        )
-                    ));
-                }
-            }
-        }
+    if is_mtls_dns_admission_unavailable(error) {
+        return mtls_dns_admission_unavailable_response();
     }
-    for consumer in &batch.consumers {
-        if !prior_consumer_ids.contains(consumer.id.as_str()) {
-            match db.get_consumer(namespace, &consumer.id).await {
-                Ok(Some(current)) if current.updated_at == consumer.updated_at => {
-                    if let Err(error) = db.delete_consumer(namespace, &consumer.id).await {
-                        errors.push(format!(
-                            "consumer '{}': {}",
-                            consumer.id,
-                            redacted_persistence_error_message(
-                                "batch_rollback_delete_consumer",
-                                &error,
-                            )
-                        ));
-                    }
-                }
-                Ok(Some(_)) => errors.push(format!(
-                    "consumer '{}' changed after admission loss and was not deleted",
-                    consumer.id
-                )),
-                Ok(None) => {}
-                Err(error) => errors.push(format!(
-                    "consumer '{}': {}",
-                    consumer.id,
-                    redacted_persistence_error_message("batch_rollback_load_consumer", &error)
-                )),
-            }
-        }
+    if crate::config::db_backend::is_batch_admission_lease_lost(error) {
+        error_persistence_failure_redacted("batch_namespace_admission_lost");
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({
+                "error": crate::config::db_backend::BATCH_ADMISSION_LEASE_LOST_MESSAGE,
+                "rollback": "not_needed",
+            }),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
     }
-    for upstream in &batch.upstreams {
-        if !prior_upstream_ids.contains(upstream.id.as_str()) {
-            match db.get_upstream(namespace, &upstream.id).await {
-                Ok(Some(current)) if current.updated_at == upstream.updated_at => {
-                    if let Err(error) = db.delete_upstream(namespace, &upstream.id).await {
-                        errors.push(format!(
-                            "upstream '{}': {}",
-                            upstream.id,
-                            redacted_persistence_error_message(
-                                "batch_rollback_delete_upstream",
-                                &error,
-                            )
-                        ));
-                    }
-                }
-                Ok(Some(_)) => errors.push(format!(
-                    "upstream '{}' changed after admission loss and was not deleted",
-                    upstream.id
-                )),
-                Ok(None) => {}
-                Err(error) => errors.push(format!(
-                    "upstream '{}': {}",
-                    upstream.id,
-                    redacted_persistence_error_message("batch_rollback_load_upstream", &error)
-                )),
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
+    let message = payload_persist_error_message(error);
+    // Identity/route/attachment conflicts are caller-fixable; everything else
+    // is reported as a backend failure with the driver detail redacted.
+    let caller_fixable = mtls_dns_identity_conflict(error).is_some()
+        || tcp_connection_throttle_attachment_conflict(error).is_some()
+        || chain_has_proxy_route_conflict(error)
+        || chain_has_unique_constraint_violation(error);
+    let status = if caller_fixable {
+        StatusCode::CONFLICT
     } else {
-        Err(errors)
-    }
-}
-
-fn batch_plugin_configs_with_intervening_proxy_dependencies(
-    current: &GatewayConfig,
-    batch: &RestorePayload,
-    snapshot: &RestorePayload,
-) -> HashSet<String> {
-    let prior_plugin_config_ids = snapshot
-        .plugin_configs
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let batch_created_plugin_config_ids = batch
-        .plugin_configs
-        .iter()
-        .filter(|resource| !prior_plugin_config_ids.contains(resource.id.as_str()))
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let mut protected = HashSet::new();
-    for proxy in &current.proxies {
-        for association in &proxy.plugins {
-            if batch_created_plugin_config_ids.contains(association.plugin_config_id.as_str())
-                && !batch.proxies.iter().any(|submitted| {
-                    submitted.id == proxy.id
-                        && submitted.plugins.iter().any(|expected| {
-                            expected.plugin_config_id == association.plugin_config_id
-                        })
-                })
-            {
-                protected.insert(association.plugin_config_id.clone());
-            }
-        }
-    }
-    protected
-}
-
-fn batch_rollback_candidate_after_intervening_write(
-    current: &GatewayConfig,
-    batch: &RestorePayload,
-    snapshot: &RestorePayload,
-    protected_plugin_config_ids: &HashSet<String>,
-) -> GatewayConfig {
-    let prior_proxy_ids = snapshot
-        .proxies
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let prior_consumer_ids = snapshot
-        .consumers
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let prior_plugin_config_ids = snapshot
-        .plugin_configs
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let prior_upstream_ids = snapshot
-        .upstreams
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<HashSet<_>>();
-    let mut candidate = current.clone();
-    candidate.proxies.retain(|current| {
-        prior_proxy_ids.contains(current.id.as_str())
-            || !batch.proxies.iter().any(|submitted| {
-                submitted.id == current.id && submitted.updated_at == current.updated_at
-            })
-    });
-    candidate.consumers.retain(|current| {
-        prior_consumer_ids.contains(current.id.as_str())
-            || !batch.consumers.iter().any(|submitted| {
-                submitted.id == current.id && submitted.updated_at == current.updated_at
-            })
-    });
-    candidate.plugin_configs.retain(|current| {
-        protected_plugin_config_ids.contains(&current.id)
-            || prior_plugin_config_ids.contains(current.id.as_str())
-            || !batch.plugin_configs.iter().any(|submitted| {
-                submitted.id == current.id && submitted.updated_at == current.updated_at
-            })
-    });
-    candidate.upstreams.retain(|current| {
-        prior_upstream_ids.contains(current.id.as_str())
-            || !batch.upstreams.iter().any(|submitted| {
-                submitted.id == current.id && submitted.updated_at == current.updated_at
-            })
-    });
-    candidate
-}
-
-fn transaction_log_graph_validation_error_message(error: crud::AfterValidateError) -> String {
-    match error {
-        crud::AfterValidateError::BadRequest(errors)
-        | crud::AfterValidateError::Conflict(errors) => errors.join("; "),
-        crud::AfterValidateError::Db(error) => {
-            redacted_persistence_error_message("batch_recovery_transaction_log_graph", &error)
-                .to_string()
-        }
-        crud::AfterValidateError::Response(_) => {
-            "transaction-log schema validation returned an HTTP response".to_string()
-        }
-    }
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    json_response(
+        status,
+        &json!({
+            "error": message,
+            "rollback": "not_needed",
+        }),
+    )
 }
 
 async fn rollback_failed_restore(
@@ -5310,7 +5107,14 @@ async fn handle_batch_create(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    // `POST /batch` guarantees the submitted graph is applied all-or-nothing. A
+    // deployment that cannot provide that (standalone MongoDB has no
+    // multi-document transactions) is refused here, before the request takes a
+    // lease or writes anything, rather than silently applying part of a graph.
+    if let Err(unsupported) = db.ensure_atomic_batch_supported() {
+        return Ok(atomic_batch_unsupported_response(&unsupported));
+    }
+    let namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(_error) => {
@@ -5874,224 +5678,36 @@ async fn handle_batch_create(
         ));
     }
 
-    // Batch persistence spans independently committed resource groups (and
-    // bounded chunks within a group). Capture the pre-batch IDs so lease loss
-    // can remove only resources this request may have inserted.
-    let batch_rollback_snapshot = match db.load_namespace_snapshot(namespace).await {
-        Ok(config) => restore_payload_from_config(config),
-        Err(error) => {
-            let message = redacted_recovery_error_message(
-                "batch_rollback_snapshot",
-                "Batch aborted: prior config could not be snapshotted for admission recovery",
-                &error,
-            );
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": message}),
-            ));
-        }
+    // One transaction covers every dependency phase and every chunk, so there
+    // is no partial state to snapshot or compensate: either the whole validated
+    // graph commits or nothing from this request is durable (issue #2401). The
+    // authorizing admission lease is re-verified inside that same transaction,
+    // so a lapsed lease aborts the write instead of leaving a graph an
+    // intervening writer may have invalidated.
+    if let Err(_error) = namespace_config_admission_guard.ensure_held() {
+        warn_persistence_failure_redacted("batch_namespace_admission_before_persist");
+        return Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
+        ));
+    }
+    let graph = AtomicBatchGraph {
+        namespace,
+        consumers: &batch.consumers,
+        upstreams: &batch.upstreams,
+        proxies: &batch.proxies,
+        plugin_configs: &batch.plugin_configs,
+        admission_lease: Some(namespace_config_admission_guard.lease_ref()),
     };
-
-    let persistence = match _namespace_config_admission_guard
-        .run_to_completion_while_held(persist_payload_resources(
-            db.as_ref(),
-            &batch,
-            true,
-            &BatchConfigWriteMode::Admission,
-        ))
+    let created = match db
+        .batch_create_config_graph_atomically(&graph, &BatchConfigWriteMode::Admission)
         .await
     {
-        Ok(result) => result,
-        Err(_error) => {
-            warn_persistence_failure_redacted("batch_namespace_admission_before_persist");
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": CONFIG_ADMISSION_UNAVAILABLE_MESSAGE}),
-            ));
-        }
-    };
-    let (created, errors, admission_unavailable) = match persistence {
-        crud::NamespaceConfigAdmissionCompletion::Held(result) => result,
-        crud::NamespaceConfigAdmissionCompletion::Lost {
-            result: (created, errors, _),
-            error: _,
-        } => {
-            error_persistence_failure_redacted("batch_namespace_admission_lost");
-            let lost_generation = _namespace_config_admission_guard.generation();
-            drop(_namespace_config_admission_guard);
-            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
-                .await
-            {
-                Ok(guard) => guard,
-                Err(rollback_error) => {
-                    let response_error = redacted_recovery_error_message(
-                        "batch_rollback_namespace_admission_reacquire",
-                        "Config admission was lost during batch persistence and could not be reacquired for rollback",
-                        &rollback_error,
-                    );
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": response_error,
-                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
-                            "persistence_errors": errors,
-                            "created": {
-                                "proxies": created.proxies,
-                                "consumers": created.consumers,
-                                "plugin_configs": created.plugin_configs,
-                                "upstreams": created.upstreams,
-                            },
-                            "rollback": "not_started",
-                        }),
-                    ));
-                }
-            };
-            let mut protected_plugin_config_ids = HashSet::new();
-            if !rollback_guard.immediately_succeeds_generation(lost_generation) {
-                let current = match db.load_namespace_snapshot(namespace).await {
-                    Ok(current) => current,
-                    Err(recovery_error) => {
-                        let response_error = redacted_recovery_error_message(
-                            "batch_intervening_graph_load",
-                            "Config admission was lost during batch persistence and the intervening graph could not be loaded for recovery",
-                            &recovery_error,
-                        );
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({
-                                "error": response_error,
-                                "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
-                                "persistence_errors": errors,
-                                "rollback": "not_started_after_intervening_write",
-                            }),
-                        ));
-                    }
-                };
-                let http_client = plugin_validation_http_client(state);
-                if crud::validate_transaction_log_schema_graph_on_blocking_pool(
-                    current.clone(),
-                    http_client.clone(),
-                )
-                .await
-                .is_ok()
-                {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": "Config admission was lost during batch persistence after another writer acquired the namespace lease; the merged graph is valid and was preserved",
-                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
-                            "persistence_errors": errors,
-                            "created": {
-                                "proxies": created.proxies,
-                                "consumers": created.consumers,
-                                "plugin_configs": created.plugin_configs,
-                                "upstreams": created.upstreams,
-                            },
-                            "rollback": "not_needed_after_intervening_write",
-                        }),
-                    ));
-                }
-                protected_plugin_config_ids =
-                    batch_plugin_configs_with_intervening_proxy_dependencies(
-                        &current,
-                        &batch,
-                        &batch_rollback_snapshot,
-                    );
-                let candidate = batch_rollback_candidate_after_intervening_write(
-                    &current,
-                    &batch,
-                    &batch_rollback_snapshot,
-                    &protected_plugin_config_ids,
-                );
-                if let Err(validation_error) =
-                    crud::validate_transaction_log_schema_graph_on_blocking_pool(
-                        candidate,
-                        http_client,
-                    )
-                    .await
-                {
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": format!(
-                                "Config admission was lost during batch persistence; conditional rollback after an intervening writer would not restore a valid transaction-log schema graph: {}",
-                                transaction_log_graph_validation_error_message(validation_error)
-                            ),
-                            "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
-                            "persistence_errors": errors,
-                            "rollback": "skipped_after_intervening_write",
-                        }),
-                    ));
-                }
-            }
-            let rollback = rollback_guard
-                .run_to_completion_while_held(rollback_failed_batch_create(
-                    db.as_ref(),
-                    namespace,
-                    &batch,
-                    &batch_rollback_snapshot,
-                    &protected_plugin_config_ids,
-                ))
-                .await;
-            let (rollback_status, rollback_errors, rollback_admission_error) = match rollback {
-                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Ok(()))) => {
-                    ("completed", None, None)
-                }
-                Ok(crud::NamespaceConfigAdmissionCompletion::Held(Err(errors))) => {
-                    ("incomplete", Some(errors), None)
-                }
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
-                    result: Ok(()),
-                    error: _,
-                }) => (
-                    "completed",
-                    None,
-                    Some(NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()),
-                ),
-                Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
-                    result: Err(errors),
-                    error: _,
-                }) => (
-                    "incomplete",
-                    Some(errors),
-                    Some(NAMESPACE_ADMISSION_LOST_MESSAGE.to_string()),
-                ),
-                Err(_error) => {
-                    warn_persistence_failure_redacted(
-                        "batch_rollback_namespace_admission_before_start",
-                    );
-                    (
-                        "not_started",
-                        None,
-                        Some(CONFIG_ADMISSION_UNAVAILABLE_MESSAGE.to_string()),
-                    )
-                }
-            };
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": "Config admission was lost during batch persistence",
-                    "admission_error": NAMESPACE_ADMISSION_LOST_MESSAGE,
-                    "persistence_errors": errors,
-                    "created": {
-                        "proxies": created.proxies,
-                        "consumers": created.consumers,
-                        "plugin_configs": created.plugin_configs,
-                        "upstreams": created.upstreams,
-                    },
-                    "rollback": rollback_status,
-                    "rollback_errors": rollback_errors,
-                    "rollback_admission_error": rollback_admission_error,
-                }),
-            ));
-        }
+        Ok(counts) => counts,
+        Err(error) => return Ok(atomic_batch_persistence_error_response(&error)),
     };
 
-    if admission_unavailable && !created.any() {
-        return Ok(mtls_dns_admission_unavailable_response());
-    }
-
-    let mut response = json!({
+    let response = json!({
         "created": {
             "proxies": created.proxies,
             "consumers": created.consumers,
@@ -6099,24 +5715,6 @@ async fn handle_batch_create(
             "upstreams": created.upstreams,
         }
     });
-
-    if !errors.is_empty() {
-        response["errors"] = json!(errors);
-        if created.any() {
-            let event = audit::AuditEvent::new(
-                actor,
-                "batch_create",
-                "gateway_config",
-                namespace,
-                namespace,
-                audit::create_diff(response["created"].clone()),
-            );
-            if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-                log_audit_enqueue_failure(&error);
-            }
-        }
-        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
-    }
 
     if created.any() {
         let event = audit::AuditEvent::new(

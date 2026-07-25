@@ -1,6 +1,7 @@
 mod admin_api_specs_handler_tests;
 mod admin_audit_rbac_tests;
 mod admin_backend_capabilities_tests;
+mod admin_batch_atomicity_tests;
 mod admin_cached_config_tests;
 mod admin_cross_namespace_refs_tests;
 mod admin_db_api_specs_tests;

@@ -210,11 +210,27 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 |---|---|---|
 | Single-document CRUD | Atomic | Atomic |
 | Multi-document operations (e.g., delete proxy + plugins) | Fail-safe sequential ordering (partial failures leave recoverable orphans) | Transactional (ACID) via `ClientSession::start_transaction` |
+| `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
 | Change streams (future) | Not available | Available |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
 
 For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, and the orphaned-proxy_group cleanup all commit atomically.
+
+It is also **required for `POST /batch`**. That endpoint guarantees the submitted
+dependency graph is applied all-or-nothing (issue #2401), which needs a single
+transaction spanning consumers, upstreams, proxies, and plugin configs.
+`startTransaction` is rejected on a standalone `mongod`, and a config graph has no
+single-document representation to swap atomically instead, so a standalone
+deployment is refused with `501 Not Implemented` **before any mutation** rather
+than applying part of a graph. Individual resource endpoints
+(`POST /proxies`, `POST /consumers`, …) are unaffected. See
+[docs/admin_batch_api.md](admin_batch_api.md#atomicity-guarantee).
+
+A batch transaction is bounded by the server's oplog entry size (16 MB by
+default) and `transactionLifetimeLimitSeconds`; a request that exceeds either
+fails atomically (nothing applied), so split very large imports into several
+`POST /batch` requests.
 
 Without a replica set, the gateway falls back to a fail-safe sequential ordering: the proxy document is deleted **before** its plugin configs, so a partial failure can only leave orphaned plugin configs (no proxy references them). Orphans are recoverable; the previous order — plugin configs first — could leave a proxy in the DB referencing now-deleted plugin_config IDs, which validation rejects on every subsequent polling cycle until manually cleaned up.
 
