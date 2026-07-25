@@ -3094,9 +3094,8 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "listener-triggered drain should honor the configured timeout"
         );
-        let err = result.expect_err(
-            "unsolicited exit must still surface as Err after drain timeout",
-        );
+        let err =
+            result.expect_err("unsolicited exit must still surface as Err after drain timeout");
         assert!(
             format!("{err:#}").contains("exited unexpectedly"),
             "preserved failure must report unsolicited exit; got {err:#}",
