@@ -236,7 +236,7 @@ fn port_least_latency_warmup_fallback_uses_port_counter() {
     );
     let upstream = upstream_with_overrides(
         LoadBalancerAlgorithm::RoundRobin,
-        vec![target("a", 8080), target("b", 8080), target("c", 8080)],
+        vec![target("a", 8080), target("b", 8080), target("c", 9090)],
         port_overrides,
     );
     let config = GatewayConfig {
@@ -636,7 +636,7 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
     assert!(
         port_sequence
             .iter()
-            .all(|host| matches!(host.as_str(), "a" | "b" | "c")),
+            .all(|host| matches!(host.as_str(), "a" | "b")),
         "port-specific random selection must stay on port 8080 targets: {port_sequence:?}"
     );
 
