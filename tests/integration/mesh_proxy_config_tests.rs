@@ -527,9 +527,11 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         .expect("decode succeeds")
         .expect("recognized ProxyConfigs carrier");
 
-    let mut xds_equivalent = MeshSlice::default();
-    xds_equivalent.node_id = native.node_id.clone();
-    xds_equivalent.namespace = native.namespace.clone();
+    let mut xds_equivalent = MeshSlice {
+        node_id: native.node_id.clone(),
+        namespace: native.namespace.clone(),
+        ..Default::default()
+    };
     apply_carrier(&mut xds_equivalent, decoded);
     assert_eq!(
         xds_equivalent.proxy_configs, native.proxy_configs,
