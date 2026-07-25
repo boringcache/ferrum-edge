@@ -7,14 +7,13 @@ under documented free-form maps (``additionalProperties`` not ``false``) and
 under arrays, so extension-map entries and list item payloads are not treated
 as schema-declared chart keys.
 
-Stdlib only: YAML is loaded via Ruby's stdlib YAML (available on GitHub-hosted
-runners and typical developer macOS/Linux images) when PyYAML is absent.
+Requires PyYAML (``pip install pyyaml``). CI installs it before invoking this
+script; no subprocess helpers are used so Cross automation policy stays clean.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,32 +30,14 @@ CHARTS = (
 def load_yaml(path: Path) -> Any:
     try:
         import yaml  # type: ignore
-    except ImportError:
-        yaml = None
-
-    if yaml is not None:
-        with path.open(encoding="utf-8") as handle:
-            return yaml.safe_load(handle)
-
-    # Ruby ships with stdlib YAML on GitHub ubuntu runners and macOS.
-    completed = subprocess.run(
-        [
-            "ruby",
-            "-ryaml",
-            "-rjson",
-            "-e",
-            "puts JSON.generate(YAML.load_file(ARGV[0]) || {})",
-            str(path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
+    except ImportError as exc:
         raise RuntimeError(
-            f"failed to load YAML {path} via Ruby: {completed.stderr.strip()}"
-        )
-    return json.loads(completed.stdout)
+            "PyYAML is required to run check_helm_values_schema_parity.py "
+            "(pip install pyyaml)"
+        ) from exc
+
+    with path.open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
 
 
 def resolve_ref(schema_root: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
