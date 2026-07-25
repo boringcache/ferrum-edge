@@ -63,7 +63,17 @@ pub struct PoolConfig {
     /// When true, hyper dynamically adjusts the connection window based on
     /// measured bandwidth-delay product, scaling up automatically on fast
     /// links and staying conservative on slow ones.
-    /// Default: false (use fixed windows for predictable performance).
+    ///
+    /// When enabled, adaptive windowing **overrides** the fixed
+    /// [`Self::http2_initial_stream_window_size`] /
+    /// [`Self::http2_initial_connection_window_size`] values at the HTTP/2
+    /// builder (hyper/reqwest semantics). Default: `true`.
+    ///
+    /// Precedence is resolved at configuration load time: an explicit stream or
+    /// connection window override from env/`ferrum.conf` or a per-proxy field
+    /// auto-disables adaptive windowing when adaptive was not also set
+    /// explicitly, so operator-tuned fixed windows take effect. An explicit
+    /// adaptive choice remains authoritative.
     pub http2_adaptive_window: bool,
 
     /// Maximum HTTP/2 frame payload size in bytes.
@@ -105,6 +115,10 @@ impl PoolConfig {
     /// Create pool configuration from environment variables/ferrum.conf with defaults.
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        // Track explicit operator intent separately from the shipped default so
+        // we never treat "value happens to equal the default" as an override.
+        let mut window_explicit = false;
+        let mut adaptive_explicit = false;
 
         // Read through `resolve_ferrum_var()` so values in ferrum.conf are
         // honored anywhere the pool config is created outside EnvConfig.
@@ -157,6 +171,7 @@ impl PoolConfig {
         {
             config.http2_initial_stream_window_size =
                 parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
+            window_explicit = true;
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
@@ -164,10 +179,21 @@ impl PoolConfig {
         {
             config.http2_initial_connection_window_size =
                 parsed.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
+            window_explicit = true;
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
-            config.http2_adaptive_window = val.parse::<bool>().unwrap_or(true);
+            match val.parse::<bool>() {
+                Ok(parsed) => {
+                    config.http2_adaptive_window = parsed;
+                    adaptive_explicit = true;
+                }
+                Err(_) => tracing::warn!(
+                    value = %val,
+                    "invalid FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW; expected true or false - \
+                     keeping the resolved default"
+                ),
+            }
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
@@ -182,6 +208,13 @@ impl PoolConfig {
         {
             config.http2_max_concurrent_streams = Some(parsed.max(1));
         }
+
+        config.apply_adaptive_window_precedence(
+            window_explicit,
+            adaptive_explicit,
+            "global env/ferrum.conf",
+            true,
+        );
 
         // Validate HTTP/2 timeout is reasonable compared to HTTP read timeout
         if config.http2_keep_alive_timeout_seconds < 10 {
@@ -231,6 +264,10 @@ impl PoolConfig {
             config.http2_keep_alive_timeout_seconds = val;
         }
 
+        let window_explicit = proxy.pool_http2_initial_stream_window_size.is_some()
+            || proxy.pool_http2_initial_connection_window_size.is_some();
+        let adaptive_explicit = proxy.pool_http2_adaptive_window.is_some();
+
         if let Some(val) = proxy.pool_http2_initial_stream_window_size {
             config.http2_initial_stream_window_size =
                 val.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE);
@@ -254,7 +291,51 @@ impl PoolConfig {
             config.http2_max_concurrent_streams = Some(val.max(1));
         }
 
+        // Resolve without an info log: `for_proxy` runs whenever a pool client /
+        // H2 builder is constructed, so logging here would spam under connection
+        // churn. Global env resolution logs once at startup; docs cover per-proxy.
+        config.apply_adaptive_window_precedence(
+            window_explicit,
+            adaptive_explicit,
+            proxy.id.as_str(),
+            false,
+        );
+
         config
+    }
+
+    /// Resolve adaptive-vs-fixed H2 window precedence for one configuration layer.
+    ///
+    /// Hyper/reqwest adaptive windowing overrides fixed initial window sizes.
+    /// When an operator sets an explicit stream/connection window at this layer
+    /// without also setting adaptive windowing explicitly, disable adaptive so
+    /// the fixed windows are not silently inert. An explicit adaptive choice at
+    /// the same layer remains authoritative.
+    ///
+    /// Explicitness is represented by the caller (env/`Option` presence), never
+    /// inferred by comparing numeric values to shipped defaults. Resolution runs
+    /// only at config load / proxy override time — never on the request path.
+    fn apply_adaptive_window_precedence(
+        &mut self,
+        window_explicit: bool,
+        adaptive_explicit: bool,
+        source: &str,
+        emit_info_log: bool,
+    ) {
+        if window_explicit && !adaptive_explicit && self.http2_adaptive_window {
+            if emit_info_log {
+                tracing::info!(
+                    source = %source,
+                    stream_window = self.http2_initial_stream_window_size,
+                    connection_window = self.http2_initial_connection_window_size,
+                    "Explicit HTTP/2 window size override present without an explicit \
+                     adaptive_window setting; disabling http2_adaptive_window so fixed \
+                     windows take effect (set FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW / \
+                     pool_http2_adaptive_window to keep adaptive flow control)"
+                );
+            }
+            self.http2_adaptive_window = false;
+        }
     }
 
     /// Get configuration for a specific proxy (global defaults + proxy overrides)
