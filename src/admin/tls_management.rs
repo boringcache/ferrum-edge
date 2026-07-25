@@ -59,6 +59,11 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
 struct AdminTlsInventoryCollector {
     env_config: Option<Arc<crate::config::EnvConfig>>,
     config: Option<Arc<arc_swap::ArcSwap<crate::config::types::GatewayConfig>>>,
+    /// Every clone of one `AdminState` shares this allocation. Retaining it
+    /// also prevents allocator address reuse while this collector remains
+    /// registered, making the pointer a stable serving-cycle identity.
+    serving_cycle_guard:
+        Arc<arc_swap::ArcSwap<Option<crate::admin::CachedDbHealthResult>>>,
 }
 
 impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCollector {
@@ -68,6 +73,10 @@ impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCol
             self.env_config.as_deref(),
             config.as_deref(),
         )
+    }
+
+    fn serving_cycle_key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.serving_cycle_guard) as usize)
     }
 }
 
@@ -83,7 +92,11 @@ fn metrics_inventory_collector(
         .as_ref()
         .map(|proxy| Arc::clone(&proxy.config))
         .or_else(|| state.cached_config.clone());
-    Arc::new(AdminTlsInventoryCollector { env_config, config })
+    Arc::new(AdminTlsInventoryCollector {
+        env_config,
+        config,
+        serving_cycle_guard: Arc::clone(&state.cached_db_health),
+    })
 }
 
 /// Ensure the process-wide collector exists for direct metrics-handler callers

@@ -50,6 +50,16 @@ pub const DEFAULT_SNAPSHOT_TTL_SECONDS: u64 = 300;
 /// fakes. Runs only on the background refresh task, never on a request path.
 pub trait TlsInventoryCollector: Send + Sync + 'static {
     fn collect_public_metadata(&self) -> TlsInventory;
+
+    /// Stable identity for listeners that belong to one admin serving cycle.
+    ///
+    /// Plaintext and HTTPS listeners start independently but share an
+    /// `AdminState`; returning the same key lets their collector registration
+    /// stay idempotent. `None` keeps the conservative replace-on-every-call
+    /// behavior for collectors that cannot prove shared ownership.
+    fn serving_cycle_key(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A published, non-secret inventory snapshot.
@@ -155,7 +165,10 @@ pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
 /// cycles refreshing from the previous cycle's config. A serving-cycle install
 /// therefore replaces the collector, advances its generation, and invalidates
 /// the current snapshot; the next bounded refresh publishes metadata from the
-/// new owner. An old in-flight refresh may finish, but its generation-bound
+/// new owner. Plaintext and HTTPS listeners from the same serving cycle are
+/// deduplicated by [`TlsInventoryCollector::serving_cycle_key`] so the second
+/// listener cannot invalidate the first listener's warmup. An old in-flight
+/// refresh from a genuinely replaced cycle may finish, but its generation-bound
 /// snapshot is ignored. Pinned test collectors remain authoritative.
 ///
 /// Returns `true` when this call replaced the collector.
@@ -165,6 +178,19 @@ pub fn replace_collector_for_serving_cycle(collector: Arc<dyn TlsInventoryCollec
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if CACHE.collector_pinned.load(Ordering::Acquire) {
+        return false;
+    }
+    let serving_cycle_key = collector.serving_cycle_key();
+    if serving_cycle_key.is_some()
+        && CACHE
+            .collector
+            .load()
+            .as_ref()
+            .as_ref()
+            .is_some_and(|registration| {
+                registration.collector.serving_cycle_key() == serving_cycle_key
+            })
+    {
         return false;
     }
     CACHE
