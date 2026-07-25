@@ -993,9 +993,11 @@ async fn test_take_then_restart_stops_probes_for_removed_target() {
         "kept target must still be probed by the replacement generation"
     );
     assert!(
-        !checker
-            .active_unhealthy_targets
-            .contains_key(&format!("up-remove::{}:{}", addr_remove.ip(), addr_remove.port())),
+        !checker.active_unhealthy_targets.contains_key(&format!(
+            "up-remove::{}:{}",
+            addr_remove.ip(),
+            addr_remove.port()
+        )),
         "stale unhealthy state for the removed upstream must be pruned"
     );
 }
@@ -1102,7 +1104,11 @@ async fn test_take_then_restart_stops_stale_passive_recovery() {
     for _ in 0..2 {
         checker.report_response(TEST_PROXY, &target, 500, false, Some(&passive_cfg));
     }
-    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "passive-host:9500"));
+    assert!(is_passive_unhealthy(
+        &checker,
+        TEST_PROXY,
+        "passive-host:9500"
+    ));
 
     // Make the cooldown already elapsed so a surviving timer would recover
     // on its next tick.
@@ -1113,10 +1119,7 @@ async fn test_take_then_restart_stops_stale_passive_recovery() {
         - 5_000;
     {
         let proxy_state = checker.passive_health.get(TEST_PROXY).unwrap();
-        *proxy_state
-            .unhealthy
-            .get_mut("passive-host:9500")
-            .unwrap() = past_ms;
+        *proxy_state.unhealthy.get_mut("passive-host:9500").unwrap() = past_ms;
     }
 
     let initial = config_with_upstreams(vec![make_upstream_with_passive_recovery(
