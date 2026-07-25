@@ -2772,7 +2772,7 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
 
     // Warm A; leave B unsampled, then eject+recover B via passive timer path.
     let inner = lb_cache.load();
-    let balancer = inner.balancers.get(TEST_UPSTREAM).unwrap();
+    let balancer = inner.balancers().get(TEST_UPSTREAM).unwrap();
     for _ in 0..5 {
         balancer.record_latency(&targets[0], 10_000);
     }
