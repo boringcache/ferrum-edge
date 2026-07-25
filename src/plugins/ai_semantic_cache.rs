@@ -239,11 +239,18 @@ const SEMANTIC_CACHE_ENTRY_VERSION: u8 = 4;
 /// singleflight in [`AiSemanticCache::compute_embedding`]) so they share one
 /// outbound request rather than each consuming a permit.
 const MAX_CONCURRENT_EMBEDDINGS: usize = 8;
-/// How long a follower waits for a singleflight leader before bypassing the
-/// semantic lookup. Bounds waiter latency when a leader stalls without
-/// cancelling; a timeout must not evict a still-running leader and duplicate
-/// the same outbound embedding call. Cancellation closes the channel and frees
-/// the slot immediately, allowing one replacement leader to be elected.
+/// Hard ceiling on how long one caller may wait for outbound-embedding
+/// admission or for a singleflight leader before bypassing the semantic lookup.
+///
+/// The *effective* wait is derived from the operator-configured
+/// `semantic_embedding_timeout_ms` (see
+/// [`AiSemanticCache::embedding_singleflight_wait`]) and only clamped by this
+/// ceiling, so a saturated or stalled embedding lane cannot hold a proxied
+/// request far past the per-call embedding budget the operator opted into —
+/// the documented failure mode is a plain cache miss, not a long stall.
+/// A timeout must not evict a still-running leader and duplicate the same
+/// outbound embedding call. Cancellation closes the channel and frees the slot
+/// immediately, allowing one replacement leader to be elected.
 const EMBEDDING_SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(30);
 /// Upper bound on singleflight re-election attempts for one caller so a
 /// pathological leader-cancellation storm cannot loop forever on the request
@@ -1116,7 +1123,9 @@ impl AiSemanticCache {
     /// dropped before publishing frees its slot (via [`EmbeddingFlightCleanup`])
     /// and closes its channel, so waiters re-enter the map and elect exactly one
     /// replacement leader rather than each issuing a duplicate outbound call.
-    /// Followers wait at most [`EMBEDDING_SINGLEFLIGHT_WAIT`]. A timeout bypasses
+    /// Admission and follower waits share one bound derived from the configured
+    /// embedding timeout ([`Self::embedding_singleflight_wait`], clamped by
+    /// [`EMBEDDING_SINGLEFLIGHT_WAIT`]). A timeout bypasses
     /// semantic lookup for that follower without evicting the live leader, so it
     /// cannot create duplicate outbound work. One shared success or failure is
     /// published to all waiters on each completed leadership.
@@ -1220,15 +1229,28 @@ impl AiSemanticCache {
         }
     }
 
+    /// Effective bound for embedding admission and singleflight follower waits.
+    ///
+    /// Derived from the configured `semantic_embedding_timeout_ms` rather than
+    /// the fixed [`EMBEDDING_SINGLEFLIGHT_WAIT`] ceiling: a leader's own worst
+    /// case is one admission wait plus one provider call, so twice the
+    /// per-call timeout is the largest wait that can still coalesce useful
+    /// work. Using the bare ceiling would let a saturated embedding lane stall
+    /// a proxied request for six times the timeout the operator configured
+    /// (30s vs the 5s default) before the request falls through to its normal
+    /// backend dispatch. The test override, when set, still wins.
     fn embedding_singleflight_wait(&self) -> Duration {
         let override_ms = self
             .embedding_singleflight_wait_override_ms
             .load(Ordering::Relaxed);
         if override_ms > 0 {
-            Duration::from_millis(override_ms)
-        } else {
-            EMBEDDING_SINGLEFLIGHT_WAIT
+            return Duration::from_millis(override_ms);
         }
+        let Some(semantic) = self.semantic.as_ref() else {
+            return EMBEDDING_SINGLEFLIGHT_WAIT;
+        };
+        let leader_budget = semantic.request_timeout.saturating_mul(2);
+        leader_budget.min(EMBEDDING_SINGLEFLIGHT_WAIT)
     }
 
     async fn compute_embedding_inner(&self, input: &str) -> Result<EmbeddingPoint, String> {
