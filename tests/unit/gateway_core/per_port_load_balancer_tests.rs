@@ -144,7 +144,9 @@ fn port_wrr_zero_weight_fallback_uses_port_counter() {
         ..GatewayConfig::default()
     };
     let cache = LoadBalancerCache::new(&config);
+    let control_cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
+    let control_snapshot = control_cache.load();
 
     for _ in 0..2 {
         LoadBalancerCache::select_target_from(&snapshot, "ferrum", "u1", "parent", None)
@@ -163,7 +165,30 @@ fn port_wrr_zero_weight_fallback_uses_port_counter() {
         })
         .collect();
 
-    assert_eq!(port_sequence, vec!["a", "b"]);
+    let control_sequence: Vec<String> = (0..2)
+        .map(|_| {
+            LoadBalancerCache::select_target_for_port_from(
+                &control_snapshot,
+                "u1",
+                "port",
+                8080,
+                None,
+            )
+            .expect("control port selection")
+            .target
+            .host
+            .clone()
+        })
+        .collect();
+
+    assert_eq!(
+        port_sequence, control_sequence,
+        "parent selections must not advance the independent per-port WRR lane"
+    );
+    assert_ne!(
+        port_sequence[0], port_sequence[1],
+        "the zero-weight per-port lane must still advance round-robin"
+    );
 }
 
 #[test]

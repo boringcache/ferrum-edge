@@ -31,14 +31,18 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
         &[
             "No route matched for request path",
             "StatusCode::NOT_FOUND",
+            // The request-scoped view is selected once before method admission
+            // so the 405 logging path reuses it, and it stays keyed by
+            // `(namespace, id)` so a same-id proxy in another tenant cannot
+            // supply this request's plugin list.
+            "let plugin_cache_view = if grpc_web_request {",
+            "request_view(&proxy.namespace, &proxy.id, request_protocol)",
             "// Per-proxy HTTP method filtering (checked before plugins to save work).",
             "StatusCode::METHOD_NOT_ALLOWED",
             "log_pre_backend_rejected_request(",
             "\"allowed_methods\"",
             "// gRPC spec mandates POST method.",
             "StatusCode::BAD_REQUEST",
-            "let plugin_cache_view =",
-            "request_view(&proxy.namespace, &proxy.id, request_protocol)",
             "// Execute on_request_received hooks",
             "await_request_plugin_deadline_with_provenance(",
             "plugin.on_request_received(&mut ctx),",
