@@ -898,7 +898,7 @@ pub async fn run(
 /// as `Err` after draining remaining listeners. Long-lived bridge tasks must
 /// not be passed here — keep them on the background drain path so a pending
 /// earlier handle cannot mask a later listener panic (issue #2368).
-pub async fn await_dp_listener_handles(
+pub(crate) async fn await_dp_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), tokio::task::JoinError> {

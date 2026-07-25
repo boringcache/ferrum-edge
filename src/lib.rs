@@ -92,6 +92,15 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    /// Exercise DP's crate-private concurrent listener supervisor without
+    /// expanding the production API solely for external regression tests.
+    pub async fn await_dp_listener_handles(
+        listener_handles: Vec<tokio::task::JoinHandle<()>>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Result<(), tokio::task::JoinError> {
+        crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(

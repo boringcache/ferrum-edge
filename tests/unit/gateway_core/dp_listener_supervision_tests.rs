@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ferrum_edge::modes::data_plane::await_dp_listener_handles;
+use ferrum_edge::_test_support::await_dp_listener_handles;
 
 #[tokio::test]
 async fn await_dp_listener_handles_observes_later_panic_while_earlier_listener_pending() {
