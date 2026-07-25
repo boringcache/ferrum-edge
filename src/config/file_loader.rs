@@ -226,7 +226,7 @@ fn read_config_snapshot(path: &Path) -> Result<(ConfigFileIdentity, Vec<u8>), St
 /// byte-identical contents. Metadata/size agreement without content equality
 /// is insufficient and is not treated as success.
 fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
-    let display = path.display();
+    let display_path = path.display();
     let mut last_reason = String::from("unknown instability");
 
     for attempt in 1..=STABLE_READ_MAX_ATTEMPTS {
@@ -249,7 +249,7 @@ fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
                 if attempt > 1 {
                     info!(
                         attempt,
-                        path = %display,
+                        path = %display_path,
                         "Configuration file stabilized after retry"
                     );
                 }
@@ -260,7 +260,7 @@ fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
                 warn!(
                     attempt,
                     max_attempts = STABLE_READ_MAX_ATTEMPTS,
-                    path = %display,
+                    path = %display_path,
                     reason,
                     "Configuration file read was unstable; retrying"
                 );
@@ -270,14 +270,14 @@ fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
             }
             Err(other) => {
                 return Err(anyhow::anyhow!(
-                    "Failed to read configuration file {display}: {other}"
+                    "Failed to read configuration file {display_path}: {other}"
                 ));
             }
         }
     }
 
     Err(anyhow::anyhow!(
-        "Configuration file {display} remained unstable after {STABLE_READ_MAX_ATTEMPTS} read \
+        "Configuration file {display_path} remained unstable after {STABLE_READ_MAX_ATTEMPTS} read \
          attempts ({last_reason}). Publish updates with an atomic replace (write a temp file, \
          fsync, rename over the path) or equivalent; file-mode reload keeps the last \
          known-good live generation when this guard fails closed."
