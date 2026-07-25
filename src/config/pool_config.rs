@@ -337,11 +337,7 @@ impl PoolConfig {
             None => self.http2_max_frame_size,
         };
 
-        let _ = write!(
-            buf,
-            ";h2=1;h2i{h2i};h2t{h2t};aw{}",
-            u8::from(adaptive)
-        );
+        let _ = write!(buf, ";h2=1;h2i{h2i};h2t{h2t};aw{}", u8::from(adaptive));
         // Adaptive window overrides fixed initial windows in reqwest/hyper, so
         // divergent `sw`/`cw` must not fragment when `aw=1`.
         if !adaptive {
