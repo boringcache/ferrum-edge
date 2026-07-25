@@ -120,13 +120,15 @@ define_header_name_set! {
 /// a `Vec`, so failing to strip first makes backend-visible shape flip across
 /// capability-path changes.
 ///
-/// `name` is expected to be lowercase (same contract as the other strip
-/// predicates). This is allocation-free and safe to call once per header in the
-/// outbound copy loop.
+/// Primary dispatch maps normally carry lowercase names (hyper/`HeaderName`),
+/// but plugin-synthesised mixed-case keys can appear in the string `HashMap`.
+/// `Forwarded` matching is ASCII case-insensitive and allocation-free so a
+/// hostile `Forwarded` / `FORWARDED` key cannot bypass ownership and precede
+/// the gateway-owned element on append/`Vec`-push transports.
 #[inline]
 pub fn is_proxy_owned_forwarding_header(name: &str, add_forwarded_header: bool) -> bool {
     is_proxy_generated_forwarding_header(name)
-        || (add_forwarded_header && matches!(name, "forwarded"))
+        || (add_forwarded_header && name.eq_ignore_ascii_case("forwarded"))
 }
 
 /// Whether client `Host` / authority should survive secondary-request filtering.
@@ -774,7 +776,10 @@ mod tests {
         // value must be stripped on every transport before the gateway element
         // is written. When regeneration is off, client Forwarded may pass.
         assert!(is_proxy_owned_forwarding_header("forwarded", true));
+        assert!(is_proxy_owned_forwarding_header("Forwarded", true));
+        assert!(is_proxy_owned_forwarding_header("FORWARDED", true));
         assert!(!is_proxy_owned_forwarding_header("forwarded", false));
+        assert!(!is_proxy_owned_forwarding_header("Forwarded", false));
         assert!(is_proxy_owned_forwarding_header("x-forwarded-for", false));
         assert!(is_proxy_owned_forwarding_header("x-forwarded-for", true));
         assert!(!is_proxy_owned_forwarding_header("via", true));

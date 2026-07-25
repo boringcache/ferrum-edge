@@ -37322,6 +37322,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_h3_backend_headers_drop_mixed_case_forwarded_when_regenerating() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([
+            ("host".to_string(), "api.example".to_string()),
+            (
+                "FORWARDED".to_string(),
+                "for=10.0.0.1;proto=https, for=\"[::1]\"".to_string(),
+            ),
+        ]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                xff_append_ip: "10.0.0.7",
+                effective_host: "h3-backend.example",
+                request_is_secure: true,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case("forwarded"))
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.9;proto=https;host=api.example"],
+            "mixed-case / malformed-folded client Forwarded must not survive"
+        );
+    }
+
     #[test]
     fn websocket_backend_url_strips_exact_listen_path_literal() {
         let mut proxy = test_proxy(ResponseBodyMode::Stream);

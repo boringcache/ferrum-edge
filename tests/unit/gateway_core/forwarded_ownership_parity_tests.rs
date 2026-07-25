@@ -12,7 +12,11 @@ use ferrum_edge::proxy::headers::is_proxy_owned_forwarding_header;
 #[test]
 fn owned_forwarding_predicate_fail_closes_forwarded_only_when_regenerating() {
     assert!(is_proxy_owned_forwarding_header("forwarded", true));
+    // Mixed-case plugin keys must not bypass ownership (append/`Vec` paths).
+    assert!(is_proxy_owned_forwarding_header("Forwarded", true));
+    assert!(is_proxy_owned_forwarding_header("FORWARDED", true));
     assert!(!is_proxy_owned_forwarding_header("forwarded", false));
+    assert!(!is_proxy_owned_forwarding_header("Forwarded", false));
     // XFF family remains always-owned (unchanged trusted-proxy contract).
     for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"] {
         assert!(is_proxy_owned_forwarding_header(name, false));

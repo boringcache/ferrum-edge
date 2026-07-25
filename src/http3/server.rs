@@ -13095,6 +13095,43 @@ mod build_h3_backend_headers_tests {
     }
 
     #[tokio::test]
+    async fn native_h3_strips_mixed_case_and_duplicate_forwarded_when_regenerating() {
+        // Hostile / plugin-injected mixed-case keys and folded duplicates must
+        // fail closed to a single gateway-owned element.
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "Forwarded".to_string(),
+            "for=10.0.0.1;proto=https, for=198.51.100.7".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case("forwarded"))
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.1;proto=https;host=api.example"],
+            "mixed-case / duplicate client Forwarded must not survive regeneration"
+        );
+    }
+
+    #[tokio::test]
     async fn native_h3_passes_client_forwarded_when_not_regenerating() {
         let state = minimal_proxy_state();
         assert!(
