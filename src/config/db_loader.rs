@@ -61,6 +61,12 @@ const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
+pub(crate) const MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL: &str = "INSERT INTO config_change_locks \
+     (lock_name, updated_at) VALUES (?, ?) \
+     ON DUPLICATE KEY UPDATE updated_at = config_change_locks.updated_at";
+pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_route_locks \
+     (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
+     ON DUPLICATE KEY UPDATE created_at = proxy_route_locks.created_at";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -341,10 +347,14 @@ pub struct DbPoolConfig {
     pub acquire_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
     pub max_lifetime_seconds: u64,
-    /// Maximum time (seconds) to wait for a new TCP connection to the database
-    /// server. Default: 10. Applies per connection attempt — separate from
-    /// `acquire_timeout_seconds` which covers the full pool checkout (wait +
-    /// connect). 0 = no explicit timeout (falls back to OS TCP timeout).
+    /// Maximum time (seconds) for each SQL pool *creation* attempt (initial
+    /// connect, failover, replica, reconnect, migrate). Default: 10.
+    ///
+    /// Enforced by [`await_pool_connect_with_timeout`] around sqlx
+    /// `AnyPoolOptions::connect` — sqlx 0.8's native PG/MySQL drivers ignore a
+    /// `connect_timeout` URL query parameter, so Ferrum must bound the future
+    /// itself. Separate from [`Self::acquire_timeout_seconds`], which still
+    /// covers in-pool checkout wait + connect. `0` disables the bound.
     pub connect_timeout_seconds: u64,
     /// Maximum execution time (seconds) for any single SQL statement. Default:
     /// 30, max 3600 (clamped at `EnvConfig` parse time). Set via
@@ -366,6 +376,66 @@ impl Default for DbPoolConfig {
             connect_timeout_seconds: 10,
             statement_timeout_seconds: 30,
         }
+    }
+}
+
+/// Await a SQL pool-connect future with the configured per-attempt bound.
+///
+/// Centralized so initial, failover, replica, reconnect, and migrate paths
+/// cannot drift. `timeout_seconds == 0` leaves the future unbounded (OS /
+/// `acquire_timeout` still apply inside sqlx). On expiry the connect future is
+/// dropped — no detached attempt — and the error is a typed
+/// `sqlx::Error::Io(TimedOut)` with a non-secret message so failover / backup
+/// classification stays transient without embedding the DSN.
+pub(crate) async fn await_pool_connect_with_timeout<F, T>(
+    timeout_seconds: u64,
+    connect: F,
+) -> Result<T, sqlx::Error>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    if timeout_seconds == 0 {
+        return connect.await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), connect).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("database pool connect timed out after {timeout_seconds}s"),
+        ))),
+    }
+}
+
+/// Connect an `AnyPool` under [`await_pool_connect_with_timeout`].
+///
+/// Does not mutate the URL: TLS / DSN query parameters are left untouched, and
+/// no ignored `connect_timeout=` query parameter is appended.
+pub(crate) async fn connect_any_pool_with_timeout(
+    options: AnyPoolOptions,
+    url: &str,
+    db_type: &str,
+    connect_timeout_seconds: u64,
+) -> Result<AnyPool, sqlx::Error> {
+    await_pool_connect_with_timeout(
+        effective_pool_connect_timeout_seconds(db_type, connect_timeout_seconds),
+        options.connect(url),
+    )
+    .await
+}
+
+/// Keep the SQL pool knob scoped to network database connects.
+///
+/// SQLite is local file I/O and the previous implementation deliberately did
+/// not append a driver timeout for it. Preserve that contract while replacing
+/// the ineffective PostgreSQL/MySQL URL parameter with a real future bound.
+pub(crate) fn effective_pool_connect_timeout_seconds(
+    db_type: &str,
+    configured_seconds: u64,
+) -> u64 {
+    if db_type == "sqlite" {
+        0
+    } else {
+        configured_seconds
     }
 }
 
@@ -673,9 +743,11 @@ impl DatabaseStore {
 
     fn proxy_route_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO proxy_route_locks \
-                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
-                .to_string(),
+            // Same S->X upgrade trap as config_change_locks / mTLS DNS
+            // admission: INSERT IGNORE takes a shared duplicate-key lock, then
+            // SELECT ... FOR UPDATE upgrades it. Prefer the no-op upsert so
+            // MySQL holds the exclusive row lock up front.
+            "mysql" => MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
                 .to_string(),
@@ -687,9 +759,11 @@ impl DatabaseStore {
 
     fn config_change_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO config_change_locks \
-                 (lock_name, updated_at) VALUES (?, ?)"
-                .to_string(),
+            // Cross-namespace writers share the single 'global' row and are not
+            // serialized by per-namespace admission. INSERT IGNORE + FOR UPDATE
+            // deadlocks on the S->X upgrade under concurrent namespaces; the
+            // no-op upsert acquires the exclusive lock immediately.
+            "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?)"
                 .to_string(),
@@ -870,11 +944,17 @@ impl DatabaseStore {
         sqlx::query(&insert_sql)
             .bind(namespace)
             .bind(&route_key_hash)
-            .bind(now)
+            .bind(&now)
             .execute(&mut **tx)
             .await?;
 
-        if self.db_type != "sqlite" {
+        // SQLite: INSERT OR IGNORE serializes via the DB writer lock.
+        // MySQL: the no-op ON DUPLICATE KEY UPDATE already holds X; a follow-up
+        // SELECT ... FOR UPDATE would be redundant and reintroduce S->X races
+        // if the insert shape ever regresses to INSERT IGNORE.
+        // PostgreSQL: INSERT ... DO NOTHING does not lock the existing row, so
+        // SELECT ... FOR UPDATE remains required.
+        if self.db_type != "sqlite" && self.db_type != "mysql" {
             let lock_sql = self.q("SELECT route_key_hash FROM proxy_route_locks \
                  WHERE namespace = ? AND route_key_hash = ? FOR UPDATE");
             sqlx::query(&lock_sql)
@@ -897,17 +977,24 @@ impl DatabaseStore {
         let insert_sql = self.config_change_lock_insert_sql();
         sqlx::query(&insert_sql)
             .bind(Self::CONFIG_CHANGE_LOCK_NAME)
-            .bind(now)
+            .bind(&now)
             .execute(&mut **tx)
             .await?;
 
         if self.db_type == "sqlite" {
+            // SQLite has no SELECT ... FOR UPDATE. This write takes the
+            // database writer lock inside the same transaction that will
+            // insert the change-log row.
             sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
                 .bind(Utc::now().to_rfc3339())
                 .bind(Self::CONFIG_CHANGE_LOCK_NAME)
                 .execute(&mut **tx)
                 .await?;
-        } else {
+        } else if self.db_type != "mysql" {
+            // PostgreSQL: INSERT ... DO NOTHING does not lock the existing row.
+            // MySQL: MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL already holds the
+            // exclusive row lock for the rest of this transaction — do not
+            // follow with SELECT ... FOR UPDATE (that was the S->X deadlock).
             let lock_sql =
                 self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
             sqlx::query(&lock_sql)
@@ -1450,19 +1537,6 @@ impl DatabaseStore {
             })
     }
 
-    /// Append `connect_timeout` to a database URL for PostgreSQL and MySQL.
-    ///
-    /// This sets the driver-level TCP connect timeout — separate from
-    /// `acquire_timeout` which covers waiting for a pool slot + connecting.
-    /// SQLite is local I/O so connect timeout is not applicable.
-    pub(crate) fn append_connect_timeout(url: &str, db_type: &str, timeout_seconds: u64) -> String {
-        if timeout_seconds == 0 || db_type == "sqlite" {
-            return url.to_string();
-        }
-        let separator = if url.contains('?') { '&' } else { '?' };
-        format!("{}{}connect_timeout={}", url, separator, timeout_seconds)
-    }
-
     /// Connect to the database with the provided pool configuration and run migrations.
     pub async fn connect_with_pool_config(
         db_type: &str,
@@ -1472,12 +1546,13 @@ impl DatabaseStore {
         // Install all drivers
         sqlx::any::install_default_drivers();
 
-        let final_url =
-            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
-
-        let pool = Self::build_pool_options_from_config(&pool_config, db_type)
-            .connect(&final_url)
-            .await?;
+        let pool = connect_any_pool_with_timeout(
+            Self::build_pool_options_from_config(&pool_config, db_type),
+            db_url,
+            db_type,
+            pool_config.connect_timeout_seconds,
+        )
+        .await?;
 
         let store = Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -1527,15 +1602,13 @@ impl DatabaseStore {
     ) -> Result<Self, anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url =
-            Self::append_connect_timeout(db_url, db_type, pool_config.connect_timeout_seconds);
-
         // `connect_lazy` does not attempt a connection — the pool is ready to
         // hand out connections on first query. Migrations are deferred until
         // the database becomes reachable and the polling loop drives a
-        // successful `reconnect()`.
+        // successful `reconnect()`. Eager reconnect/failover paths apply
+        // `connect_timeout_seconds` via [`connect_any_pool_with_timeout`].
         let pool =
-            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(&final_url)?;
+            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(db_url)?;
 
         Ok(Self {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
@@ -5954,13 +6027,13 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url = Self::append_connect_timeout(
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
             db_url,
             &self.db_type,
             self.pool_config.connect_timeout_seconds,
-        );
-
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        )
+        .await?;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
@@ -6102,13 +6175,13 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let final_url = Self::append_connect_timeout(
+        let pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
             replica_url,
             &self.db_type,
             self.pool_config.connect_timeout_seconds,
-        );
-
-        let pool = self.build_pool_options().connect(&final_url).await?;
+        )
+        .await?;
         sqlx::query("SELECT 1").fetch_one(&pool).await?;
 
         self.read_replica_pool.store(Some(Arc::new(pool)));
@@ -6207,18 +6280,18 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let final_url = Self::append_connect_timeout(
-            replica_url,
-            &self.db_type,
-            self.pool_config.connect_timeout_seconds,
-        );
-
         info!(
             "Attempting read replica reconnect for admin reads (db_type={}, url={})",
             self.db_type,
             Self::redact_url(replica_url)
         );
-        let new_pool = self.build_pool_options().connect(&final_url).await?;
+        let new_pool = connect_any_pool_with_timeout(
+            self.build_pool_options(),
+            replica_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        )
+        .await?;
         sqlx::query("SELECT 1").fetch_one(&new_pool).await?;
 
         // Failover may have started while the connection was opening. Do not
@@ -8927,21 +9000,33 @@ fn row_to_proxy(
             .try_get::<i64, _>("backend_write_timeout_ms")
             .map(|v| v.max(0) as u64)
             .unwrap_or(30000),
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Propagate decode errors — silently defaulting to None would disable
+        // backend mTLS (client cert/key) or swap the trust anchor from a custom
+        // CA to the global bundle/webpki. `Option<String>` already represents
+        // SQL NULL, so `?` is safe for the expected nullable case.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
-        dns_override: row.try_get("dns_override").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        // DNS override redirects egress; silently dropping it can send traffic
+        // to an unintended resolved address.
+        dns_override: row.try_get::<Option<String>, _>("dns_override")?,
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
             .ok()
             .map(|v| v as u64),
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
-        upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+        // Propagate decode errors — silently defaulting to None would detach
+        // the proxy from its load-balanced upstream and fall back to
+        // `backend_host`, changing routing behavior.
+        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
         circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
             Ok(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
@@ -9024,7 +9109,9 @@ fn row_to_proxy(
         // mesh DestinationRule port overrides at dispatch time, never persisted
         // as a proxy column, so a DB-loaded proxy always starts at `None`.
         pool_http1_max_pending_requests: None,
-        upstream_subset: row.try_get::<String, _>("upstream_subset").ok(),
+        // Subset selection is routing-sensitive; silently mapping a decode
+        // failure to None would broaden traffic across all upstream targets.
+        upstream_subset: row.try_get::<Option<String>, _>("upstream_subset")?,
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -9317,10 +9404,15 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         // writes, so SQL rows always start `false`.
         locality_lb_strict: false,
         locality_lb_setting: None,
-        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        // Same trust/mTLS contract as `row_to_proxy`: reject non-NULL decode
+        // failures instead of silently disabling custom CA / client identity.
+        backend_tls_client_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
+        backend_tls_client_key_path: row
+            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        backend_tls_server_ca_cert_path: row
+            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh

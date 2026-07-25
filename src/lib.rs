@@ -92,12 +92,70 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    /// Exercise DP's crate-private concurrent listener supervisor without
+    /// expanding the production API solely for external regression tests.
+    pub async fn await_dp_listener_handles(
+        listener_handles: Vec<tokio::task::JoinHandle<()>>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Result<(), tokio::task::JoinError> {
+        crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> (Option<u64>, Option<u64>) {
         ctx.compression_ownership_for_test()
+    }
+
+    pub fn take_compression_response_codec_permit_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        ctx.take_compression_response_codec_permit()
+    }
+
+    /// Whether a compression instance reserved response codec admission for this
+    /// request in `before_proxy` (the early bound on the buffered population).
+    pub fn compression_response_admission_reserved_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_compression_response_admission_owner()
+    }
+
+    /// Whether `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission (so the response streams identity).
+    pub fn compression_response_admission_declined_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.compression_response_admission_declined()
+    }
+
+    /// Build the request-body-hook compatibility context. Used to prove the
+    /// reserved response codec permit stays on the donor (live) context rather
+    /// than being moved into this short-lived clone.
+    pub fn clone_for_final_request_body_hooks_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        ctx.clone_for_final_request_body_hooks()
+    }
+
+    pub fn gateway_response_compression_algorithm_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.gateway_response_compression_algorithm()
+    }
+
+    pub fn reconcile_aborted_gateway_response_encoding_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        body_len: usize,
+    ) {
+        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            ctx,
+            response_headers,
+            body_len,
+        );
     }
 
     pub fn validate_correlation_id_composition_for_test(
@@ -638,6 +696,44 @@ pub mod _test_support {
         plugin.sample_phase_for_test()
     }
 
+    pub fn request_mirror_append_shadow_host_suffix_for_test(authority: &str) -> String {
+        crate::plugins::request_mirror::append_shadow_host_suffix(authority)
+    }
+
+    pub fn request_mirror_resolve_timeout_ms_for_test(
+        configured_mirror_timeout_ms: Option<u64>,
+        backend_read_timeout_ms: Option<u64>,
+    ) -> u64 {
+        crate::plugins::request_mirror::resolve_mirror_timeout_ms(
+            configured_mirror_timeout_ms,
+            backend_read_timeout_ms,
+        )
+    }
+
+    pub fn request_mirror_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_max_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_mirror_timeout_ms_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> Option<u64> {
+        plugin.mirror_timeout_ms_for_test()
+    }
+
+    pub fn request_mirror_metrics_snapshot_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
+        plugin.mirror_metrics_snapshot_for_test()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
@@ -672,10 +768,53 @@ pub mod _test_support {
         plugin.snapshot_generation_registered_for_tests()
     }
 
+    pub fn api_chargeback_sink_force_compact_snapshot_finalization_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.force_compact_snapshot_finalization_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_compact_recovery_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_compact_recovery_registered_for_tests()
+    }
+
     pub fn api_chargeback_sink_emit_snapshot_tick_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
     ) -> Option<Result<usize, String>> {
         plugin.emit_snapshot_tick_for_tests()
+    }
+
+    pub fn api_chargeback_sink_spool_snapshot_overflow_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        event: crate::plugins::api_chargeback_sink::ChargeEvent,
+    ) -> bool {
+        plugin.spool_snapshot_overflow_for_tests(event)
+    }
+
+    pub fn api_chargeback_sink_abort_spool_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.abort_spool_delivery_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_overflow_counters_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(u64, u64, u64)> {
+        plugin.snapshot_overflow_counters_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_overflow_delivery_then_succeeds_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
@@ -697,6 +836,33 @@ pub mod _test_support {
         crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
     }
 
+    pub async fn finalize_plugin_rejection_without_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -845,6 +1011,15 @@ pub mod _test_support {
         content_type: &str,
     ) -> Result<String, String> {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
+    /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
+    /// request-time fallback computes)`. Cached nodes are filled once per
+    /// registered schema during ConversionPlan compile (#3024).
+    pub fn openapi_validator_schema_type_cache_stats_for_test(
+        plugin: &crate::plugins::openapi_validator::OpenapiValidator,
+    ) -> (usize, usize) {
+        plugin.schema_type_cache_stats_for_test()
     }
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
@@ -1763,6 +1938,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
+    pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
@@ -1810,8 +1986,21 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
-    pub fn db_append_connect_timeout(url: &str, db_type: &str, timeout: u64) -> String {
-        crate::config::db_loader::DatabaseStore::append_connect_timeout(url, db_type, timeout)
+    pub async fn await_pool_connect_with_timeout<F, T>(
+        timeout_seconds: u64,
+        connect: F,
+    ) -> Result<T, sqlx::Error>
+    where
+        F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    {
+        crate::config::db_loader::await_pool_connect_with_timeout(timeout_seconds, connect).await
+    }
+
+    pub fn effective_pool_connect_timeout_seconds(db_type: &str, configured_seconds: u64) -> u64 {
+        crate::config::db_loader::effective_pool_connect_timeout_seconds(
+            db_type,
+            configured_seconds,
+        )
     }
 
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
@@ -2011,6 +2200,14 @@ pub mod _test_support {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
 
+    pub fn mysql_config_change_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL
+    }
+
+    pub fn mysql_proxy_route_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL
+    }
+
     pub fn mtls_dns_policy_requires_consumer_load(
         config: &crate::config::types::GatewayConfig,
     ) -> bool {
@@ -2025,6 +2222,46 @@ pub mod _test_support {
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
+    }
+
+    /// MongoDB timeout precedence (issue #2988): URI-parsed
+    /// `serverSelectionTimeoutMS`/`connectTimeoutMS` survive when the env
+    /// override is `None`, and are replaced only when explicitly set.
+    pub fn apply_mongo_timeout_overrides(
+        client_options: &mut mongodb::options::ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        crate::config::mongo_store::apply_mongo_timeout_overrides(
+            client_options,
+            server_selection_timeout_secs,
+            connect_timeout_secs,
+        )
+    }
+
+    /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
+    /// the prefix before the E11000 write-error index was inserted by this
+    /// attempt; `None` means attribution is unknown (retain everything).
+    pub fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
+        first_error_index: Option<usize>,
+    ) -> &[T] {
+        crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
+    }
+
+    /// Consumer-identity adoption-failure release set (issue #2987): the
+    /// verifiable ordered-insert prefix plus vacant reservations this adoption
+    /// attempt inserted before failing — never pre-existing same-owner docs.
+    pub fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        crate::config::mongo_store::consumer_identity_adoption_failure_release_values(
+            ordered_values,
+            ordered_first_error_index,
+            adoption_newly_inserted,
+        )
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
@@ -3234,6 +3471,13 @@ pub mod _test_support {
             fatal_send_failed,
             drain_round_exhausted,
         )
+    }
+
+    /// External regression coverage for issue #2959 (DTLS demux identity-aware
+    /// session removal). See
+    /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
+    pub fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String> {
+        crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
