@@ -7,6 +7,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
+use std::time::Duration;
 
 const TEST_PROXY: &str = "test-proxy";
 
@@ -1075,4 +1076,57 @@ fn success_based_recovery_still_clears_passive_ejection() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     checker.report_response(TEST_PROXY, "up1", &target, 200, false, Some(&config));
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+}
+
+#[tokio::test]
+async fn passive_recovery_scanner_exits_on_generation_fence_after_take() {
+    // Modes drain JoinHandles via take_active_check_handles at startup, so a
+    // later restart cannot abort the taken scanner. The generation fence must
+    // still force that stale scanner to exit when recovery is disabled.
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_passive_only("up-fence", vec![make_target("fence-a", 8080)], 30);
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(checker.active_task_count(), 0);
+
+    checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
+    assert_eq!(
+        checker.active_task_count(),
+        0,
+        "disabled passive recovery must not spawn a replacement scanner"
+    );
+
+    let handle = taken.into_iter().next().expect("taken scanner handle");
+    tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("stale scanner must exit after generation fence without relying on abort")
+        .expect("scanner task should join cleanly");
+}
+
+#[tokio::test]
+async fn passive_recovery_scanner_replaces_taken_generation_on_reload() {
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_passive_only("up-fence2", vec![make_target("fence-b", 8080)], 30);
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream.clone()]), None);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+
+    // Reload still needs passive recovery: spawn a fresh scanner and fence the taken one.
+    checker.restart_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let stale = taken.into_iter().next().expect("taken scanner handle");
+    tokio::time::timeout(Duration::from_secs(3), stale)
+        .await
+        .expect("previous generation scanner must exit after reload fence")
+        .expect("scanner task should join cleanly");
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "current generation scanner must remain registered"
+    );
 }

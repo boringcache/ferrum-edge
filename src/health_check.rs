@@ -224,6 +224,15 @@ pub struct HealthChecker {
     /// at startup, config reload, and drop — never on the proxy hot path,
     /// so the lock is uncontested.
     active_check_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Monotonic generation for the gateway-scoped passive recovery scanner.
+    ///
+    /// Bumped on every [`Self::start_with_shutdown`] /
+    /// [`Self::restart_with_shutdown`]. Modes often
+    /// [`Self::take_active_check_handles`] at startup, so a later reload cannot
+    /// abort the previously taken scanner JoinHandle — the generation fence
+    /// makes that stale scanner exit on its next tick instead of continuing
+    /// alongside a replacement (or after passive recovery has been disabled).
+    passive_recovery_generation: Arc<AtomicU64>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
     /// `set_load_balancer_cache()` after construction.
@@ -273,6 +282,7 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: Some(dns_cache),
@@ -319,6 +329,7 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: None,
@@ -401,6 +412,13 @@ impl HealthChecker {
             handle.abort();
         }
 
+        // Fence any previously taken scanners that abort() cannot reach
+        // (modes drain JoinHandles at startup via take_active_check_handles).
+        let recovery_generation = self
+            .passive_recovery_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for upstream in &config.upstreams {
             if let Some(hc_config) = &upstream.health_checks {
@@ -430,7 +448,10 @@ impl HealthChecker {
         // host:port sets cannot honor per-port/subset-only policies, SD-only
         // targets, or independent cooldowns for proxies sharing an endpoint.
         if config_needs_passive_recovery(config) {
-            new_handles.push(self.start_passive_recovery_scanner(shutdown_rx.clone()));
+            new_handles.push(self.start_passive_recovery_scanner(
+                shutdown_rx.clone(),
+                recovery_generation,
+            ));
         }
 
         match self.active_check_handles.lock() {
@@ -748,9 +769,11 @@ impl HealthChecker {
     fn start_passive_recovery_scanner(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        generation: u64,
     ) -> tokio::task::JoinHandle<()> {
         let passive_health = self.passive_health.clone();
         let lb_cache = self.lb_cache.clone();
+        let recovery_generation = Arc::clone(&self.passive_recovery_generation);
         // Fixed 1s tick: per-entry deadlines already encode the effective
         // healthy_after_seconds, so the scanner does not need a per-upstream
         // interval and must not outlive reload/shutdown ownership.
@@ -763,6 +786,13 @@ impl HealthChecker {
             timer.tick().await;
 
             loop {
+                if recovery_generation.load(Ordering::Acquire) != generation {
+                    info!(
+                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                    );
+                    return;
+                }
+
                 if let Some(ref rx) = shutdown_rx {
                     tokio::select! {
                         _ = timer.tick() => {}
@@ -773,6 +803,13 @@ impl HealthChecker {
                     }
                 } else {
                     timer.tick().await;
+                }
+
+                if recovery_generation.load(Ordering::Acquire) != generation {
+                    info!(
+                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                    );
+                    return;
                 }
 
                 recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
