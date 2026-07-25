@@ -2855,6 +2855,12 @@ where
                                 ctx,
                                 &mut response_headers,
                             );
+                        } else {
+                            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                                ctx,
+                                &mut response_headers,
+                                response_body.len(),
+                            );
                         }
                         ctx.record_deadline_response_header_plugin(
                             plugin.as_ref(),
@@ -4937,6 +4943,12 @@ where
                             &mut plugin_response_headers,
                         );
                         representation_rewritten = true;
+                    } else {
+                        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                            ctx,
+                            &mut plugin_response_headers,
+                            response_body.len(),
+                        );
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),

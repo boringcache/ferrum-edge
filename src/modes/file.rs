@@ -7,6 +7,9 @@
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
 //! any externally-crafted JWT will be rejected since nobody knows the secret.
+//! If the secret or a related admin JWT setting is explicitly present but
+//! invalid (short secret, malformed max TTL), startup fails closed instead of
+//! silently replacing operator intent with a random secret.
 //!
 //! ## Public entry points
 //!
@@ -672,6 +675,13 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // Open the observability delivery lifecycle for this serving cycle before
+    // plugin activation registers any queue worker. A previous in-process
+    // cycle that already drained leaves its generation permanently closed, so
+    // without this a second `serve()` would register workers into a closed
+    // generation and lose every deferred record.
+    crate::observability_delivery::begin_serving_cycle();
+
     // A caller-owned admin HTTPS socket is served only when both admin TLS
     // paths are configured (including over `FERRUM_ADMIN_HTTPS_PORT=0`).
     // Without both paths the socket cannot be used — drop it *before*
@@ -992,16 +1002,26 @@ pub async fn serve(
     } else {
         match create_jwt_manager_from_env() {
             Ok(jm) => jm,
-            Err(e) => {
+            Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
                 warn!(
-                    "Admin JWT not configured ({}), admin endpoints will reject requests",
-                    e
+                    "Admin JWT not configured, generating a random read-only secret; \
+                     admin endpoints will reject externally minted tokens"
                 );
                 let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
                 crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
                     secret: random_secret,
                     ..Default::default()
                 })
+            }
+            Err(e) => {
+                let startup_err = anyhow::anyhow!("Invalid admin JWT configuration: {}", e);
+                shutdown_file_background_startup_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    background_handles,
+                )
+                .await;
+                return Err(startup_err);
             }
         }
     };
