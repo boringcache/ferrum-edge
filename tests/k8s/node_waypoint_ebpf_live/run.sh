@@ -637,7 +637,10 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.bindAddress=::1)"
-  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "::1"'; then
+  # Probe hosts render via toYaml of the exec command list (same as ferrum-gateway):
+  # bare ::1 / 127.0.0.1, not the legacy `| quote` form ("::1"). The health CLI
+  # brackets bare IPv6 itself; keep asserting the concrete host value.
+  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- ::1'; then
     echo "Node-agent readiness probe did not use the concrete IPv6 admin bind address" >&2
     grep -nA10 "readinessProbe:" <<<"$rendered" >&2 || true
     exit 1
@@ -649,7 +652,7 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
     --set-string nodeAgent.admin.bindAddress=0.0.0.0)"
-  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- "127.0.0.1"'; then
+  if ! grep -A8 "readinessProbe:" <<<"$rendered" | grep -q -- '- 127.0.0.1'; then
     echo "Node-agent readiness probe did not use loopback for wildcard admin bind address" >&2
     grep -nA10 "readinessProbe:" <<<"$rendered" >&2 || true
     exit 1
