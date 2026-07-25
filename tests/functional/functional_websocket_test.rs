@@ -3174,12 +3174,13 @@ async fn test_websocket_idle_timeout_tunnel_mode_closes_idle_session() {
 async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
     use tokio::sync::mpsc;
 
-    let backend_port = free_port().await;
+    let reservation = crate::scaffolding::reserve_port()
+        .await
+        .expect("reserve idle-timeout backend port");
+    let backend_port = reservation.port;
     let (close_tx, mut backend_closes) = mpsc::unbounded_channel::<(CloseCode, String)>();
     let echo_handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{backend_port}"))
-            .await
-            .expect("bind idle-timeout recording backend");
+        let listener = reservation.into_listener();
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
@@ -3213,7 +3214,6 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
             });
         }
     });
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
