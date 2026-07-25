@@ -297,7 +297,7 @@ pub fn classify_guard_collections(
     REQUIRED_GUARD_COLLECTIONS
         .iter()
         .map(|collection| GuardCollectionStatusEntry {
-            collection: *collection,
+            collection,
             present: live_collection_names.contains(*collection),
         })
         .collect()
