@@ -19,7 +19,7 @@ use regex::{Regex, RegexSet};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
@@ -719,21 +719,30 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// [`CMS_AGE_CHUNK`] cells. That keeps route-lookup latency bounded even while
 /// the thread-local `CACHE_KEY_BUF` borrow is held on the hit path.
 ///
-/// Memory: `2 * width` bytes + 64-byte alignment padding plus one `CachePadded`
-/// aging cursor atomic (no extra heap allocation for aging).
+/// If a threshold fires while a pass is already draining, `age_pending` records
+/// that another full pass is owed and re-arms as soon as the cursor returns to
+/// idle — without double-halving any cell mid-pass or exceeding the per-lookup
+/// chunk budget.
+///
+/// Memory: `2 * width` bytes + 64-byte alignment padding plus `CachePadded`
+/// atomics for the increment counter, aging cursor, and pending-pass flag (no
+/// extra heap allocation for aging).
 struct CountMinSketch {
     row0: AlignedCounterRow,
     row1: AlignedCounterRow,
     width_mask: usize,
     /// Total increments across all keys, for triggering periodic aging.
     total_increments: CachePadded<AtomicU64>,
-    /// Age (halve all counters) after this many increments.
+    /// Age (halve all counters) after this many increments. Always ≥ 1.
     age_threshold: u64,
     /// Cells left to halve in the current aging pass (`0` = idle).
     /// Also acts as the exclusive high-water index into the flat `[row0||row1]`
     /// layout: claiming `n` cells ages the half-open range
     /// `[remaining - n, remaining)`.
     age_remaining: CachePadded<AtomicUsize>,
+    /// Set when a threshold crosses while a pass is already in progress.
+    /// Consumed to re-arm exactly one follow-up pass after the cursor drains.
+    age_pending: CachePadded<AtomicBool>,
 }
 
 impl CountMinSketch {
@@ -742,7 +751,9 @@ impl CountMinSketch {
     const AGE_CHUNK: usize = CMS_AGE_CHUNK;
 
     /// Create a new sketch with the given width (rounded up to a power of two).
-    /// `age_threshold` controls how often counters are halved (typically `cache_capacity * 4`).
+    /// `age_threshold` controls how often counters are halved (typically
+    /// `cache_capacity * 4`). A zero threshold is raised to 1 so
+    /// `is_multiple_of` never panics on the hot path.
     fn new(width: usize, age_threshold: u64) -> Self {
         let width = width.next_power_of_two();
         let row0 = AlignedCounterRow((0..width).map(|_| AtomicU8::new(0)).collect());
@@ -752,8 +763,9 @@ impl CountMinSketch {
             row1,
             width_mask: width - 1,
             total_increments: CachePadded::new(AtomicU64::new(0)),
-            age_threshold,
+            age_threshold: age_threshold.max(1),
             age_remaining: CachePadded::new(AtomicUsize::new(0)),
+            age_pending: CachePadded::new(AtomicBool::new(false)),
         }
     }
 
@@ -784,29 +796,48 @@ impl CountMinSketch {
     /// Arm a full aging pass if one is not already in progress.
     ///
     /// Concurrent callers racing at the threshold: at most one wins the CAS and
-    /// starts the pass. A threshold that fires while a pass is already running is
-    /// absorbed (skipped); production thresholds (`capacity * 4`) are far larger
-    /// than the number of increments needed to drain a pass (`2 * width / chunk`).
+    /// starts the pass. A threshold that fires while a pass is already running
+    /// sets [`Self::age_pending`] so a follow-up pass is re-armed after the
+    /// cursor drains (multiple mid-pass hits collapse to one owed pass).
     #[inline]
     fn arm_aging(&self) {
-        let _ = self.age_remaining.compare_exchange(
-            0,
-            self.total_cells(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self
+            .age_remaining
+            .compare_exchange(
+                0,
+                self.total_cells(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            self.age_pending.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Halve at most [`CMS_AGE_CHUNK`] cells of an in-progress aging pass.
     ///
     /// Lock-free: contested claims retry the CAS. Per-call work is capped at
-    /// `CMS_AGE_CHUNK` atomic RMWs regardless of sketch width.
+    /// `CMS_AGE_CHUNK` atomic RMWs regardless of sketch width. When the cursor
+    /// is idle and a pass is pending, re-arms and ages the first chunk of the
+    /// follow-up pass in the same call (still within the chunk budget).
     #[inline]
     fn age_step(&self) {
         loop {
             let remaining = self.age_remaining.load(Ordering::Relaxed);
             if remaining == 0 {
-                return;
+                if !self.age_pending.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                // Re-arm an owed follow-up pass. If another thread already
+                // armed, the CAS fails and we loop to claim from its cursor.
+                let _ = self.age_remaining.compare_exchange(
+                    0,
+                    self.total_cells(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+                continue;
             }
             let n = remaining.min(CMS_AGE_CHUNK);
             match self.age_remaining.compare_exchange(
@@ -868,8 +899,9 @@ impl CountMinSketch {
 
         // Arm a new aging cycle on the threshold, then advance at most one chunk.
         // Ordering matters: arm before step so the threshold-crossing call does
-        // bounded work immediately, and mid-cycle threshold hits cannot re-arm
-        // until `age_remaining` returns to 0.
+        // bounded work immediately. Mid-cycle threshold hits set `age_pending`
+        // instead of resetting the cursor (no double-halving; follow-up pass
+        // re-arms only after the cursor drains).
         let total = self.total_increments.fetch_add(1, Ordering::Relaxed) + 1;
         if total.is_multiple_of(self.age_threshold) {
             self.arm_aging();
@@ -896,8 +928,9 @@ impl CountMinSketch {
     /// production `increment` (which only arms + steps); kept for tests and any
     /// explicit full-refresh callers.
     fn age(&self) {
-        // Finish a partially drained pass so cells are not double-halved when we
-        // force a new full cycle below.
+        // Ignore owed follow-up passes: this helper forces exactly one full
+        // refresh after draining the current cursor.
+        self.age_pending.store(false, Ordering::Relaxed);
         while self.age_remaining.load(Ordering::Relaxed) > 0 {
             self.age_step();
         }
@@ -906,6 +939,7 @@ impl CountMinSketch {
         while self.age_remaining.load(Ordering::Relaxed) > 0 {
             self.age_step();
         }
+        self.age_pending.store(false, Ordering::Relaxed);
     }
 
     /// Reset all counters to zero (used on full cache rebuild).
@@ -918,6 +952,7 @@ impl CountMinSketch {
         }
         self.total_increments.store(0, Ordering::Relaxed);
         self.age_remaining.store(0, Ordering::Relaxed);
+        self.age_pending.store(false, Ordering::Relaxed);
     }
 }
 
@@ -3165,6 +3200,113 @@ mod tests {
     }
 
     #[test]
+    fn cms_overlapping_threshold_rearms_without_double_halving() {
+        // Production minimum width: one chunk cannot finish a pass.
+        let width = 1024;
+        let total_cells = width * 2;
+        let steps_per_pass = total_cells.div_ceil(CountMinSketch::AGE_CHUNK);
+        assert!(steps_per_pass > 2);
+
+        // High threshold so seeding and explicit arm/pending control the cycle.
+        let cms = CountMinSketch::new(width, u64::MAX);
+        for _ in 0..20 {
+            cms.increment("hot");
+        }
+        assert_eq!(cms.estimate("hot"), 20);
+
+        let hot0 = CountMinSketch::fnv1a("hot", 0) as usize & cms.width_mask;
+        let hot1 = CountMinSketch::fnv1a("hot", 0x9e3779b97f4a7c15) as usize & cms.width_mask;
+        let driver = (0..10_000)
+            .map(|i| format!("overlap-driver-{i}"))
+            .find(|k| {
+                let d0 = CountMinSketch::fnv1a(k, 0) as usize & cms.width_mask;
+                let d1 = CountMinSketch::fnv1a(k, 0x9e3779b97f4a7c15) as usize & cms.width_mask;
+                d0 != hot0 && d0 != hot1 && d1 != hot0 && d1 != hot1
+            })
+            .expect("non-colliding driver key");
+
+        cms.arm_aging();
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), total_cells);
+
+        // Progress one chunk, then simulate a mid-pass threshold hit.
+        cms.increment(&driver);
+        assert!(cms.age_remaining.load(Ordering::Relaxed) > 0);
+        cms.arm_aging();
+        assert!(
+            cms.age_pending.load(Ordering::Relaxed),
+            "mid-pass arm must record an owed follow-up pass"
+        );
+
+        // Drain the first pass via increment; every step stays ≤ AGE_CHUNK.
+        let mut guard = 0usize;
+        while cms.age_remaining.load(Ordering::Relaxed) > 0 {
+            let before = cms.age_remaining.load(Ordering::Relaxed);
+            cms.increment(&driver);
+            let after = cms.age_remaining.load(Ordering::Relaxed);
+            let aged = before.saturating_sub(after);
+            assert!(
+                aged > 0 && aged <= CountMinSketch::AGE_CHUNK,
+                "expected 1..=AGE_CHUNK cells aged, got {aged}"
+            );
+            guard += 1;
+            assert!(guard <= steps_per_pass);
+        }
+        assert!(
+            cms.age_pending.load(Ordering::Relaxed),
+            "finishing the first pass must leave the owed follow-up pending"
+        );
+        assert_eq!(cms.estimate("hot"), 10, "exactly one full pass so far");
+
+        // Next increment re-arms from pending and ages the first follow-up chunk.
+        let before = cms.age_remaining.load(Ordering::Relaxed);
+        assert_eq!(before, 0);
+        cms.increment(&driver);
+        let after = cms.age_remaining.load(Ordering::Relaxed);
+        assert!(
+            !cms.age_pending.load(Ordering::Relaxed),
+            "pending bit consumed when the follow-up pass arms"
+        );
+        assert_eq!(
+            after,
+            total_cells - CountMinSketch::AGE_CHUNK,
+            "re-arm must start a fresh full pass and age one chunk"
+        );
+        assert_eq!(
+            before + (total_cells - after),
+            CountMinSketch::AGE_CHUNK,
+            "re-arm + first chunk must stay within AGE_CHUNK"
+        );
+
+        // Finish the follow-up pass.
+        while cms.age_remaining.load(Ordering::Relaxed) > 0
+            || cms.age_pending.load(Ordering::Relaxed)
+        {
+            cms.age_step();
+            guard += 1;
+            assert!(guard <= steps_per_pass * 3);
+        }
+
+        // Two complete passes: 20 → 10 → 5. No mid-pass double-halving.
+        assert_eq!(cms.estimate("hot"), 5);
+        assert!(!cms.age_pending.load(Ordering::Relaxed));
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cms_zero_age_threshold_is_raised_to_one() {
+        let cms = CountMinSketch::new(1024, 0);
+        assert_eq!(cms.age_threshold, 1);
+        // Must not panic on is_multiple_of(0); first increment arms + steps.
+        let _ = cms.increment("k");
+        assert_eq!(cms.total_increments.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            cms.age_remaining.load(Ordering::Relaxed),
+            cms.total_cells() - CountMinSketch::AGE_CHUNK,
+            "threshold=1 must arm on the first increment with bounded work"
+        );
+    }
+
+    #[test]
     fn cms_reset_clears_all() {
         let cms = CountMinSketch::new(64, 1000);
         for _ in 0..50 {
@@ -3177,6 +3319,7 @@ mod tests {
         assert_eq!(cms.estimate("key-a"), 0);
         assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
         assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+        assert!(!cms.age_pending.load(Ordering::Relaxed));
     }
 
     #[test]
