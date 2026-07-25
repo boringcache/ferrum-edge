@@ -4421,11 +4421,15 @@ async fn wait_for_flag(flag: &std::sync::atomic::AtomicBool, budget: Duration) -
 }
 
 /// Build a DELTA envelope carrying `body` as its config JSON.
-fn delta_update(body: String) -> ferrum_edge::grpc::proto::ConfigUpdate {
+///
+/// `version` must be the RFC3339 encoding of the body's `poll_timestamp`
+/// (same instant the production CP puts on the wire). A second `Utc::now()`
+/// here fails `reconcile_snapshot_version` and the DP refuses the delta.
+fn delta_update(body: String, version: &str) -> ferrum_edge::grpc::proto::ConfigUpdate {
     ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1,
         config_json: body,
-        version: Utc::now().to_rfc3339(),
+        version: version.to_string(),
         timestamp: Utc::now().timestamp(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         trust_bundles_json: String::new(),
@@ -4669,8 +4673,9 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     // The fenced stream must be terminated, not merely skipped: a delta pushed
     // by the stale CP must never reach the DP's applied config.
     let stale_delta = add_proxy_delta(create_test_proxy("stale-injected", "/stale"));
+    let version = stale_delta.poll_timestamp.to_rfc3339();
     let body = serde_json::to_string(&stale_delta).unwrap();
-    let _ = older_tx.send(delta_update(body));
+    let _ = older_tx.send(delta_update(body, &version));
     tokio::time::sleep(Duration::from_secs(2)).await;
     let injected = proxy_state
         .config
@@ -4737,8 +4742,9 @@ async fn dp_becomes_ready_and_applies_delta_despite_unbindable_stream_port() {
 
     // The same stream must still carry deltas.
     let delta = add_proxy_delta(create_test_proxy("after-bind-failure", "/after"));
+    let version = delta.poll_timestamp.to_rfc3339();
     let body = serde_json::to_string(&delta).unwrap();
-    let _ = update_tx.send(delta_update(body));
+    let _ = update_tx.send(delta_update(body, &version));
 
     assert!(
         wait_for_proxy_id(&proxy_state, "after-bind-failure", Duration::from_secs(10)).await,
@@ -4868,7 +4874,10 @@ async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
     );
 
     // Exactly the body an older same-major.minor CP emits: bare-ID removal
-    // arrays and no additive `removed_*_keys`.
+    // arrays and no additive `removed_*_keys`. Envelope version must still
+    // match the body's poll_timestamp instant (production CP contract).
+    let poll_timestamp = Utc::now();
+    let version = poll_timestamp.to_rfc3339();
     let legacy_body = serde_json::json!({
         "added_or_modified_proxies": [],
         "removed_proxy_ids": ["proxy-1"],
@@ -4878,10 +4887,10 @@ async fn dp_applies_legacy_bare_id_removal_delta_in_its_own_namespace() {
         "removed_plugin_config_ids": [],
         "added_or_modified_upstreams": [],
         "removed_upstream_ids": ["upstream-legacy"],
-        "poll_timestamp": Utc::now().to_rfc3339(),
+        "poll_timestamp": version,
     });
     let body = serde_json::to_string(&legacy_body).unwrap();
-    let _ = update_tx.send(delta_update(body));
+    let _ = update_tx.send(delta_update(body, &version));
 
     assert!(
         wait_for_proxy_count_without_upstreams(&proxy_state, 1, Duration::from_secs(10)).await,
