@@ -9180,11 +9180,31 @@ fn row_to_proxy(
 }
 
 /// Parse a consumer row into a Consumer struct.
+fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyhow::Error> {
+    match row.try_get::<String, _>(column) {
+        Ok(value) => Ok(value),
+        Err(text_error) => {
+            // sqlx Any maps MySQL TEXT-family wire types (including
+            // MEDIUMTEXT) to its generic BLOB type. Decode those bytes
+            // explicitly, but still reject invalid UTF-8 rather than hiding a
+            // corrupt JSON/config value behind a default.
+            let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
+                anyhow::anyhow!(
+                    "column '{column}' could not be decoded as SQL text ({text_error}) \
+                     or bytes ({blob_error})"
+                )
+            })?;
+            String::from_utf8(bytes)
+                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
+        }
+    }
+}
+
 fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
-    let creds_str: String = row.try_get("credentials").map_err(|e| {
+    let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to read credentials column: {}",
             id_preview,
@@ -9199,7 +9219,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         )
     })?;
 
-    let acl_groups_str: String = row.try_get("acl_groups").unwrap_or_else(|_| "[]".into());
+    let acl_groups_str = required_utf8_text_column(row, "acl_groups").map_err(|e| {
+        anyhow::anyhow!(
+            "Consumer {}: failed to read acl_groups column: {}",
+            id_preview,
+            e
+        )
+    })?;
     let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
         anyhow::anyhow!(
             "Failed to parse acl_groups JSON for consumer: {} (raw: {})",
