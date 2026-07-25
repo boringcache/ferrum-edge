@@ -420,7 +420,15 @@ impl DeliveryLifecycle {
     }
 
     fn release_task_permit(&self) {
-        self.admitted_tasks.fetch_sub(1, Ordering::AcqRel);
+        let released =
+            self.admitted_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                    admitted.checked_sub(1)
+                });
+        debug_assert!(
+            released.is_ok(),
+            "delivery task permit release requires an owned permit"
+        );
     }
 
     fn record_capacity_rejection(&self, kind: DeliveryTaskKind) {
