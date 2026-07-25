@@ -5053,9 +5053,7 @@ mod tests {
         assert!(!body_has_multimodal_parts(&text_array));
         assert!(body_has_multimodal_parts(&multimodal));
         assert!(body_has_multimodal_parts(&multimodal_system));
-        assert!(body_has_multimodal_parts(
-            &gemini_malformed_non_text_parts
-        ));
+        assert!(body_has_multimodal_parts(&gemini_malformed_non_text_parts));
     }
 
     #[tokio::test]
