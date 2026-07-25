@@ -666,10 +666,7 @@ impl Http2ConnectionPool {
         )
     }
 
-    pub async fn get_sender(
-        &self,
-        proxy: &Proxy,
-    ) -> Result<Http2Sender, Http2PoolError> {
+    pub async fn get_sender(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 

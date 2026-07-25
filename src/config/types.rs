@@ -3095,9 +3095,16 @@ fn plugin_config_forces_request_body_buffering(pc: &PluginConfig) -> bool {
         return false;
     }
     match pc.plugin_name.as_str() {
-        "grpc_web" | "ai_prompt_compressor" | "ai_stream_router" | "ai_federation"
-        | "ai_transcript_audit" | "ai_tool_governor" | "ai_rate_limiter" | "openapi_validator"
-        | "opa" | "mcp_gateway" => true,
+        "grpc_web"
+        | "ai_prompt_compressor"
+        | "ai_stream_router"
+        | "ai_federation"
+        | "ai_transcript_audit"
+        | "ai_tool_governor"
+        | "ai_rate_limiter"
+        | "openapi_validator"
+        | "opa"
+        | "mcp_gateway" => true,
         "request_transformer" => {
             pc.config
                 .get("body")

@@ -3247,8 +3247,9 @@ impl AdminResource for Upstream {
                     {
                         admission_proxy.resolved_tls = subset_tls;
                     }
-                    admission_proxy.dispatch_kind =
-                        crate::config::types::DispatchKind::from(admission_proxy.effective_scheme());
+                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
+                        admission_proxy.effective_scheme(),
+                    );
                     let empty_plugins: &[PluginConfig] = &[];
                     let plugin_configs = cached_config
                         .as_ref()
@@ -4366,8 +4367,9 @@ impl AdminResource for Proxy {
                     {
                         admission_proxy.resolved_tls = subset_tls;
                     }
-                    admission_proxy.dispatch_kind =
-                        crate::config::types::DispatchKind::from(admission_proxy.effective_scheme());
+                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
+                        admission_proxy.effective_scheme(),
+                    );
                     let empty_plugins: &[PluginConfig] = &[];
                     let plugin_configs = cached_config
                         .as_ref()

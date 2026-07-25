@@ -31683,7 +31683,10 @@ async fn proxy_to_backend_http2(
     // this as frames are polled so summary builders observe streamed uploads
     // (not just Content-Length) once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> (retry::BackendResponse, Option<Arc<std::sync::atomic::AtomicBool>>) {
+) -> (
+    retry::BackendResponse,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request via HTTP/2 pool");
 
     // Parse the backend URL
