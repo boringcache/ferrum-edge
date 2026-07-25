@@ -816,8 +816,7 @@ impl CountMinSketch {
     fn acquire_age_owner_blocking(&self) {
         while !self.try_acquire_age_owner() {
             #[cfg(test)]
-            self.age_owner_acquire_spins
-                .fetch_add(1, Ordering::Relaxed);
+            self.age_owner_acquire_spins.fetch_add(1, Ordering::Relaxed);
             std::hint::spin_loop();
             std::thread::yield_now();
         }
