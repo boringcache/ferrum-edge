@@ -747,6 +747,8 @@ paths:
       responses:
         "200":
           description: Managed certificate deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -871,6 +873,8 @@ paths:
       responses:
         "200":
           description: Managed CA bundle deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -993,6 +997,8 @@ paths:
       responses:
         "200":
           description: Managed CRL deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1115,6 +1121,8 @@ paths:
       responses:
         "200":
           description: Managed OCSP response deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1237,6 +1245,8 @@ paths:
       responses:
         "200":
           description: Managed JWKS document deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
