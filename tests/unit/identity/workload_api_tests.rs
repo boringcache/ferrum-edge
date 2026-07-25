@@ -27,6 +27,17 @@ fn workload_request<T>(payload: T) -> Request<T> {
     req
 }
 
+fn workload_request_with_bearer<T>(payload: T, bearer: &str) -> Request<T> {
+    let mut req = workload_request(payload);
+    let value = format!("Bearer {bearer}");
+    req.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::AsciiMetadataValue::try_from(value.as_str())
+            .expect("bearer authorization metadata must be ASCII"),
+    );
+    req
+}
+
 // ── CA stub ──────────────────────────────────────────────────────────────
 
 struct StubCa {
@@ -234,6 +245,43 @@ impl Attestor for ScriptedAttestor {
             selectors: HashMap::new(),
             attestor_kind: "scripted".to_string(),
         })
+    }
+}
+
+/// Attestor that records the peer identity presented on every call and only
+/// succeeds when the bearer matches the expected retained transport identity.
+struct PeerRecordingAttestor {
+    id: SpiffeId,
+    expected_bearer: String,
+    seen_bearers: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Attestor for PeerRecordingAttestor {
+    fn kind(&self) -> &'static str {
+        "peer_recording"
+    }
+
+    async fn attest(
+        &self,
+        peer: &PeerInfo,
+    ) -> Result<WorkloadIdentity, ferrum_edge::identity::attestation::AttestError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.seen_bearers
+            .lock()
+            .expect("peer recording mutex poisoned")
+            .push(peer.bearer_token.clone());
+        match peer.bearer_token.as_deref() {
+            Some(token) if token == self.expected_bearer => Ok(WorkloadIdentity {
+                spiffe_id: self.id.clone(),
+                selectors: HashMap::new(),
+                attestor_kind: "peer_recording".to_string(),
+            }),
+            _ => Err(ferrum_edge::identity::attestation::AttestError::Failed(
+                "peer identity mismatch".to_string(),
+            )),
+        }
     }
 }
 
@@ -634,6 +682,84 @@ async fn fetch_x509svid_rotation_denies_after_entitlement_revocation() {
         .await
         .expect("timed out waiting for stream close");
     assert!(closed.is_none(), "stream must close after PermissionDenied");
+}
+
+#[tokio::test]
+async fn fetch_x509svid_rotation_reattests_retained_peer_identity() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::server::WorkloadApiService;
+    use tokio::sync::watch;
+    use tokio_stream::StreamExt;
+
+    // Rotation must revalidate using the retained authenticated peer/transport
+    // identity from stream open — not a cached SPIFFE ID alone.
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn ferrum_edge::identity::ca::CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/peer/sa/check").unwrap();
+    let expected_bearer = "retained-peer-psat".to_string();
+    let seen_bearers = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attestor: Arc<dyn ferrum_edge::identity::attestation::Attestor> =
+        Arc::new(PeerRecordingAttestor {
+            id,
+            expected_bearer: expected_bearer.clone(),
+            seen_bearers: Arc::clone(&seen_bearers),
+            calls: Arc::clone(&calls),
+        });
+
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca,
+        trust_domain,
+        600,
+        Arc::clone(&rotation),
+    );
+
+    let resp = svc
+        .fetch_x509svid(workload_request_with_bearer(
+            X509svidRequest {},
+            &expected_bearer,
+        ))
+        .await
+        .unwrap();
+    let mut stream = resp.into_inner();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("stream ended unexpectedly")
+        .expect("first message was an error");
+    assert_eq!(first.svids.len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    rotation.send_modify(|v| *v += 1);
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for peer-revalidated rotation push")
+        .expect("stream ended unexpectedly")
+        .expect("rotation push was an error");
+    assert_eq!(second.svids.len(), 1);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let seen = seen_bearers
+        .lock()
+        .expect("peer recording mutex poisoned")
+        .clone();
+    assert_eq!(
+        seen,
+        vec![
+            Some(expected_bearer.clone()),
+            Some(expected_bearer.clone())
+        ],
+        "each rotation epoch must re-attest the retained peer bearer identity"
+    );
 }
 
 #[tokio::test]
