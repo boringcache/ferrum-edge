@@ -103,8 +103,7 @@ fn reason_for(
     expected: &MeshUpdateExpectation,
 ) -> MeshUpdateRejectReason {
     let rejection = validate_mesh_config_update(update, expected, NATIVE)
-        .err()
-        .expect("response must be rejected");
+        .expect_err("response must be rejected");
     rejection.reason()
 }
 
@@ -292,7 +291,7 @@ fn rejections_increment_a_reason_labelled_metric() {
 
     let after = rendered_counter(&series);
     assert!(
-        after >= before + 1,
+        after > before,
         "the rejection must increment {series} (before={before}, after={after})"
     );
 }
