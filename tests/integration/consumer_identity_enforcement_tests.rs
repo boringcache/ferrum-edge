@@ -215,7 +215,7 @@ async fn deleted_consumer_frees_its_identity_values() {
 
 /// SQLite (BINARY) must keep NFC and NFD forms of the same grapheme as
 /// distinct consumer identities — the same byte-exact contract PostgreSQL
-/// `texteq` and MySQL `utf8mb4_bin` provide (#2994).
+/// `texteq` and MySQL `utf8mb4_0900_bin` provide (#2994).
 #[tokio::test]
 async fn nfc_and_nfd_usernames_are_distinct_byte_exact_identities() {
     let (store, _tmp) = sqlite_store().await;
@@ -268,6 +268,27 @@ async fn nfc_and_nfd_usernames_are_distinct_byte_exact_identities() {
         .expect("NFD consumer present");
     assert_eq!(loaded_nfc.username.as_bytes(), nfc_username.as_bytes());
     assert_eq!(loaded_nfd.username.as_bytes(), nfd_username.as_bytes());
+}
+
+#[tokio::test]
+async fn trailing_space_usernames_are_distinct_byte_exact_identities() {
+    let (store, _tmp) = sqlite_store().await;
+
+    store
+        .create_consumer(&consumer_in("ferrum", "plain-consumer", "alice", None))
+        .await
+        .expect("plain username must insert");
+    store
+        .create_consumer(&consumer_in("ferrum", "space-consumer", "alice ", None))
+        .await
+        .expect("trailing-space username must insert as a distinct identity");
+
+    let loaded = store
+        .get_consumer("ferrum", "space-consumer")
+        .await
+        .expect("load trailing-space consumer")
+        .expect("trailing-space consumer present");
+    assert_eq!(loaded.username.as_bytes(), b"alice ");
 }
 
 #[tokio::test]

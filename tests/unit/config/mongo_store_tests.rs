@@ -641,7 +641,7 @@ fn mongodb_doc_pins_exactly_one_tls_source_contract() {
 
 /// MongoDB identity uniqueness is BSON string equality on
 /// `"{namespace}:{identity_value}"` — already byte-exact. Issue #2994's MySQL
-/// `utf8mb4_bin` change must not invent Unicode normalization on this path.
+/// collation change must not invent Unicode normalization on this path.
 #[test]
 fn mongo_consumer_identity_keys_remain_raw_byte_strings() {
     let helper = MONGO_STORE_SOURCE
