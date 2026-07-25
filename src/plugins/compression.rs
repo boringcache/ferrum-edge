@@ -20,14 +20,15 @@
 //! produced, shared H1/H2/H3 buffered transforms restore an identity response
 //! with matching headers rather than emitting a mislabeled body.
 //!
-//! Response compression reserves its codec admission in `before_proxy`, ahead of
-//! the response-buffer decision, so the same semaphore also bounds the
-//! population of response bodies collected for compression rather than only the
-//! codec workers. A request that negotiates a supported coding but cannot obtain
-//! a bounded permit streams identity instead of pinning a (possibly unbounded)
-//! body onto the compression-only buffered path; `after_proxy` consumes the
-//! reserved permit and never reacquires once a streaming/identity path is
-//! chosen, failing closed with 406 only when identity is prohibited.
+//! Response compression reserves separate buffer admission in `before_proxy`,
+//! ahead of the response-buffer decision, while codec admission is acquired only
+//! immediately before CPU work. This bounds collected bodies without allowing
+//! slow backend requests to starve request decompression. A request that
+//! negotiates a supported coding but cannot obtain a bounded permit streams
+//! identity instead of pinning a (possibly unbounded) body onto the
+//! compression-only buffered path; `after_proxy` consumes the reserved permit
+//! and never reacquires once a streaming/identity path is chosen, failing closed
+//! with 406 only when identity is prohibited.
 //! Response compression is also disabled when the gateway response-body limit is
 //! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
 //! admitted to compression buffering has a hard per-response byte bound.
@@ -104,6 +105,11 @@ pub const MAX_CONCURRENT_CODEC_JOBS: usize = 32;
 static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 static CODEC_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
+// Response buffering is admitted separately from codec CPU work. A client may
+// hold this permit while the backend is slow, so sharing it with CODEC_BUDGET
+// would let network latency starve unrelated request decompression.
+static RESPONSE_BUFFER_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
 static CODEC_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static CODEC_SATURATED: AtomicU64 = AtomicU64::new(0);
 static CODEC_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +120,18 @@ tokio::task_local! {
     /// instead of the process-global pool so saturation tests cannot starve
     /// unrelated parallel codec work.
     static TEST_CODEC_BUDGET: Arc<Semaphore>;
+    static TEST_RESPONSE_BUFFER_BUDGET: Arc<Semaphore>;
+}
+
+/// Run `f` with an isolated response-buffer admission budget.
+#[allow(dead_code)]
+pub async fn with_test_response_buffer_budget<F, Fut, T>(permits: usize, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let budget = Arc::new(Semaphore::new(permits));
+    TEST_RESPONSE_BUFFER_BUDGET.scope(budget, f()).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +260,14 @@ fn try_acquire_codec_permit() -> Result<OwnedSemaphorePermit, ()> {
             Err(())
         }
     }
+}
+
+fn try_acquire_response_buffer_permit() -> Result<OwnedSemaphorePermit, ()> {
+    TEST_RESPONSE_BUFFER_BUDGET
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::clone(&RESPONSE_BUFFER_BUDGET))
+        .try_acquire_owned()
+        .map_err(|_| ())
 }
 
 /// Restore identity response headers when a committed gateway content coding
@@ -799,11 +825,11 @@ impl CompressionPlugin {
         (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&ctx.max_response_body_size_bytes)
     }
 
-    /// Reserve one response-compression codec permit for this request when this
+    /// Reserve one response-buffer permit for this request when this
     /// instance can select a supported nonzero coding for the client's
     /// `Accept-Encoding`. Runs in `before_proxy`, ahead of the response-buffer
-    /// decision, so the buffered population is bounded by the same codec
-    /// semaphore that bounds codec workers.
+    /// decision, so the buffered population is bounded independently of codec
+    /// CPU admission.
     ///
     /// `HEAD` carries no re-encodable wire body, so it never reserves. First
     /// success across sibling instances wins, keeping this to one response
@@ -827,7 +853,7 @@ impl CompressionPlugin {
             ctx.mark_compression_response_admission_declined();
             return;
         }
-        match try_acquire_codec_permit() {
+        match try_acquire_response_buffer_permit() {
             Ok(permit) => {
                 let claimed = ctx.claim_compression_response_admission(self.instance_id);
                 debug_assert!(
@@ -839,7 +865,7 @@ impl CompressionPlugin {
             Err(()) => {
                 ctx.mark_compression_response_admission_declined();
                 warn!(
-                    "compression: codec admission saturated at reservation; \
+                    "compression: response buffer admission saturated at reservation; \
                      response will stream identity instead of buffering for compression"
                 );
             }
@@ -1470,9 +1496,9 @@ impl Plugin for CompressionPlugin {
             return false;
         }
         // `before_proxy` negotiated a compressible coding but could not obtain a
-        // bounded codec permit: stream identity instead of buffering for a
-        // compression that cannot run (and never enter the buffered path on the
-        // strength of admission it does not hold).
+        // bounded response-buffer permit: stream identity instead of buffering
+        // for a compression that cannot run (and never enter the buffered path
+        // on the strength of admission it does not hold).
         if ctx.compression_response_admission_declined() {
             return false;
         }
@@ -1643,7 +1669,7 @@ impl Plugin for CompressionPlugin {
                 headers.remove("accept-encoding");
             }
 
-            // Reserve response-compression codec admission now, before the
+            // Reserve response-compression buffer admission now, before the
             // response-buffer decision, so a request that cannot obtain a
             // bounded permit never pins a (potentially unbounded) response body
             // onto the compression-only buffered path. Negotiate against the
@@ -1734,7 +1760,11 @@ impl Plugin for CompressionPlugin {
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
-                    // Obtain the codec permit for this coding. The reservation in
+                    // Consume the response-buffer reservation for this coding.
+                    // Codec CPU admission is intentionally acquired only by the
+                    // body transform, immediately before spawn_blocking, so slow
+                    // backend requests cannot starve request decompression.
+                    // The reservation in
                     // `before_proxy` is what bounded entry onto the buffered path,
                     // so a request that chose to stream must never reacquire:
                     //   * this instance reserved it -> consume the held permit
@@ -1753,17 +1783,18 @@ impl Plugin for CompressionPlugin {
                     //     already-admitted body. The buffered population stays
                     //     bounded because entry onto the buffered path still
                     //     required a reservation at `before_proxy` time.
-                    let permit = if ctx.owns_compression_response_admission(self.instance_id) {
+                    let buffer_permit = if ctx.owns_compression_response_admission(self.instance_id)
+                    {
                         ctx.take_compression_response_codec_permit()
                     } else if ctx.compression_response_admission_declined()
                         || ctx.has_compression_response_admission_owner()
                     {
                         None
                     } else {
-                        try_acquire_codec_permit().ok()
+                        try_acquire_response_buffer_permit().ok()
                     };
 
-                    let Some(permit) = permit else {
+                    let Some(buffer_permit) = buffer_permit else {
                         // No bounded admission for the negotiated coding (declined
                         // at reservation, or owned by a sibling). Do not commit
                         // Content-Encoding: serve identity, or 406 when identity
@@ -1801,7 +1832,7 @@ impl Plugin for CompressionPlugin {
                         claimed,
                         "response encode owner changed within a sequential hook chain"
                     );
-                    ctx.set_compression_response_codec_permit(permit);
+                    ctx.set_compression_response_codec_permit(buffer_permit);
 
                     // Retain the existing observable decision metadata.
                     ctx.metadata.insert(
@@ -1939,10 +1970,16 @@ impl Plugin for CompressionPlugin {
             return None;
         };
 
-        let Some(permit) = ctx.take_compression_response_codec_permit() else {
+        let Some(buffer_permit) = ctx.take_compression_response_codec_permit() else {
             error!(
-                "compression: missing codec admission permit for committed Content-Encoding '{encoding}'"
+                "compression: missing response-buffer admission permit for committed Content-Encoding '{encoding}'"
             );
+            ctx.mark_compression_response_encode_aborted();
+            return None;
+        };
+        drop(buffer_permit);
+        let Ok(permit) = try_acquire_codec_permit() else {
+            warn!("compression: codec admission saturated while encoding response body");
             ctx.mark_compression_response_encode_aborted();
             return None;
         };

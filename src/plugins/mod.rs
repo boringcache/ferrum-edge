@@ -1600,7 +1600,7 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
-/// Exclusive compression codec admission permit held on a request context.
+/// Exclusive compression response-buffer permit held on a request context.
 ///
 /// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
 /// permit is unique and must be transferred with `take()` / `mem::take` when a
@@ -1955,7 +1955,7 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
-    /// Process-local compression instance that reserved response codec admission
+    /// Process-local compression instance that reserved response-buffer admission
     /// in `before_proxy`, before the response-buffer decision. First-wins across
     /// sibling instances so at most one response permit is held per request. The
     /// reservation is what bounds the population of response bodies admitted onto
@@ -1963,15 +1963,14 @@ pub struct RequestContext {
     /// reserved permit rather than acquiring a fresh one on the hot path.
     compression_response_admission_owner: Option<u64>,
     /// Set when `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission. The response then streams identity (or
+    /// obtain bounded response-buffer admission. The response then streams identity (or
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
-    /// Reserved codec CPU admission permit for gateway response compression.
-    /// Reserved in `before_proxy` before the response-buffer decision and moved
-    /// into the `spawn_blocking` closure during the body transform. Drop
-    /// releases the slot if the transform never runs (cancellation). Clones
-    /// do not duplicate the exclusive permit.
+    /// Reserved response-buffer admission permit for gateway compression.
+    /// Codec CPU admission is acquired separately, immediately before the
+    /// blocking transform. Drop releases this slot on cancellation; clones do
+    /// not duplicate the exclusive permit.
     compression_response_codec_permit: HeldCodecPermit,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
@@ -2670,7 +2669,7 @@ impl RequestContext {
         self.compression_response_admission_declined
     }
 
-    /// Drop this request's reserved response codec admission (permit + owner)
+    /// Drop this request's reserved response-buffer admission (permit + owner)
     /// when `instance_id` is the reserving instance. A no-op for siblings so a
     /// non-owner declining to compress never releases another instance's slot.
     pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
@@ -3152,7 +3151,7 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
-            // The reserved response codec permit stays on the donor (live)
+            // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving
             // it here would drop the slot when this short-lived clone is dropped
