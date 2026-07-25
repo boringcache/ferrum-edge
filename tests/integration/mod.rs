@@ -34,6 +34,7 @@ mod deferred_log_tests;
 mod dtls_integration_tests;
 mod example_audit_plugin_opt_in_tests;
 mod example_plugin_contract_tests;
+mod file_mode_admin_jwt_tests;
 mod frontend_tls_live_reload_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_svid_identity_tests;
