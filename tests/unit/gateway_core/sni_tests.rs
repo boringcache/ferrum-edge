@@ -56,9 +56,9 @@ fn build_tls_client_hello_with_padding_before_sni(hostname: &str, padding_len: u
     handshake.push(body_len as u8);
     handshake.extend_from_slice(&body);
 
-    // A single TLS record can carry at most u16::MAX payload bytes. Oversized
-    // hellos used by the peek-cap tests stay under that (and under the 16 KiB
-    // peek bound) so they remain a single record unless callers re-frame them.
+    // A single TLS record can carry at most u16::MAX payload bytes. Fixtures
+    // stay under that so they remain one record unless callers re-frame them.
+    // The >16 KiB fail-closed peek test intentionally exceeds the peek bound.
     assert!(
         handshake.len() <= u16::MAX as usize,
         "handshake must fit in one TLS record length field"
@@ -1173,7 +1173,8 @@ async fn test_extract_sni_from_tcp_stream_oversized_split_across_records() {
 
 /// A ClientHello whose handshake span exceeds the 16 KiB hard peek bound, with
 /// SNI serialized after the padding, must fail closed (no SNI) rather than
-/// allocate unboundedly or invent a hostname from a truncated prefix.
+/// allocate unboundedly, wait out the handshake deadline, or invent a hostname
+/// from a truncated prefix.
 #[tokio::test]
 async fn test_extract_sni_from_tcp_stream_fails_closed_when_hello_exceeds_peek_cap() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1199,7 +1200,11 @@ async fn test_extract_sni_from_tcp_stream_fails_closed_when_hello_exceeds_peek_c
 
     let accept_task = tokio::spawn(async move {
         let (server_stream, _) = listener.accept().await.expect("accept");
-        extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5))).await
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5)))
+                .await;
+        (result, started.elapsed())
     });
 
     let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
@@ -1207,11 +1212,16 @@ async fn test_extract_sni_from_tcp_stream_fails_closed_when_hello_exceeds_peek_c
     client.write_all(&hello).await.expect("write");
     client.flush().await.expect("flush");
 
-    let result = accept_task.await.expect("accept_task");
+    let (result, elapsed) = accept_task.await.expect("accept_task");
     assert_eq!(
         result, None,
         "ClientHello exceeding the hard peek bound with SNI past the cap must \
          fail closed (None), not allocate past the bound or mis-parse a hostname"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "over-cap peek must fail closed at the hard bound without waiting out \
+         the handshake deadline: {elapsed:?}"
     );
 }
 

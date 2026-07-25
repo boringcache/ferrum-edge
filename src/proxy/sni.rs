@@ -104,7 +104,15 @@ pub async fn extract_sni_from_tcp_stream(
                 // existing non-ClientHello semantics.
                 return None;
             }
-            // `Span` with more bytes still to buffer, or `NeedMore`: keep peeking.
+            // `Span` with more bytes still to buffer, or `NeedMore`: keep peeking
+            // only while the hard peek bound still has room. A full buffer that
+            // still cannot complete the ClientHello must fail closed immediately —
+            // further peeks cannot grow past `MAX_CLIENT_HELLO_LEN`, and waiting
+            // until the handshake deadline would only prolong the same truncated
+            // parse (which must not invent an SNI from a partial oversized hello).
+            WireSpan::Span(_) | WireSpan::NeedMore if have >= MAX_CLIENT_HELLO_LEN => {
+                return extract_sni_from_client_hello(&buf[..have]);
+            }
             WireSpan::Span(_) | WireSpan::NeedMore => {}
         }
         let now = tokio::time::Instant::now();
