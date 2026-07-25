@@ -2657,7 +2657,10 @@ impl LoadBalancer {
     ///
     /// Crate-private test seam (routed through `_test_support`): lets coverage
     /// assert distinct construction-time phases without depending on OS thread →
-    /// shard assignment.
+    /// shard assignment. The library target exposes this through `_test_support`;
+    /// the binary target compiles this module without that bridge, so the helper
+    /// is intentionally unused there.
+    #[allow(dead_code)]
     pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
         std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
     }
@@ -2666,7 +2669,9 @@ impl LoadBalancer {
     ///
     /// Crate-private test seam (routed through `_test_support`): bypasses
     /// [`wrr_counter_shard`] so first-wave correlation across shards is asserted
-    /// without barriers or scheduling.
+    /// without barriers or scheduling. See
+    /// [`Self::selection_counter_phases_for_test`] for the bin-target dead-code note.
+    #[allow(dead_code)]
     pub(crate) fn select_round_robin_from_shard_for_test(
         &self,
         shard: usize,
@@ -2685,6 +2690,7 @@ impl LoadBalancer {
     /// mapping as the production Random path).
     ///
     /// Crate-private test seam: see [`Self::select_round_robin_from_shard_for_test`].
+    #[allow(dead_code)]
     pub(crate) fn select_random_from_shard_for_test(
         &self,
         shard: usize,
@@ -2703,6 +2709,9 @@ impl LoadBalancer {
     /// Crate-private test seam (routed through `_test_support`): peeks each
     /// distribute-counter phase and applies the same
     /// `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
+    /// See [`Self::selection_counter_phases_for_test`] for the bin-target
+    /// dead-code note.
+    #[allow(dead_code)]
     pub(crate) fn distribute_first_wave_bucket_mods_for_test(
         &self,
         total: u64,
