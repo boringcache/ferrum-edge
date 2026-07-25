@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 const TEST_PROXY: &str = "test-proxy";
@@ -59,7 +59,14 @@ fn test_passive_health_marks_unhealthy() {
     };
 
     for _ in 0..3 {
-        checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -80,11 +87,25 @@ fn test_passive_health_recovers() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -103,7 +124,14 @@ fn test_success_does_not_mark_unhealthy() {
     };
 
     for _ in 0..100 {
-        checker.report_response(TEST_PROXY, &target, 200, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            200,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
@@ -124,7 +152,14 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target, 502, true, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            502,
+            true,
+            Some(&config),
+        );
     }
 
     assert!(
@@ -148,11 +183,25 @@ fn test_connection_error_recovery_on_success() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target, 502, true, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            502,
+            true,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -172,8 +221,22 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target1, 500, false, Some(&config));
-        checker.report_response(TEST_PROXY, &target2, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
@@ -200,7 +263,14 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
@@ -224,8 +294,22 @@ fn test_remove_stale_targets_no_op_when_all_present() {
     };
 
     for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target1, 500, false, Some(&config));
-        checker.report_response(TEST_PROXY, &target2, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target1,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target2,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[target1, target2]);
@@ -250,7 +334,14 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
 
     // Proxy-A sends large payloads → backend returns 500s
     for _ in 0..2 {
-        checker.report_response("proxy-a", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy-a",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
 
     assert!(
@@ -263,7 +354,14 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
     );
 
     // Proxy-B sends small payloads → backend returns 200s
-    checker.report_response("proxy-b", &target, 200, false, Some(&config));
+    checker.report_response(
+        "proxy-b",
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
 
     assert!(
         is_passive_unhealthy(&checker, "proxy-a", "shared-backend:8080"),
@@ -291,7 +389,14 @@ fn test_active_and_passive_health_are_independent() {
     };
 
     for _ in 0..2 {
-        checker.report_response("proxy-a", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy-a",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, "proxy-a", "backend1:8080"));
     assert!(checker.active_unhealthy_targets.is_empty());
@@ -351,9 +456,30 @@ fn test_prune_removed_proxies() {
 
     // Insert passive health state for 3 proxies by reporting responses
     for _ in 0..2 {
-        checker.report_response("proxy1", &target, 500, false, Some(&config));
-        checker.report_response("proxy2", &target, 500, false, Some(&config));
-        checker.report_response("proxy3", &target, 500, false, Some(&config));
+        checker.report_response(
+            "proxy1",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            "proxy2",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
+        checker.report_response(
+            "proxy3",
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert_eq!(checker.passive_health.len(), 3);
 
@@ -400,8 +526,22 @@ fn test_passive_window_only_counts_recent_failures() {
     };
 
     // Record 2 failures (under threshold)
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should not be unhealthy with only 2 failures"
@@ -411,7 +551,14 @@ fn test_passive_window_only_counts_recent_failures() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     // Record 1 more failure — the old 2 should have expired from the window
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Old failures outside window should not count toward threshold"
@@ -433,11 +580,32 @@ fn test_passive_window_failures_within_window_accumulate() {
     };
 
     // All 3 failures within the 60s window
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should be unhealthy after 3 failures within window"
@@ -458,7 +626,14 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
         split_external_local_origin_errors: None,
     };
 
-    checker.report_response(TEST_PROXY, &target, 502, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        502,
+        false,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Threshold of 1 should mark unhealthy on first failure"
@@ -482,7 +657,14 @@ fn test_connection_error_ignores_status_code_list() {
     };
 
     // Status code 200 with connection_error=true should still count as failure
-    checker.report_response(TEST_PROXY, &target, 200, true, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        true,
+        Some(&config),
+    );
     assert!(
         is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Connection errors should trigger failure regardless of status code"
@@ -507,8 +689,22 @@ fn test_passive_health_per_target_isolation() {
     };
 
     // Fail target_a only
-    checker.report_response(TEST_PROXY, &target_a, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, &target_a, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target_a,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target_a,
+        500,
+        false,
+        Some(&config),
+    );
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend-a:8080"));
     assert!(
@@ -535,24 +731,59 @@ fn test_recovery_clears_failures_then_re_threshold() {
 
     // Mark unhealthy
     for _ in 0..3 {
-        checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+        checker.report_response(
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            Some(&config),
+        );
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     // Recover with a success
-    checker.report_response(TEST_PROXY, &target, 200, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     // Now it should take a full 3 failures again to mark unhealthy
     // (failure history was cleared on recovery)
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(
         !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
         "Should need full threshold after recovery"
     );
 
-    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(
+        TEST_PROXY,
+        "test-upstream",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 
@@ -565,7 +796,7 @@ fn test_no_passive_config_is_noop() {
 
     // Report with no passive config
     for _ in 0..100 {
-        checker.report_response(TEST_PROXY, &target, 500, false, None);
+        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, None);
     }
 
     assert_eq!(
@@ -858,51 +1089,6 @@ fn make_upstream_with_active_probe_tls(
     upstream
 }
 
-fn make_upstream_with_passive_recovery(
-    id: &str,
-    targets: Vec<UpstreamTarget>,
-    healthy_after_seconds: u64,
-) -> Upstream {
-    Upstream {
-        id: id.to_string(),
-        namespace: default_namespace(),
-        name: Some(format!("upstream-{}", id)),
-        targets,
-        algorithm: LoadBalancerAlgorithm::RoundRobin,
-        hash_on: None,
-        hash_on_cookie_config: None,
-        health_checks: Some(HealthCheckConfig {
-            active: None,
-            passive: Some(PassiveHealthCheck {
-                unhealthy_status_codes: vec![500],
-                unhealthy_threshold: 2,
-                unhealthy_window_seconds: 60,
-                healthy_after_seconds,
-                max_ejection_percent: None,
-                gateway_error_codes: None,
-                split_external_local_origin_errors: None,
-            }),
-        }),
-        service_discovery: None,
-        subsets: None,
-        port_overrides: HashMap::new(),
-        source_locality: None,
-        locality_lb_strict: false,
-        locality_lb_setting: None,
-        backend_tls_client_cert_path: None,
-        backend_tls_client_key_path: None,
-        backend_tls_verify_server_cert: true,
-        backend_tls_server_ca_cert_path: None,
-        backend_tls_sni: None,
-        backend_tls_san_allow_list: Vec::new(),
-        resolved_subset_tls: HashMap::new(),
-        dispatch_port_override_fallback: None,
-        api_spec_id: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
-}
-
 #[tokio::test]
 async fn test_take_retains_cancel_visibility_for_reload() {
     // Production ownership: ProxyState::new starts tasks then immediately
@@ -1087,56 +1273,25 @@ async fn test_take_then_restart_picks_up_tls_policy_change() {
 
 #[tokio::test]
 async fn test_take_then_restart_stops_stale_passive_recovery() {
-    // Drained passive-recovery timer must not mutate health after reload
-    // removes recovery (healthy_after_seconds=0) for the same target.
+    // Drained passive-recovery scanner must exit after reload removes recovery
+    // with no pending auto-recover ejection (AbortHandle cancel + generation
+    // fence). Adapted from the pre-#3128 per-upstream timer ownership test.
     let checker = HealthChecker::new();
-    let target = make_target("passive-host", 9500);
-    let passive_cfg = PassiveHealthCheck {
-        unhealthy_status_codes: vec![500],
-        unhealthy_threshold: 2,
-        unhealthy_window_seconds: 60,
-        healthy_after_seconds: 1,
-        max_ejection_percent: None,
-        gateway_error_codes: None,
-        split_external_local_origin_errors: None,
-    };
-
-    for _ in 0..2 {
-        checker.report_response(TEST_PROXY, &target, 500, false, Some(&passive_cfg));
-    }
-    assert!(is_passive_unhealthy(
-        &checker,
-        TEST_PROXY,
-        "passive-host:9500"
-    ));
-
-    // Make the cooldown already elapsed so a surviving timer would recover
-    // on its next tick.
-    let past_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-        - 5_000;
-    {
-        let proxy_state = checker.passive_health.get(TEST_PROXY).unwrap();
-        *proxy_state.unhealthy.get_mut("passive-host:9500").unwrap() = past_ms;
-    }
-
-    let initial = config_with_upstreams(vec![make_upstream_with_passive_recovery(
+    let initial = config_with_upstreams(vec![make_upstream_passive_only(
         "up-passive",
-        vec![target.clone()],
-        1,
+        vec![make_target("passive-host", 9500)],
+        30,
     )]);
     checker.start_with_shutdown(&initial, None);
     let taken = checker.take_active_check_handles();
-    assert_eq!(taken.len(), 1, "passive recovery timer must be spawned");
+    assert_eq!(taken.len(), 1, "passive recovery scanner must be spawned");
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must retain cancel visibility for the recovery scanner"
+    );
 
-    let after = config_with_upstreams(vec![make_upstream_with_passive_recovery(
-        "up-passive",
-        vec![target.clone()],
-        0, // no recovery timer in the replacement generation
-    )]);
-    checker.restart_with_shutdown(&after, None);
+    checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
 
     for _ in 0..20 {
         if taken.iter().all(|h| h.is_finished()) {
@@ -1146,18 +1301,401 @@ async fn test_take_then_restart_stops_stale_passive_recovery() {
     }
     assert!(
         taken.iter().all(|h| h.is_finished()),
-        "reload must abort the drained passive-recovery timer"
+        "reload must retire the drained passive-recovery scanner"
     );
     assert_eq!(
         checker.active_task_count(),
         0,
-        "healthy_after_seconds=0 must not spawn a replacement recovery timer"
+        "no pending auto-recover ejection and no passive policy must not spawn a scanner"
+    );
+}
+
+// ─── Passive recovery scoping (#2388 / #2943) ─────────────────────────────────
+
+fn make_upstream_passive_only(
+    id: &str,
+    targets: Vec<UpstreamTarget>,
+    healthy_after_seconds: u64,
+) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: default_namespace(),
+        name: Some(format!("upstream-{}", id)),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: Some(HealthCheckConfig {
+            active: None,
+            passive: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                healthy_after_seconds,
+                ..PassiveHealthCheck::default()
+            }),
+        }),
+        service_discovery: None,
+        subsets: None,
+        port_overrides: HashMap::new(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn eject_once(
+    checker: &HealthChecker,
+    proxy: &str,
+    upstream: &str,
+    target: &UpstreamTarget,
+    healthy_after: u64,
+) {
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: healthy_after,
+        ..PassiveHealthCheck::default()
+    };
+    checker.report_response(proxy, upstream, target, 500, false, Some(&config));
+}
+
+#[tokio::test]
+async fn per_port_only_passive_policy_recovers_via_entry_deadline() {
+    // Upstream has NO base passive policy; only a per-port overlay. Recovery
+    // must still fire from the ejection's stored deadline.
+    use ferrum_edge::config::types::UpstreamPortOverride;
+
+    let target = make_target("10.0.0.8", 8443);
+    let port_passive = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 5,
+        ..PassiveHealthCheck::default()
+    };
+    let mut upstream = make_upstream_passive_only("up1", vec![target.clone()], 0);
+    // Clear base passive — port-only.
+    upstream.health_checks = None;
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            passive_health_check: Some(port_passive.clone()),
+            ..Default::default()
+        },
     );
 
-    // Give a surviving stale timer time to tick and mutate state.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let checker = HealthChecker::new();
+    let cfg = config_with_upstreams(vec![upstream]);
+    checker.start_with_shutdown(&cfg, None);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "per-port-only healthy_after>0 must spawn the recovery scanner"
+    );
+
+    checker.report_response(
+        "proxy-port",
+        "up1",
+        &target,
+        500,
+        false,
+        Some(&port_passive),
+    );
+    assert!(is_passive_unhealthy(
+        &checker,
+        "proxy-port",
+        "10.0.0.8:8443"
+    ));
+
+    // Backdate the entry deadline and recover synchronously (deterministic).
+    {
+        let ps = checker.passive_health.get("proxy-port").unwrap();
+        let mut entry = ps.unhealthy.get_mut("10.0.0.8:8443").unwrap();
+        entry.recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
     assert!(
-        is_passive_unhealthy(&checker, TEST_PROXY, "passive-host:9500"),
-        "stale passive-recovery generation must not clear unhealthy state after policy removal"
+        !is_passive_unhealthy(&checker, "proxy-port", "10.0.0.8:8443"),
+        "per-port-only ejection must auto-recover from its stored deadline"
+    );
+}
+
+#[tokio::test]
+async fn subset_only_passive_policy_recovers_via_entry_deadline() {
+    use ferrum_edge::config::types::ResolvedSubsetTrafficPolicy;
+
+    let target = make_target("10.0.0.9", 8080);
+    let subset_passive = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 7,
+        ..PassiveHealthCheck::default()
+    };
+    let mut upstream = make_upstream_passive_only("up-sub", vec![target.clone()], 0);
+    upstream.health_checks = None;
+    upstream.resolved_subset_tls.insert(
+        "v1".to_string(),
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: Some(subset_passive.clone()),
+        },
+    );
+
+    let checker = HealthChecker::new();
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    checker.report_response(
+        "proxy-sub",
+        "up-sub",
+        &target,
+        500,
+        false,
+        Some(&subset_passive),
+    );
+    assert!(is_passive_unhealthy(&checker, "proxy-sub", "10.0.0.9:8080"));
+
+    {
+        let ps = checker.passive_health.get("proxy-sub").unwrap();
+        let mut entry = ps.unhealthy.get_mut("10.0.0.9:8080").unwrap();
+        entry.recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(!is_passive_unhealthy(
+        &checker,
+        "proxy-sub",
+        "10.0.0.9:8080"
+    ));
+}
+
+#[test]
+fn shared_endpoint_independent_cooldowns_across_proxies() {
+    // Proxy A (5s) and proxy B (300s) share host:port. A's recovery must not
+    // clear B's ejection.
+    let target = make_target("10.0.0.8", 8443);
+    let short = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 5,
+        ..PassiveHealthCheck::default()
+    };
+    let long = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 300,
+        ..PassiveHealthCheck::default()
+    };
+
+    let checker = HealthChecker::new();
+    checker.report_response("proxy-a", "up-a", &target, 500, false, Some(&short));
+    checker.report_response("proxy-b", "up-b", &target, 500, false, Some(&long));
+    assert!(is_passive_unhealthy(&checker, "proxy-a", "10.0.0.8:8443"));
+    assert!(is_passive_unhealthy(&checker, "proxy-b", "10.0.0.8:8443"));
+
+    {
+        let ps = checker.passive_health.get("proxy-a").unwrap();
+        let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
+        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 5_000);
+    }
+    {
+        let ps = checker.passive_health.get("proxy-b").unwrap();
+        let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
+        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 300_000);
+    }
+
+    // Only A's deadline is due.
+    {
+        let ps = checker.passive_health.get("proxy-a").unwrap();
+        ps.unhealthy.get_mut("10.0.0.8:8443").unwrap().recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(!is_passive_unhealthy(&checker, "proxy-a", "10.0.0.8:8443"));
+    assert!(
+        is_passive_unhealthy(&checker, "proxy-b", "10.0.0.8:8443"),
+        "proxy-b must retain its independent 300s cooldown"
+    );
+}
+
+#[tokio::test]
+async fn passive_recovery_deadline_survives_policy_reload() {
+    let target = make_target("backend1", 8080);
+    let checker = HealthChecker::new();
+
+    // Eject under a 30s policy, then reload to a 1s policy — the original
+    // deadline must still govern this ejection.
+    eject_once(&checker, TEST_PROXY, "up1", &target, 30);
+    let original_deadline = {
+        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        let entry = ps.unhealthy.get("backend1:8080").unwrap();
+        assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 30_000);
+        entry.recover_at_ms
+    };
+
+    let reloaded = make_upstream_passive_only("up1", vec![target.clone()], 1);
+    checker.restart_with_shutdown(&config_with_upstreams(vec![reloaded]), None);
+
+    let after_reload = {
+        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        ps.unhealthy.get("backend1:8080").unwrap().recover_at_ms
+    };
+    assert_eq!(
+        after_reload, original_deadline,
+        "reload must not rewrite an in-flight ejection's recovery deadline"
+    );
+
+    // Premature scan (deadline still in the future) must not recover.
+    checker.recover_due_passive_ejections();
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    {
+        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+}
+
+#[tokio::test]
+async fn in_flight_passive_recovery_scanner_survives_policy_removal() {
+    let target = make_target("backend1", 8080);
+    let checker = HealthChecker::new();
+    eject_once(&checker, TEST_PROXY, "up1", &target, 30);
+
+    let mut reloaded = make_upstream_passive_only("up1", vec![target], 0);
+    reloaded.health_checks = None;
+    checker.restart_with_shutdown(&config_with_upstreams(vec![reloaded]), None);
+
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "an in-flight auto-recovery deadline must retain a scanner after its policy is removed"
+    );
+}
+
+#[tokio::test]
+async fn service_discovery_only_target_recovers_after_passive_ejection() {
+    // Target is not in the static upstream.targets list used at scanner spawn —
+    // recovery must still clear it because deadlines live on the entry.
+    let static_target = make_target("static-a", 8080);
+    let sd_target = make_target("sd-only-b", 8080);
+    let mut upstream = make_upstream_passive_only("up-sd", vec![static_target], 1);
+
+    let checker = HealthChecker::new();
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream.clone()]), None);
+
+    let pasv = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 1,
+        ..PassiveHealthCheck::default()
+    };
+    // Simulate SD publish: report failures for a target never present in static config.
+    checker.report_response(TEST_PROXY, "up-sd", &sd_target, 500, false, Some(&pasv));
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "sd-only-b:8080"));
+
+    {
+        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        ps.unhealthy
+            .get_mut("sd-only-b:8080")
+            .unwrap()
+            .recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "sd-only-b:8080"),
+        "SD-only targets must recover; recovery must not freeze keys from static targets"
+    );
+
+    // Ensure scanner still runs after SD-style target set growth on reload.
+    upstream.targets.push(sd_target);
+    checker.restart_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+}
+
+#[test]
+fn success_based_recovery_still_clears_passive_ejection() {
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 300,
+        ..PassiveHealthCheck::default()
+    };
+    let checker = HealthChecker::new();
+    checker.report_response(TEST_PROXY, "up1", &target, 500, false, Some(&config));
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+    checker.report_response(TEST_PROXY, "up1", &target, 200, false, Some(&config));
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+}
+
+#[tokio::test]
+async fn passive_recovery_scanner_exits_on_generation_fence_after_take() {
+    // Modes drain JoinHandles via take_active_check_handles at startup.
+    // AbortHandles retain cancel ownership across take (issue #2383), and the
+    // generation fence still forces a stale scanner to exit on its next tick.
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_passive_only("up-fence", vec![make_target("fence-a", 8080)], 30);
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must not hide the scanner from reload/drop cancel ownership"
+    );
+
+    checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
+    assert_eq!(
+        checker.active_task_count(),
+        0,
+        "disabled passive recovery must not spawn a replacement scanner"
+    );
+
+    let handle = taken.into_iter().next().expect("taken scanner handle");
+    let join = tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("stale scanner must exit after abort and/or generation fence");
+    // AbortHandle cancel yields JoinError::Cancelled; a pure fence exit is Ok(()).
+    assert!(
+        join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "scanner task should finish via abort cancel or clean fence exit: {join:?}"
+    );
+}
+
+#[tokio::test]
+async fn passive_recovery_scanner_replaces_taken_generation_on_reload() {
+    let checker = HealthChecker::new();
+    let upstream = make_upstream_passive_only("up-fence2", vec![make_target("fence-b", 8080)], 30);
+    checker.start_with_shutdown(&config_with_upstreams(vec![upstream.clone()]), None);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must retain cancel visibility for the drained scanner"
+    );
+
+    // Reload still needs passive recovery: spawn a fresh scanner and
+    // fence/abort the taken one.
+    checker.restart_with_shutdown(&config_with_upstreams(vec![upstream]), None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let stale = taken.into_iter().next().expect("taken scanner handle");
+    let join = tokio::time::timeout(Duration::from_secs(3), stale)
+        .await
+        .expect("previous generation scanner must exit after reload fence/abort");
+    assert!(
+        join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "scanner task should finish via abort cancel or clean fence exit: {join:?}"
+    );
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "current generation scanner must remain registered"
     );
 }

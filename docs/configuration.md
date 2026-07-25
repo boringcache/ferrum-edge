@@ -41,7 +41,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS` | No | `60` | Maximum ACME readiness/certificate polling time per automatic renewal |
 | `FERRUM_ACME_DNS01_HOOK_COMMAND` | No | — | Executable provider hook for DNS-01 automation. Ferrum invokes it without a shell and passes `FERRUM_ACME_DNS01_ACTION`, `FERRUM_ACME_DNS01_IDENTIFIER`, `FERRUM_ACME_DNS01_TOKEN`, `FERRUM_ACME_DNS01_TXT_RECORD_NAME`, and `FERRUM_ACME_DNS01_TXT_VALUE` |
 | `FERRUM_ACME_DNS01_PROPAGATION_SECONDS` | No | `60` | Wait time after DNS-01 hook publication before Ferrum asks the ACME directory to validate the challenge |
-| `FERRUM_TLS_MANAGED_STORE_PATH` | No | `./ferrum-managed-tls` | Directory for file-backed admin-managed TLS records and recent TLS rotation events. The store persists uploaded certificates, private keys, CA bundles, and CRLs in `managed-tls.json` and bounded rotation history in `tls-events.json`; private keys are written with owner-only permissions on Unix |
+| `FERRUM_TLS_MANAGED_STORE_PATH` | No | `./ferrum-managed-tls` | Directory for file-backed admin-managed TLS records and recent TLS rotation events. The store persists uploaded certificates, private keys, CA bundles, CRLs, OCSP responses, and JWKS in `managed-tls.json` and bounded rotation history in `tls-events.json` under globally unique record IDs across material kinds; private keys are written with owner-only permissions on Unix |
 | `FERRUM_PKCS11_MODULE_PATH` | No | — | Default PKCS#11 module path used by frontend/admin/backend mTLS `pkcs11://` key sources when the URI omits `?module=` and `?module_env=`. Requires the `pkcs11` Cargo feature |
 | `FERRUM_PKCS11_PIN` | No | — | Optional example token user PIN variable for `pkcs11://...?pin_env=FERRUM_PKCS11_PIN`. Ferrum only reads it when a PKCS#11 key source references it, and never logs the value |
 | `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
@@ -309,7 +309,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 |---|---|---|---|
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
 
-File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation.
+File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation. A rejected SIGHUP candidate (read/parse/validation/apply failure) raises the shared `config_rejected` admin-health signal so authenticated `/health` reports `degraded` until a later Applied or Unchanged reload clears it; unauthenticated probes see only the coarse `status`/`ready` fields.
 
 File-mode configuration documents are limited to 64 MiB; larger files fail before allocation and parsing.
 
@@ -667,6 +667,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation (inbound only) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | TLS session resumption cache size (inbound only, TLS 1.2 stateful session IDs) |
 | `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | No | `30` | Warn when configured certificates expire within this many days; `0` disables warnings |
+| `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` | No | `300` | Maximum age of the cached, non-secret TLS inventory snapshot behind the `/metrics` certificate gauges. Scrapes read the snapshot only (no certificate/key/Kubernetes/secret-manager I/O) and schedule a single-flight background refresh once it is older than this bound; `0` disables the refresh and leaves the gauges absent |
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
@@ -805,9 +806,9 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | No | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | No | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | No | `45` | HTTP/2 keep-alive ping timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | No | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | No | `true` | Enable adaptive flow-control window sizing based on observed throughput |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | No | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB. When adaptive windowing is on, hyper/reqwest override these fixed sizes via BDP probing |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB. When adaptive windowing is on, hyper/reqwest override these fixed sizes via BDP probing |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | No | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial window sizes while enabled. An explicit stream/connection window override (env, `ferrum.conf`, or per-proxy) auto-disables adaptive when this was not also set explicitly; an explicit adaptive choice remains authoritative |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | No | `1048576` | Maximum HTTP/2 frame payload in bytes (1 MiB). Clamped to 16384..1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
@@ -847,7 +848,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_TLS_OFFLOAD_THREADS` | No | `0` | Dedicated TLS handshake offload threads; `0` disables |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | No | `auto` | TCP Fast Open toggle: `auto`, `true`, or `false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
-| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS splice acceleration toggle |
+| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS probe/gating; buffered tokio-rustls handoff currently refuse-closed (issue #2955) |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | No | `auto` | Linux io_uring splice toggle |
 | `FERRUM_UDP_GRO_ENABLED` | No | `auto` | Linux UDP GRO toggle; currently reserved/no-op |
 | `FERRUM_UDP_GSO_ENABLED` | No | `auto` | Linux UDP GSO send batching toggle |
