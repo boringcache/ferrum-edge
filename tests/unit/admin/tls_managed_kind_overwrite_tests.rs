@@ -34,7 +34,6 @@ struct TestConfig {
     jwt_secret: String,
     jwt_issuer: String,
     max_ttl: u64,
-    admin_addr: SocketAddr,
 }
 
 impl Default for TestConfig {
@@ -43,7 +42,6 @@ impl Default for TestConfig {
             jwt_secret: "test-secret-key-for-admin-api".to_string(),
             jwt_issuer: "test-ferrum-edge".to_string(),
             max_ttl: 3600,
-            admin_addr: "127.0.0.1:0".parse().unwrap(),
         }
     }
 }
@@ -178,7 +176,7 @@ fn raw_http_json_body(response: &str) -> Value {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum Collection {
     Certificate,
     CaBundle,
