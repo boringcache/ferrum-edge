@@ -611,9 +611,21 @@ async fn sql_create_persists_wire_form_without_domain_normalization() {
 
     // Global plugin with proxy_id omitted (None). Handing SQL Some("") would
     // fail the proxies(id) FK before any domain-normalization question arises.
+    //
+    // `tcp_connection_throttle` admission requires at least one TCP/TCP+TLS
+    // proxy for a global instance to protect, so the fixture carries one
+    // alongside the HTTP proxy under test. Without it, admission rejects the
+    // plugin before SQL is reached and this test never exercises persistence.
+    // The TCP proxy is fixture scaffolding only — every assertion below targets
+    // `mixed-proxy`, `mixed-consumer`, `mixed-upstream`, and `mixed-plugin`.
+    let throttle_target = make_tcp_proxy("mixed-tcp-proxy", 19_432);
     let plugin = make_global_tcp_throttle("mixed-plugin");
 
     store.create_proxy(&proxy).await.expect("proxy create");
+    store
+        .create_proxy(&throttle_target)
+        .await
+        .expect("tcp proxy create");
     store
         .create_consumer(&consumer)
         .await
