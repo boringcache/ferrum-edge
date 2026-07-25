@@ -1671,7 +1671,9 @@ paths:
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
-        `connected_since`, and `last_config_received_at`.
+        `connected_since`, `last_config_received_at`, and sticky ConfigSync
+        divergence fields (`config_diverged`, `config_diverged_since`,
+        `config_divergence_recoveries_total`).
 
         **Database/File modes**: Returns an informational message indicating
         cluster status is only meaningful in CP/DP modes.
@@ -1725,6 +1727,9 @@ paths:
                       is_primary: true
                       connected_since: "2025-01-15T10:30:00Z"
                       last_config_received_at: "2025-01-15T10:35:00Z"
+                      config_diverged: false
+                      config_diverged_since: null
+                      config_divergence_recoveries_total: 0
                 dp_mode_offline:
                   summary: DP disconnected from CP
                   value:
@@ -1735,6 +1740,9 @@ paths:
                       is_primary: true
                       connected_since: null
                       last_config_received_at: "2025-01-15T10:30:00Z"
+                      config_diverged: false
+                      config_diverged_since: null
+                      config_divergence_recoveries_total: 0
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -21934,7 +21942,7 @@ components:
           enum: [dp]
         control_plane:
           type: object
-          required: [url, status, is_primary]
+          required: [url, status, is_primary, config_diverged, config_divergence_recoveries_total]
           properties:
             url:
               type: string
@@ -21953,7 +21961,22 @@ components:
             last_config_received_at:
               type: [string, "null"]
               format: date-time
-              description: When the last config update was received (null if none yet)
+              description: When the last accepted config update was received (null if none yet). Rejected resource deltas do not advance this stamp.
+            config_diverged:
+              type: boolean
+              description: |
+                Sticky operator signal set when a non-empty ConfigSync DELTA is
+                rejected. Cleared only after an authoritative FULL_SNAPSHOT is
+                accepted. Last-known-good config continues to serve while true.
+            config_diverged_since:
+              type: [string, "null"]
+              format: date-time
+              description: When sticky divergence was first raised (null when not diverged)
+            config_divergence_recoveries_total:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Count of divergence → FULL_SNAPSHOT recovery transitions
 
     ClusterStatusOther:
       type: object
