@@ -258,6 +258,8 @@ Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are a
 
 `GET/POST /admin/tls/jwks`, `GET/PUT/DELETE /admin/tls/jwks/{id}`
 
+Record IDs are **globally unique** across those typed collections (one shared store map keyed by ID, not namespaced by kind). Create with `allow_overwrite=true` and every typed `PUT` require the existing record kind to match the route kind; a cross-kind collision returns `409 Conflict` with a stable error of the form `managed TLS record '{id}' already exists with kind {existing}, cannot overwrite with kind {requested}`. Typed `GET`/`DELETE` still reject a kind mismatch with `400 Bad Request`. Same-kind replacement is allowed even when the record is referenced: admission validates the new material before persistence, and TLS source watchers atomically activate or retain the previous runtime config.
+
 Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
 
 Create, update, and delete operations ask active TLS source watchers to re-pull immediately. Surfaces without a live watcher still pick up managed records when their owning config/runtime is rebuilt.
