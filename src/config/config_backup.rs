@@ -44,14 +44,12 @@ pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::E
         }
     };
 
-    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        anyhow::anyhow!("Failed to parse config backup at {path}: {e}")
-    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse config backup at {path}: {e}"))?;
 
     normalize_backup_version_field(&mut value)?;
-    ConfigMigrator::migrate_in_memory(&mut value).map_err(|e| {
-        anyhow::anyhow!("Config backup at {path} failed version migration: {e}")
-    })?;
+    ConfigMigrator::migrate_in_memory(&mut value)
+        .map_err(|e| anyhow::anyhow!("Config backup at {path} failed version migration: {e}"))?;
 
     let backup_version = value
         .get("version")
@@ -67,9 +65,8 @@ pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::E
         );
     }
 
-    let mut config: GatewayConfig = serde_json::from_value(value).map_err(|e| {
-        anyhow::anyhow!("Failed to deserialize config backup at {path}: {e}")
-    })?;
+    let mut config: GatewayConfig = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize config backup at {path}: {e}"))?;
 
     // Preserve the same normalize → TLS resolution order used by database
     // full loads before the rejecting runtime contract runs.

@@ -577,7 +577,10 @@ async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
                             && (lower.contains("rejected") || lower.contains("overlapping")),
                     "stderr must mention backup runtime rejection.\nstderr:\n{stderr}"
                 );
-                println!("  Gateway failed closed on invalid backup (exit={:?})", status);
+                println!(
+                    "  Gateway failed closed on invalid backup (exit={:?})",
+                    status,
+                );
                 println!("\n=== DB Config Backup Bootstrap Rejection Test PASSED ===\n");
                 return;
             }
