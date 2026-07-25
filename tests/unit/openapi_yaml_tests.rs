@@ -1397,9 +1397,7 @@ fn shared_body_gate_operations_from_source() -> BTreeSet<(String, String)> {
     operations
 }
 
-fn normalized_operation_set(
-    operations: &BTreeSet<(String, String)>,
-) -> BTreeSet<(String, String)> {
+fn normalized_operation_set(operations: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
     operations
         .iter()
         .map(|(method, path)| (method.clone(), normalized_path_template(path)))
