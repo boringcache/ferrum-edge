@@ -269,6 +269,34 @@ pub mod _test_support {
         cache.load_inner().proxy_plugins.contains_key(&key)
     }
 
+    /// Resolve a proxy's initial-response-header policy chain the way the
+    /// HTTP/3 request path does: through the namespace-composing
+    /// `PluginCacheInner` accessor.
+    pub fn initial_response_header_policy_plugins_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .initial_response_header_policy_plugins(namespace, proxy_id, protocol)
+    }
+
+    /// Resolve the same chain with a BARE proxy ID — the spelling that misses
+    /// every namespace-keyed protocol entry and silently falls back to the
+    /// global chain (issue #3094). Exposed only so regression coverage can pin
+    /// that difference; production code must never look up by raw ID.
+    pub fn initial_response_header_policy_plugins_by_bare_proxy_id_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .get_initial_response_header_policy_plugins(proxy_id, protocol)
+    }
+
     /// Whether the service-discovery loop would prune `proxy`'s passive-health
     /// state for a discovery update on upstream `(upstream_namespace,
     /// upstream_id)`. Exposes the namespace-qualified proxy-selection predicate

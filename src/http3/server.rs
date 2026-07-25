@@ -1591,9 +1591,12 @@ async fn handle_h3_request(
     // gRPC-Web is promoted only for gRPC policy selection above and must not
     // become native gRPC merely because its policy chain is gRPC-scoped.
     ctx.set_request_http_flavor(detected_http_flavor);
+    // Namespace-composed lookup: the protocol snapshot is keyed by
+    // `namespace|proxy_id`, so a bare `proxy.id` would miss every proxy entry
+    // and fall back to the global policy chain.
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
-        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+        .initial_response_header_policy_plugins(&proxy.namespace, &proxy.id, request_protocol);
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging

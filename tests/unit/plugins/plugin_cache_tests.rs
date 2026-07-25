@@ -2,7 +2,9 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    incremental_plugin_rebuild_targets_for_test, plugin_cache_with_real_ip_header_for_test,
+    incremental_plugin_rebuild_targets_for_test,
+    initial_response_header_policy_plugins_by_bare_proxy_id_for_test,
+    initial_response_header_policy_plugins_for_test, plugin_cache_with_real_ip_header_for_test,
     reconcile_fault_plugin_generations_for_test,
     request_deduplication_logical_keys_from_context_for_test, run_after_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
@@ -9536,5 +9538,74 @@ fn test_association_to_another_namespaces_plugin_config_id_does_not_attach() {
     assert!(
         has_plugin(&cache.get_plugins("tenant-a", "p1"), "rate_limiting"),
         "the owning namespace must still attach its own group plugin"
+    );
+}
+
+/// The HTTP/3 handler resolves the initial-response-header policy chain on its
+/// own, outside `request_view`. It must compose `namespace|proxy_id` like every
+/// other request-path lookup: the protocol snapshot is keyed that way, so a
+/// bare `proxy.id` misses the proxy entry and silently serves the GLOBAL policy
+/// chain to a non-default-namespace proxy — a cross-tenant fail-open with no
+/// error and no log.
+#[test]
+fn test_initial_response_header_policy_resolves_by_namespaced_key() {
+    let mut scoped = make_plugin_config_with_json(
+        "sh-scoped",
+        "security_headers",
+        json!({ "set": { "X-Policy-Scope": "tenant-a-proxy" } }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    scoped.namespace = "tenant-a".to_string();
+    let global = make_plugin_config_with_json(
+        "sh-global",
+        "security_headers",
+        json!({ "set": { "X-Policy-Scope": "global" } }),
+        PluginScope::Global,
+        None,
+    );
+    let config = make_config(
+        vec![namespaced_proxy("tenant-a", "p1", "/api", vec!["sh-scoped"])],
+        vec![scoped, global],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let composed = initial_response_header_policy_plugins_for_test(
+        &cache,
+        "tenant-a",
+        "p1",
+        ProxyProtocol::Http,
+    );
+    let mut composed_headers = HashMap::new();
+    apply_initial_response_header_policies(&composed, &mut composed_headers);
+    assert_eq!(
+        composed_headers.get("x-policy-scope").map(String::as_str),
+        Some("tenant-a-proxy"),
+        "the namespace-composed lookup must resolve the proxy's own policy chain"
+    );
+
+    let raw = initial_response_header_policy_plugins_by_bare_proxy_id_for_test(
+        &cache,
+        "p1",
+        ProxyProtocol::Http,
+    );
+    let mut raw_headers = HashMap::new();
+    apply_initial_response_header_policies(&raw, &mut raw_headers);
+    assert_eq!(
+        raw_headers.get("x-policy-scope").map(String::as_str),
+        Some("global"),
+        "a bare proxy id must miss the namespaced entry and fall back to globals"
+    );
+
+    // Every other HTTP/3 plugin-cache read goes through the request view; the
+    // standalone accessor must agree with it.
+    let view_plugins = cache
+        .request_view("tenant-a", "p1", ProxyProtocol::Http)
+        .initial_response_header_policy_plugins();
+    let mut view_headers = HashMap::new();
+    apply_initial_response_header_policies(&view_plugins, &mut view_headers);
+    assert_eq!(
+        composed_headers, view_headers,
+        "standalone policy lookup must match the request view for the same proxy"
     );
 }

@@ -3488,6 +3488,11 @@ impl PluginCacheInner {
         }
     }
 
+    /// Merged (global + proxy-scoped) plugin list for `proxy_key`.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, never a
+    /// bare proxy ID — see [`Self::protocol_entry`] for why that distinction is
+    /// load bearing.
     pub(crate) fn get_plugins(&self, proxy_key: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         if let Some(plugins) = self.proxy_plugins.get(proxy_key) {
             Arc::clone(plugins)
@@ -3496,6 +3501,18 @@ impl PluginCacheInner {
         }
     }
 
+    /// Per-protocol entry for one proxy, falling back to the global entry when
+    /// the proxy has no protocol-scoped override.
+    ///
+    /// `proxy_key` MUST be the composed `namespace|proxy_id` runtime key
+    /// produced by [`write_namespaced_runtime_key`]. The protocol snapshot is
+    /// keyed that way, so a bare proxy ID never matches a proxy entry and
+    /// silently resolves to the GLOBAL entry instead — a cross-tenant policy
+    /// fail-open with no error and no log. Request paths holding a `Proxy`
+    /// should go through [`Self::request_view`],
+    /// [`Self::grpc_web_request_view`], or a namespace-taking accessor such as
+    /// [`Self::initial_response_header_policy_plugins`] instead of passing
+    /// `proxy.id` here.
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
         self.protocol_snapshot
             .proxy
@@ -3514,125 +3531,203 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Authenticate-phase plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_auth_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.auth_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// gRPC deadline plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_grpc_deadline_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.grpc_deadline_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Authorize-phase plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_authorize_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.authorize_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Backend-admission plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_backend_admission_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.backend_admission_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Backend-path plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_backend_path_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.backend_path_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Request header names to redact for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_request_headers_to_redact(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.request_headers_to_redact))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Initial-response-header policy plugins for a composed `proxy_key` +
+    /// protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`]. Callers holding a `Proxy`
+    /// should use [`Self::initial_response_header_policy_plugins`].
     pub(crate) fn get_initial_response_header_policy_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Initial-response-header policy plugin names for a composed `proxy_key` +
+    /// protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_initial_response_header_policy_names(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<String>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.initial_response_header_policy_names))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Response-committed hook plugins for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_response_committed_plugins(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| Arc::clone(&entry.phase.response_committed_plugins))
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Pre-computed capability bitset for a composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
     pub(crate) fn get_capabilities(
         &self,
-        proxy_id: &str,
+        proxy_key: &str,
         protocol: ProxyProtocol,
     ) -> PluginCapabilities {
-        self.protocol_entry(proxy_id, protocol)
+        self.protocol_entry(proxy_key, protocol)
             .map(|entry| entry.phase.capabilities)
             .unwrap_or_default()
     }
 
-    pub(crate) fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
+    /// Response-body buffering upper bound for a composed `proxy_key`.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID; a bare ID falls back to the global flag.
+    pub(crate) fn requires_response_body_buffering(&self, proxy_key: &str) -> bool {
         self.requires_buffering
-            .get(proxy_id)
+            .get(proxy_key)
             .copied()
             .unwrap_or(self.global_requires_buffering)
     }
 
-    pub(crate) fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
+    /// Request-body buffering upper bound for a composed `proxy_key`.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID; a bare ID falls back to the global flag.
+    pub(crate) fn requires_request_body_buffering(&self, proxy_key: &str) -> bool {
         self.requires_request_buffering
-            .get(proxy_id)
+            .get(proxy_key)
             .copied()
             .unwrap_or(self.global_requires_request_buffering)
     }
 
-    pub(crate) fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
+    /// Parsed-WebSocket-framing requirement for a composed `proxy_key`.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID; a bare ID falls back to the global flag.
+    pub(crate) fn requires_ws_frame_hooks(&self, proxy_key: &str) -> bool {
         self.requires_ws_frame
-            .get(proxy_id)
+            .get(proxy_key)
             .copied()
             .unwrap_or(self.global_requires_ws_frame)
+    }
+
+    /// Initial-response-header policy plugins for `(namespace, proxy_id)`.
+    ///
+    /// Namespace-aware entry point for request paths that need only this one
+    /// value and therefore do not build a full [`Self::request_view`]. It
+    /// composes the runtime key exactly as `request_view` does, so a proxy in a
+    /// non-default namespace resolves to its own policy chain instead of
+    /// silently falling back to the global one.
+    ///
+    /// Zero allocation beyond the reusable thread-local key buffer; the result
+    /// is an `Arc` clone so nothing borrows the buffer.
+    pub(crate) fn initial_response_header_policy_plugins(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.get_initial_response_header_policy_plugins(key.as_str(), protocol)
+        })
     }
 
     pub(crate) fn request_view(
