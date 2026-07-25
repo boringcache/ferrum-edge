@@ -219,16 +219,25 @@ pub mod _test_support {
     }
 
     /// Race `recv` against the UDP reply-task stop signal with the production
-    /// register-then-check ordering.
-    pub async fn udp_reply_recv_until_stop_for_test<F, T>(
+    /// register-then-check ordering. `cancel` is an additional select arm
+    /// (production passes listener/global shutdown; tests pass `pending()`).
+    pub async fn udp_reply_recv_until_stop_for_test<F, C, T>(
         stop_flag: &std::sync::atomic::AtomicBool,
         stop_notify: &tokio::sync::Notify,
         recv: F,
+        cancel: C,
     ) -> Option<T>
     where
         F: std::future::Future<Output = T>,
+        C: std::future::Future<Output = ()>,
     {
-        crate::proxy::udp_proxy::udp_reply_recv_until_stop(stop_flag, stop_notify, recv).await
+        crate::proxy::udp_proxy::udp_reply_recv_until_stop(
+            stop_flag,
+            stop_notify,
+            recv,
+            cancel,
+        )
+        .await
     }
 
     /// Resolve a live UDP `last_client` cache hit, clearing the entry when the

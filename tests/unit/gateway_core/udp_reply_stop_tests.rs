@@ -1,8 +1,11 @@
 //! Regression coverage for UDP reply-task stop lost-wakeup (#2958) and the
 //! `last_client` expired-cache clear.
 //!
-//! These tests exercise the production helpers through `_test_support` so the
-//! stop interleave is deterministic: no sleeps and no backend datagrams.
+//! These tests exercise the production `udp_reply_recv_until_stop` helper
+//! (the same unit `create_session`'s reply loop calls) through `_test_support`
+//! so the stop interleave is deterministic: no sleeps and no backend datagrams.
+//! Tests pass `pending()` as the cancel arm; production composes listener +
+//! global shutdown into that arm instead.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,7 +28,12 @@ async fn udp_reply_stop_before_waiter_returns_without_backend_traffic() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
-        udp_reply_recv_until_stop_for_test(&stop_flag, &stop_notify, std::future::pending::<()>()),
+        udp_reply_recv_until_stop_for_test(
+            &stop_flag,
+            &stop_notify,
+            std::future::pending::<()>(),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect("pre-signaled stop must resolve without waiting on recv");
@@ -53,6 +61,7 @@ async fn udp_reply_stop_after_waiter_parks_wakes_without_backend_traffic() {
         udp_reply_recv_until_stop_for_test(
             flag.as_ref(),
             notify.as_ref(),
+            std::future::pending::<()>(),
             std::future::pending::<()>(),
         )
         .await
@@ -90,7 +99,12 @@ async fn udp_reply_stop_permit_survives_pre_registration_gap() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
-        udp_reply_recv_until_stop_for_test(&stop_flag, &stop_notify, std::future::pending::<()>()),
+        udp_reply_recv_until_stop_for_test(
+            &stop_flag,
+            &stop_notify,
+            std::future::pending::<()>(),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect("stored stop permit/flag must be observed on first await");
@@ -114,6 +128,7 @@ async fn udp_reply_stop_independent_sessions_all_observe_signal() {
             udp_reply_recv_until_stop_for_test(
                 flag.as_ref(),
                 notify.as_ref(),
+                std::future::pending::<()>(),
                 std::future::pending::<()>(),
             )
             .await

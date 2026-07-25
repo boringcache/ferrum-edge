@@ -184,7 +184,6 @@ impl UdpSession {
 /// retained when the reply task has not yet registered a waiter. Paired with
 /// [`udp_reply_recv_until_stop`]'s register-then-check ordering, store+notify
 /// cannot be missed in the gap that previously lost `notify_waiters` wakes.
-#[allow(dead_code)] // also reached via `_test_support`
 pub(crate) fn signal_udp_reply_task_stop(
     stop_flag: &std::sync::atomic::AtomicBool,
     stop_notify: &tokio::sync::Notify,
@@ -193,21 +192,46 @@ pub(crate) fn signal_udp_reply_task_stop(
     stop_notify.notify_one();
 }
 
-/// Race `recv` against the per-session reply-task stop signal.
+/// Wait until listener or global shutdown flips true.
+///
+/// Composed into [`udp_reply_recv_until_stop`]'s cancel arm so the production
+/// reply loop and the deterministic stop tests share one register-then-check
+/// implementation. Stack-allocated via `async fn` (no per-datagram heap).
+async fn udp_reply_shutdown_cancel(
+    listener_shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    global_shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    tokio::select! {
+        _ = listener_shutdown.changed() => {},
+        _ = async {
+            match global_shutdown.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {},
+    }
+}
+
+/// Race `recv` against the per-session reply-task stop signal and an optional
+/// additional cancellation future (listener/global shutdown in production;
+/// `pending()` in unit tests).
 ///
 /// Registers as a `Notify` waiter (via `Notified::enable`) **before** loading
-/// `stop_flag`, then selects the already-enabled future against `recv`.
-/// Returns `None` when stop wins or was already set; `Some` when `recv`
-/// completes first. External tests exercise this exact contract so a stop
-/// interleave never depends on flaky sleeps or backend datagrams.
-#[allow(dead_code)] // also reached via `_test_support`
-pub(crate) async fn udp_reply_recv_until_stop<F, T>(
+/// `stop_flag`, then selects the already-enabled future against `recv` and
+/// `cancel`. Returns `None` when stop or cancel wins (or stop was already
+/// set); `Some` when `recv` completes first. This is the sole copy of the
+/// register-then-check ordering used by `create_session`'s reply loop.
+pub(crate) async fn udp_reply_recv_until_stop<F, C, T>(
     stop_flag: &std::sync::atomic::AtomicBool,
     stop_notify: &tokio::sync::Notify,
     recv: F,
+    cancel: C,
 ) -> Option<T>
 where
     F: std::future::Future<Output = T>,
+    C: std::future::Future<Output = ()>,
 {
     let notified = stop_notify.notified();
     tokio::pin!(notified);
@@ -222,6 +246,7 @@ where
     tokio::select! {
         result = recv => Some(result),
         _ = notified => None,
+        _ = cancel => None,
     }
 }
 
@@ -3861,20 +3886,9 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
-            // Register the stop waiter BEFORE loading the flag (and before
-            // select!) so a concurrent store+notify cannot land in the gap
-            // that previously lost `notify_waiters` wakes. Paired with
-            // `signal_udp_reply_task_stop`'s permit-storing `notify_one`.
-            let stop = reply_stop_notify.notified();
-            tokio::pin!(stop);
-            stop.as_mut().enable();
-
-            if reply_session
-                .stop_reply_task
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                break;
-            }
+            // Listener/global shutdown may already be set; borrow() also
+            // advances each watch "seen" version so the cancel future's
+            // changed() waits for a subsequent change.
             if *reply_listener_shutdown.borrow()
                 || reply_global_shutdown
                     .as_ref()
@@ -3883,21 +3897,23 @@ async fn create_session(
                 break;
             }
 
-            // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
+            // Read from backend — via DTLS (channel-based) or raw UDP
+            // (socket-based). Both paths share `udp_reply_recv_until_stop`
+            // so the register-then-check stop ordering cannot drift from the
+            // deterministic unit tests.
             let (data_slice, data_vec);
             let len;
             if let Some(ref dtls) = reply_dtls {
-                let recv_result = tokio::select! {
-                    result = dtls.recv() => Some(result),
-                    _ = &mut stop => None,
-                    _ = reply_listener_shutdown.changed() => None,
-                    _ = async {
-                        match reply_global_shutdown.as_mut() {
-                            Some(rx) => { let _ = rx.changed().await; }
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => None,
-                };
+                let recv_result = udp_reply_recv_until_stop(
+                    &reply_session.stop_reply_task,
+                    reply_stop_notify.as_ref(),
+                    dtls.recv(),
+                    udp_reply_shutdown_cancel(
+                        &mut reply_listener_shutdown,
+                        &mut reply_global_shutdown,
+                    ),
+                )
+                .await;
                 match recv_result {
                     None => break,
                     Some(Ok(d)) => {
@@ -3925,17 +3941,16 @@ async fn create_session(
                     }
                 }
             } else if let Some(ref sock) = backend_socket {
-                let recv_result = tokio::select! {
-                    result = sock.recv(&mut buf) => Some(result),
-                    _ = &mut stop => None,
-                    _ = reply_listener_shutdown.changed() => None,
-                    _ = async {
-                        match reply_global_shutdown.as_mut() {
-                            Some(rx) => { let _ = rx.changed().await; }
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => None,
-                };
+                let recv_result = udp_reply_recv_until_stop(
+                    &reply_session.stop_reply_task,
+                    reply_stop_notify.as_ref(),
+                    sock.recv(&mut buf),
+                    udp_reply_shutdown_cancel(
+                        &mut reply_listener_shutdown,
+                        &mut reply_global_shutdown,
+                    ),
+                )
+                .await;
                 match recv_result {
                     None => break,
                     Some(Ok(n)) => {
