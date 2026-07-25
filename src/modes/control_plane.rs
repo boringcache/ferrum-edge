@@ -3189,7 +3189,7 @@ mod tests {
 
     #[tokio::test]
     async fn cp_operator_shutdown_preserves_listener_error_when_sibling_stuck() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
