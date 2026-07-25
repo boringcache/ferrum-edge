@@ -2309,20 +2309,23 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             let accumulated = per_choice.entry(index).or_default();
             if let Some(finish_reason) = choice.get("finish_reason")
                 && !finish_reason.is_null()
+                && let Some(finish_reason) = finish_reason.as_str()
             {
-                accumulated.finish_reason = Some(finish_reason.as_str()?.to_string());
+                accumulated.finish_reason = Some(finish_reason.to_string());
             }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
-            let delta = delta.as_object()?;
+            let Some(delta) = delta.as_object() else {
+                continue;
+            };
             if let Some(content) = delta.get("content")
                 && !content.is_null()
+                && let Some(content) = content.as_str()
             {
-                accumulated.content.push_str(content.as_str()?);
+                accumulated.content.push_str(content);
             }
-            if let Some(tool_calls) = delta.get("tool_calls") {
-                let tool_calls = tool_calls.as_array()?;
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 let has_indexless_call = tool_calls
                     .iter()
                     .any(|tool_call| tool_call.get("index").is_none());
@@ -2335,35 +2338,46 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                 }
                 tool_call_choices_seen.insert(index);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
-                    let tool_call = tool_call.as_object()?;
+                    let Some(tool_call) = tool_call.as_object() else {
+                        continue;
+                    };
                     let tool_index = match tool_call.get("index") {
-                        Some(index) => index.as_u64()?,
+                        Some(index) => {
+                            let Some(index) = index.as_u64() else {
+                                continue;
+                            };
+                            index
+                        }
                         None => position as u64,
                     };
                     let call = accumulated.tool_calls.entry(tool_index).or_default();
                     if let Some(id) = tool_call.get("id")
                         && !id.is_null()
+                        && let Some(id) = id.as_str()
                     {
-                        merge_sse_scalar_fragment(&mut call.id, id.as_str()?);
+                        merge_sse_scalar_fragment(&mut call.id, id);
                     }
                     if let Some(call_type) = tool_call.get("type")
                         && !call_type.is_null()
+                        && let Some(call_type) = call_type.as_str()
                     {
-                        merge_sse_scalar_fragment(&mut call.call_type, call_type.as_str()?);
+                        merge_sse_scalar_fragment(&mut call.call_type, call_type);
                     }
                     if let Some(function) = tool_call.get("function")
                         && !function.is_null()
+                        && let Some(function) = function.as_object()
                     {
-                        let function = function.as_object()?;
                         if let Some(name) = function.get("name")
                             && !name.is_null()
+                            && let Some(name) = name.as_str()
                         {
-                            merge_sse_scalar_fragment(&mut call.name, name.as_str()?);
+                            merge_sse_scalar_fragment(&mut call.name, name);
                         }
                         if let Some(arguments) = function.get("arguments")
                             && !arguments.is_null()
+                            && let Some(arguments) = arguments.as_str()
                         {
-                            call.arguments.push_str(arguments.as_str()?);
+                            call.arguments.push_str(arguments);
                         }
                     }
                 }

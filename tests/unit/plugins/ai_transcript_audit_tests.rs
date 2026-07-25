@@ -4587,6 +4587,51 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
 }
 
 #[tokio::test]
+async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let chunks: [&[u8]; 3] = [
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"alice@\"}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"finish_reason\":123,\"delta\":{\"content\":\"example.com\",\"tool_calls\":[{\"index\":0,\"id\":7,\"type\":false,\"function\":{\"name\":[],\"arguments\":{}}}]}}]}\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let mut total = 0u64;
+    for chunk in chunks {
+        let _ = inspector.on_chunk(chunk).await;
+        total += chunk.len() as u64;
+    }
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
+    assert!(!excerpt.contains("alice@") && !excerpt.contains("example.com"));
+}
+
+#[tokio::test]
 async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
