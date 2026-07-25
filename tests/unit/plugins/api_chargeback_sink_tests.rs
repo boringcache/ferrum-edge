@@ -2979,7 +2979,7 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     let (enqueued_while_blocked, written_while_blocked, lost_while_blocked) =
         spool_delivery_totals();
     assert!(
-        enqueued_while_blocked >= enqueued_baseline + 1,
+        enqueued_while_blocked > enqueued_baseline,
         "overflow must enqueue a spool job before the blocking write finishes; baseline={enqueued_baseline} observed={enqueued_while_blocked}"
     );
     assert_eq!(
@@ -3006,7 +3006,7 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
 
     let (enqueued_after_hook, written_after_hook, lost_after_hook) = spool_delivery_totals();
     assert!(
-        enqueued_after_hook >= enqueued_while_blocked + 1,
+        enqueued_after_hook > enqueued_while_blocked,
         "logging hook must enqueue while the prior spool write is still blocked"
     );
     assert_eq!(
