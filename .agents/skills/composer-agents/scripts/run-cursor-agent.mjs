@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Launch a local Cursor SDK agent pinned to grok-4.5 using the same harness
+ * Launch a local Cursor SDK agent pinned to composer-2.5 using the same harness
  * Conductor uses (Application Support @cursor/sdk + CURSOR_API_KEY).
  *
  * Env:
@@ -13,7 +13,7 @@
  *   --worktree ABS_PATH
  *   --prompt-file ABS_PATH
  *   --effort medium|high|xhigh|max  accepted for sibling-skill CLI parity; ignored
- *                                   (Cursor Grok has no effort tiers)
+ *                                   (Composer has no effort tiers)
  *   --name optional agent name
  */
 
@@ -24,6 +24,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+const MODEL_ID = "composer-2.5";
+
 function usage(exitCode = 2) {
   process.stderr.write(
     [
@@ -31,7 +33,7 @@ function usage(exitCode = 2) {
       "                            [--effort medium|high|xhigh|max] [--name NAME]",
       "",
       "Note: --effort is accepted for CLI parity with sibling agent skills but is",
-      "ignored. The Cursor Grok harness has no effort tiers; model is always grok-4.5.",
+      `ignored. Composer has no effort tiers; model is always ${MODEL_ID}.`,
       "",
     ].join("\n"),
   );
@@ -178,7 +180,7 @@ async function main() {
       case "xhigh":
       case "max":
         process.stderr.write(
-          `[grok-agents] ignoring --effort ${args.effort}: Cursor Grok has no effort tiers\n`,
+          `[composer-agents] ignoring --effort ${args.effort}: Composer has no effort tiers\n`,
         );
         break;
       default:
@@ -202,18 +204,18 @@ async function main() {
     throw new Error(`Prompt file is empty: ${args.promptFile}`);
   }
 
-  // Pin the non-Fast inference variant. Cursor's default for grok-4.5 is the
-  // Fast variant (canonical SKU cursor-grok-4.5-high-fast), which bills fast
-  // credits. Supplying params: fast=false selects the standard variant. The
-  // value is the STRING "false", the parameter form @cursor/sdk expects.
-  const model = { id: "grok-4.5", params: [{ id: "fast", value: "false" }] };
+  // Pin the non-Fast inference variant so runs bill at the standard rate
+  // instead of consuming fast credits, exactly as the grok-agents launcher
+  // does. The value is the STRING "false", the parameter form @cursor/sdk
+  // expects.
+  const model = { id: MODEL_ID, params: [{ id: "fast", value: "false" }] };
 
   const { Agent } = loadCursorSdk();
-  const agentId = `grok-agents-${randomUUID()}`;
-  const name = args.name?.trim() || "grok-4.5";
+  const agentId = `composer-agents-${randomUUID()}`;
+  const name = args.name?.trim() || MODEL_ID;
 
   process.stderr.write(
-    `[grok-agents] launching local Cursor agent model=grok-4.5 fast=false cwd=${args.worktree} id=${agentId}\n`,
+    `[composer-agents] launching local Cursor agent model=${MODEL_ID} fast=false cwd=${args.worktree} id=${agentId}\n`,
   );
 
   const agent = await Agent.create({
@@ -231,7 +233,7 @@ async function main() {
 
   try {
     const run = await agent.send(prompt, { model });
-    process.stderr.write(`[grok-agents] run started id=${run.id}\n`);
+    process.stderr.write(`[composer-agents] run started id=${run.id}\n`);
 
     for await (const event of run.stream()) {
       if (!event || typeof event !== "object") {
@@ -240,19 +242,19 @@ async function main() {
       if (event.type === "assistant") {
         emitAssistantText(textFromContent(event.message?.content));
       } else if (event.type === "thinking" && typeof event.text === "string" && event.text) {
-        process.stderr.write(`[grok-agents:thinking] ${event.text}\n`);
+        process.stderr.write(`[composer-agents:thinking] ${event.text}\n`);
       } else if (event.type === "tool_call") {
         const status = event.status ?? "unknown";
         const toolName = event.name ?? "tool";
         if (status === "running") {
-          process.stderr.write(`[grok-agents:tool] ${toolName} starting\n`);
+          process.stderr.write(`[composer-agents:tool] ${toolName} starting\n`);
         } else if (status === "error") {
-          process.stderr.write(`[grok-agents:tool] ${toolName} error\n`);
+          process.stderr.write(`[composer-agents:tool] ${toolName} error\n`);
         }
       } else if (event.type === "status" && event.status === "ERROR") {
         sawStreamError = true;
         streamErrorMessage = event.message ?? "Cursor agent failed";
-        process.stderr.write(`[grok-agents] status error: ${streamErrorMessage}\n`);
+        process.stderr.write(`[composer-agents] status error: ${streamErrorMessage}\n`);
       }
     }
 
@@ -261,30 +263,30 @@ async function main() {
     const result = await run.wait();
     const status = result?.status ?? run.status;
     process.stderr.write(
-      `[grok-agents] run finished status=${status} model=${run.model?.id ?? model.id}\n`,
+      `[composer-agents] run finished status=${status} model=${run.model?.id ?? model.id}\n`,
     );
 
     if (sawStreamError) {
-      throw new Error(streamErrorMessage || "Cursor Grok agent reported a stream ERROR");
+      throw new Error(streamErrorMessage || "Cursor Composer agent reported a stream ERROR");
     }
     if (status === "error") {
-      throw new Error(run.result ?? result?.result ?? "Cursor Grok agent failed");
+      throw new Error(run.result ?? result?.result ?? "Cursor Composer agent failed");
     }
     if (status === "cancelled") {
-      throw new Error("Cursor Grok agent was cancelled");
+      throw new Error("Cursor Composer agent was cancelled");
     }
   } finally {
     try {
       agent.close();
     } catch (closeErr) {
       const message = closeErr instanceof Error ? closeErr.message : String(closeErr);
-      process.stderr.write(`[grok-agents] agent.close() failed: ${message}\n`);
+      process.stderr.write(`[composer-agents] agent.close() failed: ${message}\n`);
     }
   }
 }
 
 main().catch((err) => {
   const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`[grok-agents] ${message}\n`);
+  process.stderr.write(`[composer-agents] ${message}\n`);
   process.exitCode = 1;
 });
