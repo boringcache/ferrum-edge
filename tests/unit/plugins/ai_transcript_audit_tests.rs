@@ -5315,7 +5315,10 @@ async fn huge_model_is_bounded_with_truncation_hash() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
-    let huge_model = "m".repeat(MAX_MODEL_BYTES + 4096);
+    // The excess bytes must differ from the retained prefix: a single-character
+    // fixture cannot observe a bypass, because any slice past the ceiling is
+    // trivially "contained" in the bounded prefix.
+    let huge_model = "m".repeat(MAX_MODEL_BYTES) + &"z".repeat(4096);
     let body =
         format!(r#"{{"model":"{huge_model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
     let mut ctx = make_ctx();
@@ -5360,7 +5363,9 @@ async fn huge_tool_count_and_name_lengths_are_bounded() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
-    let long_name = "t".repeat(MAX_TOOL_NAME_BYTES + 64);
+    // Excess bytes differ from the retained prefix so the per-name and
+    // record-wide leak assertions below can actually observe a bypass.
+    let long_name = "t".repeat(MAX_TOOL_NAME_BYTES) + &"z".repeat(64);
     let mut tools = Vec::new();
     for index in 0..(MAX_TOOL_NAMES + 32) {
         let name = if index == 0 {
@@ -5375,9 +5380,13 @@ async fn huge_tool_count_and_name_lengths_are_bounded() {
         let name = format!("{}{index}", "a".repeat(MAX_TOOL_NAME_BYTES));
         tools.push(json!({"type":"function","function":{"name": name}}));
     }
+    // Pad the prompt past `max_request_bytes` so the `full_body` raw request
+    // excerpt (an explicit opt-in that legitimately keeps raw bytes) can never
+    // reach the tool array; the record-wide assertion then only observes the
+    // bounded `tool_names`.
     let body = json!({
         "model": "gpt-4o",
-        "messages": [{"role":"user","content":"hi"}],
+        "messages": [{"role":"user","content": "h".repeat(512)}],
         "tools": tools
     });
     let body_bytes = serde_json::to_vec(&body).unwrap();
@@ -5504,16 +5513,16 @@ async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
     let ssn = "123-45-6789";
     let model_pad = MAX_MODEL_BYTES - 6;
     let tool_pad = MAX_TOOL_NAME_BYTES - 6;
-    let huge_model = format!("{}{ssn}", "m".repeat(model_pad));
-    let huge_tool = format!("{}{ssn}", "t".repeat(tool_pad));
-    assert_eq!(
-        &huge_model[..MAX_MODEL_BYTES],
-        format!("{}123-45", "m".repeat(model_pad))
-    );
-    assert_eq!(
-        &huge_tool[..MAX_TOOL_NAME_BYTES],
-        format!("{}123-45", "t".repeat(tool_pad))
-    );
+    // The pad ends on a non-word character so the SSN is a real `\b`-delimited
+    // span: a digit run glued to word characters is not PII to the builtin
+    // pattern, and the fixture would prove nothing about ordering.
+    let model_lead = "m".repeat(model_pad - 1) + "/";
+    let tool_lead = "t".repeat(tool_pad - 1) + "/";
+    let huge_model = format!("{model_lead}{ssn}");
+    let huge_tool = format!("{tool_lead}{ssn}");
+    // Straddle check: the retained window ends mid-SSN.
+    assert!(huge_model[..MAX_MODEL_BYTES].ends_with("123-45"));
+    assert!(huge_tool[..MAX_TOOL_NAME_BYTES].ends_with("123-45"));
 
     let body = json!({
         "model": huge_model.clone(),

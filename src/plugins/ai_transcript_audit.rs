@@ -838,6 +838,7 @@ impl AiTranscriptAudit {
     }
 
     /// Effective admitted capture ceilings for authenticated status / tests.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn status_snapshot(&self) -> AiTranscriptAuditSnapshot {
         self.status_snapshot_for_id(self.status_id.get().copied().unwrap_or(0))
     }
