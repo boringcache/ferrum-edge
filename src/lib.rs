@@ -3786,6 +3786,8 @@ pub mod _test_support {
             published
         };
         (config, accepted, rejected)
+    }
+
     /// Drive CP listener supervision the same way `control_plane::run` does,
     /// so external tests can assert Ok/Err without constructing a full CP.
     pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
