@@ -11419,8 +11419,9 @@ mod inner {
     impl MongoStore {
         /// Chunked, namespace-scoped audit retention (parity with SQL).
         /// Explicit calls always evaluate the max-row soft cap; insert-path
-        /// piggyback uses [`AuditMaxRowsPruneGate`] so steady-state inserts do
-        /// not pay an O(max_rows) boundary scan on every write.
+        /// piggyback uses [`crate::admin::audit::AuditMaxRowsPruneGate`] so
+        /// steady-state inserts do not pay an O(max_rows) boundary scan on
+        /// every write.
         pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
             self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
                 .await

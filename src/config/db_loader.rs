@@ -8091,8 +8091,9 @@ impl DatabaseStore {
     /// [`AUDIT_RETENTION_PRUNE_MAX_BATCHES`] and uses `idx_audit_events_namespace_ts_id`.
     ///
     /// Explicit calls always evaluate the max-row soft cap. Insert-path
-    /// piggyback uses [`AuditMaxRowsPruneGate`] so steady-state inserts do not
-    /// pay an O(max_rows) boundary scan on every write.
+    /// piggyback uses [`crate::admin::audit::AuditMaxRowsPruneGate`] so
+    /// steady-state inserts do not pay an O(max_rows) boundary scan on every
+    /// write.
     pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
             .await
