@@ -43,7 +43,9 @@ use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
-use crate::k8s_controller::{K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot};
+use crate::k8s_controller::{
+    CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+};
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
@@ -910,8 +912,14 @@ async fn settle_full_reload_rejection_state(
 
 /// Publish a DB full-reload snapshot with K8s overlay re-merge + CAS, then
 /// broadcast only namespaces that successfully refreshed (#2982 / #2983 / #2984).
+///
+/// Commit and emissions run inside one [`CpPublicationGate`] section so a
+/// concurrent K8s reconcile can neither observe a committed-but-unbroadcast
+/// snapshot nor slip its own newer full snapshot in front of this one's
+/// broadcasts.
 #[allow(clippy::too_many_arguments)]
-fn publish_cp_full_reload(
+pub(crate) fn publish_cp_full_reload(
+    publication_gate: &CpPublicationGate,
     config_arc: &ArcSwap<GatewayConfig>,
     overlay_slot: &K8sOverlaySlot,
     db_config: GatewayConfig,
@@ -922,17 +930,120 @@ fn publish_cp_full_reload(
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
 ) {
-    let published = cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
-    for namespace in refreshed_namespaces {
-        CpGrpcServer::broadcast_namespace_update(
-            broadcasts,
-            namespace,
-            published.as_ref(),
-            dp_registry,
-            cp_scope,
-        );
+    publication_gate.publish(move || {
+        let published =
+            cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
+        for namespace in refreshed_namespaces {
+            CpGrpcServer::broadcast_namespace_update(
+                broadcasts,
+                namespace,
+                published.as_ref(),
+                dp_registry,
+                cp_scope,
+            );
+        }
+        MeshGrpcServer::broadcast_full_with_registry(mesh_update_tx, published, mesh_registry);
+    });
+}
+
+/// Union of exactly the accepted per-namespace deltas.
+///
+/// Mesh subscribers are not namespace-partitioned, so they receive one merged
+/// delta — never a rejected namespace's rows.
+fn union_accepted_deltas(
+    outcome: &PartitionComposeOutcome,
+    sequence_cursor: u64,
+    poll_timestamp: chrono::DateTime<chrono::Utc>,
+) -> IncrementalResult {
+    let mut union = IncrementalResult {
+        added_or_modified_proxies: Vec::new(),
+        removed_proxy_ids: Vec::new(),
+        added_or_modified_consumers: Vec::new(),
+        removed_consumer_ids: Vec::new(),
+        added_or_modified_plugin_configs: Vec::new(),
+        removed_plugin_config_ids: Vec::new(),
+        added_or_modified_upstreams: Vec::new(),
+        removed_upstream_ids: Vec::new(),
+        sequence_cursor,
+        poll_timestamp,
+    };
+    for delta in outcome.accepted.values() {
+        let delta = delta.clone();
+        union
+            .added_or_modified_proxies
+            .extend(delta.added_or_modified_proxies);
+        union.removed_proxy_ids.extend(delta.removed_proxy_ids);
+        union
+            .added_or_modified_consumers
+            .extend(delta.added_or_modified_consumers);
+        union.removed_consumer_ids.extend(delta.removed_consumer_ids);
+        union
+            .added_or_modified_plugin_configs
+            .extend(delta.added_or_modified_plugin_configs);
+        union
+            .removed_plugin_config_ids
+            .extend(delta.removed_plugin_config_ids);
+        union
+            .added_or_modified_upstreams
+            .extend(delta.added_or_modified_upstreams);
+        union.removed_upstream_ids.extend(delta.removed_upstream_ids);
     }
-    MeshGrpcServer::broadcast_full_with_registry(mesh_update_tx, published, mesh_registry);
+    union
+}
+
+/// CAS-publish the accepted incremental partitions and emit their per-namespace
+/// DP deltas plus the mesh union delta inside one [`CpPublicationGate`] section.
+///
+/// This is the dangerous half of the ordering problem: the commit here is a
+/// *delta* while the reconciler's publication is a *full* snapshot. If a
+/// reconciler full computed before this commit were emitted after these deltas,
+/// subscribers would apply it last and silently erase the delta they had just
+/// accepted, even though `config_arc` still contains it.
+///
+/// Emissions are skipped exactly when nothing was committed: an all-rejected
+/// compose leaves the `ArcSwap` untouched, so there is no publication to order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_cp_incremental(
+    publication_gate: &CpPublicationGate,
+    config_arc: &ArcSwap<GatewayConfig>,
+    partitions: &HashMap<String, IncrementalResult>,
+    version: &str,
+    sequence_cursor: u64,
+    poll_timestamp: chrono::DateTime<chrono::Utc>,
+    broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+    dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+    cp_scope: &CpScope,
+    mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
+    mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+) -> PartitionComposeOutcome {
+    publication_gate.publish(|| {
+        let outcome = cas_publish_incremental_partitions(config_arc, partitions);
+        if outcome.accepted.is_empty() {
+            return outcome;
+        }
+
+        // Broadcast only accepted partitions (#2983).
+        for (namespace, namespace_delta) in &outcome.accepted {
+            CpGrpcServer::broadcast_namespace_delta(
+                broadcasts,
+                namespace,
+                namespace_delta,
+                version,
+                dp_registry,
+                None,
+                cp_scope,
+            );
+        }
+
+        let mesh_delta = union_accepted_deltas(&outcome, sequence_cursor, poll_timestamp);
+        MeshGrpcServer::broadcast_delta_with_registry(
+            mesh_update_tx,
+            mesh_delta,
+            version,
+            mesh_registry,
+        );
+        outcome
+    })
 }
 
 fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
@@ -1343,6 +1454,9 @@ pub async fn run(
     // and the DB poll loop (reader/composer). Empty until the first accepted
     // reconcile; full DB reloads re-merge through this slot (#2982).
     let k8s_overlay_slot = empty_k8s_overlay_slot();
+    // Shared by the two CP config writers (DB poll loop + K8s reconciler) so
+    // commit order and DP/mesh broadcast order are the same order.
+    let publication_gate = CpPublicationGate::new();
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -1903,6 +2017,7 @@ pub async fn run(
             dp_registry.clone(),
             mesh_update_tx.clone(),
             mesh_registry.clone(),
+            publication_gate.clone(),
             shutdown_tx.subscribe(),
         )
         .await
@@ -1946,6 +2061,7 @@ pub async fn run(
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
     let overlay_poll = k8s_overlay_slot.clone();
+    let publication_gate_poll = publication_gate.clone();
     let db_available_poll = db_available.clone();
     let config_rejected_poll = config_rejected.clone();
     let mut cp_poll_shutdown = shutdown_tx.subscribe();
@@ -2108,6 +2224,7 @@ pub async fn run(
                                 rejected_delta_tracker.record_accepted();
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 publish_cp_full_reload(
+                                    &publication_gate_poll,
                                     config_poll.as_ref(),
                                     &overlay_poll,
                                     outcome.config,
@@ -2284,8 +2401,23 @@ pub async fn run(
                                     continue;
                                 }
 
-                                let compose =
-                                    cas_publish_incremental_partitions(config_poll.as_ref(), &partitions);
+                                // Commit + DP/mesh emission are one publication
+                                // section, so a concurrent K8s reconcile full
+                                // snapshot can never be emitted after these
+                                // deltas and erase them in subscribers.
+                                let compose = publish_cp_incremental(
+                                    &publication_gate_poll,
+                                    config_poll.as_ref(),
+                                    &partitions,
+                                    &version,
+                                    result.sequence_cursor,
+                                    poll_ts,
+                                    poll_broadcasts.as_ref(),
+                                    &dp_registry_poll,
+                                    &poll_scope,
+                                    &mesh_update_tx,
+                                    &mesh_registry_poll,
+                                );
 
                                 // Warn-only validators (same set as
                                 // `ProxyState::validate_full_config`) run on the
@@ -2373,6 +2505,7 @@ pub async fn run(
                                                 );
                                                 last_polled_namespaces = nslist.clone();
                                                 publish_cp_full_reload(
+                                                    &publication_gate_poll,
                                                     config_poll.as_ref(),
                                                     &overlay_poll,
                                                     outcome.config,
@@ -2429,67 +2562,9 @@ pub async fn run(
                                     }
                                 }
 
-                                // Broadcast only accepted partitions; advance
-                                // cursors only for those namespaces (#2983).
-                                for (ns, ns_delta) in &compose.accepted {
-                                    CpGrpcServer::broadcast_namespace_delta(
-                                        poll_broadcasts.as_ref(),
-                                        ns,
-                                        ns_delta,
-                                        &version,
-                                        &dp_registry_poll,
-                                        None,
-                                        &poll_scope,
-                                    );
-                                }
-                                // Mesh subscribers are not namespace-partitioned,
-                                // so they receive the union of exactly the
-                                // accepted per-namespace deltas — never a
-                                // rejected namespace's rows.
-                                let mut mesh_delta = IncrementalResult {
-                                    added_or_modified_proxies: Vec::new(),
-                                    removed_proxy_ids: Vec::new(),
-                                    added_or_modified_consumers: Vec::new(),
-                                    removed_consumer_ids: Vec::new(),
-                                    added_or_modified_plugin_configs: Vec::new(),
-                                    removed_plugin_config_ids: Vec::new(),
-                                    added_or_modified_upstreams: Vec::new(),
-                                    removed_upstream_ids: Vec::new(),
-                                    sequence_cursor: result.sequence_cursor,
-                                    poll_timestamp: poll_ts,
-                                };
-                                for delta in compose.accepted.values() {
-                                    mesh_delta
-                                        .added_or_modified_proxies
-                                        .extend(delta.added_or_modified_proxies.iter().cloned());
-                                    mesh_delta
-                                        .removed_proxy_ids
-                                        .extend(delta.removed_proxy_ids.iter().cloned());
-                                    mesh_delta
-                                        .added_or_modified_consumers
-                                        .extend(delta.added_or_modified_consumers.iter().cloned());
-                                    mesh_delta
-                                        .removed_consumer_ids
-                                        .extend(delta.removed_consumer_ids.iter().cloned());
-                                    mesh_delta.added_or_modified_plugin_configs.extend(
-                                        delta.added_or_modified_plugin_configs.iter().cloned(),
-                                    );
-                                    mesh_delta
-                                        .removed_plugin_config_ids
-                                        .extend(delta.removed_plugin_config_ids.iter().cloned());
-                                    mesh_delta
-                                        .added_or_modified_upstreams
-                                        .extend(delta.added_or_modified_upstreams.iter().cloned());
-                                    mesh_delta
-                                        .removed_upstream_ids
-                                        .extend(delta.removed_upstream_ids.iter().cloned());
-                                }
-                                MeshGrpcServer::broadcast_delta_with_registry(
-                                    &mesh_update_tx,
-                                    mesh_delta,
-                                    &version,
-                                    &mesh_registry_poll,
-                                );
+                                // Deltas were already emitted with the commit
+                                // above. Advance cursors only for the accepted
+                                // namespaces (#2983).
                                 info!(
                                     "Incremental config update validated and pushed to {} namespace(s) (version={})",
                                     compose.accepted.len(),
@@ -2555,6 +2630,7 @@ pub async fn run(
                                         );
                                         rejected_delta_tracker.record_accepted();
                                         publish_cp_full_reload(
+                                            &publication_gate_poll,
                                             config_poll.as_ref(),
                                             &overlay_poll,
                                             outcome.config,
@@ -2637,6 +2713,7 @@ pub async fn run(
                                                         );
                                                         rejected_delta_tracker.record_accepted();
                                                         publish_cp_full_reload(
+                                                            &publication_gate_poll,
                                                             config_poll.as_ref(),
                                                             &overlay_poll,
                                                             outcome.config,

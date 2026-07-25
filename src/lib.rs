@@ -3584,9 +3584,84 @@ pub mod _test_support {
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::{
-        AcceptedK8sOverlay, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
-        merge_k8s_translation, store_accepted_k8s_overlay, swap_merged_k8s_translation,
+        AcceptedK8sOverlay, CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay,
+        empty_k8s_overlay_slot, merge_k8s_translation, publish_k8s_reconcile,
+        store_accepted_k8s_overlay, swap_merged_k8s_translation,
     };
+
+    /// Thin wrapper over the production CP full-reload publication so external
+    /// tests can drive it against real broadcast channels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_full_reload_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+        refreshed_namespaces: &[String],
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) {
+        crate::modes::control_plane::publish_cp_full_reload(
+            publication_gate,
+            config_arc,
+            overlay_slot,
+            db_config,
+            refreshed_namespaces,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+    }
+
+    /// Thin wrapper over the production CP incremental publication.
+    ///
+    /// Returns `(accepted_namespaces, rejected_namespaces)`; the composed view
+    /// itself is not exposed because it carries consumer credentials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_incremental_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+        version: &str,
+        sequence_cursor: u64,
+        poll_timestamp: chrono::DateTime<chrono::Utc>,
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) -> (Vec<String>, Vec<String>) {
+        let outcome = crate::modes::control_plane::publish_cp_incremental(
+            publication_gate,
+            config_arc,
+            partitions,
+            version,
+            sequence_cursor,
+            poll_timestamp,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (accepted, rejected)
+    }
 
     pub fn cas_publish_db_snapshot_with_k8s_overlay_for_test(
         config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,

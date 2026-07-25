@@ -1,25 +1,36 @@
-//! CP DB-poll / Kubernetes-overlay isolation (issues #2982–#2984).
+//! CP DB-poll / Kubernetes-overlay isolation (issues #2982–#2984) and CP
+//! publication ordering.
 //!
 //! Covers overlay survival across full DB reload, per-namespace failure
-//! isolation, and concurrent poll/reconcile CAS publication.
+//! isolation, concurrent poll/reconcile CAS publication, and the requirement
+//! that the order in which snapshots are committed to `config_arc` is the order
+//! in which DP and mesh subscribers observe them.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
-    cas_publish_db_snapshot_with_k8s_overlay_for_test, cas_publish_incremental_partitions_for_test,
-    compose_db_with_k8s_overlay, compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
+    CpPublicationGate, K8sOverlaySlot, cas_publish_db_snapshot_with_k8s_overlay_for_test,
+    cas_publish_incremental_partitions_for_test, compose_db_with_k8s_overlay,
+    compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
+    publish_cp_full_reload_for_test, publish_cp_incremental_for_test, publish_k8s_reconcile,
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
 use ferrum_edge::config::db_backend::IncrementalResult;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
 };
+use ferrum_edge::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
+use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
+use ferrum_edge::grpc::mesh_server::MeshConfigBroadcast;
+use ferrum_edge::grpc::proto::ConfigUpdate;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService};
+use tokio::sync::broadcast;
 
 fn empty_incremental() -> IncrementalResult {
     IncrementalResult {
@@ -300,4 +311,327 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
             .any(|p| p.id == "gwapi-route-overlay"),
         "concurrent reconciler overlay must survive incremental CAS"
     );
+}
+
+
+// ── CP publication ordering ─────────────────────────────────────────────────
+//
+// CAS makes each commit atomic but says nothing about the emissions that follow
+// it. The CP has two independent writers — the DB poll loop and the K8s
+// reconciler — and both DP (`ConfigUpdate.version` is informational) and mesh
+// (`MeshConfigBroadcast::Full` carries no generation) subscribers apply strictly
+// in arrival order. So the only thing keeping a subscriber from ending on a
+// snapshot older than `config_arc` is that commit order equals broadcast order,
+// which is what `CpPublicationGate` enforces and what these tests assert.
+//
+// The assertions are interleaving-independent: they hold for EVERY schedule, so
+// they never depend on sleeps or on winning a timing race.
+
+const PUBLICATION_ROUNDS: usize = 150;
+const TEST_BROADCAST_CAPACITY: usize = 8192;
+
+/// Everything the two CP writers publish through, wired to real broadcast
+/// channels so the tests observe exactly what a DP and a mesh node would.
+struct PublicationHarness {
+    gate: CpPublicationGate,
+    config_arc: Arc<ArcSwap<GatewayConfig>>,
+    overlay_slot: K8sOverlaySlot,
+    broadcasts: Arc<NamespaceBroadcasts>,
+    dp_registry: Arc<DpNodeRegistry>,
+    cp_scope: CpScope,
+    mesh_tx: broadcast::Sender<MeshConfigBroadcast>,
+    mesh_registry: Arc<MeshNodeRegistry>,
+}
+
+impl PublicationHarness {
+    fn new(initial: GatewayConfig) -> (Self, broadcast::Receiver<ConfigUpdate>) {
+        let broadcasts = Arc::new(NamespaceBroadcasts::new(TEST_BROADCAST_CAPACITY));
+        // Subscribe before any publication: the broadcast helpers no-op when no
+        // channel exists for the namespace yet.
+        let dp_rx = broadcasts.sender_for("ferrum").subscribe();
+        let (mesh_tx, _) = broadcast::channel(TEST_BROADCAST_CAPACITY);
+        let harness = Self {
+            gate: CpPublicationGate::new(),
+            config_arc: Arc::new(ArcSwap::from_pointee(initial)),
+            overlay_slot: empty_k8s_overlay_slot(),
+            broadcasts,
+            dp_registry: Arc::new(DpNodeRegistry::new()),
+            cp_scope: CpScope::Single("ferrum".to_string()),
+            mesh_tx,
+            mesh_registry: Arc::new(MeshNodeRegistry::new()),
+        };
+        (harness, dp_rx)
+    }
+
+    fn mesh_subscribe(&self) -> broadcast::Receiver<MeshConfigBroadcast> {
+        self.mesh_tx.subscribe()
+    }
+
+    fn publish_full_db_snapshot(&self, db_config: GatewayConfig) {
+        publish_cp_full_reload_for_test(
+            &self.gate,
+            self.config_arc.as_ref(),
+            &self.overlay_slot,
+            db_config,
+            &["ferrum".to_string()],
+            self.broadcasts.as_ref(),
+            self.dp_registry.as_ref(),
+            &self.cp_scope,
+            &self.mesh_tx,
+            self.mesh_registry.as_ref(),
+        );
+    }
+
+    fn publish_incremental(&self, partitions: &HashMap<String, IncrementalResult>, round: usize) {
+        publish_cp_incremental_for_test(
+            &self.gate,
+            self.config_arc.as_ref(),
+            partitions,
+            &format!("delta-{round}"),
+            round as u64,
+            Utc::now(),
+            self.broadcasts.as_ref(),
+            self.dp_registry.as_ref(),
+            &self.cp_scope,
+            &self.mesh_tx,
+            self.mesh_registry.as_ref(),
+        );
+    }
+
+    fn publish_reconcile(&self, translation: &GatewayConfig, managed: &BTreeSet<String>) {
+        publish_k8s_reconcile(
+            &self.gate,
+            self.config_arc.as_ref(),
+            &self.overlay_slot,
+            translation,
+            managed,
+            "ferrum",
+            self.broadcasts.as_ref(),
+            self.dp_registry.as_ref(),
+            &self.cp_scope,
+            &self.mesh_tx,
+            self.mesh_registry.as_ref(),
+        );
+    }
+}
+
+fn proxy_ids(config: &GatewayConfig) -> BTreeSet<String> {
+    config.proxies.iter().map(|p| p.id.clone()).collect()
+}
+
+fn json_ids(payload: &serde_json::Value, field: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
+        return ids;
+    };
+    for item in items {
+        if let Some(id) = item.get("id").and_then(|id| id.as_str()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn json_strings(payload: &serde_json::Value, field: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let Some(items) = payload.get(field).and_then(|value| value.as_array()) else {
+        return values;
+    };
+    for item in items {
+        if let Some(value) = item.as_str() {
+            values.push(value.to_string());
+        }
+    }
+    values
+}
+
+/// Fold a mesh broadcast into the state a mesh node would hold, exactly as a
+/// subscriber does: `Full` replaces, `Delta` applies on top, arrival order only.
+fn apply_mesh_event(state: &mut BTreeSet<String>, event: &MeshConfigBroadcast) {
+    match event {
+        MeshConfigBroadcast::Full(config) => *state = proxy_ids(config),
+        MeshConfigBroadcast::Delta { result, .. } => {
+            for proxy in &result.added_or_modified_proxies {
+                state.insert(proxy.id.clone());
+            }
+            for id in &result.removed_proxy_ids {
+                state.remove(id);
+            }
+        }
+    }
+}
+
+/// The same fold over the wire payload the CP actually sends to a DP.
+fn apply_dp_event(state: &mut BTreeSet<String>, update: &ConfigUpdate) {
+    let payload: serde_json::Value =
+        serde_json::from_str(&update.config_json).expect("CP payload must be JSON");
+    if update.update_type == 0 {
+        *state = json_ids(&payload, "proxies").into_iter().collect();
+        return;
+    }
+    for id in json_ids(&payload, "added_or_modified_proxies") {
+        state.insert(id);
+    }
+    for id in json_strings(&payload, "removed_proxy_ids") {
+        state.remove(&id);
+    }
+}
+
+fn drain<T: Clone>(rx: &mut broadcast::Receiver<T>) -> Vec<T> {
+    let mut events = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(event) => events.push(event),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("test subscriber lagged by {skipped}; raise the capacity")
+            }
+            Err(_) => break,
+        }
+    }
+    events
+}
+
+fn k8s_translation(round: usize) -> GatewayConfig {
+    let mut translation = GatewayConfig::default();
+    let proxy = make_proxy(&format!("gwapi-route-{round}"), "ferrum");
+    translation.proxies.push(proxy);
+    translation
+}
+
+#[test]
+fn publication_gate_orders_a_second_publisher_after_the_first() {
+    // The primitive contract: no publication may begin while another is in
+    // flight, so a commit can never be separated from its own broadcasts.
+    let gate = CpPublicationGate::new();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let (order_tx, order_rx) = mpsc::channel::<&'static str>();
+
+    let second = {
+        let gate = gate.clone();
+        let entered = Arc::clone(&entered);
+        let order_tx = order_tx.clone();
+        thread::spawn(move || {
+            entered.wait();
+            gate.publish(|| {
+                let _ = order_tx.send("second");
+            });
+        })
+    };
+
+    gate.publish(|| {
+        // Release the second publisher only once this section is open. It can
+        // record itself only from inside its own section, which cannot begin
+        // until this one ends, so "first" is always recorded first.
+        entered.wait();
+        let _ = order_tx.send("first");
+    });
+
+    second.join().expect("second publisher thread");
+    drop(order_tx);
+    let observed: Vec<&'static str> = order_rx.iter().collect();
+    assert_eq!(observed, vec!["first", "second"], "sections must not overlap");
+}
+
+#[test]
+fn competing_full_publications_never_end_on_a_stale_snapshot() {
+    // Full-vs-full: the poller commits a DB snapshot while the reconciler
+    // commits DB+overlay. Without shared ordering the poller can broadcast its
+    // older snapshot after the reconciler broadcast the newer one, leaving
+    // every DP and mesh node permanently behind `config_arc`.
+    let mut initial = GatewayConfig::default();
+    initial.proxies.push(make_proxy("db-0", "ferrum"));
+    let (harness, mut dp_rx) = PublicationHarness::new(initial);
+    let mut mesh_rx = harness.mesh_subscribe();
+    let harness = Arc::new(harness);
+    let managed = BTreeSet::from(["ferrum".to_string()]);
+
+    let reconciler = {
+        let harness = Arc::clone(&harness);
+        let managed = managed.clone();
+        thread::spawn(move || {
+            for round in 1..=PUBLICATION_ROUNDS {
+                harness.publish_reconcile(&k8s_translation(round), &managed);
+            }
+        })
+    };
+
+    for round in 1..=PUBLICATION_ROUNDS {
+        let proxy = make_proxy(&format!("db-{round}"), "ferrum");
+        let mut db_config = GatewayConfig::default();
+        db_config.proxies.push(proxy);
+        harness.publish_full_db_snapshot(db_config);
+    }
+    reconciler.join().expect("reconciler thread");
+
+    let committed = proxy_ids(&harness.config_arc.load_full());
+
+    let mesh_events = drain(&mut mesh_rx);
+    assert!(!mesh_events.is_empty(), "mesh subscribers must see traffic");
+    let mut mesh_state = BTreeSet::new();
+    for event in &mesh_events {
+        apply_mesh_event(&mut mesh_state, event);
+    }
+    assert_eq!(mesh_state, committed, "mesh must end on the committed snapshot");
+
+    let dp_events = drain(&mut dp_rx);
+    assert!(!dp_events.is_empty(), "DP subscribers must see traffic");
+    let mut dp_state = BTreeSet::new();
+    for event in &dp_events {
+        apply_dp_event(&mut dp_state, event);
+    }
+    assert_eq!(dp_state, committed, "DP must end on the committed snapshot");
+}
+
+#[test]
+fn reconcile_full_never_erases_a_newer_committed_poll_delta() {
+    // Reconcile-full vs poll-delta — the dangerous direction. A full snapshot
+    // computed before a delta commits but emitted after it would silently roll
+    // that delta back in every subscriber while `config_arc` still holds it.
+    let mut initial = GatewayConfig::default();
+    initial.proxies.push(make_proxy("db-base", "ferrum"));
+    let (harness, mut dp_rx) = PublicationHarness::new(initial.clone());
+    let mut mesh_rx = harness.mesh_subscribe();
+    let harness = Arc::new(harness);
+    let managed = BTreeSet::from(["ferrum".to_string()]);
+
+    let reconciler = {
+        let harness = Arc::clone(&harness);
+        let managed = managed.clone();
+        thread::spawn(move || {
+            for round in 1..=PUBLICATION_ROUNDS {
+                harness.publish_reconcile(&k8s_translation(round), &managed);
+            }
+        })
+    };
+
+    for round in 1..=PUBLICATION_ROUNDS {
+        let mut delta = empty_incremental();
+        delta.added_or_modified_proxies = vec![make_proxy(&format!("db-delta-{round}"), "ferrum")];
+        let partitions = HashMap::from([("ferrum".to_string(), delta)]);
+        harness.publish_incremental(&partitions, round);
+    }
+    reconciler.join().expect("reconciler thread");
+
+    let committed = proxy_ids(&harness.config_arc.load_full());
+    for round in 1..=PUBLICATION_ROUNDS {
+        let id = format!("db-delta-{round}");
+        assert!(committed.contains(&id), "accepted deltas must be committed");
+    }
+
+    // Replaying the emissions in arrival order must land exactly on the
+    // committed snapshot: no full may have overwritten a delta that was already
+    // committed when that full was emitted.
+    let mesh_events = drain(&mut mesh_rx);
+    let mut mesh_state = proxy_ids(&initial);
+    for event in &mesh_events {
+        apply_mesh_event(&mut mesh_state, event);
+    }
+    assert_eq!(mesh_state, committed, "a stale full must not erase a delta");
+
+    let dp_events = drain(&mut dp_rx);
+    let mut dp_state = proxy_ids(&initial);
+    for event in &dp_events {
+        apply_dp_event(&mut dp_state, event);
+    }
+    assert_eq!(dp_state, committed, "the DP stream must not roll back");
 }

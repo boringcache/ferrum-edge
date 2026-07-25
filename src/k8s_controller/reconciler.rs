@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -44,6 +44,50 @@ pub type K8sOverlaySlot = Arc<ArcSwap<Option<AcceptedK8sOverlay>>>;
 /// Create an empty overlay slot (no K8s translation accepted yet).
 pub fn empty_k8s_overlay_slot() -> K8sOverlaySlot {
     Arc::new(ArcSwap::from_pointee(None))
+}
+
+/// Serializes CP configuration publication so the order in which snapshots are
+/// committed to `config_arc` is the order in which DP and mesh subscribers
+/// observe them.
+///
+/// Both CP writers — the DB poll loop and the K8s reconciler — compare-and-swap
+/// into the same `ArcSwap` and then broadcast. CAS alone only makes each commit
+/// atomic; it says nothing about the emissions that follow. Without a shared
+/// gate the two steps interleave: the poller commits DB snapshot `D1`, the
+/// reconciler commits `D1 + overlay` and broadcasts it, and the poller then
+/// broadcasts its older `D1` — leaving every DP and mesh node on a snapshot
+/// older than `config_arc`. The reverse order lets a reconciler full snapshot
+/// land after a newer poll delta and erase it. Neither consumer can repair the
+/// inversion: `ConfigUpdate.version` is informational on the DP and
+/// `MeshConfigBroadcast::Full` carries no monotonic generation, so both apply
+/// strictly in arrival order.
+///
+/// Deliberately a plain synchronous mutex. Everything it guards is a background
+/// task's CAS, serialization, and `broadcast::Sender::send` — all synchronous
+/// and short. Nothing on the proxy request path takes it, and because
+/// [`Self::publish`] accepts a synchronous `FnOnce`, a future can never hold it
+/// across an `.await`; that is enforced by the signature, not by convention.
+#[derive(Clone, Default)]
+pub struct CpPublicationGate {
+    inner: Arc<Mutex<()>>,
+}
+
+impl CpPublicationGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run `publish` with exclusive CP publication rights.
+    ///
+    /// Poison-free by construction: the gate guards `()`, so a panic in another
+    /// publication leaves behind no state a later publisher could misread. The
+    /// poison flag is therefore recovered rather than propagated — a panic in
+    /// one background task must not wedge config distribution for the process,
+    /// and recovering here keeps the path free of `unwrap`/`expect`.
+    pub fn publish<R>(&self, publish: impl FnOnce() -> R) -> R {
+        let _guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        publish()
+    }
 }
 
 /// Record the last accepted K8s translation for later CP full-reload re-merge.
@@ -101,6 +145,9 @@ pub struct ReconcileBroadcasters {
     pub dp_registry: Arc<DpNodeRegistry>,
     pub mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     pub mesh_registry: Arc<MeshNodeRegistry>,
+    /// Shared with the CP DB poll loop so reconciler and poller publications
+    /// are totally ordered against each other (see [`CpPublicationGate`]).
+    pub publication_gate: CpPublicationGate,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,6 +237,7 @@ async fn run_reconcile_loop(
             dp_registry: Arc::clone(&broadcasters.dp_registry),
             mesh_update_tx: broadcasters.mesh_update_tx.clone(),
             mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+            publication_gate: broadcasters.publication_gate.clone(),
             namespace: reconciler_config.namespace.clone(),
             controller_namespace: reconciler_config.controller_namespace.clone(),
             cluster_domain: reconciler_config.cluster_domain.clone(),
@@ -234,6 +282,7 @@ async fn run_reconcile_loop(
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+                        publication_gate: broadcasters.publication_gate.clone(),
                         namespace: reconciler_config.namespace.clone(),
                         controller_namespace: reconciler_config.controller_namespace.clone(),
                         cluster_domain: reconciler_config.cluster_domain.clone(),
@@ -275,6 +324,7 @@ async fn run_reconcile_loop(
                         dp_registry: Arc::clone(&broadcasters.dp_registry),
                         mesh_update_tx: broadcasters.mesh_update_tx.clone(),
                         mesh_registry: Arc::clone(&broadcasters.mesh_registry),
+                        publication_gate: broadcasters.publication_gate.clone(),
                         namespace: reconciler_config.namespace.clone(),
                         controller_namespace: reconciler_config.controller_namespace.clone(),
                         cluster_domain: reconciler_config.cluster_domain.clone(),
@@ -466,6 +516,7 @@ struct ReconcileContext {
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
+    publication_gate: CpPublicationGate,
     namespace: String,
     controller_namespace: String,
     cluster_domain: String,
@@ -537,6 +588,63 @@ fn namespaces_for_broadcast(
     namespaces.into_iter().collect()
 }
 
+/// Publish an accepted K8s translation: record the overlay, CAS the merged
+/// snapshot into `config_arc`, and emit the per-namespace DP updates plus the
+/// mesh full snapshot — all inside one [`CpPublicationGate`] section, so the
+/// CP DB poll loop can never slip a commit or a broadcast between them.
+///
+/// Returns the published snapshot, or `None` when the merge produced no
+/// content change (nothing committed, nothing broadcast).
+///
+/// The overlay slot is still written BEFORE the CAS. Holding the gate means
+/// there is no losing CAS writer in practice, but the ordering is preserved so
+/// the CAS retry loops stay correct on their own terms: a writer that did lose
+/// re-composes against the newest accepted overlay rather than an older one.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_k8s_reconcile(
+    publication_gate: &CpPublicationGate,
+    config_arc: &ArcSwap<GatewayConfig>,
+    overlay_slot: &K8sOverlaySlot,
+    translation: &GatewayConfig,
+    managed_namespaces: &BTreeSet<String>,
+    fallback_namespace: &str,
+    broadcasts: &NamespaceBroadcasts,
+    dp_registry: &DpNodeRegistry,
+    cp_scope: &CpScope,
+    mesh_update_tx: &broadcast::Sender<MeshConfigBroadcast>,
+    mesh_registry: &MeshNodeRegistry,
+) -> Option<Arc<GatewayConfig>> {
+    publication_gate.publish(|| {
+        // Persist the translation independently of `config_arc` so CP DB full
+        // reloads can re-merge it instead of broadcasting a wipe (#2982).
+        store_accepted_k8s_overlay(
+            overlay_slot,
+            translation.clone(),
+            managed_namespaces.clone(),
+        );
+        let new_config = swap_merged_k8s_translation(config_arc, translation, managed_namespaces)?;
+
+        // Notify DPs and mesh subscribers of the config change.
+        for namespace in
+            namespaces_for_broadcast(&new_config, fallback_namespace, cp_scope, broadcasts)
+        {
+            CpGrpcServer::broadcast_namespace_update(
+                broadcasts,
+                &namespace,
+                &new_config,
+                dp_registry,
+                cp_scope,
+            );
+        }
+        MeshGrpcServer::broadcast_full_with_registry(
+            mesh_update_tx,
+            Arc::clone(&new_config),
+            mesh_registry,
+        );
+        Some(new_config)
+    })
+}
+
 async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx: ReconcileContext) {
     let start = std::time::Instant::now();
     ctx.metrics
@@ -579,16 +687,22 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         &ctx.watch_namespaces,
         &translation.config.known_namespaces,
     );
-    // Persist the translation independently of `config_arc` so CP DB full
-    // reloads can re-merge it instead of broadcasting a wipe (#2982).
-    store_accepted_k8s_overlay(
+    // Commit and broadcast as one publication, serialized against the CP DB
+    // poll loop. Kubernetes status-patch I/O stays outside the section.
+    let published = publish_k8s_reconcile(
+        &ctx.publication_gate,
+        &ctx.config_arc,
         &ctx.overlay_slot,
-        translation.config.clone(),
-        managed_namespaces.clone(),
+        &translation.config,
+        &managed_namespaces,
+        &ctx.namespace,
+        ctx.broadcasts.as_ref(),
+        &ctx.dp_registry,
+        &ctx.cp_scope,
+        &ctx.mesh_update_tx,
+        &ctx.mesh_registry,
     );
-    let Some(new_config) =
-        swap_merged_k8s_translation(&ctx.config_arc, &translation.config, &managed_namespaces)
-    else {
+    let Some(new_config) = published else {
         debug!("No config changes detected, skipping swap");
         // Owned `Vec<...>` parameters keep the patch futures Send across
         // `tokio::spawn`'s HRTB analysis — `&[T]` parameters previously
@@ -617,26 +731,6 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         return;
     };
 
-    // Notify DPs and mesh subscribers of the config change.
-    for namespace in namespaces_for_broadcast(
-        &new_config,
-        &ctx.namespace,
-        &ctx.cp_scope,
-        ctx.broadcasts.as_ref(),
-    ) {
-        CpGrpcServer::broadcast_namespace_update(
-            ctx.broadcasts.as_ref(),
-            &namespace,
-            &new_config,
-            &ctx.dp_registry,
-            &ctx.cp_scope,
-        );
-    }
-    MeshGrpcServer::broadcast_full_with_registry(
-        &ctx.mesh_update_tx,
-        new_config.clone(),
-        &ctx.mesh_registry,
-    );
     // Same clone-elision contract as the no-change branch above; see the
     // comment over `run_status_patchers` there.
     run_status_patchers(

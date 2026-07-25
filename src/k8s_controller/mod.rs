@@ -27,8 +27,9 @@ use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
 pub use reconciler::ReconcileBroadcasters;
 pub use reconciler::{
-    AcceptedK8sOverlay, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
-    merge_k8s_translation, store_accepted_k8s_overlay, swap_merged_k8s_translation,
+    AcceptedK8sOverlay, CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay,
+    empty_k8s_overlay_slot, merge_k8s_translation, publish_k8s_reconcile,
+    store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
@@ -93,6 +94,7 @@ pub async fn start_k8s_controller(
     dp_registry: Arc<DpNodeRegistry>,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     mesh_registry: Arc<MeshNodeRegistry>,
+    publication_gate: CpPublicationGate,
     shutdown: watch::Receiver<bool>,
 ) -> Result<K8sControllerHandle, anyhow::Error> {
     info!(
@@ -189,6 +191,7 @@ pub async fn start_k8s_controller(
             dp_registry,
             mesh_update_tx,
             mesh_registry,
+            publication_gate,
         },
         reconciler_config,
         gateway_status_writer,
