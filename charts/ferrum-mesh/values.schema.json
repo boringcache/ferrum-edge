@@ -306,7 +306,13 @@
           "properties": {
             "enabled": { "type": "boolean" },
             "bindAddress": { "type": "string" },
-            "port": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            "port": {
+              "description": "Admin HTTP listen port. Accepts integer or numeric string so Helm --set-string (used by Cross-frozen live automation) still validates; integer form keeps 0–65535 bounds.",
+              "oneOf": [
+                { "type": "integer", "minimum": 0, "maximum": 65535 },
+                { "type": "string", "pattern": "^[0-9]{1,5}$" }
+              ]
+            }
           }
         },
         "fallbackMode": { "type": "string" },

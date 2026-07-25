@@ -235,7 +235,7 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
-    --set "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   local ebpf_count
   ebpf_count="$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)"
@@ -288,7 +288,7 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
-    --set "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if ! grep -q "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" <<<"$rendered" ||
     ! grep -q "value: \"$ambient_registry_override\"" <<<"$rendered" ||
@@ -512,7 +512,7 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node-waypoint \
-    --set "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set-string "nodeAgent.podRegistryDir=$NODE_WAYPOINT_REGISTRY_DIR")"
   if [[ "$(grep -c "image: \"$IMAGE_REPOSITORY:$IMAGE_TAG-ebpf\"" <<<"$rendered" || true)" -lt 2 ]] ||
     ! grep -A1 "name: FERRUM_NODE_AGENT_PROXY_MODE" <<<"$rendered" | grep -q 'value: "node_waypoint"' ||
@@ -610,7 +610,7 @@ render_chart_assertions() {
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
-    --set "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
     --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN")"
   if [[ "$(grep -A1 -F "name: FERRUM_K8S_TRUST_DOMAIN" <<<"$rendered" | grep -c -F "value: \"$TRUST_DOMAIN\"" || true)" -lt 2 ]]; then
@@ -624,7 +624,7 @@ render_chart_assertions() {
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.admin.enabled=true \
-    --set nodeAgent.admin.port=0)"
+    --set-string nodeAgent.admin.port=0)"
   if grep -q "readinessProbe:" <<<"$rendered"; then
     echo "Node-agent render emitted a readiness probe for disabled admin port 0" >&2
     grep -nE 'readinessProbe:|FERRUM_ADMIN_HTTP_PORT|value: "?0"?' <<<"$rendered" >&2 || true
@@ -665,7 +665,7 @@ render_chart_assertions() {
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set nodeAgent.proxyMode=node_waypoint \
-    --set nodeAgent.admin.port=9000 >/tmp/ferrum-node-waypoint-admin-port-render.out 2>&1; then
+    --set-string nodeAgent.admin.port=9000 >/tmp/ferrum-node-waypoint-admin-port-render.out 2>&1; then
     echo "NodeWaypoint render accepted ambient and node-agent host-network admin port collision" >&2
     cat /tmp/ferrum-node-waypoint-admin-port-render.out >&2 || true
     exit 1
@@ -955,7 +955,7 @@ install_ferrum() {
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
-    --set "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
+    --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
     --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
