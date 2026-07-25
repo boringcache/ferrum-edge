@@ -15,7 +15,9 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     set_spool_write_hook_for_tests, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginHttpClient, REQUEST_ID_METADATA_KEY, TransactionSummary, WsDisconnectContext,
+};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -2759,7 +2761,7 @@ async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
 }
 
 fn billable_summary(request_id: &str) -> TransactionSummary {
-    TransactionSummary {
+    let mut summary = TransactionSummary {
         namespace: "ferrum".to_string(),
         consumer_username: Some("alice".to_string()),
         proxy_id: Some("proxy-a".to_string()),
@@ -2767,9 +2769,13 @@ fn billable_summary(request_id: &str) -> TransactionSummary {
         response_status_code: 200,
         bytes_sent: 100,
         bytes_received: 200,
-        request_id: Some(request_id.to_string()),
         ..TransactionSummary::default()
-    }
+    };
+    summary.metadata.insert(
+        REQUEST_ID_METADATA_KEY.to_string(),
+        request_id.to_string(),
+    );
+    summary
 }
 
 fn spool_delivery_totals() -> (u64, u64, u64) {
