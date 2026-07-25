@@ -1504,6 +1504,8 @@ pub async fn run(
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
+        // Match database mode: never burst catch-up full polls after a slow cycle.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // skip first immediate tick
 
         // Track the last known set of resolved IPs for the DB hostname.
