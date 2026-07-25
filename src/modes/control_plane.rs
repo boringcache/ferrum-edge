@@ -2474,21 +2474,19 @@ pub async fn run(
                                     // on an escalation tick, so a long-lived bad
                                     // tenant does not add a DB round trip to
                                     // every poll cycle.
-                                    if decision.should_escalate
-                                        || !config_rejected_poll.load(Ordering::Relaxed)
-                                    {
-                                        if let Some(rejection) =
+                                    if (decision.should_escalate
+                                        || !config_rejected_poll.load(Ordering::Relaxed))
+                                        && let Some(rejection) =
                                             namespace_rejection_error(&rejection_pairs)
-                                        {
-                                            crate::modes::record_config_validation_rejection(
-                                                &db_poll,
-                                                &db_available_poll,
-                                                &config_rejected_poll,
-                                                &rejection,
-                                                "incremental validation",
-                                            )
-                                            .await;
-                                        }
+                                    {
+                                        crate::modes::record_config_validation_rejection(
+                                            &db_poll,
+                                            &db_available_poll,
+                                            &config_rejected_poll,
+                                            &rejection,
+                                            "incremental validation",
+                                        )
+                                        .await;
                                     }
                                     if decision.should_escalate {
                                         error!(
