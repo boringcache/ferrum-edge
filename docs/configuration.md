@@ -224,19 +224,20 @@ bundle that may need them is alive.
 #### MySQL minimum version
 
 MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
-`COLLATE utf8mb4_bin` on identifier columns (`id`, `namespace`, `name`,
+`COLLATE utf8mb4_0900_bin` on identifier columns (`id`, `namespace`, `name`,
 `username`, `custom_id`, `plugin_name`, `proxy_id`, `upstream_id`,
 `upstream_subset`, `api_spec_id`, `content_hash`, `spec_version`,
-`backend_host`, `backend_tls_sni`). Binary collation makes uniqueness on
-`(namespace, name)`, `(namespace, username)`, etc. **byte-exact** — matching
-PostgreSQL and SQLite — so both case variants (`Alpha` vs `alpha`) and
-Unicode canonical equivalents (NFC `café` vs NFD `cafe\u{0301}`) remain
-distinct. A UCA collation such as `utf8mb4_0900_as_cs` is accent-/case-
-sensitive but still folds canonically equivalent sequences, which would
-diverge from the runtime's byte-keyed identity indexes. Operators upgrading a
-populated deployment that still uses `utf8mb4_0900_as_cs` (or an older
-case-insensitive default) must run the matching
-`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`
+`backend_host`, `backend_tls_sni`). This binary, `NO PAD` collation makes
+uniqueness on `(namespace, name)`, `(namespace, username)`, etc.
+**byte-exact** — matching PostgreSQL and SQLite — so case variants
+(`Alpha` vs `alpha`), Unicode canonical equivalents (NFC `café` vs NFD
+`cafe\u{0301}`), and values that differ only by trailing spaces remain
+distinct. The older `utf8mb4_bin` binary collation uses `PAD SPACE` semantics,
+while a UCA collation such as `utf8mb4_0900_as_cs` still folds canonically
+equivalent sequences; either would diverge from the runtime's byte-keyed
+identity indexes. Operators upgrading a populated deployment that still uses
+one of those collations (or an older case-insensitive default) must run the matching
+`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
 themselves; this is consistent with the build-out compatibility policy of
 folding schema changes into the V001 baseline rather than shipping
 incremental migrations.

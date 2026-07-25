@@ -1,6 +1,6 @@
 //! Live MySQL contracts for custom-plugin migration recovery,
 //! cross-namespace config-change lock serialization, and byte-exact
-//! identity uniqueness under `utf8mb4_bin` (#2994).
+//! identity uniqueness under `utf8mb4_0900_bin` (#2994).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -428,16 +428,16 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
     );
 }
 
-/// NFC and NFD forms of the same grapheme must remain distinct consumer
-/// identities under MySQL `utf8mb4_bin` (#2994), matching Postgres/SQLite and
-/// the runtime's byte-keyed `ConsumerIndex`.
+/// NFC/NFD forms and trailing-space variants must remain distinct consumer
+/// identities under MySQL `utf8mb4_0900_bin` (#2994), matching Postgres/SQLite
+/// and the runtime's byte-keyed `ConsumerIndex`.
 #[tokio::test(flavor = "multi_thread")]
-async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
+async fn mysql_byte_exact_identity_accepts_unicode_and_space_variants() {
     let fixture = match start_mysql().await {
         Ok(fixture) => fixture,
         Err(error) => {
             fail_in_ci_else_skip(
-                "mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames",
+                "mysql_byte_exact_identity_accepts_unicode_and_space_variants",
                 "MySQL 8.4",
                 &error,
             );
@@ -455,7 +455,7 @@ async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
     .await
     .expect("inspect consumers.username collation");
     assert_eq!(
-        username_collation, "utf8mb4_bin",
+        username_collation, "utf8mb4_0900_bin",
         "V001 must apply binary collation on consumers.username"
     );
 
@@ -469,8 +469,20 @@ async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
     .await
     .expect("inspect consumer_identity_index.identity_value collation");
     assert_eq!(
-        identity_collation, "utf8mb4_bin",
+        identity_collation, "utf8mb4_0900_bin",
         "V001 must apply binary collation on identity_value"
+    );
+
+    let pad_attribute: String = sqlx::query_scalar(
+        "SELECT PAD_ATTRIBUTE FROM information_schema.COLLATIONS \
+         WHERE COLLATION_NAME = 'utf8mb4_0900_bin'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("inspect utf8mb4_0900_bin padding semantics");
+    assert_eq!(
+        pad_attribute, "NO PAD",
+        "byte-exact VARCHAR identity comparison must preserve trailing spaces"
     );
 
     // U+00E9 (é) vs e + U+0301 combining acute — canonically equivalent under
@@ -490,7 +502,15 @@ async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
     store
         .create_consumer(&make_consumer("ferrum", "nfd-consumer", nfd_username))
         .await
-        .expect("NFD username must insert as a distinct identity under utf8mb4_bin");
+        .expect("NFD username must insert as a distinct identity under utf8mb4_0900_bin");
+    store
+        .create_consumer(&make_consumer("ferrum", "plain-consumer", "alice"))
+        .await
+        .expect("plain username must insert");
+    store
+        .create_consumer(&make_consumer("ferrum", "space-consumer", "alice "))
+        .await
+        .expect("trailing-space username must insert as a distinct identity");
 
     assert!(
         store
@@ -521,6 +541,29 @@ async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
         .expect("NFD consumer present");
     assert_eq!(loaded_nfc.username.as_bytes(), nfc_username.as_bytes());
     assert_eq!(loaded_nfd.username.as_bytes(), nfd_username.as_bytes());
+    let loaded_space = store
+        .get_consumer("ferrum", "space-consumer")
+        .await
+        .expect("load trailing-space consumer")
+        .expect("trailing-space consumer present");
+    assert_eq!(loaded_space.username.as_bytes(), b"alice ");
+
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", "alice", None, None)
+            .await
+            .expect("plain identity probe")
+            .is_some(),
+        "plain username must collide with the plain consumer only"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", "alice ", None, None)
+            .await
+            .expect("trailing-space identity probe")
+            .is_some(),
+        "trailing-space username must collide with the spaced consumer only"
+    );
 
     let count: i64 = sqlx::query_scalar(
         "SELECT CAST(COUNT(*) AS SIGNED) FROM consumers WHERE namespace = 'ferrum'",
@@ -528,5 +571,5 @@ async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
     .fetch_one(&fixture.pool)
     .await
     .expect("count consumers");
-    assert_eq!(count, 2);
+    assert_eq!(count, 4);
 }
