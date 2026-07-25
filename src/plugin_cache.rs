@@ -3947,6 +3947,7 @@ impl PluginCache {
     /// seam without widening the production plugin catalog. Callers must build
     /// the request epoch *after* this mutation so the published snapshot sees
     /// the injected plugin.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn prepend_proxy_plugin_for_test(
         &self,
         proxy_id: &str,

@@ -361,7 +361,7 @@ async fn dtls_accept_loop_progresses_while_first_stream_connect_is_blocked() {
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let backend = reserve_udp_port().await.expect("reserve backend UDP port");
-    let backend_port = backend.port();
+    let backend_port = backend.port;
     let backend_socket = Arc::new(backend.into_socket());
     let echo = spawn_udp_echo_backend(backend_socket).await;
 
