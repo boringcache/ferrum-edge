@@ -313,7 +313,6 @@ fn concurrent_incremental_cas_retains_reconciler_overlay() {
     );
 }
 
-
 // ── CP publication ordering ─────────────────────────────────────────────────
 //
 // CAS makes each commit atomic but says nothing about the emissions that follow
@@ -529,7 +528,11 @@ fn publication_gate_orders_a_second_publisher_after_the_first() {
     second.join().expect("second publisher thread");
     drop(order_tx);
     let observed: Vec<&'static str> = order_rx.iter().collect();
-    assert_eq!(observed, vec!["first", "second"], "sections must not overlap");
+    assert_eq!(
+        observed,
+        vec!["first", "second"],
+        "sections must not overlap"
+    );
 }
 
 #[test]
@@ -571,7 +574,10 @@ fn competing_full_publications_never_end_on_a_stale_snapshot() {
     for event in &mesh_events {
         apply_mesh_event(&mut mesh_state, event);
     }
-    assert_eq!(mesh_state, committed, "mesh must end on the committed snapshot");
+    assert_eq!(
+        mesh_state, committed,
+        "mesh must end on the committed snapshot"
+    );
 
     let dp_events = drain(&mut dp_rx);
     assert!(!dp_events.is_empty(), "DP subscribers must see traffic");

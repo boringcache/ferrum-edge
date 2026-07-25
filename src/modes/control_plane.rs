@@ -976,7 +976,9 @@ fn union_accepted_deltas(
         union
             .added_or_modified_consumers
             .extend(delta.added_or_modified_consumers);
-        union.removed_consumer_ids.extend(delta.removed_consumer_ids);
+        union
+            .removed_consumer_ids
+            .extend(delta.removed_consumer_ids);
         union
             .added_or_modified_plugin_configs
             .extend(delta.added_or_modified_plugin_configs);
@@ -986,7 +988,9 @@ fn union_accepted_deltas(
         union
             .added_or_modified_upstreams
             .extend(delta.added_or_modified_upstreams);
-        union.removed_upstream_ids.extend(delta.removed_upstream_ids);
+        union
+            .removed_upstream_ids
+            .extend(delta.removed_upstream_ids);
     }
     union
 }
