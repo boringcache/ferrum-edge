@@ -441,10 +441,8 @@ const OVERSIZED_HELLO_PADDING: usize = 4500;
 
 #[test]
 fn extract_sni_from_oversized_clienthello_with_sni_after_padding() {
-    let data = build_tls_client_hello_with_padding_before_sni(
-        "pq.example.com",
-        OVERSIZED_HELLO_PADDING,
-    );
+    let data =
+        build_tls_client_hello_with_padding_before_sni("pq.example.com", OVERSIZED_HELLO_PADDING);
     assert!(
         data.len() > 4096,
         "fixture must exceed the historical 4096-byte peek cap (got {} bytes)",
@@ -1185,8 +1183,7 @@ async fn test_extract_sni_from_tcp_stream_fails_closed_when_hello_exceeds_peek_c
     // Padding large enough that the framed hello exceeds 16 KiB and SNI sits
     // past the peek buffer — the parser on the full buffer still finds SNI, but
     // the bounded peek must not.
-    let hello =
-        build_tls_client_hello_with_padding_before_sni("overcap.example.com", 20_000);
+    let hello = build_tls_client_hello_with_padding_before_sni("overcap.example.com", 20_000);
     assert!(
         hello.len() > 16 * 1024,
         "fixture must exceed the 16 KiB peek bound (got {} bytes)",
