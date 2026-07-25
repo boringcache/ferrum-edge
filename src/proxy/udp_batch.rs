@@ -415,6 +415,10 @@ impl SendMmsgBatch {
     }
 
     /// Maximum bytes accepted per slot by [`Self::push_with_local`].
+    ///
+    /// The public library's external regression tests use this accessor; the
+    /// binary target compiles the same module without calling it.
+    #[allow(dead_code)]
     pub fn slot_size(&self) -> usize {
         self.slot_size
     }
@@ -423,6 +427,7 @@ impl SendMmsgBatch {
     ///
     /// Used by memory-footprint contract tests. Fresh batches report `0`
     /// because slot buffers are allocated lazily.
+    #[allow(dead_code)]
     pub fn datagram_buffer_capacity_bytes(&self) -> usize {
         self.bufs.iter().map(Vec::capacity).sum()
     }
