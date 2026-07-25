@@ -1,29 +1,19 @@
 ---
 name: composer-agents
-description: Dispatch and orchestrate local Cursor Composer 2.5 subagents via Conductor's Cursor SDK harness for small, fast, well-scoped ferrum-edge work — mechanical issues, docs/config parity, small fix rounds, CI repair. Use when the user asks Claude to spawn Composer/Cursor Composer agents. Escalate deep design, hot-path, or security work to grok-agents or sol-agents instead.
+description: Dispatch and orchestrate local Cursor Composer 2.5 subagents via Conductor's Cursor SDK harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. Composer is the fast tier of the agent fleet. Use when the user asks Claude to spawn Composer/Cursor Composer agents on issues, PRs, review findings, or red CI.
 ---
 
 # composer-agents: Cursor Composer 2.5 subagent orchestration
 
 You are the ORCHESTRATOR. Composer agents implement/fix; you verify their diffs, drive merge
 decisions, and never let an unreviewed PR merge. This skill uses the same local Conductor Cursor
-harness as `grok-agents` (`@cursor/sdk` + `CURSOR_API_KEY`), pinned to `composer-2.5`.
+harness as `grok-agents` (`@cursor/sdk` + `CURSOR_API_KEY`), pinned to `composer-2.5` — the fast
+tier of the fleet.
 
 **Guard: do NOT use this skill when you are yourself a dispatched worker.** If your session prompt
 references `agent-brief.md` / `continuation-brief.md`, says "YOU are the implementer", or hands
 you an existing worktree and findings to fix, implement directly. Do not recursively dispatch
 another worker.
-
-## This is the fast tier — pick tasks accordingly
-
-Dispatch Composer for work checkable by inspection and CI: mechanical single-surface issues,
-docs / `ferrum.conf` / `docs/configuration.md` / `openapi.yaml` parity, tests for already-decided
-behavior, small fix rounds (fmt, lint, deterministic CI reds, narrow findings), mechanical renames.
-
-Send to `grok-agents` / `sol-agents` instead: proxy hot paths, pool keys, router, TLS/authz/
-protocol invariants, cross-module refactors, new public APIs or plugins, anything needing a design
-call. Workers are instructed to stop and report when a task exceeds this envelope — that report is
-a success; re-dispatch to a deeper model with its findings folded in.
 
 ## Dispatch command (exact shape)
 
@@ -62,20 +52,17 @@ Every prompt must also PIN THE WORKER'S ROLE:
 Do NOT invoke agent-dispatch skills (composer-agents, grok-agents, sol-agents, opus-agents,
 fable-agents, .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
-Be MORE explicit than with the deeper tiers: name the exact files, exact acceptance criteria, and
-exact stopping point. Ambiguity costs more here than the tokens saved by a terse prompt.
-
 Then append the mode block:
 
 **Implementer (fresh issue):** issue number, worktree dir `issue-<N>` under a sibling
-`<repo>-agents/` dir, branch name, acceptance criteria, expected files to change, repo-invariant
-callouts, scope boundaries vs neighboring in-flight PRs.
+`<repo>-agents/` dir, branch name, acceptance criteria, repo-invariant callouts, scope boundaries
+vs neighboring in-flight PRs.
 
 **Fix round (existing PR):** PR number, existing worktree path, current head SHA, verified
-findings verbatim, CI-red diagnosis, per-finding guidance (fix vs acceptable-rebuttal vs escalate).
+findings verbatim, CI-red diagnosis, per-finding guidance (fix vs acceptable-rebuttal).
 
 **Shepherd (drive to clean+green):** like fix round, plus loop until review-clean AND CI green.
-Only when the user wants agents babysitting CI and the remaining work is mechanical.
+Only when the user wants agents babysitting CI.
 
 **Cadence override (recommended default — CI takes 20-30 min):** append:
 "CADENCE OVERRIDE: do NOT wait for in-progress CI. Loop: reconstruct state -> fix findings + RED
@@ -86,8 +73,7 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 1. On each agent completion: verify from GitHub (never the agent's claims alone) — head pushed?
    trigger posted to the correct bot? threads replied?
 2. Independently review the diff in the agent's worktree before any merge
-   (`git fetch origin main && git diff origin/main...HEAD` — three-dot). Weight this more heavily
-   than for the deeper tiers.
+   (`git fetch origin main && git diff origin/main...HEAD` — three-dot).
 3. Triage CI reds yourself when agents are gone.
 4. Salvage protocol for dead agents: check worktree status + unpushed commits, then relaunch a
    continuation agent with a state snapshot.
@@ -99,7 +85,5 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
   or missing `CURSOR_API_KEY` — stop and report; do not fall back to another model.
 - Capacity or transport kills mid-loop — work may already be pushed; check PR state first.
 - Agents may exit claiming "waiting on monitor" — treat every completion as end-of-turn.
-- Scope-exceeded report — expected at this tier; re-dispatch to a deeper skill, don't push Composer
-  through it.
 - Nested dispatch: if a completed run's report mentions "dispatching a worker", treat the actual
   implementing model as unknown and weight your independent diff review accordingly.

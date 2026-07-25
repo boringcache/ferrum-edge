@@ -1,8 +1,8 @@
 # Ferrum Edge Composer continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
-`agent-brief.md`, especially isolation, direct implementation, scope discipline, host discipline,
-review-trigger cadence, final reporting, and the prohibition on merging. The orchestrator must
+`agent-brief.md`, especially isolation, direct implementation, host discipline, review-trigger
+cadence, final reporting, and the prohibition on merging. The orchestrator must
 provide absolute paths to both briefs; do not use this continuation brief alone.
 
 ## Implement directly
@@ -40,15 +40,9 @@ Fix legitimate findings and deterministic CI failures. Rebut false positives wit
 and-line reasoning. Format and validate according to `agent-brief.md`, commit, push, and post
 exactly one review trigger if the new head needs review.
 
-Composer is the fast tier. If an unresolved finding requires a redesign, a cross-cutting refactor,
-or a security/protocol invariant judgment call, fix the mechanical findings, then stop and report
-the escalation with specifics instead of attempting the deep change. The orchestrator will
-re-dispatch to a deeper model.
-
 If the prompt contains a cadence override, exit after the push and single trigger instead of
 waiting on in-progress CI. Otherwise continue only for the duration and stopping condition the
 orchestrator explicitly assigned.
 
 End with the complete final report required by `agent-brief.md`, including the old and new head
-SHAs, review-thread dispositions, CI state, escalations, and anything the next round must
-reconstruct.
+SHAs, review-thread dispositions, CI state, and anything the next round must reconstruct.
