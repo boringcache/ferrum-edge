@@ -2570,6 +2570,27 @@ fn test_non_regular_fifo_config_path_rejected() {
     );
 }
 
+#[test]
+fn test_oversized_config_rejected_before_read_and_parse() {
+    let file = NamedTempFile::with_suffix(".yaml").unwrap();
+    file.as_file()
+        .set_len(64 * 1024 * 1024 + 1)
+        .expect("create sparse oversized config fixture");
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("oversized config must fail before parsing");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("maximum supported size is 67108864 bytes"),
+        "expected bounded-size diagnostic, got: {message}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {

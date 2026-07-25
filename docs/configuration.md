@@ -302,6 +302,8 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation.
 
+File-mode configuration documents are limited to 64 MiB; larger files fail before allocation and parsing.
+
 **Publish updates with an atomic replace.** Write a temporary file beside the target, `fsync` it, then `rename(2)` over `FERRUM_FILE_CONFIG_PATH` (Kubernetes ConfigMap symlink swaps are equivalent). Avoid editor save-in-place, shell `>` redirection, or `cp` onto the live path: those create a torn-write window where a truncated-but-still-valid YAML document (commonly cutting a trailing `plugin_configs` list after item N-1) can parse and pass validators while silently dropping auth/ACL plugins.
 
 Optional top-level `resource_counts` is a defense-in-depth seal for that trailing-section hazard. Place it near the top of the document (before the resource lists). When present it is validated against the file's pre-namespace-filter lengths and is stripped before `GatewayConfig` deserialization:
