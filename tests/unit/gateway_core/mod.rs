@@ -6,6 +6,7 @@ mod circuit_breaker_tests;
 mod client_ip_tests;
 mod config_delta_tests;
 mod consumer_index_tests;
+mod cp_listener_supervision_tests;
 mod cp_server_tests;
 mod date_cache_tests;
 mod dns_tests;
