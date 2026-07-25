@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock, Weak};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 const AUDIT_CHANNEL_CAPACITY: usize = 1024;
@@ -46,6 +46,10 @@ pub const AUDIT_RETENTION_PRUNE_MAX_BATCHES: u32 = 8;
 /// budget. Equals the prune batch size so soft overshoot stays small and
 /// deterministic.
 pub const AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL: u64 = AUDIT_RETENTION_PRUNE_BATCH_SIZE;
+/// Max per-gateway-instance namespaces tracked for insert-path max-row prune
+/// cadence. When the map is full and a namespace has no entry, inserts behave
+/// as if the gate required a boundary scan (no new entry is inserted).
+pub const AUDIT_MAX_ROWS_PRUNE_GATES_CAP: usize = 256;
 
 static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(DashMap::new);
 
@@ -95,6 +99,30 @@ impl AuditMaxRowsPruneGate {
     }
 }
 
+/// Resolve whether insert-path max-row pruning should run for `namespace`.
+///
+/// When the gate map is at [`AUDIT_MAX_ROWS_PRUNE_GATES_CAP`] and `namespace`
+/// has no entry, returns `true` without inserting so every insert pays the
+/// bounded boundary query (cheap for low-row namespaces).
+pub fn audit_max_rows_prune_gate_should_run(
+    gates: &DashMap<String, AuditMaxRowsPruneGate>,
+    namespace: &str,
+    max_rows: u64,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
+    }
+    if let Some(mut gate) = gates.get_mut(namespace) {
+        return gate.should_run_max_rows_prune(max_rows, false);
+    }
+    if gates.len() >= AUDIT_MAX_ROWS_PRUNE_GATES_CAP {
+        return true;
+    }
+    let mut gate = gates.entry(namespace.to_string()).or_default();
+    gate.should_run_max_rows_prune(max_rows, false)
+}
+
 /// Soft-overshoot interval for a configured per-namespace max-row cap.
 pub fn audit_retention_max_rows_check_interval(max_rows: u64) -> u64 {
     AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL.min(max_rows).max(1)
@@ -139,6 +167,17 @@ impl AuditRetentionPolicy {
         self.retention_days.is_some() || self.max_rows_per_namespace.is_some()
     }
 
+    /// Emit one startup log line when a retention policy is active.
+    pub fn log_if_enabled(&self) {
+        if self.is_enabled() {
+            info!(
+                retention_days = ?self.retention_days,
+                max_rows_per_namespace = ?self.max_rows_per_namespace,
+                "Audit event retention policy active"
+            );
+        }
+    }
+
     /// Validate operator-supplied optional retention knobs.
     pub fn from_parts(
         retention_days: Option<u64>,
@@ -156,19 +195,19 @@ impl AuditRetentionPolicy {
                 ));
             }
         }
-        if let Some(max_rows) = max_rows_per_namespace {
-            if max_rows == 0 {
-                return Err(
-                    "FERRUM_AUDIT_RETENTION_MAX_ROWS must be greater than zero when set"
-                        .to_string(),
-                );
+        let max_rows_per_namespace = match max_rows_per_namespace {
+            Some(0) => None,
+            Some(max_rows) => {
+                if max_rows > AUDIT_RETENTION_MAX_ROWS_CAP {
+                    return Err(format!(
+                        "FERRUM_AUDIT_RETENTION_MAX_ROWS must not exceed \
+                         {AUDIT_RETENTION_MAX_ROWS_CAP}"
+                    ));
+                }
+                Some(max_rows)
             }
-            if max_rows > AUDIT_RETENTION_MAX_ROWS_CAP {
-                return Err(format!(
-                    "FERRUM_AUDIT_RETENTION_MAX_ROWS must not exceed {AUDIT_RETENTION_MAX_ROWS_CAP}"
-                ));
-            }
-        }
+            None => None,
+        };
         Ok(Self {
             retention_days,
             max_rows_per_namespace,

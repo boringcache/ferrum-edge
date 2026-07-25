@@ -5,13 +5,14 @@
 //! validation and SQL/Mongo source parity for the shared retention contract.
 
 use ferrum_edge::admin::audit::{
-    AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP,
+    AUDIT_MAX_ROWS_PRUNE_GATES_CAP, AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP,
     AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL, AUDIT_RETENTION_MAX_ROWS_DEFAULT,
     AUDIT_RETENTION_PRUNE_BATCH_SIZE, AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditMaxRowsPruneGate,
     AuditRetentionPolicy, audit_retention_hit_prune_batch_budget,
-    audit_retention_max_rows_check_interval,
+    audit_retention_max_rows_check_interval, audit_max_rows_prune_gate_should_run,
 };
 use ferrum_edge::config::EnvConfig;
+use std::sync::Arc;
 
 use crate::unit::env_lock::ENV_LOCK;
 
@@ -66,17 +67,11 @@ fn audit_retention_policy_accepts_safe_bounds() {
 }
 
 #[test]
-fn audit_retention_policy_rejects_zero_and_oversize() {
+fn audit_retention_policy_rejects_zero_days_and_oversize() {
     let zero_days = AuditRetentionPolicy::from_parts(Some(0), None).unwrap_err();
     assert!(
         zero_days.contains("FERRUM_AUDIT_RETENTION_DAYS"),
         "got: {zero_days}"
-    );
-
-    let zero_rows = AuditRetentionPolicy::from_parts(None, Some(0)).unwrap_err();
-    assert!(
-        zero_rows.contains("FERRUM_AUDIT_RETENTION_MAX_ROWS"),
-        "got: {zero_rows}"
     );
 
     let over_days =
@@ -92,6 +87,19 @@ fn audit_retention_policy_rejects_zero_and_oversize() {
         over_rows.contains("FERRUM_AUDIT_RETENTION_MAX_ROWS"),
         "got: {over_rows}"
     );
+}
+
+#[test]
+fn audit_retention_policy_zero_max_rows_disables_row_cap() {
+    let policy = AuditRetentionPolicy::from_parts(None, Some(0)).unwrap();
+    assert_eq!(policy.max_rows_per_namespace, None);
+    assert!(!policy.is_enabled());
+
+    let rows_only_days =
+        AuditRetentionPolicy::from_parts(Some(30), Some(0)).unwrap();
+    assert_eq!(rows_only_days.retention_days, Some(30));
+    assert_eq!(rows_only_days.max_rows_per_namespace, None);
+    assert!(rows_only_days.is_enabled());
 }
 
 #[test]
@@ -125,6 +133,21 @@ fn env_config_defaults_to_bounded_audit_retention() {
                 config.audit_retention_max_rows,
                 Some(AUDIT_RETENTION_MAX_ROWS_DEFAULT)
             );
+        },
+    );
+}
+
+#[test]
+fn env_config_zero_max_rows_disables_row_cap() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_AUDIT_RETENTION_MAX_ROWS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.audit_retention_max_rows, None);
         },
     );
 }
@@ -215,6 +238,36 @@ fn max_rows_soft_cap_gate_keeps_draining_after_batch_budget() {
 }
 
 #[test]
+fn max_rows_prune_gate_map_at_capacity_runs_scan_without_insert() {
+    use dashmap::DashMap;
+
+    let gates: Arc<DashMap<String, AuditMaxRowsPruneGate>> =
+        Arc::new(DashMap::new());
+    for i in 0..AUDIT_MAX_ROWS_PRUNE_GATES_CAP {
+        gates.insert(format!("ns-{i}"), AuditMaxRowsPruneGate::default());
+    }
+    assert_eq!(gates.len(), AUDIT_MAX_ROWS_PRUNE_GATES_CAP);
+
+    let unknown = "fresh-namespace";
+    assert!(
+        audit_max_rows_prune_gate_should_run(&gates, unknown, 100_000, false),
+        "at-capacity unknown namespace must scan every insert"
+    );
+    assert!(
+        !gates.contains_key(unknown),
+        "at-capacity path must not grow the gate map"
+    );
+
+    let mut existing = gates.get_mut("ns-0").unwrap();
+    existing.note_max_rows_prune_result(false);
+    drop(existing);
+    assert!(
+        !audit_max_rows_prune_gate_should_run(&gates, "ns-0", 100_000, false),
+        "existing namespace must keep soft-cap cadence"
+    );
+}
+
+#[test]
 fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
     for source in [DB_LOADER_SOURCE, MONGO_STORE_SOURCE] {
         assert!(
@@ -235,6 +288,11 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
             "both backends must cadence-gate insert-path max-row scans"
         );
         assert!(
+            source.contains("AUDIT_MAX_ROWS_PRUNE_GATES_CAP")
+                || source.contains("audit_max_rows_prune_gate_should_run"),
+            "both backends must bound the per-namespace prune gate map"
+        );
+        assert!(
             source.contains("force_max_rows"),
             "both backends must distinguish insert piggyback from forced prune"
         );
@@ -251,6 +309,10 @@ fn sql_and_mongo_audit_retention_share_bounded_namespace_contract() {
     assert!(
         AUDIT_SOURCE.contains("AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL"),
         "soft-cap cadence constant must live with the retention policy"
+    );
+    assert!(
+        AUDIT_SOURCE.contains("AUDIT_MAX_ROWS_PRUNE_GATES_CAP"),
+        "prune gate map cap must live with the retention policy"
     );
     assert!(
         DB_LOADER_SOURCE.contains("ORDER BY ts ASC, id ASC"),

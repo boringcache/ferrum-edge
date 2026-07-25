@@ -11442,13 +11442,12 @@ mod inner {
                     deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
             }
             if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
-                let should_run = {
-                    let mut gate = self
-                        .audit_max_rows_prune_gates
-                        .entry(namespace.to_string())
-                        .or_default();
-                    gate.should_run_max_rows_prune(max_rows, force_max_rows)
-                };
+                let should_run = crate::admin::audit::audit_max_rows_prune_gate_should_run(
+                    &self.audit_max_rows_prune_gates,
+                    namespace,
+                    max_rows,
+                    force_max_rows,
+                );
                 if should_run {
                     let (batch_deleted, hit_budget) = self
                         .prune_audit_events_by_max_rows(namespace, max_rows)

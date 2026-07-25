@@ -1705,8 +1705,9 @@ pub struct EnvConfig {
     /// audit delivery-loss hardening (#2421): this only bounds retained rows.
     pub audit_retention_days: Option<u64>,
     /// Per-namespace audit row cap (`FERRUM_AUDIT_RETENTION_MAX_ROWS`).
-    /// Defaults to 100,000 and must be in `1..=10_000_000`. Newest events win
-    /// under deterministic `(ts, id)` ordering.
+    /// Defaults to 100,000. Set to `0` to disable the row cap (retain audit rows
+    /// indefinitely by count). Non-zero values must be in `1..=10_000_000`.
+    /// Newest events win under deterministic `(ts, id)` ordering.
     pub audit_retention_max_rows: Option<u64>,
     /// Require admin JWTs to carry an `ns` claim authorizing the
     /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
