@@ -1973,7 +1973,10 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     let row_to_upstream = source
         .split("fn row_to_upstream(")
         .nth(1)
-        .and_then(|rest| rest.split("fn strip_api_spec_id_from_runtime_config(").next())
+        .and_then(|rest| {
+            rest.split("fn strip_api_spec_id_from_runtime_config(")
+                .next()
+        })
         .expect("row_to_upstream body");
 
     // Already-hardened contrast cases that established this contract.
