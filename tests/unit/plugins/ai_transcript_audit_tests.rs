@@ -2804,6 +2804,18 @@ async fn harvests_guardrail_and_token_metadata() {
         "ai_semantic_firewall.decision".to_string(),
         "allow".to_string(),
     );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_status".to_string(),
+        "HIT".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_match".to_string(),
+        "semantic".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_similarity".to_string(),
+        "0.950000".to_string(),
+    );
     plugin
         .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
@@ -2814,6 +2826,18 @@ async fn harvests_guardrail_and_token_metadata() {
     assert_eq!(
         records[0]["guardrails"]["ai_semantic_firewall.decision"],
         "allow"
+    );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_status"],
+        "HIT"
+    );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_match"],
+        "semantic"
+    );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_similarity"],
+        "0.950000"
     );
 }
 

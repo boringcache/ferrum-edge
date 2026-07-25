@@ -1225,7 +1225,10 @@ impl AiTranscriptAudit {
                     harvest.tokens.insert(key.clone(), safe(value));
                 }
                 _ => {
-                    if key.starts_with("ai_cache") || key.starts_with("request_deduplication.") {
+                    if key.starts_with("ai_cache")
+                        || key.starts_with("ai_semantic_cache.")
+                        || key.starts_with("request_deduplication.")
+                    {
                         harvest.cache.insert(key.clone(), safe(value));
                     } else if is_guardrail_key(key) {
                         harvest.guardrails.insert(key.clone(), safe(value));
