@@ -22,8 +22,8 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
+use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::tls::inventory::{
     TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
 };

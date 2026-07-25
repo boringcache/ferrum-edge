@@ -62,8 +62,7 @@ struct AdminTlsInventoryCollector {
     /// Every clone of one `AdminState` shares this allocation. Retaining it
     /// also prevents allocator address reuse while this collector remains
     /// registered, making the pointer a stable serving-cycle identity.
-    serving_cycle_guard:
-        Arc<arc_swap::ArcSwap<Option<crate::admin::CachedDbHealthResult>>>,
+    serving_cycle_guard: Arc<arc_swap::ArcSwap<Option<crate::admin::CachedDbHealthResult>>>,
 }
 
 impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCollector {
