@@ -387,7 +387,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
 
         let (tx, out_rx) = latest_wins::channel();
         if !tx.publish(Ok(initial)) {
-            return Err(Status::cancelled("FetchX509SVID stream closed before start"));
+            return Err(Status::cancelled(
+                "FetchX509SVID stream closed before start",
+            ));
         }
 
         tokio::spawn(async move {

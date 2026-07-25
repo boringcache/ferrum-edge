@@ -1122,7 +1122,8 @@ async fn fetch_x509svid_slow_consumer_coalesces_rotations_to_newest_state() {
     );
 
     // No backlog of superseded rotations: without a further epoch, next() waits.
-    let no_backlog = tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
     assert!(
         no_backlog.is_err(),
         "capacity-one delivery must not flush a FIFO of superseded SVIDs"
@@ -1179,7 +1180,8 @@ async fn fetch_x509_bundles_slow_consumer_coalesces_to_newest_state() {
         .expect("coalesced bundle was an error");
     assert!(latest.bundles.contains_key(trust_domain.as_str()));
 
-    let no_backlog = tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
     assert!(
         no_backlog.is_err(),
         "bundle stream must not retain a FIFO across slow-consumer rotations"
@@ -1285,7 +1287,8 @@ async fn client_relay_slow_consumer_coalesces_to_newest_bundle() {
         "client relay resume must deliver the newest private-key-bearing bundle"
     );
 
-    let no_backlog = tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
     assert!(
         no_backlog.is_err(),
         "client relay must not retain a FIFO of superseded SVID bundles"
