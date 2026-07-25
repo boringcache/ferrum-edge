@@ -51,6 +51,73 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
     crate::tls::inventory::TlsInventory::collect(env_config, config.as_deref())
 }
 
+/// Metrics-safe inventory producer for the cached snapshot (issue #2410).
+///
+/// Holds the resolved `EnvConfig` and the *live* gateway-config `ArcSwap`, so a
+/// background refresh always collects against the currently published config
+/// without the admin state having to re-register on every reload.
+struct AdminTlsInventoryCollector {
+    env_config: Option<Arc<crate::config::EnvConfig>>,
+    config: Option<Arc<arc_swap::ArcSwap<crate::config::types::GatewayConfig>>>,
+    /// Every clone of one `AdminState` shares this allocation. Retaining it
+    /// also prevents allocator address reuse while this collector remains
+    /// registered, making the pointer a stable serving-cycle identity.
+    serving_cycle_guard: Arc<arc_swap::ArcSwap<Option<crate::admin::CachedDbHealthResult>>>,
+}
+
+impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCollector {
+    fn collect_public_metadata(&self) -> crate::tls::inventory::TlsInventory {
+        let config = self.config.as_ref().map(|config| config.load_full());
+        crate::tls::inventory::TlsInventory::collect_public_metadata(
+            self.env_config.as_deref(),
+            config.as_deref(),
+        )
+    }
+
+    fn serving_cycle_key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.serving_cycle_guard) as usize)
+    }
+}
+
+fn metrics_inventory_collector(
+    state: &AdminState,
+) -> Arc<dyn crate::tls::inventory_cache::TlsInventoryCollector> {
+    let env_config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.env_config));
+    let config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.config))
+        .or_else(|| state.cached_config.clone());
+    Arc::new(AdminTlsInventoryCollector {
+        env_config,
+        config,
+        serving_cycle_guard: Arc::clone(&state.cached_db_health),
+    })
+}
+
+/// Ensure the process-wide collector exists for direct metrics-handler callers
+/// that did not start through an admin serving path.
+pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
+    if crate::tls::inventory_cache::collector_installed() {
+        return;
+    }
+    crate::tls::inventory_cache::install_collector(metrics_inventory_collector(state));
+}
+
+/// Install the collector owned by this admin serving cycle.
+///
+/// Unlike scrape-time installation, a sequential in-process restart must
+/// replace the prior cycle's captured config handles. The cache marks its
+/// current snapshot stale so the warmup refresh publishes the new cycle.
+pub(super) fn replace_metrics_inventory_collector_for_serving_cycle(state: &AdminState) {
+    crate::tls::inventory_cache::replace_collector_for_serving_cycle(metrics_inventory_collector(
+        state,
+    ));
+}
+
 pub(super) async fn handle_events(
     pagination: &PaginationParams,
     query: Option<&str>,
