@@ -757,7 +757,7 @@ async fn run_script(
                                 return Ok(());
                             }
                             return Err(
-                                "ExpectHeaders: connection closed before any stream arrived".into()
+                                "ExpectHeaders: connection closed before any stream arrived".into(),
                             );
                         }
                     }
@@ -929,7 +929,9 @@ async fn run_script(
                             return Err(format!("ExpectReset: polling reset failed: {error}"));
                         }
                         Err(_) => {
-                            return Err(format!("ExpectReset: no stream reset within {duration:?}"));
+                            return Err(format!(
+                                "ExpectReset: no stream reset within {duration:?}"
+                            ));
                         }
                     }
                 }
