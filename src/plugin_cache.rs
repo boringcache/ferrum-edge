@@ -3971,10 +3971,7 @@ impl PluginCache {
                 inner.insert(proto, build_protocol_entry(plugins, proto));
             }
             protocol_snapshot.proxy.insert(proxy_id.to_string(), inner);
-            grpc_web_proxy.insert(
-                proxy_id.to_string(),
-                build_grpc_web_protocol_entry(plugins),
-            );
+            grpc_web_proxy.insert(proxy_id.to_string(), build_grpc_web_protocol_entry(plugins));
         }
         protocol_snapshot.grpc_web_proxy = grpc_web_proxy;
 

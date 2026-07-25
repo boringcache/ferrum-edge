@@ -225,9 +225,8 @@ async fn try_spawn_dtls_gateway(
         known_namespaces: Vec::new(),
         ..Default::default()
     };
-    let plugin_cache = Arc::new(
-        PluginCache::new(&gateway_config).expect("PluginCache builds with no plugins"),
-    );
+    let plugin_cache =
+        Arc::new(PluginCache::new(&gateway_config).expect("PluginCache builds with no plugins"));
     prepend_proxy_plugin_for_test(&plugin_cache, PROXY_ID, gate)
         .expect("inject gated stream-connect plugin");
     let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Udp);
@@ -358,7 +357,8 @@ async fn spawn_dtls_gateway_with_retry(
 
 #[tokio::test]
 async fn dtls_accept_loop_progresses_while_first_stream_connect_is_blocked() {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let backend = reserve_udp_port().await.expect("reserve backend UDP port");
     let backend_port = backend.port();
