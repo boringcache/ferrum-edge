@@ -1370,7 +1370,9 @@ async fn retry_streams_sse_that_succeeds_on_a_non_final_attempt() {
         "upstreams": [],
         "plugin_configs": [],
     });
-    let yaml = serde_yaml::to_string(&config).expect("yaml serialize");
+    // `to_file_mode_yaml` (not a bare `serde_yaml::to_string`) because the
+    // `retry.backoff` enum needs a real YAML tag to survive the file loader.
+    let yaml = crate::scaffolding::to_file_mode_yaml(&config);
 
     let harness = GatewayHarness::builder()
         // Keep the scripted backend cold: a warmup probe would consume

@@ -36,6 +36,7 @@ use crate::scaffolding::clients::{GrpcClient, Http2Client};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -199,7 +200,10 @@ fn grpc_file_config_with_log_config(port: u16, overrides: Value, log_config: Val
             "enabled": true,
         }],
     });
-    serde_yaml::to_string(&config).expect("serialize yaml")
+    // `to_file_mode_yaml` tags the enum-typed nodes an override may carry
+    // (`retry.backoff`); a bare `serde_yaml::to_string` emits the JSON
+    // singleton-map spelling, which the file loader rejects.
+    to_file_mode_yaml(&config)
 }
 
 fn grpc_chargeback_file_config(port: u16, overrides: Value) -> String {
@@ -2663,7 +2667,8 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
             "enabled": true,
         }],
     });
-    let yaml = serde_yaml::to_string(&config).expect("serialize yaml");
+    // Tagged-enum aware: `retry.backoff` must reach the loader as `!fixed`.
+    let yaml = to_file_mode_yaml(&config);
     let harness = GatewayHarness::builder()
         .file_config(yaml)
         .log_level("info")
