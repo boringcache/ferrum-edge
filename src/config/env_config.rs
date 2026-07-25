@@ -945,6 +945,9 @@ pub struct EnvConfig {
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
     pub log_shutdown_drain_timeout_ms: u64,
+    /// Aggregate admitted terminal/mirror/deadline-cleanup task budget.
+    /// Default: 4096.
+    pub log_delivery_max_tasks: usize,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
     /// include its own `?poll=` option. Clamped to 1 second minimum and 24 hours
@@ -2316,6 +2319,7 @@ impl Default for EnvConfig {
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
             log_shutdown_drain_timeout_ms: crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT
                 as u64,
+            log_delivery_max_tasks: crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,
@@ -2648,6 +2652,7 @@ impl EnvConfig {
             log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => crate::logging::LOG_BUFFER_BYTES_DEFAULT, clamp(crate::logging::LOG_BUFFER_BYTES_MIN, crate::logging::LOG_BUFFER_BYTES_MAX);
             log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT, clamp(crate::logging::LOG_MAX_RECORD_BYTES_MIN, crate::logging::LOG_MAX_RECORD_BYTES_MAX);
             log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64, clamp(crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN as u64, crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX as u64);
+            log_delivery_max_tasks: usize = "FERRUM_LOG_DELIVERY_MAX_TASKS" => crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT, clamp(crate::logging::LOG_DELIVERY_MAX_TASKS_MIN, crate::logging::LOG_DELIVERY_MAX_TASKS_MAX);
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
             acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);
@@ -3371,6 +3376,7 @@ impl EnvConfig {
             log_buffer_bytes,
             log_max_record_bytes,
             log_shutdown_drain_timeout_ms,
+            log_delivery_max_tasks,
             secret_refresh_interval_seconds,
             acme_auto_renew_enabled,
             acme_renew_when_remaining_days,

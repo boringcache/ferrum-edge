@@ -256,3 +256,141 @@ async fn reinitialize_does_not_orphan_an_open_generation() {
         "the updated override must take effect through a fresh post-drain generation"
     );
 }
+
+/// Issue #3028: hold the task budget open, attempt far more admissions than the
+/// cap, prove registry/permit counts stay bounded, observe rejects, then confirm
+/// permits release so later work can admit again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
+    const BUDGET: usize = 8;
+    const OVERFLOW: usize = 256;
+
+    let slot = DeliverySlot::with_limits(0, BUDGET);
+    slot.begin_cycle();
+    assert_eq!(slot.max_tasks(), BUDGET);
+
+    let release = Arc::new(Notify::new());
+    let started = Arc::new(Notify::new());
+    let mut held = 0usize;
+
+    // Fill the aggregate budget with a mix of kinds so one kind cannot bypass
+    // the shared registry cap.
+    for kind in 0..BUDGET {
+        let task_release = Arc::clone(&release);
+        let task_started = Arc::clone(&started);
+        let future = async move {
+            task_started.notify_one();
+            task_release.notified().await;
+        };
+        let admitted = match kind % 3 {
+            0 => slot.spawn_terminal(future),
+            1 => slot.spawn_mirror(future),
+            _ => slot.spawn_deadline_cleanup(future),
+        };
+        assert!(admitted, "budget fill admission {kind} must succeed");
+        held += 1;
+    }
+
+    for _ in 0..held {
+        started.notified().await;
+    }
+
+    assert_eq!(slot.active_tasks(), BUDGET);
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+
+    let rejected_before = slot.rejected_tasks();
+    let mut overflow_rejects = 0u64;
+    for i in 0..OVERFLOW {
+        let admitted = match i % 3 {
+            0 => slot.spawn_terminal(async {}),
+            1 => slot.spawn_mirror(async {}),
+            _ => slot.spawn_deadline_cleanup(async {}),
+        };
+        assert!(
+            !admitted,
+            "overflow admission {i} must reject once the budget is held open"
+        );
+        overflow_rejects += 1;
+        assert!(
+            slot.active_tasks() <= BUDGET,
+            "registry must stay within the configured budget"
+        );
+        assert!(
+            slot.admitted_tasks() <= BUDGET as u64,
+            "admission permits must stay within the configured budget"
+        );
+    }
+
+    assert_eq!(slot.active_tasks(), BUDGET);
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+    assert_eq!(
+        slot.rejected_tasks(),
+        rejected_before + overflow_rejects,
+        "capacity rejects must remain observable without spawning more deferred work"
+    );
+
+    release.notify_waiters();
+
+    // Wait for held tasks to finish and release permits.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while slot.admitted_tasks() != 0 || slot.active_tasks() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held tasks must release permits after completion"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(slot.rejected_tasks(), rejected_before + overflow_rejects);
+
+    let refill_release = Arc::new(Notify::new());
+    let refill_started = Arc::new(Notify::new());
+    for i in 0..BUDGET {
+        let task_release = Arc::clone(&refill_release);
+        let task_started = Arc::clone(&refill_started);
+        assert!(
+            slot.spawn_terminal(async move {
+                task_started.notify_one();
+                task_release.notified().await;
+            }),
+            "permit release must reopen admission up to the budget (slot {i})"
+        );
+    }
+    for _ in 0..BUDGET {
+        refill_started.notified().await;
+    }
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+    assert!(
+        !slot.spawn_terminal(async {}),
+        "budget must still reject once refilled"
+    );
+    refill_release.notify_waiters();
+    assert!(
+        slot.shutdown(Duration::from_secs(5)).await.complete(),
+        "bounded admission must not disturb the shutdown drain deadline"
+    );
+}
+
+#[tokio::test]
+async fn task_budget_override_applies_to_the_next_generation() {
+    let slot = DeliverySlot::with_limits(0, 4);
+    let first = slot.begin_cycle();
+    assert_eq!(slot.max_tasks(), 4);
+
+    slot.initialize_with_limits(0, 2);
+    assert_eq!(
+        slot.current_generation(),
+        first,
+        "open generations keep their existing budget"
+    );
+    assert_eq!(slot.max_tasks(), 4);
+
+    assert!(slot.shutdown(Duration::from_secs(5)).await.complete());
+    let second = slot.begin_cycle();
+    assert_ne!(second, first);
+    assert_eq!(
+        slot.max_tasks(),
+        2,
+        "the updated task budget must take effect on the fresh generation"
+    );
+}
