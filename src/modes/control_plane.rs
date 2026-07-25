@@ -2308,10 +2308,10 @@ where
                 // Shutdown has been requested by this point (operator or a prior
                 // listener exit), so Ok exits are expected. Errors/panics still
                 // classify as failures.
-                if let Some(err) = classify_cp_listener_exit(&name, join, true) {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                if let Some(err) = classify_cp_listener_exit(&name, join, true)
+                    && first_error.is_none()
+                {
+                    first_error = Some(err);
                 }
             }
             Ok(None) => break,
