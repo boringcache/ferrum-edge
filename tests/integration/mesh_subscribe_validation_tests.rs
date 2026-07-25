@@ -354,7 +354,9 @@ impl CpHandle {
 }
 
 async fn start_cp(updates: Vec<MeshConfigUpdate>) -> CpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind stub CP");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stub CP");
     let addr = listener.local_addr().expect("stub CP addr");
     let subscribe_count = Arc::new(AtomicUsize::new(0));
     let cp = ScriptedMeshCp {
@@ -425,7 +427,10 @@ async fn native_stream_keeps_last_good_slice_when_response_is_unbound() {
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     let snapshot = state.snapshot();
-    let slice = snapshot.as_ref().as_ref().expect("last-good slice retained");
+    let slice = snapshot
+        .as_ref()
+        .as_ref()
+        .expect("last-good slice retained");
     assert_eq!(
         slice.version, "v-last-good",
         "an unbound response must not replace the last-good slice"
