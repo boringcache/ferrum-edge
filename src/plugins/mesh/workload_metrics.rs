@@ -2349,6 +2349,7 @@ mod tests {
                     mirror_target_url: "https://mirror.example".to_string(),
                     mirror_response_status_code: Some(200),
                     mirror_response_size_bytes: Some(0),
+                    mirror_response_advertised_size_bytes: None,
                     mirror_latency_ms: 1.0,
                     mirror_error: None,
                 }),
