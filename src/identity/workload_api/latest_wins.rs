@@ -17,8 +17,8 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::stream::BoxStream;
 use tokio::sync::Notify;
-use tokio_stream::Stream;
 
 /// Create a capacity-one latest-wins channel.
 pub fn channel<T>() -> (LatestWinsSender<T>, LatestWinsReceiver<T>) {
@@ -153,14 +153,19 @@ impl<T> LatestWinsReceiver<T> {
         }
     }
 
-    /// Convert into a [`Stream`] that yields moved values until the sender ends.
-    pub fn into_stream(self) -> impl Stream<Item = T> + Send + 'static
+    /// Convert into a boxed [`futures_util::Stream`] that yields moved values
+    /// until the sender ends.
+    ///
+    /// Boxed so the returned stream is `Unpin`: `stream::unfold`'s async-block
+    /// state future is never `Unpin`, and callers across the crate use
+    /// `StreamExt::next` on the returned value.
+    pub fn into_stream(self) -> BoxStream<'static, T>
     where
         T: Send + 'static,
     {
-        futures_util::stream::unfold(self, |mut rx| async move {
+        Box::pin(futures_util::stream::unfold(self, |mut rx| async move {
             rx.recv().await.map(|item| (item, rx))
-        })
+        }))
     }
 
     fn try_take(&self) -> Option<T> {
