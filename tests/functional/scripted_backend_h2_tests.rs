@@ -2515,14 +2515,23 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
 /// With `FERRUM_ADD_FORWARDED_HEADER=true`, the direct-H2 builder must strip a
 /// spoofed client `Forwarded` and emit exactly one gateway-owned element.
 ///
-/// Fixture notes (hosted job 89647762460): the capability probe calls
-/// `http2_pool.get_sender()` against this backend and parks a live H2
-/// connection in the direct pool without ever opening a stream. A one-shot
-/// `ExpectHeaders` script on that same connection then races the ownership
-/// GET and surfaces as a fast 502 `Backend unavailable`. Give the probe its
-/// own connection script that finishes without needing a stream, and reserve
-/// a second happy-path script for the real GET (same split the H3 ownership
-/// fixture gets from colocated TCP vs UDP backends).
+/// Fixture notes (hosted job 89647762460 returned a 502 here): the gateway
+/// opens an unspecified number of connections to this backend before the
+/// request under test — the startup capability probe dials one through
+/// `http2_pool::get_sender()` and parks it, and `HEAD /` pool warmup dials
+/// another through the reqwest client. A *one-shot* script (the default)
+/// makes the fixture close each connection ~100ms after its final step, so
+/// whether a connection the gateway still has pooled is alive when the
+/// ownership GET dispatches becomes a wall-clock race; losing it surfaces as
+/// `502 {"error":"Backend unavailable"}` from `sender.send_request` on a
+/// pooled-but-dead connection.
+///
+/// `repeat_script(true)` removes that race by construction rather than by
+/// sleeping past it: the fixture serves the happy path on a loop, so every
+/// connection accepts unbounded streams and the fixture never closes a
+/// connection the gateway may have pooled. Warmup is disabled so no `HEAD /`
+/// traffic is interleaved either — same contract as the H3 ownership sibling,
+/// which sets `FERRUM_POOL_WARMUP_ENABLED=false` and gates on the registry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
@@ -2530,33 +2539,20 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
     let (cert, key) = ca.valid().expect("leaf");
     let reservation = reserve_port().await.expect("reserve port");
     let backend_port = reservation.port;
-    let happy_path = vec![
-        H2Step::ExpectHeaders(MatchHeaders::any()),
-        H2Step::DrainRequestBody,
-        H2Step::RespondHeaders(vec![
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
             (":status", "200".into()),
             ("content-type", "text/plain".into()),
             ("content-length", "2".into()),
-        ]),
-        H2Step::RespondData {
+        ]))
+        .step(H2Step::RespondData {
             data: Bytes::from_static(b"ok"),
             end_stream: true,
-        },
-    ];
-    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
-        .expect("h2 tls backend")
-        .connection_scripts([
-            // Connection 0: capability-probe dial. Finish without waiting for a
-            // client stream so the pooled probe sender is not left paired with
-            // a permanently blocked ExpectHeaders script.
-            vec![
-                H2Step::Sleep(Duration::from_millis(50)),
-                H2Step::DropConnection,
-            ],
-            // Connection 1+: ownership GET after the pool replaces the dropped
-            // probe connection.
-            happy_path,
-        ])
+        })
         .spawn()
         .expect("spawn backend");
 
@@ -2573,9 +2569,11 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .file_config(yaml)
         .log_level("info")
         .capture_output()
-        // Initial capability refresh only — avoid pool-warmup HEAD traffic
-        // against the scripted H2 fixture (same contract as the H3 ownership
-        // regression).
+        // Initial capability refresh only — no pool-warmup `HEAD /` traffic
+        // against the scripted H2 fixture. With warmup disabled the startup
+        // path still runs one capability refresh pass, which is what
+        // classifies `h2_tls=supported` for the gate below (same contract as
+        // the H3 ownership regression).
         .pool_warmup_enabled(false)
         .env("FERRUM_ADD_FORWARDED_HEADER", "true")
         .spawn()
@@ -2590,10 +2588,6 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         Some("supported"),
         "precondition: direct-H2 ownership coverage requires h2_tls=supported; entry: {entry:#?}"
     );
-    // The probe script sleeps briefly then drops. Wait past that tail so the
-    // ownership GET cannot land on connection 0 mid-Sleep (queued stream would
-    // be discarded by DropConnection → 502).
-    tokio::time::sleep(Duration::from_millis(150)).await;
 
     let response = reqwest::Client::builder()
         .http1_only()
