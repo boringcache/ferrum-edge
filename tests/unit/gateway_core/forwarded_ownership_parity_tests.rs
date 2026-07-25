@@ -6,6 +6,12 @@
 //! Reqwest appends; direct-H2/`HeaderMap::insert` replaces; H3 builders push
 //! into a `Vec`. Divergent strip policy made backend-visible Forwarded shape
 //! flip on capability-path changes.
+//!
+//! Behavior-level hosted coverage (spoofed client Forwarded → exactly one
+//! gateway-owned element on reqwest / direct-H2 / native-H3) lives in:
+//! `functional_forwarded_via_headers_test`, `scripted_backend_h2_tests`, and
+//! `scripted_backend_h3_tests`. The structural assertions below only guard
+//! shared-predicate wiring and are not the acceptance proof.
 
 use ferrum_edge::proxy::headers::is_proxy_owned_forwarding_header;
 
