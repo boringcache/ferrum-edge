@@ -70,21 +70,48 @@
             "adminJwtSecret": { "$ref": "#/definitions/secretSource" },
             "cpDpGrpcJwtSecret": { "$ref": "#/definitions/secretSource" }
           }
-        }
+        },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
       }
     },
     "injector": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
+      }
+    },
+    "ambient": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
+      }
+    },
+    "eastWest": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
       }
     },
     "ca": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
+      }
+    },
+    "nodeAgent": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "probes": { "$ref": "#/definitions/workloadProbes" }
       }
     }
   },
@@ -103,6 +130,48 @@
           }
         },
         "valueFrom": { "type": "object" }
+      }
+    },
+    "workloadProbes": {
+      "type": "object",
+      "description": "Per-workload health probes. Where an admin listener exists, liveness/startup use `ferrum-edge health --live` (GET /live) and readiness uses `ferrum-edge health` (GET /health). Injector/east-west defaults use a TCP probe on their listen port. Overrides are per-probe so liveness and readiness cannot be silently coupled.",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "failureThreshold": { "type": "integer", "minimum": 1 },
+            "periodSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed default; also used by the startup probe."
+            }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Custom readiness handler (exec/httpGet/tcpSocket) replacing the computed default."
+            }
+          }
+        }
       }
     }
   }

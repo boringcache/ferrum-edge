@@ -1438,6 +1438,172 @@ jobs:
             fi
           done
 
+          # Mesh workload probes (#2450): default/enabled/disabled/override coverage
+          # for every first-class mesh workload, including ambient/node-agent special
+          # readiness gating.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml"
+          for kind_name in \
+            "ferrum-mesh-control-plane" \
+            "ferrum-mesh-injector" \
+            "ferrum-mesh-ca" \
+            "ferrum-mesh-east-west" \
+            "ferrum-mesh-ambient" \
+            "ferrum-mesh-node-agent"; do
+            block="$(awk -v n="$kind_name" '
+              $0 ~ "name: " n {found=1}
+              found {print}
+              found && /^---$/ {exit}
+            ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+            if ! grep -q 'startupProbe:' <<<"$block" ||
+              ! grep -q 'livenessProbe:' <<<"$block" ||
+              ! grep -q 'readinessProbe:' <<<"$block"; then
+              echo "::error title=Mesh probes missing::$kind_name must render startup/liveness/readiness by default"
+              exit 1
+            fi
+          done
+          cp_liveness="$(awk '
+            /name: ferrum-mesh-control-plane/ {found=1}
+            found && /livenessProbe:/ {p=1}
+            p {print}
+            p && /periodSeconds:/ {exit}
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+          cp_startup="$(awk '
+            /name: ferrum-mesh-control-plane/ {found=1}
+            found && /startupProbe:/ {p=1}
+            p {print}
+            p && /periodSeconds:/ {exit}
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+          cp_readiness="$(awk '
+            /name: ferrum-mesh-control-plane/ {found=1}
+            found && /readinessProbe:/ {p=1}
+            p {print}
+            p && /periodSeconds:/ {exit}
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+          if ! grep -q -- '--live' <<<"$cp_liveness"; then
+            echo "::error title=CP liveness not process-only::control-plane livenessProbe must run health --live"
+            exit 1
+          fi
+          if ! grep -q -- '--live' <<<"$cp_startup"; then
+            echo "::error title=CP startup not process-only::control-plane startupProbe must run health --live"
+            exit 1
+          fi
+          if grep -q -- '--live' <<<"$cp_readiness"; then
+            echo "::error title=CP readiness coupled to liveness::control-plane readinessProbe must probe /health (no --live)"
+            exit 1
+          fi
+          injector_ready="$(awk '
+            /name: ferrum-mesh-injector/ {found=1}
+            found && /readinessProbe:/ {p=1}
+            p {print}
+            p && /periodSeconds:/ {exit}
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+          eastwest_ready="$(awk '
+            /name: ferrum-mesh-east-west/ {found=1}
+            found && /readinessProbe:/ {p=1}
+            p {print}
+            p && /periodSeconds:/ {exit}
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml")"
+          if ! grep -q 'tcpSocket:' <<<"$injector_ready" || ! grep -q 'port: webhook' <<<"$injector_ready"; then
+            echo "::error title=Injector readiness not TCP::injector readiness must default to tcpSocket on webhook"
+            exit 1
+          fi
+          if ! grep -q 'tcpSocket:' <<<"$eastwest_ready" || ! grep -q 'port: tls-passthru' <<<"$eastwest_ready"; then
+            echo "::error title=East-west readiness not TCP::east-west readiness must default to tcpSocket on tls-passthru"
+            exit 1
+          fi
+          # Disabled probes omit all three handlers.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.startup.enabled=false \
+            --set controlPlane.probes.liveness.enabled=false \
+            --set controlPlane.probes.readiness.enabled=false \
+            --set injector.enabled=true \
+            --set injector.probes.startup.enabled=false \
+            --set injector.probes.liveness.enabled=false \
+            --set injector.probes.readiness.enabled=false \
+            --set eastWest.enabled=true \
+            --set eastWest.probes.startup.enabled=false \
+            --set eastWest.probes.liveness.enabled=false \
+            --set eastWest.probes.readiness.enabled=false \
+            --set ambient.enabled=true \
+            --set ambient.probes.startup.enabled=false \
+            --set ambient.probes.liveness.enabled=false \
+            --set ambient.probes.readiness.enabled=false \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set ca.enabled=true \
+            --set ca.probes.startup.enabled=false \
+            --set ca.probes.liveness.enabled=false \
+            --set ca.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-disabled.yaml"
+          if grep -E 'startupProbe:|livenessProbe:|readinessProbe:' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-disabled.yaml"; then
+            echo "::error title=Disabled mesh probes still rendered::enabled=false must omit startup/liveness/readiness"
+            exit 1
+          fi
+          # Per-probe override replaces only that handler; shared probes.override
+          # is rejected by values.schema.json (strict parity with gateway).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.liveness.override.httpGet.path=/live \
+            --set controlPlane.probes.liveness.override.httpGet.port=admin-http \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-override.yaml"
+          grep -Fq 'path: /live' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-override.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.override.httpGet.path=/health \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.err"; then
+            echo "::error title=Coupled mesh probe override accepted::controlPlane.probes.override must be rejected"
+            exit 1
+          fi
+          # Node-agent admin port 0 still omits readiness (special ambient/node-agent behavior).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
+          if grep -q 'readinessProbe:' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"; then
+            echo "::error title=Node-agent port 0 still ready::admin port 0 must omit readinessProbe"
+            exit 1
+          fi
+          # NodeWaypoint ambient still renders admin health readiness.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=ebpf \
+            --set nodeAgent.proxyMode=node_waypoint \
+            --set-string nodeAgent.admin.port=19090 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
+          ambient_block="$(awk '
+            /name: ferrum-mesh-ambient/ { in_ambient = 1 }
+            in_ambient { print }
+            /name: ferrum-mesh-node-agent/ && in_ambient { exit }
+          ' "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml")"
+          if ! grep -q 'readinessProbe:' <<<"$ambient_block" ||
+            ! grep -A20 'readinessProbe:' <<<"$ambient_block" | grep -q -- '- "19091"' ||
+            ! grep -A20 'readinessProbe:' <<<"$ambient_block" | grep -q 'health' ||
+            grep -A20 'readinessProbe:' <<<"$ambient_block" | grep -q -- '--live'; then
+            echo "::error title=NodeWaypoint ambient readiness regress::must keep admin /health readiness without --live"
+            exit 1
+          fi
+          if ! grep -A20 'livenessProbe:' <<<"$ambient_block" | grep -q -- '--live'; then
+            echo "::error title=Ambient liveness not process-only::ambient livenessProbe must run health --live"
+            exit 1
+          fi
+
       - name: Core gateway chart static validation
         run: |
           set -euo pipefail
