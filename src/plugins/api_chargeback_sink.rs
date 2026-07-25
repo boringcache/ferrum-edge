@@ -3845,8 +3845,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     }
     validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
     validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
-    if config.clickhouse.timeout_ms == 0
-        || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
+    if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
     {
         return Err(format!(
             "{PLUGIN_NAME}: clickhouse.timeout_ms must be between 1 and {MAX_CLICKHOUSE_TIMEOUT_MS}"
@@ -6814,12 +6813,7 @@ async fn replay_spool_once(
 
         match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                finalize_replayed_spool_file(
-                    spool,
-                    claim.path(),
-                    lines.len(),
-                    dead_letters,
-                )?;
+                finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)?;
                 spool
                     .metrics
                     .last_replay_at

@@ -12,8 +12,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    spool_claim_lease_secs_for_tests,
-    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    spool_claim_lease_secs_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -1202,7 +1202,10 @@ fn spool_rejects_empty_spool_oversized_batch() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&default_test_namespace_root(temp.path())), 0);
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0
+    );
 }
 
 #[test]
@@ -1228,7 +1231,10 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     // With the resident file still present, a second write of the same size must
     // evict first (exact fit after eviction), not exceed the ceiling.
@@ -1267,7 +1273,10 @@ fn spool_quota_uses_compressed_encoded_size() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     // Using the uncompressed length as the ceiling must not be how admission
     // decides: when compressed size exceeds an artificially smaller budget,
@@ -1309,7 +1318,10 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     let before = spool.scan_stats().unwrap();
     assert_eq!(before.files, 1);
     assert_eq!(before.bytes, encoded_len);
-    assert_eq!(before.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
+    assert_eq!(
+        before.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1346,7 +1358,10 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&default_test_namespace_root(temp.path())), 0);
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0
+    );
 }
 
 #[test]
@@ -1381,7 +1396,10 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&default_test_namespace_root(temp.path())));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1465,9 +1483,8 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let namespace_root = namespace_root.expect(
-            "committed spool should create a managed namespace with spool.meta.json",
-        );
+        let namespace_root = namespace_root
+            .expect("committed spool should create a managed namespace with spool.meta.json");
         let day = namespace_root.join("20260524");
         fs::create_dir_all(&day).unwrap();
         let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
@@ -2827,8 +2844,7 @@ fn clickhouse_timeout_bound_keeps_claim_lease_above_delivery_budget() {
     raw["retry"]["initial_delay_ms"] = json!(60_000);
     raw["retry"]["max_delay_ms"] = json!(60_000);
     let config: ApiChargebackSinkConfig = serde_json::from_value(raw.clone()).unwrap();
-    let one_delivery_budget_secs =
-        ((600_000u64 * 5) + (60_000u64 * 4)).div_ceil(1_000);
+    let one_delivery_budget_secs = ((600_000u64 * 5) + (60_000u64 * 4)).div_ceil(1_000);
     assert!(
         spool_claim_lease_secs_for_tests(&config) > one_delivery_budget_secs,
         "claim lease must remain strictly above the accepted request/retry budget"
@@ -3025,8 +3041,7 @@ fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
     // A record carrying a different owner tag, planted inside our namespace.
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let foreign =
-        day.join("00000000000000000000000000.0123456789abcdef0123456789abcdef.ndjson");
+    let foreign = day.join("00000000000000000000000000.0123456789abcdef0123456789abcdef.ndjson");
     fs::write(&foreign, vec![b'x'; encoded_len as usize]).unwrap();
 
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
@@ -3181,8 +3196,8 @@ fn spool_scan_survives_directory_cycles_and_bounds_depth() {
 fn reload_generation_does_not_delete_a_live_peer_temp() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
-    let gen1 =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 11).unwrap();
+    let gen1 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 11)
+        .unwrap();
 
     let day = gen1.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
@@ -3194,8 +3209,8 @@ fn reload_generation_does_not_delete_a_live_peer_temp() {
 
     // A replacement generation runs first-prepare reconciliation while the older
     // accepted generation is still mid-write.
-    let gen2 =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 12).unwrap();
+    let gen2 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 12)
+        .unwrap();
     assert!(
         active_tmp.exists(),
         "a replacement generation must not unlink a live peer's active temp"
@@ -3205,8 +3220,8 @@ fn reload_generation_does_not_delete_a_live_peer_temp() {
     // Once the writer releases the lease, a later generation reconciles it.
     drop(lease);
     drop(gen1);
-    let gen3 =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 13).unwrap();
+    let gen3 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 13)
+        .unwrap();
     assert!(
         !active_tmp.exists(),
         "an abandoned same-process temp must be reconciled once no writer holds it"
@@ -3428,11 +3443,15 @@ fn contended_claim_returns_none_instead_of_stealing() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
     let old_gen =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 31).unwrap();
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 31)
+            .unwrap();
     let new_gen =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 32).unwrap();
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 32)
+            .unwrap();
 
-    let record = old_gen.write_events(&[sample_event("evt-handoff")]).unwrap();
+    let record = old_gen
+        .write_events(&[sample_event("evt-handoff")])
+        .unwrap();
     // Both accepted generations see the same candidate.
     assert_eq!(
         old_gen.list_replayable_spool_files_for_tests().unwrap(),
@@ -3514,7 +3533,9 @@ async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server_ok)
         .await;
-    let delivered = spool.write_events(&[sample_event("evt-delivered")]).unwrap();
+    let delivered = spool
+        .write_events(&[sample_event("evt-delivered")])
+        .unwrap();
     replay_spool_once_for_tests(&spool, &server_ok.uri())
         .await
         .unwrap();
@@ -3530,7 +3551,9 @@ async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
         .respond_with(ResponseTemplate::new(400))
         .mount(&server_perm)
         .await;
-    let poison = spool.write_events(&[sample_event("evt-permanent")]).unwrap();
+    let poison = spool
+        .write_events(&[sample_event("evt-permanent")])
+        .unwrap();
     replay_spool_once_for_tests(&spool, &server_perm.uri())
         .await
         .unwrap();
@@ -3588,13 +3611,13 @@ fn destination_change_moves_to_a_fresh_namespace_without_rerouting() {
     let mut after = test_owner_spec("node-a");
     after.table = "charges_v2";
 
-    let old =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &before, 1).unwrap();
+    let old = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &before, 1)
+        .unwrap();
     let stranded = old.write_events(&[sample_event("evt-v1")]).unwrap();
     drop(old);
 
-    let new =
-        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &after, 2).unwrap();
+    let new = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &after, 2)
+        .unwrap();
     assert!(
         !stranded.starts_with(new.namespace_root_for_tests()),
         "a destination change must move to a fresh managed namespace"
