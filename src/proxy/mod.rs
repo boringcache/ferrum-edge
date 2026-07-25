@@ -15507,9 +15507,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // This is internal ownership bookkeeping, not transaction metadata. Keep
     // it visible for the complete committed-hook lifecycle (including an owned
     // context transferred to detached deadline cleanup), then remove it from
-    // the request context before later logging/summary hooks can copy it.
-    ctx.metadata
-        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+    // the request context before later logging/summary hooks can copy it. H3
+    // calls this finalizer with `invoke_response_committed = false` and runs its
+    // committed hooks immediately afterward, so leave the marker intact for
+    // that caller; the H3 committed-hook runner consumes it after its lifecycle.
+    if invoke_response_committed {
+        ctx.metadata
+            .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+    }
 
     // Final wire shape for synthetic/reject responses: HEAD keeps representation
     // metadata (Content-Length) but omits content bytes; 204/205/304 omit both
@@ -18872,9 +18877,13 @@ async fn handle_proxy_request_inner(
         HttpFlavor::Plain if grpc_web_request => ProxyProtocol::Grpc,
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
-    let initial_response_header_policy_plugins = epoch
-        .plugin_cache
-        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+    let plugin_cache_view = if grpc_web_request {
+        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+    } else {
+        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+    };
+    let initial_response_header_policy_plugins =
+        plugin_cache_view.initial_response_header_policy_plugins();
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
@@ -18909,10 +18918,7 @@ async fn handle_proxy_request_inner(
         // native gRPC reshapes the client-visible HTTP status to trailers-only
         // 200 + grpc-status.
         record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
-        let logging_plugins = epoch
-            .plugin_cache
-            .request_view(&proxy.id, request_protocol)
-            .plugins();
+        let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
@@ -18998,10 +19004,10 @@ async fn handle_proxy_request_inner(
         .await);
     }
 
-    // Load plugin-cache values once for this request. Every plugin list,
-    // capability bitset, and buffering flag below is derived from the same
-    // cache generation without retaining the full cache across awaits.
-    let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);
+    // Use the same request-scoped cache view selected above for normal request
+    // handling. gRPC-Web is framed HTTP, so it uses the composed gRPC-Web view
+    // that keeps HTTP guardrail plugins while retaining native gRPC policies
+    // that explicitly opt in.
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();

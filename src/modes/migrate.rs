@@ -95,9 +95,13 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     // Connect without running migrations automatically
     sqlx::any::install_default_drivers();
 
-    let pool = sql_migration_pool_options(db_type)
-        .connect(&effective_url)
-        .await?;
+    let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+        sql_migration_pool_options(db_type),
+        &effective_url,
+        db_type,
+        env_config.db_pool_connect_timeout_seconds,
+    )
+    .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
 
@@ -257,9 +261,13 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
 
     sqlx::any::install_default_drivers();
 
-    let pool = sql_migration_pool_options(db_type)
-        .connect(&effective_url)
-        .await?;
+    let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+        sql_migration_pool_options(db_type),
+        &effective_url,
+        db_type,
+        env_config.db_pool_connect_timeout_seconds,
+    )
+    .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
     let status = runner.status().await?;
@@ -371,10 +379,14 @@ mod tests {
     #[tokio::test]
     async fn sqlite_migration_pool_enables_foreign_keys_per_connection() {
         sqlx::any::install_default_drivers();
-        let pool = sql_migration_pool_options("sqlite")
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite migration pool");
+        let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+            sql_migration_pool_options("sqlite"),
+            "sqlite::memory:",
+            "sqlite",
+            10,
+        )
+        .await
+        .expect("connect sqlite migration pool");
 
         let row = sqlx::query("PRAGMA foreign_keys")
             .fetch_one(&pool)
