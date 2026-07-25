@@ -585,6 +585,7 @@ jobs:
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_namespace_claim_tests
+              integration::file_mode_admin_jwt_tests
               integration::admin_cached_config_tests
               integration::admin_cross_namespace_refs_tests
               integration::admin_mesh_config_drift_tests
