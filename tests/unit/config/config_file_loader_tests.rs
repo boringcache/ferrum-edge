@@ -2415,7 +2415,8 @@ plugin_configs:
   - id: "log-plugin"
     plugin_name: "stdout_logging"
     config: {}
-    scope: global
+    scope: proxy
+    proxy_id: "proxy-1"
     enabled: true
 "#,
     );
@@ -2424,7 +2425,8 @@ plugin_configs:
             r#"  - id: "key-auth"
     plugin_name: "key_auth"
     config: {}
-    scope: global
+    scope: proxy
+    proxy_id: "proxy-1"
     enabled: true
 "#,
         );
