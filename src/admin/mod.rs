@@ -366,7 +366,7 @@ fn tls_inventory_snapshot_ttl_seconds(state: &AdminState) -> u64 {
 /// listener starts, so the first Prometheus scrape already has certificate
 /// metadata instead of waiting for its own background refresh to land.
 fn warm_tls_inventory_snapshot(state: &AdminState) {
-    tls_management::install_metrics_inventory_collector(state);
+    tls_management::replace_metrics_inventory_collector_for_serving_cycle(state);
     let ttl_seconds = tls_inventory_snapshot_ttl_seconds(state);
     if ttl_seconds > 0 {
         let ttl = Duration::from_secs(ttl_seconds);

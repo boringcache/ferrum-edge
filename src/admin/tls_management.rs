@@ -71,13 +71,9 @@ impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCol
     }
 }
 
-/// Install the process-wide metrics inventory collector. Idempotent: the first
-/// installation wins, so calling it from the admin serving path and from the
-/// scrape handler costs one lock-free load after startup.
-pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
-    if crate::tls::inventory_cache::collector_installed() {
-        return;
-    }
+fn metrics_inventory_collector(
+    state: &AdminState,
+) -> Arc<dyn crate::tls::inventory_cache::TlsInventoryCollector> {
     let env_config = state
         .proxy_state
         .as_ref()
@@ -87,8 +83,27 @@ pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
         .as_ref()
         .map(|proxy| Arc::clone(&proxy.config))
         .or_else(|| state.cached_config.clone());
-    let collector = AdminTlsInventoryCollector { env_config, config };
-    crate::tls::inventory_cache::install_collector(Arc::new(collector));
+    Arc::new(AdminTlsInventoryCollector { env_config, config })
+}
+
+/// Ensure the process-wide collector exists for direct metrics-handler callers
+/// that did not start through an admin serving path.
+pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
+    if crate::tls::inventory_cache::collector_installed() {
+        return;
+    }
+    crate::tls::inventory_cache::install_collector(metrics_inventory_collector(state));
+}
+
+/// Install the collector owned by this admin serving cycle.
+///
+/// Unlike scrape-time installation, a sequential in-process restart must
+/// replace the prior cycle's captured config handles. The cache marks its
+/// current snapshot stale so the warmup refresh publishes the new cycle.
+pub(super) fn replace_metrics_inventory_collector_for_serving_cycle(state: &AdminState) {
+    crate::tls::inventory_cache::replace_collector_for_serving_cycle(
+        metrics_inventory_collector(state),
+    );
 }
 
 pub(super) async fn handle_events(

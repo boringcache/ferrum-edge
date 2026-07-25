@@ -93,10 +93,10 @@ static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
 
 /// Install the process-wide collector. First installation wins.
 ///
-/// First-wins is deliberate: production installs from the admin serving path
-/// and from the metrics handler (both idempotent), while a test harness that
-/// pinned a counting fake with [`pin_collector`] stays in control of what the
-/// background refresh calls.
+/// The metrics handler uses this as an idempotent fallback when no admin
+/// serving path installed a collector. A test harness that pinned a counting
+/// fake with [`pin_collector`] stays in control of what the background refresh
+/// calls.
 ///
 /// Returns `true` when this call installed the collector.
 pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
@@ -112,7 +112,27 @@ pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
     true
 }
 
-/// Install a collector and refuse every later [`install_collector`].
+/// Replace the process-wide collector for a new admin serving cycle.
+///
+/// Sequential in-process serving cycles can own different `AdminState` /
+/// `ProxyState` values. Keeping the first collector forever would leave later
+/// cycles refreshing from the previous cycle's config. A serving-cycle install
+/// therefore replaces the collector and marks the current snapshot stale; the
+/// next bounded refresh publishes metadata from the new owner. Pinned test
+/// collectors remain authoritative.
+///
+/// Returns `true` when this call replaced the collector.
+pub fn replace_collector_for_serving_cycle(collector: Arc<dyn TlsInventoryCollector>) -> bool {
+    if CACHE.collector_pinned.load(Ordering::Acquire) {
+        return false;
+    }
+    CACHE.collector.store(Arc::new(Some(collector)));
+    mark_stale();
+    true
+}
+
+/// Install a collector and refuse every later install or serving-cycle
+/// replacement.
 ///
 /// Endpoint-level test harnesses pin a counting fake so the process-wide
 /// serving paths cannot replace it — or win an install race against it — while
