@@ -242,8 +242,7 @@ fn material_fixtures() -> MaterialFixtures {
     let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
-    let leaf_params =
-        CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
+    let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
     let leaf_cert = leaf_params
         .signed_by(&leaf_key, &ca_issuer)
         .expect("leaf cert");
@@ -443,11 +442,7 @@ async fn pairwise_routes_reject_cross_kind_create_overwrite_and_put() {
                 &create_body(existing, &id, &fixtures),
             )
             .await;
-            assert_eq!(
-                raw_http_status(&create),
-                201,
-                "seed {existing:?}: {create}"
-            );
+            assert_eq!(raw_http_status(&create), 201, "seed {existing:?}: {create}");
 
             let overwrite = send_raw_admin_request(
                 addr,
@@ -462,12 +457,7 @@ async fn pairwise_routes_reject_cross_kind_create_overwrite_and_put() {
                 409,
                 "create-overwrite {existing:?}->{requested:?}: {overwrite}"
             );
-            assert_kind_conflict(
-                &raw_http_json_body(&overwrite),
-                &id,
-                existing,
-                requested,
-            );
+            assert_kind_conflict(&raw_http_json_body(&overwrite), &id, existing, requested);
 
             let put = send_raw_admin_request(
                 addr,
@@ -538,7 +528,11 @@ async fn referenced_same_kind_replacement_succeeds_while_cross_kind_and_delete_c
         &create_body(Collection::CaBundle, &ca_id, &fixtures),
     )
     .await;
-    assert_eq!(raw_http_status(&create), 201, "create referenced CA: {create}");
+    assert_eq!(
+        raw_http_status(&create),
+        201,
+        "create referenced CA: {create}"
+    );
 
     let same_kind = send_raw_admin_request(
         addr,

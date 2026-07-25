@@ -315,7 +315,8 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {

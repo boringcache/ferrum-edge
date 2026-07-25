@@ -975,7 +975,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
 
-        let kept = store.get("persist-ca").expect("in-memory original retained");
+        let kept = store
+            .get("persist-ca")
+            .expect("in-memory original retained");
         assert_eq!(kept.kind, ManagedTlsMaterialKind::CaBundle);
         assert_eq!(kept.ca_bundle_pem.as_deref(), Some("ca"));
         let reopened = ManagedTlsStore::open(dir.path()).expect("reopen");
@@ -991,7 +993,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = ManagedTlsStore::open(dir.path()).expect("open store");
         store
-            .upsert(sample_record(ManagedTlsMaterialKind::Jwks, "persist-jwks"), false)
+            .upsert(
+                sample_record(ManagedTlsMaterialKind::Jwks, "persist-jwks"),
+                false,
+            )
             .expect("seed");
 
         let mut perms = std::fs::metadata(dir.path())
