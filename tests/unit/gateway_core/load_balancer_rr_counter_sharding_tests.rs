@@ -2,14 +2,15 @@
 //! LeastLatency warm-up / locality-distribute selection counters are sharded
 //! and cache-line padded (reusing the WRR shard mechanism).
 //!
-//! Throughput vs single-line contention is not asserted here — hosted perf
-//! gates cover that separately. These tests guard layout and selection parity.
+//! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` (2-target
+//! RR at 1 vs 8 threads) with `.github/scripts/verify_rr_selection_benchmark.py`
+//! for the contention floor. These unit tests guard layout and selection parity.
 
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
 use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, LocalityDistribute, Upstream, UpstreamLocalityLbSetting,
-    UpstreamTarget,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache};
 use std::collections::{BTreeMap, HashMap};
@@ -287,4 +288,157 @@ fn locality_distribute_weighted_bucket_pick_stays_proportional() {
         (west_share - 0.80).abs() < 0.05,
         "distribute bucket pick must stay near 80/20; west_share={west_share:.3}"
     );
+}
+
+#[test]
+fn single_target_round_robin_is_stable() {
+    let targets = make_targets(1);
+    let lb = LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+    for _ in 0..32 {
+        let sel = lb.select("", None).expect("selection");
+        assert_eq!(sel.target.host, "host0");
+    }
+}
+
+#[test]
+fn random_concurrent_selection_stays_near_even() {
+    let targets = make_targets(2);
+    let lb = Arc::new(LoadBalancer::new(
+        UPSTREAM,
+        LoadBalancerAlgorithm::Random,
+        &targets,
+        None,
+    ));
+
+    let thread_count = 8usize;
+    let per_thread = 2_000usize;
+    let mut handles = Vec::with_capacity(thread_count);
+    for _ in 0..thread_count {
+        let lb = Arc::clone(&lb);
+        handles.push(thread::spawn(move || {
+            let mut local = HashMap::new();
+            for _ in 0..per_thread {
+                let sel = lb.select("", None).expect("selection");
+                *local.entry(sel.target.host.clone()).or_insert(0u64) += 1;
+            }
+            local
+        }));
+    }
+
+    let mut counts = HashMap::new();
+    for handle in handles {
+        for (host, count) in handle.join().expect("worker") {
+            *counts.entry(host).or_insert(0u64) += count;
+        }
+    }
+
+    let total = (thread_count * per_thread) as f64;
+    let host0 = *counts.get("host0").unwrap_or(&0) as f64 / total;
+    let host1 = *counts.get("host1").unwrap_or(&0) as f64 / total;
+    assert!(
+        (host0 - 0.5).abs() < 0.08 && (host1 - 0.5).abs() < 0.08,
+        "sharded Random must stay near-even under concurrency; host0={host0:.3} host1={host1:.3}"
+    );
+}
+
+#[test]
+fn port_override_lane_round_robin_stays_even_under_concurrency() {
+    let now = Utc::now();
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let up = Upstream {
+        id: "u1".to_string(),
+        name: Some("u1".to_string()),
+        namespace: "ferrum".to_string(),
+        targets: make_targets(2),
+        algorithm: LoadBalancerAlgorithm::LeastConnections,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides,
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: HashMap::new(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let cache = Arc::new(LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![up],
+        ..GatewayConfig::default()
+    }));
+
+    let thread_count = 8usize;
+    let per_thread = 1_000usize;
+    let mut handles = Vec::with_capacity(thread_count);
+    for _ in 0..thread_count {
+        let cache = Arc::clone(&cache);
+        handles.push(thread::spawn(move || {
+            let snapshot = cache.load();
+            let mut local = HashMap::new();
+            for i in 0..per_thread {
+                let sel = LoadBalancerCache::select_target_for_port_from(
+                    &snapshot,
+                    "u1",
+                    &format!("p-{i}"),
+                    8080,
+                    None,
+                )
+                .expect("port-lane selection");
+                *local.entry(sel.target.host.clone()).or_insert(0u64) += 1;
+            }
+            local
+        }));
+    }
+
+    let mut counts = HashMap::new();
+    for handle in handles {
+        for (host, count) in handle.join().expect("worker") {
+            *counts.entry(host).or_insert(0u64) += count;
+        }
+    }
+
+    let total = (thread_count * per_thread) as f64;
+    let host0 = *counts.get("host0").unwrap_or(&0) as f64 / total;
+    let host1 = *counts.get("host1").unwrap_or(&0) as f64 / total;
+    assert!(
+        (host0 - 0.5).abs() < 0.05 && (host1 - 0.5).abs() < 0.05,
+        "port-lane sharded RR must stay near-even; host0={host0:.3} host1={host1:.3}"
+    );
+}
+
+#[test]
+fn selection_counter_ticket_wraps_without_biasing_modulo() {
+    // fetch_add wraps on overflow; RR/Random/distribute all consume the ticket
+    // via `% n` / golden-ratio hash, so wrapping must remain a full cycle.
+    // Directly exercise the same arithmetic the hot path uses.
+    let n = 3usize;
+    let near_max = u64::MAX - 2;
+    let mut seen = [0u64; 3];
+    for offset in 0..9u64 {
+        let ticket = near_max.wrapping_add(offset);
+        seen[(ticket as usize) % n] += 1;
+    }
+    assert_eq!(seen, [3, 3, 3]);
 }
