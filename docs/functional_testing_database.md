@@ -39,7 +39,7 @@ and omit backend URLs / containers; suites print `SKIPPED` and return success.
 | `FERRUM_TEST_POSTGRES_URL` | `postgres://ferrum:ferrum@127.0.0.1:5432/ferrum` | Plaintext PostgreSQL CRUD/namespace/migrate/recovery |
 | `FERRUM_TEST_MYSQL_URL` | `mysql://ferrum:ferrum@127.0.0.1:3306/ferrum` | Plaintext MySQL CRUD/namespace/migrate/recovery |
 | `FERRUM_TEST_MONGO_URL` | `mongodb://127.0.0.1:27017/ferrum_test` | Plaintext MongoDB CRUD/namespace/lifecycle |
-| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | Certs from `tests/scripts/setup_db_tls.sh` |
+| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | Certs from `.github/scripts/setup_db_tls.sh` |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL TLS fixtures are missing |
 

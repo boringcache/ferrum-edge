@@ -1009,9 +1009,6 @@ jobs:
               functional_mongodb_test
               functional_namespace_test
               functional_redis_rate_limiting_test
-            # Backend × behavior cells this hosted job owns (see docs matrix).
-            parity_backends: "sqlite,postgres,mysql,mongodb,redis"
-            parity_behaviors: "admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -1076,7 +1073,9 @@ jobs:
             mysql:8
 
           # TLS fixtures for functional_db_tls_test (ports 15432 / 13306).
-          ./tests/scripts/setup_db_tls.sh "${RUNNER_TEMP}/ferrum-db-tls-certs"
+          # Invoked from the scanned automation root (.github/scripts/), not
+          # tests/scripts/, so Trusted Cross policy accepts the repository command.
+          .github/scripts/setup_db_tls.sh "${RUNNER_TEMP}/ferrum-db-tls-certs"
 
           redis_ok=""
           for _ in $(seq 1 30); do
@@ -1124,8 +1123,8 @@ jobs:
           fi
 
           echo "data-plane services ready (redis:6379, mongo:27017, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
-          echo "parity backends: ${{ matrix.parity_backends || '' }}"
-          echo "parity behaviors: ${{ matrix.parity_behaviors || '' }}"
+          echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
+          echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -1194,11 +1193,13 @@ jobs:
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ matrix.shard }}" = "data-plane" ]; then
+            # Keep parity mapping text, but avoid Markdown table pipes adjacent to
+            # GitHub expressions — Trusted Cross treats `| ${{ ... }}` as a piped
+            # opaque command outside build-arm64-cross.
             echo "### Persistence parity mapping" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Backends | Behaviors |" >> $GITHUB_STEP_SUMMARY
-            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-            echo "| \`${{ matrix.parity_backends || '' }}\` | \`${{ matrix.parity_behaviors || '' }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "Backends: \`sqlite,postgres,mysql,mongodb,redis\`" >> $GITHUB_STEP_SUMMARY
+            echo "Behaviors: \`admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Required URLs: \`FERRUM_TEST_POSTGRES_URL\`, \`FERRUM_TEST_MYSQL_URL\`, \`FERRUM_TEST_MONGO_URL\` with \`FERRUM_DB_BACKENDS_REQUIRED=1\` / \`FERRUM_DB_TLS_REQUIRED=1\`." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
