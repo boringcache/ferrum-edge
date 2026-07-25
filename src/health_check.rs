@@ -211,6 +211,14 @@ pub struct HealthChecker {
     global_tls_no_verify: bool,
 }
 
+/// Per-active-check identity and lifecycle inputs for `start_active_check`.
+struct ActiveCheckStartParams<'a> {
+    target: &'a UpstreamTarget,
+    upstream_id: &'a str,
+    shutdown_rx: Option<&'a tokio::sync::watch::Receiver<bool>>,
+    generation: u64,
+}
+
 impl Default for HealthChecker {
     fn default() -> Self {
         Self::without_dns_cache(&PoolConfig::default())
@@ -397,14 +405,17 @@ impl HealthChecker {
                     let upstream_client =
                         self.build_upstream_health_client(&tls_config, active.use_tls);
                     for target in &upstream.targets {
-                        let handle = self.start_active_check(
+                        let start = ActiveCheckStartParams {
                             target,
+                            upstream_id: &upstream.id,
+                            shutdown_rx: shutdown_rx.as_ref(),
+                            generation,
+                        };
+                        let handle = self.start_active_check(
+                            &start,
                             active,
-                            &upstream.id,
-                            shutdown_rx.clone(),
                             &upstream_client,
                             &tls_config,
-                            generation,
                         );
                         new_aborts.push(handle.abort_handle());
                         new_handles.push(handle);
@@ -846,14 +857,19 @@ impl HealthChecker {
     /// Start an active health check background task for a target.
     fn start_active_check(
         &self,
-        target: &UpstreamTarget,
+        start: &ActiveCheckStartParams<'_>,
         config: &ActiveHealthCheck,
-        upstream_id: &str,
-        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         upstream_client: &Arc<reqwest::Client>,
         tls_config: &BackendTlsConfig,
-        generation: u64,
     ) -> tokio::task::JoinHandle<()> {
+        let ActiveCheckStartParams {
+            target,
+            upstream_id,
+            shutdown_rx,
+            generation,
+        } = start;
+        let shutdown_rx = shutdown_rx.map(|rx| rx.clone());
+        let generation = *generation;
         let key = target_key(upstream_id, target);
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);
