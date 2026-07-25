@@ -32031,7 +32031,6 @@ async fn proxy_to_backend_http2(
             )
         }
     };
-    };
     let read_started_at = tokio::time::Instant::now();
     let header_deadline = response_header_deadline(
         grpc_deadline_at,
