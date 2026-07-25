@@ -81,10 +81,6 @@ impl AuditMaxRowsPruneGate {
         self.inserts_since_check = 0;
         self.drain_pending = hit_batch_budget;
     }
-
-    pub fn drain_pending(&self) -> bool {
-        self.drain_pending
-    }
 }
 
 /// Soft-overshoot interval for a configured per-namespace max-row cap.

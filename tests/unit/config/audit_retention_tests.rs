@@ -179,7 +179,6 @@ fn max_rows_soft_cap_gate_skips_steady_state_scans_until_interval() {
     }
     assert!(gate.should_run_max_rows_prune(max_rows, false));
     gate.note_max_rows_prune_result(false);
-    assert!(!gate.drain_pending());
     assert!(
         !gate.should_run_max_rows_prune(max_rows, false),
         "after an under-cap check, soft cadence must reset"
@@ -199,13 +198,15 @@ fn max_rows_soft_cap_gate_keeps_draining_after_batch_budget() {
     assert!(audit_retention_hit_prune_batch_budget(full_budget));
     assert!(!audit_retention_hit_prune_batch_budget(full_budget - 1));
     gate.note_max_rows_prune_result(true);
-    assert!(gate.drain_pending());
     assert!(
         gate.should_run_max_rows_prune(100_000, false),
         "drain_pending must prune on every subsequent insert"
     );
     gate.note_max_rows_prune_result(false);
-    assert!(!gate.drain_pending());
+    assert!(
+        !gate.should_run_max_rows_prune(100_000, false),
+        "clearing drain_pending must restore the soft-cap cadence"
+    );
 }
 
 #[test]
