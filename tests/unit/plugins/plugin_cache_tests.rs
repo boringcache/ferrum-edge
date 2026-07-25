@@ -4220,6 +4220,7 @@ fn test_apply_delta_prunes_global_proxy_alerts_lifecycle_on_proxy_removal() {
     // Old in-flight sample admitted under the removed generation finishes after
     // recreate; a current-active-ID gate would incorrectly accept it.
     let stale = ferrum_edge::plugins::TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(p1_gen),
         response_status_code: 500,
@@ -4390,6 +4391,7 @@ fn test_apply_delta_proxy_group_rejects_stale_generation_after_identical_id_recr
     assert!(after.has_proxy_lifecycle_state_for_test("ferrum|p2"));
 
     let stale = ferrum_edge::plugins::TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(p1_gen),
         response_status_code: 500,
@@ -4494,12 +4496,14 @@ fn test_apply_delta_proxy_group_member_leave_rejoin_advances_alert_ownership() {
         .clone();
     assert_eq!(Arc::as_ptr(&rejoined) as *const () as usize, shared_ptr);
     let stale = ferrum_edge::plugins::TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(p1_initial_generation),
         response_status_code: 500,
         ..ferrum_edge::plugins::TransactionSummary::default()
     };
     let current = ferrum_edge::plugins::TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(p1_rejoined_generation),
         response_status_code: 500,
