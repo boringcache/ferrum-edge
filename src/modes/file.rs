@@ -1,8 +1,11 @@
 //! File mode — single-instance gateway backed by a YAML/JSON config file.
 //!
 //! Config is loaded once at startup. On Unix, sending SIGHUP triggers a
-//! hot reload: the file is re-parsed, validated, and atomically swapped
-//! into the running gateway without dropping connections.
+//! hot reload: the file is re-parsed under the file-loader stability/
+//! atomicity contract (byte-identical consecutive probes; rejects torn
+//! in-place updates), validated, and atomically swapped into the running
+//! gateway without dropping connections. Unstable or invalid candidates
+//! keep the last known-good live generation.
 //!
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
