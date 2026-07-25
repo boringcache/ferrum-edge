@@ -2507,9 +2507,7 @@ impl Default for EnvConfig {
             admin_read_only: false,
             admin_audit_enabled: false,
             audit_retention_days: None,
-            audit_retention_max_rows: Some(
-                crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT,
-            ),
+            audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
