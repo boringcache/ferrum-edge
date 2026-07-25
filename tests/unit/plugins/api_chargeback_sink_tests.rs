@@ -12,6 +12,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
+    spool_claim_lease_secs_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
@@ -2818,6 +2819,37 @@ async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
 }
 
 #[test]
+fn clickhouse_timeout_bound_keeps_claim_lease_above_delivery_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut raw = valid_config(temp.path());
+    raw["clickhouse"]["timeout_ms"] = json!(600_000);
+    raw["retry"]["max_attempts"] = json!(5);
+    raw["retry"]["initial_delay_ms"] = json!(60_000);
+    raw["retry"]["max_delay_ms"] = json!(60_000);
+    let config: ApiChargebackSinkConfig = serde_json::from_value(raw.clone()).unwrap();
+    let one_delivery_budget_secs =
+        ((600_000u64 * 5) + (60_000u64 * 4)).div_ceil(1_000);
+    assert!(
+        spool_claim_lease_secs_for_tests(&config) > one_delivery_budget_secs,
+        "claim lease must remain strictly above the accepted request/retry budget"
+    );
+    assert!(
+        spool_claim_lease_secs_for_tests(&config) > 3_600,
+        "a legitimate long delivery budget must not be truncated at one hour"
+    );
+
+    raw["clickhouse"]["timeout_ms"] = json!(600_001);
+    let error = match ApiChargebackSink::new(&raw, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("timeout above the documented maximum must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("clickhouse.timeout_ms must be between 1 and 600000"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn spool_path_component_rejects_or_encodes_escape_forms() {
     let hashed = [
         "../escape",
@@ -2946,6 +2978,8 @@ fn only_the_ferrum_namespace_differing_still_partitions_the_spool() {
     );
     let tag_a = SpoolManager::owner_tag_of_spec_for_tests(&ledger_a);
     let tag_b = SpoolManager::owner_tag_of_spec_for_tests(&ledger_b);
+    assert_eq!(tag_a.len(), 32, "per-file owner tags must retain 128 bits");
+    assert_eq!(tag_b.len(), 32, "per-file owner tags must retain 128 bits");
     assert_ne!(tag_a, tag_b, "per-file owner tags must differ per ledger");
 }
 
@@ -2991,13 +3025,19 @@ fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
     // A record carrying a different owner tag, planted inside our namespace.
     let day = spool.namespace_root_for_tests().join("20260524");
     fs::create_dir_all(&day).unwrap();
-    let foreign = day.join("00000000000000000000000000.0123456789abcdef.ndjson");
+    let foreign =
+        day.join("00000000000000000000000000.0123456789abcdef0123456789abcdef.ndjson");
     fs::write(&foreign, vec![b'x'; encoded_len as usize]).unwrap();
 
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert!(
         replayable.is_empty(),
         "a foreign-owned record must never enter the replay set"
+    );
+    assert_eq!(
+        spool.unbound_record_counts_for_tests(),
+        (1, 0),
+        "a foreign record discovered after prepare must update live status metrics"
     );
     let owned = spool.list_owned_spool_files_for_tests().unwrap();
     assert!(
@@ -3050,6 +3090,62 @@ fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
         outside_file.exists(),
         "maintenance must never delete through a symlink"
     );
+}
+
+#[test]
+fn spool_walk_bounds_empty_directory_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests();
+    for index in 0..8 {
+        fs::create_dir(root.join(format!("empty-{index}"))).unwrap();
+    }
+    let error = spool
+        .list_owned_spool_files_with_entry_limit_for_tests(5)
+        .expect_err("empty directories must count toward the traversal bound");
+    assert!(
+        error.contains("max entry count (5)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn namespace_root_symlink_swap_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
+    let saved = root.with_extension("original");
+    fs::rename(&root, &saved).unwrap();
+
+    fs::copy(
+        saved.join("spool.meta.json"),
+        outside.path().join("spool.meta.json"),
+    )
+    .unwrap();
+    let outside_day = outside.path().join("20260524");
+    fs::create_dir(&outside_day).unwrap();
+    let outside_record = outside_day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FBC"));
+    fs::write(&outside_record, b"{}\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+
+    let error = spool
+        .list_replayable_spool_files_for_tests()
+        .expect_err("a swapped namespace-root symlink must fail closed");
+    assert!(
+        error.contains("symlinked spool path") || error.contains("canonical target"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        outside_record.exists(),
+        "failed-closed maintenance must not mutate the replacement tree"
+    );
+
+    fs::remove_file(&root).unwrap();
+    fs::rename(&saved, &root).unwrap();
 }
 
 #[cfg(unix)]
@@ -3128,7 +3224,7 @@ fn peer_process_temp_is_quota_owned_and_never_a_replay_candidate() {
 
     // A peer process's in-progress temp: a different process tag.
     let peer_tmp = day.join(format!(
-        "{}.write-deadbeef-7.tmp",
+        "{}.write-deadbeefdeadbeefdeadbeefdeadbeef-7.tmp",
         owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FAW")
     ));
     fs::write(&peer_tmp, b"peer-partial").unwrap();
@@ -3384,8 +3480,12 @@ fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
     let expired_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB2");
     // 2100-01-01T00:00:00Z, comfortably beyond any test clock.
     let far_future = 4_102_444_800i64;
-    let live_claim = day.join(format!("{live_name}.claim-deadbeef-9-{far_future}.inflight"));
-    let expired_claim = day.join(format!("{expired_name}.claim-deadbeef-9-1.inflight"));
+    let live_claim = day.join(format!(
+        "{live_name}.claim-deadbeefdeadbeefdeadbeefdeadbeef-9-{far_future}.inflight"
+    ));
+    let expired_claim = day.join(format!(
+        "{expired_name}.claim-deadbeefdeadbeefdeadbeefdeadbeef-9-1.inflight"
+    ));
     fs::write(&live_claim, b"{}\n").unwrap();
     fs::write(&expired_claim, b"{}\n").unwrap();
 

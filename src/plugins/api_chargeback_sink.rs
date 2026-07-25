@@ -77,21 +77,22 @@ const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool
 /// Hex characters of the ownership digest kept in the namespace path component.
 const SPOOL_OWNER_DIGEST_LEN: usize = 32;
 /// Hex characters of the ownership digest embedded in every managed filename.
-const SPOOL_OWNER_TAG_LEN: usize = 16;
+const SPOOL_OWNER_TAG_LEN: usize = 32;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
 const SPOOL_CLAIM_MARKER: &str = ".claim-";
 const SPOOL_WRITE_MARKER: &str = ".write-";
 const SPOOL_TMP_SUFFIX: &str = ".tmp";
 /// Bound recursive spool walks (day dirs + namespace depth headroom).
 const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
-/// Hard cap on files visited in one scan/reconcile/replay listing.
-const MAX_SPOOL_TRAVERSAL_FILES: usize = 100_000;
+/// Hard cap on all directory entries visited in one scan/reconcile/replay
+/// listing. Counting directories and symlinks as well as regular files prevents
+/// an attacker-controlled tree of empty directories from escaping the bound.
+const MAX_SPOOL_TRAVERSAL_ENTRIES: usize = 100_000;
 /// Production age before a foreign or unattributable temp may be reconciled.
 const STALE_TEMP_AGE_SECS: u64 = 300;
-/// Floor/ceiling for the in-flight replay claim lease derived from the
-/// configured ClickHouse delivery budget.
+/// Floor for the in-flight replay claim lease derived from the configured
+/// ClickHouse delivery budget.
 const SPOOL_CLAIM_LEASE_MIN_SECS: u64 = 300;
-const SPOOL_CLAIM_LEASE_MAX_SECS: u64 = 3_600;
 /// Safety multiplier applied to the worst-case delivery budget so an expiring
 /// lease cannot overtake a delivery that is still legitimately in progress.
 const SPOOL_CLAIM_LEASE_BUDGET_FACTOR: u64 = 4;
@@ -111,6 +112,10 @@ const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
 /// Deployment-safe ceiling for each configured inter-attempt delay field
 /// (`retry.initial_delay_ms` and `retry.max_delay_ms`).
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Bound one ClickHouse attempt so the derived cross-process claim lease remains
+/// finite and representable. Ten minutes is already substantially above the
+/// default five-second export timeout.
+const MAX_CLICKHOUSE_TIMEOUT_MS: u64 = 600_000;
 /// Worst-case cumulative inter-attempt delay budget across retries after the
 /// initial try (exponential/capped schedule, ignoring jitter reduction).
 const MAX_RETRY_TOTAL_DELAY_MS: u64 = 600_000;
@@ -3840,9 +3845,11 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     }
     validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
     validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
-    if config.clickhouse.timeout_ms == 0 {
+    if config.clickhouse.timeout_ms == 0
+        || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
+    {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.timeout_ms must be at least 1"
+            "{PLUGIN_NAME}: clickhouse.timeout_ms must be between 1 and {MAX_CLICKHOUSE_TIMEOUT_MS}"
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
@@ -4260,10 +4267,11 @@ pub struct SpoolStats {
 /// Binds the whole namespace to the accepted plugin-config identity, the Ferrum
 /// namespace/ledger, the node identity, and the ClickHouse destination/schema it
 /// was produced for. It holds no credentials: `destination_endpoint` is the
-/// sanitized `scheme://host:port` form and the ClickHouse password is
-/// deliberately excluded so neither the record nor the derived digest is
-/// credential-derived. Replay validates this record before touching any billing
-/// file, and every individual file additionally carries [`SpoolOwner::tag`].
+/// credential-free configured base URL (including its path, when present) and
+/// the ClickHouse password is deliberately excluded so neither the record nor
+/// the derived digest is credential-derived. Replay validates this record before
+/// touching any billing file, and every individual file additionally carries
+/// [`SpoolOwner::tag`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SpoolNamespaceMeta {
     version: u32,
@@ -4505,7 +4513,7 @@ fn spool_process_tag() -> &'static str {
     SPOOL_PROCESS_TAG
         .get_or_init(|| {
             let nonce = uuid::Uuid::new_v4();
-            hex::encode(&nonce.as_bytes()[..4])
+            hex::encode(nonce.as_bytes())
         })
         .as_str()
 }
@@ -4664,7 +4672,13 @@ fn spool_claim_lease_secs(config: &ApiChargebackSinkConfig) -> u64 {
         .saturating_add(delay_budget_ms)
         .div_ceil(1_000)
         .saturating_mul(SPOOL_CLAIM_LEASE_BUDGET_FACTOR)
-        .clamp(SPOOL_CLAIM_LEASE_MIN_SECS, SPOOL_CLAIM_LEASE_MAX_SECS)
+        .max(SPOOL_CLAIM_LEASE_MIN_SECS)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn spool_claim_lease_secs_for_tests(config: &ApiChargebackSinkConfig) -> u64 {
+    spool_claim_lease_secs(config)
 }
 
 fn ensure_path_within_root(root: &Path, candidate: &Path) -> Result<(), String> {
@@ -4740,6 +4754,35 @@ fn reject_symlinked_spool_path(path: &Path) -> Result<(), String> {
             path.display()
         )),
     }
+}
+
+/// Reject an existing symlink at any managed component below `root`.
+///
+/// `create_dir_all` follows existing directory symlinks. Preflighting the
+/// validated node/plugin/owner chain prevents initial preparation from chmoding
+/// or write-probing a replacement tree before canonical containment is
+/// established.
+fn reject_symlinked_managed_chain(root: &Path, candidate: &Path) -> Result<(), String> {
+    ensure_path_within_root(root, candidate)?;
+    let relative = candidate.strip_prefix(root).map_err(|_| {
+        format!(
+            "{PLUGIN_NAME}: managed spool path '{}' is outside root '{}'",
+            candidate.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "{PLUGIN_NAME}: invalid managed spool component in '{}'",
+                candidate.display()
+            ));
+        };
+        current.push(part);
+        reject_symlinked_spool_path(&current)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4983,6 +5026,19 @@ impl SpoolManager {
 
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
+    pub fn list_owned_spool_files_with_entry_limit_for_tests(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<PathBuf>, String> {
+        self.validate_namespace_meta_if_present()?;
+        let mut files = Vec::new();
+        self.collect_with_entry_limit(&mut files, SpoolFileClass::Owned, max_entries)?;
+        files.sort();
+        Ok(files)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
     pub fn list_replayable_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
         self.list_replayable_spool_files()
     }
@@ -5094,6 +5150,7 @@ impl SpoolManager {
             && self.cfg.dir.is_dir()
             && self.namespace_root.is_dir()
         {
+            self.verify_stable_namespace_root()?;
             self.validate_namespace_meta()?;
             // Recover only claims whose owning process/generation is demonstrably
             // gone or whose lease expired; a live delivery keeps its claim.
@@ -5101,6 +5158,7 @@ impl SpoolManager {
             return Ok(());
         }
         ensure_private_dir(&self.cfg.dir)?;
+        reject_symlinked_managed_chain(&self.cfg.dir, &self.namespace_root)?;
         ensure_private_dir(&self.namespace_root)?;
         self.resolve_canonical_root()?;
         self.persist_or_validate_namespace_meta()?;
@@ -5116,8 +5174,10 @@ impl SpoolManager {
     /// symlink rejection.
     fn resolve_canonical_root(&self) -> Result<(), String> {
         if self.canonical_root.get().is_some() {
-            return Ok(());
+            return self.verify_stable_namespace_root();
         }
+        reject_symlinked_managed_chain(&self.cfg.dir, &self.namespace_root)?;
+        reject_symlinked_spool_path(&self.namespace_root)?;
         let canonical_dir = fs::canonicalize(&self.cfg.dir).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to canonicalize spool.dir '{}': {error}",
@@ -5135,16 +5195,49 @@ impl SpoolManager {
         Ok(())
     }
 
+    /// Verify that the namespace path still names the exact directory prepared
+    /// for this manager.
+    ///
+    /// A same-UID process can replace a directory entry after initial prepare.
+    /// Reject both a symlink replacement and any canonical-target change before
+    /// validating metadata, walking, replaying, renaming, or unlinking.
+    fn verify_stable_namespace_root(&self) -> Result<(), String> {
+        let expected = self.canonical_root.get().ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' has no canonical root",
+                self.namespace_root.display()
+            )
+        })?;
+        reject_symlinked_spool_path(&self.namespace_root)?;
+        let current = fs::canonicalize(&self.namespace_root).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize managed spool namespace '{}': {error}",
+                self.namespace_root.display()
+            )
+        })?;
+        if &current != expected {
+            return Err(format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' changed canonical target from '{}' to '{}'",
+                self.namespace_root.display(),
+                expected.display(),
+                current.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// Prove one path is a managed, non-symlinked node of this namespace before
     /// any create, rename, or unlink.
     fn assert_managed_path(&self, path: &Path) -> Result<(), String> {
         ensure_path_within_root(&self.namespace_root, path)?;
         reject_symlinked_spool_path(path)?;
-        if let Some(canonical_root) = self.canonical_root.get()
-            && let Some(parent) = path.parent()
-            && parent.is_dir()
-        {
-            directory_is_within_canonical_root(canonical_root, parent)?;
+        if let Some(canonical_root) = self.canonical_root.get() {
+            self.verify_stable_namespace_root()?;
+            if let Some(parent) = path.parent()
+                && parent.is_dir()
+            {
+                directory_is_within_canonical_root(canonical_root, parent)?;
+            }
         }
         Ok(())
     }
@@ -5172,6 +5265,7 @@ impl SpoolManager {
     /// Fail closed when the on-disk ownership record does not name this exact
     /// sink identity. Nothing is deleted, replayed, or rerouted on mismatch.
     fn validate_namespace_meta(&self) -> Result<(), String> {
+        self.verify_stable_namespace_root()?;
         let path = self.meta_path();
         if !path.exists() {
             return Err(format!(
@@ -5304,7 +5398,28 @@ impl SpoolManager {
     }
 
     fn collect(&self, files: &mut Vec<PathBuf>, class: SpoolFileClass) -> Result<(), String> {
-        let mut walk = SpoolWalk::new(self.namespace_root.as_path(), class);
+        self.collect_with_entry_limit(files, class, MAX_SPOOL_TRAVERSAL_ENTRIES)
+    }
+
+    fn collect_with_entry_limit(
+        &self,
+        files: &mut Vec<PathBuf>,
+        class: SpoolFileClass,
+        max_entries: usize,
+    ) -> Result<(), String> {
+        self.verify_stable_namespace_root()?;
+        let canonical_root = self.canonical_root.get().ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' has no canonical root",
+                self.namespace_root.display()
+            )
+        })?;
+        let mut walk = SpoolWalk::new_with_expected_root(
+            self.namespace_root.as_path(),
+            class,
+            canonical_root,
+            max_entries,
+        )?;
         walk.run(&self.namespace_root, files)
     }
 
@@ -5450,17 +5565,15 @@ impl SpoolManager {
         self.collect(&mut candidates, SpoolFileClass::Replayable)?;
         let mine = self.owner.tag.as_ref();
         let mut files = Vec::new();
-        let mut foreign = 0u64;
         for path in candidates {
             if spool_file_owner_tag(&path).is_some_and(|tag| tag == mine) {
                 files.push(path);
-            } else {
-                foreign = foreign.saturating_add(1);
             }
         }
-        if foreign > 0 {
-            self.warn_unbound_records(foreign, 0);
-        }
+        // Refresh the exported gauge as well as the warning. A foreign file may
+        // be planted after initial prepare, and warning without updating status
+        // would hide live operational evidence until the next full prepare.
+        self.scan_unbound_records();
         files.sort();
         Ok(files)
     }
@@ -5513,7 +5626,8 @@ impl SpoolManager {
                 ));
             }
         }
-        let lease_deadline = unix_timestamp_seconds().saturating_add(self.claim_lease_secs as i64);
+        let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
+        let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
         let claim_path = spool_claim_path(path, self.generation, lease_deadline)?;
         self.assert_managed_path(&claim_path)?;
         // Register the live lease before the rename so a concurrent prepare in
@@ -5531,6 +5645,38 @@ impl SpoolManager {
                 claim_path.display()
             )),
         }
+    }
+
+    /// Extend one live claim before starting the next bounded ClickHouse
+    /// delivery attempt.
+    ///
+    /// A single spool file can contain multiple replay chunks. Renewing between
+    /// chunks prevents the aggregate file-delivery time from outliving a lease
+    /// that is intentionally derived from one bounded request/retry budget.
+    fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), String> {
+        let durable = spool_claim_restore_path(claim.path())?;
+        let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
+        let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
+        let renewed = spool_claim_path(&durable, self.generation, lease_deadline)?;
+        if renewed == claim.path {
+            return Ok(());
+        }
+        self.assert_managed_path(claim.path())?;
+        self.assert_managed_path(&renewed)?;
+        // Register the renewed name before the atomic rename so another
+        // generation in this process cannot observe an unleased path.
+        let renewed_live = LiveSpoolPathGuard::new(renewed.clone());
+        fs::rename(claim.path(), &renewed).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to renew in-flight spool claim '{}' as '{}': {error}",
+                claim.path().display(),
+                renewed.display()
+            )
+        })?;
+        claim.path = renewed;
+        let old_live = std::mem::replace(&mut claim._live, renewed_live);
+        drop(old_live);
+        Ok(())
     }
 
     /// Release a claim back to its durable replayable name after a retryable
@@ -5562,8 +5708,10 @@ impl SpoolManager {
     }
 
     /// Count records under this node/plugin subtree that no accepted generation
-    /// owns: pre-namespace layouts and namespaces left behind by a destination
-    /// or configuration change. These are never replayed, deleted, or rerouted.
+    /// owns: pre-namespace layouts and sibling namespaces left behind by a
+    /// destination/schema/Ferrum-namespace change. A node-id or plugin-config-id
+    /// change moves to a different parent subtree and requires explicit operator
+    /// discovery. Unbound records are never replayed, deleted, or rerouted.
     fn scan_unbound_records(&self) {
         let components = match spool_namespace_components(&self.owner) {
             Ok(components) => components,
@@ -5798,9 +5946,11 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
 ///
 /// Two shapes matter: the pre-namespace layout that wrote directly under
 /// `<spool.dir>/<node>/<day>/`, and sibling owner namespaces left behind when
-/// the ClickHouse destination, database, table, plugin id, or Ferrum namespace
-/// changed. Both are reported, never replayed and never deleted, so an operator
-/// decides whether the records still belong to the new destination.
+/// the ClickHouse destination, database, table, or Ferrum namespace changed.
+/// A plugin-config-id or node-id change moves to another parent subtree and is
+/// intentionally not attributed to this live instance. Discoverable records are
+/// reported, never replayed and never deleted, so an operator decides whether
+/// they still belong to the new destination.
 fn count_unbound_spool_records(
     spool_dir: &Path,
     components: &SpoolNamespaceComponents,
@@ -5863,7 +6013,10 @@ fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> Vec<PathBuf> {
 
 fn count_records_in(dir: &Path) -> u64 {
     let mut records = Vec::new();
-    let mut walk = SpoolWalk::new(dir, SpoolFileClass::AnyRecord);
+    let mut walk = match SpoolWalk::new(dir, SpoolFileClass::AnyRecord) {
+        Ok(walk) => walk,
+        Err(_) => return 0,
+    };
     match walk.run(dir, &mut records) {
         Ok(()) => records.len() as u64,
         Err(_) => 0,
@@ -5890,20 +6043,71 @@ enum SpoolFileClass {
 struct SpoolWalk<'a> {
     root: &'a Path,
     class: SpoolFileClass,
-    file_count: usize,
+    entry_count: usize,
+    max_entries: usize,
     visited: HashSet<DirIdentity>,
     canonical_root: Option<PathBuf>,
 }
 
 impl<'a> SpoolWalk<'a> {
-    fn new(root: &'a Path, class: SpoolFileClass) -> Self {
-        Self {
+    fn new(root: &'a Path, class: SpoolFileClass) -> Result<Self, String> {
+        Self::new_inner(root, class, None, MAX_SPOOL_TRAVERSAL_ENTRIES)
+    }
+
+    fn new_with_expected_root(
+        root: &'a Path,
+        class: SpoolFileClass,
+        expected_root: &Path,
+        max_entries: usize,
+    ) -> Result<Self, String> {
+        Self::new_inner(root, class, Some(expected_root), max_entries)
+    }
+
+    fn new_inner(
+        root: &'a Path,
+        class: SpoolFileClass,
+        expected_root: Option<&Path>,
+        max_entries: usize,
+    ) -> Result<Self, String> {
+        let canonical_root = match fs::symlink_metadata(root) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing to walk symlinked spool root '{}'",
+                    root.display()
+                ));
+            }
+            Ok(_) => Some(fs::canonicalize(root).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to canonicalize spool walk root '{}': {error}",
+                    root.display()
+                )
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to lstat spool walk root '{}': {error}",
+                    root.display()
+                ));
+            }
+        };
+        if let (Some(expected), Some(actual)) = (expected_root, canonical_root.as_deref())
+            && actual != expected
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool walk root '{}' changed canonical target from '{}' to '{}'",
+                root.display(),
+                expected.display(),
+                actual.display()
+            ));
+        }
+        Ok(Self {
             root,
             class,
-            file_count: 0,
+            entry_count: 0,
+            max_entries,
             visited: HashSet::new(),
-            canonical_root: fs::canonicalize(root).ok(),
-        }
+            canonical_root,
+        })
     }
 
     fn run(&mut self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -5918,6 +6122,7 @@ impl<'a> SpoolWalk<'a> {
             ));
         }
         ensure_path_within_root(self.root, dir)?;
+        reject_symlinked_spool_path(dir)?;
         if let Some(canonical_root) = self.canonical_root.as_deref() {
             directory_is_within_canonical_root(canonical_root, dir)?;
         }
@@ -5938,6 +6143,14 @@ impl<'a> SpoolWalk<'a> {
                     dir.display()
                 )
             })?;
+            if self.entry_count >= self.max_entries {
+                return Err(format!(
+                    "{PLUGIN_NAME}: spool traversal exceeded max entry count ({}) under '{}'",
+                    self.max_entries,
+                    self.root.display()
+                ));
+            }
+            self.entry_count = self.entry_count.saturating_add(1);
             let path = entry.path();
             ensure_path_within_root(self.root, &path)?;
             // Never follow symlinks for scan, replay, eviction, quarantine, or
@@ -5977,13 +6190,6 @@ impl<'a> SpoolWalk<'a> {
             if path.file_name().and_then(|name| name.to_str()) == Some(SPOOL_META_FILENAME) {
                 continue;
             }
-            if self.file_count >= MAX_SPOOL_TRAVERSAL_FILES {
-                return Err(format!(
-                    "{PLUGIN_NAME}: spool traversal exceeded max file count ({MAX_SPOOL_TRAVERSAL_FILES}) under '{}'",
-                    self.root.display()
-                ));
-            }
-            self.file_count = self.file_count.saturating_add(1);
             if spool_file_matches(&path, self.class) {
                 files.push(path);
             }
@@ -6356,15 +6562,52 @@ fn write_private_file_atomically_with_ops(
     ops: SpoolFsOps,
 ) -> Result<(), String> {
     let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
-    if result.is_err() {
-        // Keep quota accounting honest and the publish atomic after a failed
-        // write, rename, or directory sync: a leftover `*.tmp`, or a rename that
-        // landed without a durable directory entry, must never remain visible as
-        // a committed batch that the caller was told did not commit.
-        let _ = fs::remove_file(tmp_path);
-        let _ = fs::remove_file(final_path);
+    let Err(primary_error) = result else {
+        return Ok(());
+    };
+
+    // Keep quota accounting honest and make rollback as durable as the
+    // filesystem permits after a failed write, rename, or directory sync. A
+    // second real parent-directory fsync persists successful cleanup even when
+    // the injected or first production sync failed. If cleanup itself cannot be
+    // completed, preserve that evidence in the returned error rather than
+    // claiming a guaranteed rollback.
+    let mut cleanup_errors = Vec::new();
+    for path in [tmp_path, final_path] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_errors.push(format!(
+                "failed to remove rollback path '{}': {error}",
+                path.display()
+            )),
+        }
     }
-    result
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        match File::open(parent) {
+            Ok(dir) => {
+                if let Err(error) = dir.sync_all() {
+                    cleanup_errors.push(format!(
+                        "failed to fsync rollback directory '{}': {error}",
+                        parent.display()
+                    ));
+                }
+            }
+            Err(error) => cleanup_errors.push(format!(
+                "failed to open rollback directory '{}': {error}",
+                parent.display()
+            )),
+        }
+    }
+    if cleanup_errors.is_empty() {
+        Err(primary_error)
+    } else {
+        Err(format!(
+            "{primary_error}; rollback cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))
+    }
 }
 
 fn write_private_file_atomically_inner(
@@ -6518,7 +6761,7 @@ async fn replay_spool_once(
 ) -> Result<(), String> {
     let files = spool.list_replayable_spool_files()?;
     for file in files {
-        let claim = {
+        let mut claim = {
             let _guard = spool
                 .write_lock
                 .lock()
@@ -6565,13 +6808,18 @@ async fn replay_spool_once(
             .map(str::to_owned)
             .collect();
         if lines.is_empty() {
-            spool.remove_delivered_claim(&inflight)?;
+            spool.remove_delivered_claim(claim.path())?;
             continue;
         }
 
-        match replay_spool_lines(flush_config, &lines, batch_size).await {
+        match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                finalize_replayed_spool_file(spool, &inflight, lines.len(), dead_letters)?;
+                finalize_replayed_spool_file(
+                    spool,
+                    claim.path(),
+                    lines.len(),
+                    dead_letters,
+                )?;
                 spool
                     .metrics
                     .last_replay_at
@@ -6586,7 +6834,7 @@ async fn replay_spool_once(
                     .write_lock
                     .lock()
                     .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
-                spool.release_claim_locked(&inflight)?;
+                spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
         }
@@ -6607,6 +6855,8 @@ struct DeadLetterChunk {
 /// Multi-row 413 splits deterministically using `batch_size` without rewriting
 /// row payloads (event_id and other fields stay byte-identical).
 async fn replay_spool_lines(
+    spool: &SpoolManager,
+    claim: &mut SpoolClaimHandle,
     flush_config: &ClickHouseFlushConfig,
     lines: &[String],
     batch_size: usize,
@@ -6616,6 +6866,13 @@ async fn replay_spool_lines(
     while let Some(chunk) = stack.pop() {
         if chunk.is_empty() {
             continue;
+        }
+        {
+            let _guard = spool
+                .write_lock
+                .lock()
+                .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+            spool.renew_claim_locked(claim)?;
         }
         let body = chunk.join("\n");
         match post_json_each_row(flush_config, body, chunk.len()).await {

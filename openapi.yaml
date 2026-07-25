@@ -20949,7 +20949,12 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 600000
               default: 5000
+              description: >-
+                Per-attempt ClickHouse connect/request timeout. Bounded at ten
+                minutes so the cross-process spool claim lease remains finite
+                and strictly longer than the accepted request/retry budget.
         batch:
           type: object
           additionalProperties: false

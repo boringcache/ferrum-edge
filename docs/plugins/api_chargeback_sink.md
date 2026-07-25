@@ -307,8 +307,11 @@ must name a `FERRUM_*` variable.
 
 A failed ClickHouse export uses `retry.max_attempts` total attempts (including
 the initial try; valid range **1–32**). `0` is rejected rather than silently
-rewritten. Batch `size` is capped at **10000** and `flush_interval_ms` at
-**600000** to match the shared `BatchingLogger` admission limits. Each of
+rewritten. `clickhouse.timeout_ms` is bounded to **1–600000** ms per attempt so
+the cross-process spool claim lease is finite and remains longer than the
+accepted request/retry budget. Batch `size` is capped at **10000** and
+`flush_interval_ms` at **600000** to match the shared `BatchingLogger` admission
+limits. Each of
 `retry.initial_delay_ms` and
 `retry.max_delay_ms` is capped at **60000** ms. The inter-attempt delay uses
 **bounded exponential backoff**: it starts at `retry.initial_delay_ms` and
@@ -340,14 +343,15 @@ The owner identity is the tuple
 database, table, node id)`.
 
 `owner_digest` is a domain-separated, length-prefixed SHA-256 over that tuple
-(first 32 hex characters in the path); `owner_tag` is its first 16 hex
+(first 32 hex characters in the path); `owner_tag` is its first 32 hex
 characters and is embedded in **every** managed filename. The endpoint is the
-sanitized `scheme://host:port` form and the ClickHouse password is deliberately
-excluded, so neither the path, the manifest, nor the digest is credential
-derived. `safe_node` and `safe_plugin` stay human-readable when the source value
-is already a safe component; absolute paths, parent segments, separators, NUL,
-drive letters, UNC, and Windows device prefixes are hashed into one safe
-component instead of being joined, and NUL is rejected outright.
+credential-free configured base URL, including its configured path when present,
+and the ClickHouse password is deliberately excluded, so neither the path, the
+manifest, nor the digest is credential derived. `safe_node` and `safe_plugin`
+stay human-readable when the source value is already a safe component; absolute
+paths, parent segments, separators, NUL, drive letters, UNC, and Windows device
+prefixes are hashed into one safe component instead of being joined, and NUL is
+rejected outright.
 
 Versioned `spool.meta.json` records the whole tuple plus `owner_digest`,
 `owner_tag`, and the format version. It is written at prepare time and validated
@@ -366,17 +370,22 @@ counted (`chargeback_sink_spool_jobs_lost_total` /
 created with private permissions, written as process/generation-attributed
 `*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
 directory-fsynced on Unix. A Unix parent-directory open or fsync failure is a
-**write failure**: the publish is rolled back and the error is returned before
-any snapshot baseline commit. On platforms that cannot fsync directories (notably
-Windows) a successful file sync plus rename is the durability boundary this
-plugin can offer, and that limit is stated rather than claimed away — there is no
-silent "best-effort" success after a failed directory sync on Unix.
+**write failure**: Ferrum removes the temp/final path, performs a second real
+parent-directory fsync, and returns the error before any snapshot baseline
+commit. If rollback removal or its second fsync also fails, that failure is
+included in the returned diagnostic rather than claiming a guaranteed rollback.
+On platforms that cannot fsync directories (notably Windows) a successful file
+sync plus rename is the durability boundary this plugin can offer, and that limit
+is stated rather than claimed away — there is no silent "best-effort" success
+after a failed directory sync on Unix.
 
 Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
 and stale-temp cleanup use non-following metadata), proves the managed root
 resolves under the canonical `spool.dir`, enforces containment for every path it
-creates, renames, or unlinks, bounds traversal depth and file count, and skips
-directory cycles by device/inode identity.
+creates, renames, or unlinks, verifies that the namespace path still names its
+original canonical directory before every walk/mutation, bounds traversal depth
+and total directory-entry count, and skips directory cycles by device/inode
+identity.
 
 ### Claim and lease protocol
 
@@ -391,10 +400,12 @@ claims** each candidate by renaming it to
 before any ClickHouse delivery. The rename is the mutual-exclusion primitive: on
 a shared volume exactly one accepted generation or process can win it, and the
 loser simply moves on to the next file. `process_tag` is a per-process nonce
-drawn at startup, so a restart never mistakes a crashed run's claim for live
-work. The lease deadline is derived from the configured worst-case delivery
-budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry backoff
-schedule, ×4, clamped to 300–3600 seconds).
+drawn with 128 bits at startup, so a restart never mistakes a crashed run's claim
+for live work. The lease deadline is derived from the configured worst-case
+delivery budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry
+backoff schedule, ×4, with a 300-second floor and no shorter ceiling).
+Multi-chunk replay renews the claim before each chunk, so the aggregate delivery
+of one file cannot outlive a lease sized for one bounded request/retry budget.
 
 Claim disposition:
 
@@ -467,8 +478,8 @@ destination. Two shapes are recognized and reported instead:
 - **Pre-namespace (legacy) records** written directly under
   `<spool.dir>/<node>/<YYYYMMDD>/`, which carry no ownership binding.
 - **Orphaned namespaces**: a sibling `o<owner_digest>` directory left behind when
-  the plugin config id, Ferrum namespace/ledger, ClickHouse endpoint, database,
-  table, or node identity changed.
+  the Ferrum namespace/ledger, ClickHouse endpoint, database, or table changed
+  while the node id and plugin config id stayed the same.
 
 Both are counted when the managed namespace is prepared (process start, or the
 first tick after storage recovers) into `spool.unbound_files` /
@@ -481,6 +492,9 @@ re-point the sink at the original destination so the records become owned again,
 or export/remove them out of band. A record whose `owner_tag` names a different
 identity but sits inside this namespace (only reachable by tampering or a
 hand-moved file) is treated the same way: counted, reported, never touched.
+Changing the node id or plugin config id moves records to a different parent
+subtree, so the replacement instance cannot safely attribute or count them;
+operators must inspect those previous subtrees explicitly.
 
 Offline validation and candidate-generation staging do not create, chmod, or
 probe `spool.dir`. After cache publication, the committed replayer prepares and
@@ -529,9 +543,10 @@ forms are hashed rather than joined raw). It is also part of the spool ownership
 digest, so a node-identity change produces a fresh managed namespace. Resolution
 order is `FERRUM_NODE_ID`, then `HOSTNAME`, then `/etc/hostname`, then
 `unknown`. If the node identity changes across restarts, records under the
-previous identity become unbound: they are reported through
-`spool.unbound_files` / `chargeback_sink_spool_unbound_files` and a rate-limited
-warning, and are never replayed or deleted automatically.
+previous identity remain in the previous `<safe_node>` subtree and are never
+replayed or deleted automatically. Because the replacement instance scans only
+its own node/plugin subtree, node-id changes are not added to its unbound metric;
+operators must inspect and reconcile the previous node subtree explicitly.
 
 ## Reconciliation Queries
 
