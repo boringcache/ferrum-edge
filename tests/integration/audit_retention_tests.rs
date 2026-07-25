@@ -234,8 +234,7 @@ async fn pagination_remains_correct_across_prune_boundary() {
 #[tokio::test]
 async fn insert_piggyback_applies_soft_max_rows_without_failing_insert() {
     let max_rows = 2u64;
-    let interval =
-        ferrum_edge::admin::audit::audit_retention_max_rows_check_interval(max_rows);
+    let interval = ferrum_edge::admin::audit::audit_retention_max_rows_check_interval(max_rows);
     let (store, _tmp) = sqlite_store_with_retention(AuditRetentionPolicy {
         retention_days: None,
         max_rows_per_namespace: Some(max_rows),

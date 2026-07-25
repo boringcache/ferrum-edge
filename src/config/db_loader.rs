@@ -433,8 +433,7 @@ pub struct DatabaseStore {
     audit_retention: crate::admin::audit::AuditRetentionPolicy,
     /// Per-namespace soft-cap cadence for max-row boundary scans (shared across
     /// store clones in this process). See [`crate::admin::audit::AuditMaxRowsPruneGate`].
-    audit_max_rows_prune_gates:
-        Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
+    audit_max_rows_prune_gates: Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
     /// Set to `true` when the store was created via
     /// [`DatabaseStore::connect_offline_with_pool_config`] — the lazy pool
     /// never ran migrations because the DB was unreachable at startup.
@@ -8122,7 +8121,9 @@ impl DatabaseStore {
                 gate.should_run_max_rows_prune(max_rows, force_max_rows)
             };
             if should_run {
-                let batch_deleted = self.prune_audit_events_by_max_rows(namespace, max_rows).await?;
+                let batch_deleted = self
+                    .prune_audit_events_by_max_rows(namespace, max_rows)
+                    .await?;
                 deleted = deleted.saturating_add(batch_deleted);
                 let hit_budget =
                     crate::admin::audit::audit_retention_hit_prune_batch_budget(batch_deleted);
