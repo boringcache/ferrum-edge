@@ -22,7 +22,7 @@ use ferrum_edge::admin::{
 use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::tls::inventory::{
     TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
@@ -253,7 +253,7 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
         None,
     )
     .expect("proxy state");
-    let (base, shutdown) = start_admin(admin_state_with_proxy(proxy_state)).await;
+    let (base, shutdown) = start_admin(admin_state_with_proxy(proxy_state.clone())).await;
     let client = reqwest::Client::new();
 
     // Phase 0: the auth tier is untouched.
@@ -346,6 +346,39 @@ async fn metrics_scrapes_read_cached_snapshot_without_refetching_or_blocking() {
         settled,
         "scrapes after a completed refresh must stay fetch-free"
     );
+
+    // Phase 5: an accepted GatewayConfig publication invalidates the snapshot
+    // even when no source watcher fired. Config reloads can replace TLS source
+    // descriptors themselves, so waiting for the ordinary TTL here would
+    // expose stale certificate metadata after a successful reload.
+    let mut reloaded = GatewayConfig::default();
+    reloaded.proxies.push(
+        serde_json::from_value(json!({
+            "id": "tls-inventory-reload-proxy",
+            "namespace": "ferrum",
+            "name": "tls-inventory-reload-proxy",
+            "hosts": [],
+            "listen_path": "/tls-inventory-reload",
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "preserve_host_header": false,
+            "backend_connect_timeout_ms": 5000,
+            "backend_read_timeout_ms": 30000,
+            "backend_write_timeout_ms": 30000,
+            "backend_tls_verify_server_cert": true
+        }))
+        .expect("reload proxy should deserialize"),
+    );
+    assert_eq!(
+        proxy_state.update_config(reloaded),
+        ConfigApplyOutcome::Applied,
+        "the fixture reload must publish before testing cache invalidation"
+    );
+    let before_reload_refresh = collector.fetches();
+    let _ = scrape(&client, &base).await;
+    wait_for_fetches(&collector, before_reload_refresh + 1).await;
 
     let _ = shutdown.send(true);
 }
