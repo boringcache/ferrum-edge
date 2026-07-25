@@ -873,6 +873,7 @@ async fn run_with_backend(
 /// drive the node-agent watcher loop against an injected finite (or pending)
 /// pod-event stream without a live Kubernetes API. CNI is disabled; callers
 /// may seed already-attached pods to assert BPF detach/cleanup side effects.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
 pub(crate) async fn run_with_pod_stream_for_test<S, I>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
