@@ -666,10 +666,22 @@ fn mongo_consumer_identity_keys_remain_raw_byte_strings() {
 #[test]
 fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
     for (helper_name, forbidden) in [
-        ("fn proxy_to_doc(", &["to_ascii_lowercase", "to_lowercase"][..]),
-        ("fn upstream_to_doc(", &["to_ascii_lowercase", "to_lowercase"][..]),
-        ("fn consumer_to_doc(", &["to_ascii_lowercase", "to_lowercase"][..]),
-        ("fn plugin_config_to_doc(", &["to_ascii_lowercase", "to_lowercase"][..]),
+        (
+            "fn proxy_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn upstream_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn consumer_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn plugin_config_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
     ] {
         let start = MONGO_STORE_SOURCE
             .find(helper_name)

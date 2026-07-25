@@ -6439,25 +6439,24 @@ async fn handle_restore(
         .as_ref()
         .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
         .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-    let (candidate, mut validation_errors) =
-        match validate_restore_candidate_on_blocking_pool(
-            candidate,
-            cert_expiry_days,
-            state.backend_allow_ips.clone(),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_error) => {
-                warn_persistence_failure_redacted("restore_payload_validation_task");
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": "Restore aborted: payload validation could not complete. Existing config was NOT deleted."
-                    }),
-                ));
-            }
-        };
+    let (candidate, mut validation_errors) = match validate_restore_candidate_on_blocking_pool(
+        candidate,
+        cert_expiry_days,
+        state.backend_allow_ips.clone(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_payload_validation_task");
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: payload validation could not complete. Existing config was NOT deleted."
+                }),
+            ));
+        }
+    };
     // Restore is an operator-provided admin write, so reject mesh-PROJECTED
     // upstream fields the same way direct POST/PUT does. This check is
     // intentionally NOT part of the shared `validate_all_fields` step (that
@@ -6515,9 +6514,8 @@ async fn handle_restore(
                 }),
             ));
         }
-        Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-            "Plugin-graph candidate validation returned an unexpected response".to_string(),
-        ),
+        Err(crud::AfterValidateError::Response(_)) => validation_errors
+            .push("Plugin-graph candidate validation returned an unexpected response".to_string()),
     }
     if !validation_errors.is_empty() {
         return Ok(json_response(

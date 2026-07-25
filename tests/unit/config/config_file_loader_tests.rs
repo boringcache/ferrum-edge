@@ -2720,10 +2720,7 @@ plugin_configs:
     assert_eq!(config.proxies[0].hosts, vec!["api.example.com".to_string()]);
     assert_eq!(config.proxies[0].backend_host, "backend.example.com");
     assert_eq!(config.consumers[0].custom_id, None);
-    assert_eq!(
-        config.upstreams[0].targets[0].host,
-        "reviews.mesh.internal"
-    );
+    assert_eq!(config.upstreams[0].targets[0].host, "reviews.mesh.internal");
     assert_eq!(
         config.upstreams[0].backend_tls_sni.as_deref(),
         Some("reviews.mesh.internal")

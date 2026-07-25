@@ -319,15 +319,13 @@ async fn test_admin_restore_persists_normalized_canonical_fields_mongodb() {
     assert_eq!(proxy["hosts"][0], "api.example.com");
     assert_eq!(proxy["backend_host"], "backend.example.com");
 
-    let consumer =
-        admin_get_json(&client, &gateway, "/consumers/mongo-norm-consumer", &auth).await;
+    let consumer = admin_get_json(&client, &gateway, "/consumers/mongo-norm-consumer", &auth).await;
     assert!(
         consumer.get("custom_id").is_none() || consumer["custom_id"].is_null(),
         "blank custom_id must normalize away: {consumer}"
     );
 
-    let upstream =
-        admin_get_json(&client, &gateway, "/upstreams/mongo-norm-upstream", &auth).await;
+    let upstream = admin_get_json(&client, &gateway, "/upstreams/mongo-norm-upstream", &auth).await;
     assert_eq!(upstream["targets"][0]["host"], "reviews.mesh.internal");
     assert_eq!(upstream["backend_tls_sni"], "reviews.mesh.internal");
     assert_eq!(
@@ -335,8 +333,13 @@ async fn test_admin_restore_persists_normalized_canonical_fields_mongodb() {
         "reviews.mesh.internal"
     );
 
-    let plugin =
-        admin_get_json(&client, &gateway, "/plugins/config/mongo-norm-plugin", &auth).await;
+    let plugin = admin_get_json(
+        &client,
+        &gateway,
+        "/plugins/config/mongo-norm-plugin",
+        &auth,
+    )
+    .await;
     assert!(
         plugin.get("proxy_id").is_none() || plugin["proxy_id"].is_null(),
         "blank proxy_id must normalize away: {plugin}"

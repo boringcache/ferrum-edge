@@ -802,7 +802,10 @@ async fn test_admin_restore_persists_normalized_canonical_fields_sqlite() {
     );
 
     let proxy: serde_json::Value = client
-        .get(format!("{}/proxies/func-norm-proxy", harness.admin_base_url))
+        .get(format!(
+            "{}/proxies/func-norm-proxy",
+            harness.admin_base_url
+        ))
         .header("Authorization", &auth)
         .send()
         .await
