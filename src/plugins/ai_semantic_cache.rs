@@ -1233,9 +1233,10 @@ impl AiSemanticCache {
     ///
     /// Derived from the configured `semantic_embedding_timeout_ms` rather than
     /// the fixed [`EMBEDDING_SINGLEFLIGHT_WAIT`] ceiling: a leader's own worst
-    /// case is one admission wait plus one provider call, so twice the
-    /// per-call timeout is the largest wait that can still coalesce useful
-    /// work. Using the bare ceiling would let a saturated embedding lane stall
+    /// case is one admission wait plus one provider call. A follower budget of
+    /// twice the per-call timeout leaves one provider-timeout's admission
+    /// cushion while still coalescing useful work. Using the bare ceiling would
+    /// let a saturated embedding lane stall
     /// a proxied request for six times the timeout the operator configured
     /// (30s vs the 5s default) before the request falls through to its normal
     /// backend dispatch. The test override, when set, still wins.
@@ -3159,8 +3160,8 @@ fn body_has_multimodal_parts(body: &Value) -> bool {
         Some(CacheRequestFamily::Gemini) => {
             if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
                 for content in contents {
-                    if let Some(parts) = content.get("parts").and_then(|p| p.as_array())
-                        && parts.iter().any(|part| !is_gemini_text_part(part))
+                    if let Some(parts) = content.get("parts")
+                        && content_has_multimodal_parts(parts, PartDialect::Gemini)
                     {
                         return true;
                     }
@@ -5028,8 +5029,20 @@ mod tests {
             "system": [{"type": "image", "image_url": {"url": "https://example.com/a.png"}}],
             "messages": [{"role": "user", "content": "hi"}]
         });
+        let gemini_malformed_non_text_parts = json!({
+            "contents": [{
+                "role": "user",
+                "parts": {"inlineData": {"mimeType": "image/png", "data": "aGVsbG8="}}
+            }]
+        });
 
-        for body in [&text_only, &text_array, &multimodal, &multimodal_system] {
+        for body in [
+            &text_only,
+            &text_array,
+            &multimodal,
+            &multimodal_system,
+            &gemini_malformed_non_text_parts,
+        ] {
             assert_eq!(
                 body_has_multimodal_parts(body),
                 build_multimodal_fingerprint(body).is_some(),
@@ -5040,6 +5053,9 @@ mod tests {
         assert!(!body_has_multimodal_parts(&text_array));
         assert!(body_has_multimodal_parts(&multimodal));
         assert!(body_has_multimodal_parts(&multimodal_system));
+        assert!(body_has_multimodal_parts(
+            &gemini_malformed_non_text_parts
+        ));
     }
 
     #[tokio::test]
