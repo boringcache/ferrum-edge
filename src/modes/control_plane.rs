@@ -2191,6 +2191,12 @@ async fn monitor_cp_listener_handles_until_exit(
 ) -> Result<(), anyhow::Error> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
+    // Dropping a JoinHandle detaches its task. Retain independent abort handles
+    // so a listener that ignores shutdown cannot outlive the bounded drain.
+    let abort_handles: Vec<tokio::task::AbortHandle> = listener_handles
+        .iter()
+        .map(|(_, handle)| handle.abort_handle())
+        .collect();
     let mut futures: FuturesUnordered<_> = listener_handles
         .into_iter()
         .map(|(name, handle)| async move { (name, handle.await) })
@@ -2201,6 +2207,7 @@ async fn monitor_cp_listener_handles_until_exit(
     if *shutdown_tx.borrow() {
         return drain_cp_listener_futures(
             &mut futures,
+            &abort_handles,
             drain_timeout,
             "Timed out waiting for CP listeners to drain after shutdown",
         )
@@ -2228,6 +2235,7 @@ async fn monitor_cp_listener_handles_until_exit(
             // when the deadline expires afterward.
             drain_cp_listener_futures(
                 &mut futures,
+                &abort_handles,
                 drain_timeout,
                 "Timed out waiting for CP listeners to drain after shutdown",
             )
@@ -2246,6 +2254,7 @@ async fn monitor_cp_listener_handles_until_exit(
 
             let remaining_result = drain_cp_listener_futures(
                 &mut futures,
+                &abort_handles,
                 drain_timeout,
                 "Timed out waiting for remaining CP listeners to drain after listener exit",
             )
@@ -2263,11 +2272,13 @@ async fn monitor_cp_listener_handles_until_exit(
 /// Drain remaining CP listener join futures under a single deadline.
 ///
 /// Failures observed before the deadline are preserved and returned even if a
-/// sibling is still stuck when the timeout fires. On timeout, remaining
-/// `JoinHandle`s are dropped (aborting stuck tasks) and a prior clean operator
-/// stop stays `Ok` when no failure was collected.
+/// sibling is still stuck when the timeout fires. On timeout, all retained
+/// abort handles are fired (completed tasks are unaffected), then remaining
+/// join futures are dropped. A prior clean operator stop stays `Ok` when no
+/// failure was collected.
 async fn drain_cp_listener_futures<Fut>(
     futures: &mut futures_util::stream::FuturesUnordered<Fut>,
+    abort_handles: &[tokio::task::AbortHandle],
     drain_timeout: Duration,
     timeout_message: &str,
 ) -> Result<(), anyhow::Error>
@@ -2306,8 +2317,11 @@ where
             Ok(None) => break,
             Err(_) => {
                 warn!("{timeout_message}");
-                // Drop remaining join futures so stuck listener tasks abort
-                // instead of outliving supervision.
+                for abort_handle in abort_handles {
+                    abort_handle.abort();
+                }
+                // Once abort has been requested, release the remaining join
+                // futures without detaching still-running listeners.
                 *futures = futures_util::stream::FuturesUnordered::new();
                 break;
             }
@@ -3058,6 +3072,7 @@ mod tests {
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let stuck_abort = stuck.abort_handle();
         let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
         let started = Instant::now();
@@ -3086,6 +3101,13 @@ mod tests {
             format!("{err:#}").contains("exited unexpectedly"),
             "preserved failure must report unsolicited exit; got {err:#}",
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stuck_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stuck listener must be aborted at the drain deadline");
     }
 
     #[tokio::test]
