@@ -1542,6 +1542,12 @@ pub async fn handle_admin_request(
                 ));
             }
         },
+        Err(JwtError::NotConfigured) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Admin authentication is unavailable"}),
+            ));
+        }
         Err(JwtError::MissingHeader) => {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,
@@ -5149,10 +5155,15 @@ pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::Plug
             // The real-IP header is also safe to resolve from this CP: ConfigSync
             // rejects every DP that does not advertise the same effective value
             // before any snapshot can be distributed.
+            //
+            // Compression codec gates and the request-body ceiling must also
+            // match serving PluginCache admission so CP cannot accept a
+            // max_decompressed_request_size that DPs later reject.
             plugins::PluginHttpClient::default_with_backend_allow_ips(
                 state.backend_allow_ips.clone(),
             )
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_process_compression_admission_policy()
         })
 }
 
