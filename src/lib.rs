@@ -231,13 +231,8 @@ pub mod _test_support {
         F: std::future::Future<Output = T>,
         C: std::future::Future<Output = ()>,
     {
-        crate::proxy::udp_proxy::udp_reply_recv_until_stop(
-            stop_flag,
-            stop_notify,
-            recv,
-            cancel,
-        )
-        .await
+        crate::proxy::udp_proxy::udp_reply_recv_until_stop(stop_flag, stop_notify, recv, cancel)
+            .await
     }
 
     /// Resolve a live UDP `last_client` cache hit, clearing the entry when the
