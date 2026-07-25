@@ -205,6 +205,23 @@ fn test_from_env_explicit_adaptive_false_with_windows() {
 }
 
 #[test]
+fn test_from_env_unparseable_adaptive_window_does_not_suppress_auto_disable() {
+    // A typo like "yes" must not count as explicit adaptive intent; fixed windows
+    // must still take effect.
+    with_env_vars(
+        &[
+            ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216"),
+            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "yes"),
+        ],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+            assert!(!config.http2_adaptive_window);
+        },
+    );
+}
+
+#[test]
 fn test_proxy_overrides() {
     let global = PoolConfig::default();
     let mut proxy = create_test_proxy();

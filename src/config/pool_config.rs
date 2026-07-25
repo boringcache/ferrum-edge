@@ -183,8 +183,17 @@ impl PoolConfig {
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
-            config.http2_adaptive_window = val.parse::<bool>().unwrap_or(true);
-            adaptive_explicit = true;
+            match val.parse::<bool>() {
+                Ok(parsed) => {
+                    config.http2_adaptive_window = parsed;
+                    adaptive_explicit = true;
+                }
+                Err(_) => tracing::warn!(
+                    value = %val,
+                    "invalid FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW; expected true or false - \
+                     keeping the resolved default"
+                ),
+            }
         }
 
         if let Some(val) = resolve_ferrum_var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
