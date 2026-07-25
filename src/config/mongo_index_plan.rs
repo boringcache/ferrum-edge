@@ -4,9 +4,9 @@
 //! consume [`required_mongo_indexes`] / [`required_guard_collections`] so the
 //! operator-facing plan cannot drift from the indexes `up` actually ensures.
 
+use mongodb::IndexModel;
 use mongodb::bson::{Document, doc};
 use mongodb::options::IndexOptions;
-use mongodb::IndexModel;
 
 /// Projection field stamped onto consumer documents for the HMAC secret-hash
 /// uniqueness index. Must stay identical to the field written by
@@ -64,10 +64,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     ));
     plan.push(keys_only("proxies", doc! { "updated_at": 1 }));
     plan.push(keys_only("proxies", doc! { "upstream_id": 1 }));
-    plan.push(keys_only(
-        "proxies",
-        doc! { "plugins.plugin_config_id": 1 },
-    ));
+    plan.push(keys_only("proxies", doc! { "plugins.plugin_config_id": 1 }));
     plan.push(unique_partial(
         "proxies",
         doc! { "namespace": 1, "listen_port": 1 },
@@ -114,7 +111,10 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
 
     // consumer_identity_index — `_id` uniqueness is the atomic guard; the
     // non-unique {namespace} index supports namespace wipes / cleanup filters.
-    plan.push(keys_only("consumer_identity_index", doc! { "namespace": 1 }));
+    plan.push(keys_only(
+        "consumer_identity_index",
+        doc! { "namespace": 1 },
+    ));
 
     // plugin_configs
     plan.push(keys_only("plugin_configs", doc! { "proxy_id": 1 }));
@@ -201,10 +201,7 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     plan.push(keys_only("api_specs", doc! { "namespace": 1, "tags": 1 }));
 
     // audit_events
-    plan.push(keys_only(
-        "audit_events",
-        doc! { "namespace": 1, "ts": -1 },
-    ));
+    plan.push(keys_only("audit_events", doc! { "namespace": 1, "ts": -1 }));
     plan.push(keys_only("audit_events", doc! { "actor": 1 }));
     plan.push(keys_only(
         "audit_events",
@@ -399,17 +396,13 @@ fn compare_index_options(
     let req_unique = required.map(|o| effective_bool(o.unique)).unwrap_or(false);
     let live_unique = live.map(|o| effective_bool(o.unique)).unwrap_or(false);
     if req_unique != live_unique {
-        return Err(format!(
-            "unique expected={req_unique} found={live_unique}"
-        ));
+        return Err(format!("unique expected={req_unique} found={live_unique}"));
     }
 
     let req_sparse = required.map(|o| effective_bool(o.sparse)).unwrap_or(false);
     let live_sparse = live.map(|o| effective_bool(o.sparse)).unwrap_or(false);
     if req_sparse != live_sparse {
-        return Err(format!(
-            "sparse expected={req_sparse} found={live_sparse}"
-        ));
+        return Err(format!("sparse expected={req_sparse} found={live_sparse}"));
     }
 
     let req_partial = required.and_then(|o| o.partial_filter_expression.as_ref());
@@ -445,9 +438,7 @@ fn compare_index_options(
     let req_hidden = required.map(|o| effective_bool(o.hidden)).unwrap_or(false);
     let live_hidden = live.map(|o| effective_bool(o.hidden)).unwrap_or(false);
     if req_hidden != live_hidden {
-        return Err(format!(
-            "hidden expected={req_hidden} found={live_hidden}"
-        ));
+        return Err(format!("hidden expected={req_hidden} found={live_hidden}"));
     }
 
     let req_wildcard = required.and_then(|o| o.wildcard_projection.as_ref());

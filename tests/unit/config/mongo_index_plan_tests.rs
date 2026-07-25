@@ -4,13 +4,12 @@
 //! present / missing / mismatched classification without a live MongoDB.
 
 use ferrum_edge::config::mongo_index_plan::{
-    IndexPresence, REQUIRED_GUARD_COLLECTIONS, classify_plan_against_live,
-    classify_required_index, default_index_name, dry_run_lines, required_mongo_indexes,
-    summarize_index,
+    IndexPresence, REQUIRED_GUARD_COLLECTIONS, classify_plan_against_live, classify_required_index,
+    default_index_name, dry_run_lines, required_mongo_indexes, summarize_index,
 };
+use mongodb::IndexModel;
 use mongodb::bson::doc;
 use mongodb::options::IndexOptions;
-use mongodb::IndexModel;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -140,8 +139,7 @@ fn run_migrations_and_status_consume_canonical_plan() {
         "mongodb status must connect before reporting"
     );
     assert!(
-        status_body.contains("listIndexes only")
-            || status_body.contains("index_migration_status"),
+        status_body.contains("listIndexes only") || status_body.contains("index_migration_status"),
         "mongodb status must compare via index_migration_status"
     );
 
@@ -270,10 +268,12 @@ fn classify_plan_against_live_reports_mixed_presence() {
     let mut live = HashMap::new();
     live.insert(
         "proxies".to_string(),
-        vec![IndexModel::builder()
-            .keys(sample.model.keys.clone())
-            .options(sample.model.options.clone())
-            .build()],
+        vec![
+            IndexModel::builder()
+                .keys(sample.model.keys.clone())
+                .options(sample.model.options.clone())
+                .build(),
+        ],
     );
 
     let report = classify_plan_against_live(&live);

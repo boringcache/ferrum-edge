@@ -84,11 +84,11 @@ mod inner {
     use uuid::Uuid;
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
-    use regex::escape as regex_escape;
     use crate::config::mongo_index_plan::{
         HMAC_SECRET_HASHES_FIELD, REQUIRED_GUARD_COLLECTIONS, RequiredMongoIndex,
         classify_plan_against_live, default_index_name, required_mongo_indexes,
     };
+    use regex::escape as regex_escape;
 
     // MongoDB server error codes used by the index-upgrade logic in
     // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
@@ -1579,7 +1579,9 @@ mod inner {
             let collection = self.collection(entry.collection);
             match collection.create_index(entry.model.clone()).await {
                 Ok(_) => Ok(()),
-                Err(err) if entry.recreate_on_options_conflict && is_index_options_conflict(&err) => {
+                Err(err)
+                    if entry.recreate_on_options_conflict && is_index_options_conflict(&err) =>
+                {
                     let index_name = default_index_name(&entry.model.keys);
                     warn!(
                         collection = entry.collection,
