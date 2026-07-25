@@ -492,10 +492,11 @@ impl DeliveryLifecycle {
         if self.cancelling_tasks.load(Ordering::Acquire) {
             if let Some((_, task)) = self.tasks.remove(&task_id) {
                 task.abort.abort();
+                // This removal owns the permit. If the entry is already gone,
+                // cancel_remaining removed it and released the permit.
+                self.release_task_permit();
                 self.counters.record_cancelled(kind);
             }
-            // TaskCompletion was never installed (start not sent); release here.
-            self.release_task_permit();
             return false;
         }
         if start_tx.send(()).is_err() {
