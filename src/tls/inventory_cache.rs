@@ -30,7 +30,7 @@
 //! bound `ferrum_tls_inventory_snapshot_max_age_seconds`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -64,6 +64,9 @@ pub struct TlsInventorySnapshot {
     /// Monotonic collection instant used for TTL math (wall-clock jumps must not
     /// pin or expire the snapshot).
     collected_at_instant: Instant,
+    /// Serving-cycle collector generation that produced this snapshot. A
+    /// snapshot from a replaced collector is never exposed to the new cycle.
+    collector_generation: u64,
 }
 
 impl TlsInventorySnapshot {
@@ -79,7 +82,12 @@ struct InventoryCache {
     refresh_in_flight: AtomicBool,
     stale_requested: AtomicBool,
     generation: AtomicU64,
+    collector_generation: AtomicU64,
     collector_pinned: AtomicBool,
+    /// Registration is cold-path only (admin serving-cycle startup and test
+    /// setup). Serialize install/replace/pin so a pinned test collector cannot
+    /// be overwritten by a racing fallback or serving-cycle registration.
+    collector_registration: Mutex<()>,
 }
 
 static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
@@ -88,7 +96,9 @@ static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
     refresh_in_flight: AtomicBool::new(false),
     stale_requested: AtomicBool::new(false),
     generation: AtomicU64::new(0),
+    collector_generation: AtomicU64::new(1),
     collector_pinned: AtomicBool::new(false),
+    collector_registration: Mutex::new(()),
 });
 
 /// Install the process-wide collector. First installation wins.
@@ -100,6 +110,10 @@ static CACHE: LazyLock<InventoryCache> = LazyLock::new(|| InventoryCache {
 ///
 /// Returns `true` when this call installed the collector.
 pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
+    let _registration = CACHE
+        .collector_registration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if CACHE.collector_pinned.load(Ordering::Acquire) {
         return false;
     }
@@ -117,16 +131,23 @@ pub fn install_collector(collector: Arc<dyn TlsInventoryCollector>) -> bool {
 /// Sequential in-process serving cycles can own different `AdminState` /
 /// `ProxyState` values. Keeping the first collector forever would leave later
 /// cycles refreshing from the previous cycle's config. A serving-cycle install
-/// therefore replaces the collector and marks the current snapshot stale; the
-/// next bounded refresh publishes metadata from the new owner. Pinned test
-/// collectors remain authoritative.
+/// therefore replaces the collector, advances its generation, and invalidates
+/// the current snapshot; the next bounded refresh publishes metadata from the
+/// new owner. An old in-flight refresh may finish, but its generation-bound
+/// snapshot is ignored. Pinned test collectors remain authoritative.
 ///
 /// Returns `true` when this call replaced the collector.
 pub fn replace_collector_for_serving_cycle(collector: Arc<dyn TlsInventoryCollector>) -> bool {
+    let _registration = CACHE
+        .collector_registration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if CACHE.collector_pinned.load(Ordering::Acquire) {
         return false;
     }
     CACHE.collector.store(Arc::new(Some(collector)));
+    CACHE.collector_generation.fetch_add(1, Ordering::AcqRel);
+    CACHE.snapshot.store(Arc::new(None));
     mark_stale();
     true
 }
@@ -140,8 +161,15 @@ pub fn replace_collector_for_serving_cycle(collector: Arc<dyn TlsInventoryCollec
 /// never pins.
 #[allow(dead_code)] // Used by the external endpoint tests, not by the binary.
 pub fn pin_collector(collector: Arc<dyn TlsInventoryCollector>) {
+    let _registration = CACHE
+        .collector_registration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     CACHE.collector_pinned.store(true, Ordering::Release);
     CACHE.collector.store(Arc::new(Some(collector)));
+    CACHE.collector_generation.fetch_add(1, Ordering::AcqRel);
+    CACHE.snapshot.store(Arc::new(None));
+    mark_stale();
 }
 
 /// Whether a collector has been installed.
@@ -151,7 +179,14 @@ pub fn collector_installed() -> bool {
 
 /// Lock-free read of the published snapshot. Never performs source I/O.
 pub fn snapshot() -> Option<Arc<TlsInventorySnapshot>> {
-    CACHE.snapshot.load().as_ref().clone()
+    loop {
+        let generation_before = CACHE.collector_generation.load(Ordering::Acquire);
+        let snapshot = CACHE.snapshot.load().as_ref().clone();
+        let generation_after = CACHE.collector_generation.load(Ordering::Acquire);
+        if generation_before == generation_after {
+            return snapshot.filter(|snapshot| snapshot.collector_generation == generation_after);
+        }
+    }
 }
 
 /// Ask the next due check to refresh regardless of remaining TTL.
@@ -186,6 +221,7 @@ pub fn schedule_refresh_if_due(ttl: Duration) -> bool {
     let Some(collector) = CACHE.collector.load().as_ref().clone() else {
         return false;
     };
+    let collector_generation = CACHE.collector_generation.load(Ordering::Acquire);
     let Some(guard) = RefreshGuard::try_acquire() else {
         return false;
     };
@@ -199,20 +235,22 @@ pub fn schedule_refresh_if_due(ttl: Duration) -> bool {
     CACHE.stale_requested.store(false, Ordering::Relaxed);
     handle.spawn_blocking(move || {
         let _guard = guard;
-        publish(collector.collect_public_metadata());
+        publish(collector.collect_public_metadata(), collector_generation);
     });
     true
 }
 
-fn publish(inventory: TlsInventory) {
+fn publish(inventory: TlsInventory, collector_generation: u64) {
     let snapshot = Arc::new(TlsInventorySnapshot {
         inventory: Arc::new(inventory),
         collected_at: Utc::now(),
         generation: CACHE.generation.fetch_add(1, Ordering::Relaxed) + 1,
         collected_at_instant: Instant::now(),
+        collector_generation,
     });
     debug!(
         generation = snapshot.generation,
+        collector_generation,
         entries = snapshot.inventory.entries.len(),
         "Published cached TLS inventory snapshot"
     );

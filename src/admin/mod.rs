@@ -1541,7 +1541,16 @@ pub async fn handle_admin_request(
                 registry.refresh_tls_certificate_inventory(&snapshot.inventory);
                 registry.set_tls_inventory_freshness(Some((collected_at, snapshot_ttl_seconds)));
             }
-            None => registry.set_tls_inventory_freshness(None),
+            None => {
+                // A serving-cycle collector replacement invalidates the prior
+                // cycle's snapshot. Clear any gauges derived from it rather
+                // than exposing stale certificate metadata until the new
+                // generation's background refresh publishes.
+                registry.refresh_tls_certificate_inventory(
+                    &crate::tls::inventory::TlsInventory::default(),
+                );
+                registry.set_tls_inventory_freshness(None);
+            }
         }
         let mut metrics_output = registry.render();
         metrics_output.push_str(&crate::logging::render_prometheus());
