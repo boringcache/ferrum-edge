@@ -4386,7 +4386,12 @@ fn spool_owner_digest(fields: &[&str]) -> String {
 /// Fault selection is per-[`SpoolManager`] state supplied at construction, not a
 /// process-global switch, so no production sink can be steered away from the
 /// real filesystem calls.
+///
+/// Non-`None` variants are constructed only by the external unit-test suite via
+/// [`SpoolManager::for_tests_with_owner_and_faults`]; the binary crate never
+/// builds them, so clippy's dead-code lint is expected there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SpoolFsFault {
     None,
     FileSync,
@@ -6813,7 +6818,25 @@ async fn replay_spool_once(
 
         match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)?;
+                if let Err(error) = finalize_replayed_spool_file(
+                    spool,
+                    claim.path(),
+                    lines.len(),
+                    dead_letters,
+                ) {
+                    // Permanent rejection could not publish dead-letter metadata.
+                    // Release the claim so the original record remains
+                    // replayable: durability of the payload outranks quarantine
+                    // progress when the sidecar write fails.
+                    let _guard = spool
+                        .write_lock
+                        .lock()
+                        .map_err(|_| {
+                            format!("{PLUGIN_NAME}: spool writer lock is poisoned")
+                        })?;
+                    spool.release_claim_locked(claim.path())?;
+                    return Err(error);
+                }
                 spool
                     .metrics
                     .last_replay_at
