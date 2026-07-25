@@ -152,10 +152,7 @@ impl DeliverySlot {
     /// A drained generation is replaced immediately, which is what lets a
     /// second in-process serve deliver again.
     pub fn initialize(&self, pool_shard_override: usize) {
-        self.initialize_with_limits(
-            pool_shard_override,
-            self.max_tasks.load(Ordering::Acquire),
-        );
+        self.initialize_with_limits(pool_shard_override, self.max_tasks.load(Ordering::Acquire));
     }
 
     /// Record shard and task-budget overrides for the next open generation.
@@ -221,10 +218,7 @@ impl DeliverySlot {
     /// Reserved admission permits for the current generation (registry plus
     /// in-flight spawn handoff).
     pub fn admitted_tasks(&self) -> u64 {
-        self.current
-            .load()
-            .admitted_tasks
-            .load(Ordering::Acquire)
+        self.current.load().admitted_tasks.load(Ordering::Acquire)
     }
 
     /// Aggregate rejected-task count for the current generation.
@@ -1277,11 +1271,10 @@ mod tests {
         assert_eq!(lifecycle.tasks.len(), 2);
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
         assert!(
-            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {},)
+            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },)
         );
-        assert!(
-            !lifecycle.spawn(TaskAdmission::Internal, DeliveryTaskKind::Mirror, async {},)
-        );
+        assert!(!lifecycle.spawn(TaskAdmission::Internal, DeliveryTaskKind::Mirror, async {},));
         assert!(!lifecycle.spawn(
             TaskAdmission::External,
             DeliveryTaskKind::DeadlineCleanup,
@@ -1298,10 +1291,9 @@ mod tests {
                 .await
         );
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
-        assert!(lifecycle.spawn(
-            TaskAdmission::External,
-            DeliveryTaskKind::Terminal,
-            async {},
-        ));
+        assert!(
+            lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },)
+        );
     }
 }
