@@ -20,7 +20,8 @@
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
 use crate::common::{
-    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+    configure_coverage_gateway_command, continue_if_backend_available, explicit_test_binary,
+    host_port_from_db_url, shutdown_gateway_child, tcp_endpoint_reachable,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -34,33 +35,9 @@ const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
 
 /// Check if MongoDB is reachable at the expected address.
-/// Returns false if MongoDB is down — tests will be skipped gracefully.
 async fn mongodb_is_available(url: &str) -> bool {
-    // Extract host:port from the MongoDB URL (mongodb://host:port/db)
-    let host_port = url
-        .strip_prefix("mongodb://")
-        .or_else(|| url.strip_prefix("mongodb+srv://"))
-        .and_then(|s| s.split('/').next())
-        .and_then(|s| {
-            // Strip credentials if present (user:pass@host:port)
-            if s.contains('@') {
-                s.split('@').next_back()
-            } else {
-                Some(s)
-            }
-        })
-        .unwrap_or("localhost:27017");
-
-    match tokio::net::TcpStream::connect(host_port).await {
-        Ok(_) => true,
-        Err(_) => {
-            eprintln!(
-                "MongoDB not available at {} — skipping MongoDB functional tests",
-                host_port
-            );
-            false
-        }
-    }
+    let host_port = host_port_from_db_url(url);
+    tcp_endpoint_reachable(&host_port).await
 }
 
 /// Default certificate directory for TLS tests.
@@ -679,7 +656,11 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
 
-    if !mongodb_is_available(&mongo_url).await {
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_url}"),
+    ) {
         return;
     }
 

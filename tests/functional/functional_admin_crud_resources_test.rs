@@ -3,15 +3,23 @@
 //! Existing functional suites cover individual admin surfaces such as proxy
 //! routing, plugin CRUD, backup/restore, Mongo connectivity, and file-mode
 //! startup/reload. These tests fill the cross-resource gaps:
-//! - full Proxy/Consumer/PluginConfig/Upstream CRUD on one SQL backend
-//! - the same CRUD matrix on MongoDB
+//! - full Proxy/Consumer/PluginConfig/Upstream CRUD on SQLite, PostgreSQL,
+//!   MySQL, and MongoDB
 //! - upstream field variants, including health-check settings
 //! - all available plugin config CRUD through the admin API
 //! - OpenAPI spec CRUD and extracted runtime resources
+//! - concurrent admin mutations (representative transactional contention)
 //! - file-mode reload updates and deletes resource-backed runtime state while
 //!   admin writes remain read-only
-
-use crate::common::{DbType, TestGateway, spawn_http_identifying};
+//!
+//! Hosted CI sets `FERRUM_DB_BACKENDS_REQUIRED=1` plus explicit
+//! `FERRUM_TEST_POSTGRES_URL` / `FERRUM_TEST_MYSQL_URL` /
+//! `FERRUM_TEST_MONGO_URL` so missing backends fail closed. Local runs skip
+//! when those URLs/servers are absent.
+use crate::common::{
+    continue_if_backend_available, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    tcp_endpoint_reachable, DbType, TestGateway, spawn_http_identifying,
+};
 use ferrum_edge::plugins::available_plugins;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -186,6 +194,117 @@ async fn test_admin_sqlite_runtime_resource_crud_matrix() {
     )
     .await;
     run_available_plugin_config_crud(&gateway, backend_a.port, "sqlite").await;
+    run_concurrent_admin_mutations(&gateway, backend_a.port, "sqlite").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_admin_postgres_runtime_resource_crud_matrix() {
+    let Some(postgres_url) = postgres_test_url() else {
+        return;
+    };
+    let host_port = host_port_from_db_url(&postgres_url);
+    if !continue_if_backend_available(
+        "postgres",
+        tcp_endpoint_reachable(&host_port).await,
+        &format!("not reachable at {host_port}"),
+    ) {
+        return;
+    }
+
+    let backend_a = spawn_http_identifying("pg-crud-a")
+        .await
+        .expect("spawn postgres backend a");
+    let backend_b = spawn_http_identifying("pg-crud-b")
+        .await
+        .expect("spawn postgres backend b");
+
+    let gateway = TestGateway::builder()
+        .mode_database(DbType::Postgres(postgres_url))
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .expect("spawn postgres gateway");
+
+    run_admin_resource_crud_matrix(
+        &gateway,
+        backend_a.port,
+        backend_b.port,
+        "postgres",
+        "pg-crud-a",
+        "pg-crud-b",
+    )
+    .await;
+    run_upstream_field_variant_crud(&gateway, backend_a.port, backend_b.port, "postgres").await;
+    run_api_spec_crud_bundle(
+        &gateway,
+        backend_a.port,
+        backend_b.port,
+        "postgres",
+        "pg-crud-a",
+        "pg-crud-b",
+    )
+    .await;
+    // Full available-plugin enumeration stays on SQLite/Mongo to avoid
+    // needless duplication; dialect risk is covered by the shared CRUD,
+    // upstream, API-spec, and concurrent mutation cells above.
+    run_concurrent_admin_mutations(&gateway, backend_a.port, "postgres").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_admin_mysql_runtime_resource_crud_matrix() {
+    let Some(mysql_url) = mysql_test_url() else {
+        return;
+    };
+    let host_port = host_port_from_db_url(&mysql_url);
+    if !continue_if_backend_available(
+        "mysql",
+        tcp_endpoint_reachable(&host_port).await,
+        &format!("not reachable at {host_port}"),
+    ) {
+        return;
+    }
+
+    let backend_a = spawn_http_identifying("mysql-crud-a")
+        .await
+        .expect("spawn mysql backend a");
+    let backend_b = spawn_http_identifying("mysql-crud-b")
+        .await
+        .expect("spawn mysql backend b");
+
+    let gateway = TestGateway::builder()
+        .mode_database(DbType::MySql(mysql_url))
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .expect("spawn mysql gateway");
+
+    run_admin_resource_crud_matrix(
+        &gateway,
+        backend_a.port,
+        backend_b.port,
+        "mysql",
+        "mysql-crud-a",
+        "mysql-crud-b",
+    )
+    .await;
+    run_upstream_field_variant_crud(&gateway, backend_a.port, backend_b.port, "mysql").await;
+    run_api_spec_crud_bundle(
+        &gateway,
+        backend_a.port,
+        backend_b.port,
+        "mysql",
+        "mysql-crud-a",
+        "mysql-crud-b",
+    )
+    .await;
+    // Full available-plugin enumeration stays on SQLite/Mongo to avoid
+    // needless duplication; dialect risk is covered by the shared CRUD,
+    // upstream, API-spec, and concurrent mutation cells above.
+    run_concurrent_admin_mutations(&gateway, backend_a.port, "mysql").await;
 }
 
 #[tokio::test]
@@ -193,8 +312,11 @@ async fn test_admin_sqlite_runtime_resource_crud_matrix() {
 async fn test_admin_mongodb_runtime_resource_crud_matrix() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
-        eprintln!("MongoDB is not available at {mongo_url}; skipping MongoDB CRUD matrix");
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_url}"),
+    ) {
         return;
     }
 
@@ -236,6 +358,7 @@ async fn test_admin_mongodb_runtime_resource_crud_matrix() {
     )
     .await;
     run_available_plugin_config_crud(&gateway, backend_a.port, "mongodb").await;
+    run_concurrent_admin_mutations(&gateway, backend_a.port, "mongodb").await;
 }
 
 #[tokio::test]
@@ -1011,6 +1134,102 @@ async fn run_api_spec_crud_bundle(
         &client,
         &gateway.proxy_url(&format!("{listen_path}/orders/deleted")),
         StatusCode::NOT_FOUND,
+    )
+    .await;
+}
+
+/// Representative concurrent admin mutations against one backend.
+///
+/// Fires parallel consumer creates, then verifies every id is readable and
+/// unique constraints still reject a colliding username. Also creates a proxy
+/// aimed at `backend_port` so the concurrent path touches routing resources.
+async fn run_concurrent_admin_mutations(gateway: &TestGateway, backend_port: u16, prefix: &str) {
+    let client = Client::new();
+    let auth = gateway.auth_header();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..8];
+    let base = format!("{prefix}-{suffix}-concurrent");
+
+    let mut create_futures = Vec::new();
+    for idx in 0..8 {
+        let consumer_id = format!("{base}-c{idx}");
+        let username = format!("{base}-user-{idx}");
+        let body = json!({
+            "id": consumer_id,
+            "username": username,
+            "custom_id": format!("{base}-custom-{idx}")
+        });
+        let client = client.clone();
+        let auth = auth.clone();
+        let admin_url = gateway.admin_url("/consumers");
+        create_futures.push(async move {
+            let response = client
+                .post(admin_url)
+                .header("Authorization", auth)
+                .json(&body)
+                .send()
+                .await
+                .expect("concurrent consumer create");
+            (
+                consumer_id,
+                response.status(),
+                response.text().await.unwrap_or_default(),
+            )
+        });
+    }
+
+    let results = futures_util::future::join_all(create_futures).await;
+    for (consumer_id, status, body) in &results {
+        assert!(
+            status.is_success(),
+            "concurrent create of {consumer_id} failed: {status} {body}"
+        );
+    }
+
+    for (consumer_id, _, _) in &results {
+        let value = admin_get_json(
+            &client,
+            gateway,
+            &format!("/consumers/{consumer_id}"),
+            &auth,
+        )
+        .await;
+        assert_eq!(value["id"], *consumer_id);
+    }
+
+    let collision = json!({
+        "id": format!("{base}-collision"),
+        "username": format!("{base}-user-0"),
+        "custom_id": format!("{base}-collision-custom")
+    });
+    let response = client
+        .post(gateway.admin_url("/consumers"))
+        .header("Authorization", &auth)
+        .json(&collision)
+        .send()
+        .await
+        .expect("collision create");
+    assert!(
+        response.status().is_client_error(),
+        "duplicate username should be rejected after concurrent creates, got {}",
+        response.status()
+    );
+
+    let proxy_id = format!("{base}-proxy");
+    let listen_path = format!("/{base}");
+    admin_post_json(
+        &client,
+        gateway,
+        "/proxies",
+        &auth,
+        json!({
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true
+        }),
     )
     .await;
 }

@@ -1,0 +1,269 @@
+//! Cross-backend database parity cells that need live PostgreSQL/MySQL.
+//!
+//! Complements the SQLite-only migrate/outage suites and the per-backend CRUD
+//! / namespace / TLS entry points:
+//! - baseline migrate `up` + idempotent re-run on PostgreSQL and MySQL
+//! - connectivity recovery after pausing the CI database container
+//!
+//! Hosted CI provisions plaintext backends and sets
+//! `FERRUM_DB_BACKENDS_REQUIRED=1`. Local runs skip when URLs/containers are
+//! absent unless that flag is set.
+
+use crate::common::{
+    continue_if_backend_available, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    tcp_endpoint_reachable, DbType, TestGateway,
+};
+use serde_json::json;
+use std::process::Command;
+use std::time::Duration;
+use uuid::Uuid;
+
+fn gateway_binary() -> &'static str {
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
+    } else {
+        "./target/release/ferrum-edge"
+    }
+}
+
+fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Output {
+    Command::new(gateway_binary())
+        .env("FERRUM_MODE", "migrate")
+        .env("FERRUM_MIGRATE_ACTION", action)
+        .env("FERRUM_DB_TYPE", db_type)
+        .env("FERRUM_DB_URL", db_url)
+        .env("FERRUM_LOG_LEVEL", "info")
+        .env(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "functional-migrate-parity-secret-key-1234567890",
+        )
+        .output()
+        .expect("spawn ferrum-edge migrate process")
+}
+
+async fn assert_migrate_up_idempotent(db_type: &str, db_url: &str) {
+    let first = tokio::task::spawn_blocking({
+        let db_type = db_type.to_string();
+        let db_url = db_url.to_string();
+        move || run_migrate("up", &db_type, &db_url)
+    })
+    .await
+    .expect("join first migrate");
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first.status.success(),
+        "{db_type} migrate up failed: {}\n{}",
+        first.status,
+        first_stderr
+    );
+
+    let second = tokio::task::spawn_blocking({
+        let db_type = db_type.to_string();
+        let db_url = db_url.to_string();
+        move || run_migrate("up", &db_type, &db_url)
+    })
+    .await
+    .expect("join second migrate");
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        second.status.success(),
+        "{db_type} migrate up idempotent re-run failed: {}\n{}",
+        second.status,
+        second_stderr
+    );
+    assert!(
+        second_stdout.contains("up to date") || second_stdout.contains("No migrations applied"),
+        "{db_type} second migrate up should report no pending migrations; got:\n{second_stdout}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_postgres_migrate_up_is_idempotent() {
+    let Some(url) = postgres_test_url() else {
+        return;
+    };
+    let host_port = host_port_from_db_url(&url);
+    if !continue_if_backend_available(
+        "postgres",
+        tcp_endpoint_reachable(&host_port).await,
+        &format!("not reachable at {host_port}"),
+    ) {
+        return;
+    }
+    // Isolate schema work onto a dedicated database name when the URL path is
+    // the shared CI database — migrate is safe to re-run, but keep the probe
+    // pointed at the provisioned URL verbatim.
+    assert_migrate_up_idempotent("postgres", &url).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_mysql_migrate_up_is_idempotent() {
+    let Some(url) = mysql_test_url() else {
+        return;
+    };
+    let host_port = host_port_from_db_url(&url);
+    if !continue_if_backend_available(
+        "mysql",
+        tcp_endpoint_reachable(&host_port).await,
+        &format!("not reachable at {host_port}"),
+    ) {
+        return;
+    }
+    assert_migrate_up_idempotent("mysql", &url).await;
+}
+
+struct DockerUnpauseGuard {
+    container: String,
+}
+
+impl Drop for DockerUnpauseGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["unpause", &self.container])
+            .output();
+    }
+}
+
+fn docker_pause(container: &str) -> Option<DockerUnpauseGuard> {
+    let output = Command::new("docker")
+        .args(["pause", container])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(DockerUnpauseGuard {
+        container: container.to_string(),
+    })
+}
+
+async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
+    if !continue_if_backend_available(
+        label,
+        Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Running}}", container])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+            .unwrap_or(false),
+        &format!("{container} is not running"),
+    ) {
+        return;
+    }
+
+    let gateway = TestGateway::builder()
+        .mode_database(db)
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .unwrap_or_else(|error| panic!("spawn {label} gateway for connectivity recovery: {error}"));
+
+    let client = reqwest::Client::new();
+    let auth = gateway.auth_header();
+    let proxy_id = format!("recovery-{}", Uuid::new_v4().simple());
+    let listen_path = format!("/recovery-{}", Uuid::new_v4().simple());
+
+    let create = client
+        .post(gateway.admin_url("/proxies"))
+        .header("Authorization", &auth)
+        .json(&json!({
+            "id": proxy_id,
+            "listen_path": listen_path,
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "strip_listen_path": true
+        }))
+        .send()
+        .await
+        .expect("create proxy before outage");
+    assert!(
+        create.status().is_success(),
+        "pre-outage create failed: {}",
+        create.status()
+    );
+
+    let _guard = docker_pause(container).unwrap_or_else(|| {
+        panic!("{label} connectivity recovery could not pause {container}");
+    });
+
+    // Give the pool a moment to observe the paused backend.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let during = client
+        .post(gateway.admin_url("/proxies"))
+        .header("Authorization", &auth)
+        .json(&json!({
+            "id": format!("{proxy_id}-during"),
+            "listen_path": format!("{listen_path}-during"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9,
+            "strip_listen_path": true
+        }))
+        .send()
+        .await
+        .expect("admin write during outage");
+    assert!(
+        during.status().as_u16() == 503 || during.status().is_server_error(),
+        "admin write during paused DB should fail closed, got {}",
+        during.status()
+    );
+
+    drop(_guard);
+    // Wait for docker unpause + pool reconnect.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let recovery_id = format!("{proxy_id}-recovered");
+    loop {
+        let recovered = client
+            .post(gateway.admin_url("/proxies"))
+            .header("Authorization", &auth)
+            .json(&json!({
+                "id": recovery_id,
+                "listen_path": format!("{listen_path}-recovered"),
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 9,
+                "strip_listen_path": true
+            }))
+            .send()
+            .await
+            .expect("admin write after recovery");
+        if recovered.status().is_success() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{label} admin writes did not recover within 30s after unpause (last status {})",
+            recovered.status()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_postgres_connectivity_recovery_after_container_pause() {
+    let Some(url) = postgres_test_url() else {
+        return;
+    };
+    run_connectivity_recovery(
+        DbType::Postgres(url),
+        "ferrum-ci-postgres",
+        "postgres",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_mysql_connectivity_recovery_after_container_pause() {
+    let Some(url) = mysql_test_url() else {
+        return;
+    };
+    run_connectivity_recovery(DbType::MySql(url), "ferrum-ci-mysql", "mysql").await;
+}

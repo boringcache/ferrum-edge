@@ -990,13 +990,16 @@ jobs:
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel.
+            # race when nextest runs this shard in parallel. Also hosts the
+            # required PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells
+            # documented in docs/functional_testing_database.md.
             nextest_jobs: 1
             filters: |
               functional_capability_registry_test
               functional_admin_crud_resources_test
               functional_cp_dp_resilience_test
               functional_cp_dp_test
+              functional_database_parity_test
               functional_database_test
               functional_db_failover_test
               functional_db_outage_test
@@ -1006,6 +1009,9 @@ jobs:
               functional_mongodb_test
               functional_namespace_test
               functional_redis_rate_limiting_test
+            # Backend × behavior cells this hosted job owns (see docs matrix).
+            parity_backends: "sqlite,postgres,mysql,mongodb,redis"
+            parity_behaviors: "admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
@@ -1043,20 +1049,35 @@ jobs:
           path: .
 
       - name: Start data-plane service containers
-        # Only the data-plane shard runs the redis/mongo-backed functional tests
-        # (functional_redis_rate_limiting_test, functional_mongodb_test). These
-        # services were previously declared job-wide, so EVERY shard provisioned
-        # redis + mongo at job startup — a transient Docker Hub pull hiccup then
-        # failed otherwise-unrelated shards (e.g. resilience) before any test ran.
-        # Start them only where they're used to isolate that blast radius. Ports
-        # map to the runner's localhost exactly as the service containers did, so
-        # the tests' localhost:6379 / localhost:27017 connections are unchanged.
+        # Only the data-plane shard runs redis/mongo/postgres/mysql-backed
+        # functional persistence tests. These services were previously declared
+        # job-wide (or omitted for SQL), so either every shard paid the Docker
+        # cost or PostgreSQL/MySQL suites silently skipped. Start them only
+        # where they're used, set explicit URLs, and fail closed when readiness
+        # fails. Ports map to the runner's localhost exactly as the tests expect.
         if: matrix.shard == 'data-plane'
         run: |
+          set -euo pipefail
+
           docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
           docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
-          # The runner used to gate steps on the services' --health-cmd; reproduce
-          # that readiness wait using the tools shipped inside each image.
+          docker run -d --name ferrum-ci-postgres \
+            -e POSTGRES_DB=ferrum \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum \
+            -p 5432:5432 \
+            postgres:16-alpine
+          docker run -d --name ferrum-ci-mysql \
+            -e MYSQL_DATABASE=ferrum \
+            -e MYSQL_USER=ferrum \
+            -e MYSQL_PASSWORD=ferrum \
+            -e MYSQL_ROOT_PASSWORD=ferrum \
+            -p 3306:3306 \
+            mysql:8
+
+          # TLS fixtures for functional_db_tls_test (ports 15432 / 13306).
+          ./tests/scripts/setup_db_tls.sh "${RUNNER_TEMP}/ferrum-db-tls-certs"
+
           redis_ok=""
           for _ in $(seq 1 30); do
             if docker exec ferrum-ci-redis redis-cli ping 2>/dev/null | grep -q PONG; then
@@ -1064,6 +1085,10 @@ jobs:
             fi
             sleep 2
           done
+          if [ -z "$redis_ok" ]; then
+            echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
+          fi
+
           mongo_ok=""
           for _ in $(seq 1 30); do
             if docker exec ferrum-ci-mongo mongosh --quiet \
@@ -1072,13 +1097,35 @@ jobs:
             fi
             sleep 2
           done
-          if [ -z "$redis_ok" ]; then
-            echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
-          fi
           if [ -z "$mongo_ok" ]; then
             echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
           fi
-          echo "data-plane services ready (redis:6379, mongo:27017)"
+
+          pg_ok=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-ci-postgres pg_isready -U ferrum -d ferrum >/dev/null 2>&1; then
+              pg_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$pg_ok" ]; then
+            echo "::error::postgres did not become ready"; docker logs ferrum-ci-postgres; exit 1
+          fi
+
+          mysql_ok=""
+          for _ in $(seq 1 90); do
+            if docker exec ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum -pferrum --silent >/dev/null 2>&1; then
+              mysql_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mysql_ok" ]; then
+            echo "::error::mysql did not become ready"; docker logs ferrum-ci-mysql; exit 1
+          fi
+
+          echo "data-plane services ready (redis:6379, mongo:27017, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
+          echo "parity backends: ${{ matrix.parity_backends || '' }}"
+          echo "parity behaviors: ${{ matrix.parity_behaviors || '' }}"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -1131,13 +1178,33 @@ jobs:
           NEXTEST_JOBS: ${{ matrix.nextest_jobs }}
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
-        timeout-minutes: 30
+          # Explicit backend URLs for the data-plane persistence matrix. Empty
+          # on non-data-plane shards (harmless — those filters never consult them).
+          FERRUM_TEST_POSTGRES_URL: ${{ matrix.shard == 'data-plane' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          FERRUM_TEST_MYSQL_URL: ${{ matrix.shard == 'data-plane' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          FERRUM_TEST_MONGO_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+          FERRUM_TEST_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
+          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+          FERRUM_DB_TLS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+        timeout-minutes: 45
 
       - name: Summarize functional shard
         if: always()
         run: |
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ matrix.shard }}" = "data-plane" ]; then
+            echo "### Persistence parity mapping" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Backends | Behaviors |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+            echo "| \`${{ matrix.parity_backends || '' }}\` | \`${{ matrix.parity_behaviors || '' }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Required URLs: \`FERRUM_TEST_POSTGRES_URL\`, \`FERRUM_TEST_MYSQL_URL\`, \`FERRUM_TEST_MONGO_URL\` with \`FERRUM_DB_BACKENDS_REQUIRED=1\` / \`FERRUM_DB_TLS_REQUIRED=1\`." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "See \`docs/functional_testing_database.md\` for the backend × behavior matrix." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
           echo '```' >> $GITHUB_STEP_SUMMARY
           printf '%s\n' "$FUNCTIONAL_FILTERS" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

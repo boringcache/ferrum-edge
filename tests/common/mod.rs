@@ -56,11 +56,17 @@
 //! progress — once callers in later PRs import them, the allow is a no-op.
 #![allow(dead_code, unused_imports)]
 
+pub mod backend_availability;
 pub mod config_builder;
 pub mod echo_servers;
 pub mod gateway_harness;
 pub mod hmac_helpers;
 
+pub use backend_availability::{
+    continue_if_backend_available, continue_if_tls_fixture_available, db_backends_required,
+    db_tls_required, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    tcp_endpoint_reachable,
+};
 pub use config_builder::{
     ConsumerBuilder, GatewayConfigBuilder, PluginConfigBuilder, ProxyBuilder, UpstreamBuilder,
     write_yaml_value,

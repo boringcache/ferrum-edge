@@ -26,10 +26,17 @@
 //!   `mongodb://localhost:27017/ferrum_test` is reachable, matching
 //!   `functional_mongodb_test` conventions)
 //!
+//! Hosted CI sets `FERRUM_DB_BACKENDS_REQUIRED=1` so a missing expected
+//! backend fails instead of silently skipping. Local developers keep the
+//! historical opt-out by leaving that variable unset.
+//!
 //! All tests are `#[ignore]` — invoke with `cargo test --test functional_tests
 //! -- --ignored namespace`.
 
-use crate::common::{DbType, TestGateway};
+use crate::common::{
+    continue_if_backend_available, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    tcp_endpoint_reachable, DbType, TestGateway,
+};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -62,39 +69,48 @@ impl Backend {
 }
 
 /// Resolve the DB URL for the requested backend. Returns `None` when an
-/// external backend's env var is unset and no default is reachable — the
-/// calling test should skip in that case.
+/// external backend is unavailable and backends are not required — the
+/// calling test should skip in that case. When `FERRUM_DB_BACKENDS_REQUIRED`
+/// is set, missing/unreachable backends panic instead of returning `None`.
 async fn resolve_db(backend: Backend) -> Option<DbType> {
     match backend {
         Backend::Sqlite => Some(DbType::Sqlite),
-        Backend::Postgres => std::env::var("FERRUM_TEST_POSTGRES_URL")
-            .ok()
-            .map(DbType::Postgres),
-        Backend::Mysql => std::env::var("FERRUM_TEST_MYSQL_URL")
-            .ok()
-            .map(DbType::MySql),
+        Backend::Postgres => {
+            let url = postgres_test_url()?;
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "postgres",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
+            }
+            Some(DbType::Postgres(url))
+        }
+        Backend::Mysql => {
+            let url = mysql_test_url()?;
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "mysql",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
+            }
+            Some(DbType::MySql(url))
+        }
         Backend::Mongodb => {
             let url = std::env::var("FERRUM_TEST_MONGO_URL")
                 .unwrap_or_else(|_| "mongodb://localhost:27017/ferrum_test".to_string());
-            // Probe TCP reachability before returning the URL.
-            let host_port = url
-                .strip_prefix("mongodb://")
-                .or_else(|| url.strip_prefix("mongodb+srv://"))
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| {
-                    if s.contains('@') {
-                        s.split('@').next_back()
-                    } else {
-                        Some(s)
-                    }
-                })
-                .unwrap_or("localhost:27017")
-                .to_string();
-            if tokio::net::TcpStream::connect(&host_port).await.is_ok() {
-                Some(DbType::Mongo(url))
-            } else {
-                None
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "mongodb",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
             }
+            Some(DbType::Mongo(url))
         }
     }
 }

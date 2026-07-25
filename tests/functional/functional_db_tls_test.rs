@@ -11,7 +11,7 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
-use crate::common::{DbType, TestGateway};
+use crate::common::{continue_if_tls_fixture_available, DbType, TestGateway};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -481,9 +481,11 @@ async fn run_crud_and_proxy_tests(
 async fn test_postgresql_tls_verify_full() {
     println!("\n=== PostgreSQL TLS (verify-full via FERRUM_DB_TLS_MODE) ===\n");
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -533,9 +535,11 @@ async fn test_postgresql_tls_verify_full() {
 async fn test_postgresql_tls_require() {
     println!("\n=== PostgreSQL TLS (require — encrypted, no cert verification) ===\n");
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -581,9 +585,11 @@ async fn test_postgresql_tls_require() {
 async fn test_mysql_tls_verify_identity() {
     println!("\n=== MySQL TLS (verify-full -> VERIFY_IDENTITY via FERRUM_DB_TLS_MODE) ===\n");
 
-    if !is_container_running("ferrum-test-mysql-tls") {
-        println!("SKIPPED: ferrum-test-mysql-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "mysql",
+        is_container_running("ferrum-test-mysql-tls"),
+        "ferrum-test-mysql-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -632,9 +638,11 @@ async fn test_mysql_tls_verify_identity() {
 async fn test_mysql_tls_required() {
     println!("\n=== MySQL TLS (require -> REQUIRED via FERRUM_DB_TLS_MODE) ===\n");
 
-    if !is_container_running("ferrum-test-mysql-tls") {
-        println!("SKIPPED: ferrum-test-mysql-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "mysql",
+        is_container_running("ferrum-test-mysql-tls"),
+        "ferrum-test-mysql-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -724,8 +732,11 @@ async fn test_sqlite_without_tls_settings() {
 async fn test_health_endpoint_shows_db_status() {
     println!("\n=== Health Endpoint with TLS DB ===\n");
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 

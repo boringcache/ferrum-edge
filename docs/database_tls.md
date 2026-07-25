@@ -422,6 +422,10 @@ export FERRUM_DB_TLS_CA_CERT_PATH=/etc/ferrum/rds-combined-ca-bundle.pem
 ## Functional Testing
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
+Hosted CI runs `tests/scripts/setup_db_tls.sh` in the data-plane functional shard and
+sets `FERRUM_DB_TLS_REQUIRED=1` so a missing PostgreSQL/MySQL TLS fixture fails the
+job instead of silently skipping. Local developers keep the opt-out by leaving that
+flag unset when the containers are not running.
 
 ### Setup
 
