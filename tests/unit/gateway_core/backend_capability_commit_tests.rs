@@ -296,7 +296,9 @@ fn vacant_commit_loses_to_an_entry_inserted_during_the_probe() {
         "a vacant expectation must not overwrite a concurrently inserted entry"
     );
 
-    let fetched = registry.get(&proxy, None).expect("live insert must survive");
+    let fetched = registry
+        .get(&proxy, None)
+        .expect("live insert must survive");
     assert_eq!(fetched.hbone, UNSUPPORTED);
 }
 
