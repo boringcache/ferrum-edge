@@ -31762,12 +31762,29 @@ async fn proxy_to_backend_http2(
     } else {
         usize::MAX
     };
-    let body = body::SizeLimitedIncoming::new_with_counter(
-        body,
-        max_request_body_size,
-        Arc::clone(&body_size_exceeded),
-        Arc::clone(ctx_bytes_sent_observed),
-    );
+    let (body, body_completion_rx) = if state.max_request_body_size_bytes > 0 {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        (
+            body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+            ),
+            Some(completion_rx),
+        )
+    } else {
+        (
+            body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            ),
+            None,
+        )
+    };
 
     // Set the URI
     parts.uri = uri;
@@ -32013,6 +32030,33 @@ async fn proxy_to_backend_http2(
             Err(e) => return map_h2_err(e),
         }
     };
+
+    // HTTP/2 is full duplex: a backend may return response headers before it
+    // has consumed the upload. Do not expose that response until the request
+    // body adapter has made the configured size-limit decision authoritative.
+    // A dropped adapter means the H2 sender abandoned the upload; never trust
+    // an early backend response in that case.
+    if let Some(body_completion_rx) = body_completion_rx
+        && body_completion_rx.await.is_err()
+    {
+        error!(proxy_id = %proxy.id, "HTTP/2 backend abandoned request upload after sending response headers");
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ProtocolError),
+            },
+            None,
+        );
+    }
+    if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+        return request_body_too_large();
+    }
 
     // Extract response status and headers
     let status = response.status().as_u16();

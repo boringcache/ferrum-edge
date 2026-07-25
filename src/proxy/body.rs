@@ -1496,6 +1496,7 @@ pub struct SizeLimitedIncoming {
     /// because ownership has already transferred to reqwest's request builder.
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     exceeded: Arc<AtomicBool>,
+    completion: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl SizeLimitedIncoming {
@@ -1547,6 +1548,26 @@ impl SizeLimitedIncoming {
             max_bytes,
             bytes_seen,
             exceeded,
+            completion: None,
+        }
+    }
+
+    /// Construct with a signal that resolves when the complete client body has
+    /// been consumed or rejected. Direct-H2 callers use this to avoid exposing
+    /// early backend response headers before a request-size decision is final.
+    pub fn new_with_counter_and_completion(
+        incoming: Incoming,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+        bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+        completion: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            inner: incoming,
+            max_bytes,
+            bytes_seen,
+            exceeded,
+            completion: Some(completion),
         }
     }
 
@@ -1613,13 +1634,26 @@ impl http_body::Body for SizeLimitedIncoming {
                     let total = prev.saturating_add(data_len);
                     if total > this.max_bytes as u64 {
                         this.exceeded.store(true, Ordering::Release);
+                        if let Some(completion) = this.completion.take() {
+                            let _ = completion.send(());
+                        }
                         return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(completion) = this.completion.take() {
+                    let _ = completion.send(());
+                }
+                Poll::Ready(Some(Err(Box::new(e))))
+            }
+            Poll::Ready(None) => {
+                if let Some(completion) = this.completion.take() {
+                    let _ = completion.send(());
+                }
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
