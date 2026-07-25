@@ -24,6 +24,10 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 
 The eBPF connect programs read `FERRUM_CAPTURE_CONFIG` before rewriting to loopback. If the singleton config entry is absent, they fall back to ABI defaults so older loaders fail open to the historical `15001` behavior.
 
+### Startup rollback of pinned eBPF state
+
+`load_programs` pins original-destination maps under `/sys/fs/bpf/ferrum`. Those pins outlive a dropped userspace object, so a failed startup must not rely on `Drop` alone. After a successful load, node-agent initialization is transactional: any later failure inside map/config/SOCK_OPS setup rolls back with `cleanup_all` before returning. Once initialization succeeds, `run_with_backend` owns cleanup exactly once for every remaining exit — Kubernetes client construction failure, ordinary watcher-loop shutdown, and Drop on unwind — so stale Ferrum pins are not left for a mesh proxy to open while no healthy node-agent is managing them. Cleanup failures are warned with the original startup/runtime error preserved as the returned cause.
+
 ## Pod Lifecycle Events
 
 The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_name}` field selector) and reacts to three Kubernetes event flavors. `Event::Apply` from the watcher conflates "added" and "modified", so the same code path handles initial enrollment and mid-life updates.

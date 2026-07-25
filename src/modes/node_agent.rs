@@ -841,12 +841,21 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
+    // `initialize_backend` is transactional: any post-`load_programs` failure
+    // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
+    // function owns cleanup exactly once through `InitializedBackendOwner`
+    // (normal shutdown, Kubernetes client construction failure, and Drop on
+    // any other exit). Do not call `cleanup_all` on a second path.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
+    let mut owner = InitializedBackendOwner::new(backend);
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
 
     let mut shutdown_rx = shutdown_tx.subscribe();
-    let client = build_node_agent_kube_client().await?;
+    let client = match build_node_agent_kube_client().await {
+        Ok(client) => client,
+        Err(err) => return Err(owner.fail_with(err)),
+    };
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
@@ -908,7 +917,7 @@ async fn run_with_backend(
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
                         handle_kube_pod_applied(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -917,7 +926,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                            handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -925,7 +934,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -938,13 +947,13 @@ async fn run_with_backend(
                         if let Some(seen) = init_seen.take() {
                             let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                                handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
                             // Also remove pods whose owned failure snapshots
                             // vanished across the relist; otherwise the retry
                             // loop replays them indefinitely (see helper docs).
                             prune_failed_enrollments_from_relist(
-                                backend.as_mut(),
+                                owner.backend_mut(),
                                 &pod_states,
                                 config,
                                 &metrics,
@@ -968,7 +977,7 @@ async fn run_with_backend(
                 match cni_work {
                     Some(work) => {
                         let enrolled_uid = process_cni_work_item(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -992,37 +1001,37 @@ async fn run_with_backend(
                 // that would otherwise keep capture partially attached. Cheap
                 // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     false,
                 );
                 retry_pending_pod_detaches(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_pod_ip_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_updates(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_cgroup_map_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1030,7 +1039,7 @@ async fn run_with_backend(
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness_with_sync_state(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1048,7 +1057,7 @@ async fn run_with_backend(
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    cleanup_all_pods(backend.as_mut(), &pod_states, config);
+    owner.shutdown_pods(&pod_states, config);
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -5577,6 +5586,26 @@ fn initialize_backend(
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));
     }
+
+    // Programs (and any bpffs pins created during load) are live. Every
+    // subsequent failure must roll back via `cleanup_all` before returning so
+    // a crashed/retried startup cannot leave stale Ferrum maps under
+    // `/sys/fs/bpf/ferrum`. `run_with_backend` takes ownership only after this
+    // function returns Ok.
+    match initialize_backend_after_load(backend, config, metrics) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            rollback_loaded_backend(backend, &err);
+            Err(err)
+        }
+    }
+}
+
+fn initialize_backend_after_load(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
         metrics.set_topology_degraded("capture_unavailable");
@@ -5714,7 +5743,130 @@ fn initialize_backend(
     Ok(())
 }
 
-fn cleanup_all_pods(
+/// Roll back BPF programs/maps/pins after `load_programs` succeeded but a later
+/// initialization step failed. Cleanup errors are warned with the original
+/// cause and never replace it.
+fn rollback_loaded_backend(backend: &mut dyn EbpfBackend, original: &anyhow::Error) {
+    if let Err(cleanup_err) = backend.cleanup_all() {
+        warn!(
+            error = %cleanup_err,
+            original_error = %original,
+            "Failed to roll back BPF state after node-agent initialization failure; \
+             original error preserved"
+        );
+    }
+}
+
+/// Single owner of `cleanup_all` after successful `initialize_backend`.
+///
+/// Every post-init exit — Kubernetes client construction failure, normal
+/// shutdown, or Drop on unwind — must invoke cleanup exactly once through this
+/// type. `initialize_backend` owns rollback for pre-success failures so the
+/// two paths never double-clean.
+struct InitializedBackendOwner {
+    backend: Option<Box<dyn EbpfBackend>>,
+    cleaned_up: bool,
+}
+
+impl InitializedBackendOwner {
+    fn new(backend: Box<dyn EbpfBackend>) -> Self {
+        Self {
+            backend: Some(backend),
+            cleaned_up: false,
+        }
+    }
+
+    fn backend_mut(&mut self) -> &mut dyn EbpfBackend {
+        // Invariant: production never takes the backend; only
+        // `into_backend_for_test` disarms Drop and takes it after cleanup.
+        self.backend
+            .as_mut()
+            .map(|backend| backend.as_mut())
+            .expect(
+                "invariant: InitializedBackendOwner.backend is present until Drop or test take",
+            )
+    }
+
+    /// Detach enrolled pods and invoke `cleanup_all` exactly once (normal
+    /// shutdown path).
+    fn shutdown_pods(
+        &mut self,
+        pod_states: &DashMap<String, PodAttachmentState>,
+        config: &NodeAgentConfig,
+    ) {
+        detach_enrolled_pods(self.backend_mut(), pod_states, config);
+        self.cleanup_once("shutdown");
+    }
+
+    /// Cleanup after a late startup/runtime error (e.g. Kubernetes client
+    /// construction). Preserves `err` as the returned cause; cleanup failures
+    /// are surfaced as structured warnings only.
+    fn fail_with(mut self, err: anyhow::Error) -> anyhow::Error {
+        self.cleanup_once_preserving(&err, "startup/runtime error");
+        err
+    }
+
+    fn cleanup_once(&mut self, context: &'static str) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if let Err(cleanup_err) = backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                context,
+                "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
+            );
+        }
+    }
+
+    fn cleanup_once_preserving(&mut self, original: &anyhow::Error, context: &'static str) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        let Some(backend) = self.backend.as_mut() else {
+            return;
+        };
+        if let Err(cleanup_err) = backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                original_error = %original,
+                context,
+                "Failed to cleanup BPF state after error; original error preserved"
+            );
+        }
+    }
+
+    /// Test-only: disarm Drop and take the backend for mock inspection.
+    fn into_backend_for_test(mut self) -> (Box<dyn EbpfBackend>, bool) {
+        let cleaned_up = self.cleaned_up;
+        self.cleaned_up = true;
+        let backend = self.backend.take().expect(
+            "invariant: InitializedBackendOwner.backend is present until Drop or test take",
+        );
+        (backend, cleaned_up)
+    }
+
+    fn fail_with_for_test(mut self, err: anyhow::Error) -> (anyhow::Error, Box<dyn EbpfBackend>) {
+        self.cleanup_once_preserving(&err, "startup/runtime error");
+        let (backend, _) = self.into_backend_for_test();
+        (err, backend)
+    }
+}
+
+impl Drop for InitializedBackendOwner {
+    fn drop(&mut self) {
+        // Panic / early-return safety net. No-op when `shutdown_pods` or
+        // `fail_with` already cleaned up.
+        self.cleanup_once("drop");
+    }
+}
+
+fn detach_enrolled_pods(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
@@ -5734,6 +5886,14 @@ fn cleanup_all_pods(
             warn!(pod_uid = %state.pod_uid, error = %e, "Failed to detach BPF programs during shutdown");
         }
     }
+}
+
+fn cleanup_all_pods(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+) {
+    detach_enrolled_pods(backend, pod_states, config);
     if let Err(e) = backend.cleanup_all() {
         warn!(error = %e, "Failed to cleanup BPF state during shutdown");
     }
@@ -5751,6 +5911,159 @@ fn cleanup_all_pods(
     // open). A fresh ack is only ever published by `reconcile_udp_capture_readiness`
     // once the BPF gate is verifiably re-closed, which a restarted node-agent
     // re-derives from live state rather than trusting a persisted marker.
+}
+
+/// Observable result for external #2371 startup-cleanup probes.
+#[derive(Debug, Clone)]
+pub struct NodeAgentStartupCleanupProbe {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub cleanup_all_calls: usize,
+    pub cleaned_up: bool,
+    pub programs_loaded: bool,
+    pub capture_config_set: bool,
+}
+
+fn local_pod_ebpf_test_config() -> NodeAgentConfig {
+    let mut capture_config = CaptureConfig::explicit(15006, 15001);
+    capture_config.mode = CaptureMode::Ebpf;
+    NodeAgentConfig {
+        node_name: "test-node".to_string(),
+        capture_config,
+        cgroup_root: "/sys/fs/cgroup".to_string(),
+        bpf_fs_path: "/sys/fs/bpf".to_string(),
+        fallback_mode: FallbackMode::Iptables,
+        excluded_namespaces: HashSet::new(),
+        capture_contract: CaptureContract::local_pod_defaults(),
+        trust_domain: "cluster.local".to_string(),
+        node_waypoint_pod_registry_dir: None,
+    }
+}
+
+/// External-test seam: `initialize_backend` after a successful `load_programs`.
+/// Post-`load_programs` failure must roll back via `cleanup_all` exactly once.
+pub(crate) fn probe_post_load_init_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
+    let config = local_pod_ebpf_test_config();
+    let mut backend = crate::ebpf::MockEbpfBackend {
+        fail_update_capture_config: true,
+        ..crate::ebpf::MockEbpfBackend::default()
+    };
+    let metrics = NodeAgentMetrics::default();
+    let result = initialize_backend(&mut backend, &config, &metrics);
+    NodeAgentStartupCleanupProbe {
+        ok: result.is_ok(),
+        error: result.err().map(|e| e.to_string()),
+        cleanup_all_calls: backend.cleanup_all_calls,
+        cleaned_up: backend.cleaned_up,
+        programs_loaded: backend.programs_loaded,
+        capture_config_set: backend.capture_config.is_some(),
+    }
+}
+
+/// Kubernetes-client-style late failure after successful initialization.
+pub(crate) fn probe_k8s_client_style_late_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe
+{
+    let config = local_pod_ebpf_test_config();
+    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
+    let mut backend = crate::ebpf::MockEbpfBackend {
+        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
+        ..crate::ebpf::MockEbpfBackend::default()
+    };
+    let metrics = NodeAgentMetrics::default();
+    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
+        return NodeAgentStartupCleanupProbe {
+            ok: false,
+            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: backend.capture_config.is_some(),
+        };
+    }
+    let owner = InitializedBackendOwner::new(Box::new(backend));
+    let (err, _backend) =
+        owner.fail_with_for_test(anyhow::anyhow!("injected kubernetes client construction failure"));
+    NodeAgentStartupCleanupProbe {
+        ok: false,
+        error: Some(err.to_string()),
+        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch
+            .cleaned_up
+            .load(std::sync::atomic::Ordering::Relaxed),
+        programs_loaded: true,
+        capture_config_set: false,
+    }
+}
+
+/// Normal shutdown must call `cleanup_all` exactly once (shutdown + Drop).
+pub(crate) fn probe_normal_shutdown_cleanup_once_for_test() -> NodeAgentStartupCleanupProbe {
+    let config = local_pod_ebpf_test_config();
+    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
+    let mut backend = crate::ebpf::MockEbpfBackend {
+        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
+        ..crate::ebpf::MockEbpfBackend::default()
+    };
+    let metrics = NodeAgentMetrics::default();
+    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
+        return NodeAgentStartupCleanupProbe {
+            ok: false,
+            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: backend.capture_config.is_some(),
+        };
+    }
+    let mut owner = InitializedBackendOwner::new(Box::new(backend));
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    owner.shutdown_pods(&pod_states, &config);
+    drop(owner);
+    NodeAgentStartupCleanupProbe {
+        ok: true,
+        error: None,
+        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch
+            .cleaned_up
+            .load(std::sync::atomic::Ordering::Relaxed),
+        programs_loaded: true,
+        capture_config_set: false,
+    }
+}
+
+/// Cleanup failure must not hide the original startup/runtime error.
+pub(crate) fn probe_cleanup_failure_preserves_original_error_for_test()
+-> NodeAgentStartupCleanupProbe {
+    let config = local_pod_ebpf_test_config();
+    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
+    let mut backend = crate::ebpf::MockEbpfBackend {
+        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
+        fail_cleanup_all: true,
+        ..crate::ebpf::MockEbpfBackend::default()
+    };
+    let metrics = NodeAgentMetrics::default();
+    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
+        return NodeAgentStartupCleanupProbe {
+            ok: false,
+            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: backend.capture_config.is_some(),
+        };
+    }
+    let owner = InitializedBackendOwner::new(Box::new(backend));
+    let (err, _backend) =
+        owner.fail_with_for_test(anyhow::anyhow!("original injected startup failure"));
+    NodeAgentStartupCleanupProbe {
+        ok: false,
+        error: Some(err.to_string()),
+        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
+        cleaned_up: watch
+            .cleaned_up
+            .load(std::sync::atomic::Ordering::Relaxed),
+        programs_loaded: true,
+        capture_config_set: false,
+    }
 }
 
 #[cfg(test)]
@@ -6377,6 +6690,8 @@ mod tests {
 
         assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert!(err.to_string().contains("SOCK_OPS identity bridge"));
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("node_waypoint_sock_ops_unavailable")
@@ -6424,6 +6739,8 @@ mod tests {
         assert!(err.to_string().contains("trusted node"));
         assert!(backend.node_ips.is_empty());
         assert!(backend.node_ips6.is_empty());
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
@@ -6457,6 +6774,8 @@ mod tests {
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
         assert!(backend.capture_config.is_none());
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_UNAVAILABLE

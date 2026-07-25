@@ -705,6 +705,14 @@ pub trait EbpfBackend: Send + Sync {
     fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String>;
 }
 
+/// Shared counters so tests can observe `cleanup_all` after a mock backend is
+/// moved into `Box<dyn EbpfBackend>` (post-init cleanup-owner coverage).
+#[derive(Debug, Default)]
+pub struct MockCleanupWatch {
+    pub calls: std::sync::atomic::AtomicUsize,
+    pub cleaned_up: std::sync::atomic::AtomicBool,
+}
+
 /// In-memory mock backend for Phase 1 and integration tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
@@ -736,6 +744,16 @@ pub struct MockEbpfBackend {
     pub operations: Vec<String>,
     pub detached_pods: Vec<String>,
     pub cleaned_up: bool,
+    /// Number of times `cleanup_all` was invoked. Tests for startup rollback
+    /// and shutdown assert exactly-once ownership via this counter (idempotent
+    /// repeats still increment so double-cleanup paths are detectable).
+    pub cleanup_all_calls: usize,
+    /// Optional shared view of cleanup counters for tests that move this mock
+    /// into a `Box<dyn EbpfBackend>` (see `InitializedBackendOwner`).
+    pub cleanup_watch: Option<std::sync::Arc<MockCleanupWatch>>,
+    /// When `true`, `cleanup_all` records the call then returns an error so
+    /// callers can prove original startup/runtime errors stay visible.
+    pub fail_cleanup_all: bool,
     pub fail_update_capture_config: bool,
     pub fail_update_pod_ip: bool,
     pub fail_update_node_probe_port: bool,
@@ -967,6 +985,15 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn cleanup_all(&mut self) -> Result<(), String> {
+        self.cleanup_all_calls = self.cleanup_all_calls.saturating_add(1);
+        if let Some(watch) = &self.cleanup_watch {
+            watch
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            watch
+                .cleaned_up
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.cgroup_attachments.clear();
         self.tc_attachments.clear();
         self.pod_ips.clear();
@@ -978,7 +1005,15 @@ impl EbpfBackend for MockEbpfBackend {
         self.include_ports.clear();
         self.workload_identities.clear();
         self.sock_ops_attached_cgroup_root = None;
+        self.bypass_uids.clear();
+        self.cidr_excludes.clear();
+        self.cidr_includes.clear();
+        self.port_excludes.clear();
+        self.capture_config = None;
         self.cleaned_up = true;
+        if self.fail_cleanup_all {
+            return Err("injected cleanup_all failure".to_string());
+        }
         Ok(())
     }
 

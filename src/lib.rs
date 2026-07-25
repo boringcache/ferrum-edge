@@ -3635,4 +3635,30 @@ pub mod _test_support {
             }
         }
     }
+
+    pub type NodeAgentStartupCleanupProbe =
+        crate::modes::node_agent::NodeAgentStartupCleanupProbe;
+
+    /// Post-`load_programs` initialization failure must roll back BPF state.
+    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        crate::modes::node_agent::probe_post_load_init_failure_cleanup_for_test()
+    }
+
+    /// Kubernetes-client-style late failure after successful eBPF init.
+    pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        crate::modes::node_agent::probe_k8s_client_style_late_failure_cleanup_for_test()
+    }
+
+    /// Normal shutdown must invoke `cleanup_all` exactly once.
+    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe {
+        crate::modes::node_agent::probe_normal_shutdown_cleanup_once_for_test()
+    }
+
+    /// Cleanup failure must preserve the original startup/runtime error.
+    pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        crate::modes::node_agent::probe_cleanup_failure_preserves_original_error_for_test()
+    }
 }
