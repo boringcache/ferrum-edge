@@ -2101,19 +2101,23 @@ pub async fn run(
     // Wait for ALL listener handles to exit, or the shutdown signal if no
     // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
     //
-    // Reuses fallible listener-handle supervision (same Result shape as
-    // file/database mode) while preserving CP's drain-timeout semantics:
+    // CP listener supervision keeps a single drain budget per wake reason
+    // (listener exit vs operator SIGINT/SIGTERM) so a monitor-originated
+    // shutdown cannot be overwritten by an outer equal-timeout `Ok(())`:
     //
     // 1. On the shutdown signal, every listener observes it via its own
     //    `shutdown_tx.subscribe()` receiver and exits gracefully —
     //    `serve_with_incoming_shutdown` for gRPC (so tonic completes
     //    in-flight RPCs and `TrackedStream`'s `Drop` deregisters the DP
     //    from `DpNodeRegistry`), and the watch-driven shutdown loops for
-    //    admin HTTP/HTTPS. Expected Ok exits after SIGINT/SIGTERM stay clean.
+    //    admin HTTP/HTTPS. Expected Ok exits after SIGINT/SIGTERM stay clean;
+    //    a stuck sibling after operator stop still returns Ok after the
+    //    configured drain timeout.
     // 2. If a listener returns a serve error, panics, or exits Ok without a
     //    prior shutdown request, the monitor preserves that first unexpected
-    //    failure, fires shutdown so siblings drain, and propagates Err from
-    //    `run()` so the process exits non-zero.
+    //    failure, fires shutdown so siblings drain under the same timeout
+    //    bound, and propagates Err from `run()` so the process exits non-zero
+    //    even when a sibling is still stuck at the deadline.
     let mut listener_handles: Vec<(String, ListenerJoinHandle)> = Vec::new();
     if let Some(handle) = admin_http_handle {
         listener_handles.push(("CP admin HTTP listener".to_string(), handle));
@@ -2161,38 +2165,23 @@ pub(crate) async fn wait_for_cp_listeners_until_shutdown_or_exit(
         return Ok(());
     }
 
-    let listener_shutdown_tx = shutdown_tx.clone();
-    let mut listener_monitor = tokio::spawn(async move {
-        monitor_cp_listener_handles_until_exit(
-            listener_handles,
-            listener_shutdown_tx,
-            drain_timeout,
-        )
-        .await
-    });
-    tokio::select! {
-        result = &mut listener_monitor => {
-            match result {
-                Ok(inner) => inner,
-                Err(err) => Err(anyhow::anyhow!("CP listener monitor task failed: {err}")),
-            }
-        }
-        _ = wait_for_cp_shutdown(&shutdown_tx) => {
-            match tokio::time::timeout(drain_timeout, &mut listener_monitor).await {
-                Ok(Ok(inner)) => inner,
-                Ok(Err(err)) => {
-                    Err(anyhow::anyhow!("CP listener monitor task failed: {err}"))
-                }
-                Err(_) => {
-                    warn!("Timed out waiting for CP listeners to drain after shutdown");
-                    listener_monitor.abort();
-                    // Explicit SIGINT/SIGTERM already requested shutdown; a drain
-                    // timeout must not turn a clean operator stop into failure.
-                    Ok(())
-                }
-            }
-        }
-    }
+    // Run supervision inline (no outer select + equal drain timeout). An earlier
+    // shape raced a monitor-originated shutdown against an outer `drain_timeout`
+    // that could abort the monitor and convert a preserved listener failure into
+    // `Ok(())`. Provenance lives inside the monitor: listener-exit vs operator
+    // shutdown each own a single drain budget and return their own result.
+    monitor_cp_listener_handles_until_exit(listener_handles, shutdown_tx, drain_timeout).await
+}
+
+/// Wake reason for the first event observed while supervising CP listeners.
+enum CpListenerMonitorWake {
+    /// A listener task completed (Ok, Err, or panic/join failure).
+    ListenerExit(
+        String,
+        Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ),
+    /// Shared shutdown watch flipped before any listener exited (SIGINT/SIGTERM).
+    OperatorShutdown,
 }
 
 async fn monitor_cp_listener_handles_until_exit(
@@ -2200,61 +2189,134 @@ async fn monitor_cp_listener_handles_until_exit(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     drain_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
-    let mut names = Vec::with_capacity(listener_handles.len());
-    let mut handles = Vec::with_capacity(listener_handles.len());
-    for (name, handle) in listener_handles {
-        names.push(name);
-        handles.push(handle);
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut futures: FuturesUnordered<_> = listener_handles
+        .into_iter()
+        .map(|(name, handle)| async move { (name, handle.await) })
+        .collect();
+
+    // Operator already requested stop before supervision began (e.g. SIGTERM
+    // landed while listeners were still being spawned into the wait helper).
+    if *shutdown_tx.borrow() {
+        return drain_cp_listener_futures(
+            &mut futures,
+            drain_timeout,
+            "Timed out waiting for CP listeners to drain after shutdown",
+        )
+        .await;
     }
 
-    let (first_join, idx, remaining_handles) = futures_util::future::select_all(handles).await;
-    // `select_all` removes the completed future with `swap_remove`, so mirror
-    // that operation on the parallel name vector. Order-preserving `remove`
-    // would misattribute later failures whenever the final handle is swapped
-    // into a non-final slot.
-    let first_name = names.swap_remove(idx);
-    let shutdown_already_requested = *shutdown_tx.borrow();
-    let first_error =
-        classify_cp_listener_exit(&first_name, first_join, shutdown_already_requested);
-
-    info!(
-        listener = %first_name,
-        "CP listener task exited; triggering control-plane shutdown"
-    );
-    let _ = shutdown_tx.send(true);
-
-    let remaining: Vec<(String, ListenerJoinHandle)> =
-        names.into_iter().zip(remaining_handles).collect();
-    let remaining_result = if remaining.is_empty() {
-        Ok(())
-    } else {
-        let shutdown_on_failure = {
-            let shutdown_tx = shutdown_tx.clone();
-            move || {
-                let _ = shutdown_tx.send(true);
-            }
-        };
-        let mut remaining_monitor = tokio::spawn(async move {
-            crate::modes::file::await_fallible_listener_handles(remaining, shutdown_on_failure)
-                .await
-        });
-        match tokio::time::timeout(drain_timeout, &mut remaining_monitor).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(err)) => Err(anyhow::anyhow!(
-                "CP listener drain monitor task failed: {err}"
-            )),
-            Err(_) => {
-                warn!("Timed out waiting for remaining CP listeners to drain after listener exit");
-                remaining_monitor.abort();
-                Ok(())
-            }
+    let wake = tokio::select! {
+        // Prefer a completed listener over a concurrent operator shutdown so an
+        // unsolicited/error/panic exit is classified before the drain path can
+        // treat a pre-shutdown Ok as an expected clean stop.
+        biased;
+        Some((name, join)) = futures.next() => {
+            CpListenerMonitorWake::ListenerExit(name, join)
+        }
+        _ = wait_for_cp_shutdown(&shutdown_tx) => {
+            CpListenerMonitorWake::OperatorShutdown
         }
     };
 
-    match (first_error, remaining_result) {
-        (Some(err), _) => Err(err),
-        (None, Err(err)) => Err(err),
-        (None, Ok(())) => Ok(()),
+    match wake {
+        CpListenerMonitorWake::OperatorShutdown => {
+            // Explicit SIGINT/SIGTERM: one drain budget for every still-running
+            // listener. Stuck siblings stay Ok; serve errors / panics still
+            // surface because the drain loop preserves the first failure even
+            // when the deadline expires afterward.
+            drain_cp_listener_futures(
+                &mut futures,
+                drain_timeout,
+                "Timed out waiting for CP listeners to drain after shutdown",
+            )
+            .await
+        }
+        CpListenerMonitorWake::ListenerExit(first_name, first_join) => {
+            let shutdown_already_requested = *shutdown_tx.borrow();
+            let first_error =
+                classify_cp_listener_exit(&first_name, first_join, shutdown_already_requested);
+
+            info!(
+                listener = %first_name,
+                "CP listener task exited; triggering control-plane shutdown"
+            );
+            let _ = shutdown_tx.send(true);
+
+            let remaining_result = drain_cp_listener_futures(
+                &mut futures,
+                drain_timeout,
+                "Timed out waiting for remaining CP listeners to drain after listener exit",
+            )
+            .await;
+
+            match (first_error, remaining_result) {
+                (Some(err), _) => Err(err),
+                (None, Err(err)) => Err(err),
+                (None, Ok(())) => Ok(()),
+            }
+        }
+    }
+}
+
+/// Drain remaining CP listener join futures under a single deadline.
+///
+/// Failures observed before the deadline are preserved and returned even if a
+/// sibling is still stuck when the timeout fires. On timeout, remaining
+/// `JoinHandle`s are dropped (aborting stuck tasks) and a prior clean operator
+/// stop stays `Ok` when no failure was collected.
+async fn drain_cp_listener_futures<Fut>(
+    futures: &mut futures_util::stream::FuturesUnordered<Fut>,
+    drain_timeout: Duration,
+    timeout_message: &str,
+) -> Result<(), anyhow::Error>
+where
+    Fut: std::future::Future<
+            Output = (
+                String,
+                Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+            ),
+        >,
+{
+    use futures_util::stream::StreamExt;
+
+    if futures.is_empty() {
+        return Ok(());
+    }
+
+    let mut first_error: Option<anyhow::Error> = None;
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+
+    loop {
+        if futures.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, futures.next()).await {
+            Ok(Some((name, join))) => {
+                // Shutdown has been requested by this point (operator or a prior
+                // listener exit), so Ok exits are expected. Errors/panics still
+                // classify as failures.
+                if let Some(err) = classify_cp_listener_exit(&name, join, true) {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                warn!("{timeout_message}");
+                // Drop remaining join futures so stuck listener tasks abort
+                // instead of outliving supervision.
+                *futures = futures_util::stream::FuturesUnordered::new();
+                break;
+            }
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
     }
 }
 
@@ -2985,6 +3047,11 @@ mod tests {
         );
     }
 
+    // Regression for the equal-deadline race: an unsolicited listener exit
+    // must preserve `first_error` through the drain timeout even when a
+    // sibling never observes shutdown. The prior outer `select!` could see
+    // the monitor-originated shutdown, start an equal `drain_timeout`, abort
+    // the monitor, and return `Ok(())` — losing the failure.
     #[tokio::test]
     async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -3012,6 +3079,132 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "listener-triggered drain should honor the configured timeout"
         );
-        result.expect_err("unsolicited exit must still surface as Err after drain timeout");
+        let err = result.expect_err(
+            "unsolicited exit must still surface as Err after drain timeout",
+        );
+        assert!(
+            format!("{err:#}").contains("exited unexpectedly"),
+            "preserved failure must report unsolicited exit; got {err:#}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_listener_error_with_stuck_sibling_returns_err_after_drain_timeout() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let failing =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed")) });
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("failing listener".to_string(), failing),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("listener failure must not wait forever on stuck siblings");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "error-triggered drain should honor the configured timeout"
+        );
+        let err = result.expect_err("serve error must surface as Err after drain timeout");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("accept loop failed"),
+            "preserved failure must include serve error; got {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_operator_shutdown_with_stuck_listener_returns_ok_after_drain_timeout() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let mut draining_rx = shutdown_tx.subscribe();
+        let draining = tokio::spawn(async move {
+            while !*draining_rx.borrow() {
+                if draining_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("draining listener".to_string(), draining),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("operator shutdown must not wait forever on stuck listeners");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "operator drain should honor the configured timeout"
+        );
+        result.expect("SIGINT/SIGTERM plus stuck listener must stay Ok");
+    }
+
+    #[tokio::test]
+    async fn cp_operator_shutdown_preserves_listener_error_when_sibling_stuck() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let failing = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("failed during operator drain"))
+        });
+
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("failing listener".to_string(), failing),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("operator shutdown must not wait forever on stuck listeners");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "operator drain should honor the configured timeout"
+        );
+        let err = result.expect_err(
+            "listener failure during operator shutdown must not be lost to drain timeout",
+        );
+        assert!(
+            format!("{err:#}").contains("failed during operator drain"),
+            "preserved failure must include serve error; got {err:#}",
+        );
     }
 }

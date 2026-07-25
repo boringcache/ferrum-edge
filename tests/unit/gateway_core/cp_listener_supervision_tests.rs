@@ -217,3 +217,77 @@ async fn remaining_failure_keeps_its_listener_name_after_first_handle_is_removed
         "swap-removal must not misattribute the failure: {rendered}"
     );
 }
+
+#[tokio::test]
+async fn unsolicited_exit_with_stuck_sibling_returns_err_after_drain_timeout() {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    let stuck = tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+    let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+            vec![
+                ("stuck listener".to_string(), stuck),
+                ("exited listener".to_string(), exited),
+            ],
+            shutdown_tx,
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("unsolicited exit must not wait forever on stuck siblings");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "listener-triggered drain should honor the configured timeout"
+    );
+    let err = result.expect_err("unsolicited exit must still surface as Err after drain timeout");
+    assert!(
+        format!("{err:#}").contains("exited unexpectedly"),
+        "error should report unsolicited exit; got {err:#}",
+    );
+}
+
+#[tokio::test]
+async fn operator_shutdown_with_stuck_sibling_returns_ok_after_drain_timeout() {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+    let stuck = tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+    let mut draining_rx = shutdown_tx.subscribe();
+    let draining = tokio::spawn(async move {
+        while !*draining_rx.borrow() {
+            if draining_rx.changed().await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    shutdown_tx
+        .send(true)
+        .expect("watch send must succeed with live receivers");
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+            vec![
+                ("stuck listener".to_string(), stuck),
+                ("draining listener".to_string(), draining),
+            ],
+            shutdown_tx,
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("operator shutdown must not wait forever on stuck listeners");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "operator drain should honor the configured timeout"
+    );
+    result.expect("SIGINT/SIGTERM plus stuck listener must stay Ok");
+}
