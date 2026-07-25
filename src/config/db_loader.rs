@@ -8087,11 +8087,14 @@ impl DatabaseStore {
         let start = std::time::Instant::now();
         let mut deleted = 0u64;
         if let Some(days) = self.audit_retention.retention_days {
-            deleted = deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
+            deleted =
+                deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
         }
         if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
-            deleted = deleted
-                .saturating_add(self.prune_audit_events_by_max_rows(namespace, max_rows).await?);
+            deleted = deleted.saturating_add(
+                self.prune_audit_events_by_max_rows(namespace, max_rows)
+                    .await?,
+            );
         }
         self.check_slow_query("prune_audit_events", start);
         Ok(deleted)
@@ -8127,10 +8130,8 @@ impl DatabaseStore {
         max_rows: u64,
     ) -> Result<u64, anyhow::Error> {
         let offset = i64::try_from(max_rows).unwrap_or(i64::MAX);
-        let boundary_sql = self.q(
-            "SELECT ts, id FROM audit_events WHERE namespace = ? \
-             ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?",
-        );
+        let boundary_sql = self.q("SELECT ts, id FROM audit_events WHERE namespace = ? \
+             ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?");
         let boundary = sqlx::query(&boundary_sql)
             .bind(namespace)
             .bind(offset)

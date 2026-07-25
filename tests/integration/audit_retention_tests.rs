@@ -11,9 +11,7 @@ use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use serde_json::json;
 use tempfile::TempDir;
 
-async fn sqlite_store_with_retention(
-    policy: AuditRetentionPolicy,
-) -> (DatabaseStore, TempDir) {
+async fn sqlite_store_with_retention(policy: AuditRetentionPolicy) -> (DatabaseStore, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("audit_retention_test.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -84,7 +82,10 @@ async fn age_prune_is_namespace_isolated_and_respects_cutoff() {
         max_rows_per_namespace: None,
     });
     let deleted = store.prune_audit_events("ns-a").await.unwrap();
-    assert!(deleted >= 1, "ns-a should prune at least the 10-day-old row");
+    assert!(
+        deleted >= 1,
+        "ns-a should prune at least the 10-day-old row"
+    );
 
     let ns_a = store
         .list_audit_events(
@@ -111,10 +112,7 @@ async fn age_prune_is_namespace_isolated_and_respects_cutoff() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        ns_b.total, 2,
-        "pruning ns-a must not delete ns-b rows"
-    );
+    assert_eq!(ns_b.total, 2, "pruning ns-a must not delete ns-b rows");
 }
 
 #[tokio::test]
@@ -123,19 +121,11 @@ async fn max_rows_cap_keeps_newest_by_ts_id_and_preserves_other_namespace() {
 
     for minutes in [5, 4, 3, 2, 1] {
         store
-            .insert_audit_event(&event_ordered(
-                "cap-a",
-                &format!("a-{minutes}"),
-                minutes,
-            ))
+            .insert_audit_event(&event_ordered("cap-a", &format!("a-{minutes}"), minutes))
             .await
             .unwrap();
         store
-            .insert_audit_event(&event_ordered(
-                "cap-b",
-                &format!("b-{minutes}"),
-                minutes,
-            ))
+            .insert_audit_event(&event_ordered("cap-b", &format!("b-{minutes}"), minutes))
             .await
             .unwrap();
     }
@@ -182,11 +172,7 @@ async fn pagination_remains_correct_across_prune_boundary() {
 
     for minutes in (1..=6).rev() {
         store
-            .insert_audit_event(&event_ordered(
-                "page-ns",
-                &format!("p-{minutes}"),
-                minutes,
-            ))
+            .insert_audit_event(&event_ordered("page-ns", &format!("p-{minutes}"), minutes))
             .await
             .unwrap();
     }
@@ -248,11 +234,7 @@ async fn insert_piggyback_applies_max_rows_without_failing_insert() {
 
     for minutes in [3, 2, 1] {
         store
-            .insert_audit_event(&event_ordered(
-                "piggy",
-                &format!("g-{minutes}"),
-                minutes,
-            ))
+            .insert_audit_event(&event_ordered("piggy", &format!("g-{minutes}"), minutes))
             .await
             .unwrap();
     }

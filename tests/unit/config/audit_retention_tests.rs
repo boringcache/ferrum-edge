@@ -114,10 +114,7 @@ fn env_config_rejects_invalid_audit_retention() {
         ],
         || {
             let err = EnvConfig::from_env().unwrap_err();
-            assert!(
-                err.contains("FERRUM_AUDIT_RETENTION_DAYS"),
-                "got: {err}"
-            );
+            assert!(err.contains("FERRUM_AUDIT_RETENTION_DAYS"), "got: {err}");
         },
     );
 

@@ -4771,7 +4771,10 @@ mod inner {
             self.backend_allow_ips = policy;
         }
 
-        fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy) {
+        fn set_audit_retention_policy(
+            &mut self,
+            policy: crate::admin::audit::AuditRetentionPolicy,
+        ) {
             self.audit_retention = policy;
         }
 
@@ -11498,9 +11501,10 @@ mod inner {
             }) else {
                 return Ok(0);
             };
-            let boundary_ts = boundary.get("ts").cloned().ok_or_else(|| {
-                anyhow::anyhow!("audit_events retention boundary missing ts")
-            })?;
+            let boundary_ts = boundary
+                .get("ts")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("audit_events retention boundary missing ts"))?;
             let boundary_id = boundary
                 .get("id")
                 .cloned()
