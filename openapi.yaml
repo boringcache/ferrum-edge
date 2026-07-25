@@ -61,13 +61,37 @@ info:
     available, including mesh egress-scope dry-runs, backend capability
     refreshes, and forced TLS source reloads.
 
-    ## Request body size limits
+    ## Request body size and time limits
 
     Most write endpoints accept request bodies up to 1 MiB; bodies that exceed
     the limit are rejected with `413 Payload Too Large`. The `/restore`
     endpoint has a higher configurable limit (default 100 MiB, controlled by
     `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`) to accommodate large-scale
     backups (30K+ proxies / 90K+ plugins can reach ~80 MB).
+
+    Every body-collecting endpoint — including `POST`/`PUT /api-specs` — is
+    additionally bounded in *time* by `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS`
+    (default 30, `0` disables). A body that has not finished arriving when the
+    deadline expires is rejected with `408 Request Timeout` and its HTTP/1.1
+    connection or HTTP/2 stream is released.
+
+    The body is read only for routes that consume it, and only after that
+    route's role gate. An unknown path, a method the path does not route, a
+    read/delete route, and a caller whose role the route would reject with
+    `403` are all answered without the request body being buffered.
+
+    ## Admin HTTP/2
+
+    The admin listeners serve HTTP/1.1 and HTTP/2 (HTTPS negotiates via ALPN,
+    plaintext accepts h2c prior knowledge). HTTP/2 connections advertise
+    bounded `SETTINGS_MAX_CONCURRENT_STREAMS`
+    (`FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS`, default 64) and
+    `SETTINGS_MAX_HEADER_LIST_SIZE`
+    (`FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES`, default 65536), so one
+    connection can neither multiplex unbounded streams nor accumulate an
+    unbounded header block per stream. A connection that neither delivers a new
+    request nor holds one in flight for a whole
+    `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window is closed.
   version: 0.2.0
   license:
     name: PolyForm Noncommercial 1.0.0
@@ -3438,6 +3462,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
@@ -4749,6 +4775,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: A spec already exists for this proxy ID, a resource name / listen_path conflicts, or the embedded plugin associations would make mTLS DNS identities ambiguous
           content:
@@ -4975,6 +5003,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
           content:
@@ -5332,6 +5362,15 @@ components:
             error: Admin API is in read-only mode
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: >-
+        The request body did not finish arriving within
+        FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS (default 30). The HTTP/1.1
+        connection or HTTP/2 stream is released; retry the request.
       content:
         application/json:
           schema:

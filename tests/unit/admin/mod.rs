@@ -4,6 +4,7 @@ mod admin_db_health_cache_tests;
 mod admin_jwt_auth_tests;
 mod admin_metrics_contract_tests;
 mod admin_read_only_tests;
+mod admin_slowloris_tests;
 mod admin_tests;
 mod admin_validation_tests;
 mod api_specs_path_item_ref_tests;

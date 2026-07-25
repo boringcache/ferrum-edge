@@ -2048,6 +2048,30 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
+    /// Absolute deadline (seconds) for reading an admin request body, applied
+    /// to every admin body-collecting handler including the API-spec ones.
+    /// A size cap alone does not bound *time*: a client that trickles one byte
+    /// per interval pins a task and its buffer indefinitely, and over HTTP/2 a
+    /// single connection can multiplex many such streams. `0` disables the
+    /// deadline (bodies are then bounded only by size). Default: 30 seconds.
+    pub admin_body_read_timeout_seconds: u64,
+
+    /// Server-advertised `SETTINGS_MAX_CONCURRENT_STREAMS` for admin HTTP/2
+    /// connections (TLS via ALPN `h2`, plaintext via h2c prior knowledge).
+    /// Bounds how many requests one admin connection can multiplex, so the
+    /// admin connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`) also bounds the
+    /// number of retained request tasks/buffers. Default: 64.
+    pub admin_http2_max_concurrent_streams: u32,
+
+    /// Server-advertised `SETTINGS_MAX_HEADER_LIST_SIZE` for admin HTTP/2
+    /// connections. Bounds the header block a single stream may accumulate
+    /// across `HEADERS` + `CONTINUATION` frames before the peer is reset, which
+    /// is the HTTP/2 analogue of the HTTP/1.1 header-read bound. Admin requests
+    /// carry only a bearer token and a few small headers. Clamped to a 1 KiB
+    /// floor so a misconfiguration cannot lock out ordinary JWTs.
+    /// Default: 65536 (64 KiB).
+    pub admin_http2_max_header_list_size_bytes: u32,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -2565,6 +2589,11 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_body_read_timeout_seconds: crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
+            admin_http2_max_concurrent_streams:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
+            admin_http2_max_header_list_size_bytes:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -2999,6 +3028,9 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS;
+            admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS, max(1u32);
+            admin_http2_max_header_list_size_bytes: u32 = "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES, max(1_024u32);
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -3619,6 +3651,9 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_body_read_timeout_seconds,
+            admin_http2_max_concurrent_streams,
+            admin_http2_max_header_list_size_bytes,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,

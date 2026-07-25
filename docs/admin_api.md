@@ -281,6 +281,21 @@ Pagination is validated only by routes that consume it, after their authenticati
 
 Two endpoints intentionally differ and document their own bounds below: `GET /audit` shares these bounds for `limit` but caps `offset` at `2^32 - 1`, and `GET /api-specs` uses a default of 50 and a maximum of 200. Both return their own `{ items, ..., next_offset }` envelope instead of `data`/`pagination`.
 
+## Request body admission
+
+The request body is read only for routes that consume it, and only after that route's role gate. An unknown path, a method the path does not route, a read/delete route, and a caller whose role the route would reject with `403` are all answered without the body being buffered — the receiver is dropped so the protocol layer discards any remaining bytes instead of collecting them into a buffer no handler will read.
+
+For the routes that do consume a body, the size cap (1 MiB, or `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for `POST /restore` and `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for `POST`/`PUT /api-specs`) is paired with an absolute deadline, `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default 30, `0` disables). A size cap bounds how many bytes a client may send, not how long it may take: without the deadline a client that trickles one byte at a time holds the collecting task, its buffer, and the underlying connection or HTTP/2 stream open indefinitely. A body that has not finished arriving when the deadline expires returns `408 Request Timeout` and its HTTP/1.1 connection or HTTP/2 stream is released.
+
+## Admin listener transport bounds
+
+Both admin listeners (plaintext and HTTPS) serve HTTP/1.1 and HTTP/2 — HTTPS negotiates via ALPN, plaintext accepts h2c prior knowledge — and apply the same bounds:
+
+- **HTTP/1.1 header reads** are bounded by `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default 10, `0` disables).
+- **HTTP/2 concurrency** is bounded by the advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (`FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS`, default 64), so `FERRUM_ADMIN_MAX_CONNECTIONS` also bounds the total number of retained admin request tasks and buffers rather than only the number of TCP connections.
+- **HTTP/2 header blocks** are bounded by the advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (`FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES`, default 65536), so an incomplete `HEADERS`/`CONTINUATION` block cannot accumulate without limit on a stream.
+- **Connection progress** is bounded by the same `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window: a connection that neither delivers a new request nor holds one in flight for a whole window is closed. This covers the HTTP/1.1-vs-HTTP/2 version sniff (a peer that connects and sends nothing) and HTTP/2 streams whose header block never completes. An idle keep-alive admin connection is therefore closed after this long and the client reconnects, which is what the HTTP/1.1 header timer already did. A response still being written to a slow reader counts as in flight and is not interrupted.
+
 ## Proxies
 
 ```bash

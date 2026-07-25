@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ use crate::config::db_backend::{
     validate_api_spec_restore_inputs,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
-use crate::util::body_limit::is_length_limit_error;
+use crate::util::body_limit::{BodyCollectError, collect_body_with_limits};
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -49,6 +49,8 @@ enum ApiSpecError {
     PayloadTooLarge(usize),
     /// Body collection error (non-size)
     BodyCollect,
+    /// Body did not finish arriving within the configured deadline (408).
+    BodyTimeout(u64),
     /// Extraction/parse error (400)
     Extract(ExtractError),
     /// Generic 400 (invalid query params, etc.)
@@ -538,6 +540,7 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::BAD_REQUEST,
             &json!({"error": "Failed to read request body"}),
         ),
+        ApiSpecError::BodyTimeout(seconds) => crate::admin::body_timeout_response(seconds),
         ApiSpecError::BadRequest(msg) => json_resp(StatusCode::BAD_REQUEST, &json!({"error": msg})),
         ApiSpecError::Extract(e) => {
             let code = extract_error_code(&e);
@@ -1133,17 +1136,31 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
 // Helper: collect body with a size limit
 // ---------------------------------------------------------------------------
 
-async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>, ApiSpecError> {
+/// Collect an API-spec request body under the same size **and** time bounds as
+/// every other admin body (issue #2404). Spec bodies are the largest the admin
+/// plane accepts (default 25 MiB), which makes them the most attractive target
+/// for a trickle-fed body that never completes, so the deadline matters here
+/// even more than on the 1 MiB routes.
+async fn collect_body(
+    req: Request<Incoming>,
+    max_mib: usize,
+    deadline: Option<std::time::Duration>,
+) -> Result<Vec<u8>, ApiSpecError> {
     let max_bytes = max_mib.saturating_mul(1024).saturating_mul(1024);
-    match Limited::new(req.into_body(), max_bytes).collect().await {
-        Ok(collected) => Ok(collected.to_bytes().to_vec()),
-        Err(e) => {
-            if is_length_limit_error(e.as_ref()) {
-                Err(ApiSpecError::PayloadTooLarge(max_mib))
-            } else {
-                tracing::warn!(error = %e, "failed to read api spec request body");
-                Err(ApiSpecError::BodyCollect)
-            }
+    match collect_body_with_limits(req.into_body(), max_bytes, deadline).await {
+        Ok(bytes) => Ok(bytes),
+        Err(BodyCollectError::TooLarge) => Err(ApiSpecError::PayloadTooLarge(max_mib)),
+        Err(BodyCollectError::Timeout) => {
+            let seconds = deadline.map(|d| d.as_secs()).unwrap_or_default();
+            tracing::warn!(
+                timeout_seconds = seconds,
+                "api spec request body was not fully received before the deadline"
+            );
+            Err(ApiSpecError::BodyTimeout(seconds))
+        }
+        Err(BodyCollectError::Transport(e)) => {
+            tracing::warn!(error = %e, "failed to read api spec request body");
+            Err(ApiSpecError::BodyCollect)
         }
     }
 }
@@ -2873,7 +2890,8 @@ pub async fn handle_post_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body = match collect_body(req, max_mib).await {
+    let body_deadline = state.admin_request_limits.body_read_timeout();
+    let body = match collect_body(req, max_mib, body_deadline).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3040,7 +3058,8 @@ pub async fn handle_put_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body = match collect_body(req, max_mib).await {
+    let body_deadline = state.admin_request_limits.body_read_timeout();
+    let body = match collect_body(req, max_mib, body_deadline).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3755,6 +3774,7 @@ pub async fn handle_delete_api_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use hyper::HeaderMap;
 
     // -----------------------------------------------------------------------
