@@ -10,7 +10,6 @@
 //! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and enforces
 //! `major.minor` version compatibility between CP and DP.
 
-use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
