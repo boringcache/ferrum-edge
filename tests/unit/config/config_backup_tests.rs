@@ -57,6 +57,23 @@ fn test_load_config_backup_invalid_json() {
 }
 
 #[test]
+fn test_load_config_backup_read_failure_is_not_missing() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let err = load_config_backup(
+        directory
+            .path()
+            .to_str()
+            .expect("temporary directory path must be UTF-8"),
+    )
+    .expect_err("a configured path that cannot be read as a file must be Err");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Failed to read config backup"),
+        "read failure must be actionable, got: {msg}"
+    );
+}
+
+#[test]
 fn test_load_config_backup_empty_config() {
     let json = r#"{
         "version": "1",

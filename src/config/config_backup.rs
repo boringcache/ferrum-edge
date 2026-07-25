@@ -15,7 +15,6 @@
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::collect_rejecting_runtime_config_errors;
-use std::path::Path;
 use tracing::{error, info, warn};
 
 /// Attempt to load a GatewayConfig from an externally provided backup JSON file.
@@ -29,15 +28,21 @@ use tracing::{error, info, warn};
 /// policy), or fails the rejecting runtime validation contract. Returns
 /// `Ok(Some(config))` only for a snapshot that is safe to serve.
 pub fn load_config_backup(path: &str) -> Result<Option<GatewayConfig>, anyhow::Error> {
-    let file_path = Path::new(path);
-    if !file_path.exists() {
-        warn!("No config backup file found at {}", path);
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(file_path).map_err(|e| {
-        anyhow::anyhow!("Failed to read config backup at {path}: {e}")
-    })?;
+    // Read once and classify the result directly. `Path::exists()` both creates
+    // a check/use race and returns false for some metadata errors, which would
+    // incorrectly collapse an inaccessible configured backup to `Ok(None)`.
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            warn!("No config backup file found at {}", path);
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "Failed to read config backup at {path}: {error}"
+            ));
+        }
+    };
 
     let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
         anyhow::anyhow!("Failed to parse config backup at {path}: {e}")
