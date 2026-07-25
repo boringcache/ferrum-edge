@@ -14,8 +14,10 @@ const ISTIO_STATUS_RS: &str = include_str!("../../../src/k8s_controller/istio_st
 const CARRIER_RS: &str = include_str!("../../../src/xds/carrier.rs");
 const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
 const MESH_MD: &str = include_str!("../../../docs/mesh.md");
+const CONTROL_PLANE_RBAC: &str =
+    include_str!("../../../charts/ferrum-mesh/templates/control-plane-rbac.yaml");
 
-/// Nine kinds watched by `ISTIO_CRDS` (order must match `watcher.rs`).
+/// Ten kinds watched by `ISTIO_CRDS` (order must match `watcher.rs`).
 const WATCHED_STATUS_KINDS: &[&str] = &[
     "AuthorizationPolicy",
     "PeerAuthentication",
@@ -26,6 +28,7 @@ const WATCHED_STATUS_KINDS: &[&str] = &[
     "WorkloadEntry",
     "Sidecar",
     "Telemetry",
+    "ProxyConfig",
 ];
 
 fn extract_istio_crd_kinds(source: &str) -> Vec<String> {
@@ -88,7 +91,7 @@ fn extract_supported_status_kinds(source: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn istio_crds_are_exactly_the_nine_watched_status_kinds() {
+fn istio_crds_are_exactly_the_ten_watched_status_kinds() {
     let kinds = extract_istio_crd_kinds(WATCHER_RS);
     let expected: Vec<String> = WATCHED_STATUS_KINDS
         .iter()
@@ -96,11 +99,16 @@ fn istio_crds_are_exactly_the_nine_watched_status_kinds() {
         .collect();
     assert_eq!(
         kinds, expected,
-        "ISTIO_CRDS kind list drifted from the documented nine watched/status kinds"
+        "ISTIO_CRDS kind list drifted from the documented ten watched/status kinds"
     );
     assert!(
-        !kinds.iter().any(|k| k == "ProxyConfig"),
-        "ProxyConfig must not be in ISTIO_CRDS (watcher/status gap is intentional)"
+        kinds.iter().any(|k| k == "ProxyConfig"),
+        "ProxyConfig must be in ISTIO_CRDS (issue #2396)"
+    );
+    assert!(
+        WATCHER_RS.contains("version: \"v1beta1\"")
+            && WATCHER_RS.contains("plural: \"proxyconfigs\""),
+        "ProxyConfig watcher must target networking.istio.io/v1beta1 proxyconfigs"
     );
 }
 
@@ -116,8 +124,8 @@ fn status_writer_supported_kinds_match_istio_crds() {
         "is_supported_istio_kind must stay lock-step with ISTIO_CRDS"
     );
     assert!(
-        !status_kinds.contains("ProxyConfig"),
-        "ProxyConfig must not be a status-writer kind"
+        status_kinds.contains("ProxyConfig"),
+        "ProxyConfig must be a status-writer kind (Istio CRD declares subresources.status)"
     );
 }
 
@@ -134,6 +142,18 @@ fn proxy_config_has_ecds_carrier_marker() {
     assert!(
         CARRIER_RS.contains("FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL"),
         "carrier.rs must export FERRUM_ECDS_PROXY_CONFIGS_TYPE_URL"
+    );
+}
+
+#[test]
+fn helm_rbac_grants_proxyconfig_watch_and_status() {
+    assert!(
+        CONTROL_PLANE_RBAC.contains("proxyconfigs"),
+        "chart Istio RBAC must grant get/list/watch on proxyconfigs"
+    );
+    assert!(
+        CONTROL_PLANE_RBAC.contains("proxyconfigs/status"),
+        "chart Istio RBAC must grant status verbs on proxyconfigs/status"
     );
 }
 
@@ -158,8 +178,12 @@ fn configuration_md_hosts_capability_contract_v1() {
         "capability contract must include an explicit ProxyConfig row"
     );
     assert!(
-        CONFIGURATION_MD.contains("**No** (not in `ISTIO_CRDS`"),
-        "ProxyConfig row must state watcher/RBAC is absent"
+        CONFIGURATION_MD.contains("| `ProxyConfig` | Yes | Yes"),
+        "ProxyConfig row must state watcher/RBAC is present"
+    );
+    assert!(
+        !CONFIGURATION_MD.contains("**No** (not in `ISTIO_CRDS`"),
+        "ProxyConfig row must not claim watcher/RBAC is absent"
     );
     assert!(
         CONFIGURATION_MD.contains("ProxyConfigsCarrier"),
@@ -175,6 +199,9 @@ fn configuration_md_rejects_stale_istio_capability_claims() {
         "including the negative-match siblings `notMethods`, `notPaths`, `notHosts`, and `notPorts` — is rejected at translation time",
         "Other Istio CRDs (`VirtualService`, `ServiceEntry`, `RequestAuthentication`, `Sidecar`, `Telemetry`, `WorkloadEntry`) are deferred to a follow-on",
         "patches `status.conditions[]` on `AuthorizationPolicy`, `PeerAuthentication`, and `DestinationRule` CRDs so",
+        "what is missing is the Kubernetes watcher/RBAC/status path",
+        "but it is not in `ISTIO_CRDS` and the status writer does not patch it",
+        "all nine watched/translated Istio kinds",
     ];
     for phrase in stale {
         assert!(
@@ -193,8 +220,8 @@ fn configuration_md_rejects_stale_istio_capability_claims() {
         "docs/configuration.md must document negative-match translation"
     );
     assert!(
-        CONFIGURATION_MD.contains("all nine watched/translated Istio kinds"),
-        "docs/configuration.md must claim status for all nine watched kinds"
+        CONFIGURATION_MD.contains("all ten watched/translated Istio kinds"),
+        "docs/configuration.md must claim status for all ten watched kinds"
     );
 }
 
@@ -211,6 +238,10 @@ fn mesh_md_proxy_config_transport_matches_carrier_semantics() {
         "docs/mesh.md must not require native-only for ProxyConfig"
     );
     assert!(
+        !MESH_MD.contains("does **not** watch `ProxyConfig` CRDs"),
+        "docs/mesh.md must not claim ProxyConfig is unwatched"
+    );
+    assert!(
         MESH_MD.contains("ProxyConfigsCarrier"),
         "docs/mesh.md must document ProxyConfigsCarrier transport"
     );
@@ -219,7 +250,7 @@ fn mesh_md_proxy_config_transport_matches_carrier_semantics() {
         "docs/mesh.md must link the shared capability-dimensions contract"
     );
     assert!(
-        MESH_MD.contains("All nine translated kinds are covered"),
-        "docs/mesh.md Istio CRD Status must keep the nine-kind claim"
+        MESH_MD.contains("All ten translated kinds are covered"),
+        "docs/mesh.md Istio CRD Status must keep the ten-kind claim"
     );
 }

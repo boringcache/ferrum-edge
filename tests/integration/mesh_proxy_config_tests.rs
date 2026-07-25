@@ -436,3 +436,109 @@ fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
         .expect("mesh-wide ProxyConfig must contribute sampling");
     assert_eq!(sampling, 7.5);
 }
+
+/// CFG-05 / XDS-02: a Kubernetes `networking.istio.io/v1beta1` ProxyConfig
+/// object in a translation batch must land on the native mesh slice and
+/// round-trip identically through the Ferrum `ProxyConfigsCarrier` ECDS path.
+/// This is the deterministic proof that the watcher/translator ingestion path
+/// affects both native and xDS-equivalent mesh slices (issue #2396).
+#[test]
+fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::config_sources::k8s::{
+        K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    };
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+    use ferrum_edge::xds::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
+
+    let proxy_config = K8sObject {
+        api_version: "networking.istio.io/v1beta1".to_string(),
+        kind: "ProxyConfig".to_string(),
+        metadata: K8sMetadata {
+            name: "api-defaults".to_string(),
+            uid: String::new(),
+            namespace: "default".to_string(),
+            generation: Some(1),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: serde_json::json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "concurrency": 4,
+            "image": {"imageType": "distroless"},
+            "environmentVariables": {"GOMAXPROCS": "4"},
+            "tracing": {"sampling": 42.0}
+        }),
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    let options = K8sTranslationOptions::new(
+        "default".to_string(),
+        TrustDomain::new("cluster.local").expect("test trust domain"),
+    );
+    let translation =
+        translate_k8s_objects(&[proxy_config], options).expect("ProxyConfig translation succeeds");
+    let gateway_config = translation.config;
+    assert_eq!(
+        gateway_config
+            .mesh
+            .as_ref()
+            .expect("mesh present")
+            .proxy_configs
+            .len(),
+        1,
+        "K8s ProxyConfig must populate mesh.proxy_configs"
+    );
+
+    let request = MeshSliceRequest {
+        node_id: "node-a".to_string(),
+        namespace: "default".to_string(),
+        workload_spiffe_id: None,
+        labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+        cluster_domain: "cluster.local".to_string(),
+        enforce_sidecar_egress: false,
+        sidecar_egress_dry_run: false,
+        enforce_sidecar_identity_narrowing: false,
+        waypoint_name: None,
+        ambient_udp_source_scoping: false,
+    };
+    let native = MeshSlice::from_gateway_config(&gateway_config, request);
+    assert_eq!(native.proxy_configs.len(), 1);
+    let resolved = native
+        .resolved_proxy_config()
+        .expect("selector-matching ProxyConfig must resolve");
+    assert_eq!(resolved.tracing_sampling, Some(42.0));
+    assert_eq!(resolved.concurrency, Some(4));
+    assert_eq!(resolved.image.as_deref(), Some("distroless"));
+
+    let carriers = build_slice_carriers(&native);
+    let proxy_carrier = carriers
+        .iter()
+        .find(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_)))
+        .expect("native slice must emit ProxyConfigsCarrier");
+    let encoded = proxy_carrier
+        .encode_value()
+        .expect("ProxyConfigsCarrier encodes");
+    let decoded = MeshSliceCarrier::decode(proxy_carrier.type_url(), &encoded)
+        .expect("decode succeeds")
+        .expect("recognized ProxyConfigs carrier");
+
+    let mut xds_equivalent = MeshSlice::default();
+    xds_equivalent.node_id = native.node_id.clone();
+    xds_equivalent.namespace = native.namespace.clone();
+    apply_carrier(&mut xds_equivalent, decoded);
+    assert_eq!(
+        xds_equivalent.proxy_configs, native.proxy_configs,
+        "xDS ProxyConfigsCarrier must recover the same proxy_configs as native"
+    );
+    assert_eq!(
+        xds_equivalent
+            .resolved_proxy_config()
+            .and_then(|pc| pc.tracing_sampling),
+        Some(42.0)
+    );
+}
