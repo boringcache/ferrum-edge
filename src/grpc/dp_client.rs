@@ -1744,11 +1744,19 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 ) {
                     let incoming_trust_equiv =
                         gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                    // Compare like against like: the applied config has already
+                    // been through `update_config`'s pre-swap canonicalization
+                    // (HMAC quarantine, gateway workload-metrics identity
+                    // injection), which this candidate has not. Without that the
+                    // exception is silently inert on any node those steps touch —
+                    // notably a DP with a gateway SVID — and every equivalent
+                    // failover snapshot is fenced.
+                    let comparable = proxy_state.canonicalize_snapshot_for_comparison(&config);
                     match snapshot_authority.as_ref() {
                         Some(authority) => authoritative_snapshot_payload_matches(
                             proxy_state.current_config().as_ref(),
                             &authority.gateway_trust,
-                            &config,
+                            &comparable,
                             incoming_trust_equiv.as_ref(),
                         ),
                         None => false,

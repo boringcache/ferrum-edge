@@ -8752,6 +8752,40 @@ impl ProxyState {
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
     }
+
+    /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
+    /// does before it swaps, so the result is content-comparable against
+    /// [`Self::current_config`].
+    ///
+    /// `update_config` normalizes fields, resolves upstream TLS, quarantines
+    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// **before** storing the snapshot. A raw CP-delivered candidate has not
+    /// been through those node-local steps, so comparing it directly against
+    /// the applied config reports a spurious mismatch on any node whose
+    /// identity or credential state triggers one of them — most visibly a DP
+    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// plugin config exists only on the applied side.
+    ///
+    /// The ConfigSync older-cross-source identical-payload exception
+    /// (`configsync_lifecycle::authoritative_snapshot_payload_matches`) depends
+    /// on that comparison, so it must canonicalize first or the exception is
+    /// silently inert and every equivalent failover snapshot is fenced.
+    ///
+    /// Quarantine diagnostics are intentionally discarded: this is a read-only
+    /// comparison helper on a clone, and `update_config` logs them on the real
+    /// apply path.
+    pub fn canonicalize_snapshot_for_comparison(&self, config: &GatewayConfig) -> GatewayConfig {
+        let mut candidate = config.clone();
+        candidate.normalize_fields();
+        candidate.resolve_upstream_tls();
+        let _ = candidate.quarantine_invalid_hmac_credentials();
+        inject_gateway_workload_metrics_if_svid(
+            &mut candidate,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
+        candidate
+    }
 }
 
 /// Drives the per-IP cleanup interval loop.

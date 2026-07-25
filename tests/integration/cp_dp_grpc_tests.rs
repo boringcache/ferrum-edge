@@ -4692,6 +4692,47 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn older_cross_source_payload_comparison_canonicalizes_the_candidate() {
+    // The older-cross-source identical-payload exception compares a raw
+    // CP-delivered snapshot against the DP's *applied* config. `update_config`
+    // canonicalizes a snapshot before storing it (normalize, resolve upstream
+    // TLS, quarantine invalid HMAC credentials, inject gateway
+    // workload-metrics identity), so comparing the raw candidate reports a
+    // spurious mismatch and fences an equivalent failover snapshot that should
+    // have established a safe delta base.
+    //
+    // Hostname normalization is the cheapest deterministic proof of that skew:
+    // the applied config holds the lowercased host, the raw candidate does not.
+    use ferrum_edge::grpc::configsync_lifecycle::gateway_config_content_matches;
+
+    let state = create_test_proxy_state();
+
+    let mut raw = create_test_config(1);
+    raw.proxies[0].backend_host = "UPPER.Example.Test".to_string();
+
+    let outcome = state.update_config(raw.clone());
+    assert_eq!(outcome, ferrum_edge::proxy::ConfigApplyOutcome::Applied);
+
+    let applied = state.current_config();
+    assert_eq!(
+        applied.proxies[0].backend_host, "upper.example.test",
+        "update_config must store the canonicalized snapshot"
+    );
+
+    assert!(
+        !gateway_config_content_matches(applied.as_ref(), &raw),
+        "raw candidate must not match the applied config; this is the skew being guarded"
+    );
+
+    let comparable = state.canonicalize_snapshot_for_comparison(&raw);
+    assert!(
+        gateway_config_content_matches(applied.as_ref(), &comparable),
+        "canonicalized candidate must match the applied config so the \
+         identical-payload exception is not silently inert"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn dp_becomes_ready_and_applies_delta_despite_unbindable_stream_port() {
     // Issue #2971 acceptance: a CP snapshot containing a stream proxy whose port
     // never binds on this node must still make the DP ready, must not tear down
