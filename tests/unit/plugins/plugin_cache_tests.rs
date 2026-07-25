@@ -9060,8 +9060,8 @@ fn test_priority_override_reverses_default_order() {
     assert_eq!(plugins[1].priority(), 5000);
 }
 
-#[test]
-fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
+#[tokio::test]
+async fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
     assert_eq!(
         ferrum_edge::plugins::plugin_failure_policy("ai_semantic_cache"),
         Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
