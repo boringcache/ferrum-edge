@@ -382,6 +382,118 @@ fn mongo_atomic_batch_refuses_standalone_and_uses_one_session_transaction() {
     assert!(MONGO_STORE_SOURCE.contains("error.get_custom::<AtomicBatchAbort>()"));
 }
 
+/// Both backends must compare the admission lease's expiry against the
+/// *database's own current* clock at the final gate.
+///
+/// A timestamp captured before the transaction opened is already stale by the
+/// time the graph has been written, and staler still when MongoDB's convenient
+/// transaction runner retries the callback. With owner and generation still
+/// matching (the lease lapsed but nobody has reacquired it yet), such a
+/// comparison would let the batch commit after expiry — exactly the
+/// fail-closed guarantee the gate exists to provide. This test fails if a
+/// precomputed expiry timestamp is reintroduced on either path.
+#[test]
+fn atomic_batch_lease_gate_compares_expiry_against_current_database_time() {
+    // ---- MongoDB ----------------------------------------------------------
+    let outer_start = MONGO_STORE_SOURCE
+        .find("        async fn batch_create_config_graph_atomically(")
+        .expect("Mongo atomic batch writer must exist");
+    let outer_end = MONGO_STORE_SOURCE[outer_start..]
+        .find("\n        async fn batch_create_proxies(")
+        .expect("batch_create_proxies must follow the atomic writer")
+        + outer_start;
+    let outer = &MONGO_STORE_SOURCE[outer_start..outer_end];
+    assert!(
+        !outer.contains("lease_server_time()"),
+        "the atomic-batch plan must not capture a server timestamp before the transaction: \
+         it would be stale at the in-session lease gate"
+    );
+
+    let plan_start = MONGO_STORE_SOURCE
+        .find("    struct MongoAtomicBatchPlan {")
+        .expect("atomic batch plan struct must exist");
+    let plan_end = MONGO_STORE_SOURCE[plan_start..]
+        .find("\n    }")
+        .expect("plan struct must terminate")
+        + plan_start;
+    let plan = &MONGO_STORE_SOURCE[plan_start..plan_end];
+    assert!(
+        !plan.contains("BsonDateTime"),
+        "the atomic batch plan must carry no precomputed timestamp; the lease gate reads \
+         MongoDB's clock in-session instead"
+    );
+
+    let writer_start = MONGO_STORE_SOURCE
+        .find("        async fn write_atomic_batch_graph_in_session(")
+        .expect("in-session writer must exist");
+    let writer_end = MONGO_STORE_SOURCE[writer_start..]
+        .find("\n    /// Everything one atomic batch transaction needs")
+        .expect("plan struct must follow the in-session writer")
+        + writer_start;
+    let writer = &MONGO_STORE_SOURCE[writer_start..writer_end];
+    let gate_start = writer
+        .find("config_admission_locks_in_transaction()")
+        .expect("in-session lease verification");
+    let gate = &writer[gate_start..];
+    // Owner and generation still have to match, and the expiry comparison is
+    // evaluated by the server at this gate, on every runner retry.
+    assert!(gate.contains("\"owner\": owner.as_str(),"));
+    assert!(gate.contains("\"generation\": *generation,"));
+    assert!(
+        gate.contains("\"$expr\": { \"$gt\": [ \"$expires_at\", \"$$NOW\" ] },"),
+        "the lease gate must compare expires_at against MongoDB's own $$NOW, following the \
+         lease-renewal convention"
+    );
+    // The write that enlists the lease document in the transaction's write set
+    // must stamp a truthful timestamp, not a captured one.
+    assert!(gate.contains("Self::server_time_lease_touch_pipeline()"));
+    let touch_start = MONGO_STORE_SOURCE
+        .find("        fn server_time_lease_touch_pipeline() -> Vec<Document> {")
+        .expect("server-time touch pipeline must exist");
+    let touch_end = MONGO_STORE_SOURCE[touch_start..]
+        .find("\n        }")
+        .expect("touch pipeline must terminate")
+        + touch_start;
+    assert!(
+        MONGO_STORE_SOURCE[touch_start..touch_end].contains("\"updated_at\": \"$$NOW\""),
+        "the lease-gate write must stamp updated_at from the server clock"
+    );
+    // The only fallback is the DocumentDB one, and it re-reads the server clock
+    // at the gate rather than reusing anything captured earlier.
+    assert!(
+        gate.contains("is_pipeline_update_unsupported(&error)"),
+        "pipeline-form rejection (AWS DocumentDB) must be the only fallback trigger"
+    );
+    let fallback_start = gate
+        .find("is_pipeline_update_unsupported(&error)")
+        .expect("fallback arm");
+    assert!(
+        gate[fallback_start..].contains("self.lease_server_time().await"),
+        "the classic fallback must read the MongoDB server clock at the gate, never the \
+         client clock or a pre-transaction snapshot"
+    );
+    assert!(
+        gate.contains("result.matched_count != 1"),
+        "a lapsed or stolen lease must still abort the transaction"
+    );
+    assert!(gate.contains("AtomicBatchAbort::AdmissionLeaseLost"));
+
+    // ---- SQL --------------------------------------------------------------
+    let sql_start = SQL_STORE_SOURCE
+        .find("    async fn verify_namespace_config_admission_lease_tx(")
+        .expect("SQL in-transaction lease verification must exist");
+    let sql_end = match SQL_STORE_SOURCE[sql_start..].find("\n    async fn ") {
+        Some(offset) => sql_start + offset,
+        None => SQL_STORE_SOURCE.len(),
+    };
+    let sql = &SQL_STORE_SOURCE[sql_start..sql_end];
+    assert!(
+        sql.contains("self.config_admission_lease_now_sql()")
+            && sql.contains("expires_at > {now}"),
+        "the SQL lease gate must compare expires_at against the database's current time"
+    );
+}
+
 /// The admin handler must refuse an unsupported deployment before it mutates
 /// anything, and must never report partial counts.
 #[test]

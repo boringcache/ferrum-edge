@@ -1504,6 +1504,18 @@ mod inner {
             }]
         }
 
+        /// Aggregation-pipeline update that stamps `updated_at` from the server
+        /// clock without extending the lease.
+        ///
+        /// Used by the atomic-batch lease gate: the expiry comparison lives in
+        /// the query filter (`$expr` against `$$NOW`) and this write exists to
+        /// enlist the lease document in the transaction's write set, so the
+        /// timestamp it records has to be the server's own current time rather
+        /// than anything the client captured earlier.
+        fn server_time_lease_touch_pipeline() -> Vec<Document> {
+            vec![doc! { "$set": { "updated_at": "$$NOW" } }]
+        }
+
         async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
             let response = self.lease_db().run_command(doc! { "hello": 1 }).await?;
             response
@@ -4227,19 +4239,59 @@ mod inner {
                 // that took the lease mid-transaction raises a write conflict
                 // (retried, then matching nothing) instead of being masked by
                 // the transaction's read snapshot.
-                let result = self
-                    .config_admission_locks_in_transaction()
+                //
+                // Expiry is compared against MongoDB's own clock AT THIS GATE
+                // (`$expr` + `$$NOW`, the same convention the lease renew path
+                // uses), never against a timestamp captured before the
+                // transaction opened. A pre-transaction snapshot goes stale
+                // while the graph is written — and staler still when the
+                // convenient runner retries the callback — so a lease that
+                // lapsed with no competing acquirer yet would still match on
+                // owner/generation and commit. `$$NOW` re-evaluates on every
+                // attempt, matching the SQL backends' database-`now()` check at
+                // the same point.
+                let locks = self.config_admission_locks_in_transaction();
+                let result = locks
                     .update_one(
                         doc! {
                             "_id": plan.lease_namespace.as_str(),
                             "owner": owner.as_str(),
                             "generation": *generation,
-                            "expires_at": { "$gt": plan.lease_now },
+                            "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
                         },
-                        doc! { "$set": { "updated_at": plan.lease_now } },
+                        Self::server_time_lease_touch_pipeline(),
                     )
                     .session(&mut *session)
-                    .await?;
+                    .await;
+                let result = match result {
+                    Err(error) if is_pipeline_update_unsupported(&error) => {
+                        // AWS DocumentDB rejects pipeline-form updates. Read the
+                        // server clock here, at the gate, and re-issue the
+                        // equivalent classic comparison — still MongoDB's time
+                        // and still evaluated after every phase has been
+                        // written, never the client clock and never a value
+                        // captured before the transaction opened.
+                        let now = self.lease_server_time().await.map_err(|error| {
+                            mongodb::error::Error::custom(format!(
+                                "namespace config admission lease verification could not read \
+                                 the MongoDB server clock: {error}"
+                            ))
+                        })?;
+                        locks
+                            .update_one(
+                                doc! {
+                                    "_id": plan.lease_namespace.as_str(),
+                                    "owner": owner.as_str(),
+                                    "generation": *generation,
+                                    "expires_at": { "$gt": now },
+                                },
+                                doc! { "$set": { "updated_at": now } },
+                            )
+                            .session(&mut *session)
+                            .await
+                    }
+                    result => result,
+                }?;
                 if result.matched_count != 1 {
                     let abort = AtomicBatchAbort::AdmissionLeaseLost;
                     return Err(mongodb::error::Error::custom(abort));
@@ -4266,8 +4318,13 @@ mod inner {
         chunk_size: usize,
         fault: Option<AtomicBatchFault>,
         lease_namespace: String,
+        /// Owner + generation the batch must still hold at the final gate. The
+        /// expiry comparison deliberately has no counterpart here: it is
+        /// evaluated from MongoDB's clock inside the session (see
+        /// [`MongoStore::write_atomic_batch_graph_in_session`]), because any
+        /// timestamp precomputed into this plan would be stale by the time a
+        /// long — or retried — transaction reaches that gate.
         admission_lease: Option<(String, i64)>,
-        lease_now: BsonDateTime,
     }
 
     // -----------------------------------------------------------------------
@@ -8374,9 +8431,6 @@ mod inner {
                 fault,
                 lease_namespace: graph.namespace.to_string(),
                 admission_lease,
-                // Server clock, read before the transaction, so the in-session
-                // expiry comparison never depends on this node's clock.
-                lease_now: self.lease_server_time().await?,
             };
 
             let counts = Self::run_mtls_dns_mutations(&mut mtls_leases, async {

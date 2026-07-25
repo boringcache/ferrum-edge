@@ -24,6 +24,9 @@ one commit.
 - The namespace config-admission lease that authorized the batch is re-verified
   inside the persisting transaction. If it lapsed, the transaction is aborted
   (`503`) rather than committing a graph another writer may have invalidated.
+  Expiry is compared against the *database's* current clock at that final gate —
+  SQL backends use `now()`, MongoDB uses `$$NOW` — so neither a long transaction
+  nor a retried one can commit against a stale timestamp.
 
 The guarantee covers only the resources in the request. It does not roll back
 audit events (written after the commit) or unrelated resources that already
