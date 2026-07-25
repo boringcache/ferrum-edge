@@ -336,8 +336,8 @@ impl NativeMeshConfigConsumer {
 
 #[cfg(test)]
 mod tests {
-    use super::update_validation::MeshUpdateRejectReason;
     use super::*;
+    use crate::modes::mesh::config_consumer::update_validation::MeshUpdateRejectReason;
 
     fn test_client_config() -> NativeMeshClientConfig {
         NativeMeshClientConfig {
