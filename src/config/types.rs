@@ -613,13 +613,12 @@ pub struct UpstreamPortOverride {
     /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
     /// seconds, with sub-second values rejected at translate time).
     ///
-    /// Pool keys intentionally exclude policy fields, so when two proxies
-    /// share the same pool entry but configure different per-port idle
-    /// timeouts the first proxy to materialise the entry wins for that
-    /// shared `reqwest::Client`. Identical to the existing `connect_timeout_ms`
-    /// per-port + cross-proxy sharing tradeoff documented in CLAUDE.md's
-    /// "Policy cross-proxy sharing" note — operators who need strict
-    /// per-proxy isolation fragment via `dns_override`.
+    /// On the reqwest pool this value is part of the client-behavior (`rcfg`)
+    /// pool-key segment, so divergent per-port idle timeouts isolate distinct
+    /// shared clients rather than first-creator-wins leaking. Direct-H2 / gRPC
+    /// pool keys still exclude several builder-only knobs (see those pools'
+    /// first-materializer notes). Request-only connect timeouts remain
+    /// per-request and do not fragment any pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule

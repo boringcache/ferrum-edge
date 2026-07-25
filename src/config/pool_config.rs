@@ -235,10 +235,14 @@ impl PoolConfig {
     pub fn apply_proxy_overrides(&self, proxy: &crate::config::types::Proxy) -> PoolConfig {
         let mut config = self.clone();
 
-        // Apply proxy-level overrides if present
-        // Note: max_idle_per_host is intentionally global-only — per-proxy overrides
-        // were removed because they fragment the connection pool (different values create
-        // separate reqwest::Client instances for the same backend).
+        // Apply proxy-level overrides if present.
+        //
+        // `max_idle_per_host` is intentionally global-only — per-proxy overrides
+        // were removed because they fragment the connection pool (different values
+        // create separate reqwest::Client instances for the same backend). That
+        // deliberate tradeoff is documented; other client-baked settings *do*
+        // enter the reqwest pool key via `append_reqwest_client_behavior_pool_key`
+        // so divergent per-proxy values cannot silently first-creator-wins leak.
 
         if let Some(val) = proxy.pool_idle_timeout_seconds {
             config.idle_timeout_seconds = val;
@@ -341,6 +345,94 @@ impl PoolConfig {
     /// Get configuration for a specific proxy (global defaults + proxy overrides)
     pub fn for_proxy(&self, proxy: &crate::config::types::Proxy) -> PoolConfig {
         self.apply_proxy_overrides(proxy)
+    }
+
+    /// Effective `enable_http2` after proxy overrides, without cloning `PoolConfig`.
+    #[inline]
+    pub fn effective_enable_http2(&self, proxy: &crate::config::types::Proxy) -> bool {
+        proxy.pool_enable_http2.unwrap_or(self.enable_http2)
+    }
+
+    /// Append the reqwest client-level settings that `ConnectionPool::create_client`
+    /// bakes into the shared `reqwest::Client`.
+    ///
+    /// These settings cannot be applied per-request, so they must partition the
+    /// reqwest pool key. The encoding is deterministic and inspectable
+    /// (`rcfg=…`) and writes directly into `buf` (no intermediate `String` /
+    /// `PoolConfig` clone). Secrets never appear here.
+    ///
+    /// Included (mirrors `create_client`):
+    /// - `idle_timeout_seconds` → `i`
+    /// - effective TCP keepalive seconds (`0` when keep-alive is disabled) → `ka`
+    /// - `enable_http2` → `h2=0|1`
+    /// - when H2 enabled: keep-alive interval/timeout (`h2i`/`h2t`), adaptive
+    ///   window (`aw`), max frame size (`mf`), and fixed stream/connection
+    ///   windows (`sw`/`cw`) **only when adaptive window is off** (reqwest/
+    ///   hyper adaptive mode overrides the fixed windows)
+    ///
+    /// Explicitly excluded:
+    /// - `max_idle_per_host` — deliberate global-only fragmentation tradeoff
+    /// - `backend_connect_timeout_ms` / `backend_read_timeout_ms` — request-only
+    /// - `http2_max_concurrent_streams` — not consumed by reqwest `create_client`
+    pub fn append_reqwest_client_behavior_pool_key(
+        &self,
+        proxy: &crate::config::types::Proxy,
+        buf: &mut String,
+    ) {
+        use std::fmt::Write;
+
+        let idle = proxy
+            .pool_idle_timeout_seconds
+            .unwrap_or(self.idle_timeout_seconds);
+        let keep_alive_enabled = proxy
+            .pool_enable_http_keep_alive
+            .unwrap_or(self.enable_http_keep_alive);
+        // Match `create_client`: TCP keepalive is only installed when enabled.
+        let tcp_ka = if keep_alive_enabled {
+            proxy
+                .pool_tcp_keepalive_seconds
+                .unwrap_or(self.tcp_keepalive_seconds)
+        } else {
+            0
+        };
+        let enable_http2 = self.effective_enable_http2(proxy);
+
+        buf.push('|');
+        let _ = write!(buf, "rcfg=i{idle};ka{tcp_ka}");
+        if !enable_http2 {
+            buf.push_str(";h2=0");
+            return;
+        }
+
+        let h2i = proxy
+            .pool_http2_keep_alive_interval_seconds
+            .unwrap_or(self.http2_keep_alive_interval_seconds);
+        let h2t = proxy
+            .pool_http2_keep_alive_timeout_seconds
+            .unwrap_or(self.http2_keep_alive_timeout_seconds);
+        let adaptive = proxy
+            .pool_http2_adaptive_window
+            .unwrap_or(self.http2_adaptive_window);
+        let max_frame = match proxy.pool_http2_max_frame_size {
+            Some(val) => val.clamp(MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE),
+            None => self.http2_max_frame_size,
+        };
+
+        let _ = write!(buf, ";h2=1;h2i{h2i};h2t{h2t};aw{}", u8::from(adaptive));
+        // Adaptive window overrides fixed initial windows in reqwest/hyper, so
+        // divergent `sw`/`cw` must not fragment when `aw=1`.
+        if !adaptive {
+            let stream_window = match proxy.pool_http2_initial_stream_window_size {
+                Some(val) => val.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE),
+                None => self.http2_initial_stream_window_size,
+            };
+            let conn_window = match proxy.pool_http2_initial_connection_window_size {
+                Some(val) => val.clamp(MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE),
+                None => self.http2_initial_connection_window_size,
+            };
+            let _ = write!(buf, ";sw{stream_window};cw{conn_window}");
+        }
+        let _ = write!(buf, ";mf{max_frame}");
     }
 
     /// Validate and clamp `max_idle_per_host` to the allowed range, logging

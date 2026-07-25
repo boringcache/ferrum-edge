@@ -406,3 +406,44 @@ fn test_validate_accepts_boundary_values() {
         MAX_IDLE_PER_HOST
     );
 }
+
+#[test]
+fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
+    let global = PoolConfig::default();
+    let mut adaptive = create_test_proxy();
+    adaptive.pool_http2_adaptive_window = Some(true);
+    adaptive.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let mut buf = String::new();
+    global.append_reqwest_client_behavior_pool_key(&adaptive, &mut buf);
+    assert_eq!(buf, "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576");
+    assert!(
+        !buf.contains(";sw"),
+        "adaptive on must omit fixed windows: {buf}"
+    );
+
+    let mut fixed = create_test_proxy();
+    fixed.pool_http2_adaptive_window = Some(false);
+    fixed.pool_http2_initial_stream_window_size = Some(65_535);
+    fixed.pool_http2_initial_connection_window_size = Some(131_072);
+
+    buf.clear();
+    global.append_reqwest_client_behavior_pool_key(&fixed, &mut buf);
+    assert_eq!(
+        buf,
+        "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw0;sw65535;cw131072;mf1048576"
+    );
+}
+
+#[test]
+fn test_append_reqwest_client_behavior_pool_key_keepalive_disabled() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_enable_http_keep_alive = Some(false);
+    proxy.pool_tcp_keepalive_seconds = Some(15);
+    proxy.pool_enable_http2 = Some(false);
+
+    let mut buf = String::new();
+    global.append_reqwest_client_behavior_pool_key(&proxy, &mut buf);
+    assert_eq!(buf, "|rcfg=i90;ka0;h2=0");
+}
