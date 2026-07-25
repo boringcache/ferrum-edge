@@ -2663,3 +2663,77 @@ fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {
         "churn test must observe either fail-closed rejects or only full two-plugin successes"
     );
 }
+
+#[test]
+fn file_loader_normalizes_mixed_case_hosts_sni_san_and_blank_optional_ids() {
+    // Parity seam for issue #2402: file-mode loading must produce the same
+    // canonical forms restore persists for mixed-case hosts/SNI/SAN and blank
+    // optional identifiers.
+    let yaml = r#"
+version: "1"
+consumers:
+  - id: "norm-consumer"
+    username: "norm_user"
+    custom_id: "   "
+proxies:
+  - id: "norm-proxy"
+    hosts: ["API.Example.COM"]
+    listen_path: "/norm"
+    backend_scheme: http
+    backend_host: "Backend.Example.COM"
+    backend_port: 8080
+    strip_listen_path: true
+    upstream_id: "norm-upstream"
+upstreams:
+  - id: "norm-upstream"
+    name: "norm_upstream"
+    targets:
+      - host: "Reviews.Mesh.Internal"
+        port: 8080
+        weight: 100
+    backend_tls_sni: "Reviews.Mesh.Internal"
+    backend_tls_san_allow_list:
+      - "Reviews.Mesh.Internal"
+      - "spiffe://Cluster.Local/ns/Default/sa/Reviews"
+plugin_configs:
+  - id: "norm-plugin"
+    plugin_name: "rate_limiting"
+    scope: global
+    proxy_id: ""
+    enabled: true
+    config:
+      limits:
+        - scope: default
+          window_seconds: 60
+          max_requests: 100
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{yaml}").unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("file load must admit the mixed-case fixture");
+
+    assert_eq!(config.proxies[0].hosts, vec!["api.example.com".to_string()]);
+    assert_eq!(config.proxies[0].backend_host, "backend.example.com");
+    assert_eq!(config.consumers[0].custom_id, None);
+    assert_eq!(
+        config.upstreams[0].targets[0].host,
+        "reviews.mesh.internal"
+    );
+    assert_eq!(
+        config.upstreams[0].backend_tls_sni.as_deref(),
+        Some("reviews.mesh.internal")
+    );
+    assert_eq!(
+        config.upstreams[0].backend_tls_san_allow_list,
+        vec![
+            "reviews.mesh.internal".to_string(),
+            "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+        ]
+    );
+    assert_eq!(config.plugin_configs[0].proxy_id, None);
+}

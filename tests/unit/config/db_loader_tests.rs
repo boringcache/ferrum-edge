@@ -573,6 +573,112 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
     assert_eq!(loaded.backend_tls_san_allow_list, vec!["10.0.0.8"]);
 }
 
+/// SQL writers bind the payload they receive directly. Mixed-case hosts /
+/// SNI / SAN values and blank optional identifiers therefore survive in the
+/// durable rows unless restore/CRUD admission normalizes before persistence
+/// (issue #2402). Assert against raw columns because `get_*` re-normalizes on
+/// read and would hide a write-path miss.
+#[tokio::test]
+async fn sql_create_persists_wire_form_without_domain_normalization() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("restore_normalization_sql.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut proxy = make_http_proxy("mixed-proxy");
+    proxy.hosts = vec!["API.Example.COM".to_string()];
+    proxy.backend_host = "Backend.Example.COM".to_string();
+    proxy.listen_path = Some("/mixed".to_string());
+
+    let mut consumer = make_consumer("mixed-consumer", "mixed_user");
+    consumer.custom_id = Some("   ".to_string());
+
+    let mut upstream = make_upstream("mixed-upstream");
+    upstream.targets[0].host = "Reviews.Mesh.Internal".to_string();
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+    upstream.backend_tls_san_allow_list = vec![
+        "Reviews.Mesh.Internal".to_string(),
+        "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+    ];
+
+    let mut plugin = make_global_tcp_throttle("mixed-plugin");
+    // Bypass PluginConfig::normalize_fields() so the store is handed a blank
+    // optional identifier the same way a broken restore path would.
+    plugin.proxy_id = Some(String::new());
+
+    store.create_proxy(&proxy).await.expect("proxy create");
+    store
+        .create_consumer(&consumer)
+        .await
+        .expect("consumer create");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("upstream create");
+    store
+        .create_plugin_config(&plugin)
+        .await
+        .expect("plugin create");
+
+    let hosts: String = sqlx::query_scalar("SELECT hosts FROM proxies WHERE id = 'mixed-proxy'")
+        .fetch_one(&store.pool())
+        .await
+        .unwrap();
+    let backend_host: String =
+        sqlx::query_scalar("SELECT backend_host FROM proxies WHERE id = 'mixed-proxy'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert!(
+        hosts.contains("API.Example.COM"),
+        "SQL proxy insert must not lowercase hosts: {hosts}"
+    );
+    assert_eq!(backend_host, "Backend.Example.COM");
+
+    let custom_id: Option<String> =
+        sqlx::query_scalar("SELECT custom_id FROM consumers WHERE id = 'mixed-consumer'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert_eq!(custom_id.as_deref(), Some("   "));
+
+    let targets: String =
+        sqlx::query_scalar("SELECT targets FROM upstreams WHERE id = 'mixed-upstream'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    let sni: Option<String> =
+        sqlx::query_scalar("SELECT backend_tls_sni FROM upstreams WHERE id = 'mixed-upstream'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    let sans: Option<String> = sqlx::query_scalar(
+        "SELECT backend_tls_san_allow_list FROM upstreams WHERE id = 'mixed-upstream'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert!(
+        targets.contains("Reviews.Mesh.Internal"),
+        "SQL upstream insert must not lowercase target hosts: {targets}"
+    );
+    assert_eq!(sni.as_deref(), Some("Reviews.Mesh.Internal"));
+    assert!(
+        sans.as_deref()
+            .is_some_and(|value| value.contains("Reviews.Mesh.Internal")),
+        "SQL upstream insert must not lowercase DNS SANs: {sans:?}"
+    );
+
+    let proxy_id: Option<String> =
+        sqlx::query_scalar("SELECT proxy_id FROM plugin_configs WHERE id = 'mixed-plugin'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert_eq!(proxy_id.as_deref(), Some(""));
+}
+
 #[tokio::test]
 async fn consumer_credential_index_enforces_keyauth_uniqueness() {
     let temp_dir = tempfile::TempDir::new().unwrap();

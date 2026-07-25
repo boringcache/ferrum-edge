@@ -3329,6 +3329,15 @@ paths:
         imported in dependency order (consumers & upstreams first, then proxies,
         then plugin configs).
 
+        Restore normalizes the submitted payload once before validation — the
+        same `normalize_fields()` admission used by CRUD, batch, file mode, and
+        database loaders — and persists that exact canonical instance. Mixed-case
+        hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list
+        entries, and blank optional identifiers (`custom_id`, plugin `proxy_id`)
+        are rewritten before any durable write. Credential hashing and restore
+        timestamps mutate that same normalized instance; they do not reintroduce
+        the discarded wire-form original.
+
         To perform an additive (non-destructive) import, use `POST /batch`
         instead.
 
@@ -6264,7 +6273,7 @@ components:
             Optional list of hostnames this proxy matches. Empty means match all
             hosts. Supports exact hostnames (`api.example.com`) and wildcard
             prefixes (`*.example.com`). Entries are normalized to lowercase on
-            create/update. Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
+            admission (CRUD create/update, batch, restore, and config loaders). Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
             for exact hosts or `*.[a-z0-9]([a-z0-9.-]*[a-z0-9])?` for wildcards.
 
 
