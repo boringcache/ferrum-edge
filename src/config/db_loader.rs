@@ -428,6 +428,8 @@ pub struct DatabaseStore {
     full_load_page_size: i64,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendEgressPolicy,
+    /// Optional age / per-namespace row retention for `audit_events`.
+    audit_retention: crate::admin::audit::AuditRetentionPolicy,
     /// Set to `true` when the store was created via
     /// [`DatabaseStore::connect_offline_with_pool_config`] — the lazy pool
     /// never ran migrations because the DB was unreachable at startup.
@@ -1514,6 +1516,7 @@ impl DatabaseStore {
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+            audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -1572,6 +1575,7 @@ impl DatabaseStore {
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+            audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
@@ -8058,7 +8062,160 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
         self.check_slow_query("insert_audit_event", start);
+        // Retention is best-effort after a successful insert so enqueue/insert
+        // semantics stay unchanged when prune fails (see #2421 for delivery loss).
+        if self.audit_retention.is_enabled()
+            && let Err(error) = self.prune_audit_events(&event.namespace).await
+        {
+            warn!(
+                namespace = %event.namespace,
+                error = %error,
+                "Failed to prune audit_events after insert; retention will retry on later writes"
+            );
+        }
         Ok(())
+    }
+
+    /// Chunked, namespace-scoped audit retention. Age uses strict `ts < cutoff`;
+    /// the row cap keeps the newest `max_rows` by deterministic `(ts, id)`.
+    /// Work is bounded by [`AUDIT_RETENTION_PRUNE_BATCH_SIZE`] ×
+    /// [`AUDIT_RETENTION_PRUNE_MAX_BATCHES`] and uses `idx_audit_events_namespace_ts_id`.
+    pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        if !self.audit_retention.is_enabled() {
+            return Ok(0);
+        }
+        let start = std::time::Instant::now();
+        let mut deleted = 0u64;
+        if let Some(days) = self.audit_retention.retention_days {
+            deleted = deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
+        }
+        if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
+            deleted = deleted
+                .saturating_add(self.prune_audit_events_by_max_rows(namespace, max_rows).await?);
+        }
+        self.check_slow_query("prune_audit_events", start);
+        Ok(deleted)
+    }
+
+    async fn prune_audit_events_by_age(
+        &self,
+        namespace: &str,
+        retention_days: u64,
+    ) -> Result<u64, anyhow::Error> {
+        let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
+        let cutoff = audit_ts_string(&(Utc::now() - chrono::Duration::days(days_i64)));
+        let delete_sql = self.audit_age_delete_sql();
+        let mut total = 0u64;
+        for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+            let result = sqlx::query(&delete_sql)
+                .bind(namespace)
+                .bind(&cutoff)
+                .execute(&self.pool())
+                .await?;
+            let batch = result.rows_affected();
+            total = total.saturating_add(batch);
+            if batch < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn prune_audit_events_by_max_rows(
+        &self,
+        namespace: &str,
+        max_rows: u64,
+    ) -> Result<u64, anyhow::Error> {
+        let offset = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        let boundary_sql = self.q(
+            "SELECT ts, id FROM audit_events WHERE namespace = ? \
+             ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?",
+        );
+        let boundary = sqlx::query(&boundary_sql)
+            .bind(namespace)
+            .bind(offset)
+            .fetch_optional(&self.pool())
+            .await?;
+        let Some(boundary) = boundary else {
+            return Ok(0);
+        };
+        let boundary_ts: String = boundary.try_get("ts")?;
+        let boundary_id: String = boundary.try_get("id")?;
+        let delete_sql = self.audit_max_rows_delete_sql();
+        let mut total = 0u64;
+        for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+            let result = sqlx::query(&delete_sql)
+                .bind(namespace)
+                .bind(&boundary_ts)
+                .bind(&boundary_ts)
+                .bind(&boundary_id)
+                .execute(&self.pool())
+                .await?;
+            let batch = result.rows_affected();
+            total = total.saturating_add(batch);
+            if batch < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    fn audit_age_delete_sql(&self) -> String {
+        let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
+        match self.db_type.as_str() {
+            "postgres" => self.q(&format!(
+                "DELETE FROM audit_events WHERE ctid IN (\
+                     SELECT ctid FROM audit_events \
+                     WHERE namespace = ? AND ts < ? \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            )),
+            "sqlite" => format!(
+                "DELETE FROM audit_events WHERE rowid IN (\
+                     SELECT rowid FROM audit_events \
+                     WHERE namespace = ? AND ts < ? \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            ),
+            _ => format!(
+                "DELETE FROM audit_events \
+                 WHERE namespace = ? AND ts < ? \
+                 ORDER BY ts ASC, id ASC \
+                 LIMIT {batch}"
+            ),
+        }
+    }
+
+    fn audit_max_rows_delete_sql(&self) -> String {
+        let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
+        // Include the boundary row itself: it is the first excess event under
+        // newest-first OFFSET max_rows, so `(ts, id) <= boundary` is correct.
+        match self.db_type.as_str() {
+            "postgres" => self.q(&format!(
+                "DELETE FROM audit_events WHERE ctid IN (\
+                     SELECT ctid FROM audit_events \
+                     WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            )),
+            "sqlite" => format!(
+                "DELETE FROM audit_events WHERE rowid IN (\
+                     SELECT rowid FROM audit_events \
+                     WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            ),
+            _ => format!(
+                "DELETE FROM audit_events \
+                 WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                 ORDER BY ts ASC, id ASC \
+                 LIMIT {batch}"
+            ),
+        }
     }
 
     pub async fn list_audit_events(
@@ -8337,6 +8494,10 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy) {
         self.backend_allow_ips = policy;
+    }
+
+    fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy) {
+        self.audit_retention = policy;
     }
 
     async fn load_full_config_for_purpose(
@@ -8859,6 +9020,10 @@ impl DatabaseBackend for DatabaseStore {
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         DatabaseStore::list_audit_events(self, namespace, filter).await
+    }
+
+    async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseStore::prune_audit_events(self, namespace).await
     }
 }
 

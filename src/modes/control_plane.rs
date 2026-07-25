@@ -747,6 +747,10 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            store.set_audit_retention_policy(crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            });
             store.run_migrations().await?;
             Box::new(store)
         }
@@ -771,6 +775,10 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            store.set_audit_retention_policy(crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            });
 
             if let Some(ref replica_url) = effective_replica_url {
                 match store.connect_read_replica(replica_url).await {

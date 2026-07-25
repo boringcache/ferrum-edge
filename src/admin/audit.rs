@@ -24,7 +24,72 @@ use uuid::Uuid;
 const AUDIT_CHANNEL_CAPACITY: usize = 1024;
 const AUDIT_SINK_STALE_CHECK_INTERVAL_SECONDS: u64 = 60;
 
+/// Upper bound for `FERRUM_AUDIT_RETENTION_DAYS` (100 years).
+pub const AUDIT_RETENTION_DAYS_MAX: u64 = 36_500;
+/// Upper bound for `FERRUM_AUDIT_RETENTION_MAX_ROWS` per namespace.
+pub const AUDIT_RETENTION_MAX_ROWS_CAP: u64 = 10_000_000;
+/// Rows deleted per prune statement so a multi-million-row backlog cannot hold
+/// a write lock for one unbounded DELETE / deleteMany.
+pub const AUDIT_RETENTION_PRUNE_BATCH_SIZE: u64 = 1_000;
+/// Max DELETE batches per prune call so insert-path piggyback stays bounded.
+pub const AUDIT_RETENTION_PRUNE_MAX_BATCHES: u32 = 8;
+
 static AUDIT_SINKS: LazyLock<DashMap<usize, AuditSinkEntry>> = LazyLock::new(DashMap::new);
+
+/// Per-namespace audit-event retention policy from env/config.
+///
+/// Distinct from delivery-loss hardening (#2421): this only bounds durable
+/// `audit_events` growth after successful inserts. Unset fields disable that
+/// half of the policy. When both are unset, stores skip prune work entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditRetentionPolicy {
+    /// Delete events older than this many days (strict `ts < cutoff`).
+    pub retention_days: Option<u64>,
+    /// Keep at most this many newest events per namespace, ordered by `(ts, id)`.
+    pub max_rows_per_namespace: Option<u64>,
+}
+
+impl AuditRetentionPolicy {
+    pub fn is_enabled(&self) -> bool {
+        self.retention_days.is_some() || self.max_rows_per_namespace.is_some()
+    }
+
+    /// Validate operator-supplied optional retention knobs.
+    pub fn from_parts(
+        retention_days: Option<u64>,
+        max_rows_per_namespace: Option<u64>,
+    ) -> Result<Self, String> {
+        if let Some(days) = retention_days {
+            if days == 0 {
+                return Err(
+                    "FERRUM_AUDIT_RETENTION_DAYS must be greater than zero when set".to_string(),
+                );
+            }
+            if days > AUDIT_RETENTION_DAYS_MAX {
+                return Err(format!(
+                    "FERRUM_AUDIT_RETENTION_DAYS must not exceed {AUDIT_RETENTION_DAYS_MAX}"
+                ));
+            }
+        }
+        if let Some(max_rows) = max_rows_per_namespace {
+            if max_rows == 0 {
+                return Err(
+                    "FERRUM_AUDIT_RETENTION_MAX_ROWS must be greater than zero when set"
+                        .to_string(),
+                );
+            }
+            if max_rows > AUDIT_RETENTION_MAX_ROWS_CAP {
+                return Err(format!(
+                    "FERRUM_AUDIT_RETENTION_MAX_ROWS must not exceed {AUDIT_RETENTION_MAX_ROWS_CAP}"
+                ));
+            }
+        }
+        Ok(Self {
+            retention_days,
+            max_rows_per_namespace,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

@@ -858,6 +858,7 @@ mod inner {
         slow_query_threshold_ms: Option<u64>,
         cert_expiry_warning_days: u64,
         backend_allow_ips: crate::config::BackendEgressPolicy,
+        audit_retention: crate::admin::audit::AuditRetentionPolicy,
         failover_urls: Vec<String>,
         replica_set_configured: Arc<AtomicBool>,
     }
@@ -942,6 +943,7 @@ mod inner {
                 slow_query_threshold_ms: None,
                 cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
                 backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+                audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 failover_urls: Vec::new(),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
@@ -4767,6 +4769,10 @@ mod inner {
 
         fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy) {
             self.backend_allow_ips = policy;
+        }
+
+        fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy) {
+            self.audit_retention = policy;
         }
 
         async fn load_full_config_for_purpose(
@@ -9499,11 +9505,13 @@ mod inner {
                     )
                     .await?;
 
-                // audit_events indexes (admin-only mutation log).
+                // audit_events indexes (admin-only mutation log). Include `id`
+                // so list and retention prune share deterministic `(ts, id)`
+                // keyset behavior with the SQL `idx_audit_events_namespace_ts_id`.
                 self.audit_events()
                     .create_index(
                         IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "ts": -1 })
+                            .keys(doc! { "namespace": 1, "ts": -1, "id": -1 })
                             .build(),
                     )
                     .await?;
@@ -11316,6 +11324,15 @@ mod inner {
                 .insert_one(audit_event_to_doc(event)?)
                 .await?;
             self.check_slow_query("insert_audit_event", start);
+            if self.audit_retention.is_enabled()
+                && let Err(error) = self.prune_audit_events(&event.namespace).await
+            {
+                warn!(
+                    namespace = %event.namespace,
+                    error = %error,
+                    "Failed to prune audit_events after insert; retention will retry on later writes"
+                );
+            }
             Ok(())
         }
 
@@ -11347,7 +11364,7 @@ mod inner {
                 .count_documents(filter_doc.clone())
                 .await? as i64;
             let options = FindOptions::builder()
-                .sort(doc! { "ts": -1, "_id": -1 })
+                .sort(doc! { "ts": -1, "id": -1 })
                 .skip(Some(filter.offset as u64))
                 .limit(Some(filter.limit as i64))
                 .build();
@@ -11359,6 +11376,10 @@ mod inner {
             }
             self.check_slow_query("list_audit_events", start);
             Ok(PaginatedResult { items, total })
+        }
+
+        async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+            MongoStore::prune_audit_events(self, namespace).await
         }
     }
 
@@ -11386,6 +11407,148 @@ mod inner {
     }
 
     impl MongoStore {
+        /// Chunked, namespace-scoped audit retention (parity with SQL).
+        pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+            if !self.audit_retention.is_enabled() {
+                return Ok(0);
+            }
+            let start = std::time::Instant::now();
+            let mut deleted = 0u64;
+            if let Some(days) = self.audit_retention.retention_days {
+                deleted =
+                    deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
+            }
+            if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
+                deleted = deleted.saturating_add(
+                    self.prune_audit_events_by_max_rows(namespace, max_rows)
+                        .await?,
+                );
+            }
+            self.check_slow_query("prune_audit_events", start);
+            Ok(deleted)
+        }
+
+        async fn prune_audit_events_by_age(
+            &self,
+            namespace: &str,
+            retention_days: u64,
+        ) -> Result<u64, anyhow::Error> {
+            let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
+            let cutoff = Utc::now() - chrono::Duration::days(days_i64);
+            let cutoff_bson = audit_ts_bound(&cutoff);
+            let mut total = 0u64;
+            for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+                let options = FindOptions::builder()
+                    .sort(doc! { "ts": 1, "id": 1 })
+                    .limit(Some(
+                        crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE as i64,
+                    ))
+                    .projection(doc! { "_id": 1 })
+                    .build();
+                let audit_events = self.audit_events();
+                let mut cursor = audit_events
+                    .find(doc! {
+                        "namespace": namespace,
+                        "ts": { "$lt": cutoff_bson.clone() },
+                    })
+                    .with_options(options)
+                    .await?;
+                let mut ids = Vec::new();
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    if let Some(id) = doc.get("_id").cloned() {
+                        ids.push(id);
+                    }
+                }
+                if ids.is_empty() {
+                    break;
+                }
+                let batch_len = ids.len() as u64;
+                self.audit_events()
+                    .delete_many(doc! { "_id": { "$in": ids } })
+                    .await?;
+                total = total.saturating_add(batch_len);
+                if batch_len < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+
+        async fn prune_audit_events_by_max_rows(
+            &self,
+            namespace: &str,
+            max_rows: u64,
+        ) -> Result<u64, anyhow::Error> {
+            let options = FindOptions::builder()
+                .sort(doc! { "ts": -1, "id": -1 })
+                .skip(Some(max_rows))
+                .limit(Some(1))
+                .projection(doc! { "ts": 1, "id": 1 })
+                .build();
+            let audit_events = self.audit_events();
+            let mut cursor = audit_events
+                .find(doc! { "namespace": namespace })
+                .with_options(options)
+                .await?;
+            let Some(boundary) = (if cursor.advance().await? {
+                Some(cursor.deserialize_current()?)
+            } else {
+                None
+            }) else {
+                return Ok(0);
+            };
+            let boundary_ts = boundary.get("ts").cloned().ok_or_else(|| {
+                anyhow::anyhow!("audit_events retention boundary missing ts")
+            })?;
+            let boundary_id = boundary
+                .get("id")
+                .cloned()
+                .or_else(|| boundary.get("_id").cloned())
+                .ok_or_else(|| anyhow::anyhow!("audit_events retention boundary missing id"))?;
+
+            let mut total = 0u64;
+            for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+                let options = FindOptions::builder()
+                    .sort(doc! { "ts": 1, "id": 1 })
+                    .limit(Some(
+                        crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE as i64,
+                    ))
+                    .projection(doc! { "_id": 1 })
+                    .build();
+                let audit_events = self.audit_events();
+                let mut cursor = audit_events
+                    .find(doc! {
+                        "namespace": namespace,
+                        "$or": [
+                            { "ts": { "$lt": boundary_ts.clone() } },
+                            { "ts": boundary_ts.clone(), "id": { "$lte": boundary_id.clone() } },
+                        ],
+                    })
+                    .with_options(options)
+                    .await?;
+                let mut ids = Vec::new();
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    if let Some(id) = doc.get("_id").cloned() {
+                        ids.push(id);
+                    }
+                }
+                if ids.is_empty() {
+                    break;
+                }
+                let batch_len = ids.len() as u64;
+                self.audit_events()
+                    .delete_many(doc! { "_id": { "$in": ids } })
+                    .await?;
+                total = total.saturating_add(batch_len);
+                if batch_len < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+
         async fn load_full_proxies_opt_session(
             &self,
             namespace: &str,
@@ -12807,6 +12970,7 @@ mod inner {
                 slow_query_threshold_ms: None,
                 cert_expiry_warning_days: 30,
                 backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+                audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 failover_urls,
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
