@@ -101,9 +101,9 @@ pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
 /// replace the prior cycle's captured config handles. The cache marks its
 /// current snapshot stale so the warmup refresh publishes the new cycle.
 pub(super) fn replace_metrics_inventory_collector_for_serving_cycle(state: &AdminState) {
-    crate::tls::inventory_cache::replace_collector_for_serving_cycle(
-        metrics_inventory_collector(state),
-    );
+    crate::tls::inventory_cache::replace_collector_for_serving_cycle(metrics_inventory_collector(
+        state,
+    ));
 }
 
 pub(super) async fn handle_events(
