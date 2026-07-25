@@ -869,7 +869,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             "mode": "metadata_only",
             "capture": {
                 "request": true,
-                "response": false,
+                "response": true,
                 "streaming_response": false
             },
             "sampling": {
@@ -971,6 +971,26 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "a saturated instance must not erase a peer instance's staged candidate"
     );
     assert!(peer.forces_reqwest_dispatch(&peer_overflow));
+    assert!(
+        !plugin.should_buffer_response_body(&peer_overflow),
+        "a saturated instance must not buffer a response for a peer's candidate"
+    );
+    plugin
+        .capture_final_response_body(
+            &mut peer_overflow,
+            200,
+            &headers,
+            br#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )
+        .await;
+    assert_eq!(
+        peer_overflow
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected"),
+        "a saturated instance must not commit a response record for a peer's candidate"
+    );
 }
 
 // ---------------------------------------------------------------------------

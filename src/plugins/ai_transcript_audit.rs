@@ -1345,7 +1345,9 @@ impl AiTranscriptAudit {
     /// re-evaluation (`refine_stream_response_for_content_type`) can never
     /// disagree about whether this request's response is worth buffering.
     fn buffered_response_capture_wanted(&self, ctx: &RequestContext) -> bool {
-        if !self.capture.response {
+        if !self.capture.response
+            || (flag(&ctx.metadata, MD_CANDIDATE) && !self.has_staged_candidate(&ctx.metadata))
+        {
             return false;
         }
         // A `stream: true` request expects an SSE response; do not buffer it —
@@ -1578,7 +1580,10 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !self.active
+            || !flag(&ctx.metadata, MD_CANDIDATE)
+            || !self.has_staged_candidate(&ctx.metadata)
+        {
             return PluginResult::Continue;
         }
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
@@ -1684,7 +1689,7 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return PluginResult::Continue;
         };
-        if !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
             self.staging.remove(&record_id);
             return PluginResult::Continue;
         }
@@ -1749,7 +1754,7 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        if !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
             self.staging.remove(&record_id);
             return;
         }
@@ -1758,11 +1763,10 @@ impl Plugin for AiTranscriptAudit {
             .get(MD_SINK_STATUS)
             .is_some_and(|status| status == "rejected");
 
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+            return;
+        };
+        let sample_hit = staging.sample_hit;
         let (emit, reason) = self.emit_decision(
             sample_hit,
             guardrail_fired(&ctx.metadata),
@@ -1771,7 +1775,6 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
-        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         if !emit {
             // A fail-closed rejection (`on_sink_error`/`on_buffer_full: reject`)
             // stamps `MD_SINK_STATUS = "rejected"` and returns a 503 in the
@@ -1805,7 +1808,7 @@ impl Plugin for AiTranscriptAudit {
             &record_id,
             envelope,
             &ctx.metadata,
-            staging.as_ref(),
+            Some(&staging),
             response_excerpt,
             response_truncated,
             response_hash,
@@ -1813,7 +1816,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             Some(response_headers),
         );
-        let status = match self.enqueue(record, staging.as_mut()) {
+        let status = match self.enqueue(record, Some(&mut staging)) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
