@@ -985,6 +985,7 @@ impl CountMinSketch {
     /// explicit full-refresh callers. Spins on `age_step` until the single
     /// owner publishes an idle cursor (non-blocking for the hot path; this
     /// helper is off the route-lookup path).
+    #[cfg(test)]
     fn age(&self) {
         // Ignore owed follow-up passes: this helper forces exactly one full
         // refresh after draining the current cursor.
