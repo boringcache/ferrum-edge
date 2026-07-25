@@ -923,9 +923,7 @@ where
     initialize_backend(backend, config, metrics.as_ref())?;
 
     if cni_config.enabled && kube_client.is_none() {
-        anyhow::bail!(
-            "CNI plugin listener requires a Kubernetes client for pod metadata lookups"
-        );
+        anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
     }
 
     let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();

@@ -7,11 +7,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use ferrum_edge::_test_support::run_with_pod_stream_for_test;
 use ferrum_edge::capture::{CaptureConfig, CaptureMode};
 use ferrum_edge::ebpf::{
     CaptureContract, FallbackMode, MockEbpfBackend, NodeAgentMetrics, PodAttachmentState,
 };
-use ferrum_edge::_test_support::run_with_pod_stream_for_test;
 use ferrum_edge::modes::node_agent::NodeAgentConfig;
 use futures::stream;
 use k8s_openapi::api::core::v1::Pod;
@@ -101,10 +101,7 @@ async fn shutdown_requested_wins_over_an_already_exhausted_stream() {
         "requested shutdown must win over stream exhaustion, got {result:?}"
     );
     assert!(backend.cleaned_up);
-    assert_eq!(
-        backend.detached_pods,
-        vec!["pod-shutdown-race".to_string()]
-    );
+    assert_eq!(backend.detached_pods, vec!["pod-shutdown-race".to_string()]);
 }
 
 #[tokio::test]
