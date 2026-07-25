@@ -151,6 +151,7 @@ impl DeliverySlot {
     /// registered against it. The new override applies to the next generation.
     /// A drained generation is replaced immediately, which is what lets a
     /// second in-process serve deliver again.
+    #[allow(dead_code)] // Used by external lifecycle tests; production calls `initialize_with_limits`.
     pub fn initialize(&self, pool_shard_override: usize) {
         self.initialize_with_limits(pool_shard_override, self.max_tasks.load(Ordering::Acquire));
     }
@@ -206,22 +207,26 @@ impl DeliverySlot {
     }
 
     /// Configured aggregate task admission budget for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the lifecycle field in `render_prometheus`.
     pub fn max_tasks(&self) -> usize {
         self.current.load().max_tasks
     }
 
     /// Tasks currently held in the registry for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads `tasks.len()` in `render_prometheus`.
     pub fn active_tasks(&self) -> usize {
         self.current.load().tasks.len()
     }
 
     /// Reserved admission permits for the current generation (registry plus
     /// in-flight spawn handoff).
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
     pub fn admitted_tasks(&self) -> u64 {
         self.current.load().admitted_tasks.load(Ordering::Acquire)
     }
 
     /// Aggregate rejected-task count for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin uses `rejected_task_count()` in `render_prometheus`.
     pub fn rejected_tasks(&self) -> u64 {
         self.current.load().rejected_task_count()
     }
