@@ -14,7 +14,7 @@ mod tls_management;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::service::service_fn;
