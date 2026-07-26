@@ -10030,9 +10030,12 @@ components:
           type: boolean
           description: |
             `true` when the admin API will accept writes. `false` when the
-            admin API is in read-only mode or when the database is currently
-            unavailable. When `false` and read-only mode is not configured,
-            `status` is forced to `degraded`.
+            admin API is in read-only mode, when the database is currently
+            unavailable, or when the active config-store pool is on a
+            `FERRUM_DB_FAILOVER_URLS` topology without
+            `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`. When `false` and
+            read-only mode is not configured, `status` is forced to
+            `degraded`.
         timestamp:
           type: string
           format: date-time
@@ -10048,6 +10051,8 @@ components:
           description: |
             Database connectivity info. Present only when the gateway has a
             configured database (database/cp/dp modes); absent in file mode.
+            Authenticated detail only (with the rest of the detailed health
+            body).
           required: [status]
           properties:
             status:
@@ -10094,6 +10099,8 @@ components:
                       type: integer
                     active:
                       type: integer
+            failover_topology:
+              $ref: "#/components/schemas/DatabaseFailoverTopology"
         cached_config:
           type: object
           required: [available]
@@ -10782,6 +10789,47 @@ components:
           format: int64
         escalated:
           type: boolean
+
+    DatabaseFailoverTopology:
+      type: object
+      description: |
+        Authenticated `/health` detail only. Present while the active config-store
+        pool points at a `FERRUM_DB_FAILOVER_URLS` entry. URLs are always redacted
+        (no userinfo). When `allow_writes` is false (default), admin mutations
+        return 503 and `admin_writes_enabled` is false. When
+        `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, writes are permitted under the
+        operator's synchronously replicated multi-primary assertion; Ferrum
+        allows automatic primary failback and emits one bounded process-local
+        divergence-risk log for the window (not a durable fence; cleared by
+        restart). This object does not claim per-request mutation success.
+      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
+      properties:
+        primary_active:
+          type: boolean
+          description: |
+            `false` while the active write/runtime pool is on a failover URL.
+            DNS/TLS reconnect paths target the configured primary URL and set
+            this `true` only after a successful primary reconnect; failover
+            reconnects keep it `false`.
+        allow_writes:
+          type: boolean
+          description: |
+            Current value of `FERRUM_DB_FAILOVER_ALLOW_WRITES` on this store.
+        opt_in_writes_enabled_during_window:
+          type: boolean
+          description: |
+            Sticky process-local marker: opt-in writes were enabled at any point
+            during the current failover window. Conservative risk signal only;
+            does not count admitted, rejected, or successful mutations.
+        failover_since_unix_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when failover topology became active.
+        active_url_redacted:
+          type: string
+          description: |
+            Credential-free redaction of the active DB URL (`redact_url`).
+            Never contains userinfo.
 
     DatabaseDeltaPollingHealth:
       type: object

@@ -527,7 +527,7 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
 }
 
 #[tokio::test]
-async fn test_check_write_allowed_opt_in_records_failover_write() {
+async fn test_check_write_allowed_opt_in_is_policy_pure() {
     use ferrum_edge::_test_support::DbPoolConfig;
     use ferrum_edge::config::db_backend::DatabaseBackend;
     use ferrum_edge::config::db_loader::DatabaseStore;
@@ -588,19 +588,26 @@ async fn test_check_write_allowed_opt_in_records_failover_write() {
         !state.admin_writes_currently_blocked(),
         "opt-in must leave observe-only gate open"
     );
-    assert_eq!(db.failover_topology_status().failover_writes_accepted, 0);
+    let before = db.failover_topology_status();
+    assert!(before.allow_writes);
+    assert!(
+        before.opt_in_writes_enabled_during_window,
+        "store opt-in enablement records the window risk marker"
+    );
     assert!(
         state.check_write_allowed().is_none(),
         "opt-in must admit mutations on failover"
     );
+    let after = db.failover_topology_status();
     assert_eq!(
-        db.failover_topology_status().failover_writes_accepted,
-        1,
-        "mutation gate must record failover-window write evidence"
+        before, after,
+        "check_write_allowed must be observationally pure (no mutation counters)"
     );
+    // Rejected/invalid requests never reach persistence; the public health
+    // surface must not claim "accepted" writes from gate admission alone.
     assert!(
-        !state.admin_writes_currently_blocked(),
-        "health observe path must not inflate the write counter"
+        state.check_write_allowed().is_none() && state.check_write_allowed().is_none(),
+        "repeated gate checks must stay pure"
     );
-    assert_eq!(db.failover_topology_status().failover_writes_accepted, 1);
+    assert_eq!(db.failover_topology_status(), after);
 }

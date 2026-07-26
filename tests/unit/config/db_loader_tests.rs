@@ -2268,9 +2268,10 @@ fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) 
 }
 
 #[tokio::test]
-async fn failover_write_gate_and_failback_fence_preserve_failover_writes() {
-    // Issue #3001: default fail-closed admin writes on failover; opt-in writes
-    // fence primary failback so a recovered primary cannot silently erase them.
+async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
+    // Issue #3001 contract B: default fail-closed admin writes on failover;
+    // opt-in permits writes and allows automatic primary failback with a
+    // process-local divergence-risk marker (no durable fence).
     use ferrum_edge::config::db_backend::DatabaseBackend;
 
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2295,14 +2296,15 @@ async fn failover_write_gate_and_failback_fence_preserve_failover_writes() {
         "startup must land on failover when primary is missing"
     );
     assert!(!status.allow_writes);
+    assert!(!status.opt_in_writes_enabled_during_window);
 
-    // Failback without opt-in writes remains available (no accepted writes).
+    // Failback without opt-in remains available.
     seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
     let active = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
     assert_eq!(active, primary_rw_url);
     assert!(store.failover_topology_status().primary_active);
 
-    // Return to failover topology and admit an opt-in write.
+    // Return to failover topology with opt-in enabled.
     let mut store = DatabaseStore::connect_with_failover(
         "sqlite",
         &format!("sqlite:{}?mode=rw", temp_dir.path().join("missing-primary.db").to_string_lossy()),
@@ -2313,8 +2315,11 @@ async fn failover_write_gate_and_failback_fence_preserve_failover_writes() {
     .unwrap();
     store.set_failover_allow_writes(true);
     assert!(!store.failover_topology_status().primary_active);
-    store.note_failover_admin_write();
-    assert_eq!(store.failover_topology_status().failover_writes_accepted, 1);
+    assert!(
+        store
+            .failover_topology_status()
+            .opt_in_writes_enabled_during_window
+    );
 
     sqlx::query(
         "INSERT INTO upstreams (id, namespace, name, targets) VALUES ('failover-write', 'failover-ns', 'failover-name', '[]')",
@@ -2323,25 +2328,27 @@ async fn failover_write_gate_and_failback_fence_preserve_failover_writes() {
     .await
     .unwrap();
 
-    // Primary is reachable, but failback must refuse so the failover write is not erased.
-    // try_failover_reconnect skips primary and stays on a healthy failover URL.
+    // Primary is reachable: failback is allowed under contract B. The
+    // process-local opt-in risk marker is cleared on mark_primary; operators
+    // rely on the bounded failback log (and sync multi-primary assertion).
     let active = store
         .try_failover_reconnect(&primary_rw_url)
         .await
-        .expect("failover URL must remain available when primary failback is fenced");
-    assert_eq!(active, failover_url);
+        .expect("primary failback must proceed under opt-in contract B");
+    assert_eq!(active, primary_rw_url);
     assert!(
-        !store.failover_topology_status().primary_active,
-        "store must remain on failover after refused failback"
+        store.failover_topology_status().primary_active,
+        "store must return to primary after successful failback"
     );
-    assert_eq!(
-        store.failover_topology_status().failover_writes_accepted,
-        1,
-        "failover-window write evidence must survive the fenced failback attempt"
+    assert!(
+        !store
+            .failover_topology_status()
+            .opt_in_writes_enabled_during_window,
+        "failback must clear the process-local window marker"
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["failover-ns".to_string()],
-        "failover-window write must still be visible on the active topology"
+        vec!["primary-ns".to_string()],
+        "after failback the active topology is the primary snapshot"
     );
 }

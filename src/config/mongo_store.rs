@@ -5255,10 +5255,6 @@ mod inner {
             self.failover_topology.set_allow_writes(allow);
         }
 
-        fn note_failover_admin_write(&self) {
-            self.failover_topology.note_admin_write();
-        }
-
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
             self.slow_query_threshold_ms = threshold_ms;
         }
@@ -9676,9 +9672,10 @@ mod inner {
             // actually talk to MongoDB. On `Err` the swap is skipped and the
             // existing (possibly degraded) client stays in place — same
             // contract as `DatabaseStore::reconnect` for sqlx.
-            if !self.failover_topology.primary_active() {
-                self.failover_topology.ensure_primary_failback_allowed()?;
-            }
+            //
+            // Callers pass the configured primary URL. Failover reconnects use
+            // `reconnect_failover` so an active failover URL is never labeled
+            // primary (issue #3001).
             let (new_connection, replica_set_configured) = Self::build_connection_bundle(
                 db_url,
                 &self.conn_settings,
@@ -9716,33 +9713,25 @@ mod inner {
         }
 
         async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
-            let skip_primary = match self.failover_topology.ensure_primary_failback_allowed() {
-                Ok(()) => false,
-                Err(divergence) => {
-                    warn!("{divergence}");
-                    true
-                }
-            };
-
             // Try primary first. `reconnect()` rebuilds the underlying
             // `Client` against the primary URL and pings it; on success
             // the swap is committed and the gateway is back on the
-            // primary. Skip when failover-window writes fence failback.
-            if !skip_primary {
-                match self.reconnect(primary_url).await {
-                    Ok(()) => {
-                        info!(
-                            "Reconnected to primary MongoDB ({})",
-                            crate::config::db_backend::redact_url(primary_url)
-                        );
-                        return Ok(primary_url.to_string());
-                    }
-                    Err(error) => {
-                        warn!(
-                            "Primary MongoDB reconnect failed: {}",
-                            crate::config::db_backend::redact_error_text(&error, &[primary_url])
-                        );
-                    }
+            // primary. Opt-in failover windows emit one divergence-risk
+            // marker via mark_primary (issue #3001 contract B); failback
+            // is not fenced.
+            match self.reconnect(primary_url).await {
+                Ok(()) => {
+                    info!(
+                        "Reconnected to primary MongoDB ({})",
+                        crate::config::db_backend::redact_url(primary_url)
+                    );
+                    return Ok(primary_url.to_string());
+                }
+                Err(error) => {
+                    warn!(
+                        "Primary MongoDB reconnect failed: {}",
+                        crate::config::db_backend::redact_error_text(&error, &[primary_url])
+                    );
                 }
             }
 

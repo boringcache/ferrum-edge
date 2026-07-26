@@ -487,8 +487,8 @@ pub struct DatabaseStore {
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
-    /// the unavailable primary topology. Also tracks failover-window admin
-    /// write admissions and the failback fence (issue #3001).
+    /// the unavailable primary topology. Also tracks sticky failover topology
+    /// and the process-local opt-in divergence-risk marker (issue #3001).
     failover_topology: DbFailoverTopologyState,
     db_type: String,
     failover_urls: Vec<String>,
@@ -6295,16 +6295,14 @@ impl DatabaseStore {
     /// Atomically replace the connection pool with a freshly connected one.
     ///
     /// Called by the DB polling loop when DnsCache detects that the database
-    /// FQDN now resolves to a different set of IPs. The old pool is closed
-    /// gracefully in the background — in-flight queries complete normally.
+    /// FQDN now resolves to a different set of IPs, and by DB TLS live reload.
+    /// Callers pass the configured primary URL (`FERRUM_DB_URL` effective form).
+    /// On success this records primary topology — never label an active
+    /// failover URL as primary (failover reconnects use
+    /// [`Self::reconnect_for_topology`] with [`DatabaseTopology::Failover`] or
+    /// [`Self::try_failover_reconnect`]). The old pool is closed gracefully in
+    /// the background — in-flight queries complete normally.
     pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
-        // DNS/TLS reconnect always targets the configured primary URL. When
-        // sticky failover has accepted admin writes, refuse this path the same
-        // way `try_failover_reconnect` does so a recovered primary cannot
-        // silently erase the failover window (issue #3001).
-        if !self.failover_topology.primary_active() {
-            self.failover_topology.ensure_primary_failback_allowed()?;
-        }
         self.reconnect_for_topology(db_url, DatabaseTopology::Primary)
             .await
     }
@@ -6636,41 +6634,32 @@ impl DatabaseStore {
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
     ///
-    /// When admin writes were accepted on a failover URL under
-    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, primary failback is refused so a
-    /// recovered primary cannot silently republish a stale snapshot (issue
-    /// #3001). Polling and reads remain available on the failover topology.
+    /// Primary failback is always attempted when the primary answers (issue
+    /// #3001 opt-in contract B). When `FERRUM_DB_FAILOVER_ALLOW_WRITES` was
+    /// enabled during the failover window, [`DbFailoverTopologyState::mark_primary`]
+    /// emits one bounded divergence-risk marker; Ferrum does not fence failback.
+    /// Polling and reads remain available on whichever topology reconnects.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
-        let skip_primary = match self.failover_topology.ensure_primary_failback_allowed() {
-            Ok(()) => false,
-            Err(divergence) => {
-                warn!("{divergence}");
-                true
+        // Try primary first.
+        match self
+            .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
+            .await
+        {
+            Ok(()) => {
+                info!("Reconnected to primary database");
+                return Ok(primary_url.to_string());
             }
-        };
-
-        // Try primary first (unless failover-window writes fence failback).
-        if !skip_primary {
-            match self
-                .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
-                .await
-            {
-                Ok(()) => {
-                    info!("Reconnected to primary database");
-                    return Ok(primary_url.to_string());
-                }
-                Err(error) if !is_transient_failover_error(&error) => {
-                    return Err(mark_non_transient(
-                        error,
-                        "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
-                        &[primary_url],
-                    ));
-                }
-                Err(error) => {
-                    let safe_error =
-                        crate::config::db_backend::redact_error_text(&error, &[primary_url]);
-                    warn!("Primary database reconnect failed transiently: {safe_error}");
-                }
+            Err(error) if !is_transient_failover_error(&error) => {
+                return Err(mark_non_transient(
+                    error,
+                    "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                    &[primary_url],
+                ));
+            }
+            Err(error) => {
+                let safe_error =
+                    crate::config::db_backend::redact_error_text(&error, &[primary_url]);
+                warn!("Primary database reconnect failed transiently: {safe_error}");
             }
         }
 
@@ -8839,10 +8828,6 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_failover_allow_writes(&mut self, allow: bool) {
         self.failover_topology.set_allow_writes(allow);
-    }
-
-    fn note_failover_admin_write(&self) {
-        self.failover_topology.note_admin_write();
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {

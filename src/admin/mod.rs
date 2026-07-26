@@ -336,27 +336,22 @@ impl AdminState {
     /// Check whether write operations are allowed. Returns an error response
     /// if the admin API is read-only, the database is currently unavailable, or
     /// the active pool is on sticky failover without
-    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`. When this gate admits a mutation while
-    /// on failover under the opt-in, it records the failover-window write so
-    /// primary failback cannot silently erase it (issue #3001).
+    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES` (issue #3001).
     ///
-    /// For observe-only callers such as `/health`, use
-    /// [`Self::admin_writes_currently_blocked`] so health probes do not inflate
-    /// the failover write counter.
+    /// Observationally pure: does not mutate failover topology counters or
+    /// risk markers. Opt-in enablement is recorded by the store when
+    /// `set_failover_allow_writes(true)` is applied on failover topology.
     pub fn check_write_allowed(&self) -> Option<Response<Full<Bytes>>> {
-        self.evaluate_write_gate(true)
+        self.evaluate_write_gate()
     }
 
-    /// Whether admin mutations are currently blocked, without recording a
-    /// failover-window write admission.
+    /// Whether admin mutations are currently blocked (same policy as
+    /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
     pub fn admin_writes_currently_blocked(&self) -> bool {
-        self.evaluate_write_gate(false).is_some()
+        self.evaluate_write_gate().is_some()
     }
 
-    fn evaluate_write_gate(
-        &self,
-        record_failover_write: bool,
-    ) -> Option<Response<Full<Bytes>>> {
+    fn evaluate_write_gate(&self) -> Option<Response<Full<Bytes>>> {
         if self.read_only {
             return Some(json_response(
                 StatusCode::FORBIDDEN,
@@ -373,18 +368,13 @@ impl AdminState {
         }
         if let Some(ref db) = self.db {
             let topology = db.failover_topology_status();
-            if !topology.primary_active {
-                if !topology.allow_writes {
-                    return Some(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
-                        }),
-                    ));
-                }
-                if record_failover_write {
-                    db.note_failover_admin_write();
-                }
+            if !topology.primary_active && !topology.allow_writes {
+                return Some(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
+                    }),
+                ));
             }
         }
         None
@@ -1352,8 +1342,7 @@ pub async fn handle_admin_request(
         }
 
         // Report whether admin writes are enabled (read_only flag + db_available
-        // + sticky failover write gate). Observe-only so /health does not record
-        // a failover-window write admission.
+        // + sticky failover write gate). Policy observation only.
         let writes_blocked = state.admin_writes_currently_blocked();
         health_status["admin_writes_enabled"] = json!(!writes_blocked);
         if writes_blocked && !state.read_only {
@@ -1363,11 +1352,12 @@ pub async fn handle_admin_request(
 
         if let Some(db) = &state.db {
             let topology = db.failover_topology_status();
-            if !topology.primary_active || topology.failover_writes_accepted > 0 {
+            if !topology.primary_active {
                 let mut failover = json!({
                     "primary_active": topology.primary_active,
-                    "failover_writes_accepted": topology.failover_writes_accepted,
                     "allow_writes": topology.allow_writes,
+                    "opt_in_writes_enabled_during_window":
+                        topology.opt_in_writes_enabled_during_window,
                 });
                 if let Some(since) = topology.failover_since_unix_ms {
                     failover["failover_since_unix_ms"] = json!(since);
