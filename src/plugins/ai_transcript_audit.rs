@@ -2217,9 +2217,7 @@ impl Plugin for AiTranscriptAudit {
         if !self.stream_tee_wanted(&ctx.metadata) {
             return None;
         }
-        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
-            return None;
-        };
+        let sample_hit = self.owned_sample_hit(&ctx.metadata)?;
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
         // this request won the sampling roll (`emit_decision` emits on `sampled`
