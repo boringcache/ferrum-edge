@@ -297,9 +297,7 @@ fn openapi_workload_metrics_sampling_documents_proxy_config_source() {
         "openapi.yaml sampling_percentage must cite ProxyConfig.spec.tracing.sampling"
     );
     assert!(
-        !OPENAPI_YAML.contains(
-            "Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD)."
-        ),
+        !OPENAPI_YAML.contains("Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD)."),
         "openapi.yaml must not claim sampling_percentage is Telemetry-only"
     );
 }
