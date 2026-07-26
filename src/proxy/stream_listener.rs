@@ -132,7 +132,13 @@ impl StreamBackendRoutingKey {
             let mut targets: Vec<(String, u16)> = config
                 .upstreams
                 .iter()
-                .find(|u| u.id.as_str() == upstream_id.as_str())
+                .find(|u| {
+                    // Upstream references are namespace-local. A bare-id match
+                    // would latch onto another tenant's same-id upstream and
+                    // gate TLS-cache retention against the wrong target set.
+                    u.namespace.as_str() == proxy.namespace.as_str()
+                        && u.id.as_str() == upstream_id.as_str()
+                })
                 .map(|u| {
                     // Mirror `LoadBalancer::with_subsets_and_port_overrides`:
                     // a target belongs to a subset when its tags contain
@@ -2566,6 +2572,64 @@ mod tests {
             key_a,
             StreamBackendRoutingKey::from_proxy(&proxy, &v1_is_a),
             "unchanged subset membership must compare equal"
+        );
+    }
+
+    #[test]
+    fn stream_backend_routing_key_resolves_upstream_by_namespace() {
+        // Same upstream id in two tenants must not latch TLS routing onto the
+        // foreign tenant's targets (issue #3094).
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p1",
+            "namespace": "tenant-a",
+            "listen_path": "/",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": 9443,
+            "upstream_id": "u1",
+        }))
+        .expect("proxy deserialize");
+
+        // Insert the foreign upstream first so a bare-id find would wrongly
+        // prefer it.
+        let config_both = GatewayConfig {
+            upstreams: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "u1",
+                    "namespace": "tenant-b",
+                    "algorithm": "round_robin",
+                    "targets": [{"host": "foreign.example", "port": 443}],
+                }))
+                .expect("upstream deserialize"),
+                serde_json::from_value(serde_json::json!({
+                    "id": "u1",
+                    "namespace": "tenant-a",
+                    "algorithm": "round_robin",
+                    "targets": [{"host": "local.example", "port": 443}],
+                }))
+                .expect("upstream deserialize"),
+            ],
+            ..GatewayConfig::default()
+        };
+
+        let key = StreamBackendRoutingKey::from_proxy(&proxy, &config_both);
+        assert_eq!(
+            key.upstream_targets.as_deref(),
+            Some(&[("local.example".to_string(), 443u16)][..]),
+            "routing key must use the same-namespace upstream, not a same-id foreign one"
+        );
+
+        // Drop the local upstream: the foreign same-id entry must not fill in.
+        let config_foreign_only = GatewayConfig {
+            upstreams: vec![config_both.upstreams[0].clone()],
+            ..GatewayConfig::default()
+        };
+        let missing = StreamBackendRoutingKey::from_proxy(&proxy, &config_foreign_only);
+        assert_eq!(
+            missing.upstream_targets.as_deref(),
+            Some(&[][..]),
+            "a dangling same-namespace upstream_id must yield an empty target set"
         );
     }
 }

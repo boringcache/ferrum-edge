@@ -3668,6 +3668,7 @@ fn test_validate_unique_resource_ids_duplicate_proxy() {
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Duplicate proxy ID 'p1'"));
+    assert!(err[0].contains("namespace"));
 }
 
 #[test]
@@ -3689,6 +3690,99 @@ fn test_validate_unique_resource_ids_allows_consumer_id_in_different_namespaces(
     config.consumers = vec![prod, staging];
 
     assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_different_namespaces() {
+    // Same resource id may exist in two tenants; uniqueness is per namespace.
+    let mut config = empty_config();
+    let mut prod_proxy = make_proxy("shared", "/api");
+    prod_proxy.namespace = "prod".to_string();
+    let mut staging_proxy = make_proxy("shared", "/api");
+    staging_proxy.namespace = "staging".to_string();
+    let mut prod_upstream = make_upstream("shared");
+    prod_upstream.namespace = "prod".to_string();
+    let mut staging_upstream = make_upstream("shared");
+    staging_upstream.namespace = "staging".to_string();
+    let mut prod_plugin = PluginConfig {
+        id: "shared".into(),
+        namespace: "prod".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut staging_plugin = prod_plugin.clone();
+    staging_plugin.namespace = "staging".to_string();
+    config.proxies = vec![prod_proxy, staging_proxy];
+    config.upstreams = vec![prod_upstream, staging_upstream];
+    config.plugin_configs = vec![prod_plugin, staging_plugin];
+
+    assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_upstream_references_rejects_cross_namespace_same_id() {
+    // A proxy in tenant-a referencing upstream "u1" must not pass admission
+    // just because tenant-b owns an upstream with that id (issue #3094).
+    let mut config = empty_config();
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.namespace = "tenant-a".to_string();
+    proxy.upstream_id = Some("u1".to_string());
+    let mut foreign_upstream = make_upstream("u1");
+    foreign_upstream.namespace = "tenant-b".to_string();
+    config.proxies = vec![proxy];
+    config.upstreams = vec![foreign_upstream];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("non-existent upstream_id 'u1'")),
+        "expected dangling same-namespace upstream rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn test_resolve_upstream_tls_keeps_same_id_upstreams_in_two_namespaces_independent() {
+    // Bare-id TLS projection would last-win and stamp the wrong tenant's CA onto
+    // every proxy that references a shared upstream id (issue #3094).
+    let mut config = empty_config();
+    let mut tenant_a_upstream = make_upstream("u1");
+    tenant_a_upstream.namespace = "tenant-a".to_string();
+    tenant_a_upstream.backend_tls_server_ca_cert_path = Some("/tenant-a/ca.pem".into());
+    let mut tenant_b_upstream = make_upstream("u1");
+    tenant_b_upstream.namespace = "tenant-b".to_string();
+    tenant_b_upstream.backend_tls_server_ca_cert_path = Some("/tenant-b/ca.pem".into());
+    let mut tenant_a_proxy = make_proxy("p1", "/a");
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    tenant_a_proxy.upstream_id = Some("u1".to_string());
+    let mut tenant_b_proxy = make_proxy("p1", "/b");
+    tenant_b_proxy.namespace = "tenant-b".to_string();
+    tenant_b_proxy.upstream_id = Some("u1".to_string());
+    config.upstreams = vec![tenant_a_upstream, tenant_b_upstream];
+    config.proxies = vec![tenant_a_proxy, tenant_b_proxy];
+
+    config.resolve_upstream_tls();
+
+    assert_eq!(
+        config.proxies[0]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/tenant-a/ca.pem")
+    );
+    assert_eq!(
+        config.proxies[1]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/tenant-b/ca.pem")
+    );
 }
 
 #[test]

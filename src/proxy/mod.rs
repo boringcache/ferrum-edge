@@ -1186,7 +1186,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
     proxy: &Proxy,
     pool_key: &str,
     forces_reqwest: bool,
-    upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+    upstream_map: &HashMap<(&str, &str), &crate::config::types::Upstream>,
     http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
     https_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
 ) {
@@ -1197,7 +1197,8 @@ fn collect_reqwest_warmup_candidates_for_proxy(
 
     let mut targets: Vec<(String, u16)> = Vec::new();
     if let Some(ref upstream_id) = proxy.upstream_id
-        && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+        && let Some(upstream) =
+            upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
     {
         for target in &upstream.targets {
             // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
@@ -5159,7 +5160,7 @@ impl ProxyState {
         let proxy_map = config
             .proxies
             .iter()
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect::<HashMap<_, _>>();
         for plugin in &config.plugin_configs {
             if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
@@ -5176,7 +5177,7 @@ impl ProxyState {
             let base_proxy = plugin
                 .proxy_id
                 .as_deref()
-                .and_then(|proxy_id| proxy_map.get(proxy_id).copied())
+                .and_then(|proxy_id| proxy_map.get(&(plugin.namespace.as_str(), proxy_id)).copied())
                 .or_else(|| config.proxies.first());
             let Some(base_proxy) = base_proxy else {
                 continue;
@@ -6105,15 +6106,18 @@ impl ProxyState {
         &self,
         config: &GatewayConfig,
     ) -> Vec<BackendCapabilityProbeTarget> {
-        let upstream_map: HashMap<&str, &Upstream> = config
+        // Capability probes must resolve upstreams/proxies by (namespace, id).
+        // A bare-id map last-wins across tenants and can probe or retain the
+        // wrong tenant's targets while retain_keys drops the correct ones.
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| (upstream.id.as_str(), upstream))
+            .map(|upstream| ((upstream.namespace.as_str(), upstream.id.as_str()), upstream))
             .collect();
-        let proxy_map: HashMap<&str, &Proxy> = config
+        let proxy_map: HashMap<(&str, &str), &Proxy> = config
             .proxies
             .iter()
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -6124,7 +6128,8 @@ impl ProxyState {
             }
 
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+                && let Some(upstream) =
+                    upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
             {
                 for target in &upstream.targets {
                     // SKIP cross-cluster east-west HBONE targets: they dial the
@@ -6222,7 +6227,7 @@ impl ProxyState {
     /// and dispatch capability keys agree by construction.
     fn collect_mesh_tcp_egress_capability_targets(
         config: &GatewayConfig,
-        upstream_map: &HashMap<&str, &Upstream>,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
         seen: &mut std::collections::HashSet<String>,
         targets: &mut Vec<BackendCapabilityProbeTarget>,
     ) {
@@ -6236,7 +6241,9 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                else {
                     continue;
                 };
                 let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
@@ -6246,7 +6253,11 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &service.namespace,
+                        &upstream_id,
+                    );
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -6284,7 +6295,9 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
+            let Some(upstream) = upstream_map
+                .get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            else {
                 continue;
             };
             let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
@@ -6294,8 +6307,11 @@ impl ProxyState {
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
-            relay_proxy.dispatch_port_overrides =
-                Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id);
+            relay_proxy.dispatch_port_overrides = Self::projected_dispatch_overrides_for_upstream(
+                config,
+                &spec.service.namespace,
+                &spec.upstream_id,
+            );
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -6333,7 +6349,9 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                else {
                     continue;
                 };
                 let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
@@ -6343,7 +6361,11 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &service.namespace,
+                        &upstream_id,
+                    );
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -6367,8 +6389,8 @@ impl ProxyState {
     fn collect_mesh_route_dispatch_capability_targets(
         &self,
         config: &GatewayConfig,
-        proxy_map: &HashMap<&str, &Proxy>,
-        upstream_map: &HashMap<&str, &Upstream>,
+        proxy_map: &HashMap<(&str, &str), &Proxy>,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
         seen: &mut std::collections::HashSet<String>,
         targets: &mut Vec<BackendCapabilityProbeTarget>,
     ) {
@@ -6379,7 +6401,7 @@ impl ProxyState {
             let Some(proxy_id) = plugin.proxy_id.as_deref() else {
                 continue;
             };
-            let Some(base_proxy) = proxy_map.get(proxy_id) else {
+            let Some(base_proxy) = proxy_map.get(&(plugin.namespace.as_str(), proxy_id)) else {
                 continue;
             };
             if !base_proxy.dispatch_kind.is_http_family() {
@@ -6403,7 +6425,9 @@ impl ProxyState {
                 let mut effective_proxy = (*base_proxy).clone();
                 if let Some(upstream_id) = destination.upstream_id {
                     effective_proxy.upstream_id = Some(upstream_id.clone());
-                    let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    let Some(upstream) = upstream_map
+                        .get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
+                    else {
                         continue;
                     };
                     effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
@@ -7211,10 +7235,10 @@ impl ProxyState {
         // probes also `tokio::join!` H2 + H3 internally) — overloading
         // backends and breaking the operator-set cap.
         let warmup_semaphore = Arc::new(Semaphore::new(concurrency));
-        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &crate::config::types::Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| (upstream.id.as_str(), upstream))
+            .map(|upstream| ((upstream.namespace.as_str(), upstream.id.as_str()), upstream))
             .collect();
 
         // Collect ALL reqwest warmup candidates upfront, partitioned by
@@ -7715,8 +7739,11 @@ impl ProxyState {
         let Some(mesh) = config.mesh.as_deref() else {
             return HashMap::new();
         };
-        let upstream_ids: std::collections::HashSet<&str> =
-            config.upstreams.iter().map(|u| u.id.as_str()).collect();
+        let upstream_keys: std::collections::HashSet<(&str, &str)> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.namespace.as_str(), u.id.as_str()))
+            .collect();
         let mut projection = HashMap::new();
 
         for service in &mesh.services {
@@ -7729,10 +7756,14 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_ids.contains(upstream_id.as_str()) {
+                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
                         upstream_id.clone(),
-                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                        Self::projected_dispatch_overrides_for_upstream(
+                            config,
+                            &service.namespace,
+                            &upstream_id,
+                        ),
                     );
                 }
             }
@@ -7742,10 +7773,14 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_ids.contains(upstream_id.as_str()) {
+                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
                         upstream_id.clone(),
-                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                        Self::projected_dispatch_overrides_for_upstream(
+                            config,
+                            &service.namespace,
+                            &upstream_id,
+                        ),
                     );
                 }
             }
@@ -7756,10 +7791,16 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            if upstream_ids.contains(spec.upstream_id.as_str()) {
+            if upstream_keys
+                .contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            {
                 projection.insert(
                     spec.upstream_id.clone(),
-                    Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id),
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &spec.service.namespace,
+                        &spec.upstream_id,
+                    ),
                 );
             }
         }
@@ -7769,9 +7810,13 @@ impl ProxyState {
 
     fn projected_dispatch_overrides_for_upstream(
         config: &GatewayConfig,
+        namespace: &str,
         upstream_id: &str,
     ) -> Option<HashMap<u16, crate::config::types::ResolvedPortOverride>> {
-        let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.namespace == namespace && u.id == upstream_id)?;
         if upstream.port_overrides.is_empty() {
             return None;
         }
@@ -34700,10 +34745,10 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let upstream_map: HashMap<&str, &Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), u))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -34794,10 +34839,10 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let upstream_map: HashMap<&str, &Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), u))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -41044,7 +41089,7 @@ mod tests {
         let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
         let https_proxy = warmup_test_proxy("s", BackendScheme::Https, "secure.test", 443);
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41094,7 +41139,7 @@ mod tests {
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
         let shared_pool_key = "test-pool-key|shared-tls";
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41142,7 +41187,7 @@ mod tests {
         let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41193,8 +41238,8 @@ mod tests {
             "up1",
             &[("a.test", 8443), ("b.test", 8443), ("c.test", 8443)],
         );
-        let mut upstreams: HashMap<&str, &Upstream> = HashMap::new();
-        upstreams.insert("up1", &upstream);
+        let mut upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
+        upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()), &upstream);
 
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41223,7 +41268,7 @@ mod tests {
         // proxy's traffic.
         let proxy_skip = warmup_test_proxy("skip", BackendScheme::Https, "shared.test", 443);
         let proxy_force = warmup_test_proxy("force", BackendScheme::Https, "shared.test", 443);
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         // Same pool_key so the two proxies actually share a candidate.
         let shared_pool_key = "pool-key-shared";
 
