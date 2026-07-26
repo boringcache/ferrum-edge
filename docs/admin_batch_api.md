@@ -493,8 +493,18 @@ Each resource in the batch is validated before any database writes. If validatio
 | 501 | The configured database deployment cannot provide the all-or-nothing guarantee (standalone MongoDB) — refused before any mutation | No |
 | 503 | No database available, the datastore write failed, or the namespace config-admission lease lapsed before commit | No |
 
-Every non-`201` status leaves the namespace exactly as it was, so retrying the
-same payload is safe.
+Every non-`201` status leaves the namespace as it was, so retrying the same
+payload is safe. `409`, `501`, and the datastore/lease `503`s are raised by the
+persistence attempt and carry `"rollback": "not_needed"`; `400` and the
+namespace-admission `503` are raised before persistence and keep their shared
+response shapes (`validation_errors` and the admission-unavailable body
+respectively). No failure body ever carries `created` counts.
+
+**One residual case the server cannot decide.** If the database acknowledges the
+commit but the acknowledgement is lost in transit, the transaction is durable
+while Ferrum reports `503`. A retry of the identical payload then answers `409`
+instead of `201` — that is the signal to re-read the namespace (`GET /backup`)
+before retrying again, rather than evidence of a second failure.
 
 ## Chunking Strategy
 

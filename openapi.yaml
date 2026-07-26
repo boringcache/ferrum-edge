@@ -3296,12 +3296,23 @@ paths:
 
         ### Failure responses
 
-        Every non-`201` status leaves the namespace exactly as it was. Failure
-        bodies carry `error` and `"rollback": "not_needed"` (persistence is one
-        transaction, so there is never a partial graph to compensate for), plus
-        `detail` on `501`. `503` covers namespace-admission contention, a lapsed
-        admission lease, and a failed datastore write — all retryable with the
-        identical payload.
+        Every non-`201` status leaves the namespace as it was, and no failure
+        body ever carries `created` counts. Statuses raised by the persistence
+        attempt itself — `409`, `501`, and the datastore/lease `503`s — use
+        `BatchAtomicFailureResponse`: `error`, `"rollback": "not_needed"`
+        (persistence is one transaction, so there is never a partial graph to
+        compensate for), plus `detail` on `501`. Statuses raised before
+        persistence keep their shared shapes instead: `400` returns
+        `error` + `validation_errors`, and a namespace-admission `503` returns
+        the shared admission-unavailable body. `503` covers namespace-admission
+        contention, a lapsed admission lease, and a failed datastore write —
+        all retryable with the identical payload.
+
+        One residual case is not decidable by the server: if the commit itself
+        is acknowledged but the acknowledgement is lost in transit, the batch
+        is reported as a `503` even though the graph is durable. A retry of the
+        identical payload then reports `409` rather than `201`, which is the
+        signal to re-read the namespace before retrying again.
       tags: [Batch]
       requestBody:
         required: true
