@@ -7454,9 +7454,12 @@ async fn admin_request_with_body(
 const OVERSIZED_BODY: usize = 2 * 1024 * 1024;
 
 /// A paginated GET must resolve `limit`/`offset` from the request line before
-/// the shared `Limited::collect` body read. Otherwise an oversized (and wholly
-/// unused) GET body turns the documented malformed-pagination `400` into a
-/// `413`, after buffering up to the cap on a read endpoint.
+/// the shared body read. Otherwise an oversized (and wholly unused) GET body
+/// turns the documented malformed-pagination `400` into a `413`, after
+/// buffering up to the cap on a read endpoint. Issue #2404 additionally stopped
+/// read routes from having their body collected at all, so this gate is now
+/// defence in depth for GETs — but it still decides the status on the mutation
+/// routes below, whose bodies *are* collected.
 #[tokio::test]
 async fn malformed_pagination_on_get_list_precedes_body_buffering() {
     let tc = TestConfig::default();
@@ -7519,8 +7522,8 @@ async fn malformed_pagination_on_get_list_precedes_body_buffering() {
 
 /// `/audit` narrows the shared `i64` offset to the audit store's `u32`. That
 /// route-specific ceiling has to be replayed in the pre-body gate too, or an
-/// offset the handler would reject with `400` instead buffers an unused body
-/// and returns `413`.
+/// offset the handler would reject with `400` is answered by some later stage
+/// instead of the documented pagination error.
 #[tokio::test]
 async fn audit_offset_ceiling_precedes_body_buffering() {
     let tc = TestConfig::default();
@@ -7552,9 +7555,12 @@ async fn audit_offset_ceiling_precedes_body_buffering() {
     assert_eq!(status, 400, "no-body audit offset: {body:?}");
     assert_eq!(body["error"], "Audit offset exceeds supported range");
 
-    // The bound is exact: `u32::MAX` is still accepted, so the oversized body
-    // reaches the shared reader and its `413` — proving the `400` above came
-    // from the ceiling, not from a blanket rejection of the route.
+    // The bound is exact: `u32::MAX` is still accepted, so the request runs on
+    // to the handler and reports the handler's own `503 No database` — proving
+    // the `400` above came from the ceiling, not from a blanket rejection of
+    // the route. `GET /audit` does not consume a request body, so per issue
+    // #2404 the oversized body is never buffered and can no longer be the
+    // witness here; the handler's status is.
     let (status, body) = admin_request_with_body(
         reqwest::Method::GET,
         &base_url,
@@ -7564,8 +7570,12 @@ async fn audit_offset_ceiling_precedes_body_buffering() {
     )
     .await;
     assert_eq!(
-        status, 413,
+        status, 503,
         "u32::MAX offset is in range and must not be pre-rejected: {body:?}"
+    );
+    assert_eq!(
+        body["error"], "No database",
+        "the in-range offset must reach the handler, not any earlier gate: {body:?}"
     );
 
     // Unrelated list routes keep the wider `i64` contract: the same offset is a

@@ -789,6 +789,28 @@ async fn insufficient_role_answers_without_collecting_the_body() {
     harness.shutdown().await;
 }
 
+/// A known *read* route is the largest class of routes that never touch the
+/// body, and the one an authenticated low-privilege caller can reach most
+/// cheaply. `GET /proxies` must answer from its handler — `503` with no
+/// database and no cached config — while the announced body is still
+/// outstanding, rather than buffering it up to the size cap first.
+#[tokio::test]
+async fn read_route_answers_without_collecting_the_body() {
+    let state = admin_state(LONG, limits(LONG));
+    let harness = AdminHarness::start_plain(state).await;
+    let token = token_with_role("admin");
+    assert_answered_without_reading_body(
+        &harness,
+        "GET",
+        "/proxies",
+        &token,
+        503,
+        "read route with an unread body",
+    )
+    .await;
+    harness.shutdown().await;
+}
+
 /// An unauthenticated caller must not be able to pin a body-collecting task.
 #[tokio::test]
 async fn unauthenticated_request_answers_without_collecting_the_body() {
