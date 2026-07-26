@@ -620,7 +620,9 @@ async fn provision_resources(
             .json(&json!({ "consumers": chunk }))
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch consumer create failed: {} - {}", status, body).into());
@@ -652,7 +654,9 @@ async fn provision_resources(
             .json(&json!({ "proxies": chunk }))
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch proxy create failed: {} - {}", status, body).into());
@@ -741,7 +745,9 @@ async fn provision_resources(
             .json(&json!({ "plugin_configs": chunk }))
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch plugin create failed: {} - {}", status, body).into());
@@ -901,7 +907,9 @@ async fn provision_resources(
             .json(&json!({ "proxies": chunk }))
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch open proxy create failed: {} - {}", status, body).into());

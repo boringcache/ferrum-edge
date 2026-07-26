@@ -236,7 +236,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
 | **Transaction Logging** | `client_ip` included in all log entries and transaction summaries |
 | **X-Forwarded-For (outbound)** | Outbound XFF chain built per standard `proxy_add_x_forwarded_for` semantics (see below) |
-| **Forwarded (outbound, RFC 7239)** | `for=` carries the resolved client IP when `FERRUM_ADD_FORWARDED_HEADER` is enabled |
+| **Forwarded (outbound, RFC 7239)** | `for=` carries the resolved client IP when `FERRUM_ADD_FORWARDED_HEADER` is enabled; client-supplied `Forwarded` is discarded so only the gateway-owned element reaches backends |
 
 ## Troubleshooting
 
