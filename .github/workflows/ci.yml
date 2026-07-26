@@ -1095,10 +1095,218 @@ jobs:
 
           # TLS fixtures for functional_db_tls_test (ports 15432 / 13306) and
           # functional_mongodb_test TLS/mTLS cells (ports 27018 / 27019).
-          # Invoked from the scanned automation root (.github/scripts/), not
-          # tests/scripts/, so Trusted Cross policy accepts the repository command.
-          .github/scripts/setup_db_tls.sh "${RUNNER_TEMP}/ferrum-db-tls-certs"
-          .github/scripts/setup_mongo_tls.sh "${RUNNER_TEMP}/ferrum-mongo-tls-certs"
+          # Provisioned inline in this non-ARM64 data-plane job — do not add
+          # new .github/scripts helpers for these fixtures (Trusted Cross treats
+          # newly reachable automation scripts as Cross-sensitive surfaces).
+          # Local SQL TLS remains tests/scripts/setup_db_tls.sh; Mongo TLS is
+          # hosted-CI-owned (local cells skip unless fixtures are already up).
+          DB_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-db-tls-certs"
+          MONGO_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-mongo-tls-certs"
+          mkdir -p "$DB_TLS_CERT_DIR" "$MONGO_TLS_CERT_DIR"
+
+          # --- PostgreSQL / MySQL TLS certificates ---
+          openssl genrsa -out "$DB_TLS_CERT_DIR/ca.key" 4096 2>/dev/null
+          openssl req -new -x509 -days 3650 -key "$DB_TLS_CERT_DIR/ca.key" \
+            -out "$DB_TLS_CERT_DIR/ca.crt" -subj "/CN=Ferrum Test CA" 2>/dev/null
+
+          pg_ext=$(mktemp)
+          cat > "$pg_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:postgres-tls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/pg-server.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/pg-server.key" \
+            -out "$DB_TLS_CERT_DIR/pg-server.csr" -subj "/CN=postgres-tls" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/pg-server.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$pg_ext" \
+            -out "$DB_TLS_CERT_DIR/pg-server.crt" 2>/dev/null
+          rm -f "$pg_ext" "$DB_TLS_CERT_DIR/pg-server.csr"
+
+          mysql_ext=$(mktemp)
+          cat > "$mysql_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:mysql-tls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/mysql-server.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/mysql-server.key" \
+            -out "$DB_TLS_CERT_DIR/mysql-server.csr" -subj "/CN=mysql-tls" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/mysql-server.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mysql_ext" \
+            -out "$DB_TLS_CERT_DIR/mysql-server.crt" 2>/dev/null
+          rm -f "$mysql_ext" "$DB_TLS_CERT_DIR/mysql-server.csr"
+
+          client_ext=$(mktemp)
+          cat > "$client_ext" <<'EXTEOF'
+          [v3_req]
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/client.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/client.key" \
+            -out "$DB_TLS_CERT_DIR/client.csr" -subj "/CN=ferrum" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/client.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$client_ext" \
+            -out "$DB_TLS_CERT_DIR/client.crt" 2>/dev/null
+          rm -f "$client_ext" "$DB_TLS_CERT_DIR/client.csr" "$DB_TLS_CERT_DIR/ca.srl"
+
+          chmod 600 "$DB_TLS_CERT_DIR/pg-server.key" "$DB_TLS_CERT_DIR/client.key"
+          chmod 644 "$DB_TLS_CERT_DIR/mysql-server.key" "$DB_TLS_CERT_DIR/mysql-server.crt" \
+            "$DB_TLS_CERT_DIR/ca.crt" "$DB_TLS_CERT_DIR/pg-server.crt" "$DB_TLS_CERT_DIR/client.crt"
+
+          docker rm -f ferrum-test-pg-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-pg-tls \
+            -p 15432:5432 \
+            -e POSTGRES_DB=ferrum \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=test-password \
+            -v "$DB_TLS_CERT_DIR:/certs-src:ro" \
+            --entrypoint sh \
+            postgres:16 \
+            -c '
+              cp /certs-src/pg-server.crt /var/lib/postgresql/server.crt &&
+              cp /certs-src/pg-server.key /var/lib/postgresql/server.key &&
+              cp /certs-src/ca.crt /var/lib/postgresql/ca.crt &&
+              chown postgres:postgres /var/lib/postgresql/server.* /var/lib/postgresql/ca.crt &&
+              chmod 600 /var/lib/postgresql/server.key &&
+              chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/ca.crt &&
+              exec docker-entrypoint.sh postgres \
+                -c ssl=on \
+                -c ssl_cert_file=/var/lib/postgresql/server.crt \
+                -c ssl_key_file=/var/lib/postgresql/server.key \
+                -c ssl_ca_file=/var/lib/postgresql/ca.crt
+            '
+
+          docker rm -f ferrum-test-mysql-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mysql-tls \
+            -p 13306:3306 \
+            -e MYSQL_DATABASE=ferrum \
+            -e MYSQL_USER=ferrum \
+            -e MYSQL_PASSWORD=test-password \
+            -e MYSQL_ROOT_PASSWORD=test-password \
+            -v "$DB_TLS_CERT_DIR/mysql-server.crt:/etc/mysql/ssl/server-cert.pem:ro" \
+            -v "$DB_TLS_CERT_DIR/mysql-server.key:/etc/mysql/ssl/server-key.pem:ro" \
+            -v "$DB_TLS_CERT_DIR/ca.crt:/etc/mysql/ssl/ca.pem:ro" \
+            mysql:8 \
+            --require-secure-transport=ON \
+            --ssl-cert=/etc/mysql/ssl/server-cert.pem \
+            --ssl-key=/etc/mysql/ssl/server-key.pem \
+            --ssl-ca=/etc/mysql/ssl/ca.pem
+
+          # --- MongoDB TLS / mTLS certificates ---
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/ca.key" 4096 2>/dev/null
+          openssl req -new -x509 -days 3650 -key "$MONGO_TLS_CERT_DIR/ca.key" \
+            -out "$MONGO_TLS_CERT_DIR/ca.crt" -subj "/CN=Ferrum Mongo Test CA" 2>/dev/null
+
+          mongo_server_ext=$(mktemp)
+          cat > "$mongo_server_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:mongo-tls,DNS:mongo-mtls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/server.key" 2048 2>/dev/null
+          openssl req -new -key "$MONGO_TLS_CERT_DIR/server.key" \
+            -out "$MONGO_TLS_CERT_DIR/server.csr" -subj "/CN=mongo-tls" 2>/dev/null
+          openssl x509 -req -in "$MONGO_TLS_CERT_DIR/server.csr" -CA "$MONGO_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$MONGO_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mongo_server_ext" \
+            -out "$MONGO_TLS_CERT_DIR/server.crt" 2>/dev/null
+          rm -f "$mongo_server_ext" "$MONGO_TLS_CERT_DIR/server.csr"
+          cat "$MONGO_TLS_CERT_DIR/server.crt" "$MONGO_TLS_CERT_DIR/server.key" \
+            > "$MONGO_TLS_CERT_DIR/mongodb.pem"
+
+          mongo_client_ext=$(mktemp)
+          cat > "$mongo_client_ext" <<'EXTEOF'
+          [v3_req]
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EXTEOF
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/client.key" 2048 2>/dev/null
+          openssl req -new -key "$MONGO_TLS_CERT_DIR/client.key" \
+            -out "$MONGO_TLS_CERT_DIR/client.csr" -subj "/CN=ferrum-mongo-client" 2>/dev/null
+          openssl x509 -req -in "$MONGO_TLS_CERT_DIR/client.csr" -CA "$MONGO_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$MONGO_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mongo_client_ext" \
+            -out "$MONGO_TLS_CERT_DIR/client.crt" 2>/dev/null
+          rm -f "$mongo_client_ext" "$MONGO_TLS_CERT_DIR/client.csr" "$MONGO_TLS_CERT_DIR/ca.srl"
+          cat "$MONGO_TLS_CERT_DIR/client.crt" "$MONGO_TLS_CERT_DIR/client.key" \
+            > "$MONGO_TLS_CERT_DIR/client.pem"
+
+          # File-based mongosh ping (no opaque mongosh --eval readiness surface).
+          printf '%s\n' 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' \
+            > "$MONGO_TLS_CERT_DIR/ping.js"
+
+          chmod 600 "$MONGO_TLS_CERT_DIR/ca.key" "$MONGO_TLS_CERT_DIR/server.key" \
+            "$MONGO_TLS_CERT_DIR/client.key" "$MONGO_TLS_CERT_DIR/mongodb.pem" \
+            "$MONGO_TLS_CERT_DIR/client.pem"
+          chmod 644 "$MONGO_TLS_CERT_DIR/ca.crt" "$MONGO_TLS_CERT_DIR/server.crt" \
+            "$MONGO_TLS_CERT_DIR/client.crt" "$MONGO_TLS_CERT_DIR/ping.js"
+
+          docker rm -f ferrum-test-mongo-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mongo-tls \
+            -p 27018:27017 \
+            -v "$MONGO_TLS_CERT_DIR:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
+            --entrypoint bash \
+            mongo:7 \
+            -c '
+              set -e
+              mkdir -p /certs
+              cp /certs-src/mongodb.pem /certs/mongodb.pem
+              cp /certs-src/ca.crt /certs/ca.crt
+              cp /certs-src/client.pem /certs/client.pem
+              cp /certs-src/ping.js /certs/ping.js
+              chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
+              chmod 600 /certs/mongodb.pem /certs/client.pem
+              chmod 644 /certs/ca.crt /certs/ping.js
+              exec docker-entrypoint.sh mongod \
+                --bind_ip_all \
+                --tlsMode requireTLS \
+                --tlsCertificateKeyFile /certs/mongodb.pem \
+                --tlsCAFile /certs/ca.crt \
+                --tlsAllowConnectionsWithoutCertificates
+            '
+
+          docker rm -f ferrum-test-mongo-mtls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mongo-mtls \
+            -p 27019:27017 \
+            -v "$MONGO_TLS_CERT_DIR:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt --tlsCertificateKeyFile /certs/client.pem /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
+            --entrypoint bash \
+            mongo:7 \
+            -c '
+              set -e
+              mkdir -p /certs
+              cp /certs-src/mongodb.pem /certs/mongodb.pem
+              cp /certs-src/ca.crt /certs/ca.crt
+              cp /certs-src/client.pem /certs/client.pem
+              cp /certs-src/ping.js /certs/ping.js
+              chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
+              chmod 600 /certs/mongodb.pem /certs/client.pem
+              chmod 644 /certs/ca.crt /certs/ping.js
+              exec docker-entrypoint.sh mongod \
+                --bind_ip_all \
+                --tlsMode requireTLS \
+                --tlsCertificateKeyFile /certs/mongodb.pem \
+                --tlsCAFile /certs/ca.crt
+            '
 
           # The runner used to gate steps on the services' --health-cmd; reproduce
           # that readiness wait using the tools shipped inside each image.
@@ -1195,6 +1403,76 @@ jobs:
           docker exec ferrum-ci-postgres psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
             "ALTER USER ferrum WITH CREATEDB;"
 
+          # SQL TLS readiness (TCP probes; avoid mid-init false positives).
+          pg_tls_ok=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-test-pg-tls pg_isready -h 127.0.0.1 -U ferrum -d ferrum >/dev/null 2>&1; then
+              pg_tls_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$pg_tls_ok" ]; then
+            echo "::error::postgres TLS fixture did not become ready"
+            docker logs ferrum-test-pg-tls; exit 1
+          fi
+
+          mysql_tls_ok=""
+          for _ in $(seq 1 90); do
+            if MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
+                  mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
+              && MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
+                  mysql -h 127.0.0.1 -uferrum -D ferrum -e "SELECT 1" >/dev/null 2>&1; then
+              mysql_tls_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mysql_tls_ok" ]; then
+            echo "::error::mysql TLS fixture did not become ready"
+            docker logs ferrum-test-mysql-tls; exit 1
+          fi
+
+          MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls mysql -uroot -e \
+            "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
+          docker exec ferrum-test-pg-tls psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
+            "ALTER USER ferrum WITH CREATEDB;"
+
+          # Mongo TLS/mTLS readiness via docker HEALTHCHECK status only
+          # (file-based ping.js; no docker-exec mongosh --eval for these fixtures).
+          for name in ferrum-test-mongo-tls ferrum-test-mongo-mtls; do
+            mongo_tls_ok=""
+            for _ in $(seq 1 60); do
+              state_json="$(docker inspect "$name" 2>/dev/null || true)"
+              if [ -z "$state_json" ]; then
+                echo "::error::$name is missing"
+                exit 1
+              fi
+              running="$(printf '%s\n' "$state_json" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)[0]["State"].get("Running") else "false")')"
+              status="$(printf '%s\n' "$state_json" | python3 -c 'import json,sys; s=json.load(sys.stdin)[0]["State"]; print((s.get("Health") or {}).get("Status") or "none")')"
+              if [ "$running" != "true" ]; then
+                echo "::error::$name is not running"
+                docker logs --tail 40 "$name" || true
+                exit 1
+              fi
+              case "$status" in
+                healthy)
+                  mongo_tls_ok=1
+                  break
+                  ;;
+                unhealthy)
+                  echo "::error::$name HEALTHCHECK reported unhealthy"
+                  docker logs --tail 40 "$name" || true
+                  exit 1
+                  ;;
+              esac
+              sleep 2
+            done
+            if [ -z "$mongo_tls_ok" ]; then
+              echo "::error::$name did not become healthy"
+              docker logs --tail 40 "$name" || true
+              exit 1
+            fi
+          done
+
           echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020, mongo-tls:27018, mongo-mtls:27019, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
           echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
           echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
@@ -1275,8 +1553,7 @@ jobs:
             docker unpause "$name" >/dev/null 2>&1
             docker rm -f "$name" >/dev/null 2>&1
           done
-          .github/scripts/setup_db_tls.sh --cleanup >/dev/null 2>&1 || true
-          .github/scripts/setup_mongo_tls.sh --cleanup >/dev/null 2>&1 || true
+          rm -rf "${RUNNER_TEMP}/ferrum-db-tls-certs" "${RUNNER_TEMP}/ferrum-mongo-tls-certs"
 
       - name: Summarize functional shard
         if: always()

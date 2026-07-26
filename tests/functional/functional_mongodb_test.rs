@@ -12,9 +12,10 @@
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
 //!      - Docker: `docker run -d --name mongo-test -p 27017:27017 mongo:7`
-//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs
-//!      - Hosted CI / local: `.github/scripts/setup_mongo_tls.sh` (or the
-//!        `tests/scripts/setup_mongo_tls.sh` wrapper)
+//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs under
+//!      `FERRUM_TEST_MONGO_CERT_DIR` (defaults to `/tmp/ferrum-mongo-tls-certs`)
+//!      listening on 27018 (TLS) / 27019 (mTLS). Hosted data-plane CI
+//!      provisions these fixtures inline; local runs skip unless present.
 //!   3. Build the gateway: `cargo build`
 //!
 //! Hosted data-plane sets `FERRUM_DB_TLS_REQUIRED=1` with explicit
@@ -771,7 +772,7 @@ async fn test_mongodb_tls_connection() {
         ca_exists && reachable,
         &format!(
             "verify-full fixture unavailable (ca_exists={ca_exists}, reachable at {host_port}); \
-             run .github/scripts/setup_mongo_tls.sh"
+             hosted data-plane CI provisions Mongo TLS inline"
         ),
     ) {
         return;
@@ -817,7 +818,7 @@ async fn test_mongodb_tls_require_connection() {
         reachable,
         &format!(
             "require-mode fixture unavailable (reachable at {host_port}); \
-             run .github/scripts/setup_mongo_tls.sh"
+             hosted data-plane CI provisions Mongo TLS inline"
         ),
     ) {
         return;
@@ -868,7 +869,7 @@ async fn test_mongodb_mtls_connection() {
         certs_present && reachable,
         &format!(
             "mTLS fixture unavailable (certs_present={certs_present}, reachable at {host_port}); \
-             run .github/scripts/setup_mongo_tls.sh"
+             hosted data-plane CI provisions Mongo mTLS inline"
         ),
     ) {
         return;

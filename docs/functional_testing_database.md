@@ -39,7 +39,7 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | Concurrent mutations | included in SQLite CRUD matrix | included in PostgreSQL CRUD matrix | included in MySQL CRUD matrix | included in MongoDB CRUD matrix |
 | Migrate up + idempotency | `functional_migrate_*` (application shard) | `test_postgres_migrate_up_is_idempotent` | `test_mysql_migrate_up_is_idempotent` | N/A (index ensure path in Mongo lifecycle) |
 | Connectivity recovery | `functional_db_outage_test` / `functional_db_failover_test` | `test_postgres_connectivity_recovery_after_container_pause` | `test_mysql_connectivity_recovery_after_container_pause` | proxy continues on cached config in Mongo lifecycle |
-| Supported TLS modes | `test_sqlite_without_tls_settings` (N/A network TLS) | `test_postgresql_tls_verify_full`, `test_postgresql_tls_require` | `test_mysql_tls_verify_identity`, `test_mysql_tls_required` | `test_mongodb_tls_connection` (verify-full), `test_mongodb_tls_require_connection` (require), `test_mongodb_mtls_connection` (mTLS); hosted via `.github/scripts/setup_mongo_tls.sh` |
+| Supported TLS modes | `test_sqlite_without_tls_settings` (N/A network TLS) | `test_postgresql_tls_verify_full`, `test_postgresql_tls_require` | `test_mysql_tls_verify_identity`, `test_mysql_tls_required` | `test_mongodb_tls_connection` (verify-full), `test_mongodb_tls_require_connection` (require), `test_mongodb_mtls_connection` (mTLS); hosted inline in data-plane CI |
 
 ### CI job mapping
 
@@ -59,10 +59,10 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | `FERRUM_TEST_MONGO_TLS_URL` | `mongodb://127.0.0.1:27018/ferrum_test` | MongoDB TLS verify-full |
 | `FERRUM_TEST_MONGO_TLS_REQUIRE_URL` | `mongodb://127.0.0.1:27018/ferrum_test` | MongoDB TLS require (encryption without cert verification) |
 | `FERRUM_TEST_MONGO_MTLS_URL` | `mongodb://127.0.0.1:27019/ferrum_test` | MongoDB mTLS client authentication |
-| `FERRUM_TEST_MONGO_CERT_DIR` | `${RUNNER_TEMP}/ferrum-mongo-tls-certs` | Certs from `.github/scripts/setup_mongo_tls.sh` (`ca.crt`, `client.crt`, `client.key`) |
+| `FERRUM_TEST_MONGO_CERT_DIR` | `${RUNNER_TEMP}/ferrum-mongo-tls-certs` | Certs provisioned inline by data-plane CI (`ca.crt`, `client.crt`, `client.key`) |
 | `FERRUM_TEST_MONGO_REPLICA_SET` | `rs0` | Enables the transactional `POST /batch` MongoDB cell |
 | `FERRUM_TEST_MONGO_REPLICA_SET_URL` | `mongodb://localhost:27020/ferrum_test` | Replica-set member for that cell |
-| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | Certs from `.github/scripts/setup_db_tls.sh` |
+| `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | SQL TLS certs provisioned inline by data-plane CI (local: `tests/scripts/setup_db_tls.sh`) |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL/MongoDB TLS fixtures are missing |
 
@@ -443,7 +443,7 @@ println!("✓ Test description");
 ## Future Enhancements
 
 - [x] Add PostgreSQL/MySQL backend testing — required CI matrix in this doc + `functional_database_parity_test` / admin CRUD / namespace entry points
-- [x] Add TLS configuration testing — see [Database TLS Testing](database_tls.md#functional-testing); hosted data-plane runs `setup_db_tls.sh` + `setup_mongo_tls.sh` with `FERRUM_DB_TLS_REQUIRED=1`
+- [x] Add TLS configuration testing — see [Database TLS Testing](database_tls.md#functional-testing); hosted data-plane provisions SQL + Mongo TLS fixtures inline with `FERRUM_DB_TLS_REQUIRED=1`
 - [ ] Add metrics verification (check actual metric values)
 - [x] Add concurrent request testing — `run_concurrent_admin_mutations` in the admin CRUD matrix
 - [ ] Add large payload testing
@@ -463,8 +463,9 @@ The MongoDB functional test (`tests/functional/functional_mongodb_test.rs`) prov
 # Start MongoDB (plaintext)
 docker run -d --name mongo-test -p 27017:27017 mongo:7
 
-# Start MongoDB TLS + mTLS fixtures (canonical CI script; wrapper under tests/scripts/)
-.github/scripts/setup_mongo_tls.sh
+# MongoDB TLS/mTLS fixtures are provisioned inline by hosted data-plane CI.
+# Local TLS cells skip unless FERRUM_TEST_MONGO_CERT_DIR and ports 27018/27019
+# are already available.
 
 # Build the gateway
 cargo build
@@ -476,7 +477,7 @@ cargo build
 # Run the plaintext MongoDB test
 cargo test --test functional_tests test_mongodb_plaintext_full_lifecycle -- --ignored --nocapture
 
-# Run TLS tests (requires the Mongo TLS fixture above; hosted CI sets FERRUM_DB_TLS_REQUIRED=1)
+# Run TLS tests (hosted CI sets FERRUM_DB_TLS_REQUIRED=1; local skips without fixtures)
 cargo test --test functional_tests test_mongodb_tls_connection -- --ignored --nocapture
 cargo test --test functional_tests test_mongodb_tls_require_connection -- --ignored --nocapture
 cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --nocapture
@@ -506,7 +507,6 @@ cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --n
 
 ```bash
 docker stop mongo-test && docker rm mongo-test
-.github/scripts/setup_mongo_tls.sh --cleanup
 ```
 
 ## References

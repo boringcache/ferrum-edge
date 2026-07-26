@@ -422,22 +422,20 @@ export FERRUM_DB_TLS_CA_CERT_PATH=/etc/ferrum/rds-combined-ca-bundle.pem
 ## Functional Testing
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
-Hosted CI runs `.github/scripts/setup_db_tls.sh` (PostgreSQL/MySQL) and
-`.github/scripts/setup_mongo_tls.sh` (MongoDB verify-full / require / mTLS) in the
-data-plane functional shard and sets `FERRUM_DB_TLS_REQUIRED=1` so a missing TLS
-fixture fails the job instead of silently skipping. Local developers keep the
-opt-out by leaving that flag unset when the containers are not running.
+Hosted CI provisions PostgreSQL/MySQL TLS and MongoDB TLS/require/mTLS fixtures
+inline in the data-plane functional shard (`.github/workflows/ci.yml`) and sets
+`FERRUM_DB_TLS_REQUIRED=1` so a missing TLS fixture fails the job instead of
+silently skipping. Local developers keep the opt-out by leaving that flag unset
+when the containers are not running.
 
 ### Setup
 
 ```bash
 # Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
-./.github/scripts/setup_db_tls.sh
-# Compatibility wrapper: ./tests/scripts/setup_db_tls.sh
+./tests/scripts/setup_db_tls.sh
 
-# Generate certificates and start TLS/mTLS MongoDB containers
-./.github/scripts/setup_mongo_tls.sh
-# Compatibility wrapper: ./tests/scripts/setup_mongo_tls.sh
+# MongoDB TLS/mTLS fixtures are owned by hosted data-plane CI. Local Mongo TLS
+# cells skip unless FERRUM_TEST_MONGO_CERT_DIR / 27018 / 27019 are already present.
 
 # Build the gateway
 cargo build
@@ -454,7 +452,7 @@ cargo test --test functional_tests test_postgresql_tls_verify_full -- --ignored 
 cargo test --test functional_tests test_mysql_tls_verify_identity -- --ignored --nocapture
 cargo test --test functional_tests test_sqlite_without_tls_settings -- --ignored --nocapture
 
-# Run MongoDB TLS/mTLS tests
+# Run MongoDB TLS/mTLS tests (hosted CI provisions fixtures; local skips by default)
 cargo test --test functional_tests test_mongodb_tls_connection -- --ignored --nocapture
 cargo test --test functional_tests test_mongodb_tls_require_connection -- --ignored --nocapture
 cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --nocapture
@@ -486,9 +484,8 @@ Each test performs a complete CRUD cycle:
 ### Cleanup
 
 ```bash
-# Stop and remove the test database containers
-./.github/scripts/setup_db_tls.sh --cleanup
-./.github/scripts/setup_mongo_tls.sh --cleanup
+# Stop and remove the PostgreSQL/MySQL TLS test containers
+./tests/scripts/setup_db_tls.sh --cleanup
 ```
 
 ## Troubleshooting
