@@ -610,8 +610,9 @@ fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
             "redis_url",
         ),
     ] {
-        let error = RequestDeduplication::new(&config, PluginHttpClient::default())
-            .expect_err("unknown key must be rejected");
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("unknown key must be rejected");
+        };
         assert!(
             error.contains("request_deduplication: unknown configuration key(s)"),
             "{error}"
@@ -671,8 +672,9 @@ fn redis_only_keys_outside_redis_mode_are_rejected() {
         json!({"sync_mode": "local", "redis_key_prefix": "dedup"}),
         json!({"on_redis_unavailable": "local_only"}),
     ] {
-        let error = RequestDeduplication::new(&config, PluginHttpClient::default())
-            .expect_err("Redis-only key outside Redis mode must be rejected");
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("Redis-only key outside Redis mode must be rejected");
+        };
         assert!(
             error.contains("require sync_mode='redis'"),
             "unexpected error: {error}"
@@ -682,15 +684,16 @@ fn redis_only_keys_outside_redis_mode_are_rejected() {
 
 #[test]
 fn on_redis_unavailable_requires_a_known_policy() {
-    let error = RequestDeduplication::new(
+    let Err(error) = RequestDeduplication::new(
         &json!({
             "sync_mode": "redis",
             "redis_url": "redis://host:6379",
             "on_redis_unavailable": "fallback"
         }),
         PluginHttpClient::default(),
-    )
-    .expect_err("unknown policy must be rejected");
+    ) else {
+        panic!("unknown policy must be rejected");
+    };
     assert!(error.contains("'on_redis_unavailable'"), "{error}");
 }
 
