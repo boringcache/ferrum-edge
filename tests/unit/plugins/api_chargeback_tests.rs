@@ -3564,10 +3564,7 @@ fn test_ordinary_identity_equal_to_overflow_label_does_not_collide() {
         .iter()
         .find(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
         .expect("overflow aggregate row must exist after budget exhaustion");
-    let overflow_calls = overflow_entry
-        .value()
-        .call_count
-        .load(Ordering::Relaxed);
+    let overflow_calls = overflow_entry.value().call_count.load(Ordering::Relaxed);
     assert!(
         overflow_calls >= 5,
         "overflow row must retain folded charges, got {overflow_calls}"

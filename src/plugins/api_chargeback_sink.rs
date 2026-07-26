@@ -5231,9 +5231,9 @@ impl SpoolManager {
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
         // Optional test seam: runs under the writer lock so injected stalls
         // model real compression/write/fsync latency without changing the
-        // request-path enqueue contract.
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::BeforeWrite);
-        let _after_hook = SpoolWriteHookAfterGuard;
+        // request-path enqueue contract. Snapshot the hook once so AfterWrite
+        // cannot observe a different (later-installed) hook than BeforeWrite.
+        let _after_hook = SpoolWriteHookAfterGuard::enter();
         self.prepare_live_storage_locked()?;
         let body = serialize_json_each_row(events)?;
         if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
@@ -6728,23 +6728,39 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     }
 }
 
-fn run_spool_write_hook_for_tests(point: SpoolWriteHookPoint) {
-    let hook = spool_write_hook_slot()
+fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
+    spool_write_hook_slot()
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
-    if let Some(hook) = hook {
-        hook(point);
-    }
+        .and_then(|slot| slot.clone())
 }
 
 /// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
-/// exit path after [`SpoolWriteHookPoint::BeforeWrite`] has been observed.
-struct SpoolWriteHookAfterGuard;
+/// exit path with the same hook instance that observed `BeforeWrite`.
+///
+/// Re-reading the process-global slot on drop would let a write that entered
+/// under hook A publish `AfterWrite` to a later-installed hook B — breaking
+/// tests that deliberately stall one generation's write while asserting that
+/// generation has not finished.
+struct SpoolWriteHookAfterGuard {
+    hook: Option<SpoolWriteHookForTests>,
+}
+
+impl SpoolWriteHookAfterGuard {
+    fn enter() -> Self {
+        let hook = snapshot_spool_write_hook_for_tests();
+        if let Some(ref hook) = hook {
+            hook(SpoolWriteHookPoint::BeforeWrite);
+        }
+        Self { hook }
+    }
+}
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::AfterWrite);
+        if let Some(hook) = self.hook.take() {
+            hook(SpoolWriteHookPoint::AfterWrite);
+        }
     }
 }
 

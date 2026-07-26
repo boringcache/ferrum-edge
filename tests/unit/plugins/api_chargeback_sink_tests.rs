@@ -3008,29 +3008,39 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let finished = Arc::new((Mutex::new(false), Condvar::new()));
+    // Count writers currently parked inside BeforeWrite so the assertion below
+    // proves the gated write is still blocked, not merely that AfterWrite has
+    // not yet been observed on some other unpaired completion.
+    let parked_before_write = Arc::new(AtomicUsize::new(0));
     let _clear_hook = ClearSpoolWriteHookOnDrop {
         release: Arc::clone(&release),
     };
-    let block_first = Arc::new(AtomicBool::new(true));
 
     let entered_for_hook = Arc::clone(&entered);
     let release_for_hook = Arc::clone(&release);
     let finished_for_hook = Arc::clone(&finished);
+    let parked_for_hook = Arc::clone(&parked_before_write);
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => {
-            if block_first.swap(false, Ordering::SeqCst) {
-                {
-                    let (lock, cv) = &*entered_for_hook;
-                    let mut guard = lock.lock().expect("entered gate lock");
-                    *guard = true;
-                    cv.notify_all();
-                }
-                let (lock, cv) = &*release_for_hook;
-                let mut guard = lock.lock().expect("release gate lock");
-                while !*guard {
-                    guard = cv.wait(guard).expect("release gate wait");
+            // Hold the release lock before publishing `entered` so the test
+            // cannot race past this point until we are on the condvar wait.
+            // Every write that arrives while the gate is closed parks here, so
+            // a peer SpoolManager cannot publish AfterWrite early.
+            let (lock, cv) = &*release_for_hook;
+            let mut guard = lock.lock().expect("release gate lock");
+            {
+                let (entered_lock, entered_cv) = &*entered_for_hook;
+                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
+                if !*entered_guard {
+                    *entered_guard = true;
+                    entered_cv.notify_all();
                 }
             }
+            parked_for_hook.fetch_add(1, Ordering::SeqCst);
+            while !*guard {
+                guard = cv.wait(guard).expect("release gate wait");
+            }
+            parked_for_hook.fetch_sub(1, Ordering::SeqCst);
         }
         SpoolWriteHookPoint::AfterWrite => {
             let (lock, cv) = &*finished_for_hook;
@@ -3100,6 +3110,10 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     assert_eq!(
         lost_after_hook, lost_baseline,
         "bounded overflow enqueue must not drop while the delivery queue has capacity"
+    );
+    assert!(
+        parked_before_write.load(Ordering::SeqCst) > 0,
+        "gated spool write must still be parked in BeforeWrite before release"
     );
     assert!(
         !*finished.0.lock().expect("finished gate lock"),

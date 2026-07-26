@@ -255,8 +255,7 @@ fn oversized_header_without_external_identity_does_not_block_consumer() {
     assert_eq!(ctx.authenticated_identity_header, None);
 
     // External identities disabled: oversized header must not block the Consumer.
-    let outcome =
-        VerifyOutcome::success(Some(consumer), Some("alice".to_string()), Some(header));
+    let outcome = VerifyOutcome::success(Some(consumer), Some("alice".to_string()), Some(header));
     let ctx = context();
     assert!(authentication_attempt_can_commit(&ctx, &outcome, false));
     let mut ctx = context();
