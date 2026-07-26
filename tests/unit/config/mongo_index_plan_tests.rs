@@ -65,6 +65,25 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
         api_specs_unique.recreate_on_options_conflict,
         "api_specs unique+partial must recreate on options conflict"
     );
+
+    // Issue #2999: upstream (namespace, name) uniqueness is a durable Mongo
+    // invariant (partial unique on string names), matching the SQL baseline.
+    let upstream_name_unique = plan
+        .iter()
+        .find(|entry| {
+            entry.collection == "upstreams" && entry.model.keys == doc! { "namespace": 1, "name": 1 }
+        })
+        .expect("upstreams (namespace, name) index");
+    let upstream_opts = upstream_name_unique
+        .model
+        .options
+        .as_ref()
+        .expect("upstreams name index options");
+    assert_eq!(upstream_opts.unique, Some(true));
+    assert_eq!(
+        upstream_opts.partial_filter_expression.as_ref(),
+        Some(&doc! { "name": { "$type": "string" } })
+    );
 }
 
 #[test]
