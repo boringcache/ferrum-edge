@@ -1448,7 +1448,10 @@ mod tests {
                 .next_task_id
                 .load(Ordering::Relaxed)
                 .saturating_sub(start_id);
-            let cancelled = lifecycle.counters.cancelled_terminal.load(Ordering::Relaxed);
+            let cancelled = lifecycle
+                .counters
+                .cancelled_terminal
+                .load(Ordering::Relaxed);
             assert_eq!(lifecycle.tasks.len(), 0);
             assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
             assert!(
