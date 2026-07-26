@@ -3811,6 +3811,41 @@ fn test_validate_resource_ids_invalid_consumer_id() {
     assert!(err[0].contains("Consumer ID"));
 }
 
+#[test]
+fn test_validate_resource_ids_rejects_malformed_namespaces_for_every_resource_kind() {
+    let mut proxy = make_proxy("proxy-1", "/api");
+    proxy.namespace = "tenant|prod".to_string();
+    let mut consumer = make_consumer("consumer-1", "alice");
+    consumer.namespace = "tenant/prod".to_string();
+    let mut upstream = make_upstream("upstream-1");
+    upstream.namespace = "tenant prod".to_string();
+    let mut plugin = mtls_plugin(
+        "plugin-1",
+        PluginScope::Global,
+        None,
+        serde_json::json!({}),
+    );
+    plugin.namespace = String::new();
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        consumers: vec![consumer],
+        upstreams: vec![upstream],
+        plugin_configs: vec![plugin],
+        ..empty_config()
+    };
+    let errors = config.validate_resource_ids().unwrap_err();
+    assert_eq!(errors.len(), 4, "unexpected identity errors: {errors:?}");
+    for resource in ["Proxy", "Consumer", "Upstream", "PluginConfig"] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.starts_with(resource) && error.contains("namespace")),
+            "missing {resource} namespace rejection: {errors:?}"
+        );
+    }
+}
+
 // ---- Resource ID uniqueness tests ----
 
 #[test]

@@ -4675,10 +4675,12 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that all resource IDs are well-formed.
+    /// Validate that all resource IDs and namespaces are well-formed.
     ///
-    /// Checks every proxy, consumer, plugin_config, and upstream ID against
-    /// the `validate_resource_id` format rules.
+    /// Composite runtime keys use a delimiter that is excluded by the shared
+    /// ID/namespace grammar. Validate both halves at the config boundary so a
+    /// corrupt database row or untrusted file cannot make two tenant
+    /// identities collide after encoding.
     pub fn validate_resource_ids(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -4686,20 +4688,32 @@ impl GatewayConfig {
             if let Err(msg) = validate_resource_id(&proxy.id) {
                 errors.push(format!("Proxy ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&proxy.namespace) {
+                errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+            }
         }
         for consumer in &self.consumers {
             if let Err(msg) = validate_resource_id(&consumer.id) {
                 errors.push(format!("Consumer ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&consumer.namespace) {
+                errors.push(format!("Consumer '{}': {}", consumer.id, msg));
             }
         }
         for pc in &self.plugin_configs {
             if let Err(msg) = validate_resource_id(&pc.id) {
                 errors.push(format!("PluginConfig ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&pc.namespace) {
+                errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+            }
         }
         for upstream in &self.upstreams {
             if let Err(msg) = validate_resource_id(&upstream.id) {
                 errors.push(format!("Upstream ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&upstream.namespace) {
+                errors.push(format!("Upstream '{}': {}", upstream.id, msg));
             }
         }
 
