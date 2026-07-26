@@ -19,6 +19,7 @@ mod ai_stream_router_normalization_tests;
 mod ai_token_metrics_contract_tests;
 mod api_chargeback_sink_tests;
 mod apply_incremental_outcome_tests;
+mod audit_retention_tests;
 mod backend_mtls_tests;
 mod backend_tls_san_allow_list_tests;
 mod cni_tests;
