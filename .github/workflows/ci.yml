@@ -1197,9 +1197,9 @@ jobs:
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "${{ matrix.shard }}" = "data-plane" ]; then
-            # Keep parity mapping text, but avoid Markdown table pipes adjacent to
-            # GitHub expressions — Trusted Cross treats `| ${{ ... }}` as a piped
-            # opaque command outside build-arm64-cross.
+            # Keep parity mapping as plain prose (no Markdown table pipes beside
+            # workflow expressions). Trusted Cross otherwise treats a piped
+            # expression cell as an opaque command outside build-arm64-cross.
             echo "### Persistence parity mapping" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "Backends: \`sqlite,postgres,mysql,mongodb,redis\`" >> $GITHUB_STEP_SUMMARY
