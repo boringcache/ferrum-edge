@@ -2077,6 +2077,15 @@ pub async fn run(
     let initial_polled_namespaces = polled_namespaces;
     let poll_auto_apply_plugin_migrations = env_config.auto_apply_plugin_migrations;
 
+    // Poll freshness + bounded rejection metrics (CP registers the same type as
+    // database mode so authenticated `/health` and `/metrics` can expose
+    // `last_poll_completed_at` — issue #2986).
+    let database_delta_poll_metrics =
+        Arc::new(crate::modes::database::DatabaseDeltaPollMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
+    let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
+
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         // Match database mode: never burst catch-up full polls after a slow cycle.
@@ -2184,6 +2193,7 @@ pub async fn run(
                                 )
                                 .await
                                 {
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 merge_refreshed_change_sequences(
@@ -2228,6 +2238,7 @@ pub async fn run(
                                     )
                                     .await
                                     {
+                                        database_delta_poll_metrics_for_poll.record_poll_completed();
                                         continue;
                                     }
                                     // Reachable backend, invalid snapshot: keep the
@@ -2249,6 +2260,7 @@ pub async fn run(
                                     );
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
                             }
                         }
@@ -2290,6 +2302,7 @@ pub async fn run(
                                 )
                                 .await
                                 {
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -2327,6 +2340,7 @@ pub async fn run(
                                         next_sequences,
                                     );
                                     rejected_delta_tracker.record_accepted();
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
@@ -2511,6 +2525,8 @@ pub async fn run(
                                                 }
                                             }
                                         }
+                                        database_delta_poll_metrics_for_poll
+                                            .record_poll_completed();
                                         continue;
                                     }
                                     if compose.accepted.is_empty() {
@@ -2518,6 +2534,8 @@ pub async fn run(
                                             consecutive_identical_rejections = decision.consecutive,
                                             "Incremental CP config update rejected by validation; leaving sequence cursors unchanged so the next poll retries the same rows"
                                         );
+                                        database_delta_poll_metrics_for_poll
+                                            .record_poll_completed();
                                         continue;
                                     }
                                 }
@@ -2580,6 +2598,7 @@ pub async fn run(
                                         )
                                         .await
                                         {
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
                                         db_available_poll.store(true, Ordering::Relaxed);
@@ -2628,6 +2647,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
+                                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                                 continue;
                                             }
                                             crate::modes::record_config_validation_rejection(
@@ -2638,6 +2658,7 @@ pub async fn run(
                                                 "full fallback reload",
                                             )
                                             .await;
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
                                         // Both incremental and full reload failed —
@@ -2663,6 +2684,7 @@ pub async fn run(
                                                         )
                                                         .await
                                                         {
+                                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                                             continue;
                                                         }
                                                         db_available_poll.store(true, Ordering::Relaxed);
@@ -2706,6 +2728,7 @@ pub async fn run(
                                                             )
                                                             .await
                                                             {
+                                                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                                                 continue;
                                                             }
                                                             crate::modes::record_config_validation_rejection(
@@ -2740,6 +2763,8 @@ pub async fn run(
                         }
                     }
 
+                    // Normal fallthrough: success, empty, rejection, or handled error.
+                    database_delta_poll_metrics_for_poll.record_poll_completed();
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");
@@ -2748,6 +2773,21 @@ pub async fn run(
             }
         }
     });
+
+    let db_poll_supervisor = {
+        let startup_ready = startup_ready.clone();
+        let serving_degraded = serving_degraded.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            crate::modes::db_poll_supervision::supervise_control_plane_poll_task(
+                db_poll_handle,
+                startup_ready,
+                serving_degraded,
+                shutdown_rx,
+            )
+            .await;
+        })
+    };
 
     let mesh_registry_reaper_handle = {
         let registry = mesh_registry.clone();
@@ -2833,7 +2873,7 @@ pub async fn run(
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
     let mut background_handles = vec![
-        db_poll_handle,
+        db_poll_supervisor,
         mesh_registry_reaper_handle,
         runtime_system_handle,
         runtime_window_handle,
