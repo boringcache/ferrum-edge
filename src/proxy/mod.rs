@@ -34737,8 +34737,12 @@ mod tests {
         );
         // The single-target HBONE-tagged, identity-pinned upstream the Ambient
         // materializer would emit.
+        // `namespace` mirrors the owning Service: the collector resolves the
+        // upstream by `(service.namespace, upstream_id)`, and the serde default
+        // is `DEFAULT_NAMESPACE` ("ferrum"), not `"default"`.
         let mut upstream: Upstream = serde_json::from_value(json!({
             "id": bywl_id,
+            "namespace": "default",
             "name": "redis.default.svc.cluster.local",
             "targets": [{
                 "host": "10.0.0.7",
@@ -34843,8 +34847,10 @@ mod tests {
             cluster_ips: vec!["10.96.0.10".to_string()],
         };
         let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        // Same-namespace as the owning Service; see the TCP by-workload case.
         let upstream: Upstream = serde_json::from_value(json!({
             "id": udp_id,
+            "namespace": "default",
             "name": "dns.default.svc.cluster.local",
             "targets": [{
                 "host": "10.0.0.9",
@@ -38573,11 +38579,17 @@ mod tests {
         let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
         old_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
         new_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);
@@ -38637,11 +38649,17 @@ mod tests {
             crate::modes::mesh::mesh_outbound_tcp_upstream_id("default", "mysql", 3306);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
         old_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
         new_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);
@@ -38712,11 +38730,17 @@ mod tests {
         );
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
         old_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
         new_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);

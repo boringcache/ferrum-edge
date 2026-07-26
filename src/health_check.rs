@@ -577,6 +577,7 @@ impl HealthChecker {
     /// `upstream_id` is recorded on new ejections so automatic / success-based
     /// recovery can reset least-latency state for the owning balancer without
     /// scanning unrelated proxies by host:port.
+    #[allow(clippy::too_many_arguments)]
     pub fn report_response(
         &self,
         namespace: &str,

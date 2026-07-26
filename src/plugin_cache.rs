@@ -4153,32 +4153,39 @@ impl PluginCache {
     /// seam without widening the production plugin catalog. Callers must build
     /// the request epoch *after* this mutation so the published snapshot sees
     /// the injected plugin.
+    ///
+    /// Keyed by the same `namespace|proxy_id` runtime key production composes,
+    /// so the injected plugin is actually visible to
+    /// [`Self::get_plugins_for_protocol`] and friends. A bare-id key would land
+    /// in the map unreachable and the seam would silently no-op.
     #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
     pub(crate) fn prepend_proxy_plugin_for_test(
         &self,
+        namespace: &str,
         proxy_id: &str,
         plugin: Arc<dyn Plugin>,
     ) -> Result<(), String> {
+        let proxy_key = namespaced_runtime_key(namespace, proxy_id);
         let current = self.load_inner();
         let mut proxy_plugins = current.proxy_plugins.clone();
         let base = proxy_plugins
-            .get(proxy_id)
+            .get(&proxy_key)
             .map(|list| list.as_slice())
             .unwrap_or(current.global_plugins.as_slice());
         let mut merged = Vec::with_capacity(base.len().saturating_add(1));
         merged.push(plugin);
         merged.extend(base.iter().cloned());
-        proxy_plugins.insert(proxy_id.to_string(), Arc::new(merged));
+        proxy_plugins.insert(proxy_key.clone(), Arc::new(merged));
 
         let mut protocol_snapshot = current.protocol_snapshot.clone();
         let mut grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
-        if let Some(plugins) = proxy_plugins.get(proxy_id) {
+        if let Some(plugins) = proxy_plugins.get(&proxy_key) {
             let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
             for &proto in &ALL_PROXY_PROTOCOLS {
                 inner.insert(proto, build_protocol_entry(plugins, proto));
             }
-            protocol_snapshot.proxy.insert(proxy_id.to_string(), inner);
-            grpc_web_proxy.insert(proxy_id.to_string(), build_grpc_web_protocol_entry(plugins));
+            protocol_snapshot.proxy.insert(proxy_key.clone(), inner);
+            grpc_web_proxy.insert(proxy_key, build_grpc_web_protocol_entry(plugins));
         }
         protocol_snapshot.grpc_web_proxy = grpc_web_proxy;
 

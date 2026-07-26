@@ -228,7 +228,7 @@ async fn try_spawn_dtls_gateway(
     };
     let plugin_cache =
         Arc::new(PluginCache::new(&gateway_config).expect("PluginCache builds with no plugins"));
-    prepend_proxy_plugin_for_test(&plugin_cache, PROXY_ID, gate)
+    prepend_proxy_plugin_for_test(&plugin_cache, &proxy_namespace, PROXY_ID, gate)
         .expect("inject gated stream-connect plugin");
     let attached =
         plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);

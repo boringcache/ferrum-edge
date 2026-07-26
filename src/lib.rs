@@ -260,12 +260,17 @@ pub mod _test_support {
     /// DTLS frontend listener without widening the production plugin catalog.
     /// Build the request epoch after calling this so the published snapshot
     /// includes the injected plugin.
+    ///
+    /// `namespace` is required: the plugin cache is keyed by the full
+    /// `(namespace, proxy_id)` identity, so an injection under a bare id would
+    /// never be resolved by the request path.
     pub fn prepend_proxy_plugin_for_test(
         cache: &crate::PluginCache,
+        namespace: &str,
         proxy_id: &str,
         plugin: Arc<dyn Plugin>,
     ) -> Result<(), String> {
-        cache.prepend_proxy_plugin_for_test(proxy_id, plugin)
+        cache.prepend_proxy_plugin_for_test(namespace, proxy_id, plugin)
     }
 
     /// Deterministic allocator helper for proxy lifecycle ownership generations.

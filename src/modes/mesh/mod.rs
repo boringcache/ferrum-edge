@@ -20017,8 +20017,13 @@ mod tests {
             ..GatewayConfig::default()
         };
         // p2 selects subset v1 — should pick up the subset overlay.
+        // `resolve_upstream_tls` resolves upstream/subset TLS by
+        // `(namespace, upstream_id)`, so the proxy must declare the test
+        // upstream's namespace explicitly — the serde default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), not `"default"`.
         let mut p2: Proxy = serde_json::from_value(serde_json::json!({
             "id": "p2",
+            "namespace": "default",
             "hosts": ["p2.example.com"],
             "backend_host": "",
             "backend_port": 0,
