@@ -180,7 +180,8 @@ impl RedisConfig {
     /// (`redis://user:pass@host`), so the raw string must never reach a tracing
     /// field, an error message, or an admin projection. Scheme, host, port, and
     /// database path are preserved because they are the diagnostics that make a
-    /// connect failure actionable; only the userinfo is replaced.
+    /// connect failure actionable; userinfo is replaced and query/fragment data
+    /// is removed.
     ///
     /// Cold path only (connect/health-check failure logging), so the allocation
     /// here never touches a proxy hot path.
@@ -387,14 +388,24 @@ impl RedisConfig {
 /// Strip userinfo, query, and fragment from a connection URL, keeping
 /// scheme/host/port/path.
 ///
-/// Fails closed to a bare marker when the value cannot be parsed: an
-/// unparseable string cannot be proven credential-free, and `redis_url` is
-/// only validated for `sync_mode: "redis"` plus explicitly supplied values, so
-/// a caller can still hold a string this function has never validated.
+/// Only `redis` / `rediss` URLs receive the diagnostic-preserving projection.
+/// Any other parseable scheme (including opaque `data:` / `mailto:` values and
+/// ordinary `http(s):` URLs that may carry secrets in the path) fails closed to
+/// a bare marker — admin projections match by the `redis_url` key name, so a
+/// non-Redis value must never be echoed as if it were a safe endpoint label.
+///
+/// Unparseable strings also fail closed: they cannot be proven credential-free,
+/// and `redis_url` is only validated for `sync_mode: "redis"` plus explicitly
+/// supplied values, so a caller can still hold a string this function has never
+/// validated.
 pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
     let Ok(mut parsed) = Url::parse(raw_url) else {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     };
+    match parsed.scheme() {
+        "redis" | "rediss" => {}
+        _ => return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string(),
+    }
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
     let has_suffix = parsed.query().is_some() || parsed.fragment().is_some();
     if !has_userinfo && !has_suffix {

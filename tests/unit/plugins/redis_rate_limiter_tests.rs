@@ -70,6 +70,25 @@ fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
     // Unparseable values cannot be proven credential-free, so they fail closed.
     let unparseable = make_config("not a url", false);
     assert_eq!(unparseable.redacted_url(), "[REDACTED]");
+
+    // Non-Redis schemes are never safe diagnostics for a `redis_url` field —
+    // even after stripping userinfo — so they fail closed wholesale.
+    let http_scheme = make_config(
+        "http://user:pass@collector.internal/path?token=query-secret#frag-secret",
+        false,
+    );
+    assert_eq!(http_scheme.redacted_url(), "[REDACTED]");
+
+    // IPv6 authorities keep diagnostics while stripping userinfo.
+    let ipv6 = make_config("redis://user:pass@[2001:db8::10]:6379/2", false);
+    assert_eq!(ipv6.redacted_url(), "redis://redacted@[2001:db8::10]:6379/2");
+
+    // Opaque schemes can embed secrets outside userinfo/query/fragment; they
+    // must not be echoed just because the URL crate can parse them.
+    let opaque = make_config("mailto:user:pass@example.com", false);
+    assert_eq!(opaque.redacted_url(), "[REDACTED]");
+    let data_url = make_config("data:text/plain,super-secret-token", false);
+    assert_eq!(data_url.redacted_url(), "[REDACTED]");
 }
 
 /// `RedisConfig` used to derive `Debug`, which printed the ACL password and the

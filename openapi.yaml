@@ -19287,7 +19287,12 @@ components:
           description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
         redis_url:
           type: string
-          description: Redis connection URL (required when sync_mode is redis)
+          description: >-
+            Redis connection URL (required when sync_mode is redis). URL-embedded
+            userinfo is accepted but never disclosed: connection/health-check
+            logs and non-admin/audit projections keep only the scheme, host,
+            port, and database, replace the userinfo, and remove query/fragment
+            data. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
@@ -19330,8 +19335,11 @@ components:
             envelopes. Required when sync_mode is redis (fail closed if omitted).
             Minimum 32 bytes. Bound to the full status/header/body envelope and
             the Redis namespace/key context. Compared in constant time; never
-            logged. Rolling the key quarantines prior entries — there is no
-            legacy unauthenticated read path during build-out.
+            logged, and replaced by [REDACTED] in admin audit diffs and in
+            viewer/operator plugin-config reads (full admin reads stay raw so
+            rotation by read-modify-write works). Rolling the key quarantines
+            prior entries — there is no legacy unauthenticated read path during
+            build-out.
 
     AiTokenMetricsConfig:
       type: object
