@@ -375,6 +375,93 @@ async fn start_test_cp_server(
     (addr, update_tx, handle)
 }
 
+/// A CP gRPC server whose transport can actually be severed mid-stream.
+///
+/// `start_test_cp_server` runs tonic on the *test* runtime, and tonic spawns a
+/// detached `tokio::spawn` task per accepted connection (`serve_connection` in
+/// `tonic::transport::server`). Aborting the returned `JoinHandle` therefore
+/// only drops the accept loop and its listener — every already-established
+/// ConfigSync stream keeps being served forever. A DP connected to such a
+/// "killed" CP never observes EOF, never fails over, and every assertion that
+/// depends on failover silently becomes vacuous.
+///
+/// This variant owns a dedicated runtime instead. Shutting that runtime down
+/// drops the accept loop *and* every per-connection task, closing their
+/// sockets, so the DP sees the CP go away exactly as it would in production.
+struct SeverableTestCpServer {
+    addr: SocketAddr,
+    /// Held for parity with `start_test_cp_server` so a future test can push
+    /// deltas from a severable CP. The served `CpGrpcServer` owns its own
+    /// sender, so this clone is not load-bearing for broadcasts.
+    _update_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl SeverableTestCpServer {
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// Close the listener and every established stream on this CP.
+    ///
+    /// `shutdown_background` is used rather than dropping the runtime so this is
+    /// safe to call from inside the test's async context.
+    fn sever(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for SeverableTestCpServer {
+    fn drop(&mut self) {
+        self.sever();
+    }
+}
+
+/// Start a CP whose established ConfigSync streams can be severed on demand.
+///
+/// See [`SeverableTestCpServer`] for why `start_test_cp_server` cannot do this.
+async fn start_severable_test_cp_server(config: GatewayConfig) -> SeverableTestCpServer {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, update_tx) = CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let (mesh_server, _mesh_update_tx) =
+        MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("dedicated CP runtime should build");
+
+    // The listener must be bound on the runtime that will serve it: a socket
+    // registered with one reactor cannot be polled from another.
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        if addr_tx.send(addr).is_err() {
+            return;
+        }
+        // Never `expect` here: the future is dropped by `sever()`, and a
+        // shutdown-time error is the expected outcome, not a test failure.
+        let _ = Server::builder()
+            .add_service(server.into_service())
+            .add_service(mesh_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let addr = addr_rx.await.expect("CP listener should bind");
+
+    SeverableTestCpServer {
+        addr,
+        _update_tx: update_tx,
+        runtime: Some(runtime),
+    }
+}
+
 /// Start a CP with the supplied correlation/client-attribution ownership value.
 async fn start_test_cp_server_with_real_ip_header(
     config: GatewayConfig,
@@ -4615,14 +4702,17 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     // serving the newer active config.
     let mut newer = create_test_config(3);
     newer.loaded_at = Utc::now();
-    let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
+    // Severable: aborting a `start_test_cp_server` handle leaves the DP's
+    // established stream alive, so the DP would never fail over and every
+    // assertion below would hold vacuously.
+    let mut newer_cp = start_severable_test_cp_server(newer).await;
 
     let mut older = create_test_config(1);
     older.loaded_at = Utc::now() - chrono::Duration::hours(6);
     let (older_addr, older_tx, _older_handle) = start_test_cp_server(older).await;
 
     let proxy_state = create_test_proxy_state();
-    let newer_url = format!("http://127.0.0.1:{}", newer_addr.port());
+    let newer_url = newer_cp.url();
     let older_url = format!("http://127.0.0.1:{}", older_addr.port());
     let connection_state = Arc::new(ArcSwap::new(Arc::new(
         DpCpConnectionState::new_disconnected(&newer_url),
@@ -4630,7 +4720,7 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
 
     let ps = proxy_state.clone();
     let cs = connection_state.clone();
-    let urls = vec![newer_url, older_url];
+    let urls = vec![newer_url, older_url.clone()];
     let client_handle = tokio::spawn(async move {
         dp_client::start_dp_client_with_shutdown_and_startup_ready(
             urls,
@@ -4652,10 +4742,21 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
         wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
         "DP should apply the newer CP's snapshot"
     );
+    // `wait_for_proxy_count` can win the race against `update_state_config_received`,
+    // so wait for the stamp itself before baselining against it.
+    assert!(
+        wait_for_new_accepted_config(&connection_state, None).await,
+        "the primary CP's accepted snapshot must be recorded before failover"
+    );
     let accepted_at = connection_state.load().last_config_received_at;
 
     // Take the newer CP away so the DP fails over to the stale one.
-    newer_handle.abort();
+    newer_cp.sever();
+    assert!(
+        wait_for_cp_url(&connection_state, &older_url, Duration::from_secs(30)).await,
+        "the DP must actually reach the stale fallback CP — otherwise the \
+         assertions below hold vacuously"
+    );
 
     // Give the DP several failover cycles against the stale CP.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -4712,6 +4813,29 @@ fn send_delta(
     let _ = tx.send(delta_update(body, &version));
 }
 
+/// Wait until the DP's reported CP endpoint is `expected`.
+///
+/// `cp_url` is rewritten on both connect and disconnect, so this proves the DP
+/// actually *attempted* that endpoint. Failover tests need it: without a real
+/// disconnect the DP stays pinned to the first CP and every post-failover
+/// assertion passes vacuously.
+async fn wait_for_cp_url(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    expected: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_state.load().cp_url == expected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Wait until the DP reports an accepted config other than `previous`.
 ///
 /// Only an *accepted* update moves this stamp, so it distinguishes a failover
@@ -4754,11 +4878,16 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
     newer.trust_bundles = Some(Box::new(create_test_trust_bundles()));
     let mut equivalent_older = newer.clone();
     equivalent_older.loaded_at = newer.loaded_at - chrono::Duration::hours(6);
-    let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
+    // Severable: the primary must genuinely go away. Aborting a
+    // `start_test_cp_server` handle only drops tonic's accept loop — the
+    // already-established ConfigSync stream is served by a detached
+    // per-connection task and keeps running, so the DP would never fail over
+    // and never evaluate the fallback CP's snapshot at all.
+    let mut newer_cp = start_severable_test_cp_server(newer).await;
     let (older_addr, older_tx, _older_handle) = start_test_cp_server(equivalent_older).await;
 
     let proxy_state = create_test_proxy_state();
-    let newer_url = format!("http://127.0.0.1:{}", newer_addr.port());
+    let newer_url = newer_cp.url();
     let older_url = format!("http://127.0.0.1:{}", older_addr.port());
     let connection_state = Arc::new(ArcSwap::new(Arc::new(
         DpCpConnectionState::new_disconnected(&newer_url),
@@ -4789,10 +4918,22 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
         "DP should apply the primary CP's snapshot"
     );
     let primary_watermark = proxy_state.config.load().loaded_at;
+    // Baseline against a stamp that is actually recorded: `wait_for_proxy_count`
+    // can win the race against `update_state_config_received`, and a `None`
+    // baseline would let the primary's own stamp satisfy `base_taken` below.
+    assert!(
+        wait_for_new_accepted_config(&connection_state, None).await,
+        "the primary CP's accepted snapshot must be recorded before failover"
+    );
     let accepted_at = connection_state.load().last_config_received_at;
 
     // Fail over to the equivalent-but-older CP.
-    newer_handle.abort();
+    newer_cp.sever();
+    assert!(
+        wait_for_cp_url(&connection_state, &older_url, Duration::from_secs(30)).await,
+        "the DP must actually fail over to the fallback CP once the primary's \
+         transport is severed"
+    );
     let base_taken = wait_for_new_accepted_config(&connection_state, accepted_at).await;
     assert!(
         base_taken,
