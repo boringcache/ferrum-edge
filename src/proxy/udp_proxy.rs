@@ -659,9 +659,7 @@ fn resolve_udp_session_epoch_view(
 
     let proxy = epoch
         .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
         .clone();
     let proxy_key = crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
     let plugins = epoch
@@ -3144,9 +3142,7 @@ async fn handle_dtls_client_inner(
     // Look up proxy config
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 

@@ -1131,11 +1131,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     // This avoids reading certificate files from disk on every connection.
     let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
         let current_config = config.load();
-        find_listener_proxy(
-            &current_config,
-            proxy_namespace.as_ref(),
-            proxy_id.as_ref(),
-        )
+        find_listener_proxy(&current_config, proxy_namespace.as_ref(), proxy_id.as_ref())
             // Passthrough proxies relay raw bytes without originating backend
             // TLS; their listener must not fail because unrelated TLS material
             // (global CA bundle / upstream-resolved fields) is unreadable.
@@ -2219,9 +2215,7 @@ async fn handle_tcp_connection_inner(
     // Look up the proxy config and extract only the fields we need.
     let proxy = epoch
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
 
     let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();
