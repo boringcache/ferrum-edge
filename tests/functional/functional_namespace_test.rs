@@ -35,8 +35,8 @@
 
 use crate::common::{
     DbType, IsolatedSqlDatabase, TestGateway, continue_if_backend_available,
-    ensure_shared_sql_containers_resumed, host_port_from_db_url, mysql_test_url,
-    postgres_test_url, provision_isolated_sql_database, tcp_endpoint_reachable,
+    ensure_shared_sql_containers_resumed, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    provision_isolated_sql_database, tcp_endpoint_reachable,
 };
 use serde_json::Value;
 use std::time::{Duration, Instant};

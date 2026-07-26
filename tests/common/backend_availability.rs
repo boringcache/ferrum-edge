@@ -190,10 +190,7 @@ impl Drop for IsolatedSqlDatabase {
                         "-v",
                         "ON_ERROR_STOP=1",
                         "-c",
-                        &format!(
-                            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE);",
-                            self.db_name
-                        ),
+                        &format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE);", self.db_name),
                     ])
                     .output(),
                 IsolatedSqlKind::Mysql => std::process::Command::new("docker")
@@ -211,10 +208,8 @@ impl Drop for IsolatedSqlDatabase {
             match output {
                 Ok(output) if output.status.success() => return,
                 Ok(output) => {
-                    last_stderr = scrub_secret(
-                        &String::from_utf8_lossy(&output.stderr),
-                        &self.password,
-                    );
+                    last_stderr =
+                        scrub_secret(&String::from_utf8_lossy(&output.stderr), &self.password);
                 }
                 Err(error) => {
                     last_stderr = scrub_secret(&error.to_string(), &self.password);
