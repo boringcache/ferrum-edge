@@ -12,6 +12,13 @@ enables fail-closed mode via `FERRUM_DB_BACKENDS_REQUIRED=1` and
 `FERRUM_DB_TLS_REQUIRED=1`. A missing/unreachable expected backend fails the
 job instead of silently skipping.
 
+The shard runs two mongod instances: the standalone on `27017` (the required
+backend for the cells below, and for the documented `POST /batch` 501 refusal)
+and a single-node replica set on `27020` for the multi-document transactional
+batch path. The replica set is opt-in through `FERRUM_TEST_MONGO_REPLICA_SET`
+rather than `FERRUM_DB_BACKENDS_REQUIRED`, but once declared an unreachable
+member fails the cell instead of skipping.
+
 Local developers keep the historical opt-out: leave those required flags unset
 and omit backend URLs / containers; suites print `SKIPPED` and return success.
 
@@ -47,6 +54,8 @@ sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 | `FERRUM_TEST_POSTGRES_URL` | `postgres://ferrum:ferrum@127.0.0.1:5432/ferrum` | Plaintext PostgreSQL CRUD/namespace/migrate/recovery |
 | `FERRUM_TEST_MYSQL_URL` | `mysql://ferrum:ferrum@127.0.0.1:3306/ferrum` | Plaintext MySQL CRUD/namespace/migrate/recovery |
 | `FERRUM_TEST_MONGO_URL` | `mongodb://127.0.0.1:27017/ferrum_test` | Plaintext MongoDB CRUD/namespace/lifecycle |
+| `FERRUM_TEST_MONGO_REPLICA_SET` | `rs0` | Enables the transactional `POST /batch` MongoDB cell |
+| `FERRUM_TEST_MONGO_REPLICA_SET_URL` | `mongodb://localhost:27020/ferrum_test` | Replica-set member for that cell |
 | `FERRUM_TEST_CERT_DIR` | `${RUNNER_TEMP}/ferrum-db-tls-certs` | Certs from `.github/scripts/setup_db_tls.sh` |
 | `FERRUM_DB_BACKENDS_REQUIRED` | `1` | Fail when an expected plaintext backend is missing |
 | `FERRUM_DB_TLS_REQUIRED` | `1` | Fail when PostgreSQL/MySQL TLS fixtures are missing |

@@ -41,6 +41,10 @@
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
+    use crate::config::batch_atomicity::{
+        AtomicBatchAbort, AtomicBatchCounts, AtomicBatchFault, AtomicBatchGraph, AtomicBatchPhase,
+        AtomicBatchUnsupported, BatchAdmissionLeaseLost,
+    };
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
@@ -110,6 +114,10 @@ mod inner {
     const MONGO_MIGRATION_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
     const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
+    /// Documents per `insert_many` inside one atomic batch transaction. Bounds
+    /// individual command payloads well under the 16 MB BSON limit; it does
+    /// **not** bound durability, because every chunk shares one transaction.
+    const MONGO_ATOMIC_BATCH_CHUNK_SIZE: usize = 1_000;
     const MONGO_ADMISSION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
     // update_one/delete_one operations, so a couple of connections is ample
@@ -1512,6 +1520,18 @@ mod inner {
             }]
         }
 
+        /// Aggregation-pipeline update that stamps `updated_at` from the server
+        /// clock without extending the lease.
+        ///
+        /// Used by the atomic-batch lease gate: the expiry comparison lives in
+        /// the query filter (`$expr` against `$$NOW`) and this write exists to
+        /// enlist the lease document in the transaction's write set, so the
+        /// timestamp it records has to be the server's own current time rather
+        /// than anything the client captured earlier.
+        fn server_time_lease_touch_pipeline() -> Vec<Document> {
+            vec![doc! { "$set": { "updated_at": "$$NOW" } }]
+        }
+
         async fn lease_server_time(&self) -> Result<BsonDateTime, anyhow::Error> {
             let response = self.lease_db().run_command(doc! { "hello": 1 }).await?;
             response
@@ -1815,13 +1835,48 @@ mod inner {
             Ok(leases)
         }
 
+        /// Releases every admission lease, reporting the first cleanup error.
+        ///
+        /// The loop always drains the whole vector. Returning early would
+        /// leave the remaining guards holding `InFlightOrUncertain` mutation
+        /// state, so their `Drop` would strand both the non-expiring lock
+        /// document and this process's connection-generation pin even though
+        /// the protected mutation outcome is already settled.
         async fn release_mtls_dns_admission_leases(
             leases: &mut Vec<MongoLockGuard>,
         ) -> Result<(), anyhow::Error> {
+            let mut first_error: Option<anyhow::Error> = None;
             while let Some(mut lease) = leases.pop() {
-                lease.release().await?;
+                if let Err(error) = lease.release().await
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
             }
-            Ok(())
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        /// Post-commit lease cleanup for a confirmed durable write.
+        ///
+        /// Once the guarded mutation has committed, releasing the admission
+        /// leases can no longer change the stored result. Propagating a
+        /// cleanup failure here would turn a committed batch into a failed
+        /// admin response and invite an identical retry that collides with
+        /// the rows just created, so cleanup trouble is logged (namespace and
+        /// lock label only) and the confirmed success is returned. Guards
+        /// whose explicit release failed are already settled, so their `Drop`
+        /// still performs owner-qualified majority cleanup and releases the
+        /// local generation pin.
+        async fn release_mtls_dns_admission_leases_after_commit(leases: &mut Vec<MongoLockGuard>) {
+            if let Err(error) = Self::release_mtls_dns_admission_leases(leases).await {
+                error!(
+                    "MongoDB mTLS DNS admission lease cleanup failed after a committed write; \
+                     the durable result stands and is reported as success: {error}"
+                );
+            }
         }
 
         fn mark_mtls_dns_mutations_started(leases: &mut [MongoLockGuard]) {
@@ -2424,6 +2479,16 @@ mod inner {
                 collection: lease_db.collection("config_admission_locks"),
                 _connection: lease_db._connection,
             }
+        }
+
+        /// The same `config_admission_locks` collection reached through the main
+        /// client instead of the dedicated lease client.
+        ///
+        /// Sessions are client-scoped, so an in-transaction ownership check has
+        /// to use the client that owns the transaction. Lease upkeep still runs
+        /// on the isolated lease pool via [`Self::config_admission_locks`].
+        fn config_admission_locks_in_transaction(&self) -> MongoCollectionHandle {
+            self.collection("config_admission_locks")
         }
 
         /// Merged consumer identity keyspace (id ∪ username ∪ custom_id per
@@ -4130,6 +4195,290 @@ mod inner {
 
             Ok(())
         }
+
+        // ---------------------------------------------------------------
+        // Atomic batch graph write (issue #2401)
+        // ---------------------------------------------------------------
+
+        /// Why standalone MongoDB cannot serve `POST /batch`.
+        ///
+        /// Multi-document transactions require a replica set or a sharded
+        /// cluster: `startTransaction` on a standalone `mongod` is rejected
+        /// outright, and there is no single-document representation of a config
+        /// graph to swap instead. Rather than fall back to per-family writes
+        /// that can strand half a graph, the request is refused before it
+        /// mutates anything.
+        fn atomic_batch_standalone_refusal() -> AtomicBatchUnsupported {
+            AtomicBatchUnsupported::new(
+                "MongoDB multi-document transactions require a replica set; set \
+                 FERRUM_MONGO_REPLICA_SET (or a ?replicaSet= URL option) so POST /batch \
+                 can persist the whole graph in one transaction",
+            )
+        }
+
+        /// Translate a failed atomic-batch transaction back into a typed error.
+        ///
+        /// The convenient-transaction runner only aborts when the callback
+        /// returns `Err`, so application-level aborts travel as
+        /// `Error::custom(AtomicBatchAbort)` and are unwrapped here.
+        fn atomic_batch_transaction_error(error: mongodb::error::Error) -> anyhow::Error {
+            match error.get_custom::<AtomicBatchAbort>().copied() {
+                Some(AtomicBatchAbort::AdmissionLeaseLost) => {
+                    anyhow::Error::new(BatchAdmissionLeaseLost).context(
+                        "MongoDB atomic batch aborted before commit: the namespace config \
+                         admission lease was no longer held",
+                    )
+                }
+                Some(AtomicBatchAbort::InjectedFault(fault)) => fault.error(),
+                None => anyhow::Error::new(error)
+                    .context("batch_create_config_graph_atomically transaction failed"),
+            }
+        }
+
+        fn check_atomic_batch_fault_in_session(
+            fault: Option<AtomicBatchFault>,
+            phase: AtomicBatchPhase,
+            completed_chunks: usize,
+        ) -> mongodb::error::Result<()> {
+            let Some(fault) = fault else {
+                return Ok(());
+            };
+            if !fault.trips(phase, completed_chunks) {
+                return Ok(());
+            }
+            let abort = AtomicBatchAbort::InjectedFault(fault);
+            Err(mongodb::error::Error::custom(abort))
+        }
+
+        /// Write the whole batch graph inside one transaction session.
+        ///
+        /// Runs the dependency phases in order and re-verifies the namespace
+        /// config-admission lease last, immediately before the runner commits.
+        /// Every failure path returns `Err`, so the runner aborts and nothing
+        /// from the graph becomes durable.
+        async fn write_atomic_batch_graph_in_session(
+            &self,
+            session: &mut ClientSession,
+            plan: &MongoAtomicBatchPlan,
+        ) -> mongodb::error::Result<()> {
+            Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Consumers, 0)?;
+            if !plan.consumer_docs.is_empty() {
+                // Reserve the merged identity keyspace for the whole batch
+                // before any consumer document, exactly as the per-family path
+                // does: every reservation is read and classified before any
+                // write, same-owner reservations are adopted, and a cross-owner
+                // or intra-batch collision fails closed.
+                self.preflight_reserve_consumer_identity_docs_in_session(
+                    &mut *session,
+                    plan.consumer_identity_docs.as_slice(),
+                )
+                .await?;
+            }
+            for (index, chunk) in plan.consumer_docs.chunks(plan.chunk_size).enumerate() {
+                self.consumers()
+                    .insert_many(chunk.to_vec())
+                    .ordered(false)
+                    .session(&mut *session)
+                    .await?;
+                Self::check_atomic_batch_fault_in_session(
+                    plan.fault,
+                    AtomicBatchPhase::Consumers,
+                    index + 1,
+                )?;
+            }
+            for (namespace, id) in &plan.consumer_changes {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace.as_str(),
+                    "consumer",
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+
+            Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Upstreams, 0)?;
+            for (index, chunk) in plan.upstream_docs.chunks(plan.chunk_size).enumerate() {
+                self.upstreams()
+                    .insert_many(chunk.to_vec())
+                    .ordered(false)
+                    .session(&mut *session)
+                    .await?;
+                Self::check_atomic_batch_fault_in_session(
+                    plan.fault,
+                    AtomicBatchPhase::Upstreams,
+                    index + 1,
+                )?;
+            }
+            for (namespace, id) in &plan.upstream_changes {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace.as_str(),
+                    "upstream",
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+
+            Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Proxies, 0)?;
+            for (index, chunk) in plan.proxy_docs.chunks(plan.chunk_size).enumerate() {
+                self.proxies()
+                    .insert_many(chunk.to_vec())
+                    .ordered(false)
+                    .session(&mut *session)
+                    .await?;
+                Self::check_atomic_batch_fault_in_session(
+                    plan.fault,
+                    AtomicBatchPhase::Proxies,
+                    index + 1,
+                )?;
+            }
+            for (namespace, id) in &plan.proxy_changes {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace.as_str(),
+                    "proxy",
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+
+            Self::check_atomic_batch_fault_in_session(
+                plan.fault,
+                AtomicBatchPhase::PluginConfigs,
+                0,
+            )?;
+            for (index, chunk) in plan.plugin_config_docs.chunks(plan.chunk_size).enumerate() {
+                self.plugin_configs()
+                    .insert_many(chunk.to_vec())
+                    .ordered(false)
+                    .session(&mut *session)
+                    .await?;
+                Self::check_atomic_batch_fault_in_session(
+                    plan.fault,
+                    AtomicBatchPhase::PluginConfigs,
+                    index + 1,
+                )?;
+            }
+            for (namespace, id) in &plan.plugin_config_changes {
+                self.record_config_change_in_session(
+                    &mut *session,
+                    namespace.as_str(),
+                    "plugin_config",
+                    id.as_str(),
+                    "upsert",
+                )
+                .await?;
+            }
+
+            // MongoDB embeds plugin associations in the proxy document, so this
+            // phase has no separate write. The fault point is still honored so
+            // the phase is covered by the same fault-injection matrix as SQL.
+            Self::check_atomic_batch_fault_in_session(
+                plan.fault,
+                AtomicBatchPhase::ProxyPluginAssociations,
+                0,
+            )?;
+            Self::check_atomic_batch_fault_in_session(
+                plan.fault,
+                AtomicBatchPhase::AdmissionRevalidation,
+                0,
+            )?;
+
+            if let Some((owner, generation)) = &plan.admission_lease {
+                // Conditional in-session write, not a read: the lease document
+                // joins this transaction's write set, so a competing acquirer
+                // that took the lease mid-transaction raises a write conflict
+                // (retried, then matching nothing) instead of being masked by
+                // the transaction's read snapshot.
+                //
+                // Expiry is compared against MongoDB's own clock AT THIS GATE
+                // (`$expr` + `$$NOW`, the same convention the lease renew path
+                // uses), never against a timestamp captured before the
+                // transaction opened. A pre-transaction snapshot goes stale
+                // while the graph is written — and staler still when the
+                // convenient runner retries the callback — so a lease that
+                // lapsed with no competing acquirer yet would still match on
+                // owner/generation and commit. `$$NOW` re-evaluates on every
+                // attempt, matching the SQL backends' database-`now()` check at
+                // the same point.
+                let locks = self.config_admission_locks_in_transaction();
+                let result = locks
+                    .update_one(
+                        doc! {
+                            "_id": plan.lease_namespace.as_str(),
+                            "owner": owner.as_str(),
+                            "generation": *generation,
+                            "$expr": { "$gt": [ "$expires_at", "$$NOW" ] },
+                        },
+                        Self::server_time_lease_touch_pipeline(),
+                    )
+                    .session(&mut *session)
+                    .await;
+                let result = match result {
+                    Err(error) if is_pipeline_update_unsupported(&error) => {
+                        // AWS DocumentDB rejects pipeline-form updates. Read the
+                        // server clock here, at the gate, and re-issue the
+                        // equivalent classic comparison — still MongoDB's time
+                        // and still evaluated after every phase has been
+                        // written, never the client clock and never a value
+                        // captured before the transaction opened.
+                        let now = self.lease_server_time().await.map_err(|error| {
+                            mongodb::error::Error::custom(format!(
+                                "namespace config admission lease verification could not read \
+                                 the MongoDB server clock: {error}"
+                            ))
+                        })?;
+                        locks
+                            .update_one(
+                                doc! {
+                                    "_id": plan.lease_namespace.as_str(),
+                                    "owner": owner.as_str(),
+                                    "generation": *generation,
+                                    "expires_at": { "$gt": now },
+                                },
+                                doc! { "$set": { "updated_at": now } },
+                            )
+                            .session(&mut *session)
+                            .await
+                    }
+                    result => result,
+                }?;
+                if result.matched_count != 1 {
+                    let abort = AtomicBatchAbort::AdmissionLeaseLost;
+                    return Err(mongodb::error::Error::custom(abort));
+                }
+            }
+
+            Self::check_atomic_batch_fault_in_session(plan.fault, AtomicBatchPhase::Commit, 0)?;
+            Ok(())
+        }
+    }
+
+    /// Everything one atomic batch transaction needs, precomputed outside the
+    /// session so the retryable callback never re-serializes documents.
+    struct MongoAtomicBatchPlan {
+        consumer_docs: Vec<Document>,
+        consumer_identity_docs: Vec<Document>,
+        consumer_changes: Vec<(String, String)>,
+        upstream_docs: Vec<Document>,
+        upstream_changes: Vec<(String, String)>,
+        proxy_docs: Vec<Document>,
+        proxy_changes: Vec<(String, String)>,
+        plugin_config_docs: Vec<Document>,
+        plugin_config_changes: Vec<(String, String)>,
+        chunk_size: usize,
+        fault: Option<AtomicBatchFault>,
+        lease_namespace: String,
+        /// Owner + generation the batch must still hold at the final gate. The
+        /// expiry comparison deliberately has no counterpart here: it is
+        /// evaluated from MongoDB's clock inside the session (see
+        /// [`MongoStore::write_atomic_batch_graph_in_session`]), because any
+        /// timestamp precomputed into this plan would be stale by the time a
+        /// long — or retried — transaction reaches that gate.
+        admission_lease: Option<(String, i64)>,
     }
 
     // -----------------------------------------------------------------------
@@ -8112,6 +8461,180 @@ mod inner {
         // Batch operations
         // -------------------------------------------------------------------
 
+        fn ensure_atomic_batch_supported(&self) -> Result<(), AtomicBatchUnsupported> {
+            if self.replica_set_configured() {
+                Ok(())
+            } else {
+                Err(Self::atomic_batch_standalone_refusal())
+            }
+        }
+
+        /// Persist an entire validated batch graph in one MongoDB transaction.
+        ///
+        /// Standalone MongoDB is refused before any mutation: it has no
+        /// multi-document transactions, so the only alternative would be the
+        /// per-family writes this replaces. Replica-set deployments run every
+        /// dependency phase and every chunk in one session transaction, so a
+        /// failure anywhere — including after a chunk boundary — leaves nothing
+        /// from the request durable and an identical retry is idempotent.
+        ///
+        /// Concurrency: the namespace mTLS/plugin-graph admission leases are held
+        /// across candidate validation and the transaction (as in the per-family
+        /// paths), and the namespace config-admission lease is re-verified with
+        /// an in-session conditional write immediately before commit. Every
+        /// writer that could invalidate the validated graph — proxy, consumer,
+        /// plugin-config, and upstream mutations — has to take one of those two
+        /// leases first, so nothing can interleave with the committed graph.
+        async fn batch_create_config_graph_atomically(
+            &self,
+            graph: &AtomicBatchGraph<'_>,
+            mode: &BatchConfigWriteMode,
+        ) -> Result<AtomicBatchCounts, anyhow::Error> {
+            if graph.is_empty() {
+                return Ok(AtomicBatchCounts::default());
+            }
+            // Re-check topology here, not just at the admin preflight: a
+            // reconnect between the two must not open a partial-commit window.
+            if !self.replica_set_configured() {
+                return Err(anyhow::Error::new(Self::atomic_batch_standalone_refusal()));
+            }
+            let (fault, chunk_size_override) =
+                crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
+            let chunk_size = chunk_size_override.unwrap_or(MONGO_ATOMIC_BATCH_CHUNK_SIZE);
+            // The override registry already rejects zero, but `chunks(0)`
+            // panics, so clamp rather than trust it.
+            let chunk_size = chunk_size.max(1);
+            let admission_namespaces = graph.admission_namespaces();
+
+            let lease_scope = admission_namespaces.iter().copied();
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases_for_mode(lease_scope, mode)
+                .await?;
+            if mode.validates_mtls_dns() {
+                for namespace in &admission_namespaces {
+                    let namespace = *namespace;
+                    self.validate_plugin_graph_admission_candidate(namespace, |candidate| {
+                        candidate.consumers.extend(
+                            graph
+                                .consumers
+                                .iter()
+                                .filter(|item| item.namespace == namespace)
+                                .cloned(),
+                        );
+                        candidate.proxies.extend(
+                            graph
+                                .proxies
+                                .iter()
+                                .filter(|item| item.namespace == namespace)
+                                .cloned(),
+                        );
+                        candidate.plugin_configs.extend(
+                            graph
+                                .plugin_configs
+                                .iter()
+                                .filter(|item| item.namespace == namespace)
+                                .cloned(),
+                        );
+                    })
+                    .await?;
+                }
+            }
+
+            let admission_lease = match graph.admission_lease {
+                Some(lease) => {
+                    let generation = i64::try_from(lease.generation).map_err(|_| {
+                        anyhow::anyhow!("namespace config admission generation is out of range")
+                    })?;
+                    Some((lease.owner.to_string(), generation))
+                }
+                None => None,
+            };
+            let plan = MongoAtomicBatchPlan {
+                consumer_docs: graph
+                    .consumers
+                    .iter()
+                    .map(consumer_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                consumer_identity_docs: graph
+                    .consumers
+                    .iter()
+                    .flat_map(|consumer| {
+                        consumer_identity_index_docs(
+                            &consumer.namespace,
+                            &consumer.id,
+                            &consumer_identity_values(consumer),
+                        )
+                    })
+                    .collect(),
+                consumer_changes: graph
+                    .consumers
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                upstream_docs: graph
+                    .upstreams
+                    .iter()
+                    .map(upstream_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                upstream_changes: graph
+                    .upstreams
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                proxy_docs: graph
+                    .proxies
+                    .iter()
+                    .map(proxy_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                proxy_changes: graph
+                    .proxies
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                plugin_config_docs: graph
+                    .plugin_configs
+                    .iter()
+                    .map(plugin_config_to_doc)
+                    .collect::<Result<Vec<Document>, anyhow::Error>>()?,
+                plugin_config_changes: graph
+                    .plugin_configs
+                    .iter()
+                    .map(|item| (item.namespace.clone(), item.id.clone()))
+                    .collect(),
+                chunk_size,
+                fault,
+                lease_namespace: graph.namespace.to_string(),
+                admission_lease,
+            };
+
+            let counts = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .and_run((self, &plan), |s, (this, plan)| {
+                        Box::pin(async move {
+                            this.write_atomic_batch_graph_in_session(&mut *s, plan)
+                                .await
+                        })
+                    })
+                    .await
+                    .map_err(Self::atomic_batch_transaction_error)?;
+                for namespace in &admission_namespaces {
+                    self.compact_config_changes_best_effort(namespace).await;
+                }
+                Ok(AtomicBatchCounts {
+                    consumers: graph.consumers.len(),
+                    upstreams: graph.upstreams.len(),
+                    proxies: graph.proxies.len(),
+                    plugin_configs: graph.plugin_configs.len(),
+                })
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
+            Ok(counts)
+        }
+
         async fn batch_create_proxies(
             &self,
             proxies: &[Proxy],
@@ -8223,7 +8746,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -8569,7 +9092,7 @@ mod inner {
             Ok(count)
                 })
                 .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -8693,7 +9216,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -8802,7 +9325,7 @@ mod inner {
                 Ok(count)
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(count)
         }
 
@@ -9559,7 +10082,7 @@ mod inner {
                 Ok(())
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
@@ -9778,7 +10301,7 @@ mod inner {
                 Ok(())
             })
             .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
@@ -9868,7 +10391,7 @@ mod inner {
                     Ok(())
                 })
                 .await?;
-                Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+                Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
                 return Ok(());
             }
 
@@ -10356,7 +10879,7 @@ mod inner {
             Ok(())
                 })
                 .await?;
-            Self::release_mtls_dns_admission_leases(&mut mtls_leases).await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
             Ok(())
         }
 
