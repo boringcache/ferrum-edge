@@ -3954,7 +3954,7 @@ fn test_extreme_timestamp_bounds_are_rejected_at_admission() {
             "timestamp": Value::Object(timestamp),
             "reject_missing_security_header": false
         });
-        let err = SoapWsSecurity::new(&config).expect_err("extreme value must be rejected");
+        let err = SoapWsSecurity::new(&config).err().expect("extreme value must be rejected");
         assert!(
             err.contains(key) && err.contains("must be an integer"),
             "unexpected error for {key}: {err}"
@@ -3972,7 +3972,7 @@ fn test_extreme_saml_skew_is_rejected_at_admission() {
         },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("extreme SAML skew must be rejected");
+    let err = SoapWsSecurity::new(&config).err().expect("extreme SAML skew must be rejected");
     assert!(
         err.contains("clock_skew_seconds"),
         "unexpected error: {err}"
@@ -4049,7 +4049,7 @@ fn test_unknown_root_key_is_rejected() {
         "nonce_replay_protection": { "max_cache_size": 50 },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("documented alias must be rejected");
+    let err = SoapWsSecurity::new(&config).err().expect("documented alias must be rejected");
     assert!(
         err.contains("unknown configuration key") && err.contains("nonce_replay_protection"),
         "unexpected error: {err}"
@@ -4062,7 +4062,7 @@ fn test_unknown_nested_key_is_rejected_with_suggestion() {
         "timestamp": { "require": true, "clock_skew_second": 30 },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("misspelling must be rejected");
+    let err = SoapWsSecurity::new(&config).err().expect("misspelling must be rejected");
     assert!(
         err.contains("config.timestamp.clock_skew_second")
             && err.contains("did you mean 'clock_skew_seconds'"),
@@ -4083,7 +4083,7 @@ fn test_string_valued_enabled_flag_is_rejected() {
         },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("wrong-typed enabled must be rejected");
+    let err = SoapWsSecurity::new(&config).err().expect("wrong-typed enabled must be rejected");
     assert!(
         err.contains("config.username_token.enabled") && err.contains("must be a boolean"),
         "unexpected error: {err}"
@@ -4099,7 +4099,7 @@ fn test_non_string_saml_audience_is_rejected() {
         "saml": { "enabled": false, "audience": 123 },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("wrong-typed audience must be rejected");
+    let err = SoapWsSecurity::new(&config).err().expect("wrong-typed audience must be rejected");
     assert!(
         err.contains("config.saml.audience") && err.contains("must be a string"),
         "unexpected error: {err}"
@@ -4116,7 +4116,7 @@ fn test_malformed_credential_entries_are_rejected_not_dropped() {
             "credentials": [{"username": "alice"}]
         }
     });
-    let err = SoapWsSecurity::new(&missing_password).expect_err("missing password must reject");
+    let err = SoapWsSecurity::new(&missing_password).err().expect("missing password must reject");
     assert!(
         err.contains("password") && err.contains("is required"),
         "{err}"
@@ -4130,7 +4130,7 @@ fn test_malformed_credential_entries_are_rejected_not_dropped() {
             "credentials": [{"username": "alice", "password": 42}]
         }
     });
-    let err = SoapWsSecurity::new(&wrong_type).expect_err("non-string password must reject");
+    let err = SoapWsSecurity::new(&wrong_type).err().expect("non-string password must reject");
     assert!(err.contains("password"), "{err}");
 
     let unknown_field = json!({
@@ -4141,7 +4141,7 @@ fn test_malformed_credential_entries_are_rejected_not_dropped() {
             "credentials": [{"username": "alice", "password": "p", "role": "admin"}]
         }
     });
-    let err = SoapWsSecurity::new(&unknown_field).expect_err("unknown credential key must reject");
+    let err = SoapWsSecurity::new(&unknown_field).err().expect("unknown credential key must reject");
     assert!(err.contains("role"), "{err}");
 }
 
@@ -4158,7 +4158,7 @@ fn test_duplicate_credential_username_is_rejected() {
             ]
         }
     });
-    let err = SoapWsSecurity::new(&config).expect_err("duplicate username must reject");
+    let err = SoapWsSecurity::new(&config).err().expect("duplicate username must reject");
     assert!(err.contains("duplicates an earlier entry"), "{err}");
 }
 
@@ -4172,7 +4172,7 @@ fn test_unsupported_algorithm_value_is_rejected_not_dropped() {
         },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("unknown algorithm must reject");
+    let err = SoapWsSecurity::new(&config).err().expect("unknown algorithm must reject");
     assert!(
         err.contains("rsa-md5") && err.contains("is not one of"),
         "unexpected error: {err}"
@@ -4186,7 +4186,7 @@ fn test_non_string_cert_path_entry_is_rejected() {
         "saml": { "enabled": false, "trusted_issuers": ["https://idp", 7] },
         "reject_missing_security_header": false
     });
-    let err = SoapWsSecurity::new(&config).expect_err("non-string entry must reject");
+    let err = SoapWsSecurity::new(&config).err().expect("non-string entry must reject");
     assert!(
         err.contains("trusted_issuers[1]"),
         "unexpected error: {err}"
@@ -4203,7 +4203,7 @@ fn test_zero_nonce_cache_controls_are_rejected() {
             "nonce": Value::Object(nonce),
             "reject_missing_security_header": false
         });
-        let err = SoapWsSecurity::new(&config).expect_err("zero must be rejected");
+        let err = SoapWsSecurity::new(&config).err().expect("zero must be rejected");
         assert!(err.contains(key), "unexpected error for {key}: {err}");
     }
 }
