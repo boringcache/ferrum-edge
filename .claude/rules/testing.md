@@ -61,6 +61,15 @@ paths:
 - Functional and conformance suites are intentionally excluded; they spawn subprocesses or use separate coverage reporters. Line coverage for lib/unit/integration runs in CI through `.github/workflows/coverage.yml`.
 - Coverage outputs (`target/llvm-cov/`, `target/llvm-cov-target/`) are gitignored.
 
+## Simulating A Server Going Away (tonic)
+
+- `JoinHandle::abort()` on a task running `tonic::transport::Server::serve_with_incoming` does **not** disconnect existing clients. tonic spawns a detached `tokio::spawn` task per accepted connection, so aborting the accept loop only closes the listener; every established stream keeps being served.
+- A long-lived server-streaming RPC (`ConfigSync.Subscribe`, `MeshSubscribe`, xDS ADS) therefore survives the "shutdown", and any assertion that depends on the client noticing — reconnect, CP/DP failover, stale-snapshot fencing — passes vacuously.
+- `serve_with_incoming_shutdown` is not sufficient either: its signal triggers a *graceful* per-connection shutdown (GOAWAY), which never ends an infinite response stream.
+- To genuinely sever the transport, own the server's runtime and shut it down (`tests/integration/cp_dp_grpc_tests.rs::SeverableTestCpServer`): dropping the runtime aborts the accept loop and every per-connection task, closing their sockets.
+- Any failover test must additionally assert the client actually reached the fallback (e.g. `wait_for_cp_url`) before asserting what the fallback may or may not do. A negative-only assertion after a fake shutdown proves nothing.
+- A `tokio::sync::broadcast` push to a CP that currently has no subscriber is silently dropped, so "the DP never applied X" can pass because X was never delivered. Assert delivery (`Sender::send` returns the receiver count) and a DP-side effect of the rejection (sticky `config_diverged` or its `config_divergence_recoveries_total`) rather than the absence alone.
+
 ## Functional Test Rules
 
 - Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.
