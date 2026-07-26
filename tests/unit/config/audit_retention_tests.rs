@@ -8,8 +8,8 @@ use ferrum_edge::admin::audit::{
     AUDIT_MAX_ROWS_PRUNE_GATES_CAP, AUDIT_RETENTION_DAYS_MAX, AUDIT_RETENTION_MAX_ROWS_CAP,
     AUDIT_RETENTION_MAX_ROWS_CHECK_INTERVAL, AUDIT_RETENTION_MAX_ROWS_DEFAULT,
     AUDIT_RETENTION_PRUNE_BATCH_SIZE, AUDIT_RETENTION_PRUNE_MAX_BATCHES, AuditMaxRowsPruneGate,
-    AuditRetentionPolicy, audit_retention_hit_prune_batch_budget,
-    audit_retention_max_rows_check_interval, audit_max_rows_prune_gate_should_run,
+    AuditRetentionPolicy, audit_max_rows_prune_gate_should_run,
+    audit_retention_hit_prune_batch_budget, audit_retention_max_rows_check_interval,
 };
 use ferrum_edge::config::EnvConfig;
 use std::sync::Arc;
@@ -34,8 +34,7 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
 }
 
 const DB_LOADER_SOURCE: &str = include_str!("../../../src/config/db_loader.rs");
-const MONGO_INDEX_PLAN_SOURCE: &str =
-    include_str!("../../../src/config/mongo_index_plan.rs");
+const MONGO_INDEX_PLAN_SOURCE: &str = include_str!("../../../src/config/mongo_index_plan.rs");
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
 const AUDIT_SOURCE: &str = include_str!("../../../src/admin/audit.rs");
 
@@ -97,8 +96,7 @@ fn audit_retention_policy_zero_max_rows_disables_row_cap() {
     assert_eq!(policy.max_rows_per_namespace, None);
     assert!(!policy.is_enabled());
 
-    let rows_only_days =
-        AuditRetentionPolicy::from_parts(Some(30), Some(0)).unwrap();
+    let rows_only_days = AuditRetentionPolicy::from_parts(Some(30), Some(0)).unwrap();
     assert_eq!(rows_only_days.retention_days, Some(30));
     assert_eq!(rows_only_days.max_rows_per_namespace, None);
     assert!(rows_only_days.is_enabled());
@@ -243,8 +241,7 @@ fn max_rows_soft_cap_gate_keeps_draining_after_batch_budget() {
 fn max_rows_prune_gate_map_at_capacity_runs_scan_without_insert() {
     use dashmap::DashMap;
 
-    let gates: Arc<DashMap<String, AuditMaxRowsPruneGate>> =
-        Arc::new(DashMap::new());
+    let gates: Arc<DashMap<String, AuditMaxRowsPruneGate>> = Arc::new(DashMap::new());
     for i in 0..AUDIT_MAX_ROWS_PRUNE_GATES_CAP {
         gates.insert(format!("ns-{i}"), AuditMaxRowsPruneGate::default());
     }
