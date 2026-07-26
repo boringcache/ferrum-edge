@@ -309,13 +309,27 @@ const CASES: &[Case] = &[
         backend_target: Backend::Exact("/canon/admin"),
         why: "fully encoded spelling is the same policy path",
     },
-    // An escape of a character that cannot appear literally in a path stays
-    // escaped — decoding it would produce an untransmittable target.
+    // An escape of a character that cannot appear literally in a path is
+    // refused: it could not be decoded into the forwarded target, and keeping
+    // it escaped would leave policy reading `/canon/a%20b` while a decoding
+    // backend resolves `/canon/a b`.
     Case {
         target: "/canon/a%20b",
-        status: 200,
-        backend_target: Backend::Exact("/canon/a%20b"),
-        why: "space stays escaped and uppercase-normalized",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "encoded space cannot be forwarded literally",
+    },
+    Case {
+        target: "/canon/a%7Bb",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "encoded brace cannot be forwarded literally",
+    },
+    Case {
+        target: "/canon/caf%C3%A9",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "encoded non-ASCII bytes cannot be forwarded literally",
     },
     Case {
         target: "/canon/a%2fb",
@@ -357,7 +371,7 @@ const CASES: &[Case] = &[
         target: "/canon/caf%C3%28",
         status: 400,
         backend_target: Backend::Never,
-        why: "invalid UTF-8 resolves differently per backend runtime",
+        why: "escaped non-ASCII bytes are refused, valid UTF-8 or not",
     },
     Case {
         target: "/canon/%00",

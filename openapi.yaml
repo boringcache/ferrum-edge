@@ -6381,14 +6381,15 @@ components:
             **Must already be a canonical policy path.** Request paths are
             canonicalized at the frontend boundary before route lookup:
             percent-escapes of characters that are legal literally in a path are
-            decoded (`/%61dmin` becomes `/admin`), surviving escapes are
-            uppercase-hex normalized, and encoded separators (`%2F`, `%5C`,
-            `%3F`, `%23`), escape-synthesized dot segments, double encodings
-            (`%25…`), encoded control characters, invalid escapes, and escapes
-            that do not decode to valid UTF-8 are rejected with `400`. A
-            `listen_path` written in any other spelling is therefore
-            unreachable, and admission rejects it on every create, update,
-            batch, restore, and config-load path. See
+            decoded (`/%61dmin` becomes `/admin`) and every other escape is
+            rejected with `400`: encoded separators (`%2F`, `%5C`, `%3F`,
+            `%23`), escape-synthesized dot segments, double encodings (`%25…`),
+            encoded control characters, invalid escapes, and escapes of
+            characters that cannot appear literally in a path (`%20`, `%7B`,
+            and any percent-encoded non-ASCII byte). No percent escape survives
+            canonicalization, so a `listen_path` containing one is unreachable,
+            and admission rejects it on every create, update, batch, restore,
+            and config-load path. See
             `docs/request_path_canonicalization.md`.
           examples:
             - /api/v1
@@ -17603,11 +17604,13 @@ components:
                 a request path. The prefix must also already be a canonical
                 policy path: request paths are canonicalized at the frontend
                 boundary (percent-escapes of characters that are legal
-                literally in a path are decoded, surviving escapes are
-                uppercase-hex normalized, and encoded separators / dot segments
-                / double encodings / invalid escapes are rejected with `400`),
-                so a prefix such as `/%61dmin` or `/api%2Fadmin` is rejected at
-                admission rather than silently never matching. See
+                literally in a path are decoded, and every other escape —
+                separators, dot segments, double encodings, control
+                characters, invalid escapes, and escapes of characters such as
+                `%20` or `%7B` that cannot appear literally in a path — is
+                rejected with `400`), so no percent escape survives and a
+                prefix such as `/%61dmin`, `/api%2Fadmin`, or `/api%20name` is
+                rejected at admission rather than silently never matching. See
                 `docs/request_path_canonicalization.md`. Mutually exclusive
                 with `header`.
             header:

@@ -86,35 +86,56 @@ fn every_unreserved_and_sub_delim_escape_is_decoded() {
 }
 
 #[test]
-fn escapes_of_characters_illegal_in_a_path_stay_encoded_with_uppercase_hex() {
-    // Space cannot appear literally in a request target, so it stays escaped —
-    // and the canonical form is uppercase hex (RFC 3986 6.2.2.1).
-    assert_eq!(canonical("/api%20name"), "/api%20name");
-    assert_eq!(canonical("/api%7bname%7d"), "/api%7Bname%7D");
-    assert_eq!(canonical("/caf%c3%a9"), "/caf%C3%A9");
-    // Already uppercase and undecodable: borrowed, not rebuilt.
-    assert!(matches!(
-        canonicalize_policy_path("/api%20name").expect("accepted"),
-        Cow::Borrowed(_)
-    ));
+fn escapes_of_characters_illegal_in_a_path_are_rejected() {
+    // A space, `{`, `[`, or any non-ASCII byte cannot be written literally in a
+    // request target. Retaining the escape would forward `/api%20name` while
+    // policy read `/api%20name` and a decoding backend resolved `/api name` —
+    // exactly the policy/backend mismatch this module exists to remove — so the
+    // target is refused instead.
+    for path in [
+        "/api%20name",
+        "/api%7bname",
+        "/api%7Dname",
+        "/api%5Bname%5D",
+        "/api%22name",
+        "/api%3Cname%3E",
+        "/api%5Ename",
+        "/api%60name",
+        "/api%7Cname",
+        "/caf%c3%a9",
+        "/%E2%9C%93",
+        "/%FF",
+    ] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::UnrepresentableEscape,
+            "{path:?}"
+        );
+    }
 }
 
 #[test]
-fn canonical_form_is_idempotent_and_is_a_valid_request_target() {
+fn no_percent_escape_survives_canonicalization() {
+    // The single-coordinate contract: an escape is either decoded to the byte
+    // it names or the request is refused, so the canonical path is byte-for-byte
+    // what a decoding backend resolves and there is no second spelling to keep
+    // in sync.
     for raw in [
         "/%61dmin",
-        "/api%20name",
-        "/caf%c3%a9/%76%31",
         "/a/%2Ehidden",
         "/%40user/%3Bmatrix",
+        "/api/%76%31/users",
     ] {
         let once = canonical(raw);
+        assert!(
+            !once.contains('%'),
+            "{raw:?} canonicalized to {once:?}, which still carries an escape"
+        );
         let twice = canonical(&once);
         assert_eq!(once, twice, "canonicalization must be idempotent for {raw:?}");
-        // Every surviving `%` still introduces a complete escape, and no byte
-        // that would need escaping was emitted literally.
+        // No byte that would need escaping was emitted literally.
         assert!(
-            !once.bytes().any(|byte| byte <= 0x20 || byte == 0x7F),
+            !once.bytes().any(|byte| byte <= 0x20 || byte >= 0x7F),
             "{once:?} must be transmissible as a request target"
         );
     }
@@ -166,7 +187,7 @@ fn double_encoding_is_rejected_at_the_lead_byte() {
     }
 }
 
-// ── Invalid escapes and invalid UTF-8 ──────────────────────────────────────
+// ── Invalid escapes and non-ASCII byte sequences ───────────────────────────
 
 #[test]
 fn incomplete_or_non_hex_escapes_are_rejected() {
@@ -180,15 +201,18 @@ fn incomplete_or_non_hex_escapes_are_rejected() {
 }
 
 #[test]
-fn escapes_that_do_not_decode_to_utf8_are_rejected() {
-    // Backends disagree about invalid UTF-8 (reject / replace with U+FFFD /
-    // pass through), so the gateway cannot know which path it authorized.
-    for path in ["/caf%C3%28", "/%FF", "/%C3", "/%E2%82"] {
-        assert_eq!(rejection(path), PolicyPathRejection::InvalidUtf8, "{path:?}");
+fn escaped_non_ascii_bytes_are_rejected_whether_or_not_they_form_valid_utf8() {
+    // Valid UTF-8 (`%C3%A9`) and invalid UTF-8 (`%C3%28`, a lone `%FF`) reach
+    // the same verdict: a non-ASCII byte cannot be spelled literally in the
+    // forwarded target, so keeping it escaped would leave the gateway
+    // evaluating `/caf%C3%A9` while the backend resolves `/café`.
+    for path in ["/caf%C3%A9", "/caf%C3%28", "/%FF", "/%C3", "/%E2%82"] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::UnrepresentableEscape,
+            "{path:?}"
+        );
     }
-    // Valid multi-byte UTF-8 is accepted and stays escaped.
-    assert_eq!(canonical("/caf%C3%A9"), "/caf%C3%A9");
-    assert_eq!(canonical("/%E2%9C%93"), "/%E2%9C%93");
 }
 
 #[test]
@@ -249,7 +273,10 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
         (PolicyPathRejection::EncodedSeparator, "encoded_separator"),
         (PolicyPathRejection::EncodedBackslash, "encoded_backslash"),
         (PolicyPathRejection::EncodedControl, "encoded_control"),
-        (PolicyPathRejection::InvalidUtf8, "invalid_utf8"),
+        (
+            PolicyPathRejection::UnrepresentableEscape,
+            "unrepresentable_escape",
+        ),
         (
             PolicyPathRejection::AmbiguousDotSegment,
             "ambiguous_dot_segment",
@@ -271,7 +298,6 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
 #[test]
 fn non_canonical_reason_flags_config_values_that_can_never_match() {
     assert_eq!(non_canonical_policy_path_reason("/admin"), None);
-    assert_eq!(non_canonical_policy_path_reason("/api%20name"), None);
     assert_eq!(non_canonical_policy_path_reason("*"), None);
     assert_eq!(non_canonical_policy_path_reason("/api/../admin"), None);
 
@@ -291,10 +317,19 @@ fn non_canonical_reason_flags_config_values_that_can_never_match() {
         non_canonical_policy_path_reason("/api%2"),
         Some("invalid_escape")
     );
-    // Lowercase hex on an escape that survives still changes the bytes, so it
-    // is not canonical as configured.
+    // No escape survives canonicalization, so a configured value carrying one
+    // is never usable as written — an escape of a character that cannot appear
+    // literally in a path is refused by the same rule the request path is.
+    assert_eq!(
+        non_canonical_policy_path_reason("/api%20name"),
+        Some("unrepresentable_escape")
+    );
     assert_eq!(
         non_canonical_policy_path_reason("/api%7bname"),
-        Some("percent-escapes that canonicalize to a different path")
+        Some("unrepresentable_escape")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("/caf%C3%A9"),
+        Some("unrepresentable_escape")
     );
 }

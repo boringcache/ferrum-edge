@@ -38,25 +38,25 @@ a path — RFC 3986 `pchar`, i.e. `unreserved` / `sub-delims` / `:` / `@` — is
 decoded to that character. `/%61dmin` becomes `/admin`, `/%40user` becomes
 `/@user`.
 
-**Accepted and kept escaped.** An escape of a character that cannot appear
-literally in a request target (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``,
-`{`, `|`, `}`, and any non-ASCII byte) survives, normalized to uppercase hex
-per RFC 3986 §6.2.2.1: `/api%20name` stays `/api%20name`, `/caf%c3%a9` becomes
-`/caf%C3%A9`.
+**No escape survives.** An escape is either decoded to the byte it names or the
+request is refused, so a canonical policy path never contains a `%`. That is
+what makes the canonical path a single coordinate: the gateway cannot evaluate
+one spelling while forwarding another that a decoding backend reads
+differently.
 
 **Rejected with `400`.** Each case is a target whose meaning depends on which
 component decodes it, so there is no reading the gateway can adopt without
 risking disagreement with the backend:
 
-| Reason token            | Example          | Why |
-| ----------------------- | ---------------- | --- |
-| `invalid_escape`        | `/a%`, `/a%2`, `/a%zz` | A lenient parser and a strict one disagree about where the escape ends. |
-| `double_encoding`       | `/a%25b`, `/a%252Fb` | An encoded `%` is the lead byte of any double encoding; a second decode could introduce structure. |
-| `encoded_separator`     | `/a%2Fb`, `/a%3Fb`, `/a%23b` | Decoding would add a segment, a query, or a fragment the raw target did not have. |
-| `encoded_backslash`     | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
-| `encoded_control`       | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
-| `invalid_utf8`          | `/caf%C3%28`     | Backends variously reject, substitute `U+FFFD`, or pass the bytes through — the authorized path would not be the resolved path. |
-| `ambiguous_dot_segment` | `/a/%2e%2e/b`    | A percent escape produced a `.` or `..` segment. |
+| Reason token             | Example          | Why |
+| ------------------------ | ---------------- | --- |
+| `invalid_escape`         | `/a%`, `/a%2`, `/a%zz` | A lenient parser and a strict one disagree about where the escape ends. |
+| `double_encoding`        | `/a%25b`, `/a%252Fb` | An encoded `%` is the lead byte of any double encoding; a second decode could introduce structure. |
+| `encoded_separator`      | `/a%2Fb`, `/a%3Fb`, `/a%23b` | Decoding would add a segment, a query, or a fragment the raw target did not have. |
+| `encoded_backslash`      | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
+| `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
+| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte cannot appear literally in a request target (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would produce an untransmittable target. Neither is a single coordinate, so the target is refused. |
+| `ambiguous_dot_segment`  | `/a/%2e%2e/b`    | A percent escape produced a `.` or `..` segment. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
@@ -73,13 +73,15 @@ and the backend.
    of the raw target. Routing, `openapi_validator` parameter segments (`[^/]+`),
    and the backend cannot disagree about how many segments a request has.
 2. **Decode idempotence.** `canonicalize(canonicalize(p)) == canonicalize(p)`,
-   and a further decode of a canonical path can never introduce structure —
-   surviving escapes only encode bytes that are not separators.
-3. **One coordinate system.** Only `pchar`-legal bytes are decoded and every
-   surviving escape is still a valid escape, so the canonical path is itself a
-   valid HTTP request target. Policy evaluation and backend forwarding use the
-   same string; `strip_listen_path` offsets measured by the router are valid
-   offsets into the forwarded path.
+   and a further decode of a canonical path is a no-op — there is no escape
+   left to decode.
+3. **One coordinate system.** Only `pchar`-legal bytes are decoded and no
+   escape survives, so the canonical path is itself a valid HTTP request target
+   *and* is byte-identical to what a decoding backend resolves. Policy
+   evaluation and backend forwarding use the same string; `strip_listen_path`
+   offsets measured by the router are valid offsets into the forwarded path.
+   There is no spelling left on which a policy rule and the application can
+   disagree.
 
 ## Protocol parity
 
@@ -93,8 +95,10 @@ same way its other `400` rejections are shaped.
 ## Configured paths must be canonical too
 
 Operator-authored path values are compared against the canonical request path,
-so a non-canonical configured value can never match. Rather than silently never
-firing, these are rejected at admission using the same canonicalizer:
+so a non-canonical configured value can never match. Because no escape survives
+canonicalization, a configured path is canonical exactly when it contains no
+percent escape. Rather than silently never firing, non-canonical values are
+rejected at admission using the same canonicalizer:
 
 - `Proxy.listen_path` — rejected by `Proxy::validate_fields()` and by the
   dedicated `GatewayConfig::validate_listen_path_encodings()` that runs on
@@ -122,7 +126,7 @@ Transaction logs record the canonical path.
 
 ## Operational impact
 
-This is a behavior change for two shapes of traffic that previously succeeded:
+This is a behavior change for three shapes of traffic that previously succeeded:
 
 - Targets with encoded separators (`%2F`, `%252F`) were folded into `/` for
   route lookup and now receive `400`. Folding changes segment structure, so a
@@ -131,8 +135,18 @@ This is a behavior change for two shapes of traffic that previously succeeded:
   parameter must move that value into the query string or a header.
 - Targets with a percent escape that decoded to a `.` or `..` segment now
   receive `400`.
+- Targets carrying an escape of a character that cannot be written literally in
+  a path — `%20` for space, `%7B`/`%5B` for brackets, and any percent-encoded
+  non-ASCII text such as `/caf%C3%A9` — now receive `400`
+  (`unrepresentable_escape`). This is the broadest of the three: **percent-encoded
+  spaces and non-ASCII path segments are no longer accepted at all.** The
+  gateway has no way to hold one such target that both policy and a decoding
+  backend read the same way, so it refuses rather than authorize a spelling the
+  application may resolve differently. APIs that need spaces or non-ASCII text
+  in a resource identifier must carry that value in the query string, a header,
+  or a body field, or use a `pchar`-legal identifier in the path.
 
-There is no configuration switch for either. A per-deployment opt-out would
+There is no configuration switch for any of them. A per-deployment opt-out would
 mean policy is computed differently depending on config, which is the class of
 divergence this representation exists to eliminate.
 

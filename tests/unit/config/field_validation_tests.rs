@@ -336,14 +336,16 @@ fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
         "expected regex-form rejection, got {errs:?}"
     );
 
-    // Negative: an escape of a character that cannot appear literally in a
-    // path (`%20` for space) is already canonical and stays allowed.
-    proxy.listen_path = Some("/api%20name".into());
-    let result = proxy.validate_fields();
-    if let Err(errs) = &result {
+    // An escape of a character that cannot appear literally in a path (`%20`
+    // for space, `%7B` for a brace, `%C3%A9` for `é`) cannot be decoded into
+    // the forwarded target either, so the runtime refuses those request paths
+    // outright and such a listen_path is dead config.
+    for path in ["/api%20name", "/api/%7Bid%7D", "/caf%C3%A9"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            !errs.iter().any(|e| e.contains(MARKER)),
-            "did not expect a canonical-path rejection for `%20`, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected unrepresentable-escape rejection for {path:?}, got {errs:?}"
         );
     }
 

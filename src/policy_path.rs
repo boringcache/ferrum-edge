@@ -36,10 +36,15 @@
 //!    double encoding) is [`PolicyPathRejection::DoubleEncoding`]. Combined with rule 2 this means
 //!    a second decode of the canonical path can never introduce a separator,
 //!    so "decoded once" and "decoded twice" describe the same route.
-//! 4. **The decoded byte stream is valid UTF-8.** Otherwise backends disagree
-//!    (reject / replace with `U+FFFD` / pass bytes through), and the path the
-//!    gateway authorized is not the path the backend resolves.
-//!    ([`PolicyPathRejection::InvalidUtf8`].)
+//! 4. **Every escape decodes to a byte that is legal literally in a path.**
+//!    An escape the canonical path could not spell literally — encoded space,
+//!    `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `|`, `}`, and every
+//!    non-ASCII byte, whether or not it is part of a valid UTF-8 sequence — is
+//!    [`PolicyPathRejection::UnrepresentableEscape`]. Retaining such an escape
+//!    would put a *different* string on the wire than the one policy read:
+//!    the gateway would evaluate `/api%20name` while a decoding backend
+//!    resolves `/api name`, which is the same policy/backend semantic
+//!    mismatch this module exists to remove.
 //! 5. **No escape may synthesize a dot segment.** `/a/%2e%2e/b` is
 //!    [`PolicyPathRejection::AmbiguousDotSegment`]. A *literal* `/a/../b` is left exactly as it is —
 //!    it is equally visible to the operator, the gateway, and the backend, and
@@ -50,14 +55,15 @@
 //! 7. **Escapes of characters that are legal literally in a path are decoded**
 //!    (RFC 3986 `pchar` = `unreserved` / `sub-delims` / `:` / `@`), so
 //!    `/%61dmin` canonicalizes to `/admin` and an operator's literal rule
-//!    matches. Every surviving escape is uppercase-hex normalized
-//!    (RFC 3986 §6.2.2.1).
+//!    matches.
 //!
-//! Because only `pchar`-legal bytes are ever decoded and every surviving
-//! escape is still a valid escape, **the canonical path is always a valid HTTP
-//! request target**. That is what lets one representation serve both policy
-//! and forwarding: there is no second "wire" coordinate system to keep in
-//! sync.
+//! Rules 4 and 7 together mean **no percent escape survives canonicalization**:
+//! an escape is either decoded to the literal byte it names or the request is
+//! refused. The canonical path is therefore always a valid HTTP request target
+//! *and* is byte-identical to what a decoding backend resolves. That is what
+//! lets one representation serve both policy and forwarding: there is no
+//! second "wire" coordinate system to keep in sync, and no spelling on which
+//! the gateway and the backend can disagree.
 //!
 //! The function is idempotent: `canonicalize(canonicalize(p)) == canonicalize(p)`.
 //!
@@ -66,7 +72,9 @@
 //! A path with no `%` is returned borrowed, unmodified, and can never be
 //! rejected. That is the overwhelming majority of production traffic, so the
 //! hot path stays allocation-free and no request without a percent escape
-//! changes behavior.
+//! changes behavior. The converse also holds: because no escape survives, a
+//! borrowed result means the target contained no escape at all, and an owned
+//! result always means at least one escape was decoded.
 //!
 //! # Relationship to `normalize_encoded_slashes`
 //!
@@ -98,8 +106,10 @@ pub enum PolicyPathRejection {
     EncodedBackslash,
     /// An encoded C0 control character or `DEL` (includes `%00`).
     EncodedControl,
-    /// The fully decoded path is not valid UTF-8.
-    InvalidUtf8,
+    /// An escape of a byte that cannot appear literally in a request target
+    /// (space, `{`, `[`, any non-ASCII byte, …). Keeping the escape would make
+    /// the forwarded spelling differ from the string policy evaluated.
+    UnrepresentableEscape,
     /// A percent escape produced a `.` or `..` path segment.
     AmbiguousDotSegment,
 }
@@ -113,7 +123,7 @@ impl PolicyPathRejection {
             Self::EncodedSeparator => "encoded_separator",
             Self::EncodedBackslash => "encoded_backslash",
             Self::EncodedControl => "encoded_control",
-            Self::InvalidUtf8 => "invalid_utf8",
+            Self::UnrepresentableEscape => "unrepresentable_escape",
             Self::AmbiguousDotSegment => "ambiguous_dot_segment",
         }
     }
@@ -134,7 +144,9 @@ impl PolicyPathRejection {
             Self::EncodedControl => {
                 r#"{"error":"Request path contains an encoded control character"}"#
             }
-            Self::InvalidUtf8 => r#"{"error":"Request path does not decode to valid UTF-8"}"#,
+            Self::UnrepresentableEscape => {
+                r#"{"error":"Request path contains an unrepresentable percent-escape"}"#
+            }
             Self::AmbiguousDotSegment => {
                 r#"{"error":"Request path contains an encoded dot segment"}"#
             }
@@ -149,18 +161,24 @@ impl PolicyPathRejection {
             Self::EncodedSeparator => "Encoded path separator in request path",
             Self::EncodedBackslash => "Encoded backslash in request path",
             Self::EncodedControl => "Encoded control character in request path",
-            Self::InvalidUtf8 => "Request path does not decode to valid UTF-8",
+            Self::UnrepresentableEscape => "Unrepresentable percent-escape in request path",
             Self::AmbiguousDotSegment => "Encoded dot segment in request path",
         }
     }
 }
 
 /// Bytes that are legal to appear literally in a path segment and are
-/// therefore decoded rather than left escaped: RFC 3986 `pchar` minus
-/// `pct-encoded`, i.e. `unreserved / sub-delims / ":" / "@"`.
+/// therefore decoded: RFC 3986 `pchar` minus `pct-encoded`, i.e.
+/// `unreserved / sub-delims / ":" / "@"`.
 ///
-/// `/` is deliberately absent — an encoded `/` is rejected, never decoded,
-/// because decoding it would add a segment the raw target did not have.
+/// This table is exhaustive for what canonicalization accepts. An escape of
+/// any other byte is refused, because the escape could not be rendered
+/// literally in the forwarded request target and a retained escape is a second
+/// spelling the backend may read differently than policy did.
+///
+/// `/` is deliberately absent — an encoded `/` is rejected with its own
+/// dedicated reason, because decoding it would add a segment the raw target
+/// did not have.
 const DECODE_TO_LITERAL: [bool; 256] = build_decode_table();
 
 const fn build_decode_table() -> [bool; 256] {
@@ -178,8 +196,6 @@ const fn build_decode_table() -> [bool; 256] {
     }
     table
 }
-
-const HEX_UPPER: [u8; 16] = *b"0123456789ABCDEF";
 
 #[inline]
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -220,12 +236,10 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
         return Ok(Cow::Borrowed(raw));
     }
 
+    // Every accepted escape is decoded to one literal byte, so this is both the
+    // canonical policy path and the byte stream a decoding backend resolves —
+    // there is only one buffer because there is only one coordinate system.
     let mut canonical: Vec<u8> = Vec::with_capacity(bytes.len());
-    // Byte stream a decoding backend would resolve. Validated as UTF-8 once at
-    // the end; kept separate from `canonical` because canonical retains the
-    // escapes for bytes that are not legal literally in a path.
-    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut changed = false;
     let mut segment_start = 0usize;
     let mut segment_has_escape = false;
     let mut index = 0usize;
@@ -236,7 +250,6 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
         if byte == b'/' {
             check_segment(&canonical, segment_start, segment_has_escape)?;
             canonical.push(b'/');
-            decoded.push(b'/');
             segment_start = canonical.len();
             segment_has_escape = false;
             index += 1;
@@ -245,7 +258,6 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
 
         if byte != b'%' {
             canonical.push(byte);
-            decoded.push(byte);
             index += 1;
             continue;
         }
@@ -263,45 +275,36 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
             b'/' | b'?' | b'#' => return Err(PolicyPathRejection::EncodedSeparator),
             b'\\' => return Err(PolicyPathRejection::EncodedBackslash),
             0x00..=0x1F | 0x7F => return Err(PolicyPathRejection::EncodedControl),
+            // Anything left that is not `pchar`-legal cannot be written
+            // literally into the forwarded request target. Retaining the
+            // escape would leave policy reading `/api%20name` while a decoding
+            // backend resolves `/api name`, so the target is refused instead.
+            // This also covers every non-ASCII byte, valid UTF-8 sequence or
+            // not, so there is no decoded byte stream left to UTF-8 validate.
+            _ if !DECODE_TO_LITERAL[value as usize] => {
+                return Err(PolicyPathRejection::UnrepresentableEscape);
+            }
             _ => {}
         }
 
-        decoded.push(value);
-        if DECODE_TO_LITERAL[value as usize] {
-            canonical.push(value);
-            changed = true;
-        } else {
-            let high_hex = HEX_UPPER[(value >> 4) as usize];
-            let low_hex = HEX_UPPER[(value & 0x0F) as usize];
-            if bytes[index + 1] != high_hex || bytes[index + 2] != low_hex {
-                changed = true;
-            }
-            canonical.push(b'%');
-            canonical.push(high_hex);
-            canonical.push(low_hex);
-        }
+        canonical.push(value);
         segment_has_escape = true;
         index += 3;
     }
 
     check_segment(&canonical, segment_start, segment_has_escape)?;
 
-    if std::str::from_utf8(&decoded).is_err() {
-        return Err(PolicyPathRejection::InvalidUtf8);
-    }
-
-    if !changed {
-        return Ok(Cow::Borrowed(raw));
-    }
-
+    // Reaching here means at least one `%` was consumed (the fast path handled
+    // the escape-free case) and every escape collapsed from three bytes to one,
+    // so the canonical form always differs from `raw` and is always owned.
+    //
     // `canonical` is `raw`'s literal bytes (valid UTF-8, copied in order and
-    // never split mid-codepoint) interleaved with decoded ASCII `pchar`s and
-    // ASCII escape text, so it is valid UTF-8 by construction. The fallible
-    // form keeps this a documented invariant instead of a panic.
-    match String::from_utf8(canonical) {
-        Ok(canonical) => Ok(Cow::Owned(canonical)),
-        Err(_) => Err(PolicyPathRejection::InvalidUtf8),
-    }
+    // never split mid-codepoint) interleaved with decoded ASCII `pchar`s, so it
+    // is valid UTF-8 by construction. The fallible form keeps that a documented
+    // invariant instead of a panic.
+    String::from_utf8(canonical)
+        .map(Cow::Owned)
+        .map_err(|_| PolicyPathRejection::UnrepresentableEscape)
 }
 
 /// Why an operator-configured path value is not already a canonical policy

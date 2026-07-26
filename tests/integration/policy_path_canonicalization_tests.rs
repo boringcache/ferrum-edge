@@ -289,7 +289,7 @@ async fn request_termination_rejects_a_prefix_that_could_never_match() {
     // A prefix written in a non-canonical spelling is not a stricter rule, it
     // is a dead one — admission refuses it rather than letting it silently
     // never fire.
-    for prefix in ["/%61dmin", "/api%2Fadmin", "/api%2"] {
+    for prefix in ["/%61dmin", "/api%2Fadmin", "/api%2", "/api%20name"] {
         let error = RequestTermination::new(&json!({
             "status_code": 403,
             "trigger": { "path_prefix": prefix }
@@ -301,9 +301,10 @@ async fn request_termination_rejects_a_prefix_that_could_never_match() {
         );
     }
 
-    // Canonical prefixes, including the asterisk-form OPTIONS target and an
-    // escape that cannot be decoded any further, stay valid.
-    for prefix in ["/admin", "*", "/api%20name"] {
+    // Canonical prefixes — which, since no escape survives canonicalization,
+    // means prefixes with no percent escape at all — stay valid, including the
+    // asterisk-form OPTIONS target.
+    for prefix in ["/admin", "*", "/api/v1/reports"] {
         RequestTermination::new(&json!({
             "status_code": 403,
             "trigger": { "path_prefix": prefix }
@@ -375,6 +376,25 @@ async fn encoded_separators_never_reach_routing() {
     // whether `/admin%2Freports` has two segments or three — the question that
     // let a folded route decision disagree with a non-decoding backend.
     for raw in ["/admin%2Freports", "/admin%5Creports", "/admin%252Freports"] {
+        assert!(
+            canonicalize_policy_path(raw).is_err(),
+            "{raw:?} must be rejected before routing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn escapes_that_cannot_be_forwarded_literally_never_reach_routing() {
+    // If the gateway kept `%20` / `%7B` / `%C3%A9` escaped it would forward that
+    // spelling to a backend that commonly decodes it, so policy would evaluate
+    // `/admin%20reports` while the application resolved `/admin reports`. The
+    // boundary refuses them instead of shipping two coordinates.
+    for raw in [
+        "/admin%20reports",
+        "/admin/%7Bid%7D",
+        "/admin/caf%C3%A9",
+        "/admin%5Bid%5D",
+    ] {
         assert!(
             canonicalize_policy_path(raw).is_err(),
             "{raw:?} must be rejected before routing"
