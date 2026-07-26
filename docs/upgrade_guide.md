@@ -162,11 +162,16 @@ Configuration is now rejected when:
   plugin construction instead of being interpreted by a partial evaluator, so
   malformed keyword shapes, invalid type names (`"type": "objcet"`), and invalid
   `pattern` regexes are configuration errors rather than no-ops.
-- a schema uses a non-local `$ref`/`$dynamicRef` (anything not starting with
-  `#`), a non-fragment `$id`, a `$vocabulary` declaration, or a `$schema` naming
-  a draft other than the configured one. No external reference is ever fetched:
-  the dependency is built without HTTP or file retrievers.
-- a schema nests deeper than 32 levels or contains more than 20000 nodes.
+- an actual schema position uses a non-local `$ref`/`$dynamicRef` (anything not
+  starting with `#`), a non-fragment `$id` / `id`, a `$vocabulary` declaration,
+  or a `$schema` naming a draft other than the configured one. Property and
+  definition names with those spellings, and literal objects under `enum`,
+  `const`, `default`, or `examples`, are not schema keywords. No external
+  reference is ever fetched: the dependency is built without HTTP or file
+  retrievers.
+- the complete supplied schema value nests deeper than 32 levels or contains
+  more than 20000 JSON nodes. Literal and annotation data counts toward both
+  budgets.
 - `json_schema_draft` (new, default `draft2020-12`, also accepts `draft7`) has
   any other value. Draft-4 spellings such as a boolean `exclusiveMinimum` are
   rejected; convert them to the numeric draft-7/2020-12 form.

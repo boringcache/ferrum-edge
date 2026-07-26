@@ -17352,9 +17352,12 @@ components:
             JSON Schema for request body validation. Compiled at plugin
             construction under json_schema_draft; a malformed schema, an unknown
             or unsupported keyword shape, an invalid type name, a non-local
-            $ref/$dynamicRef, a non-fragment $id, a $vocabulary declaration, a
-            $schema naming another draft, or a schema exceeding the 32-level /
-            20000-node budget fails construction.
+            $ref/$dynamicRef, a non-fragment $id/id, a $vocabulary declaration,
+            a $schema naming another draft, or a schema exceeding the 32-level /
+            20000-node budget fails construction. Reference and identifier
+            policy applies only at actual schema positions; property/definition
+            names and literal annotation/instance objects are not interpreted as
+            keywords. Budgets count every JSON node in the supplied value.
         json_schema_draft:
           type: string
           enum: [draft2020-12, draft7]

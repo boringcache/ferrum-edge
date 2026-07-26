@@ -143,10 +143,15 @@ enum Direction {
     Response,
 }
 
+struct CompiledJsonSchema {
+    validator: jsonschema::Validator,
+    canonicalize_object_order: bool,
+}
+
 pub struct BodyValidator {
     // ── Request validation config ──
     /// Compiled JSON Schema for request body validation (if configured).
-    json_validator: Option<jsonschema::Validator>,
+    json_validator: Option<CompiledJsonSchema>,
     /// Required JSON fields (simple validation without full JSON Schema).
     required_fields: Vec<String>,
     /// Required XML elements in request bodies, parsed into expanded names.
@@ -163,7 +168,7 @@ pub struct BodyValidator {
 
     // ── Response validation config ──
     /// Compiled JSON Schema for response body validation (if configured).
-    response_json_validator: Option<jsonschema::Validator>,
+    response_json_validator: Option<CompiledJsonSchema>,
     /// Required JSON fields in response bodies.
     response_required_fields: Vec<String>,
     /// Required XML elements in response bodies, parsed into expanded names.
@@ -346,13 +351,13 @@ impl BodyValidator {
     fn validate_json_body(
         body: &str,
         required_fields: &[String],
-        json_validator: Option<&jsonschema::Validator>,
+        json_schema: Option<&CompiledJsonSchema>,
         direction: Direction,
     ) -> Result<(), String> {
         // Parse as JSON. `serde_json`'s own 128-level nesting limit bounds the
         // instance depth the compiled validator then walks, so a deeply nested
         // hostile body cannot drive unbounded recursion here.
-        let parsed: Value =
+        let mut parsed: Value =
             serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Check required fields
@@ -369,10 +374,19 @@ impl BodyValidator {
         // Validate against the schema compiled at plugin construction. Nothing
         // is compiled per request, and the reported message never echoes the
         // rejected value.
-        if let Some(validator) = json_validator
-            && let Err(error) = validator.validate(&parsed)
-        {
-            return Err(schema_violation_message(&error, direction));
+        if let Some(schema) = json_schema {
+            // jsonschema 0.46.5 compares object members in insertion order for
+            // `uniqueItems` when serde_json's workspace-wide `preserve_order`
+            // feature is active. JSON object equality is order-insensitive, so
+            // canonicalize only for schemas that actually use `uniqueItems`.
+            // The flag is computed once by the schema-position audit; all other
+            // validators retain the existing request-path cost.
+            if schema.canonicalize_object_order {
+                parsed.sort_all_objects();
+            }
+            if let Err(error) = schema.validator.validate(&parsed) {
+                return Err(schema_violation_message(&error, direction));
+            }
         }
 
         Ok(())
@@ -712,7 +726,7 @@ fn optional_compiled_schema(
     config: &Value,
     field: &'static str,
     draft: SchemaDraft,
-) -> Result<Option<jsonschema::Validator>, String> {
+) -> Result<Option<CompiledJsonSchema>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
     };
@@ -725,7 +739,7 @@ fn optional_compiled_schema(
         return Err(format!("body_validator: '{field}' must not be empty"));
     }
 
-    audit_schema(value, field, draft)?;
+    let audit = audit_schema(value, field, draft)?;
 
     let options = match draft {
         SchemaDraft::Draft7 => jsonschema::draft7::options(),
@@ -747,13 +761,28 @@ fn optional_compiled_schema(
         // validator here; `Ok(None)` above is reserved for "the operator did
         // not configure this field at all", so an unconfigured surface stays
         // unvalidated while a configured one can never degrade to `None`.
-        .map(Some)
+        .map(|validator| {
+            Some(CompiledJsonSchema {
+                validator,
+                canonicalize_object_order: audit.has_unique_items,
+            })
+        })
 }
 
-/// Bounded structural audit of a configured JSON Schema.
+#[derive(Default)]
+struct SchemaAudit {
+    has_unique_items: bool,
+}
+
+/// Bounded structural and semantic audit of a configured JSON Schema.
 ///
 /// The compiler already rejects malformed keyword shapes, invalid type names,
-/// and bad regexes. This pass adds the policy the library cannot express:
+/// and bad regexes. The structural pass charges every JSON value, including
+/// literal instance data and annotations. The semantic pass applies keyword
+/// policy only at actual schema positions and follows the subschema-bearing
+/// keywords supported by Draft 7 and Draft 2020-12.
+///
+/// Together the passes add the policy the library cannot express:
 ///
 /// * every `$ref` / `$dynamicRef` must be a local fragment (`#...`), so no
 ///   schema can cause a network or filesystem retrieval. The `jsonschema`
@@ -766,16 +795,23 @@ fn optional_compiled_schema(
 ///   vocabulary, and silently ignoring one is exactly the failure mode this
 ///   advisory is about.
 /// * `$schema`, when present, must name the configured draft.
-/// * depth and node count stay inside fixed budgets.
-fn audit_schema(schema: &Value, field: &'static str, draft: SchemaDraft) -> Result<(), String> {
-    let mut nodes = 0usize;
-    audit_schema_node(schema, field, draft, 0, &mut nodes)
-}
-
-fn audit_schema_node(
-    node: &Value,
+/// * depth and node count stay inside fixed budgets across the complete value.
+fn audit_schema(
+    schema: &Value,
     field: &'static str,
     draft: SchemaDraft,
+) -> Result<SchemaAudit, String> {
+    let mut nodes = 0usize;
+    audit_schema_structure(schema, field, 0, &mut nodes)?;
+
+    let mut audit = SchemaAudit::default();
+    audit_schema_node(schema, field, draft, &mut audit)?;
+    Ok(audit)
+}
+
+fn audit_schema_structure(
+    node: &Value,
+    field: &'static str,
     depth: usize,
     nodes: &mut usize,
 ) -> Result<(), String> {
@@ -794,66 +830,184 @@ fn audit_schema_node(
     match node {
         Value::Array(items) => {
             for item in items {
-                audit_schema_node(item, field, draft, depth + 1, nodes)?;
+                audit_schema_structure(item, field, depth + 1, nodes)?;
             }
         }
         Value::Object(map) => {
-            for (key, value) in map {
-                match key.as_str() {
-                    "$ref" | "$dynamicRef" => {
-                        let Some(reference) = value.as_str() else {
-                            return Err(format!(
-                                "body_validator: '{field}' has a non-string '{key}'"
-                            ));
-                        };
-                        if !reference.starts_with('#') {
-                            return Err(format!(
-                                "body_validator: '{field}' has non-local '{key}' \
-                                 '{reference}'; only local references (starting with '#') \
-                                 are supported and no external reference is ever retrieved"
-                            ));
-                        }
-                    }
-                    "$id" | "id" => {
-                        let Some(id) = value.as_str() else {
-                            return Err(format!(
-                                "body_validator: '{field}' has a non-string '{key}'"
-                            ));
-                        };
-                        if !id.starts_with('#') {
-                            return Err(format!(
-                                "body_validator: '{field}' has non-fragment '{key}' '{id}'; \
-                                 a base URI would allow external reference resolution"
-                            ));
-                        }
-                    }
-                    "$vocabulary" => {
-                        return Err(format!(
-                            "body_validator: '{field}' declares '$vocabulary'; custom \
-                             vocabularies are not supported and would not be enforced"
-                        ));
-                    }
-                    "$schema" => {
-                        let Some(uri) = value.as_str() else {
-                            return Err(format!(
-                                "body_validator: '{field}' has a non-string '$schema'"
-                            ));
-                        };
-                        if !draft.schema_uris().contains(&uri) {
-                            return Err(format!(
-                                "body_validator: '{field}' declares unsupported '$schema' \
-                                 '{uri}'; configured draft is '{}'",
-                                draft.config_value()
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-                audit_schema_node(value, field, draft, depth + 1, nodes)?;
+            for value in map.values() {
+                audit_schema_structure(value, field, depth + 1, nodes)?;
             }
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn audit_schema_node(
+    node: &Value,
+    field: &'static str,
+    draft: SchemaDraft,
+    audit: &mut SchemaAudit,
+) -> Result<(), String> {
+    // Both supported drafts allow boolean schemas. Scalars and arrays reached
+    // through malformed keyword shapes are left to the compiler to reject.
+    let Value::Object(map) = node else {
+        return Ok(());
+    };
+
+    for key in ["$ref", "$dynamicRef"] {
+        if let Some(value) = map.get(key) {
+            let Some(reference) = value.as_str() else {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-string '{key}'"
+                ));
+            };
+            if !reference.starts_with('#') {
+                return Err(format!(
+                    "body_validator: '{field}' has non-local '{key}' \
+                     '{reference}'; only local references (starting with '#') \
+                     are supported and no external reference is ever retrieved"
+                ));
+            }
+        }
+    }
+
+    for key in ["$id", "id"] {
+        if let Some(value) = map.get(key) {
+            let Some(id) = value.as_str() else {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-string '{key}'"
+                ));
+            };
+            if !id.starts_with('#') {
+                return Err(format!(
+                    "body_validator: '{field}' has non-fragment '{key}' '{id}'; \
+                     a base URI would allow external reference resolution"
+                ));
+            }
+        }
+    }
+
+    if map.contains_key("$vocabulary") {
+        return Err(format!(
+            "body_validator: '{field}' declares '$vocabulary'; custom \
+             vocabularies are not supported and would not be enforced"
+        ));
+    }
+
+    if let Some(value) = map.get("$schema") {
+        let Some(uri) = value.as_str() else {
+            return Err(format!(
+                "body_validator: '{field}' has a non-string '$schema'"
+            ));
+        };
+        if !draft.schema_uris().contains(&uri) {
+            return Err(format!(
+                "body_validator: '{field}' declares unsupported '$schema' \
+                 '{uri}'; configured draft is '{}'",
+                draft.config_value()
+            ));
+        }
+    }
+
+    if map.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
+        audit.has_unique_items = true;
+    }
+
+    // These object-valued keywords contain schemas as their map values. The
+    // member names are instance-property/definition names, never keywords.
+    for keyword in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                audit_schema_node(subschema, field, draft, audit)?;
+            }
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            // A Draft 7 dependency value is either a schema or an array of
+            // property names. Arrays are literal names and are not traversed.
+            if let Some(dependencies) = map.get("dependencies").and_then(Value::as_object) {
+                for dependency in dependencies.values() {
+                    if dependency.is_object() || dependency.is_boolean() {
+                        audit_schema_node(dependency, field, draft, audit)?;
+                    }
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            if let Some(subschemas) = map.get("dependentSchemas").and_then(Value::as_object) {
+                for subschema in subschemas.values() {
+                    audit_schema_node(subschema, field, draft, audit)?;
+                }
+            }
+        }
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_array) {
+            for subschema in subschemas {
+                audit_schema_node(subschema, field, draft, audit)?;
+            }
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            if let Some(items) = map.get("items").and_then(Value::as_array) {
+                for subschema in items {
+                    audit_schema_node(subschema, field, draft, audit)?;
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            if let Some(subschemas) = map.get("prefixItems").and_then(Value::as_array) {
+                for subschema in subschemas {
+                    audit_schema_node(subschema, field, draft, audit)?;
+                }
+            }
+        }
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(subschema) = map.get(keyword) {
+            audit_schema_node(subschema, field, draft, audit)?;
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            for keyword in ["items", "additionalItems"] {
+                if let Some(subschema) = map.get(keyword)
+                    && !subschema.is_array()
+                {
+                    audit_schema_node(subschema, field, draft, audit)?;
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            for keyword in [
+                "items",
+                "unevaluatedProperties",
+                "unevaluatedItems",
+                "contentSchema",
+            ] {
+                if let Some(subschema) = map.get(keyword) {
+                    audit_schema_node(subschema, field, draft, audit)?;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

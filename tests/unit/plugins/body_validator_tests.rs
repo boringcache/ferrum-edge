@@ -3558,6 +3558,186 @@ async fn json_schema_union_type_array_is_enforced() {
     assert_reject(result, Some(400));
 }
 
+#[tokio::test]
+async fn json_schema_property_named_id_compiles_for_request_and_response() {
+    let schema = json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": {"id": {"type": "integer"}}
+    });
+
+    let request_plugin = json_schema_plugin(schema.clone());
+    let mut ctx = make_json_ctx(r#"{"id": 7}"#);
+    let mut headers = make_json_headers();
+    assert_continue(request_plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let response_plugin = response_schema_plugin(schema);
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    assert_continue(
+        response_plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"id": 7}"#)
+            .await,
+    );
+}
+
+#[test]
+fn schema_keyword_spellings_are_allowed_as_property_and_definition_names() {
+    let names = ["$ref", "$id", "$schema", "$vocabulary", "$dynamicRef"];
+    let mut properties = serde_json::Map::new();
+    let mut definitions = serde_json::Map::new();
+    for name in names {
+        properties.insert(name.to_string(), json!({"type": "string"}));
+        definitions.insert(name.to_string(), json!({"type": "string"}));
+    }
+
+    let draft202012 = json!({
+        "json_schema": {
+            "type": "object",
+            "properties": properties.clone(),
+            "$defs": definitions.clone()
+        }
+    });
+    BodyValidator::new(&draft202012).expect("2020-12 names are not active keywords");
+
+    let draft7 = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "object",
+            "properties": properties,
+            "definitions": definitions
+        }
+    });
+    BodyValidator::new(&draft7).expect("Draft 7 names are not active keywords");
+}
+
+#[tokio::test]
+async fn schema_literal_objects_do_not_activate_schema_keywords() {
+    let literal = json!({
+        "id": 7,
+        "$ref": "https://literal.example/schema.json",
+        "$id": 9,
+        "$schema": false,
+        "$vocabulary": {"https://literal.example/vocab": true},
+        "$dynamicRef": "file:///literal.json"
+    });
+    let plugin = json_schema_plugin(json!({
+        "type": "object",
+        "required": ["enum_value", "const_value"],
+        "properties": {
+            "enum_value": {"enum": [literal.clone()]},
+            "const_value": {"const": literal.clone()},
+            "defaulted": {"type": "object", "default": literal.clone()},
+            "exampled": {"type": "object", "examples": [literal.clone()]}
+        },
+        "default": literal.clone(),
+        "examples": [literal.clone()]
+    }));
+    let body = json!({
+        "enum_value": literal.clone(),
+        "const_value": literal,
+        "defaulted": {},
+        "exampled": {}
+    })
+    .to_string();
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[test]
+fn non_local_references_are_rejected_in_supported_subschema_positions() {
+    let external = json!({"$ref": "https://example.com/nested.json"});
+    let draft202012 = [
+        json!({"properties": {"x": external.clone()}}),
+        json!({"patternProperties": {"^x": external.clone()}}),
+        json!({"$defs": {"x": external.clone()}}),
+        json!({"definitions": {"x": external.clone()}}),
+        json!({"dependentSchemas": {"x": external.clone()}}),
+        json!({"allOf": [external.clone()]}),
+        json!({"anyOf": [external.clone()]}),
+        json!({"oneOf": [external.clone()]}),
+        json!({"prefixItems": [external.clone()]}),
+        json!({"items": external.clone()}),
+        json!({"additionalProperties": external.clone()}),
+        json!({"unevaluatedProperties": external.clone()}),
+        json!({"contains": external.clone()}),
+        json!({"propertyNames": external.clone()}),
+        json!({"not": external.clone()}),
+        json!({"if": external.clone()}),
+        json!({"then": external.clone()}),
+        json!({"else": external.clone()}),
+        json!({"unevaluatedItems": external.clone()}),
+        json!({"contentSchema": external.clone()}),
+    ];
+    for schema in draft202012 {
+        let config = json!({"json_schema": schema});
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("nested non-local reference must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+
+    let draft7 = [
+        json!({"dependencies": {"x": external.clone()}}),
+        json!({"items": [true, external.clone()]}),
+        json!({"additionalItems": external}),
+    ];
+    for schema in draft7 {
+        let config = json!({
+            "json_schema_draft": "draft7",
+            "json_schema": schema
+        });
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("nested Draft 7 non-local reference must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+}
+
+#[test]
+fn nested_schema_nodes_still_enforce_reference_identifier_and_dialect_policy() {
+    let schemas = [
+        json!({"properties": {"x": {"$dynamicRef": "https://example.com/dynamic"}}}),
+        json!({"properties": {"x": {"$id": "https://example.com/base"}}}),
+        json!({"properties": {"x": {"id": "https://example.com/legacy-base"}}}),
+        json!({"properties": {"x": {"$vocabulary": {"https://example.com/v": true}}}}),
+        json!({
+            "properties": {
+                "x": {
+                    "$schema": "http://json-schema.org/draft-07/schema#"
+                }
+            }
+        }),
+    ];
+
+    for schema in schemas {
+        assert!(
+            BodyValidator::new(&json!({"json_schema": schema})).is_err(),
+            "nested schema policy must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn boolean_subschemas_compile_and_are_enforced() {
+    let plugin = json_schema_plugin(json!({
+        "type": "object",
+        "properties": {
+            "allowed": true,
+            "denied": false
+        }
+    }));
+
+    let mut ctx = make_json_ctx(r#"{"allowed": {"anything": true}}"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_json_ctx(r#"{"denied": null}"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
 #[test]
 fn malformed_schemas_fail_configuration_closed() {
     let configs = [
@@ -3656,6 +3836,34 @@ fn schema_recursion_and_size_budgets_are_bounded() {
     let error = BodyValidator::new(&wide)
         .err()
         .expect("over-wide is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+
+    // Literal annotation data is still part of the supplied JSON value and
+    // cannot evade either budget merely because it is not a schema position.
+    let mut literal = json!("leaf");
+    for _ in 0..40 {
+        literal = json!({"annotation": literal});
+    }
+    let deep_literal = json!({
+        "json_schema": {
+            "type": "string",
+            "default": literal
+        }
+    });
+    let error = BodyValidator::new(&deep_literal)
+        .err()
+        .expect("over-deep literal annotation is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+
+    let wide_literal = json!({
+        "json_schema": {
+            "type": "integer",
+            "enum": vec![json!(0); 20_000]
+        }
+    });
+    let error = BodyValidator::new(&wide_literal)
+        .err()
+        .expect("over-wide literal instance data is rejected");
     assert!(error.contains("schema budget"), "{error}");
 }
 

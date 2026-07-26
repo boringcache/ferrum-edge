@@ -3628,11 +3628,13 @@ rewrite `Content-Type`.
 Configuration fails closed — and therefore preserves the previous plugin generation — when a schema:
 
 - is not a valid schema for the configured draft (malformed keyword shapes, invalid type names such as `"type": "objcet"`, invalid `pattern` regexes)
-- uses a `$ref` or `$dynamicRef` that is not a local fragment (`#...`), a non-fragment `$id`, or a `$vocabulary` declaration
+- uses a `$ref` or `$dynamicRef` that is not a local fragment (`#...`), a non-fragment `$id` / `id`, or a `$vocabulary` declaration at an actual schema position
 - declares a `$schema` naming a draft other than the configured one
-- nests deeper than 32 levels or contains more than 20000 nodes
+- nests deeper than 32 levels or contains more than 20000 JSON nodes, counting the complete supplied value including literal `enum` / `const` data and annotations
 
 No JSON Schema reference is ever retrieved over the network or from the filesystem: the `jsonschema` dependency is built with `default-features = false`, which removes the HTTP and file retrievers, and non-local references are additionally rejected with an explicit configuration error. Local recursive references are supported; instance recursion is bounded by `serde_json`'s 128-level parse nesting limit.
+
+The audit follows only schema-bearing positions for the selected draft, including property/definition maps, composition and tuple arrays, and single-schema keywords such as `items`, `additionalProperties`, conditionals, and unevaluated constraints. Map member names under `properties`, `patternProperties`, `$defs`, and `definitions` are names, not active keywords. Likewise, objects inside `enum`, `const`, `default`, `examples`, and other annotations remain literal instance data, so members named `id`, `$ref`, `$id`, `$schema`, `$vocabulary`, or `$dynamicRef` do not acquire schema meaning there. Boolean subschemas are supported.
 
 Client-visible schema failures never echo the rejected value. A request failure names the failing keyword and the instance location (`/items/0/id`); a response failure names only the keyword, so an upstream body's shape is not described back to the client.
 
