@@ -1080,60 +1080,6 @@ impl std::fmt::Display for TcpAcceptLoopClass {
     }
 }
 
-/// Deterministic test-only fault applied once when a matching accept loop starts.
-#[derive(Debug, Clone)]
-pub(crate) enum TcpAcceptLoopFault {
-    Panic { accept_loop_id: usize },
-    EarlyError { accept_loop_id: usize, message: String },
-}
-
-fn tcp_accept_loop_fault_slot() -> &'static arc_swap::ArcSwap<Option<TcpAcceptLoopFault>> {
-    static SLOT: std::sync::OnceLock<arc_swap::ArcSwap<Option<TcpAcceptLoopFault>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| arc_swap::ArcSwap::from_pointee(None))
-}
-
-/// Install (or clear) a one-shot accept-loop fault for external lifecycle tests.
-pub(crate) fn set_tcp_accept_loop_fault_for_test(fault: Option<TcpAcceptLoopFault>) {
-    tcp_accept_loop_fault_slot().store(Arc::new(fault));
-}
-
-fn take_matching_tcp_accept_loop_fault(accept_loop_id: usize) -> Option<TcpAcceptLoopFault> {
-    let current = tcp_accept_loop_fault_slot().load_full();
-    let fault = current.as_ref().as_ref()?;
-    let matches = match fault {
-        TcpAcceptLoopFault::Panic {
-            accept_loop_id: target,
-        }
-        | TcpAcceptLoopFault::EarlyError {
-            accept_loop_id: target,
-            ..
-        } => *target == accept_loop_id,
-    };
-    if !matches {
-        return None;
-    }
-    let fault = fault.clone();
-    // Clear before applying so a restart cannot re-trip the same injection.
-    tcp_accept_loop_fault_slot().store(Arc::new(None));
-    Some(fault)
-}
-
-fn apply_tcp_accept_loop_fault(accept_loop_id: usize) -> Result<(), anyhow::Error> {
-    match take_matching_tcp_accept_loop_fault(accept_loop_id) {
-        Some(TcpAcceptLoopFault::Panic { accept_loop_id }) => {
-            panic!("injected TCP accept loop {accept_loop_id} panic");
-        }
-        Some(TcpAcceptLoopFault::EarlyError {
-            accept_loop_id,
-            message,
-        }) => Err(anyhow::anyhow!(
-            "injected TCP accept loop {accept_loop_id} early exit: {message}"
-        )),
-        None => Ok(()),
-    }
-}
-
 enum TcpAcceptPeerExit {
     /// Ordinary shutdown, peer-cancel teardown, or post-failure abort join.
     Clean,
@@ -1257,8 +1203,6 @@ async fn run_supervised_tcp_accept_loop(
     mut peer_cancel_rx: watch::Receiver<bool>,
     accept_loop_id: usize,
 ) -> Result<(), anyhow::Error> {
-    apply_tcp_accept_loop_fault(accept_loop_id)?;
-
     tokio::select! {
         result = run_tcp_accept_loop(
             listener,
@@ -1439,7 +1383,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         let listener = listeners
             .pop()
             .ok_or_else(|| anyhow::anyhow!("TCP listener set unexpectedly empty"))?;
-        apply_tcp_accept_loop_fault(0)?;
         let result =
             run_tcp_accept_loop(listener, loop_state, shutdown, global_shutdown, 0).await;
         if result.is_err() {

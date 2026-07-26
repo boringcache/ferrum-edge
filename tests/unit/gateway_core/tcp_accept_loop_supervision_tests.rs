@@ -4,17 +4,17 @@
 //! Extra accept loops previously ran as unchecked `JoinHandle`s while the
 //! primary loop was awaited forever. Panics and ordinary early errors on a
 //! non-primary peer stayed invisible until listener shutdown (and were then
-//! discarded). These tests drive the production supervisor seam with synthetic
-//! peer tasks so lifecycle behavior is deterministic without inline source
-//! tests.
+//! discarded). These tests exercise the production supervisor through a narrow
+//! `_test_support` wrapper with synthetic peer tasks (including deliberate
+//! non-primary panics and ordinary errors) so JoinError/error classification
+//! and sibling cancellation stay deterministic without a production fault seam.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ferrum_edge::_test_support::{
-    TcpAcceptLoopClass, TcpAcceptLoopFault, set_tcp_accept_loop_fault_for_test,
-    supervise_tcp_accept_loop_peers_for_test,
+    TcpAcceptLoopClass, supervise_tcp_accept_loop_peers_for_test,
 };
 use tokio::sync::watch;
 
@@ -287,14 +287,4 @@ async fn supervise_does_not_double_count_cancel_on_multiple_failures() {
         msg.contains("primary") || msg.contains("extra(1)"),
         "failure must identify a loop class; got {msg}"
     );
-}
-
-#[test]
-fn tcp_accept_loop_fault_seam_round_trips() {
-    set_tcp_accept_loop_fault_for_test(Some(TcpAcceptLoopFault::EarlyError {
-        accept_loop_id: 1,
-        message: "boom".to_string(),
-    }));
-    set_tcp_accept_loop_fault_for_test(Some(TcpAcceptLoopFault::Panic { accept_loop_id: 2 }));
-    set_tcp_accept_loop_fault_for_test(None);
 }
