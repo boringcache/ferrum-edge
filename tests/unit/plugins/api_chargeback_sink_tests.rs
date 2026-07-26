@@ -6,13 +6,16 @@ use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
-    ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, SpoolWriteHookPoint,
+    ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
+    SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault, SpoolManager,
+    SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    set_spool_write_hook_for_tests, write_private_file_atomically_for_tests,
+    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
+    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::{
@@ -1030,6 +1033,61 @@ fn encoded_event_len(event: &ChargeEvent, compression: SpoolCompression) -> u64 
         .len() as u64
 }
 
+fn spool_settings(dir: &Path, max_bytes: u64) -> SpoolSettings {
+    SpoolSettings {
+        enabled: true,
+        dir: dir.to_path_buf(),
+        max_bytes,
+        replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
+        compression: SpoolCompression::None,
+    }
+}
+
+/// Owner identity matching `SpoolManager::for_tests`.
+fn test_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
+    SpoolOwnerSpec {
+        node_id,
+        plugin_config_id: "test-plugin",
+        ferrum_namespace: "ferrum",
+        destination_endpoint: "http://127.0.0.1:8123",
+        database: "ferrum",
+        table: "charges_raw",
+    }
+}
+
+fn default_test_namespace_root(spool_dir: &Path) -> std::path::PathBuf {
+    SpoolManager::namespace_root_path_for_tests(spool_dir, &test_owner_spec("node-a")).unwrap()
+}
+
+fn default_test_owner_tag() -> String {
+    SpoolManager::owner_tag_of_spec_for_tests(&test_owner_spec("node-a"))
+}
+
+/// Durable spool file name for the default test owner.
+fn owned_data_name(ulid: &str) -> String {
+    format!("{ulid}.{}.ndjson", default_test_owner_tag())
+}
+
+fn find_spool_namespace_root(spool_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![spool_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some("spool.meta.json") {
+                return path.parent().map(|p| p.to_path_buf());
+            }
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    None
+}
+
 fn disk_owned_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -1039,9 +1097,12 @@ fn disk_owned_bytes(root: &Path) -> u64 {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path);
                 continue;
@@ -1049,10 +1110,16 @@ fn disk_owned_bytes(root: &Path) -> u64 {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let owned = name.ends_with(".ndjson.tmp")
-                || name.ends_with(".ndjson.zst.tmp")
-                || name.ends_with(".ndjson.rejected.meta.tmp")
-                || name.ends_with(".ndjson.zst.rejected.meta.tmp")
+            if name == "spool.meta.json" {
+                continue;
+            }
+            let is_temp = name.ends_with(".tmp")
+                && (name.contains(".write-")
+                    || name.ends_with(".ndjson.tmp")
+                    || name.ends_with(".ndjson.zst.tmp")
+                    || name.ends_with(".rejected.meta.tmp"));
+            let owned = name.ends_with(".inflight")
+                || is_temp
                 || name.ends_with(".ndjson.corrupt")
                 || name.ends_with(".ndjson.zst.corrupt")
                 || name.ends_with(".ndjson.rejected.meta")
@@ -1061,7 +1128,8 @@ fn disk_owned_bytes(root: &Path) -> u64 {
                     && !name.ends_with(".tmp")
                     && !name.ends_with(".corrupt")
                     && !name.ends_with(".rejected")
-                    && !name.ends_with(".meta"));
+                    && !name.ends_with(".meta")
+                    && !name.ends_with(".inflight"));
             if owned {
                 total = total.saturating_add(meta.len());
             }
@@ -1108,7 +1176,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
         stats.bytes,
-        disk_owned_bytes(&temp.path().join("node-a")),
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
         "status bytes must match on-disk owned usage"
     );
 }
@@ -1138,7 +1206,10 @@ fn spool_rejects_empty_spool_oversized_batch() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0
+    );
 }
 
 #[test]
@@ -1164,7 +1235,10 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     // With the resident file still present, a second write of the same size must
     // evict first (exact fit after eviction), not exceed the ceiling.
@@ -1203,7 +1277,10 @@ fn spool_quota_uses_compressed_encoded_size() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     // Using the uncompressed length as the ceiling must not be how admission
     // decides: when compressed size exceeds an artificially smaller budget,
@@ -1228,7 +1305,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     let temp = tempfile::tempdir().unwrap();
     let event = sample_event("evt-after-corrupt");
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
-    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    let corrupt_dir = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&corrupt_dir).unwrap();
     let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson.corrupt");
     fs::write(&corrupt, vec![0u8; encoded_len as usize]).unwrap();
@@ -1245,7 +1322,10 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
     let before = spool.scan_stats().unwrap();
     assert_eq!(before.files, 1);
     assert_eq!(before.bytes, encoded_len);
-    assert_eq!(before.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(
+        before.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1261,7 +1341,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
 #[test]
 fn spool_reconciles_stale_tmp_files_at_startup() {
     let temp = tempfile::tempdir().unwrap();
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
@@ -1282,7 +1362,10 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 0);
     assert_eq!(stats.bytes, 0);
-    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0
+    );
 }
 
 #[test]
@@ -1290,7 +1373,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let event = sample_event("evt-tmp-budget");
     let encoded_len = encoded_event_len(&event, SpoolCompression::None);
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
@@ -1317,7 +1400,10 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.bytes, encoded_len);
-    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
 
     let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
     assert!(written.exists());
@@ -1360,7 +1446,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     assert_eq!(stats.bytes, encoded_len);
     assert_eq!(
         stats.bytes,
-        disk_owned_bytes(&temp.path().join("node-a")),
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
         "status bytes must match on-disk owned usage after concurrent writes"
     );
 }
@@ -1393,25 +1479,17 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         // replayer wakes on the publication gate and creates/probes live
         // storage on its first tick. Validation and pre-commit staging must
         // not create this directory.
-        let mut node_dirs = Vec::new();
+        let mut namespace_root = None;
         for _ in 0..200 {
-            node_dirs = fs::read_dir(temp.path())
-                .unwrap()
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-                .collect();
-            if node_dirs.len() == 1 {
+            namespace_root = find_spool_namespace_root(temp.path());
+            if namespace_root.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            node_dirs.len(),
-            1,
-            "committed spool should create exactly one node directory"
-        );
-        let day = node_dirs[0].join("20260524");
+        let namespace_root = namespace_root
+            .expect("committed spool should create a managed namespace with spool.meta.json");
+        let day = namespace_root.join("20260524");
         fs::create_dir_all(&day).unwrap();
         let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
         fs::write(&corrupt, vec![0u8; corrupt_bytes as usize]).unwrap();
@@ -1525,7 +1603,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
-    let day = temp.path().join("node-a").join("20260524");
+    let day = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&day).unwrap();
     let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
     fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
@@ -1572,8 +1650,13 @@ fn failed_atomic_spool_write_removes_tmp_and_does_not_publish() {
     // temp body has already been created.
     fs::create_dir(&final_path).unwrap();
 
-    let err = write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n")
-        .expect_err("rename onto a directory must fail the atomic publish");
+    let err = write_private_file_atomically_for_tests(
+        &tmp_path,
+        &final_path,
+        b"{\"ok\":true}\n",
+        SpoolFinalOwnership::Unique,
+    )
+    .expect_err("rename onto a directory must fail the atomic publish");
     assert!(
         err.contains("failed to rename spool temp file"),
         "unexpected error: {err}"
@@ -1606,9 +1689,10 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    let corrupt_dir = default_test_namespace_root(temp.path()).join("20260524");
     fs::create_dir_all(&corrupt_dir).unwrap();
-    let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson");
+    let corrupt_name = owned_data_name("00000000000000000000000000");
+    let corrupt = corrupt_dir.join(&corrupt_name);
     fs::write(&corrupt, [0xff, 0xfe, 0xfd]).unwrap();
     let valid = spool.write_events(&[sample_event("evt-good")]).unwrap();
 
@@ -1622,9 +1706,9 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
     );
     assert!(
         corrupt
-            .with_file_name("00000000000000000000000000.ndjson.corrupt")
+            .with_file_name(format!("{corrupt_name}.corrupt"))
             .exists(),
-        "corrupt spool file should be quarantined"
+        "corrupt spool file should be quarantined under its durable data name"
     );
     let requests = wait_for_requests(&server, 1).await;
     assert_eq!(requests.len(), 1);
@@ -3069,6 +3153,1518 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     held_export.release_held_connections();
     set_spool_write_hook_for_tests(None);
     drop(plugin);
+}
+
+#[test]
+fn clickhouse_timeout_bound_keeps_claim_lease_above_delivery_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut raw = valid_config(temp.path());
+    raw["clickhouse"]["timeout_ms"] = json!(600_000);
+    raw["retry"]["max_attempts"] = json!(5);
+    raw["retry"]["initial_delay_ms"] = json!(60_000);
+    raw["retry"]["max_delay_ms"] = json!(60_000);
+    let config: ApiChargebackSinkConfig = serde_json::from_value(raw.clone()).unwrap();
+    let one_delivery_budget_secs = ((600_000u64 * 5) + (60_000u64 * 4)).div_ceil(1_000);
+    assert!(
+        spool_claim_lease_secs_for_tests(&config) > one_delivery_budget_secs,
+        "claim lease must remain strictly above the accepted request/retry budget"
+    );
+    assert!(
+        spool_claim_lease_secs_for_tests(&config) > 3_600,
+        "a legitimate long delivery budget must not be truncated at one hour"
+    );
+
+    raw["clickhouse"]["timeout_ms"] = json!(600_001);
+    let error = match ApiChargebackSink::new(&raw, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("timeout above the documented maximum must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("clickhouse.timeout_ms must be between 1 and 600000"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn spool_path_component_rejects_or_encodes_escape_forms() {
+    let hashed = [
+        "../escape",
+        "..\\escape",
+        "/abs",
+        "C:\\windows",
+        "C:/windows",
+        // Drive-relative forms carry no separator at all and still resolve
+        // against a per-drive current directory on Windows.
+        "C:",
+        "d:data",
+        r"\\?\C:\windows",
+        r"\\.\pipe\x",
+        "//unc/share",
+        "\\\\server\\share",
+        "has/slash",
+        "has\\slash",
+        ".",
+        "..",
+    ];
+    for raw in hashed {
+        let encoded = SpoolManager::encode_spool_path_component_for_tests(raw)
+            .unwrap_or_else(|err| panic!("hostile component {raw:?} should encode: {err}"));
+        assert!(
+            encoded.starts_with("n_"),
+            "hostile {raw:?} must be hashed, got {encoded}"
+        );
+        assert!(!encoded.contains('/') && !encoded.contains('\\') && !encoded.contains('\0'));
+    }
+    let nul_err = SpoolManager::encode_spool_path_component_for_tests("x\0y")
+        .expect_err("NUL must be rejected");
+    assert!(nul_err.contains("NUL"));
+    let empty_err = SpoolManager::encode_spool_path_component_for_tests("   ")
+        .expect_err("a whitespace-only component must not become a path segment");
+    assert!(empty_err.contains("must not be empty"), "{empty_err}");
+    assert_eq!(
+        SpoolManager::encode_spool_path_component_for_tests("edge-0").unwrap(),
+        "edge-0"
+    );
+}
+
+#[test]
+fn hostile_node_ids_stay_inside_the_configured_spool_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let hostile = [
+        "../../escape",
+        "/etc",
+        "C:\\Windows\\Temp",
+        "\\\\server\\share",
+        "//?/C:/x",
+    ];
+    for node_id in hostile {
+        let settings = spool_settings(temp.path(), 1024 * 1024);
+        let spool = SpoolManager::for_tests(settings, node_id)
+            .unwrap_or_else(|err| panic!("hostile node id {node_id:?} must be encoded: {err}"));
+        let root = spool.namespace_root_for_tests().to_path_buf();
+        assert!(
+            root.starts_with(temp.path()),
+            "namespace {} escaped {}",
+            root.display(),
+            temp.path().display()
+        );
+        let written = spool.write_events(&[sample_event("evt-node")]).unwrap();
+        assert!(written.starts_with(temp.path()));
+        let relative = root.strip_prefix(temp.path()).unwrap();
+        for component in relative.components() {
+            let text = component.as_os_str().to_string_lossy().to_string();
+            assert!(!text.contains('/'), "component leaked a separator: {text}");
+            assert!(!text.contains('\\'), "component leaked a separator: {text}");
+            assert_ne!(text, "..", "component escaped the root");
+        }
+    }
+}
+
+#[test]
+fn sibling_instances_never_share_a_spool_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let sink_a = SpoolOwnerSpec {
+        node_id: "node-a",
+        plugin_config_id: "plugin-a",
+        ferrum_namespace: "tenant-a",
+        destination_endpoint: "http://ch-a:8123",
+        database: "ledger_a",
+        table: "charges_a",
+    };
+    let sink_b = SpoolOwnerSpec {
+        node_id: "node-a",
+        plugin_config_id: "plugin-b",
+        ferrum_namespace: "tenant-b",
+        destination_endpoint: "http://ch-b:8123",
+        database: "ledger_b",
+        table: "charges_b",
+    };
+    let settings_a = spool_settings(temp.path(), 1024 * 1024);
+    let settings_b = spool_settings(temp.path(), 1024 * 1024);
+    let a = SpoolManager::for_tests_with_owner(settings_a, &sink_a, 1).unwrap();
+    let b = SpoolManager::for_tests_with_owner(settings_b, &sink_b, 2).unwrap();
+
+    assert_ne!(
+        a.namespace_root_for_tests(),
+        b.namespace_root_for_tests(),
+        "distinct plugin/ledger/destination identities must not share a namespace"
+    );
+    assert_ne!(a.owner_tag_for_tests(), b.owner_tag_for_tests());
+
+    let path_a = a.write_events(&[sample_event("evt-a")]).unwrap();
+    let path_b = b.write_events(&[sample_event("evt-b")]).unwrap();
+    assert!(path_a.starts_with(a.namespace_root_for_tests()));
+    assert!(path_b.starts_with(b.namespace_root_for_tests()));
+
+    // Neither instance can see, replay, or evict the other's records.
+    let replayable_a = a.list_replayable_spool_files_for_tests().unwrap();
+    let replayable_b = b.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable_a, vec![path_a.clone()]);
+    assert_eq!(replayable_b, vec![path_b.clone()]);
+    assert!(path_a.exists());
+    assert!(path_b.exists());
+}
+
+#[test]
+fn only_the_ferrum_namespace_differing_still_partitions_the_spool() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut ledger_a = test_owner_spec("node-a");
+    ledger_a.ferrum_namespace = "tenant-a";
+    let mut ledger_b = test_owner_spec("node-a");
+    ledger_b.ferrum_namespace = "tenant-b";
+
+    let root_a = SpoolManager::namespace_root_path_for_tests(temp.path(), &ledger_a).unwrap();
+    let root_b = SpoolManager::namespace_root_path_for_tests(temp.path(), &ledger_b).unwrap();
+    assert_ne!(
+        root_a, root_b,
+        "two ledgers on one node/plugin/destination must not share a namespace"
+    );
+    let tag_a = SpoolManager::owner_tag_of_spec_for_tests(&ledger_a);
+    let tag_b = SpoolManager::owner_tag_of_spec_for_tests(&ledger_b);
+    assert_eq!(tag_a.len(), 32, "per-file owner tags must retain 128 bits");
+    assert_eq!(tag_b.len(), 32, "per-file owner tags must retain 128 bits");
+    assert_ne!(tag_a, tag_b, "per-file owner tags must differ per ledger");
+}
+
+#[test]
+fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-owned")]).unwrap();
+
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let raw = fs::read_to_string(&meta_path).unwrap();
+    let mut meta: Value = serde_json::from_str(&raw).unwrap();
+    meta["table"] = json!("someone_elses_table");
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let err = spool
+        .list_replayable_spool_files_for_tests()
+        .expect_err("mismatched ownership metadata must fail closed");
+    assert!(
+        err.contains("does not match this sink identity"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        record.exists(),
+        "a failed ownership check must never delete billing records"
+    );
+
+    // Restoring the record makes replay listing work again.
+    fs::write(&meta_path, raw).unwrap();
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable, vec![record]);
+}
+
+#[test]
+fn oversized_namespace_metadata_fails_closed_without_mutating_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-owned")]).unwrap();
+
+    // A same-UID actor can inflate the manifest without knowing this owner's
+    // tag, because it is read before ownership is established. The bounded read
+    // must reject it rather than allocating it inside the billing process.
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let raw = fs::read_to_string(&meta_path).unwrap();
+    let mut planted = raw.as_bytes().to_vec();
+    planted.resize(256 * 1024, b' ');
+    fs::write(&meta_path, &planted).unwrap();
+
+    let err = spool
+        .list_replayable_spool_files_for_tests()
+        .expect_err("an oversized ownership manifest must fail closed");
+    assert!(err.contains("artifact bound"), "unexpected error: {err}");
+    assert!(
+        record.exists(),
+        "a rejected manifest must never delete billing records"
+    );
+
+    fs::write(&meta_path, raw).unwrap();
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable, vec![record]);
+}
+
+#[test]
+fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-own");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+
+    // A record carrying a different owner tag, planted inside our namespace.
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let foreign = day.join("00000000000000000000000000.0123456789abcdef0123456789abcdef.ndjson");
+    fs::write(&foreign, vec![b'x'; encoded_len as usize]).unwrap();
+
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a foreign-owned record must never enter the replay set"
+    );
+    assert_eq!(
+        spool.unbound_record_counts_for_tests(),
+        (1, 0),
+        "a foreign record discovered after prepare must update live status metrics"
+    );
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.contains(&foreign),
+        "a foreign-owned record still counts toward the quota"
+    );
+
+    // Quota pressure must fail closed rather than delete another owner's data.
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("eviction must not be able to reclaim another owner's bytes");
+    assert!(
+        err.contains("owned by another identity"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        foreign.exists(),
+        "a foreign-owned record must survive quota pressure"
+    );
+}
+
+#[test]
+fn spool_scan_ignores_symlinks_and_stays_in_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("secret.ndjson");
+    fs::write(&outside_file, b"{\"event_id\":\"leaked\"}\n").unwrap();
+
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let link = spool.namespace_root_for_tests().join("escape-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
+    assert!(
+        owned.iter().all(|path| path.starts_with(&root)),
+        "owned listing must stay inside the managed namespace"
+    );
+    assert!(
+        owned.iter().all(|path| path != &outside_file),
+        "symlink targets outside the namespace must not be collected"
+    );
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(replayable.is_empty());
+    assert!(
+        outside_file.exists(),
+        "maintenance must never delete through a symlink"
+    );
+}
+
+#[test]
+fn spool_walk_bounds_empty_directory_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests();
+    for index in 0..8 {
+        fs::create_dir(root.join(format!("empty-{index}"))).unwrap();
+    }
+    let error = spool
+        .list_owned_spool_files_with_entry_limit_for_tests(5)
+        .expect_err("empty directories must count toward the traversal bound");
+    assert!(
+        error.contains("max entry count (5)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_spool_directory_symlink_is_rejected_before_write_probe() {
+    let parent = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let linked_spool = parent.path().join("spool-link");
+    std::os::unix::fs::symlink(outside.path(), &linked_spool).unwrap();
+
+    let error = match SpoolManager::for_tests(spool_settings(&linked_spool, 1024 * 1024), "node-a")
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a symlinked spool root must fail before its write probe"),
+    };
+    assert!(
+        error.contains("symlinked spool path"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "failed preparation must not create or truncate files through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn namespace_root_symlink_swap_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
+    let saved = root.with_extension("original");
+    fs::rename(&root, &saved).unwrap();
+
+    fs::copy(
+        saved.join("spool.meta.json"),
+        outside.path().join("spool.meta.json"),
+    )
+    .unwrap();
+    let outside_day = outside.path().join("20260524");
+    fs::create_dir(&outside_day).unwrap();
+    let outside_record = outside_day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FBC"));
+    fs::write(&outside_record, b"{}\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+
+    let error = spool
+        .list_replayable_spool_files_for_tests()
+        .expect_err("a swapped namespace-root symlink must fail closed");
+    assert!(
+        error.contains("symlinked spool path") || error.contains("canonical target"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        outside_record.exists(),
+        "failed-closed maintenance must not mutate the replacement tree"
+    );
+
+    fs::remove_file(&root).unwrap();
+    fs::rename(&saved, &root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn spool_scan_survives_directory_cycles_and_bounds_depth() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let root = spool.namespace_root_for_tests().to_path_buf();
+
+    // Self-referential loop: the walk must terminate instead of recursing.
+    let loop_dir = root.join("20260524");
+    fs::create_dir_all(&loop_dir).unwrap();
+    std::os::unix::fs::symlink(&root, loop_dir.join("loop")).unwrap();
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(owned.iter().all(|path| path.starts_with(&root)));
+
+    // Depth beyond the traversal bound is reported, never followed silently.
+    let mut deep = root.clone();
+    for index in 0..12 {
+        deep = deep.join(format!("d{index}"));
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let record = deep.join(owned_data_name("00000000000000000000000009"));
+    fs::write(&record, b"{}\n").unwrap();
+    let err = spool
+        .list_owned_spool_files_for_tests()
+        .expect_err("traversal beyond the depth bound must fail closed");
+    assert!(err.contains("max depth"), "unexpected error: {err}");
+}
+
+#[test]
+fn reload_generation_does_not_delete_a_live_peer_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let gen1 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 11)
+        .unwrap();
+
+    let day = gen1.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let final_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FAV"));
+    let active_tmp = gen1.write_temp_path_for_tests(&final_path).unwrap();
+    fs::write(&active_tmp, b"partial").unwrap();
+    // Model generation 11 mid-write: its temp path is leased for this process.
+    let lease = SpoolManager::hold_live_spool_path_for_tests(&active_tmp);
+
+    // A replacement generation runs first-prepare reconciliation while the older
+    // accepted generation is still mid-write.
+    let gen2 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 12)
+        .unwrap();
+    assert!(
+        active_tmp.exists(),
+        "a replacement generation must not unlink a live peer's active temp"
+    );
+    drop(gen2);
+
+    // Once the writer releases the lease, a later generation reconciles it.
+    drop(lease);
+    drop(gen1);
+    let gen3 = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 13)
+        .unwrap();
+    assert!(
+        !active_tmp.exists(),
+        "an abandoned same-process temp must be reconciled once no writer holds it"
+    );
+    drop(gen3);
+}
+
+#[test]
+fn manifest_write_does_not_collide_with_a_peer_manifest_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
+    fs::create_dir_all(&root).unwrap();
+
+    // A peer generation or peer process sharing this volume is mid-publish on
+    // its own ownership manifest. A fixed `spool.meta.json.tmp` would make this
+    // path the same name for every writer: `create_new` would fail and the
+    // rollback would then unlink the peer's live temp and the manifest itself.
+    let peer_tmp = root.join("spool.meta.json.tmp");
+    fs::write(&peer_tmp, b"peer in-progress manifest").unwrap();
+
+    let spool = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 41)
+        .unwrap();
+    let manifest = spool.namespace_root_for_tests().join("spool.meta.json");
+
+    assert!(
+        peer_tmp.exists(),
+        "publishing the ownership manifest must not unlink a peer writer's temp"
+    );
+    assert_eq!(
+        fs::read(&peer_tmp).unwrap(),
+        b"peer in-progress manifest".to_vec(),
+        "a peer writer's manifest temp must not be truncated or overwritten"
+    );
+    assert!(
+        manifest.is_file(),
+        "the ownership manifest must still be published"
+    );
+}
+
+#[test]
+fn admission_eviction_never_unlinks_a_live_peer_generation_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let event = sample_event("evt-live-temp");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    // Room for exactly one encoded record, so the planted temp blocks admission.
+    let settings = spool_settings(temp.path(), encoded_len);
+
+    let gen1 = SpoolManager::for_tests_with_owner(settings.clone(), &spec, 21).unwrap();
+    let day = gen1.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let final_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB1"));
+    let active_tmp = gen1.write_temp_path_for_tests(&final_path).unwrap();
+    fs::write(&active_tmp, vec![0u8; encoded_len as usize]).unwrap();
+    // Generation 21 is mid-publish: payload written and fsynced, rename pending.
+    let lease = SpoolManager::hold_live_spool_path_for_tests(&active_tmp);
+
+    // A replacement generation holds its own writer lock, so only the shared
+    // live-path set can stop its quota eviction from unlinking that temp.
+    let gen2 = SpoolManager::for_tests_with_owner(settings.clone(), &spec, 22).unwrap();
+    let err = gen2
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("admission must fail closed rather than evict a live peer temp");
+    assert!(
+        err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        active_tmp.exists(),
+        "eviction must never unlink a peer generation's in-progress temp"
+    );
+
+    // Once the writer releases the lease the same quota pressure reclaims it.
+    drop(lease);
+    let written = gen2.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !active_tmp.exists(),
+        "an abandoned same-process temp stays reclaimable under quota pressure"
+    );
+}
+
+#[test]
+fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let event = sample_event("evt-peer-temp");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+
+    // Production stale-temp horizon: another process's fresh temp is protected.
+    let spool = SpoolManager::for_tests_with_owner_faults_and_ages(
+        settings.clone(),
+        &spec,
+        31,
+        SpoolFsFault::None,
+        300,
+        300,
+    )
+    .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let peer_tmp = day.join(format!(
+        "{}.write-deadbeefdeadbeefdeadbeefdeadbeef-7.tmp",
+        owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB2")
+    ));
+    fs::write(&peer_tmp, vec![0u8; encoded_len as usize]).unwrap();
+
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("a peer process's fresh temp must not be evicted to admit a write");
+    assert!(
+        err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        peer_tmp.exists(),
+        "eviction must respect the stale-temp horizon for peer-process temps"
+    );
+
+    // With the horizon elapsed the same temp is reconciled and the write fits.
+    let reclaiming = SpoolManager::for_tests_with_owner_faults_and_ages(
+        settings,
+        &spec,
+        32,
+        SpoolFsFault::None,
+        0,
+        300,
+    )
+    .unwrap();
+    assert!(
+        !peer_tmp.exists(),
+        "an expired peer-process temp is reconciled at first prepare"
+    );
+    let written = reclaiming
+        .write_events(std::slice::from_ref(&event))
+        .unwrap();
+    assert!(written.exists());
+}
+
+#[test]
+fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
+    let bomb = encode_spool_bytes_for_tests(&bomb_plain, SpoolCompression::Zstd).unwrap();
+    assert!(
+        bomb.len() < 4096,
+        "the fixture must exercise a high compression ratio"
+    );
+    let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB3.ndjson.zst");
+    fs::write(&bomb_path, &bomb).unwrap();
+    let err = decode_spool_file_for_tests(&bomb_path)
+        .expect_err("a high-ratio archive must not expand without bound");
+    assert!(
+        err.contains("decompression bound"),
+        "unexpected error: {err}"
+    );
+
+    // A record within the expansion allowance still decodes normally.
+    let ok_plain = vec![b'\n'; 512 * 1024];
+    let ok = encode_spool_bytes_for_tests(&ok_plain, SpoolCompression::Zstd).unwrap();
+    let ok_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB4.ndjson.zst");
+    fs::write(&ok_path, &ok).unwrap();
+    let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
+    assert_eq!(decoded.len(), ok_plain.len());
+}
+
+#[test]
+fn spool_replay_caps_large_encoded_and_decoded_artifacts_absolutely() {
+    let hard_limit = spool_artifact_byte_limit_for_tests();
+    assert_eq!(
+        spool_decompression_limit_for_tests(u64::MAX),
+        hard_limit,
+        "the ratio allowance must never bypass the absolute artifact ceiling"
+    );
+
+    // A sparse file proves the encoded-size boundary is checked from metadata
+    // before replay attempts to allocate or read its attacker-selected length.
+    let temp = tempfile::tempdir().unwrap();
+    let oversized_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB5.ndjson");
+    let oversized = fs::File::create(&oversized_path).unwrap();
+    oversized.set_len(hard_limit.saturating_add(1)).unwrap();
+    drop(oversized);
+    let err = decode_spool_file_for_tests(&oversized_path)
+        .expect_err("an oversized raw artifact must fail before allocation");
+    assert!(
+        err.contains("hard") && err.contains("artifact bound"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn peer_process_temp_is_quota_owned_and_never_a_replay_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    // A peer process's in-progress temp: a different process tag.
+    let peer_tmp = day.join(format!(
+        "{}.write-deadbeefdeadbeefdeadbeefdeadbeef-7.tmp",
+        owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FAW")
+    ));
+    fs::write(&peer_tmp, b"peer-partial").unwrap();
+
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.contains(&peer_tmp),
+        "a peer temp still counts toward the quota"
+    );
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "an in-progress temp is never a replay candidate"
+    );
+
+    // Test managers use a zero stale age, so a later generation's first prepare
+    // reconciles the foreign temp instead of leaving it forever.
+    let next = SpoolManager::for_tests(spool_settings(temp.path(), 1024 * 1024), "node-a").unwrap();
+    assert!(
+        !peer_tmp.exists(),
+        "a stale peer temp is reconciled once past the stale age"
+    );
+    drop(next);
+}
+
+#[test]
+fn atomic_spool_write_fault_injection_surfaces_before_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("batch.ndjson");
+    let tmp_path = temp.path().join("batch.ndjson.tmp");
+    let mut faults = vec![SpoolFsFault::FileSync, SpoolFsFault::Rename];
+    if cfg!(unix) {
+        faults.push(SpoolFsFault::DirOpen);
+        faults.push(SpoolFsFault::DirSync);
+    }
+    for fault in faults {
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&final_path);
+        let err = write_private_file_atomically_with_fault_for_tests(
+            &tmp_path,
+            &final_path,
+            b"{\"ok\":true}\n",
+            fault,
+            SpoolFinalOwnership::Unique,
+        )
+        .expect_err("an injected durable-write fault must fail the write");
+        assert!(
+            err.contains("injected fault"),
+            "unexpected error for {fault:?}: {err}"
+        );
+        assert!(
+            !final_path.exists(),
+            "a faulted write must not publish for {fault:?}"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "a faulted write must clean its temp for {fault:?}"
+        );
+    }
+    // The unfaulted path still publishes durably.
+    write_private_file_atomically_for_tests(
+        &tmp_path,
+        &final_path,
+        b"{\"ok\":true}\n",
+        SpoolFinalOwnership::Unique,
+    )
+    .unwrap();
+    assert!(final_path.exists());
+}
+
+#[test]
+fn rollback_before_rename_preserves_a_peer_published_shared_final() {
+    // `spool.meta.json` is one shared name for every writer of a namespace, so a
+    // writer that fails before its own rename must never unlink the manifest a
+    // peer already published.
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("spool.meta.json");
+    let peer_bytes: &[u8] = b"{\"published_by\":\"peer\"}\n";
+    fs::write(&final_path, peer_bytes).unwrap();
+
+    for fault in [SpoolFsFault::FileSync, SpoolFsFault::Rename] {
+        let tmp_path = temp
+            .path()
+            .join(format!("spool.meta.json.write-{fault:?}.tmp"));
+        let err = write_private_file_atomically_with_fault_for_tests(
+            &tmp_path,
+            &final_path,
+            b"{\"published_by\":\"me\"}\n",
+            fault,
+            SpoolFinalOwnership::Shared,
+        )
+        .expect_err("an injected pre-rename fault must fail the write");
+        assert!(
+            err.contains("injected fault"),
+            "unexpected error for {fault:?}: {err}"
+        );
+        assert!(
+            !err.contains("rollback cleanup also failed"),
+            "a clean rollback must not report a cleanup failure for {fault:?}: {err}"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "rollback must still remove this attempt's own temp for {fault:?}"
+        );
+        assert_eq!(
+            fs::read(&final_path).unwrap(),
+            peer_bytes,
+            "rollback must not unlink a final path this attempt never published ({fault:?})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_after_rename_never_unlinks_a_shared_final() {
+    // Both post-rename interleavings of the shared manifest name. A path unlink
+    // cannot be made atomic with any proof of which file the name currently
+    // resolves to, so the shared final is simply never unlinked: with a peer
+    // replacement the peer's newer publication survives, and without one this
+    // attempt's own unsynced bytes stay put for the next prepare to validate or
+    // regenerate. Either way the durability error is still reported.
+    let temp = tempfile::tempdir().unwrap();
+
+    // (a) A peer republishes the shared name between this attempt's rename and
+    // its failing directory fsync.
+    let raced_final = temp.path().join("raced.spool.meta.json");
+    let raced_tmp = temp.path().join("raced.spool.meta.json.write-race.tmp");
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &raced_tmp,
+        &raced_final,
+        b"{\"published_by\":\"me\"}\n",
+        SpoolFsFault::PeerRepublishThenDirSync,
+        SpoolFinalOwnership::Shared,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !err.contains("rollback cleanup also failed"),
+        "a clean rollback must not report a cleanup failure: {err}"
+    );
+    assert!(
+        !raced_tmp.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
+    assert_eq!(
+        fs::read(&raced_final).unwrap(),
+        PEER_REPUBLISH_MARKER,
+        "rollback must not unlink a peer publication that replaced this attempt's rename"
+    );
+
+    // (b) No peer replacement at all: the entry is still this attempt's bytes,
+    // and it is still left in place rather than unlinked by path.
+    let quiet_final = temp.path().join("quiet.spool.meta.json");
+    let quiet_tmp = temp.path().join("quiet.spool.meta.json.write-quiet.tmp");
+    let mine: &[u8] = b"{\"published_by\":\"me\"}\n";
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &quiet_tmp,
+        &quiet_final,
+        mine,
+        SpoolFsFault::DirSync,
+        SpoolFinalOwnership::Shared,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !quiet_tmp.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
+    assert_eq!(
+        fs::read(&quiet_final).unwrap(),
+        mine,
+        "an unsynced shared final is left for the next prepare, not unlinked by path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_after_rename_removes_a_unique_final() {
+    // The counterpart to the shared case: a ULID-derived name has exactly one
+    // possible writer, so rollback of a post-rename failure unlinks it and the
+    // "never delete" rule stays scoped to shared names only.
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join(format!("{}.owner-tag.ndjson", new_ulid()));
+    let tmp_path = temp.path().join("unique.write-own.tmp");
+
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &tmp_path,
+        &final_path,
+        b"{\"ok\":true}\n",
+        SpoolFsFault::DirSync,
+        SpoolFinalOwnership::Unique,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !err.contains("rollback cleanup also failed"),
+        "a clean rollback must not report a cleanup failure: {err}"
+    );
+    assert!(
+        !final_path.exists(),
+        "an unsynced publication at a uniquely owned name must be rolled back"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_manifest_rollback_leaves_live_storage_unprepared() {
+    // A failed manifest publish must not be laundered into a successful prepare
+    // just because the shared final is left on disk: the durability error is
+    // still returned, no batch is accepted, and nothing is published.
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 31, SpoolFsFault::DirSync)
+            .unwrap();
+
+    let err = faulted
+        .write_events(&[sample_event("evt-manifest-unsynced")])
+        .expect_err("an unsynced manifest publish must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    let replayable = faulted.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a failed prepare must not publish a replay candidate"
+    );
+
+    // The retry is the recovery path the shared-final rule relies on: the next
+    // prepare revalidates the manifest left on disk against this sink's identity
+    // rather than inheriting a "prepared" baseline, and the still-faulted
+    // durable write keeps the batch uncommitted.
+    let err = faulted
+        .write_events(&[sample_event("evt-manifest-unsynced-2")])
+        .expect_err("a retry under the same fault must not silently succeed");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "no attempt may leave a committed or leftover owned byte behind"
+    );
+}
+
+#[test]
+fn injected_file_sync_failure_keeps_the_spool_batch_uncommitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 21, SpoolFsFault::FileSync)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-not-durable")])
+        .expect_err("a failed durable handoff must be reported to the caller");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+
+    let root = default_test_namespace_root(temp.path());
+    assert_eq!(
+        disk_owned_bytes(&root),
+        0,
+        "a write that reported failure must leave no committed or leftover bytes"
+    );
+    let replayable = faulted.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a failed write must not publish a replay candidate"
+    );
+}
+
+#[test]
+fn injected_rename_failure_keeps_the_spool_batch_uncommitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 23, SpoolFsFault::Rename)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-no-rename")])
+        .expect_err("a failed rename must be reported to the caller");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "a failed rename must leave no committed or leftover bytes"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn injected_directory_open_failure_rolls_back_the_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 24, SpoolFsFault::DirOpen)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-dir-open")])
+        .expect_err("a directory-open failure must not be reported as a durable commit");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "an unpersisted rename must be rolled back, not left as a phantom batch"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn injected_directory_sync_failure_rolls_back_the_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let faulted =
+        SpoolManager::for_tests_with_owner_and_faults(settings, &spec, 22, SpoolFsFault::DirSync)
+            .unwrap();
+    let err = faulted
+        .write_events(&[sample_event("evt-dir-sync")])
+        .expect_err("a directory-sync failure must not be reported as a durable commit");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert_eq!(
+        disk_owned_bytes(&default_test_namespace_root(temp.path())),
+        0,
+        "an unpersisted rename must be rolled back, not left as a phantom batch"
+    );
+}
+
+#[tokio::test]
+async fn replay_claim_is_excluded_from_eviction_and_released_on_retryable() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[503]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let probe = sample_event("evt-old");
+    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let oldest = spool.write_events(std::slice::from_ref(&probe)).unwrap();
+
+    let claim = spool
+        .hold_replay_claim_for_tests(&oldest)
+        .unwrap()
+        .expect("an uncontended claim must succeed");
+    let claim_path = claim.claim_path_for_tests().to_path_buf();
+    assert!(claim_path.exists());
+    assert!(!oldest.exists());
+    let claim_name = claim_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap()
+        .to_string();
+    assert!(claim_name.ends_with(".inflight"));
+
+    // Quota pressure while the file is claimed must fail closed, never evict it.
+    let err = spool
+        .write_events(&[sample_event("evt-new")])
+        .expect_err("an in-flight claim is never an eviction candidate");
+    assert!(err.contains("in-flight"), "unexpected error: {err}");
+    assert!(claim_path.exists(), "in-flight claim must survive eviction");
+    drop(claim);
+
+    // Retryable delivery releases the claim back to a durable replayable name.
+    let released = spool.release_inflight_file_for_tests(&claim_path).unwrap();
+    assert_eq!(released.as_deref(), Some(oldest.as_path()));
+    assert!(oldest.exists());
+    assert!(!claim_path.exists());
+
+    let err = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("503 must remain retryable");
+    assert!(!err.is_empty());
+    assert!(
+        oldest.exists(),
+        "a retryable failure must leave the record durable and replayable"
+    );
+}
+
+#[test]
+fn contended_claim_returns_none_instead_of_stealing() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let old_gen =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 31)
+            .unwrap();
+    let new_gen =
+        SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 32)
+            .unwrap();
+
+    let record = old_gen
+        .write_events(&[sample_event("evt-handoff")])
+        .unwrap();
+    // Both accepted generations see the same candidate.
+    assert_eq!(
+        old_gen.list_replayable_spool_files_for_tests().unwrap(),
+        new_gen.list_replayable_spool_files_for_tests().unwrap()
+    );
+
+    let winner = old_gen
+        .hold_replay_claim_for_tests(&record)
+        .unwrap()
+        .expect("the first claimer wins");
+    let loser = new_gen.hold_replay_claim_for_tests(&record).unwrap();
+    assert!(
+        loser.is_none(),
+        "a second accepted generation must not be able to claim the same file"
+    );
+
+    // The winner's live claim survives the peer generation's maintenance.
+    new_gen.prepare_live_storage_for_tests().unwrap();
+    let claim_path = winner.claim_path_for_tests().to_path_buf();
+    assert!(
+        claim_path.exists(),
+        "peer maintenance must not reclaim a live claim"
+    );
+
+    // After the winner disappears, the peer recovers the record for delivery.
+    drop(winner);
+    new_gen.prepare_live_storage_for_tests().unwrap();
+    assert!(!claim_path.exists(), "an orphaned claim must be recovered");
+    assert_eq!(
+        new_gen.list_replayable_spool_files_for_tests().unwrap(),
+        vec![record],
+        "safe handoff returns the record to the surviving generation"
+    );
+}
+
+#[test]
+fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let live_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB1");
+    let expired_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB2");
+    // 2100-01-01T00:00:00Z, comfortably beyond any test clock.
+    let far_future = 4_102_444_800i64;
+    let live_claim = day.join(format!(
+        "{live_name}.claim-deadbeefdeadbeefdeadbeefdeadbeef-9-{far_future}.inflight"
+    ));
+    let expired_claim = day.join(format!(
+        "{expired_name}.claim-deadbeefdeadbeefdeadbeefdeadbeef-9-1.inflight"
+    ));
+    fs::write(&live_claim, b"{}\n").unwrap();
+    fs::write(&expired_claim, b"{}\n").unwrap();
+
+    spool.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        live_claim.exists(),
+        "a peer process's unexpired lease must not be reclaimed"
+    );
+    assert!(
+        !expired_claim.exists(),
+        "an expired peer lease must be recovered"
+    );
+    assert!(
+        day.join(&expired_name).exists(),
+        "recovery restores the durable replayable name"
+    );
+}
+
+/// Lexical containment guard run before every managed create/rename/unlink.
+fn within_root(candidate: &str) -> Result<(), String> {
+    SpoolManager::ensure_path_within_root_for_tests(Path::new("spool"), Path::new(candidate))
+}
+
+#[test]
+fn managed_path_containment_rejects_escape_and_absolute_replacement() {
+    // Ordinary managed descendants, including a no-op `.` component and a `..`
+    // that still resolves inside the root.
+    within_root("spool/20260524/a.ndjson").expect("a managed descendant is inside");
+    within_root("spool/./20260524").expect("a current-dir component is a no-op");
+    within_root("spool/a/../b").expect("an interior parent segment is allowed");
+
+    // `..` walking off the front of the candidate is rejected before any
+    // filesystem call.
+    let popped = within_root("spool/../../etc/passwd").expect_err("escape refused");
+    assert!(popped.contains("escapes root"), "{popped}");
+
+    // A sibling tree that merely shares a parent is outside the root.
+    let sibling = within_root("other/a.ndjson").expect_err("sibling refused");
+    assert!(sibling.contains("outside root"), "{sibling}");
+
+    // An absolute component replaces the join instead of extending it.
+    let absolute = within_root("/etc/shadow").expect_err("absolute refused");
+    assert!(absolute.contains("outside root"), "{absolute}");
+}
+
+#[test]
+fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    assert_eq!(spool.generation_for_tests(), 1);
+
+    let record = spool
+        .write_events(&[sample_event("evt-claimable")])
+        .unwrap();
+    let claim = spool
+        .claim_replay_file_for_tests(&record)
+        .unwrap()
+        .expect("the owner claims its own durable record");
+    assert!(claim.exists(), "the claim rename must have happened");
+    assert!(!record.exists(), "the durable name is consumed");
+
+    // A claim marker is not itself a replay candidate.
+    let non_replayable = spool
+        .claim_replay_file_for_tests(&claim)
+        .expect_err("an in-flight claim must not be re-claimed");
+    assert!(
+        non_replayable.contains("refusing to claim non-replayable spool file"),
+        "{non_replayable}"
+    );
+
+    // A record carrying another owner's tag is never claimable, read, or moved.
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let foreign_tag = "00112233445566778899aabbccddeeff";
+    assert_ne!(foreign_tag, default_test_owner_tag());
+    let foreign = day.join(format!("01ARZ3NDEKTSV4RRFFQ69G5FB7.{foreign_tag}.ndjson"));
+    fs::write(&foreign, b"{}\n").unwrap();
+    let refused = spool
+        .claim_replay_file_for_tests(&foreign)
+        .expect_err("a foreign-tagged record must not be claimable");
+    assert!(refused.contains("owned by another identity"), "{refused}");
+    assert!(foreign.exists(), "a foreign record must not be touched");
+
+    // Releasing a path that carries no claim marker is refused rather than
+    // renaming an arbitrary managed file.
+    let not_a_claim = spool
+        .release_inflight_file_for_tests(&foreign)
+        .expect_err("only claim markers can be released");
+    assert!(
+        not_a_claim.contains("missing a claim marker"),
+        "{not_a_claim}"
+    );
+    assert!(foreign.exists(), "a refused release mutates nothing");
+}
+
+#[test]
+fn unattributed_claim_is_recovered_only_after_its_lease_horizon() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    // A long lease horizon: an unparseable claim marker is treated as a peer's
+    // live work and left alone.
+    let patient = SpoolManager::for_tests_with_owner_faults_and_ages(
+        spool_settings(temp.path(), 1 << 20),
+        &spec,
+        41,
+        SpoolFsFault::None,
+        300,
+        3_600,
+    )
+    .unwrap();
+    let day = patient.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let data_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB8");
+    let mangled = day.join(format!("{data_name}.claim-not-a-valid-marker.inflight"));
+    fs::write(&mangled, b"{}\n").unwrap();
+
+    patient.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        mangled.exists(),
+        "an unattributable claim inside its lease horizon must be left alone"
+    );
+    assert!(
+        !day.join(&data_name).exists(),
+        "nothing may be published back to the replayable name yet"
+    );
+
+    // The same marker past its horizon is recovered to the durable name.
+    let impatient = SpoolManager::for_tests_with_owner_faults_and_ages(
+        spool_settings(temp.path(), 1 << 20),
+        &spec,
+        42,
+        SpoolFsFault::None,
+        300,
+        0,
+    )
+    .unwrap();
+    assert!(
+        !mangled.exists(),
+        "an unattributable claim past its lease horizon is recovered"
+    );
+    assert!(
+        day.join(&data_name).exists(),
+        "recovery restores the durable replayable name"
+    );
+    assert_eq!(
+        impatient.list_replayable_spool_files_for_tests().unwrap(),
+        vec![day.join(&data_name)],
+        "the recovered record becomes replayable again"
+    );
+}
+
+#[test]
+fn claim_renewal_moves_the_lease_deadline_without_releasing_the_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-renew")]).unwrap();
+    let mut claim = spool
+        .hold_replay_claim_for_tests(&record)
+        .unwrap()
+        .expect("the owner claims its own durable record");
+    let first = claim.claim_path_for_tests().to_path_buf();
+
+    // 2100-01-01T00:00:00Z, unambiguously distinct from the initial deadline.
+    let far_future = 4_102_444_800i64;
+    spool
+        .renew_claim_at_for_tests(&mut claim, far_future)
+        .unwrap();
+    let renewed = claim.claim_path_for_tests().to_path_buf();
+    let renewed_name = renewed.file_name().unwrap().to_string_lossy().to_string();
+
+    assert_ne!(first, renewed, "renewal moves the lease deadline");
+    assert!(renewed_name.ends_with(&format!("-{far_future}.inflight")));
+    assert!(!first.exists(), "the previous claim name is gone");
+    assert!(renewed.exists(), "the renewed claim holds the record");
+    assert!(!record.exists(), "the durable name stays claimed");
+
+    // A live renewed claim is still protected from peer maintenance.
+    spool.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        renewed.exists(),
+        "a live renewed claim must not be reclaimed by maintenance"
+    );
+
+    let released = spool
+        .release_inflight_file_for_tests(&renewed)
+        .unwrap()
+        .expect("release restores the durable record");
+    assert_eq!(released, record);
+    assert!(record.exists(), "the payload is replayable again");
+}
+
+#[tokio::test]
+async fn replay_removes_a_claimed_spool_file_with_no_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let empty = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB9"));
+    fs::write(&empty, b"\n   \n").unwrap();
+
+    // The unreachable address proves no delivery is attempted: the claimed file
+    // carries no rows, so it is finalized without a ClickHouse call.
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/insert")
+        .await
+        .expect("a row-less spool file must not fail the replay tick");
+
+    assert!(
+        !empty.exists(),
+        "a row-less spool file is claimed and removed"
+    );
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "no claim or durable remnant may be left behind"
+    );
+}
+
+#[tokio::test]
+async fn replay_outcomes_delivered_permanent_and_claim_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+
+    let server_ok = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server_ok)
+        .await;
+    let delivered = spool
+        .write_events(&[sample_event("evt-delivered")])
+        .unwrap();
+    replay_spool_once_for_tests(&spool, &server_ok.uri())
+        .await
+        .unwrap();
+    assert!(!delivered.exists(), "a delivered claim must be removed");
+    let owned = spool.list_owned_spool_files_for_tests().unwrap();
+    assert!(
+        owned.is_empty(),
+        "a delivered replay must leave no claim behind: {owned:?}"
+    );
+
+    let server_perm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server_perm)
+        .await;
+    let poison = spool
+        .write_events(&[sample_event("evt-permanent")])
+        .unwrap();
+    replay_spool_once_for_tests(&spool, &server_perm.uri())
+        .await
+        .unwrap();
+    assert_rejected_sidecar(&poison, 400, "permanent_http");
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "a permanently rejected record must leave the replay set"
+    );
+}
+
+#[test]
+fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
+    let plugin_dir = root.parent().unwrap().to_path_buf();
+    let node_dir = plugin_dir.parent().unwrap().to_path_buf();
+
+    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/<ULID>.ndjson`.
+    let legacy_day = node_dir.join("20260101");
+    fs::create_dir_all(&legacy_day).unwrap();
+    let legacy = legacy_day.join("00000000000000000000000000.ndjson");
+    fs::write(&legacy, b"{\"event_id\":\"legacy\"}\n").unwrap();
+
+    // A namespace orphaned by a destination change.
+    let orphan_ns = plugin_dir.join("o00000000000000000000000000000000");
+    let orphan_day = orphan_ns.join("20260102");
+    fs::create_dir_all(&orphan_day).unwrap();
+    let orphan = orphan_day.join("00000000000000000000000001.ndjson");
+    fs::write(&orphan, b"{\"event_id\":\"old-destination\"}\n").unwrap();
+
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let (files, namespaces) = spool.unbound_record_counts_for_tests();
+    assert_eq!(files, 2, "both unbound records must be reported");
+    assert_eq!(namespaces, 1, "the orphaned namespace must be reported");
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "unbound records must never be replayed to the newly configured destination"
+    );
+
+    // Writing under the new identity leaves the unbound records untouched.
+    spool.write_events(&[sample_event("evt-new")]).unwrap();
+    assert!(legacy.exists(), "legacy records must never be deleted");
+    assert!(orphan.exists(), "orphaned records must never be deleted");
+}
+
+#[test]
+fn unbound_scan_shares_one_entry_budget_across_sibling_namespaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let root = spool.namespace_root_for_tests();
+    let plugin_dir = root.parent().unwrap();
+
+    let mut records = Vec::new();
+    for index in 1..=4 {
+        let day = plugin_dir.join(format!("o{index:032x}")).join("20260101");
+        fs::create_dir_all(&day).unwrap();
+        let record = day.join(format!("{index:026}.ndjson"));
+        fs::write(&record, b"{\"event_id\":\"orphan\"}\n").unwrap();
+        records.push(record);
+    }
+
+    // The node directory consumes one entry and the plugin directory contains
+    // the live namespace plus these four siblings. Six entries therefore
+    // exhaust one aggregate budget before any sibling can receive a fresh
+    // recursive allowance.
+    let (files, namespaces, truncated) = spool.scan_unbound_records_with_entry_limit_for_tests(6);
+    assert!(truncated, "the aggregate scan must report its global cap");
+    assert!(
+        files < records.len() as u64 && namespaces < records.len() as u64,
+        "a bounded scan must not restart the entry budget for every sibling namespace"
+    );
+    assert!(
+        records.iter().all(|record| record.exists()),
+        "a truncated unbound scan is observability-only and must not mutate records"
+    );
+}
+
+#[test]
+fn destination_change_moves_to_a_fresh_namespace_without_rerouting() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut before = test_owner_spec("node-a");
+    before.table = "charges_v1";
+    let mut after = test_owner_spec("node-a");
+    after.table = "charges_v2";
+
+    let old = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &before, 1)
+        .unwrap();
+    let stranded = old.write_events(&[sample_event("evt-v1")]).unwrap();
+    drop(old);
+
+    let new = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &after, 2)
+        .unwrap();
+    assert!(
+        !stranded.starts_with(new.namespace_root_for_tests()),
+        "a destination change must move to a fresh managed namespace"
+    );
+    let replayable = new.list_replayable_spool_files_for_tests().unwrap();
+    assert!(
+        replayable.is_empty(),
+        "records for the previous destination must not be replayed to the new one"
+    );
+    let (files, namespaces) = new.unbound_record_counts_for_tests();
+    assert_eq!(files, 1);
+    assert_eq!(namespaces, 1);
+    assert!(
+        stranded.exists(),
+        "the stranded record is retained for the operator"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn staged_and_rejected_generations_never_touch_the_spool() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+
+    // Stage a candidate without committing it: nothing may be created on disk.
+    let staged = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    staged.start_background_tasks().unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let entries: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "a staged, never-accepted generation must not create spool state: {entries:?}"
+    );
+    assert!(
+        !staged.owns_active_sink(),
+        "staging must not publish an accepted sink"
+    );
+
+    // Dropping without commit models a rejected plugin-cache generation.
+    drop(staged);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        after.is_empty(),
+        "a rejected generation must leave no spool side effects: {after:?}"
+    );
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        requests.is_empty(),
+        "a rejected generation must never deliver externally"
+    );
 }
 
 #[test]

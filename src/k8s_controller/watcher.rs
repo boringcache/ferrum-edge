@@ -107,6 +107,17 @@ pub const ISTIO_CRDS: &[CrdSpec] = &[
         plural: "telemetries",
         namespaced: true,
     },
+    // Served as networking.istio.io/v1beta1 only (Istio has no v1 ProxyConfig).
+    // Discovered at runtime via find_crd_resource; absent clusters skip
+    // registration and the reprobe task restarts the watcher once installed —
+    // same last-known-good / relist path as every other ISTIO_CRDS entry.
+    CrdSpec {
+        group: "networking.istio.io",
+        version: "v1beta1",
+        kind: "ProxyConfig",
+        plural: "proxyconfigs",
+        namespaced: true,
+    },
 ];
 
 pub const GATEWAY_API_CRDS: &[CrdSpec] = &[
@@ -922,6 +933,59 @@ mod tests {
         assert_eq!(
             crd_watch_namespaces(http_route, &["default".to_string()], "istio-system"),
             vec!["default".to_string()]
+        );
+    }
+
+    #[test]
+    fn proxy_config_is_watched_as_networking_v1beta1() {
+        let proxy_config = ISTIO_CRDS
+            .iter()
+            .find(|resource| resource.kind == "ProxyConfig")
+            .expect("ProxyConfig must be in ISTIO_CRDS");
+        assert_eq!(proxy_config.group, "networking.istio.io");
+        assert_eq!(proxy_config.version, "v1beta1");
+        assert_eq!(proxy_config.plural, "proxyconfigs");
+        assert!(
+            proxy_config.namespaced,
+            "ProxyConfig is a namespaced Istio CRD"
+        );
+        assert_eq!(
+            crd_watch_namespaces(proxy_config, &["default".to_string()], "istio-system"),
+            vec!["default".to_string(), "istio-system".to_string()],
+            "ProxyConfig watches configured namespaces plus the Istio root namespace"
+        );
+        assert!(
+            namespaces_with_istio_root(&[], "istio-system").is_empty(),
+            "empty watch list keeps Api::all (already includes root); no extra scoped store"
+        );
+    }
+
+    #[test]
+    fn istio_watch_selection_registers_proxy_config_with_other_crds() {
+        let kinds: HashSet<&str> = ISTIO_CRDS.iter().map(|crd| crd.kind).collect();
+        assert!(kinds.contains("ProxyConfig"));
+        assert_eq!(
+            ISTIO_CRDS.len(),
+            10,
+            "ten Istio kinds are watched (nine historical + ProxyConfig)"
+        );
+        // Selection gate: watch_istio drives registration from ISTIO_CRDS only.
+        let selection = WatcherSelection {
+            watch_istio: true,
+            watch_gateway_api: false,
+            watch_core: false,
+            watch_gateway_api_data_plane_service: false,
+            watch_node_locality: false,
+            watch_mesh_config: false,
+        };
+        assert!(selection.watch_istio);
+        let mut planned = Vec::new();
+        if selection.watch_istio {
+            planned.extend(ISTIO_CRDS.iter().map(|crd| crd.kind));
+        }
+        assert!(
+            planned.contains(&"ProxyConfig"),
+            "watch_istio selection must plan a ProxyConfig watcher"
         );
     }
 

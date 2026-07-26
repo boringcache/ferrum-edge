@@ -668,6 +668,7 @@ jobs:
               integration::db_incremental_poll_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
+              integration::db_row_decode_rejection_tests
               integration::vendor_integrity_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6

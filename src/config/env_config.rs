@@ -946,6 +946,9 @@ pub struct EnvConfig {
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
     pub log_shutdown_drain_timeout_ms: u64,
+    /// Aggregate admitted terminal/mirror/deadline-cleanup task budget.
+    /// Default: 4096.
+    pub log_delivery_max_tasks: usize,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
     /// include its own `?poll=` option. Clamped to 1 second minimum and 24 hours
@@ -2082,6 +2085,38 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
+    /// Absolute deadline (seconds) for reading a **1 MiB** admin request body,
+    /// applied to every admin body-collecting handler including the API-spec
+    /// ones. A size cap alone does not bound *time*: a client that trickles one
+    /// byte per interval pins a task and its buffer indefinitely, and over
+    /// HTTP/2 a single connection can multiplex many such streams.
+    ///
+    /// Routes with a larger size cap scale the deadline by that cap, so the
+    /// bound is one shared minimum throughput rather than a flat wall clock
+    /// that would demand 25x/100x the upload rate from `POST`/`PUT /api-specs`
+    /// (`FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`) and `POST /restore`
+    /// (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`). At the defaults that is
+    /// 30 s for 1 MiB, 750 s for a 25 MiB spec, and 3000 s for a 100 MiB
+    /// restore. `0` disables the deadline on every route (bodies are then
+    /// bounded only by size). Default: 30 seconds.
+    pub admin_body_read_timeout_seconds: u64,
+
+    /// Server-advertised `SETTINGS_MAX_CONCURRENT_STREAMS` for admin HTTP/2
+    /// connections (TLS via ALPN `h2`, plaintext via h2c prior knowledge).
+    /// Bounds how many requests one admin connection can multiplex, so the
+    /// admin connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`) also bounds the
+    /// number of retained request tasks/buffers. Default: 64.
+    pub admin_http2_max_concurrent_streams: u32,
+
+    /// Server-advertised `SETTINGS_MAX_HEADER_LIST_SIZE` for admin HTTP/2
+    /// connections. Bounds the header block a single stream may accumulate
+    /// across `HEADERS` + `CONTINUATION` frames before the peer is reset, which
+    /// is the HTTP/2 analogue of the HTTP/1.1 header-read bound. Admin requests
+    /// carry only a bearer token and a few small headers. Clamped to a 1 KiB
+    /// floor so a misconfiguration cannot lock out ordinary JWTs.
+    /// Default: 65536 (64 KiB).
+    pub admin_http2_max_header_list_size_bytes: u32,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -2350,6 +2385,7 @@ impl Default for EnvConfig {
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
             log_shutdown_drain_timeout_ms: crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT
                 as u64,
+            log_delivery_max_tasks: crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,
@@ -2604,6 +2640,11 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_body_read_timeout_seconds: crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
+            admin_http2_max_concurrent_streams:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
+            admin_http2_max_header_list_size_bytes:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -2687,6 +2728,7 @@ impl EnvConfig {
             log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => crate::logging::LOG_BUFFER_BYTES_DEFAULT, clamp(crate::logging::LOG_BUFFER_BYTES_MIN, crate::logging::LOG_BUFFER_BYTES_MAX);
             log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT, clamp(crate::logging::LOG_MAX_RECORD_BYTES_MIN, crate::logging::LOG_MAX_RECORD_BYTES_MAX);
             log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64, clamp(crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN as u64, crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX as u64);
+            log_delivery_max_tasks: usize = "FERRUM_LOG_DELIVERY_MAX_TASKS" => crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT, clamp(crate::logging::LOG_DELIVERY_MAX_TASKS_MIN, crate::logging::LOG_DELIVERY_MAX_TASKS_MAX);
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
             acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);
@@ -3050,6 +3092,9 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS;
+            admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS, max(1u32);
+            admin_http2_max_header_list_size_bytes: u32 = "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES, max(1_024u32);
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -3422,6 +3467,7 @@ impl EnvConfig {
             log_buffer_bytes,
             log_max_record_bytes,
             log_shutdown_drain_timeout_ms,
+            log_delivery_max_tasks,
             secret_refresh_interval_seconds,
             acme_auto_renew_enabled,
             acme_renew_when_remaining_days,
@@ -3675,6 +3721,9 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_body_read_timeout_seconds,
+            admin_http2_max_concurrent_streams,
+            admin_http2_max_header_list_size_bytes,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,
