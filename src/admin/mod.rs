@@ -2422,8 +2422,15 @@ pub async fn handle_admin_request(
 
         // Batch create
         (Method::POST, ["batch"]) => {
-            // Role check happens before body buffering (see
-            // `body_consuming_route_role`).
+            // The pre-body gate in `body_consuming_route_role` already applied
+            // this role so an unauthorized caller's body is never buffered.
+            // Re-run it here anyway: `handle_batch_create` has no role check of
+            // its own, so without this arm the admission table would be the
+            // *sole* authority on a bulk-write route, and a future edit to that
+            // table would silently open it. Idempotent — matches every other arm.
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             handle_batch_create(&state, &auth, &body_bytes, &namespace).await
         }
 
@@ -2436,8 +2443,14 @@ pub async fn handle_admin_request(
             handle_backup(&state, query.as_deref(), &namespace).await
         }
         (Method::POST, ["restore"]) => {
-            // Role check happens before body buffering (see
-            // `body_consuming_route_role`).
+            // As with `/batch`: the pre-body gate already ran, and this replays
+            // it because `handle_restore` has no role check of its own. Restore
+            // replaces all configuration in the namespace, so it must not be
+            // the one route whose authorization lives only in the body
+            // admission table.
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
         }
 
