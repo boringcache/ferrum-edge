@@ -2280,8 +2280,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cert_path = dir.path().join("client-chain.pem");
         let key_path = dir.path().join("client-key.pem");
-        let key_pair =
-            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
         let params = CertificateParams::new(vec!["client.local".to_string()]).expect("cert params");
         let certificate = params.self_signed(&key_pair).expect("self-sign cert");
         std::fs::write(
