@@ -5975,6 +5975,19 @@ pub mod startup_cleanup_test_seams {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
+    /// Did the *failed* step leave a live capture config behind?
+    ///
+    /// Read from the mock's pre-cleanup snapshot when rollback ran, because
+    /// `cleanup_all` clears `capture_config` — sampling the live field after a
+    /// rollback would report `false` no matter what the step did.
+    fn capture_config_set_before_cleanup(backend: &MockEbpfBackend) -> bool {
+        backend
+            .pre_cleanup_state
+            .as_ref()
+            .map(|pre| pre.capture_config_set)
+            .unwrap_or_else(|| backend.capture_config.is_some())
+    }
+
     /// Observable result for the external #2371 startup-cleanup probes.
     #[derive(Debug, Clone)]
     pub struct NodeAgentStartupCleanupProbe {
@@ -5983,9 +5996,12 @@ pub mod startup_cleanup_test_seams {
         pub cleanup_all_calls: usize,
         pub cleaned_up: bool,
         /// Sampled at the last point the mock is directly observable, i.e. just
-        /// before an `InitializedBackendOwner` takes it by value.
+        /// before an `InitializedBackendOwner` takes it by value. `cleanup_all`
+        /// does not reset this flag, so it survives a rollback.
         pub programs_loaded: bool,
-        /// Same sampling point as `programs_loaded`.
+        /// Whether the capture config was live *before* any cleanup wiped it
+        /// (see `capture_config_set_before_cleanup`), so a rollback cannot make
+        /// this read `false` vacuously.
         pub capture_config_set: bool,
     }
 
@@ -6035,7 +6051,7 @@ pub mod startup_cleanup_test_seams {
                 cleanup_all_calls: backend.cleanup_all_calls,
                 cleaned_up: backend.cleaned_up,
                 programs_loaded: backend.programs_loaded,
-                capture_config_set: backend.capture_config.is_some(),
+                capture_config_set: capture_config_set_before_cleanup(&backend),
             });
         }
         let sampled = SampledMock {
@@ -6088,7 +6104,30 @@ pub mod startup_cleanup_test_seams {
             cleanup_all_calls: backend.cleanup_all_calls,
             cleaned_up: backend.cleaned_up,
             programs_loaded: backend.programs_loaded,
-            capture_config_set: backend.capture_config.is_some(),
+            capture_config_set: capture_config_set_before_cleanup(&backend),
+        }
+    }
+
+    /// The mirror image of the post-load probe: a failure in `load_programs`
+    /// itself created nothing, so the rollback guard must NOT be armed yet and
+    /// `cleanup_all` must not run. This pins the guard to the `load_programs`
+    /// boundary — hoisting it above the load would start unpinning maps a
+    /// *different*, still-healthy node-agent may own.
+    pub(crate) fn probe_pre_load_failure_skips_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
+        let config = local_pod_ebpf_test_config();
+        let mut backend = MockEbpfBackend {
+            fail_load_programs: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+        let result = initialize_backend(&mut backend, &config, &metrics);
+        NodeAgentStartupCleanupProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: capture_config_set_before_cleanup(&backend),
         }
     }
 
@@ -6767,10 +6806,18 @@ mod tests {
             },
         );
 
-        assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert!(err.to_string().contains("SOCK_OPS identity bridge"));
         assert!(backend.cleaned_up);
         assert_eq!(backend.cleanup_all_calls, 1);
+        // Read the attach state from the pre-rollback snapshot: rollback's
+        // `cleanup_all` clears `sock_ops_attached_cgroup_root`, so asserting on
+        // the live field here would pass even if the attach had succeeded.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert!(pre.sock_ops_attached_cgroup_root.is_none());
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("node_waypoint_sock_ops_unavailable")
@@ -6816,10 +6863,17 @@ mod tests {
         );
 
         assert!(err.to_string().contains("trusted node"));
-        assert!(backend.node_ips.is_empty());
-        assert!(backend.node_ips6.is_empty());
         assert!(backend.cleaned_up);
         assert_eq!(backend.cleanup_all_calls, 1);
+        // Pre-rollback snapshot: `cleanup_all` clears the node-IP maps, so the
+        // "no trusted source was ever written" assertion has to read the state
+        // captured just before the wipe.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert_eq!(pre.node_ip_count, 0);
+        assert_eq!(pre.node_ip6_count, 0);
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
@@ -6852,9 +6906,17 @@ mod tests {
 
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
-        assert!(backend.capture_config.is_none());
         assert!(backend.cleaned_up);
         assert_eq!(backend.cleanup_all_calls, 1);
+        // Pre-rollback snapshot: `cleanup_all` clears `capture_config`, so the
+        // live field is `None` either way. The snapshot proves the *failed*
+        // write left no config behind before rollback ran.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert!(!pre.capture_config_set);
+        assert!(backend.capture_config.is_none());
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_UNAVAILABLE

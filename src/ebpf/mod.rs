@@ -713,6 +713,26 @@ pub struct MockCleanupWatch {
     pub cleaned_up: std::sync::atomic::AtomicBool,
 }
 
+/// Snapshot of the observable mock state taken at the **first** `cleanup_all`,
+/// i.e. immediately before cleanup wipes it.
+///
+/// Startup rollback deliberately tears the maps down on a failed
+/// `initialize_backend`, which means assertions like "the failed
+/// capture-config write left no live config" or "SOCK_OPS never attached"
+/// would pass vacuously if read off the post-cleanup backend — `cleanup_all`
+/// clears those very fields. Tests assert against this snapshot instead so
+/// they still fail if the step under test actually succeeded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MockPreCleanupState {
+    pub capture_config_set: bool,
+    pub sock_ops_attached_cgroup_root: Option<String>,
+    pub node_ip_count: usize,
+    pub node_ip6_count: usize,
+    pub cgroup_attachment_count: usize,
+    pub tc_attachment_count: usize,
+    pub pod_ip_count: usize,
+}
+
 /// In-memory mock backend for Phase 1 and integration tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
@@ -751,6 +771,13 @@ pub struct MockEbpfBackend {
     /// Optional shared view of cleanup counters for tests that move this mock
     /// into a `Box<dyn EbpfBackend>` (see `InitializedBackendOwner`).
     pub cleanup_watch: Option<std::sync::Arc<MockCleanupWatch>>,
+    /// Observable state captured at the first `cleanup_all`, before cleanup
+    /// wiped it. `None` until cleanup runs. See [`MockPreCleanupState`].
+    pub pre_cleanup_state: Option<MockPreCleanupState>,
+    /// When `true`, `load_programs` fails without marking programs loaded, so
+    /// tests can prove the rollback guard is armed only *after* a successful
+    /// load (a pre-load failure created nothing and must not clean up).
+    pub fail_load_programs: bool,
     /// When `true`, `cleanup_all` records the call then returns an error so
     /// callers can prove original startup/runtime errors stay visible.
     pub fail_cleanup_all: bool,
@@ -779,6 +806,9 @@ pub struct MockEbpfBackend {
 
 impl EbpfBackend for MockEbpfBackend {
     fn load_programs(&mut self) -> Result<(), String> {
+        if self.fail_load_programs {
+            return Err("injected load_programs failure".to_string());
+        }
         self.programs_loaded = true;
         Ok(())
     }
@@ -986,6 +1016,20 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.cleanup_all_calls = self.cleanup_all_calls.saturating_add(1);
+        // Snapshot before the wipe so post-cleanup assertions stay meaningful.
+        // Only the FIRST cleanup records: a second call would overwrite the
+        // pre-rollback view with an already-empty one.
+        if self.pre_cleanup_state.is_none() {
+            self.pre_cleanup_state = Some(MockPreCleanupState {
+                capture_config_set: self.capture_config.is_some(),
+                sock_ops_attached_cgroup_root: self.sock_ops_attached_cgroup_root.clone(),
+                node_ip_count: self.node_ips.len(),
+                node_ip6_count: self.node_ips6.len(),
+                cgroup_attachment_count: self.cgroup_attachments.len(),
+                tc_attachment_count: self.tc_attachments.len(),
+                pod_ip_count: self.pod_ips.len(),
+            });
+        }
         if let Some(watch) = &self.cleanup_watch {
             watch
                 .calls

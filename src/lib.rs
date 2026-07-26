@@ -3724,6 +3724,12 @@ pub mod _test_support {
         node_agent_cleanup_seams::probe_post_load_init_failure_cleanup_for_test()
     }
 
+    /// A `load_programs` failure created nothing, so it must NOT clean up.
+    pub fn node_agent_pre_load_failure_skips_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_pre_load_failure_skips_cleanup_for_test()
+    }
+
     /// Kubernetes-client-style late failure after successful eBPF init.
     pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
     -> NodeAgentStartupCleanupProbe {

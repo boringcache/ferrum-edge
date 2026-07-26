@@ -8,6 +8,7 @@ use ferrum_edge::_test_support::{
     node_agent_k8s_client_style_late_failure_cleanup_probe_for_test,
     node_agent_normal_shutdown_cleanup_once_probe_for_test,
     node_agent_post_load_init_failure_cleanup_probe_for_test,
+    node_agent_pre_load_failure_skips_cleanup_probe_for_test,
 };
 
 #[test]
@@ -34,6 +35,27 @@ fn post_load_programs_failure_calls_cleanup_all_once() {
     assert_eq!(
         probe.cleanup_all_calls, 1,
         "post-load rollback must call cleanup_all exactly once"
+    );
+}
+
+#[test]
+fn load_programs_failure_does_not_call_cleanup_all() {
+    let probe = node_agent_pre_load_failure_skips_cleanup_probe_for_test();
+
+    assert!(!probe.ok, "load_programs failure must abort init");
+    let error = probe.error.expect("load failure must surface an error");
+    assert!(
+        error.contains("injected load_programs failure"),
+        "original load error preserved: {error}"
+    );
+    assert!(
+        !probe.programs_loaded,
+        "load_programs must not report success"
+    );
+    assert!(!probe.cleaned_up);
+    assert_eq!(
+        probe.cleanup_all_calls, 0,
+        "nothing was created before load_programs, so rollback must not run"
     );
 }
 
