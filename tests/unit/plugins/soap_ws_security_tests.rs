@@ -424,7 +424,7 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
             "enabled": true,
             "trusted_issuers": ["urn:test:idp"],
             "trusted_signing_certs": [MALFORMED_INLINE_PEM],
-            "allowed_algorithms": ["rsa-sha256"]
+            "allowed_signature_algorithms": ["rsa-sha256"]
         }
     });
     let err = SoapWsSecurity::new(&config)
