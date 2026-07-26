@@ -1203,6 +1203,23 @@ pub mod _test_support {
         crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
     }
 
+    /// Bounded global capacity-overflow Close (RFC 6455 1009).
+    pub fn ws_global_capacity_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_global_capacity_close_frame()
+    }
+
+    /// Defined idle-timeout policy Close (RFC 6455 1001).
+    pub fn ws_idle_timeout_policy_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_idle_timeout_policy_close_frame()
+    }
+
+    /// Global capacity-overflow Close selection used when no plugin rule binds.
+    pub fn global_ws_capacity_close_for_error_for_test(
+        error: &WsError,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
+    }
+
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
     pub async fn apply_ws_frame_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
