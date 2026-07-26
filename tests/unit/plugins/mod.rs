@@ -47,6 +47,7 @@ mod ip_restriction_tests;
 mod jwks_auth_custom_token_location_tests;
 mod jwks_auth_inline_keys_tests;
 mod jwks_auth_multi_audience_tests;
+mod auth_principal_binding_tests;
 mod jwks_auth_support;
 mod jwks_auth_tests;
 mod jwks_cache_tests;

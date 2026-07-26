@@ -1482,10 +1482,10 @@ fn test_consumer_index_mtls_delta() {
     );
 }
 
-// --- Does not overwrite existing consumer identification ---
+// --- Same-principal binding for composed factors ---
 
 #[tokio::test]
-async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
+async fn test_mtls_auth_rejects_a_certificate_belonging_to_a_different_principal() {
     let cert_der = create_test_cert("client.example.com", None, None);
     let consumer1 = create_mtls_consumer("c1", "alice", "client.example.com");
     let consumer2 = create_mtls_consumer("c2", "bob", "other.example.com");
@@ -1493,13 +1493,34 @@ async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
 
     let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
-    // Pre-set a different consumer (e.g., from a previous auth plugin)
+    // A previous auth plugin already committed Bob. This certificate proves
+    // Alice, so the chain composes two different principals.
     ctx.identified_consumer = Some(Arc::new(consumer2));
 
     let result = plugin.authenticate(&mut ctx, &index).await;
+    // Fails closed instead of silently retaining Bob while Alice's factor is
+    // treated as satisfied (GHSA-2xjg-2v8q-cr33).
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        "bob",
+        "a rejected composition must not install the conflicting principal"
+    );
+}
+
+#[tokio::test]
+async fn test_mtls_auth_accepts_a_certificate_for_the_already_committed_principal() {
+    let cert_der = create_test_cert("client.example.com", None, None);
+    let consumer1 = create_mtls_consumer("c1", "alice", "client.example.com");
+    let index = ConsumerIndex::new(&[consumer1.clone()]);
+
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+    let mut ctx = create_ctx_with_cert(cert_der);
+    ctx.identified_consumer = Some(Arc::new(consumer1));
+
+    let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
-    // Should keep the original consumer, not overwrite
-    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "bob");
+    assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
 }
 
 #[tokio::test]

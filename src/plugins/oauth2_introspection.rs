@@ -24,8 +24,8 @@ use super::utils::auth_flow::{
     ExtractedCredential, VerifyOutcome, commit_authentication_attempt, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
-    parse_claim_headers,
+    ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
+    emit_claim_headers_to_attempt, parse_claim_headers,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
@@ -85,6 +85,10 @@ pub struct Oauth2Introspection {
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     allow_provider_fanout: bool,
+    /// Complete gateway-owned `claim_headers` destination set across every
+    /// provider. Precomputed so `before_proxy` can sanitize without walking the
+    /// provider list.
+    claim_header_destinations: ClaimHeaderDestinations,
     discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -393,6 +397,12 @@ impl Oauth2Introspection {
                 .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
 
+        let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
+            providers
+                .iter()
+                .map(|provider| provider.claim_headers.as_slice()),
+        );
+
         Ok(Self {
             providers,
             http_client,
@@ -404,6 +414,7 @@ impl Oauth2Introspection {
             strip_authorization_on_success,
             has_custom_query_token_locations,
             allow_provider_fanout,
+            claim_header_destinations,
             discovery_tasks: Mutex::new(None),
         })
     }
@@ -1211,7 +1222,12 @@ impl super::Plugin for Oauth2Introspection {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(
+            ctx,
+            headers,
+            CLAIM_HEADER_METADATA_PREFIX,
+            &self.claim_header_destinations,
+        );
         PluginResult::Continue
     }
 
