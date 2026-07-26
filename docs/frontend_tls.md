@@ -85,9 +85,13 @@ failures. They close the client side without dialing the backend or recording a
 backend circuit-breaker failure.
 
 The deliberate exception is operator-enabled HTTP/3 0-RTT early data
-(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled,
-Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
-so backends can apply their own replay policy.
+(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled
+for HTTP/3, Ferrum sets the QUIC TLS early-data size to `u32::MAX` (quinn/rustls
+require `0` or `2^32-1`; a finite TLS byte cap is not available on QUIC),
+permits only configured replay-safe methods, and forwards `Early-Data: 1`
+so backends can apply their own replay policy. HTTPS/H1/H2 currently keep
+rustls 0-RTT disabled until per-request early-data state is available, so
+the method allowlist does not enable a TCP TLS early-data byte cap either.
 
 0-RTT and frontend mTLS are mutually exclusive on the HTTP/3 listener. When
 `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set, the H3 listener never takes

@@ -401,11 +401,19 @@ fn build_h3_quinn_server_config(
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
     // 0-RTT early data: controlled by FERRUM_TLS_EARLY_DATA_METHODS.
-    // When 0 (default), 0-RTT is disabled — early data is replayable, which is
-    // dangerous for non-idempotent operations proxied through an API gateway.
-    // When non-zero, the gateway accepts 0-RTT and enforces per-method filtering
-    // via quinn's into_0rtt() detection in handle_h3_connection().
-    server_tls_config.max_early_data_size = tls_policy.early_data_max_size;
+    // When the policy reports 0 (default), 0-RTT is disabled — early data is
+    // replayable, which is dangerous for non-idempotent operations proxied
+    // through an API gateway. When the policy reports any non-zero value
+    // (methods configured), QUIC/rustls requires max_early_data_size to be
+    // exactly u32::MAX (2^32-1). A finite TLS early-data byte cap is not
+    // expressible on QUIC; Ferrum's method allowlist in handle_h3_connection()
+    // remains the application-layer admission control. Mapping here keeps
+    // startup and live reload fail-closed: quinn panics on any other size, so
+    // we never pass the policy's finite aspirational value through.
+    server_tls_config.max_early_data_size = match tls_policy.early_data_max_size {
+        0 => 0,
+        _ => u32::MAX,
+    };
 
     // Enable TLS 1.3 session resumption for QUIC connections.
     // Stateless tickets allow clients to resume sessions without a full handshake,

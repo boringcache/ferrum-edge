@@ -19,7 +19,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 
 ## Listener and enablement
 
-HTTP/3 is a separate QUIC listener alongside the main hyper HTTP server. QUIC mandates TLS 1.3 (RFC 9001), so the server forces TLS 1.3 regardless of `FERRUM_TLS_*` settings and advertises `h3` in ALPN. Stateless session tickets are always enabled (saves 1 RTT on reconnects). Early data (0-RTT) is controlled by `FERRUM_TLS_EARLY_DATA_METHODS` — when configured, `quinn::Connection::into_0rtt()` detects early data and the gateway enforces per-method filtering. 0-RTT is **not** used when the H3 listener is configured for frontend mTLS (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`): TLS 1.3 does not accept early data under client authentication, and the 0.5-RTT accept path would materialize the connection before the peer certificate is knowable. Ordinary 1-RTT mTLS is unaffected; a startup warning records that early data is inert on that listener.
+HTTP/3 is a separate QUIC listener alongside the main hyper HTTP server. QUIC mandates TLS 1.3 (RFC 9001), so the server forces TLS 1.3 regardless of `FERRUM_TLS_*` settings and advertises `h3` in ALPN. Stateless session tickets are always enabled (saves 1 RTT on reconnects). Early data (0-RTT) is controlled by `FERRUM_TLS_EARLY_DATA_METHODS` — when configured, the QUIC rustls config sets `max_early_data_size = u32::MAX` (the only enabled value quinn/rustls accept; a finite TLS early-data byte cap is not expressible on QUIC), `quinn::Connection::into_0rtt()` detects early data, and the gateway enforces per-method filtering. 0-RTT is **not** used when the H3 listener is configured for frontend mTLS (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`): TLS 1.3 does not accept early data under client authentication, and the 0.5-RTT accept path would materialize the connection before the peer certificate is knowable. Ordinary 1-RTT mTLS is unaffected; a startup warning records that early data is inert on that listener.
 
 Enable the listener with:
 
@@ -413,9 +413,13 @@ pinning the recv task for the QUIC idle-timeout window.
 RFC 9220 Extended CONNECT can in principle be carried in QUIC 0-RTT
 early data, but `FERRUM_TLS_EARLY_DATA_METHODS` does NOT list `CONNECT`
 by default — operators who want WebSocket upgrades via 0-RTT must opt
-in explicitly. On accepted 0-RTT requests the gateway forwards
-`Early-Data: 1` to the backend (same shim as plain H3 / cross-protocol
-bridge) so origins can apply their own replay-safety policy.
+in explicitly. When early data is enabled for HTTP/3, the QUIC TLS
+layer advertises `max_early_data_size = u32::MAX` because quinn/rustls
+reject every other non-zero value; Ferrum's method allowlist is the
+application-layer admission control (there is no finite QUIC TLS byte
+cap). On accepted 0-RTT requests the gateway forwards `Early-Data: 1`
+to the backend (same shim as plain H3 / cross-protocol bridge) so
+origins can apply their own replay-safety policy.
 
 Peer identity and early data are published as one per-connection snapshot
 (`http3::peer_identity::H3ConnectionIdentity`, an `ArcSwap` slot read once

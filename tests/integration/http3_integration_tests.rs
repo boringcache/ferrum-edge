@@ -1734,8 +1734,9 @@ fn build_h3_mtls_fixture() -> H3MtlsFixture {
 
 /// Build a quinn server endpoint that requires a client certificate, mirroring
 /// `build_h3_quinn_server_config`: TLS 1.3 only, `h3` ALPN, a WebPKI client-cert
-/// verifier, and the same non-zero `max_early_data_size` the gateway installs
-/// when `FERRUM_TLS_EARLY_DATA_METHODS` is configured.
+/// verifier, and the same QUIC early-data size the gateway installs when
+/// `FERRUM_TLS_EARLY_DATA_METHODS` is configured (`u32::MAX` — quinn/rustls
+/// reject every other non-zero value).
 fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(fixture.ca_der.clone()).expect("trust CA");
@@ -1755,9 +1756,10 @@ fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
         .with_single_cert(certs, key)
         .expect("server TLS config");
     server_tls.alpn_protocols = vec![b"h3".to_vec()];
-    // Non-zero exactly as `TlsPolicy::early_data_max_size` sets it when
-    // FERRUM_TLS_EARLY_DATA_METHODS is non-empty.
-    server_tls.max_early_data_size = 16_384;
+    // QUIC/rustls contract: enabled early data must be exactly u32::MAX.
+    // Production `build_h3_quinn_server_config` maps any non-zero
+    // `TlsPolicy::early_data_max_size` to this value.
+    server_tls.max_early_data_size = u32::MAX;
 
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quic cfg");
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
