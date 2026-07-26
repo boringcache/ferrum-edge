@@ -3,6 +3,7 @@
 //! - `types` — Core domain model (Proxy, Consumer, Upstream, PluginConfig, etc.)
 //! - `env_config` — Environment variable parsing (90+ vars) + conf file overlay
 //! - `conf_file` — `ferrum.conf` parser (env vars take precedence over conf values)
+//! - `batch_atomicity` — Graph-level all-or-nothing vocabulary for `POST /batch`
 //! - `db_loader` — Database config loader with incremental polling
 //! - `file_loader` — YAML/JSON file loader with version migration
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
@@ -10,6 +11,11 @@
 //! - `migrations` — SQL schema migrations for database mode
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
+// The fault-injection seam is driven by external tests through the lib target's
+// `_test_support` shim; the bin target recompiles this module without those
+// callers, so its installers would otherwise read as dead code there.
+#[allow(dead_code)]
+pub mod batch_atomicity;
 pub mod conf_file;
 pub mod config_backup;
 pub mod config_migration;

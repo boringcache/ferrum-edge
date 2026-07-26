@@ -1601,29 +1601,29 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
-/// Exclusive compression codec admission permit held on a request context.
+/// Exclusive compression response-buffer permit held on a request context.
 ///
 /// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
 /// permit is unique and must be transferred with `take()` / `mem::take` when a
 /// compatibility clone needs to own the reserved slot.
 #[derive(Default)]
-struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+struct HeldResponseBufferPermit(Option<tokio::sync::OwnedSemaphorePermit>);
 
-impl std::fmt::Debug for HeldCodecPermit {
+impl std::fmt::Debug for HeldResponseBufferPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("HeldCodecPermit")
+        f.debug_tuple("HeldResponseBufferPermit")
             .field(&self.0.is_some())
             .finish()
     }
 }
 
-impl Clone for HeldCodecPermit {
+impl Clone for HeldResponseBufferPermit {
     fn clone(&self) -> Self {
         Self(None)
     }
 }
 
-impl HeldCodecPermit {
+impl HeldResponseBufferPermit {
     fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
         self.0 = Some(permit);
     }
@@ -1967,7 +1967,7 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
-    /// Process-local compression instance that reserved response codec admission
+    /// Process-local compression instance that reserved response-buffer admission
     /// in `before_proxy`, before the response-buffer decision. First-wins across
     /// sibling instances so at most one response permit is held per request. The
     /// reservation is what bounds the population of response bodies admitted onto
@@ -1975,16 +1975,17 @@ pub struct RequestContext {
     /// reserved permit rather than acquiring a fresh one on the hot path.
     compression_response_admission_owner: Option<u64>,
     /// Set when `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission. The response then streams identity (or
+    /// obtain bounded response-buffer admission. The response then streams identity (or
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
-    /// Reserved codec CPU admission permit for gateway response compression.
-    /// Reserved in `before_proxy` before the response-buffer decision and moved
-    /// into the `spawn_blocking` closure during the body transform. Drop
-    /// releases the slot if the transform never runs (cancellation). Clones
-    /// do not duplicate the exclusive permit.
-    compression_response_codec_permit: HeldCodecPermit,
+    /// Reserved response-buffer admission permit for gateway compression.
+    /// Codec CPU admission is acquired separately, immediately before the
+    /// blocking transform, and this permit is held across that transform so the
+    /// retained-body population never exceeds the response-buffer budget. Drop
+    /// releases this slot on cancellation; clones do not duplicate the
+    /// exclusive permit.
+    compression_response_buffer_permit: HeldResponseBufferPermit,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
     /// owning transform must emit these bytes so the backend never sees a
@@ -2387,7 +2388,7 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
@@ -2683,27 +2684,41 @@ impl RequestContext {
         self.compression_response_admission_declined
     }
 
-    /// Drop this request's reserved response codec admission (permit + owner)
+    /// Drop this request's reserved response-buffer admission (permit + owner)
     /// when `instance_id` is the reserving instance. A no-op for siblings so a
     /// non-owner declining to compress never releases another instance's slot.
     pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
         if self.compression_response_admission_owner == Some(instance_id) {
             self.compression_response_admission_owner = None;
-            let _ = self.compression_response_codec_permit.take();
+            let _ = self.compression_response_buffer_permit.take();
         }
     }
 
-    pub(crate) fn set_compression_response_codec_permit(
+    /// Clear admission ownership for `instance_id` while leaving the reserved
+    /// buffer permit on the context. Used when this instance will not encode but
+    /// the body was already admitted onto the compression buffered path: a later
+    /// sibling with a broader config can take the same slot instead of briefly
+    /// leaving a retained body unaccounted for (or racing a fresh acquire).
+    pub(crate) fn relinquish_compression_response_admission_ownership_if_owner(
+        &mut self,
+        instance_id: u64,
+    ) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+        }
+    }
+
+    pub(crate) fn set_compression_response_buffer_permit(
         &mut self,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        self.compression_response_codec_permit.set(permit);
+        self.compression_response_buffer_permit.set(permit);
     }
 
-    pub(crate) fn take_compression_response_codec_permit(
+    pub(crate) fn take_compression_response_buffer_permit(
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.compression_response_codec_permit.take()
+        self.compression_response_buffer_permit.take()
     }
 
     pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
@@ -2726,7 +2741,7 @@ impl RequestContext {
         self.gateway_response_compression_algorithm = None;
         self.compression_response_encode_owner = None;
         self.compression_response_admission_owner = None;
-        let _ = self.compression_response_codec_permit.take();
+        let _ = self.compression_response_buffer_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -3166,13 +3181,13 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
-            // The reserved response codec permit stays on the donor (live)
+            // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving
             // it here would drop the slot when this short-lived clone is dropped
             // (only `metadata`/WAF/AI state is copied back), releasing admission
             // while the live context still owns the response encode.
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),

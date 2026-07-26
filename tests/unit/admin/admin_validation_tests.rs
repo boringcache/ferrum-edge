@@ -178,9 +178,21 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
             >= 5,
         "batch and restore persistence must preserve concrete outcomes across lease loss"
     );
-    assert!(batch_source.contains("rollback_failed_batch_create("));
-    assert!(batch_source.contains("batch_plugin_configs_with_intervening_proxy_dependencies("));
-    assert!(batch_source.contains("protected_plugin_config_ids.contains(&plugin_config.id)"));
+    // `POST /batch` is all-or-nothing (issue #2401): one backend transaction
+    // spans every dependency phase and every chunk, and the authorizing lease is
+    // re-verified inside it. There is deliberately no compensating rollback for
+    // batch create to fail — the transaction simply does not commit.
+    assert!(batch_source.contains("db.ensure_atomic_batch_supported()"));
+    assert!(batch_source.contains("batch_create_config_graph_atomically(&graph,"));
+    assert!(batch_source.contains("Some(namespace_config_admission_guard.lease_ref())"));
+    assert!(
+        !batch_source.contains("rollback_failed_batch_create("),
+        "batch create must not reintroduce compensating rollback"
+    );
+    assert!(
+        !batch_source.contains("StatusCode::MULTI_STATUS"),
+        "batch create must not reintroduce a partial-success response"
+    );
     assert!(batch_source.contains("immediately_succeeds_generation(lost_generation)"));
     assert_eq!(
         batch_source

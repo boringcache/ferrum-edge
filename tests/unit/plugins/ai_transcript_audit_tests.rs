@@ -2850,6 +2850,18 @@ async fn harvests_guardrail_and_token_metadata() {
         "ai_semantic_firewall.decision".to_string(),
         "allow".to_string(),
     );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_status".to_string(),
+        "HIT".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_match".to_string(),
+        "semantic".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_semantic_cache.7.cache_similarity".to_string(),
+        "0.950000".to_string(),
+    );
     plugin
         .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
@@ -2861,6 +2873,201 @@ async fn harvests_guardrail_and_token_metadata() {
         records[0]["guardrails"]["ai_semantic_firewall.decision"],
         "allow"
     );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_status"],
+        "HIT"
+    );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_match"],
+        "semantic"
+    );
+    assert_eq!(
+        records[0]["cache"]["ai_semantic_cache.7.cache_similarity"],
+        "0.950000"
+    );
+}
+
+/// The harvester must accept the `ai_semantic_cache.<instance_id>.*` telemetry
+/// schema exactly — including keeping each instance's id in the exported key so
+/// a multi-instance chain does not collapse into one ambiguous reading — while
+/// refusing anything outside the producer's own grammar and value domain.
+#[tokio::test]
+async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+
+    let admitted: &[(&str, &str)] = &[
+        // Two live instances: provenance must survive into the record.
+        ("ai_semantic_cache.7.cache_status", "HIT"),
+        ("ai_semantic_cache.7.cache_match", "semantic"),
+        ("ai_semantic_cache.7.cache_similarity", "0.950000"),
+        ("ai_semantic_cache.12.cache_status", "MISS"),
+        // Pre-namespace spelling still lands in the cache section.
+        ("ai_cache_status", "BYPASS"),
+        // Separate producer, separate key.
+        ("request_deduplication.replayed", "true"),
+    ];
+    let rejected: &[(&str, &str)] = &[
+        // The staged prompt fingerprint is not telemetry and must never ship.
+        ("ai_semantic_cache.7.cache_key", "0123456789abcdef01234567"),
+        ("ai_cache_key", "0123456789abcdef01234567"),
+        // Right namespace, invented field — must not become an export channel.
+        ("ai_semantic_cache.7.prompt", "who is the ceo of acme corp"),
+        ("ai_semantic_cache.7.cache_status.extra", "HIT"),
+        // Namespace without the instance-id component.
+        ("ai_semantic_cache.cache_status", "HIT"),
+        // Non-numeric / oversized instance ids are not producer output.
+        ("ai_semantic_cache.abc.cache_status", "HIT"),
+        (
+            "ai_semantic_cache.999999999999999999999.cache_status",
+            "HIT",
+        ),
+        ("ai_semantic_cache.18446744073709551616.cache_status", "HIT"),
+        ("ai_semantic_cache.007.cache_status", "HIT"),
+        // Prefix-without-separator collision the old predicate accepted.
+        ("ai_cache_hijack", "leaked"),
+        // Grammar matches but the value is outside the producer's domain.
+        ("ai_semantic_cache.9.cache_status", "who is the ceo of acme"),
+        ("ai_semantic_cache.9.cache_match", "arbitrary"),
+        ("ai_semantic_cache.10.cache_match", "exact"),
+        ("ai_semantic_cache.9.cache_similarity", "not-a-number"),
+        ("ai_semantic_cache.10.cache_similarity", "12.5"),
+        // In-range floats that are not the producer's `{:.6}` spelling.
+        ("ai_semantic_cache.11.cache_similarity", "0.95"),
+        ("ai_semantic_cache.13.cache_similarity", "1"),
+        ("ai_semantic_cache.14.cache_similarity", "1e0"),
+        ("ai_semantic_cache.15.cache_similarity", "+0.950000"),
+        ("ai_semantic_cache.16.cache_similarity", "1.000001"),
+        // Sibling namespace under the dedup producer.
+        ("request_deduplication.cached_body", "cached response text"),
+    ];
+    for &(key, value) in admitted.iter().chain(rejected) {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let cache = records[0]["cache"]
+        .as_object()
+        .expect("cache section is an object");
+
+    for &(key, value) in admitted {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value),
+            "producer-schema key {key} was not exported"
+        );
+    }
+    for &(key, _) in rejected {
+        assert!(
+            !cache.contains_key(key),
+            "off-schema key {key} leaked into the audit record"
+        );
+    }
+    // Nothing beyond the admitted set — no other section absorbed the rejects.
+    assert_eq!(cache.len(), admitted.len());
+    let serialized = serde_json::to_string(&records[0]).expect("record serializes");
+    assert!(
+        !serialized.contains("0123456789abcdef01234567"),
+        "the staged cache key reached the record through another field"
+    );
+    assert!(
+        !serialized.contains("who is the ceo of acme"),
+        "off-schema metadata reached the record through another field"
+    );
+}
+
+/// Oversized multi-instance chains must truncate the `cache` section in sorted
+/// key order (not `HashMap` iteration order) so the surviving subset is stable,
+/// and only along the per-instance axis: the fixed-name producer keys sort
+/// around the `ai_semantic_cache.*` block — `request_deduplication.replayed`
+/// sorts after all of it — so a plain sorted cut would drop the documented
+/// replay marker before an eleventh cache instance's status.
+#[tokio::test]
+async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+
+    // Two fixed-name keys: one sorting before the namespaced block, one after.
+    let fixed: &[(&str, &str)] = &[
+        ("ai_cache_status", "BYPASS"),
+        ("request_deduplication.replayed", "true"),
+    ];
+    for &(key, value) in fixed {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+    // 40 instances against a 32-entry cap with 2 fixed-name keys reserved
+    // leaves a 30-entry budget on the per-instance axis.
+    let mut expected_namespaced = std::collections::BTreeMap::new();
+    for instance_id in 0..40u64 {
+        let key = format!("ai_semantic_cache.{instance_id}.cache_status");
+        let value = if instance_id % 2 == 0 { "HIT" } else { "MISS" };
+        ctx.metadata.insert(key.clone(), value.to_string());
+        expected_namespaced.insert(key, value.to_string());
+    }
+    let boundary = expected_namespaced.keys().nth(30).cloned();
+    if let Some(boundary) = boundary {
+        expected_namespaced.retain(|key, _| *key < boundary);
+    }
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let cache = records[0]["cache"]
+        .as_object()
+        .expect("cache section is an object");
+    assert_eq!(cache.len(), 32);
+    assert_eq!(expected_namespaced.len(), 30);
+    for &(key, value) in fixed {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value),
+            "the per-instance cap displaced fixed-name producer key {key}"
+        );
+    }
+    for (key, value) in &expected_namespaced {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value.as_str()),
+            "sorted truncation dropped or rewrote {key}"
+        );
+    }
+    for key in cache.keys() {
+        assert!(
+            expected_namespaced.contains_key(key)
+                || fixed.iter().any(|&(fixed_key, _)| fixed_key == key),
+            "unsorted survivor {key} escaped the sorted cap"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

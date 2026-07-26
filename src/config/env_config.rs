@@ -1243,6 +1243,23 @@ pub struct EnvConfig {
     /// Path to PEM CA bundle for verifying DP client certificates (mTLS).
     /// When set, the CP requires and verifies client certificates from DPs.
     pub cp_grpc_tls_client_ca_path: Option<String>,
+    /// Maximum concurrent CP gRPC listener connections, counted from **before**
+    /// the TLS/mTLS handshake starts through the end of the served HTTP/2
+    /// session. A permit is acquired before any per-socket handshake task is
+    /// allocated, so an unauthenticated client cannot grow descriptor, memory,
+    /// or scheduler usage past this bound by opening sockets and withholding
+    /// the TLS ClientHello (advisory GHSA-2xqr-7j7p-77qp). Shared across the
+    /// plaintext listener and every TLS certificate-reload generation.
+    /// `FERRUM_CP_GRPC_MAX_CONNECTIONS`. Default 1024; `0` = unlimited (not
+    /// recommended on a reachable CP).
+    pub cp_grpc_max_connections: usize,
+    /// Maximum concurrent CP gRPC listener connections from one source IP, so a
+    /// single host cannot consume the whole `cp_grpc_max_connections` budget.
+    /// `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`. Default 64; `0` disables per-IP
+    /// limiting. Must not exceed `cp_grpc_max_connections` when both are set —
+    /// a larger per-IP cap can never fire and is refused at startup rather than
+    /// silently ignored.
+    pub cp_grpc_max_connections_per_ip: usize,
     /// Capacity of the tokio broadcast channel used to fan out config deltas
     /// to subscribed Data Planes. When a DP lags behind by more than this many
     /// updates, it receives a full config snapshot instead of the missed deltas.
@@ -2405,6 +2422,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
+            cp_grpc_max_connections: 1024,
+            cp_grpc_max_connections_per_ip: 64,
             cp_broadcast_channel_capacity: 128,
             cp_namespaces: Vec::new(),
             cp_require_namespace_claim: false,
@@ -2819,6 +2838,8 @@ impl EnvConfig {
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
+            cp_grpc_max_connections: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS" => 1024usize;
+            cp_grpc_max_connections_per_ip: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP" => 64usize;
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
@@ -3471,6 +3492,8 @@ impl EnvConfig {
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
+            cp_grpc_max_connections,
+            cp_grpc_max_connections_per_ip,
             cp_broadcast_channel_capacity,
             cp_namespaces,
             cp_require_namespace_claim,
@@ -5095,6 +5118,57 @@ impl EnvConfig {
         // operator made an explicit, auditable choice to permit it.
         self.validate_cp_dp_grpc_transport_security()?;
 
+        // Bounded pre-authentication admission on the CP gRPC listener.
+        self.validate_cp_grpc_connection_limits()?;
+
+        Ok(())
+    }
+
+    /// Validate the CP gRPC pre-authentication admission caps
+    /// (`FERRUM_CP_GRPC_MAX_CONNECTIONS` / `..._PER_IP`, advisory
+    /// GHSA-2xqr-7j7p-77qp). Scoped to CP mode — no other mode builds the
+    /// limiter, so a stray variable elsewhere must not fail startup.
+    ///
+    /// Two rules, both fail-closed rather than silently degrading:
+    ///
+    /// 1. Neither value may exceed the tokio semaphore ceiling. `ConnLimiter`
+    ///    clamps, and a silent clamp hides that the configured number is not
+    ///    the enforced number.
+    /// 2. A per-IP cap larger than the global cap can never fire, so one host
+    ///    could still consume the entire global budget. That is exactly the
+    ///    condition the per-IP cap exists to prevent, so it is a configuration
+    ///    error rather than a no-op.
+    pub fn validate_cp_grpc_connection_limits(&self) -> Result<(), String> {
+        if !matches!(self.mode, OperatingMode::ControlPlane) {
+            return Ok(());
+        }
+        let max_conn_limit = crate::util::conn_limit::MAX_CONN_LIMIT;
+        if self.cp_grpc_max_connections > max_conn_limit {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the cap entirely.",
+                self.cp_grpc_max_connections
+            ));
+        }
+        if self.cp_grpc_max_connections_per_ip > max_conn_limit {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the per-IP cap.",
+                self.cp_grpc_max_connections_per_ip
+            ));
+        }
+        if self.cp_grpc_max_connections > 0
+            && self.cp_grpc_max_connections_per_ip > self.cp_grpc_max_connections
+        {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP ({}) is greater than \
+                 FERRUM_CP_GRPC_MAX_CONNECTIONS ({}), so the per-IP cap can never be reached and \
+                 a single source IP could consume the entire CP gRPC connection budget. Lower the \
+                 per-IP cap, raise the global cap, or set the per-IP cap to 0 to disable it \
+                 deliberately.",
+                self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
+            ));
+        }
         Ok(())
     }
 
