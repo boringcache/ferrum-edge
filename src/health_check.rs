@@ -424,10 +424,10 @@ impl HealthChecker {
     /// `active_target_states`) is intentionally preserved across the restart
     /// so consecutive_successes/failures counters carry over and the next
     /// probe tick continues from current state — avoiding probe flapping
-    /// during reload. Removed targets are pruned by
-    /// [`Self::restart_with_shutdown`] before this runs; generation gating
-    /// inside each task additionally refuses stale mutations after the
-    /// generation advances.
+    /// during reload. Generation gating inside each task refuses stale dials
+    /// and stale health mutations as soon as the generation advances, which is
+    /// why [`Self::restart_with_shutdown`] prunes removed targets only after
+    /// this call returns.
     pub fn start_with_shutdown(
         &self,
         config: &GatewayConfig,
@@ -484,12 +484,8 @@ impl HealthChecker {
                             shutdown_rx: shutdown_rx.as_ref(),
                             generation,
                         };
-                        let handle = self.start_active_check(
-                            &start,
-                            active,
-                            &upstream_client,
-                            &tls_config,
-                        );
+                        let handle =
+                            self.start_active_check(start, active, &upstream_client, &tls_config);
                         new_aborts.push(handle.abort_handle());
                         new_handles.push(handle);
                     }
@@ -558,8 +554,23 @@ impl HealthChecker {
         new_config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Prune active-probe state for upstreams that are no longer in the
-        // config so the shared maps don't accumulate stale entries.
+        // Retire the previous generation and spawn the replacement FIRST.
+        // `start_with_shutdown` advances `task_generation` before aborting,
+        // so every prior probe task is fenced (and aborted) before the prune
+        // below runs. Pruning first would leave the whole spawn phase —
+        // which builds per-upstream TLS clients and can touch the
+        // filesystem — as a window in which a still-running old-generation
+        // probe could re-insert a target that was just removed.
+        self.start_with_shutdown(new_config, shutdown_rx);
+
+        // Prune active-probe state for upstreams / targets that are no longer
+        // in the config so the shared maps don't accumulate stale entries.
+        // The replacement generation only ever writes keys that are in
+        // `active_keys`, so running this after the spawn cannot drop live
+        // state. A fenced old-generation probe that already passed its
+        // generation check could still land one inert write after the prune;
+        // the entry belongs to a target that is no longer selectable and is
+        // cleared by the next reload or `remove_stale_targets` sweep.
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
@@ -569,8 +580,6 @@ impl HealthChecker {
             .retain(|key, _| active_keys.contains(key));
         self.active_target_states
             .retain(|key, _| active_keys.contains(key));
-
-        self.start_with_shutdown(new_config, shutdown_rx);
     }
 
     /// Get or create the per-proxy passive health state.
@@ -934,19 +943,21 @@ impl HealthChecker {
     /// Start an active health check background task for a target.
     fn start_active_check(
         &self,
-        start: &ActiveCheckStartParams<'_>,
+        start: ActiveCheckStartParams<'_>,
         config: &ActiveHealthCheck,
         upstream_client: &Arc<reqwest::Client>,
         tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
+        // Destructure by value: taking `start` by reference would bind
+        // `target` as `&&UpstreamTarget`, and `target.clone()` below would
+        // then clone the *reference* into the `'static` spawn (E0521).
         let ActiveCheckStartParams {
             target,
             upstream_id,
             shutdown_rx,
             generation,
         } = start;
-        let shutdown_rx = shutdown_rx.map(|rx| rx.clone());
-        let generation = *generation;
+        let shutdown_rx = shutdown_rx.cloned();
         let key = target_key(upstream_id, target);
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);

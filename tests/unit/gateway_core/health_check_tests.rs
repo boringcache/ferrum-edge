@@ -1074,6 +1074,26 @@ async fn wait_for_min_probes(count: &AtomicU64, min: u64, timeout: Duration) {
     }
 }
 
+/// Await every drained `JoinHandle` of a retired generation and assert the
+/// task actually ended.
+///
+/// Awaiting (rather than polling `is_finished()` a fixed number of times) keeps
+/// the assertion deterministic on a busy hosted runner. A retired task ends
+/// either because `HealthChecker` aborted it through its retained AbortHandle
+/// (`JoinError::is_cancelled`) or because it observed the generation fence and
+/// returned cleanly.
+async fn assert_generation_retired(taken: Vec<tokio::task::JoinHandle<()>>, context: &str) {
+    for handle in taken {
+        let join = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap_or_else(|_| panic!("{context}: retired task did not finish"));
+        assert!(
+            join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+            "{context}: retired task must end via abort cancel or fence exit: {join:?}"
+        );
+    }
+}
+
 fn make_upstream_with_active_probe_tls(
     id: &str,
     targets: Vec<UpstreamTarget>,
@@ -1152,17 +1172,7 @@ async fn test_take_then_restart_stops_probes_for_removed_target() {
     )]);
     checker.restart_with_shutdown(&after_remove, None);
 
-    // Allow abort to propagate to drained startup tasks.
-    for _ in 0..20 {
-        if taken.iter().all(|h| h.is_finished()) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        taken.iter().all(|h| h.is_finished()),
-        "restart must abort the drained startup generation"
-    );
+    assert_generation_retired(taken, "restart must abort the drained startup generation").await;
     assert_eq!(checker.active_task_count(), 1);
 
     let remove_baseline = count_remove.load(Ordering::SeqCst);
@@ -1210,13 +1220,11 @@ async fn test_take_then_restart_picks_up_interval_change() {
     )]);
     checker.restart_with_shutdown(&after_change, None);
 
-    for _ in 0..20 {
-        if taken.iter().all(|h| h.is_finished()) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(taken.iter().all(|h| h.is_finished()));
+    assert_generation_retired(
+        taken,
+        "interval change must retire the drained 1s generation",
+    )
+    .await;
 
     // Replacement generation fires one immediate interval tick, then sleeps
     // for 3600s. An orphaned 1s generation would add ~2 more probes here.
@@ -1254,16 +1262,11 @@ async fn test_take_then_restart_picks_up_tls_policy_change() {
     )]);
     checker.restart_with_shutdown(&after_tls, None);
 
-    for _ in 0..20 {
-        if taken.iter().all(|h| h.is_finished()) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        taken.iter().all(|h| h.is_finished()),
-        "TLS policy reload must abort the drained startup probe task"
-    );
+    assert_generation_retired(
+        taken,
+        "TLS policy reload must abort the drained startup probe task",
+    )
+    .await;
     assert_eq!(
         checker.active_task_count(),
         1,
@@ -1293,21 +1296,43 @@ async fn test_take_then_restart_stops_stale_passive_recovery() {
 
     checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
 
-    for _ in 0..20 {
-        if taken.iter().all(|h| h.is_finished()) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        taken.iter().all(|h| h.is_finished()),
-        "reload must retire the drained passive-recovery scanner"
-    );
+    assert_generation_retired(
+        taken,
+        "reload must retire the drained passive-recovery scanner",
+    )
+    .await;
     assert_eq!(
         checker.active_task_count(),
         0,
         "no pending auto-recover ejection and no passive policy must not spawn a scanner"
     );
+}
+
+#[tokio::test]
+async fn test_take_then_shutdown_signal_drains_taken_handles_cleanly() {
+    // Graceful shutdown path: modes await the drained JoinHandles while the
+    // watch channel — not abort — retires the tasks. Retaining AbortHandles
+    // must not detach or pre-abort them, so every join here has to come back
+    // clean (never `JoinError::Cancelled`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let checker = HealthChecker::new();
+    let config = config_with_upstreams(vec![
+        make_upstream_with_active_probe("up-sd", vec![make_target("sd-host", 9600)], 3600),
+        make_upstream_passive_only("up-sd-passive", vec![make_target("sd-host", 9601)], 30),
+    ]);
+    checker.start_with_shutdown(&config, Some(shutdown_rx));
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 2, "one active probe + one recovery scanner");
+
+    shutdown_tx.send(true).expect("shutdown receiver alive");
+
+    for handle in taken {
+        let join = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("shutdown signal must drain the taken handle");
+        join.expect("graceful shutdown must not abort a drained task");
+    }
 }
 
 // ─── Passive recovery scoping (#2388 / #2943) ─────────────────────────────────
