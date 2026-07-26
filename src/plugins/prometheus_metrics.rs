@@ -1988,6 +1988,16 @@ impl MetricsRegistry {
                 "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
                 compression_codec.worker_failures,
             ),
+            (
+                "ferrum_compression_response_buffer_admitted_total",
+                "Response-compression buffer admissions granted (bounds bodies collected for compression).",
+                compression_codec.response_buffer_admitted,
+            ),
+            (
+                "ferrum_compression_response_buffer_saturated_total",
+                "Response-compression buffer admission refusals; the response streams identity (or 406) instead.",
+                compression_codec.response_buffer_saturated,
+            ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
             output.push_str(&format!("# TYPE {name} counter\n"));
