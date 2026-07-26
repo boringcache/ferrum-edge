@@ -2558,6 +2558,37 @@ pub(crate) fn compose_early_upload_bound(
     }
 }
 
+/// Decision for a direct-H2 request whose backend response headers arrived
+/// before the client upload reached a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectH2UploadGate {
+    /// The upload finished cleanly, so the backend response may be forwarded.
+    Forward,
+    /// The configured request body limit was exceeded — deterministic 413,
+    /// never the backend's early response.
+    RequestBodyTooLarge,
+    /// The upload errored, was abandoned, or never reported an outcome. Fail
+    /// closed: an untrusted early backend response must not reach the client.
+    FailClosed,
+}
+
+/// Map a terminal request-body outcome onto the direct-H2 response gate.
+///
+/// `None` models a completion sender dropped without reporting. The adapter's
+/// `Drop` impl makes that unreachable in practice, but it must still fail
+/// closed rather than default to forwarding.
+pub(crate) fn classify_direct_h2_upload_outcome(
+    outcome: Option<body::RequestBodyOutcome>,
+) -> DirectH2UploadGate {
+    match outcome {
+        Some(body::RequestBodyOutcome::Completed) => DirectH2UploadGate::Forward,
+        Some(body::RequestBodyOutcome::Exceeded) => DirectH2UploadGate::RequestBodyTooLarge,
+        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) | None => {
+            DirectH2UploadGate::FailClosed
+        }
+    }
+}
+
 /// Later early-phase consumers must reuse one already-drained prebuffer rather
 /// than starting (and deducting) a second fresh whole-upload timeout.
 #[inline]
@@ -32127,25 +32158,71 @@ async fn proxy_to_backend_http2(
     // HTTP/2 is full duplex: a backend may return response headers before it
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
-    // A dropped adapter means the H2 sender abandoned the upload; never trust
-    // an early backend response in that case.
-    if let Some(body_completion_rx) = body_completion_rx
-        && body_completion_rx.await.is_err()
-    {
-        error!(proxy_id = %proxy.id, "HTTP/2 backend abandoned request upload after sending response headers");
-        return (
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ProtocolError),
-            },
-            None,
-        );
+    if let Some(body_completion_rx) = body_completion_rx {
+        // The header phase has already spent its own deadline, so the upload
+        // phase reuses the operator whole-upload stall guard composed with any
+        // client RPC deadline. Without it a backend that answers early and then
+        // stops reading the upload — or a client that stalls mid-body — would
+        // pin this request open indefinitely.
+        let upload_bound =
+            compose_early_upload_bound(grpc_deadline_at, proxy.backend_read_timeout_ms);
+        let outcome = match upload_bound {
+            Some((upload_deadline, bound_kind)) => {
+                match tokio::time::timeout_at(upload_deadline, body_completion_rx).await {
+                    Ok(received) => received.ok(),
+                    Err(_) => {
+                        if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                            return request_body_too_large();
+                        }
+                        return match bound_kind {
+                            EarlyUploadBoundKind::RpcDeadline => (
+                                client_grpc_deadline_exceeded_response_for_optional_request(
+                                    ctx,
+                                    headers,
+                                    resolved_ip,
+                                ),
+                                None,
+                            ),
+                            EarlyUploadBoundKind::OperatorTimeout => {
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    "HTTP/2: client upload did not finish within the whole-upload bound ({}ms) after backend response headers",
+                                    proxy.backend_read_timeout_ms
+                                );
+                                (request_body_timeout_backend_response(resolved_ip), None)
+                            }
+                        };
+                    }
+                }
+            }
+            // Both bounds are disabled by configuration; preserve the existing
+            // "0 = no timeout" contract shared with the buffered upload paths.
+            None => body_completion_rx.await.ok(),
+        };
+        match classify_direct_h2_upload_outcome(outcome) {
+            DirectH2UploadGate::Forward => {}
+            DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
+            DirectH2UploadGate::FailClosed => {
+                error!(
+                    proxy_id = %proxy.id,
+                    outcome = ?outcome,
+                    "HTTP/2 request upload did not complete; refusing to forward early backend response"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                    },
+                    None,
+                );
+            }
+        }
     }
     if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
         return request_body_too_large();

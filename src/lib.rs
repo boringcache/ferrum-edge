@@ -3647,6 +3647,37 @@ pub mod _test_support {
         crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
     }
 
+    /// Public mirror of the crate-private direct-H2 upload gate decision.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum DirectH2UploadGateForTest {
+        Forward,
+        RequestBodyTooLarge,
+        FailClosed,
+    }
+
+    /// Terminal outcome the size-limit adapter reports when it is dropped
+    /// without ever having been polled to a terminal state. Hyper's HTTP/2
+    /// client takes exactly that path for a known end-of-stream request body.
+    pub fn request_body_drop_outcome_for_test(
+        inner_is_end_stream: bool,
+    ) -> crate::proxy::body::RequestBodyOutcome {
+        crate::proxy::body::request_body_drop_outcome(inner_is_end_stream)
+    }
+
+    /// Gate a direct-H2 backend response on the terminal upload outcome.
+    /// `None` models a completion sender dropped without reporting.
+    pub fn direct_h2_upload_gate_for_test(
+        outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+    ) -> DirectH2UploadGateForTest {
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome) {
+            crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
+            crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
+                DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
+        }
+    }
+
     pub fn effective_request_body_limit_for_protocol_for_test(
         is_grpc_request: bool,
         http_limit: usize,
