@@ -5036,13 +5036,11 @@ async fn empty_tool_call_array_never_forces_the_raw_frame_fallback() {
     );
     assert_eq!(parsed["tool_calls"]["0"][0]["id"], "call_y", "{excerpt}");
     assert_eq!(
-        parsed["tool_calls"]["0"][0]["function"]["name"],
-        "notify",
+        parsed["tool_calls"]["0"][0]["function"]["name"], "notify",
         "{excerpt}"
     );
     assert_eq!(
-        parsed["tool_calls"]["0"][0]["function"]["arguments"],
-        "{}",
+        parsed["tool_calls"]["0"][0]["function"]["arguments"], "{}",
         "{excerpt}"
     );
 }
@@ -5549,7 +5547,11 @@ async fn malformed_tool_call_index_is_unidentified_not_a_capture_downgrade() {
     assert!(!excerpt.contains("BBB"), "{excerpt}");
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
     let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
-    assert_eq!(calls.len(), 2, "malformed indices must not share a bucket: {excerpt}");
+    assert_eq!(
+        calls.len(),
+        2,
+        "malformed indices must not share a bucket: {excerpt}"
+    );
     for (occurrence, call) in calls.iter().enumerate() {
         assert_eq!(call["index_unattributed"], true, "{excerpt}");
         assert_eq!(call["occurrence"], occurrence as u64, "{excerpt}");
