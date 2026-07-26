@@ -1253,6 +1253,189 @@ fn every_documented_operation_matches_an_admin_dispatch_route() {
     );
 }
 
+/// Admin operations that can return `408 Request Timeout` when
+/// `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` expires.
+///
+/// Shared-gate members mirror `body_consuming_route_role` in
+/// `src/admin/mod.rs`. `POST`/`PUT /api-specs` collect through their own
+/// handlers with the same deadline and must stay in this set even though they
+/// are not admitted by that table. Action routes that never buffer a body
+/// (for example `POST /admin/tls/rotate/{surface}`) must not appear here.
+fn admin_body_timeout_408_inventory() -> BTreeSet<(String, String)> {
+    const OPS: &[(&str, &str)] = &[
+        ("POST", "/proxies"),
+        ("PUT", "/proxies/{id}"),
+        ("POST", "/consumers"),
+        ("PUT", "/consumers/{id}"),
+        ("POST", "/consumers/{consumer_id}/credentials/{cred_type}"),
+        ("PUT", "/consumers/{consumer_id}/credentials/{cred_type}"),
+        ("POST", "/plugins/config"),
+        ("PUT", "/plugins/config/{id}"),
+        ("POST", "/upstreams"),
+        ("PUT", "/upstreams/{id}"),
+        ("POST", "/batch"),
+        ("POST", "/restore"),
+        ("POST", "/mesh/egress-scope/test"),
+        ("POST", "/admin/tls/acme/certificates"),
+        ("PUT", "/admin/tls/acme/certificates/{id}"),
+        ("POST", "/admin/tls/acme/renew/{id}"),
+        ("POST", "/admin/tls/acme/orders"),
+        ("POST", "/admin/tls/acme/orders/{id}/finalize"),
+        ("POST", "/admin/tls/certificates"),
+        ("PUT", "/admin/tls/certificates/{id}"),
+        ("POST", "/admin/tls/ca-bundles"),
+        ("PUT", "/admin/tls/ca-bundles/{id}"),
+        ("POST", "/admin/tls/crls"),
+        ("PUT", "/admin/tls/crls/{id}"),
+        ("POST", "/admin/tls/ocsp-responses"),
+        ("PUT", "/admin/tls/ocsp-responses/{id}"),
+        ("POST", "/admin/tls/jwks"),
+        ("PUT", "/admin/tls/jwks/{id}"),
+        ("POST", "/admin/tls/validate"),
+        ("POST", "/api-specs"),
+        ("PUT", "/api-specs/{id}"),
+    ];
+    OPS.iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect()
+}
+
+fn openapi_request_timeout_operations(spec: &serde_json::Value) -> BTreeSet<(String, String)> {
+    let paths = spec["paths"]
+        .as_object()
+        .expect("OpenAPI paths is an object");
+    let mut operations = BTreeSet::new();
+
+    for (path, path_item) in paths {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let Some(response) = operation["responses"].get("408") else {
+                continue;
+            };
+            assert_eq!(
+                response.get("$ref").and_then(|value| value.as_str()),
+                Some("#/components/responses/RequestTimeout"),
+                "{method} {path} documents 408 without #/components/responses/RequestTimeout"
+            );
+            operations.insert((method.to_ascii_uppercase(), path.clone()));
+        }
+    }
+
+    operations
+}
+
+/// Parse `body_consuming_route_role` match arms into normalized `(METHOD, path)`
+/// pairs (`{param}` → `{}`) so the pin cannot drift from the runtime gate.
+fn shared_body_gate_operations_from_source() -> BTreeSet<(String, String)> {
+    let source = include_str!("../../src/admin/mod.rs");
+    let start = source
+        .find("fn body_consuming_route_role")
+        .expect("body_consuming_route_role must exist");
+    let after = &source[start..];
+    let end = after
+        .find("\nfn tls_route_required_role")
+        .expect("tls_route_required_role must follow body_consuming_route_role");
+    let gate = &after[..end];
+
+    let arm = Regex::new(
+        r#"(?x)
+        (?:^|\n)\s*
+        ((?:\[[^\]]+\])(?:\s*\|\s*\[[^\]]+\])*)
+        (?:\s+if\s+(is_post|is_put))?
+        \s*=>
+        "#,
+    )
+    .expect("body-gate arm regex compiles");
+
+    let mut operations = BTreeSet::new();
+    for captures in arm.captures_iter(gate) {
+        let patterns = captures[1].to_string();
+        let methods: &[&str] = match captures.get(2).map(|value| value.as_str()) {
+            Some("is_post") => &["POST"],
+            Some("is_put") => &["PUT"],
+            None => &["POST", "PUT"],
+            Some(other) => panic!("unsupported body-gate method guard `{other}`"),
+        };
+
+        for pattern in patterns.split('|').map(str::trim) {
+            let inner = pattern
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or_else(|| panic!("body-gate pattern must be a slice: {pattern}"));
+            let mut segments = Vec::new();
+            for part in inner.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if part == "_" {
+                    segments.push("{}");
+                    continue;
+                }
+                let literal = part
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("unsupported body-gate segment `{part}`"));
+                segments.push(literal);
+            }
+            let path = format!("/{}", segments.join("/"));
+            for method in methods {
+                operations.insert(((*method).to_string(), path.clone()));
+            }
+        }
+    }
+
+    assert!(
+        !operations.is_empty(),
+        "body_consuming_route_role parser found no body-consuming arms"
+    );
+    operations
+}
+
+fn normalized_operation_set(operations: &BTreeSet<(String, String)>) -> BTreeSet<(String, String)> {
+    operations
+        .iter()
+        .map(|(method, path)| (method.clone(), normalized_path_template(path)))
+        .collect()
+}
+
+#[test]
+fn admin_body_timeout_routes_document_request_timeout_in_openapi() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let pinned = admin_body_timeout_408_inventory();
+    let documented = openapi_request_timeout_operations(&spec);
+    assert_eq!(
+        documented, pinned,
+        "OpenAPI RequestTimeout (408) inventory drifted from the admin body-timeout route pin"
+    );
+
+    let mut expected_from_runtime = shared_body_gate_operations_from_source();
+    // `/api-specs` uses the shared deadline via its own collectors, not the
+    // shared `body_bytes` gate.
+    expected_from_runtime.insert(("POST".to_string(), "/api-specs".to_string()));
+    expected_from_runtime.insert(("PUT".to_string(), "/api-specs/{}".to_string()));
+
+    assert_eq!(
+        normalized_operation_set(&documented),
+        expected_from_runtime,
+        "runtime body-consuming inventory (shared gate + api-specs) drifted from OpenAPI 408 docs"
+    );
+
+    let api_specs_source = include_str!("../../src/admin/api_specs/handlers.rs");
+    assert!(
+        api_specs_source.contains("ApiSpecError::BodyTimeout")
+            && api_specs_source.contains("collect_body_with_limits"),
+        "api-specs must keep the shared body-read deadline that OpenAPI documents as 408"
+    );
+}
+
 fn collect_openapi_inventory(
     value: &serde_json::Value,
     refs: &mut BTreeSet<String>,

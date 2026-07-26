@@ -460,9 +460,16 @@ fn test_parse_scheme_rejects_unknown_or_removed_aliases() {
     for value in [
         "ftp", "", "nonsense", "ws", "wss", "grpc", "grpcs", "h3", "tcp_tls",
     ] {
-        assert!(
-            parse_scheme(value).is_err(),
+        let err = parse_scheme(value).expect_err(&format!(
             "{value:?} should not be accepted as backend_scheme"
+        ));
+        assert!(
+            !err.contains(value) || value.is_empty(),
+            "scheme rejection must not embed the raw column body: {err}"
+        );
+        assert!(
+            err.contains("unsupported backend_scheme"),
+            "scheme rejection must stay actionable: {err}"
         );
     }
 }
@@ -1424,10 +1431,22 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
             .to_string()
             .contains("failed to parse credentials JSON")
     );
+    // Excluding the undecodable row itself must not fail — PUT overwrite
+    // repair with mTLS credentials needs to skip its own corrupt body
+    // (issue #2997).
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "other.example.com", Some("legacy"))
+            .await
+            .expect("excluded undecodable consumer must not block self uniqueness"),
+        "excluded undecodable consumer is not a conflict"
+    );
 }
 
 #[tokio::test]
 async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
+    use ferrum_edge::_test_support::is_row_decode_rejection;
+
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("mtls_dns_policy_fast_path.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
@@ -1469,11 +1488,18 @@ async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
         })
         .await
         .expect_err("enabling san_dns must take the full Consumer validation path");
+    let message = error.to_string();
     assert!(
-        error
-            .to_string()
-            .contains("failed to parse credentials JSON"),
-        "unexpected full-path error: {error:#}"
+        message.contains("failed to parse credentials JSON"),
+        "full-path admission must surface the credentials parse failure: {error:#}"
+    );
+    assert!(
+        message.contains("malformed"),
+        "full-path admission must identify the undecodable consumer id: {error:#}"
+    );
+    assert!(
+        !is_row_decode_rejection(&error),
+        "admin-write admission must not retain the poll-loop RowDecodeRejection marker: {error:#}"
     );
 }
 
@@ -1765,6 +1791,32 @@ fn initial_config_load_validation_error_is_non_transient() {
     assert!(
         DatabaseStore::is_non_transient_init_error(&classified),
         "a non-transient config-load error must be marked so backup bootstrap is refused: {classified}"
+    );
+}
+
+#[test]
+fn initial_config_load_row_decode_rejection_is_non_transient() {
+    // Issue #2997: poll loops treat RowDecodeRejection like a validation
+    // rejection (keep admin writable), but startup must stay fail-loud — a
+    // decode failure must still refuse FERRUM_DB_CONFIG_BACKUP_PATH bootstrap.
+    use ferrum_edge::_test_support::{
+        is_poll_validation_rejection, is_row_decode_rejection, row_decode_rejection_error,
+    };
+
+    let raw = row_decode_rejection_error(
+        "consumer",
+        Some("c-bad"),
+        "Consumer c-bad: failed to parse credentials JSON: EOF",
+    );
+    assert!(is_row_decode_rejection(&raw));
+    assert!(
+        is_poll_validation_rejection(&raw),
+        "row-decode must classify for the poll loop"
+    );
+    let classified = DatabaseStore::classify_initial_config_load_error(raw);
+    assert!(
+        DatabaseStore::is_non_transient_init_error(&classified),
+        "startup must keep row-decode fail-loud / non-transient: {classified}"
     );
 }
 
@@ -2197,18 +2249,18 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     let source = include_str!("../../../src/config/db_loader.rs");
 
     let row_to_proxy = source
-        .split("fn row_to_proxy(")
+        .split("fn row_to_proxy_inner(")
         .nth(1)
         .and_then(|rest| rest.split("fn row_to_consumer(").next())
-        .expect("row_to_proxy body");
+        .expect("row_to_proxy_inner body");
     let row_to_upstream = source
-        .split("fn row_to_upstream(")
+        .split("fn row_to_upstream_inner(")
         .nth(1)
         .and_then(|rest| {
             rest.split("fn strip_api_spec_id_from_runtime_config(")
                 .next()
         })
-        .expect("row_to_upstream body");
+        .expect("row_to_upstream_inner body");
 
     // Already-hardened contrast cases that established this contract.
     assert!(
