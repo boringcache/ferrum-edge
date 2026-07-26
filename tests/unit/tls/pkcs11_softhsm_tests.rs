@@ -14,11 +14,18 @@
 //! | `FERRUM_PKCS11_TEST_MISMATCHED_KEY_SOURCE` | `pkcs11://` URI selecting a different token key |
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use ferrum_edge::config::types::Proxy;
 use ferrum_edge::tls::TlsPolicy;
 use ferrum_edge::tls::backend::BackendTlsConfigBuilder;
+use ferrum_edge::tls::source::subscription::WatchedMaterialSource;
 use ferrum_edge::tls::source::{CertSource, MaterialKind};
+use ferrum_edge::tls::{
+    FrontendTlsRebuildFn, FrontendTlsReloadConfig, frontend_tls_slot_with,
+    spawn_frontend_tls_reload_task,
+};
 
 fn env_var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("set {name} to run the hosted PKCS#11 tests"))
@@ -142,29 +149,96 @@ fn backend_mtls_rejects_a_token_key_that_does_not_match_the_certificate() {
     assert_rejected_without_disclosure(&error);
 }
 
-/// A failed rebuild must leave the caller holding the previous identity. The
-/// reload loop keeps the last-good `ServerConfig` when the rebuild closure
-/// errors, so the contract this test pins is that the rebuild *does* error and
-/// that a subsequent good rebuild still succeeds — a mismatch never leaves the
-/// signer in a state that poisons later loads.
-#[test]
+/// A failed frontend live reload must keep the last-good PKCS#11 identity in
+/// the published slot. This drives the real `spawn_frontend_tls_reload_task`
+/// path: a watched cert-file change triggers rebuild, the rebuild closure
+/// attempts a mismatched PKCS#11 pairing, and the slot must retain the
+/// original matching `ServerConfig`.
+#[tokio::test]
 #[ignore = "requires a configured SoftHSM token; see the PKCS#11 SoftHSM CI job"]
-fn a_rejected_reload_leaves_the_matching_identity_loadable() {
+async fn a_rejected_reload_leaves_the_matching_identity_loadable() {
+    use rustls::crypto::ring::default_provider;
+    use tokio::sync::watch;
+
+    let _ = default_provider().install_default();
+
     let published = load_server_config(&matching_key_source()).expect("initial good config");
-    let retained = published.clone();
+    let slot = frontend_tls_slot_with(published.clone());
+    let (revision_tx, revision_rx) = watch::channel(0u64);
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let error = load_server_config(&mismatched_key_source())
-        .expect_err("rotating onto a mismatched key must fail the rebuild");
-    assert_rejected_without_disclosure(&format!("{error:#}"));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert_trigger = dir.path().join("cert.pem");
+    let cert_bytes = std::fs::read(certificate_path()).expect("read test certificate");
+    std::fs::write(&cert_trigger, &cert_bytes).expect("write trigger cert");
 
-    // The rebuild returned an error rather than a config, so what the reload
-    // loop is holding is still the original `Arc` — not a partially built or
-    // unusable replacement.
-    assert!(
-        Arc::ptr_eq(&published, &retained),
-        "a failed rebuild must not replace the published server config"
+    let rebuild_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_rebuild = rebuild_attempts.clone();
+    let mismatched_key = mismatched_key_source();
+    let rebuild: FrontendTlsRebuildFn = Box::new(move || {
+        attempts_for_rebuild.fetch_add(1, Ordering::SeqCst);
+        let error = load_server_config(&mismatched_key)
+            .expect_err("rotating onto a mismatched key must fail the rebuild");
+        assert_rejected_without_disclosure(&format!("{error:#}"));
+        Err(error)
+    });
+
+    let task = spawn_frontend_tls_reload_task(
+        FrontendTlsReloadConfig {
+            // Unique surface: the force-reload registry is process-global.
+            surface: "test_pkcs11_rejected_frontend_reload",
+            sources: vec![
+                WatchedMaterialSource::new(
+                    "cert",
+                    CertSource::parse(
+                        cert_trigger.to_string_lossy().into_owned(),
+                        MaterialKind::Cert,
+                    ),
+                    MaterialKind::Cert,
+                ),
+                WatchedMaterialSource::new(
+                    "key",
+                    CertSource::parse(matching_key_source(), MaterialKind::Key),
+                    MaterialKind::Key,
+                ),
+            ],
+            slot: slot.clone(),
+            interval: Duration::from_millis(50),
+            revision_tx,
+            rebuild,
+        },
+        Some(shutdown_rx),
     );
-    load_server_config(&matching_key_source()).expect("previous identity still loads");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    std::thread::sleep(Duration::from_millis(10));
+    let mut rotated = cert_bytes;
+    rotated.push(b'\n');
+    std::fs::write(&cert_trigger, &rotated).expect("mutate trigger cert");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while rebuild_attempts.load(Ordering::SeqCst) == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for frontend TLS reload rebuild attempt");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        *revision_rx.borrow(),
+        0,
+        "failed reload must not advance the revision counter"
+    );
+    let retained = slot.load_full().as_ref().clone().expect("slot intact");
+    assert!(
+        Arc::ptr_eq(&retained, &published),
+        "failed reload must keep the original matching server config in the slot"
+    );
+    load_server_config(&matching_key_source()).expect("matching identity still loadable");
+
+    task.abort();
 }
 
 /// The token key must expose an SPKI that rustls can compare, or prove the
