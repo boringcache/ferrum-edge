@@ -90,6 +90,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
     /// Exercise DP's crate-private concurrent listener supervisor without
@@ -209,6 +210,42 @@ pub mod _test_support {
         (udp_metadata, dtls_metadata)
     }
 
+    /// Signal a UDP reply task to stop using the production flag+`notify_one`
+    /// contract (permit-storing wake).
+    pub fn signal_udp_reply_task_stop_for_test(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+    ) {
+        crate::proxy::udp_proxy::signal_udp_reply_task_stop(stop_flag, stop_notify);
+    }
+
+    /// Race `recv` against the UDP reply-task stop signal with the production
+    /// register-then-check ordering. `cancel` is an additional select arm
+    /// (production passes listener/global shutdown; tests pass `pending()`).
+    pub async fn udp_reply_recv_until_stop_for_test<F, C, T>(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+        recv: F,
+        cancel: C,
+    ) -> Option<T>
+    where
+        F: std::future::Future<Output = T>,
+        C: std::future::Future<Output = ()>,
+    {
+        crate::proxy::udp_proxy::udp_reply_recv_until_stop(stop_flag, stop_notify, recv, cancel)
+            .await
+    }
+
+    /// Resolve a live UDP `last_client` cache hit, clearing the entry when the
+    /// cached session is expired (same seam the recv loop uses).
+    pub fn take_udp_last_client_if_live_for_test<T>(
+        last_client: &mut Option<(std::net::SocketAddr, std::sync::Arc<T>)>,
+        client_addr: std::net::SocketAddr,
+        is_expired: impl FnOnce(&T) -> bool,
+    ) -> Option<std::sync::Arc<T>> {
+        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
+    }
+
     pub fn plugin_cache_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,
@@ -216,6 +253,20 @@ pub mod _test_support {
         let http_client = crate::plugins::PluginHttpClient::default()
             .with_real_ip_header(real_ip_header.map(str::to_string));
         crate::PluginCache::with_http_client(config, http_client)
+    }
+
+    /// Prepend a plugin onto one proxy's resolved list for external tests.
+    ///
+    /// Used to inject a gated `on_stream_connect` admission seam into a live
+    /// DTLS frontend listener without widening the production plugin catalog.
+    /// Build the request epoch after calling this so the published snapshot
+    /// includes the injected plugin.
+    pub fn prepend_proxy_plugin_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        plugin: Arc<dyn Plugin>,
+    ) -> Result<(), String> {
+        cache.prepend_proxy_plugin_for_test(proxy_id, plugin)
     }
 
     /// Deterministic allocator helper for proxy lifecycle ownership generations.
@@ -1165,6 +1216,23 @@ pub mod _test_support {
         close: Option<CloseFrame>,
     ) -> Option<CloseFrame> {
         crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
+    }
+
+    /// Bounded global capacity-overflow Close (RFC 6455 1009).
+    pub fn ws_global_capacity_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_global_capacity_close_frame()
+    }
+
+    /// Defined idle-timeout policy Close (RFC 6455 1001).
+    pub fn ws_idle_timeout_policy_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_idle_timeout_policy_close_frame()
+    }
+
+    /// Global capacity-overflow Close selection used when no plugin rule binds.
+    pub fn global_ws_capacity_close_for_error_for_test(
+        error: &WsError,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
     }
 
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
@@ -3647,30 +3715,62 @@ pub mod _test_support {
         }
     }
 
-    pub type NodeAgentStartupCleanupProbe = crate::modes::node_agent::NodeAgentStartupCleanupProbe;
+    // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
+    pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
 
     /// Post-`load_programs` initialization failure must roll back BPF state.
     pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
     {
-        crate::modes::node_agent::probe_post_load_init_failure_cleanup_for_test()
+        node_agent_cleanup_seams::probe_post_load_init_failure_cleanup_for_test()
     }
 
     /// Kubernetes-client-style late failure after successful eBPF init.
     pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
     -> NodeAgentStartupCleanupProbe {
-        crate::modes::node_agent::probe_k8s_client_style_late_failure_cleanup_for_test()
+        node_agent_cleanup_seams::probe_k8s_client_style_late_failure_cleanup_for_test()
     }
 
     /// Normal shutdown must invoke `cleanup_all` exactly once.
     pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe
     {
-        crate::modes::node_agent::probe_normal_shutdown_cleanup_once_for_test()
+        node_agent_cleanup_seams::probe_normal_shutdown_cleanup_once_for_test()
     }
 
     /// Cleanup failure must preserve the original startup/runtime error.
     pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
     -> NodeAgentStartupCleanupProbe {
-        crate::modes::node_agent::probe_cleanup_failure_preserves_original_error_for_test()
+        node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
+    }
+
+    // ── load_balancer first-wave counter seams ───────────────────────────────
+    /// Snapshot parent selection-counter shard phases without widening the
+    /// production `LoadBalancer` API for external unit tests.
+    pub fn selection_counter_phases_for_test(lb: &crate::load_balancer::LoadBalancer) -> [u64; 16] {
+        lb.selection_counter_phases_for_test()
+    }
+
+    /// One RoundRobin pick driven by an explicit counter shard.
+    pub fn select_round_robin_from_shard_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        shard: usize,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        lb.select_round_robin_from_shard_for_test(shard)
+    }
+
+    /// One Random pick driven by an explicit counter shard.
+    pub fn select_random_from_shard_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        shard: usize,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        lb.select_random_from_shard_for_test(shard)
+    }
+
+    /// First-wave locality-distribute bucket moduli across shards for `total`.
+    pub fn distribute_first_wave_bucket_mods_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        total: u64,
+    ) -> Option<Vec<u64>> {
+        lb.distribute_first_wave_bucket_mods_for_test(total)
     }
 
     /// Drive CP listener supervision the same way `control_plane::run` does,

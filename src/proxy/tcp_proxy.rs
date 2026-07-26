@@ -3737,7 +3737,14 @@ mod backend_target_selection_tests {
             unhealthy_threshold: 1,
             ..Default::default()
         };
-        health_checker.report_response(&proxy.id, &unhealthy_target, 500, false, Some(&passive));
+        health_checker.report_response(
+            &proxy.id,
+            "tcp-upstream",
+            &unhealthy_target,
+            500,
+            false,
+            Some(&passive),
+        );
 
         let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")

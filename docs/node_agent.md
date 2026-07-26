@@ -26,7 +26,14 @@ The eBPF connect programs read `FERRUM_CAPTURE_CONFIG` before rewriting to loopb
 
 ### Startup rollback of pinned eBPF state
 
-`load_programs` pins original-destination maps under `/sys/fs/bpf/ferrum`. Those pins outlive a dropped userspace object, so a failed startup must not rely on `Drop` alone. After a successful load, node-agent initialization is transactional: any later failure inside map/config/SOCK_OPS setup rolls back with `cleanup_all` before returning. Once initialization succeeds, `run_with_backend` owns cleanup exactly once for every remaining exit — Kubernetes client construction failure, ordinary watcher-loop shutdown, and Drop on unwind — so stale Ferrum pins are not left for a mesh proxy to open while no healthy node-agent is managing them. Cleanup failures are warned with the original startup/runtime error preserved as the returned cause.
+`load_programs` pins original-destination maps under `/sys/fs/bpf/ferrum`. Those pins outlive a dropped userspace object, so a failed startup must not rely on the backend's `Drop` alone.
+
+Cleanup ownership is handed off between exactly two owners, so `cleanup_all` runs exactly once on every path after a successful load:
+
+1. **During initialization** — from the moment `load_programs` succeeds until `initialize_backend` returns `Ok`, a rollback guard owns the pins. Any later failure inside map/config/SOCK_OPS/readiness setup, and any unwind out of those steps, calls `cleanup_all` before returning.
+2. **After initialization** — `run_with_backend` takes ownership and cleans up exactly once for every remaining exit: Kubernetes client construction failure, ordinary watcher-loop shutdown (including a watcher stream error), and `Drop` on unwind.
+
+Both owners latch on the first cleanup, so the handoff can never double-clean, and both do their cleanup synchronously — there is no async teardown in `Drop` and no background cleanup task. Cleanup failures are surfaced as structured warnings; the original startup/runtime error is always the returned cause.
 
 ## Pod Lifecycle Events
 

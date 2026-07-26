@@ -5590,12 +5590,17 @@ fn initialize_backend(
     // Programs (and any bpffs pins created during load) are live. Every
     // subsequent failure must roll back via `cleanup_all` before returning so
     // a crashed/retried startup cannot leave stale Ferrum maps under
-    // `/sys/fs/bpf/ferrum`. `run_with_backend` takes ownership only after this
-    // function returns Ok.
-    match initialize_backend_after_load(backend, config, metrics) {
-        Ok(()) => Ok(()),
+    // `/sys/fs/bpf/ferrum`. The guard also covers an unwind out of the init
+    // steps. `run_with_backend` takes ownership only after this function
+    // returns Ok, so exactly one of the two owners ever cleans up.
+    let mut rollback = LoadedBackendRollback::new(backend);
+    match initialize_backend_after_load(rollback.backend_mut(), config, metrics) {
+        Ok(()) => {
+            rollback.commit();
+            Ok(())
+        }
         Err(err) => {
-            rollback_loaded_backend(backend, &err);
+            rollback.roll_back(&err);
             Err(err)
         }
     }
@@ -5743,17 +5748,66 @@ fn initialize_backend_after_load(
     Ok(())
 }
 
-/// Roll back BPF programs/maps/pins after `load_programs` succeeded but a later
-/// initialization step failed. Cleanup errors are warned with the original
-/// cause and never replace it.
-fn rollback_loaded_backend(backend: &mut dyn EbpfBackend, original: &anyhow::Error) {
-    if let Err(cleanup_err) = backend.cleanup_all() {
-        warn!(
-            error = %cleanup_err,
-            original_error = %original,
-            "Failed to roll back BPF state after node-agent initialization failure; \
-             original error preserved"
-        );
+/// Rollback owner for the window between a successful `load_programs` and a
+/// successful `initialize_backend`. In that window the bpffs pins are live but
+/// nothing owns them yet, so any exit — error return **or unwind** — must
+/// `cleanup_all` exactly once. `commit` hands the window off to
+/// [`InitializedBackendOwner`] instead.
+struct LoadedBackendRollback<'a> {
+    backend: &'a mut dyn EbpfBackend,
+    /// Cleared by the first of `commit`/`roll_back`/`Drop`, so cleanup is
+    /// exactly-once no matter which one wins.
+    armed: bool,
+}
+
+impl<'a> LoadedBackendRollback<'a> {
+    fn new(backend: &'a mut dyn EbpfBackend) -> Self {
+        Self {
+            backend,
+            armed: true,
+        }
+    }
+
+    fn backend_mut(&mut self) -> &mut dyn EbpfBackend {
+        &mut *self.backend
+    }
+
+    /// Initialization succeeded: disarm without cleanup so the caller's
+    /// `InitializedBackendOwner` becomes the single cleanup owner.
+    fn commit(mut self) {
+        self.armed = false;
+    }
+
+    /// Roll back now. Cleanup errors are warned alongside the original cause
+    /// and never replace it.
+    fn roll_back(mut self, original: &anyhow::Error) {
+        self.armed = false;
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                original_error = %original,
+                "Failed to roll back BPF state after node-agent initialization failure; \
+                 original error preserved"
+            );
+        }
+    }
+}
+
+impl Drop for LoadedBackendRollback<'_> {
+    fn drop(&mut self) {
+        // Only reached on an unwind out of the init steps; the error and
+        // success paths disarm first. `cleanup_all` is synchronous, so this is
+        // safe to run in Drop.
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                "Failed to roll back BPF state while unwinding out of node-agent initialization"
+            );
+        }
     }
 }
 
@@ -5764,29 +5818,43 @@ fn rollback_loaded_backend(backend: &mut dyn EbpfBackend, original: &anyhow::Err
 /// type. `initialize_backend` owns rollback for pre-success failures so the
 /// two paths never double-clean.
 struct InitializedBackendOwner {
-    backend: Option<Box<dyn EbpfBackend>>,
+    backend: Box<dyn EbpfBackend>,
+    /// Latched by the first cleanup so every later path (including `Drop`) is a
+    /// no-op. This is the whole exactly-once mechanism; there is no second
+    /// cleanup owner after `initialize_backend` returns `Ok`.
     cleaned_up: bool,
 }
 
 impl InitializedBackendOwner {
     fn new(backend: Box<dyn EbpfBackend>) -> Self {
         Self {
-            backend: Some(backend),
+            backend,
             cleaned_up: false,
         }
     }
 
     fn backend_mut(&mut self) -> &mut dyn EbpfBackend {
-        // Invariant: production never takes the backend; only
-        // `into_backend_for_test` disarms Drop and takes it after cleanup.
-        self.backend
-            .as_mut()
-            .map(|backend| backend.as_mut())
-            .expect("invariant: InitializedBackendOwner.backend is present until Drop or test take")
+        self.backend.as_mut()
     }
 
     /// Detach enrolled pods and invoke `cleanup_all` exactly once (normal
     /// shutdown path).
+    ///
+    /// Deliberately does NOT write the `.udp-not-ready` ack. By this point
+    /// `cleanup_all()` has detached the tc classifier and torn down the pod-IP
+    /// registry, so the host-veth gate that normally drops pod-originated UDP is
+    /// *gone*, not closed. If a mesh proxy keeps running across a node-agent
+    /// DaemonSet restart, publishing the ack would tell its still-live per-netns
+    /// producer that the host gate is closed (`retain_guard = false`) and let it
+    /// tear its in-netns DROP guard down into plaintext — enrolled pods would
+    /// then egress UDP uncaptured/unauthorized until the new node-agent
+    /// re-enrolls and reopens the producer. Fail closed instead: withholding the
+    /// ack makes `await_udp_not_ready_ack` time out on the producer side, so it
+    /// retains the in-netns guard (self-healing — reaped on the producer's next
+    /// open). A fresh ack is only ever published by
+    /// `reconcile_udp_capture_readiness` once the BPF gate is verifiably
+    /// re-closed, which a restarted node-agent re-derives from live state rather
+    /// than trusting a persisted marker.
     fn shutdown_pods(
         &mut self,
         pod_states: &DashMap<String, PodAttachmentState>,
@@ -5809,10 +5877,7 @@ impl InitializedBackendOwner {
             return;
         }
         self.cleaned_up = true;
-        let Some(backend) = self.backend.as_mut() else {
-            return;
-        };
-        if let Err(cleanup_err) = backend.cleanup_all() {
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
             warn!(
                 error = %cleanup_err,
                 context,
@@ -5826,10 +5891,7 @@ impl InitializedBackendOwner {
             return;
         }
         self.cleaned_up = true;
-        let Some(backend) = self.backend.as_mut() else {
-            return;
-        };
-        if let Err(cleanup_err) = backend.cleanup_all() {
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
             warn!(
                 error = %cleanup_err,
                 original_error = %original,
@@ -5837,22 +5899,6 @@ impl InitializedBackendOwner {
                 "Failed to cleanup BPF state after error; original error preserved"
             );
         }
-    }
-
-    /// Test-only: disarm Drop and take the backend for mock inspection.
-    fn into_backend_for_test(mut self) -> (Box<dyn EbpfBackend>, bool) {
-        let cleaned_up = self.cleaned_up;
-        self.cleaned_up = true;
-        let backend = self.backend.take().expect(
-            "invariant: InitializedBackendOwner.backend is present until Drop or test take",
-        );
-        (backend, cleaned_up)
-    }
-
-    fn fail_with_for_test(mut self, err: anyhow::Error) -> (anyhow::Error, Box<dyn EbpfBackend>) {
-        self.cleanup_once_preserving(&err, "startup/runtime error");
-        let (backend, _) = self.into_backend_for_test();
-        (err, backend)
     }
 }
 
@@ -5886,6 +5932,15 @@ fn detach_enrolled_pods(
     }
 }
 
+/// Inline-test harness for the shutdown sequence over a *borrowed* backend, so
+/// the existing tests can keep asserting on their own `MockEbpfBackend` after
+/// teardown (the production owner takes the backend by value).
+///
+/// This mirrors [`InitializedBackendOwner::shutdown_pods`] step for step and
+/// calls the same production helpers; the exactly-once ownership and ordering of
+/// the real path are covered separately by
+/// [`startup_cleanup_test_seams::probe_normal_shutdown_cleanup_once_for_test`],
+/// which drives `shutdown_pods` itself.
 #[cfg(test)]
 fn cleanup_all_pods(
     backend: &mut dyn EbpfBackend,
@@ -5896,167 +5951,197 @@ fn cleanup_all_pods(
     if let Err(e) = backend.cleanup_all() {
         warn!(error = %e, "Failed to cleanup BPF state during shutdown");
     }
-    // Deliberately do NOT write the `.udp-not-ready` ack here. By this point
-    // `cleanup_all()` has detached the tc classifier and torn down the pod-IP
-    // registry, so the host-veth gate that normally drops pod-originated UDP is
-    // *gone*, not closed. If a mesh proxy keeps running across a node-agent
-    // DaemonSet restart, publishing the ack would tell its still-live per-netns
-    // producer that the host gate is closed (`retain_guard = false`) and let it
-    // tear its in-netns DROP guard down into plaintext — enrolled pods would
-    // then egress UDP uncaptured/unauthorized until the new node-agent
-    // re-enrolls and reopens the producer. Fail closed instead: withholding the
-    // ack makes `await_udp_not_ready_ack` time out on the producer side, so it
-    // retains the in-netns guard (self-healing — reaped on the producer's next
-    // open). A fresh ack is only ever published by `reconcile_udp_capture_readiness`
-    // once the BPF gate is verifiably re-closed, which a restarted node-agent
-    // re-derives from live state rather than trusting a persisted marker.
 }
 
-/// Observable result for external #2371 startup-cleanup probes.
-#[derive(Debug, Clone)]
-pub struct NodeAgentStartupCleanupProbe {
-    pub ok: bool,
-    pub error: Option<String>,
-    pub cleanup_all_calls: usize,
-    pub cleaned_up: bool,
-    pub programs_loaded: bool,
-    pub capture_config_set: bool,
-}
+/// Test-only seams for the issue #2371 startup-rollback contract.
+///
+/// Every item here exists solely so external unit tests (`tests/unit/`) can
+/// drive the *production* rollback paths through `crate::_test_support`. The
+/// library target reaches them through that bridge; `src/main.rs` re-declares
+/// every module **without** it, so in the binary target nothing in this module
+/// has a caller. That is the entire justification for the module-scoped
+/// `allow(dead_code)`: it covers only test-only items — no production item is
+/// suppressed, and `-D dead_code` still applies to the rest of the file. Same
+/// convention as the `_for_test` seams in `src/load_balancer.rs`.
+///
+/// These probes call the production entry points (`initialize_backend`,
+/// `InitializedBackendOwner::{shutdown_pods, fail_with}`) directly — there is no
+/// test-only twin of the cleanup logic to drift from.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod startup_cleanup_test_seams {
+    use super::*;
+    use crate::ebpf::{MockCleanupWatch, MockEbpfBackend};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
-fn local_pod_ebpf_test_config() -> NodeAgentConfig {
-    let mut capture_config = CaptureConfig::explicit(15006, 15001);
-    capture_config.mode = CaptureMode::Ebpf;
-    NodeAgentConfig {
-        node_name: "test-node".to_string(),
-        capture_config,
-        cgroup_root: "/sys/fs/cgroup".to_string(),
-        bpf_fs_path: "/sys/fs/bpf".to_string(),
-        fallback_mode: FallbackMode::Iptables,
-        excluded_namespaces: HashSet::new(),
-        capture_contract: CaptureContract::local_pod_defaults(),
-        trust_domain: "cluster.local".to_string(),
-        node_waypoint_pod_registry_dir: None,
+    /// Observable result for the external #2371 startup-cleanup probes.
+    #[derive(Debug, Clone)]
+    pub struct NodeAgentStartupCleanupProbe {
+        pub ok: bool,
+        pub error: Option<String>,
+        pub cleanup_all_calls: usize,
+        pub cleaned_up: bool,
+        /// Sampled at the last point the mock is directly observable, i.e. just
+        /// before an `InitializedBackendOwner` takes it by value.
+        pub programs_loaded: bool,
+        /// Same sampling point as `programs_loaded`.
+        pub capture_config_set: bool,
     }
-}
 
-/// External-test seam: `initialize_backend` after a successful `load_programs`.
-/// Post-`load_programs` failure must roll back via `cleanup_all` exactly once.
-pub(crate) fn probe_post_load_init_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
-    let config = local_pod_ebpf_test_config();
-    let mut backend = crate::ebpf::MockEbpfBackend {
-        fail_update_capture_config: true,
-        ..crate::ebpf::MockEbpfBackend::default()
-    };
-    let metrics = NodeAgentMetrics::default();
-    let result = initialize_backend(&mut backend, &config, &metrics);
-    NodeAgentStartupCleanupProbe {
-        ok: result.is_ok(),
-        error: result.err().map(|e| e.to_string()),
-        cleanup_all_calls: backend.cleanup_all_calls,
-        cleaned_up: backend.cleaned_up,
-        programs_loaded: backend.programs_loaded,
-        capture_config_set: backend.capture_config.is_some(),
+    fn local_pod_ebpf_test_config() -> NodeAgentConfig {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        }
     }
-}
 
-/// Kubernetes-client-style late failure after successful initialization.
-pub(crate) fn probe_k8s_client_style_late_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe
-{
-    let config = local_pod_ebpf_test_config();
-    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
-    let mut backend = crate::ebpf::MockEbpfBackend {
-        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
-        ..crate::ebpf::MockEbpfBackend::default()
-    };
-    let metrics = NodeAgentMetrics::default();
-    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
-        return NodeAgentStartupCleanupProbe {
-            ok: false,
-            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+    /// Mock state sampled just before an `InitializedBackendOwner` takes the
+    /// backend by value (after which it is no longer directly observable).
+    #[derive(Clone, Copy)]
+    struct SampledMock {
+        programs_loaded: bool,
+        capture_config_set: bool,
+    }
+
+    /// A successfully initialized mock, plus its pre-move sample.
+    struct InitializedMock {
+        config: NodeAgentConfig,
+        backend: MockEbpfBackend,
+        sampled: SampledMock,
+    }
+
+    /// Run `initialize_backend` over `backend`, which the caller must have set
+    /// up to reach a *successful* init. An unexpected init failure
+    /// short-circuits to a probe the calling test can report verbatim.
+    fn initialize_or_report(
+        mut backend: MockEbpfBackend,
+    ) -> Result<InitializedMock, NodeAgentStartupCleanupProbe> {
+        let config = local_pod_ebpf_test_config();
+        let metrics = NodeAgentMetrics::default();
+        if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
+            return Err(NodeAgentStartupCleanupProbe {
+                ok: false,
+                error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+                cleanup_all_calls: backend.cleanup_all_calls,
+                cleaned_up: backend.cleaned_up,
+                programs_loaded: backend.programs_loaded,
+                capture_config_set: backend.capture_config.is_some(),
+            });
+        }
+        let sampled = SampledMock {
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: backend.capture_config.is_some(),
+        };
+        Ok(InitializedMock {
+            config,
+            backend,
+            sampled,
+        })
+    }
+
+    /// Read cleanup counters back out of a backend the owner has consumed.
+    fn observed(
+        watch: &MockCleanupWatch,
+        sampled: SampledMock,
+        error: Option<String>,
+    ) -> NodeAgentStartupCleanupProbe {
+        NodeAgentStartupCleanupProbe {
+            ok: error.is_none(),
+            error,
+            cleanup_all_calls: watch.calls.load(Ordering::Relaxed),
+            cleaned_up: watch.cleaned_up.load(Ordering::Relaxed),
+            programs_loaded: sampled.programs_loaded,
+            capture_config_set: sampled.capture_config_set,
+        }
+    }
+
+    fn watched_backend(watch: &Arc<MockCleanupWatch>) -> MockEbpfBackend {
+        MockEbpfBackend {
+            cleanup_watch: Some(Arc::clone(watch)),
+            ..MockEbpfBackend::default()
+        }
+    }
+
+    /// `initialize_backend` must roll back with exactly one `cleanup_all` when a
+    /// step after a successful `load_programs` fails.
+    pub(crate) fn probe_post_load_init_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
+        let config = local_pod_ebpf_test_config();
+        let mut backend = MockEbpfBackend {
+            fail_update_capture_config: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+        let result = initialize_backend(&mut backend, &config, &metrics);
+        NodeAgentStartupCleanupProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
             cleanup_all_calls: backend.cleanup_all_calls,
             cleaned_up: backend.cleaned_up,
             programs_loaded: backend.programs_loaded,
             capture_config_set: backend.capture_config.is_some(),
-        };
+        }
     }
-    let owner = InitializedBackendOwner::new(Box::new(backend));
-    let (err, _backend) = owner.fail_with_for_test(anyhow::anyhow!(
-        "injected kubernetes client construction failure"
-    ));
-    NodeAgentStartupCleanupProbe {
-        ok: false,
-        error: Some(err.to_string()),
-        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
-        programs_loaded: true,
-        capture_config_set: false,
-    }
-}
 
-/// Normal shutdown must call `cleanup_all` exactly once (shutdown + Drop).
-pub(crate) fn probe_normal_shutdown_cleanup_once_for_test() -> NodeAgentStartupCleanupProbe {
-    let config = local_pod_ebpf_test_config();
-    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
-    let mut backend = crate::ebpf::MockEbpfBackend {
-        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
-        ..crate::ebpf::MockEbpfBackend::default()
-    };
-    let metrics = NodeAgentMetrics::default();
-    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
-        return NodeAgentStartupCleanupProbe {
-            ok: false,
-            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
-            cleanup_all_calls: backend.cleanup_all_calls,
-            cleaned_up: backend.cleaned_up,
-            programs_loaded: backend.programs_loaded,
-            capture_config_set: backend.capture_config.is_some(),
+    /// A Kubernetes-client-construction-style failure after a *successful* init
+    /// must clean up exactly once through the owner and return the original
+    /// error unchanged.
+    pub(crate) fn probe_k8s_client_style_late_failure_cleanup_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let init = match initialize_or_report(watched_backend(&watch)) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
         };
+        let sampled = init.sampled;
+        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        // Production path: `run_with_backend` funnels a kube-client error here.
+        let err = owner.fail_with(anyhow::anyhow!("injected kube client construction failure"));
+        observed(&watch, sampled, Some(err.to_string()))
     }
-    let mut owner = InitializedBackendOwner::new(Box::new(backend));
-    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-    owner.shutdown_pods(&pod_states, &config);
-    drop(owner);
-    NodeAgentStartupCleanupProbe {
-        ok: true,
-        error: None,
-        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
-        programs_loaded: true,
-        capture_config_set: false,
-    }
-}
 
-/// Cleanup failure must not hide the original startup/runtime error.
-pub(crate) fn probe_cleanup_failure_preserves_original_error_for_test()
--> NodeAgentStartupCleanupProbe {
-    let config = local_pod_ebpf_test_config();
-    let watch = std::sync::Arc::new(crate::ebpf::MockCleanupWatch::default());
-    let mut backend = crate::ebpf::MockEbpfBackend {
-        cleanup_watch: Some(std::sync::Arc::clone(&watch)),
-        fail_cleanup_all: true,
-        ..crate::ebpf::MockEbpfBackend::default()
-    };
-    let metrics = NodeAgentMetrics::default();
-    if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
-        return NodeAgentStartupCleanupProbe {
-            ok: false,
-            error: Some(format!("initialize_backend failed unexpectedly: {err}")),
-            cleanup_all_calls: backend.cleanup_all_calls,
-            cleaned_up: backend.cleaned_up,
-            programs_loaded: backend.programs_loaded,
-            capture_config_set: backend.capture_config.is_some(),
+    /// Normal shutdown must call `cleanup_all` exactly once — the subsequent
+    /// `Drop` must not clean up a second time.
+    pub(crate) fn probe_normal_shutdown_cleanup_once_for_test() -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let init = match initialize_or_report(watched_backend(&watch)) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
         };
+        let (config, sampled) = (init.config, init.sampled);
+        let mut owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        owner.shutdown_pods(&pod_states, &config);
+        // Drop must observe the latched flag and NOT clean up a second time.
+        drop(owner);
+        observed(&watch, sampled, None)
     }
-    let owner = InitializedBackendOwner::new(Box::new(backend));
-    let (err, _backend) =
-        owner.fail_with_for_test(anyhow::anyhow!("original injected startup failure"));
-    NodeAgentStartupCleanupProbe {
-        ok: false,
-        error: Some(err.to_string()),
-        cleanup_all_calls: watch.calls.load(std::sync::atomic::Ordering::Relaxed),
-        cleaned_up: watch.cleaned_up.load(std::sync::atomic::Ordering::Relaxed),
-        programs_loaded: true,
-        capture_config_set: false,
+
+    /// A failing `cleanup_all` must not hide the original startup/runtime error.
+    pub(crate) fn probe_cleanup_failure_preserves_original_error_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let backend = MockEbpfBackend {
+            fail_cleanup_all: true,
+            ..watched_backend(&watch)
+        };
+        let init = match initialize_or_report(backend) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
+        };
+        let sampled = init.sampled;
+        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let err = owner.fail_with(anyhow::anyhow!("original injected startup failure"));
+        observed(&watch, sampled, Some(err.to_string()))
     }
 }
 
