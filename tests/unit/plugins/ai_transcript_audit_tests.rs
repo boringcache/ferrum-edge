@@ -1184,8 +1184,7 @@ async fn committed_response_consumes_the_staging_permit_exactly_once() {
         .filter_map(|body| body.as_array().map(Vec::len))
         .sum();
     assert_eq!(
-        total,
-        1,
+        total, 1,
         "a replayed commit hook must not emit a second record from a consumed staging entry"
     );
 }
