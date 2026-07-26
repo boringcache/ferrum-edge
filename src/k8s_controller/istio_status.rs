@@ -2423,6 +2423,42 @@ mod tests {
     }
 
     #[test]
+    fn proxy_config_unusable_tracing_sampling_surfaces_invalid_condition() {
+        // Watching ProxyConfig makes tracing.sampling operator-reachable; an
+        // out-of-range bare double (Istio CRD has no range validation) must
+        // land as FerrumAccepted=False/Invalid rather than Accepted with a
+        // silently dropped or unvalidated percentage.
+        let obj = object(
+            "networking.istio.io/v1beta1",
+            "ProxyConfig",
+            "bad-sampling",
+            json!({ "tracing": { "sampling": 5000.0 } }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tracing.sampling"),
+            "status message must name the offending field: {:?}",
+            c["message"]
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["tracing_sampling"].as_f64(),
+            Some(5000.0),
+            "detail should retain the rejected numeric sampling for operators"
+        );
+    }
+
+    #[test]
     fn api_resource_for_authorization_policy_v1() {
         let update = IstioStatusUpdate {
             api_version: "security.istio.io/v1".to_string(),

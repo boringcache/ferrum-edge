@@ -14,6 +14,7 @@ const ISTIO_STATUS_RS: &str = include_str!("../../../src/k8s_controller/istio_st
 const CARRIER_RS: &str = include_str!("../../../src/xds/carrier.rs");
 const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
 const MESH_MD: &str = include_str!("../../../docs/mesh.md");
+const OPENAPI_YAML: &str = include_str!("../../../openapi.yaml");
 const CONTROL_PLANE_RBAC: &str =
     include_str!("../../../charts/ferrum-mesh/templates/control-plane-rbac.yaml");
 
@@ -189,6 +190,11 @@ fn configuration_md_hosts_capability_contract_v1() {
         CONFIGURATION_MD.contains("ProxyConfigsCarrier"),
         "ProxyConfig row must acknowledge the xDS ECDS carrier"
     );
+    assert!(
+        CONFIGURATION_MD.contains("fail-closed 0–100")
+            || CONFIGURATION_MD.contains("fails closed on non-numeric or out-of-range"),
+        "capability contract must document ProxyConfig tracing.sampling fail-closed bounds"
+    );
 }
 
 #[test]
@@ -276,4 +282,24 @@ fn mesh_md_proxy_config_transport_matches_carrier_semantics() {
             "docs/mesh.md must not retain stale nine-kind claim: {phrase}"
         );
     }
+}
+
+#[test]
+fn openapi_workload_metrics_sampling_documents_proxy_config_source() {
+    // Once ProxyConfig is watched, injected workload_metrics.sampling_percentage
+    // is no longer Telemetry-only; keep the OpenAPI description in lock-step.
+    assert!(
+        OPENAPI_YAML.contains("sampling_percentage:"),
+        "openapi.yaml must define workload_metrics.sampling_percentage"
+    );
+    assert!(
+        OPENAPI_YAML.contains("ProxyConfig.spec.tracing.sampling"),
+        "openapi.yaml sampling_percentage must cite ProxyConfig.spec.tracing.sampling"
+    );
+    assert!(
+        !OPENAPI_YAML.contains(
+            "Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD)."
+        ),
+        "openapi.yaml must not claim sampling_percentage is Telemetry-only"
+    );
 }

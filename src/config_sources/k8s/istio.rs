@@ -14099,6 +14099,81 @@ extensionProviders:
     }
 
     #[test]
+    fn proxy_config_tracing_sampling_rejects_unusable_values() {
+        // Mirror Telemetry.tracing.randomSamplingPercentage and the
+        // concurrency fail-closed contract: a present-but-unusable sampling
+        // value must surface as InvalidResource so FerrumAccepted=False
+        // rather than silently dropping (string) or pushing an out-of-range
+        // percentage into every matching workload's workload_metrics.
+        let bad_values = [
+            ("out_of_range_high", serde_json::json!(5000.0)),
+            ("out_of_range_low", serde_json::json!(-1.0)),
+            ("string", serde_json::json!("50")),
+            ("bool", serde_json::json!(true)),
+            ("array", serde_json::json!([50.0])),
+            ("object", serde_json::json!({"n": 50.0})),
+        ];
+
+        for (label, bad) in bad_values {
+            let err = translate_k8s_objects(
+                &[object(
+                    "ProxyConfig",
+                    serde_json::json!({ "tracing": { "sampling": bad } }),
+                )],
+                options(),
+            )
+            .expect_err(&format!("expected InvalidResource for {label}"));
+            match err {
+                K8sTranslateError::InvalidResource { kind, message, .. } => {
+                    assert_eq!(kind, "ProxyConfig", "case {label}");
+                    assert!(
+                        message.contains("spec.tracing.sampling"),
+                        "case {label}: error must name tracing.sampling: {message}"
+                    );
+                }
+                other => panic!("case {label}: expected InvalidResource, got {other:?}"),
+            }
+        }
+
+        // Inclusive bounds and an integer JSON number stay accepted.
+        for accepted in [
+            serde_json::json!(0.0),
+            serde_json::json!(100.0),
+            serde_json::json!(50),
+        ] {
+            let result = translate_k8s_objects(
+                &[object(
+                    "ProxyConfig",
+                    serde_json::json!({ "tracing": { "sampling": accepted } }),
+                )],
+                options(),
+            )
+            .unwrap_or_else(|error| panic!("sampling {accepted} must be accepted: {error}"));
+            let mesh = result.config.mesh.expect("mesh config");
+            assert_eq!(
+                mesh.proxy_configs[0].tracing_sampling,
+                accepted.as_f64(),
+                "accepted sampling must round-trip"
+            );
+        }
+
+        // Explicit JSON null is unset, matching concurrency semantics.
+        let result = translate_k8s_objects(
+            &[object(
+                "ProxyConfig",
+                serde_json::json!({ "tracing": { "sampling": serde_json::Value::Null } }),
+            )],
+            options(),
+        )
+        .expect("null sampling is unset");
+        assert!(
+            result.config.mesh.unwrap().proxy_configs[0]
+                .tracing_sampling
+                .is_none()
+        );
+    }
+
+    #[test]
     fn proxy_config_workload_selector_wins_over_namespace_default() {
         // Two ProxyConfigs in same namespace: one namespace-default (no
         // selector), one with a workload selector. Slice resolution must
