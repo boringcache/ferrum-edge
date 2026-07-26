@@ -1651,6 +1651,114 @@ async fn h1_frontend_to_native_h3_backend_uses_frontend_forwarding_metadata() {
     );
 }
 
+/// Issue #2952: with `FERRUM_ADD_FORWARDED_HEADER=true`, the H1→native-H3
+/// header builder must strip a spoofed client `Forwarded` and emit exactly
+/// one gateway-owned element once `h3=supported`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h1_frontend_to_native_h3_strips_spoofed_client_forwarded() {
+    let ca = TestCa::new("phase-h1-to-h3-forwarded-ownership").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "2".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"ok")))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let harness = GatewayHarness::builder()
+        .file_config(file_mode_yaml_for_h3(backend_port))
+        .log_level("info")
+        .capture_output()
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .env("FERRUM_ADD_FORWARDED_HEADER", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported so ownership coverage uses the native H3 path; entry: {entry:#?}"
+    );
+
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("reqwest client");
+    let resp = client
+        .get(harness.proxy_url("/api/ownership"))
+        .header(reqwest::header::HOST, "edge.example")
+        .header("forwarded", "for=10.0.0.1;proto=https")
+        .send()
+        .await
+        .expect("request through gateway");
+    if resp.status().as_u16() != 200 {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "expected 200 from H1 frontend to native H3 ownership path; got {}\n\
+             --- registry: {entry:#?}\n--- logs ---\n{logs}",
+            resp.status()
+        );
+    }
+
+    let received = h3_backend.received_requests().await;
+    let req = received
+        .iter()
+        .find(|r| r.method == "GET" && (r.path == "/ownership" || r.path.ends_with("/ownership")))
+        .unwrap_or_else(|| {
+            panic!(
+                "native H3 backend never received the ownership GET — path not exercised. \
+                 received={received:#?}"
+            )
+        });
+    let forwarded: Vec<&str> = req
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("forwarded"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        forwarded,
+        vec!["for=127.0.0.1;proto=http;host=edge.example"],
+        "native H3 path must emit exactly one gateway-owned Forwarded; got {forwarded:?} \
+         (headers={:?})",
+        req.headers
+    );
+    assert!(
+        forwarded.iter().all(|v| !v.contains("10.0.0.1")),
+        "spoofed client Forwarded must not reach the native H3 backend: {forwarded:?}"
+    );
+}
+
 // A request transformer can introduce `stream: true` only in the final request
 // body. Dispatch preference and response buffering must be re-evaluated from
 // that finalized context before an H3-capable backend transport is committed.
