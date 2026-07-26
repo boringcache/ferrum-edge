@@ -862,3 +862,43 @@ fn context_without_the_configured_header_falls_back_to_xff() {
         Some("192.0.2.9")
     );
 }
+
+/// A context that never held the raw wire map at all: `headers` carries only the
+/// folded value materialization would have produced. The contexts above retain
+/// their raw map even after `materialize_headers()`, so they never reach this
+/// branch of `RequestContext::header_field_lines`.
+fn context_with_folded_real_ip(value: Option<&str>) -> RequestContext {
+    let mut ctx = RequestContext::new("10.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    if let Some(value) = value {
+        let folded = value.to_string();
+        ctx.headers.insert("x-real-ip".to_string(), folded);
+    }
+    ctx
+}
+
+/// The documented degraded state must still fail closed: without raw headers the
+/// accessor can only see one folded value, and folding joins repeated field-lines
+/// with `, `, which the single-value contract rejects as a comma list.
+#[test]
+fn context_without_raw_headers_falls_back_to_the_folded_value_and_fails_closed() {
+    let tp = trusted("10.0.0.0/8");
+
+    let duplicates = context_with_folded_real_ip(Some("203.0.113.50, 198.51.100.23"));
+    assert!(!duplicates.has_raw_headers());
+    assert_eq!(resolve_via_context(&duplicates, &tp), None);
+
+    // Non-vacuity: a lone folded value still resolves, so the rejection above is
+    // not this branch simply refusing everything it sees.
+    let single = context_with_folded_real_ip(Some("198.51.100.23"));
+    assert_eq!(
+        resolve_via_context(&single, &tp).as_deref(),
+        Some("198.51.100.23")
+    );
+
+    // Absent here is Absent, not Rejected: the XFF walk still runs.
+    let absent = context_with_folded_real_ip(None);
+    assert_eq!(
+        resolve_via_context(&absent, &tp).as_deref(),
+        Some("192.0.2.9")
+    );
+}

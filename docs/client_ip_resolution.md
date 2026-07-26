@@ -128,9 +128,9 @@ The client IP resolution follows these security principles:
 
 4. **Authoritative header gated on trust and singular**: The `FERRUM_REAL_IP_HEADER` is only honored when the connection comes from a trusted proxy **and** the request carries exactly one field-line with exactly one value. If the configured header is present but rejected, the socket IP remains the source of truth and `X-Forwarded-For` is not consulted.
 
-6. **The trust list itself is strict**: `FERRUM_TRUSTED_PROXIES` must parse in full. Invalid configuration fails validation and startup rather than installing a partial trust boundary.
-
 5. **Forwarded scheme is correlated or overwritten**: A trusted proxy may overwrite `X-Forwarded-Proto` with one original value. If proxies append values, the scheme list must align with the validated XFF chain; Ferrum rejects malformed or misaligned chains instead of guessing from the nearest hop.
+
+6. **The trust list itself is strict**: `FERRUM_TRUSTED_PROXIES` must parse in full. Invalid configuration fails validation and startup rather than installing a partial trust boundary.
 
 ### Attack Scenarios Handled
 
