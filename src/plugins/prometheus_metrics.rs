@@ -641,9 +641,15 @@ pub struct MetricsRegistry {
     pub mesh_outbound_registry_stream_decisions:
         DashMap<Arc<str>, DashMap<&'static str, MeshOutboundRegistryDecisionCounters>>,
     /// TLS certificate expiry and validity-window gauges, refreshed on scrape
-    /// from the admin/proxy inventory. Labels are derived from configured
-    /// resources, never from request input.
+    /// from the cached, non-secret TLS inventory snapshot
+    /// (`crate::tls::inventory_cache`) — never by loading TLS material on the
+    /// scrape path (issue #2410). Labels are derived from configured resources,
+    /// never from request input.
     pub tls_cert_gauges: DashMap<TlsCertGaugeKey, TlsCertGaugeValues>,
+    /// Freshness of the cached TLS inventory snapshot backing `tls_cert_gauges`:
+    /// `(collected_at unix seconds, configured max age seconds)`. `None` until
+    /// the first background collection publishes a snapshot.
+    tls_inventory_freshness: ArcSwap<Option<(i64, u64)>>,
     /// TLS material source refresh outcomes from background source watchers.
     pub tls_source_refresh_counter: DashMap<TlsSourceRefreshKey, TimestampedCounter>,
     /// TLS material source fetch durations from background source watchers.
@@ -661,6 +667,9 @@ pub struct MetricsRegistry {
     /// Database-mode incremental polling rejection/backoff metrics.
     database_delta_poll_metrics:
         ArcSwap<Option<Arc<crate::modes::database::DatabaseDeltaPollMetrics>>>,
+    /// DP ConfigSync delta-rejection divergence metrics (issue #2394).
+    configsync_divergence_metrics:
+        ArcSwap<Option<Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>>>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -726,6 +735,7 @@ impl MetricsRegistry {
             mesh_outbound_registry_decisions: DashMap::new(),
             mesh_outbound_registry_stream_decisions: DashMap::new(),
             tls_cert_gauges: DashMap::new(),
+            tls_inventory_freshness: ArcSwap::from_pointee(None),
             tls_source_refresh_counter: DashMap::new(),
             tls_source_fetch_duration_buckets: DashMap::new(),
             tls_source_fetch_failure_counter: DashMap::new(),
@@ -733,6 +743,7 @@ impl MetricsRegistry {
             node_agent_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
+            configsync_divergence_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -1042,6 +1053,40 @@ impl MetricsRegistry {
     ) -> Option<crate::modes::database::DatabaseDeltaPollMetricsSnapshot> {
         let metrics = self.database_delta_poll_metrics.load_full();
         metrics.as_ref().as_ref().map(|metrics| metrics.snapshot())
+    }
+
+    pub fn set_configsync_divergence_metrics(
+        &self,
+        metrics: Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>,
+    ) {
+        self.configsync_divergence_metrics
+            .store(Arc::new(Some(metrics)));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn invalidate_configsync_divergence_metrics_cache(&self) {
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn configsync_divergence_metrics_snapshot(
+        &self,
+    ) -> Option<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetricsSnapshot> {
+        let metrics = self.configsync_divergence_metrics.load_full();
+        metrics.as_ref().as_ref().map(|metrics| metrics.snapshot())
+    }
+
+    /// Publish the freshness of the cached TLS inventory snapshot that backs the
+    /// certificate gauges: `Some((collected_at unix seconds, configured max age
+    /// seconds))`, or `None` while no snapshot has been collected yet.
+    ///
+    /// The render cache is invalidated only on an actual change, so repeated
+    /// scrapes inside the render TTL keep hitting the cache (issue #2240).
+    pub fn set_tls_inventory_freshness(&self, freshness: Option<(i64, u64)>) {
+        if **self.tls_inventory_freshness.load() == freshness {
+            return;
+        }
+        self.tls_inventory_freshness.store(Arc::new(freshness));
+        self.render_cache.store(Arc::new(None));
     }
 
     pub fn refresh_tls_certificate_inventory(
@@ -1670,6 +1715,11 @@ impl MetricsRegistry {
             } else {
                 0
             }
+            + if self.configsync_divergence_metrics.load().is_some() {
+                400
+            } else {
+                0
+            }
             + if self.node_agent_metrics.load().is_some() {
                 512
             } else {
@@ -2270,6 +2320,33 @@ impl MetricsRegistry {
             }
         }
 
+        if let Some((collected_at, max_age_seconds)) = **self.tls_inventory_freshness.load() {
+            // Explicit, bounded freshness for the cached snapshot the
+            // certificate gauges are rendered from (issue #2410). Alerts read
+            // `time() - ferrum_tls_inventory_snapshot_timestamp_seconds` against
+            // the exported bound instead of assuming scrape-time collection.
+            output.push_str(
+                "# HELP ferrum_tls_inventory_snapshot_timestamp_seconds Unix timestamp of the cached, non-secret TLS inventory snapshot backing the certificate gauges.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_inventory_snapshot_timestamp_seconds gauge\n");
+            render_process_gauge(
+                &mut output,
+                "ferrum_tls_inventory_snapshot_timestamp_seconds",
+                collected_at,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_tls_inventory_snapshot_max_age_seconds Configured maximum snapshot age (FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS) before a scrape schedules a background refresh.\n",
+            );
+            output.push_str("# TYPE ferrum_tls_inventory_snapshot_max_age_seconds gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_tls_inventory_snapshot_max_age_seconds",
+                max_age_seconds,
+                &ns_label,
+            );
+        }
+
         if !self.tls_source_refresh_counter.is_empty() {
             output.push_str(
                 "# HELP ferrum_tls_source_refresh_total TLS material source refresh attempts by scheme, kind, surface, and outcome.\n",
@@ -2409,6 +2486,52 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_database_delta_recoveries_total",
                 snapshot.recoveries_total,
+                &ns_label,
+            );
+        }
+
+        if let Some(snapshot) = self.configsync_divergence_metrics_snapshot() {
+            output.push_str(
+                "# HELP ferrum_configsync_delta_rejections_total Non-empty ConfigSync deltas rejected by the DP, forcing an authoritative FULL_SNAPSHOT resync.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_delta_rejections_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_delta_rejections_total",
+                snapshot.rejected_nonempty_deltas_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_divergence_recoveries_total ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_divergence_recoveries_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_divergence_recoveries_total",
+                snapshot.recoveries_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_diverged Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0).\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_diverged gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_diverged",
+                u64::from(snapshot.diverged),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_fenced_full_snapshots_total ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_fenced_full_snapshots_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_fenced_full_snapshots_total",
+                snapshot.fenced_full_snapshots_total,
                 &ns_label,
             );
         }
