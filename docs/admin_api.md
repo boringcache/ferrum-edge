@@ -837,6 +837,11 @@ Deletes the spec and cascades:
 - Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
 - Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
 - Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+- On standalone MongoDB, direct deletion of an API-spec-owned proxy returns
+  `501 Not Implemented` before mutating the proxy, scoped plugins, owner spec,
+  generated upstreams, or config-change rows. Configure
+  `FERRUM_MONGO_REPLICA_SET` (or a `replicaSet` URL option) and retry. Direct
+  deletion of a hand-managed proxy remains supported.
 - Before a direct delete of an API-spec-owned proxy, Ferrum re-reads the
   current upstream and every cascade plugin with ownership metadata intact.
   Hand-owned rows remain hand-owned; foreign API-spec ownership, missing rows,
@@ -875,7 +880,7 @@ Deletes the spec and cascades:
 | `POST /api-specs` | Created; tagged with `api_spec_id` | — |
 | `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
 | `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
-| `DELETE /proxies/{id}` | Spec row deleted by FK cascade | — |
+| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | — |
 
 ### Mode behavior
 

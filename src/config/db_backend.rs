@@ -357,6 +357,57 @@ pub(crate) fn validate_api_spec_retained_upstream_identity(
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// Stable admin-facing message for an API-spec-owned proxy delete that the
+/// configured backend deployment cannot commit atomically.
+pub const PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE: &str =
+    "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment";
+
+/// The configured backend cannot atomically delete a proxy ownership graph.
+///
+/// Standalone MongoDB cannot roll back a proxy delete if removing its owning
+/// API-spec row or spec-generated upstreams fails. The store therefore returns
+/// this typed refusal before mutating any member of that graph.
+#[derive(Debug, Clone)]
+pub struct ProxyDeleteAtomicityUnsupported {
+    detail: String,
+}
+
+impl ProxyDeleteAtomicityUnsupported {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    /// Redacted operator remediation suitable for an authenticated admin
+    /// response. It names configuration only, never resource IDs or BSON data.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for ProxyDeleteAtomicityUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE}: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for ProxyDeleteAtomicityUnsupported {}
+
+/// Borrow the typed refusal from anywhere in an error chain so admin response
+/// mapping never renders surrounding database-driver context.
+pub fn proxy_delete_atomicity_unsupported(
+    error: &anyhow::Error,
+) -> Option<&ProxyDeleteAtomicityUnsupported> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProxyDeleteAtomicityUnsupported>())
+}
+
 /// Durable cross-process fence for namespace-scoped config admission.
 ///
 /// Implementations atomically claim a namespace for `owner` and return the
