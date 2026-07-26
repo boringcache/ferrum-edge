@@ -6540,10 +6540,7 @@ impl DatabaseStore {
     ///
     /// Crate-visible so `_test_support` can drive failover publication without
     /// going through [`Self::try_failover_reconnect`]'s primary-first probe.
-    pub(crate) async fn reconnect_as_failover(
-        &self,
-        db_url: &str,
-    ) -> Result<(), anyhow::Error> {
+    pub(crate) async fn reconnect_as_failover(&self, db_url: &str) -> Result<(), anyhow::Error> {
         self.reconnect_for_topology(db_url, DatabaseTopology::Failover)
             .await
     }
