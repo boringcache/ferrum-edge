@@ -40362,8 +40362,8 @@ mod tests {
     /// | untrusted peer                     | none        | equal          | peer               |
     #[test]
     fn build_xff_value_appends_peer_and_seeds_resolved_client() {
-        let no_policy = client_ip::TrustedProxies::parse_strict("", "test")
-            .expect("empty trust list is valid");
+        let no_policy =
+            client_ip::TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
         let lb_trusted = client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
             .expect("valid trusted proxy list");
 

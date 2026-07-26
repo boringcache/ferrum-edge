@@ -204,8 +204,8 @@ fn parse_strict_rejects_any_invalid_entry() {
 
 #[test]
 fn parse_strict_rejects_invalid_ipv4_mapped_ipv6_prefix() {
-    let err = TrustedProxies::parse_strict("::ffff:10.0.0.0/95", "FERRUM_TRUSTED_PROXIES")
-        .unwrap_err();
+    let err =
+        TrustedProxies::parse_strict("::ffff:10.0.0.0/95", "FERRUM_TRUSTED_PROXIES").unwrap_err();
 
     assert!(err.contains("Invalid CIDR/IP entries: ::ffff:10.0.0.0/95"));
 }
@@ -509,8 +509,6 @@ fn real_world_cloudflare_pattern() {
         "198.51.100.23"
     );
 }
-
-
 
 // ── resolve_real_ip_header_field_lines ──────────────────────────────────────
 

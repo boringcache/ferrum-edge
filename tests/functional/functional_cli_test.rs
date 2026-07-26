@@ -2844,7 +2844,10 @@ async fn functional_cli_validate_accepts_valid_trusted_proxies() {
 
     let output = validate_database_mode_command(&temp_dir)
         .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
-        .env("FERRUM_TRUSTED_PROXIES", "10.0.0.0/8,::1,::ffff:192.0.2.0/120")
+        .env(
+            "FERRUM_TRUSTED_PROXIES",
+            "10.0.0.0/8,::1,::ffff:192.0.2.0/120",
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
