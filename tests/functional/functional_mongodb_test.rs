@@ -1221,6 +1221,35 @@ async fn submit_owned_proxy_fixture(
         .to_string()
 }
 
+async fn submit_hand_managed_proxy(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    proxy_id: &str,
+) {
+    let response = client
+        .post(format!("{}/proxies", harness.admin_base_url))
+        .header("Authorization", auth_header)
+        .json(&json!({
+            "id": proxy_id,
+            "name": format!("hand-managed-{proxy_id}"),
+            "listen_path": format!("/{proxy_id}"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+        }))
+        .send()
+        .await
+        .expect("submit hand-managed proxy fixture");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        201,
+        "hand-managed proxy fixture must be created: {body:?}"
+    );
+}
+
 async fn owned_proxy_delete_snapshot(
     db: &MongoDatabase,
     fixture: &OwnedProxyDeleteFixture,
@@ -1397,6 +1426,145 @@ async fn test_mongodb_standalone_owned_proxy_delete_refuses_before_mutation() {
     assert_eq!(
         after, before,
         "preflight refusal must leave proxy, plugin, owner spec, generated upstream, and config changes untouched"
+    );
+}
+
+/// Ownership metadata for another namespace must not classify a hand-managed
+/// proxy in the requested namespace as API-spec-owned.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_proxy_delete_scopes_owner_preflight_to_namespace() {
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("start gateway with standalone MongoDB");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let proxy_id = format!("namespace-owner-proxy-{}", &Uuid::new_v4().to_string()[..8]);
+    submit_hand_managed_proxy(&client, &harness, &auth_header, &proxy_id).await;
+
+    let db = mongo_database(&mongo_url).await;
+    let foreign_spec_id = format!("foreign-owner-{}", &Uuid::new_v4().to_string()[..8]);
+    db.collection::<Document>("api_specs")
+        .insert_one(doc! {
+            "_id": foreign_spec_id.as_str(),
+            "namespace": "other-namespace",
+            "proxy_id": proxy_id.as_str(),
+        })
+        .await
+        .expect("insert same-id API-spec owner in another namespace");
+
+    let response = client
+        .delete(format!("{}/proxies/{proxy_id}", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete hand-managed proxy");
+    assert_eq!(
+        response.status().as_u16(),
+        204,
+        "foreign-namespace ownership metadata must not block the requested namespace"
+    );
+    assert_eq!(
+        db.collection::<Document>("proxies")
+            .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count deleted hand-managed proxy"),
+        0
+    );
+    assert_eq!(
+        db.collection::<Document>("api_specs")
+            .count_documents(
+                doc! { "_id": foreign_spec_id.as_str(), "namespace": "other-namespace" },
+            )
+            .await
+            .expect("count foreign owner metadata"),
+        1,
+        "deleting one namespace must not mutate another namespace's owner metadata"
+    );
+}
+
+/// A malformed ownership tag is still an ownership/corruption signal. The
+/// standalone path must refuse it before deleting the proxy or its change log.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp() {
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("start gateway with standalone MongoDB");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let proxy_id = format!("malformed-owner-proxy-{}", &Uuid::new_v4().to_string()[..8]);
+    submit_hand_managed_proxy(&client, &harness, &auth_header, &proxy_id).await;
+
+    let db = mongo_database(&mongo_url).await;
+    db.collection::<Document>("proxies")
+        .update_one(
+            doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" },
+            doc! { "$set": { "api_spec_id": 42 } },
+        )
+        .await
+        .expect("inject malformed ownership stamp");
+    let changes_before = db
+        .collection::<Document>("config_changes")
+        .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
+        .await
+        .expect("count proxy changes before refusal");
+
+    let response = client
+        .delete(format!("{}/proxies/{proxy_id}", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete proxy with malformed ownership stamp");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status.as_u16(), 501, "malformed ownership must fail closed");
+    assert_eq!(
+        body["error"],
+        "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FERRUM_MONGO_REPLICA_SET"),
+        "refusal must name the transaction-capable remediation: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains(&proxy_id),
+        "refusal must not expose the proxy identifier: {body:?}"
+    );
+    assert_eq!(
+        db.collection::<Document>("proxies")
+            .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count proxy after refusal"),
+        1,
+        "malformed ownership refusal must happen before proxy mutation"
+    );
+    assert_eq!(
+        db.collection::<Document>("config_changes")
+            .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
+            .await
+            .expect("count proxy changes after refusal"),
+        changes_before,
+        "malformed ownership refusal must not append config changes"
     );
 }
 

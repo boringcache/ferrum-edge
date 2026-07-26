@@ -4251,11 +4251,15 @@ mod inner {
             };
             let has_api_spec_owner = self
                 .api_specs()
-                .find_one(doc! { "proxy_id": id })
+                .find_one(doc! { "proxy_id": id, "namespace": namespace })
                 .projection(doc! { "_id": 1 })
                 .await?
                 .is_some();
-            let has_api_spec_stamp = proxy_doc.get_str("api_spec_id").is_ok();
+            // The field is omitted for hand-managed proxies. Any stored value,
+            // including malformed/non-string BSON, is an ownership or
+            // corruption signal and must keep the destructive standalone path
+            // closed.
+            let has_api_spec_stamp = proxy_doc.contains_key("api_spec_id");
             if has_api_spec_owner || has_api_spec_stamp {
                 return Err(anyhow::Error::new(
                     Self::atomic_proxy_delete_standalone_refusal(),
