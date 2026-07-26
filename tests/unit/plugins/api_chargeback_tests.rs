@@ -4,7 +4,8 @@ use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::plugins::api_chargeback::{
     ApiChargeback, ChargebackRegistry, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_RETAINED_BYTES,
-    InstanceScope, OVERFLOW_CONSUMER_SENTINEL, ProtocolFamily, global_registry,
+    InstanceScope, OVERFLOW_CONSUMER_SENTINEL, ProtocolFamily, empty_charges_json,
+    empty_charges_prometheus, global_registry, try_global_registry,
 };
 use ferrum_edge::plugins::chargeback::pricing::{
     MAX_UNIT_PRICE, checked_add_charge, checked_mul_quantity,
@@ -3490,9 +3491,9 @@ fn test_identity_budget_caps_entries_without_losing_charges() {
     assert_eq!(
         registry.reserved_entries_for_tests(),
         2,
-        "identity slots must stop at max_entries"
+        "retained-row slots must stop at max_entries"
     );
-    // Two identity rows plus one aggregate overflow row.
+    // Two ordinary billing rows plus one aggregate overflow row.
     assert_eq!(registry.entries.len(), 3);
 
     let overflow: u64 = registry
@@ -3857,5 +3858,180 @@ fn test_identity_budget_holds_under_concurrent_recording_and_render() {
         total_calls,
         (THREADS * PER_THREAD) as u64,
         "every recorded call must be attributed exactly once"
+    );
+}
+
+/// `max_entries` reserves one slot per complete registry entry key, not per
+/// distinct principal. The same identity across multiple billable statuses
+/// therefore consumes multiple slots, and a further new status overflows.
+#[test]
+fn test_same_identity_multi_status_consumes_distinct_entry_slots() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+    let s = scope();
+
+    registry.record_http(
+        &s, "alice", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0,
+    );
+    registry.record_http(
+        &s, "alice", "proxy-a", "API", 404, 0.001, 0, 0, 0.0, 0.0,
+    );
+
+    assert_eq!(
+        registry.reserved_entries_for_tests(),
+        2,
+        "same identity at two statuses must occupy two max_entries slots"
+    );
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(by_consumer_calls(&registry, "alice"), 2);
+
+    // A third status for the same principal is a new row and must overflow.
+    registry.record_http(
+        &s, "alice", "proxy-a", "API", 500, 0.001, 0, 0, 0.0, 0.0,
+    );
+
+    assert_eq!(
+        registry.reserved_entries_for_tests(),
+        2,
+        "max_entries must not grow for the third status row"
+    );
+    assert_eq!(
+        registry.entries.len(),
+        3,
+        "two ordinary rows plus one overflow aggregate"
+    );
+    assert_eq!(
+        by_consumer_calls(&registry, "alice"),
+        2,
+        "admitted status rows keep per-identity attribution"
+    );
+    assert_eq!(
+        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL),
+        1,
+        "refused new status row loses only per-identity attribution"
+    );
+
+    let prometheus = registry.render_prometheus_uncached().unwrap();
+    assert!(prometheus.contains(
+        "Billing rows (complete registry entry keys) currently retained against max_entries"
+    ));
+    assert!(prometheus.contains("ferrum_api_chargeback_identity_overflow_total 1"));
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    assert_eq!(json["registry"]["entries"], 2);
+    assert_eq!(json["registry"]["max_entries"], 2);
+    assert_eq!(json["registry"]["identity_overflow_total"], 1);
+}
+
+/// Authenticated empty `/charges` must not claim the process-global OnceLock.
+/// Otherwise a scrape before any `api_chargeback` plugin is configured locks
+/// auto sharding in and a later accepted generation cannot honor
+/// `PluginHttpClient::pool_shard_amount()`.
+#[test]
+fn test_unconfigured_charges_render_does_not_claim_global_registry() {
+    let claimed_before = try_global_registry().is_some();
+
+    let json = empty_charges_json().expect("empty JSON shape");
+    let prom = empty_charges_prometheus().expect("empty Prometheus shape");
+
+    assert_eq!(
+        try_global_registry().is_some(),
+        claimed_before,
+        "empty /charges helpers must not initialize CHARGEBACK_REGISTRY"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["currency"], "USD");
+    assert!(parsed["consumers"].as_object().unwrap().is_empty());
+    assert_eq!(parsed["registry"]["entries"], 0);
+    assert_eq!(parsed["registry"]["max_entries"], DEFAULT_MAX_ENTRIES);
+    assert_eq!(
+        parsed["registry"]["max_retained_bytes"],
+        DEFAULT_MAX_RETAINED_BYTES
+    );
+    assert_eq!(
+        parsed["registry"]["overflow_consumer_id"],
+        OVERFLOW_CONSUMER_SENTINEL
+    );
+    assert!(prom.contains("ferrum_api_chargeable_calls_total"));
+    assert!(prom.contains(&format!(
+        "ferrum_api_chargeback_registry_max_entries {DEFAULT_MAX_ENTRIES}"
+    )));
+}
+
+/// When the process-global registry is still unset, empty scrapes must leave
+/// the first-writer window open so an accepted generation can create the hot
+/// map with `PluginHttpClient::pool_shard_amount()`. Creation-time shard amount
+/// is what `OnceLock` freezes; pin that contract without racing sibling tests
+/// on the process singleton.
+#[test]
+fn test_request_before_plugin_then_reload_honors_configured_shard_amount() {
+    let claimed_before = try_global_registry().is_some();
+    let _ = empty_charges_json().unwrap();
+    let _ = empty_charges_prometheus().unwrap();
+    assert_eq!(
+        try_global_registry().is_some(),
+        claimed_before,
+        "pre-plugin /charges must remain non-owning"
+    );
+
+    const CONFIGURED_SHARDS: usize = 64;
+    let registry = ChargebackRegistry::with_shard_amount(CONFIGURED_SHARDS);
+    assert_eq!(
+        registry.shard_amount_for_tests(),
+        CONFIGURED_SHARDS,
+        "owning construction must size the entry map with the configured shard count"
+    );
+
+    let plugin_source = include_str!("../../../src/plugins/api_chargeback.rs");
+    assert!(
+        plugin_source.contains("global_registry_with_shard_amount(shard_amount)"),
+        "ApiChargeback::new_with_shard_amount must pass the configured shard count into owning init"
+    );
+    let factory = include_str!("../../../src/plugins/mod.rs");
+    assert!(
+        factory.contains("api_chargeback::ApiChargeback::new_with_shard_amount")
+            && factory.contains("http_client.pool_shard_amount()"),
+        "plugin factory must thread pool_shard_amount into api_chargeback construction"
+    );
+
+    // Construction still resolves the (possibly already-created) singleton
+    // without panicking; shard count stays whatever the first owning writer set.
+    let config = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+    });
+    let plugin =
+        ApiChargeback::new_with_shard_amount(&config, "ferrum", CONFIGURED_SHARDS).unwrap();
+    assert_eq!(
+        plugin.registry_shard_amount_for_tests(),
+        global_registry().shard_amount_for_tests()
+    );
+}
+
+/// Admin `GET /charges` must use the non-owning try path, not claim the
+/// registry with auto sharding.
+#[test]
+fn test_admin_charges_path_is_non_owning_when_unconfigured() {
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let charges_idx = admin
+        .find("if path == \"/charges\" && method == Method::GET")
+        .expect("/charges handler");
+    let next_route = admin[charges_idx + 1..]
+        .find("if path == \"/charges/sink/status\"")
+        .map(|offset| charges_idx + 1 + offset)
+        .unwrap_or(admin.len());
+    let charges_block = &admin[charges_idx..next_route];
+    assert!(
+        charges_block.contains("try_global_registry"),
+        "GET /charges must use try_global_registry"
+    );
+    assert!(
+        charges_block.contains("empty_charges_json")
+            && charges_block.contains("empty_charges_prometheus"),
+        "GET /charges must render empty shapes without claiming the registry"
+    );
+    assert!(
+        !charges_block.contains("global_registry()"),
+        "GET /charges must not call owning global_registry()"
     );
 }

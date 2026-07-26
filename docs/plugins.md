@@ -1459,20 +1459,23 @@ order.
 external identity as the request principal even when no configured Consumer
 matches, so the number of distinct billing identities is not bounded by
 configuration. The shared registry therefore admits at most `max_entries`
-distinct identities and at most `max_retained_bytes` of retained state. Once
-either ceiling is reached, further *new* identities are not dropped: their
-charges are folded into a fixed-cardinality aggregate row whose `consumer` label
-is the internal sentinel
+retained billing rows (complete registry entry keys) and at most
+`max_retained_bytes` of retained state. A registry key includes consumer,
+proxy, billable status, protocol family, currency, namespace, and prices, so one
+authenticated principal can occupy many slots. Once either ceiling is reached,
+further *new rows* are not dropped: their charges are folded into a
+fixed-cardinality aggregate row whose `consumer` label is the internal sentinel
 `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
 keeping every other dimension (proxy, billable status, protocol family,
 currency, namespace, prices) intact so invoice totals still reconcile — only
-per-identity attribution is lost. That sentinel lives in the digest-form
+per-identity attribution is lost when a new row cannot be admitted. That
+sentinel lives in the digest-form
 billing-identity class (`~sha256:` marker, non-hex suffix), so
 `bounded_billing_identity` can never return it for a real authenticated claim
 or operator-configured Consumer username — including one equal to the
 human-looking label `__cardinality_overflow__` or to the sentinel string
 itself.
-Already-admitted identities keep accumulating normally and capacity is recovered
+Already-admitted rows keep accumulating normally and capacity is recovered
 by ordinary `stale_entry_ttl_seconds` eviction. Admission pressure is exported
 as fixed-cardinality, identity-free series
 (`ferrum_api_chargeback_registry_entries`,
@@ -1485,14 +1488,18 @@ the JSON format. `dropped_charges_total` is the only genuine loss path: it can
 advance only when even the aggregate row cannot reserve bytes, which means
 `max_retained_bytes` is set below the space the configured proxy/status matrix
 needs. Because `/charges` renders the whole registry in one pass, render cost is
-bounded by `max_entries`; size it for the cardinality you are willing to scrape.
+bounded by `max_entries`; size it for the row cardinality you are willing to
+scrape.
 Neither budget accepts `0` — there is no unlimited mode. Budgets (and the other
 process-global tunables) are applied only once a plugin generation is accepted
 and installed, so admin validation and a rejected reload candidate never repoint
 the registry the live generation is still using. Lowering a budget never deletes
 retained billable state: existing entries keep their reservations and drain
-through normal TTL eviction while new identities overflow until occupancy falls
-back under the ceiling.
+through normal TTL eviction while new rows overflow until occupancy falls
+back under the ceiling. Authenticated `GET /charges` before any
+`api_chargeback` plugin is configured returns the empty response shape without
+creating the process-global registry, so a later accepted generation can still
+size the hot map with its configured pool shard count.
 
 **Billing identity integrity (GHSA-m28c-f3v5-26qg):** a verified external
 identity larger than 512 bytes is rejected at authentication with `403` rather
@@ -1565,8 +1572,8 @@ are HTTP/gRPC only).
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
-| `max_entries` | Integer | `100000` | Hard ceiling on distinct billing identities retained by the shared registry. New identities beyond it are folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped. Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
-| `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering identity rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
+| `max_entries` | Integer | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
+| `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
@@ -1576,7 +1583,7 @@ authentication policy.
 | Query Parameter | Description |
 |---|---|
 | _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels. Registry saturation is additionally exported as the identity-free gauges/counters `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, and `ferrum_api_chargeback_dropped_charges_total` |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum. A top-level `registry` object reports admission budget occupancy (`entries`, `max_entries`, `retained_bytes`, `max_retained_bytes`, `identity_overflow_total`, `dropped_charges_total`, `overflow_consumer_id`) with no identity values |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum. A top-level `registry` object reports admission budget occupancy (`entries` / `max_entries` count retained billing rows / complete entry keys, not distinct principals; also `retained_bytes`, `max_retained_bytes`, `identity_overflow_total`, `dropped_charges_total`, `overflow_consumer_id`) with no identity values |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and

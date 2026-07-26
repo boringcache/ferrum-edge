@@ -33,11 +33,16 @@ paths:
   after merge (shared `/charges` registry is exactly-once) and requires every
   enabled instance to agree on the process-global render/cleanup/budget
   tunables (`max_entries` / `max_retained_bytes` included). The registry admits
-  at most `max_entries` billing identities; refused identities fold into the
+  at most `max_entries` retained billing rows (complete entry keys — one
+  principal can occupy many slots across proxy/status/family/currency/
+  namespace/price dimensions); a refused new row folds into the
   fixed-cardinality internal overflow row
   (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
-  rather than being dropped. That sentinel is in the digest-form identity
-  class, so a real principal can never share its registry key.
+  rather than being dropped (per-identity attribution lost). That sentinel is
+  in the digest-form identity class, so a real principal can never share its
+  registry key. Authenticated `GET /charges` before the plugin is configured
+  must not claim the process-global registry (empty response; later accepted
+  generation sizes the hot map with its configured pool shard count).
 - Billing identities are never prefix-truncated. External identity claims above
   512 bytes are rejected at the authentication boundary
   (`commit_authentication_attempt`); anything still needing a bound inside

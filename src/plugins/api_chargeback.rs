@@ -79,7 +79,7 @@ pub const API_CHARGEBACK_CONFIG_KEYS: &[&str] = &[
 const MAX_REGISTRY_IDENTITY_BYTES: usize = 512;
 
 /// Consumer label used for the fixed-cardinality aggregate row that absorbs
-/// charges once the identity budget is exhausted.
+/// charges once the retained-entry (`max_entries`) budget is exhausted.
 ///
 /// This is an *internal* registry representation, not a reserved username.
 /// It lives in the digest-form class used by
@@ -98,7 +98,9 @@ const MAX_REGISTRY_IDENTITY_BYTES: usize = 512;
 pub const OVERFLOW_CONSUMER_SENTINEL: &str =
     "__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1";
 
-/// Default maximum number of retained registry entries.
+/// Default maximum number of retained registry entry keys (complete billing
+/// rows). One authenticated principal can occupy many slots because the key
+/// also includes proxy, status, protocol family, currency, namespace, and prices.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
 /// Default maximum retained registry bytes (64 MiB).
@@ -117,6 +119,30 @@ static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
 
 pub fn global_registry() -> Arc<ChargebackRegistry> {
     global_registry_with_shard_amount(crate::util::sharding::pool_shard_amount(0))
+}
+
+/// Non-owning view of the process-global registry.
+///
+/// Returns `None` when no `api_chargeback` instance (and no other owning caller)
+/// has created the singleton yet. Admin `GET /charges` must use this so an
+/// authenticated scrape before the plugin is configured cannot claim the
+/// `OnceLock` with auto sharding and permanently prevent a later accepted
+/// generation from honoring `PluginHttpClient::pool_shard_amount()`.
+pub fn try_global_registry() -> Option<Arc<ChargebackRegistry>> {
+    CHARGEBACK_REGISTRY.get().cloned()
+}
+
+/// Authenticated empty `/charges` JSON shape used when the registry has never
+/// been created. Allocates only an ephemeral local registry — it does **not**
+/// claim [`CHARGEBACK_REGISTRY`].
+pub fn empty_charges_json() -> Result<String, String> {
+    ChargebackRegistry::with_shard_amount(1).render_json_uncached()
+}
+
+/// Authenticated empty `/charges` Prometheus shape used when the registry has
+/// never been created. Does **not** claim [`CHARGEBACK_REGISTRY`].
+pub fn empty_charges_prometheus() -> Result<String, String> {
+    ChargebackRegistry::with_shard_amount(1).render_prometheus_uncached()
 }
 
 /// Resolve the process-global registry, creating it with `shard_amount` shards
@@ -379,9 +405,10 @@ pub struct ChargebackEntry {
     /// Bytes this entry reserved against the registry's retained-byte budget.
     /// Released verbatim on eviction so the counter stays exact.
     retained_bytes: usize,
-    /// Whether this entry consumed one of the `max_entries` identity slots.
+    /// Whether this entry consumed one of the `max_entries` retained-row slots.
     /// Aggregate overflow rows do not (their cardinality is bounded by
-    /// configuration, not by attacker-chosen identities).
+    /// configuration — proxy × status × family × currency/namespace × prices —
+    /// not by attacker-chosen principals).
     counts_against_identity_budget: bool,
 }
 
@@ -500,12 +527,15 @@ pub struct SharedRegistryTunables {
     pub stale_entry_ttl_secs: u64,
     pub cache_invalidation_min_age_ms: u64,
     pub cleanup_interval_seconds: u64,
-    /// Hard ceiling on distinct billing identities retained by the shared
-    /// registry. Charges beyond it are folded into the fixed-cardinality
-    /// aggregate row instead of being dropped.
+    /// Hard ceiling on retained billing rows (complete registry entry keys) in
+    /// the shared registry. A new row that cannot be admitted is folded into
+    /// the fixed-cardinality aggregate instead of being dropped — invoice
+    /// totals still reconcile, only per-identity attribution is lost. One
+    /// principal can occupy many slots because keys also include proxy, status,
+    /// protocol family, currency, namespace, and prices.
     pub max_entries: usize,
-    /// Hard ceiling on retained registry bytes, covering identity rows and the
-    /// aggregate overflow rows together.
+    /// Hard ceiling on retained registry bytes, covering ordinary billing rows
+    /// and the aggregate overflow rows together.
     pub max_retained_bytes: usize,
 }
 
@@ -744,6 +774,10 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
+    /// Shard count the entry map was built with. Fixed for the process-global
+    /// singleton's lifetime; recorded so tests can assert the accepted
+    /// generation's `PluginHttpClient::pool_shard_amount()` reached the map.
+    shard_amount: usize,
     /// Current display names from the published gateway configuration.
     active_proxy_names: ArcSwap<HashMap<String, String>>,
     /// Advances whenever `active_proxy_names` is replaced. Render caches carry
@@ -759,19 +793,22 @@ pub struct ChargebackRegistry {
     cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
-    /// Hard ceiling on distinct billing identities (GHSA-wxmv-8mwr-92xf).
+    /// Hard ceiling on retained billing rows / complete entry keys
+    /// (GHSA-wxmv-8mwr-92xf). Not a distinct-principal ceiling: one identity
+    /// can consume many slots across proxy/status/family/currency/namespace/
+    /// price dimensions.
     max_entries: AtomicUsize,
-    /// Hard ceiling on retained bytes across identity and aggregate rows.
+    /// Hard ceiling on retained bytes across ordinary and aggregate rows.
     max_retained_bytes: AtomicUsize,
-    /// Identity slots reserved before a new identity key is published. Reserved
+    /// Entry-key slots reserved before a new billing row is published. Reserved
     /// atomically so concurrent cold-path inserts cannot publish state above
     /// `max_entries`.
     reserved_entries: AtomicUsize,
-    /// Retained bytes reserved by every live entry, identity and aggregate.
+    /// Retained bytes reserved by every live entry, ordinary and aggregate.
     retained_bytes: AtomicUsize,
     /// Charges that were admitted to the fixed-cardinality aggregate row
-    /// because the identity budget was exhausted. Billable state is preserved;
-    /// only per-identity attribution is lost.
+    /// because the retained-entry budget was exhausted. Billable state is
+    /// preserved; only per-identity attribution is lost.
     identity_overflow_total: AtomicU64,
     /// Charges that could not be retained at all because even the aggregate row
     /// could not reserve bytes. This is real billing loss and is exported.
@@ -798,6 +835,7 @@ impl ChargebackRegistry {
         Self {
             epoch: Instant::now(),
             entries: DashMap::with_shard_amount(shard_amount),
+            shard_amount,
             active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
             proxy_metadata_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
@@ -1050,13 +1088,17 @@ impl ChargebackRegistry {
     /// `0` and identical prices. `proxy_name` is intentionally omitted from the
     /// key (issue #2572).
     ///
-    /// **Admission (GHSA-wxmv-8mwr-92xf)**: the cold path reserves one identity
-    /// slot and its retained bytes against the process-global budget before
-    /// publishing a new key. A refusal does not discard the charge — it is
-    /// re-recorded under the fixed-cardinality
+    /// **Admission (GHSA-wxmv-8mwr-92xf)**: the cold path reserves one retained
+    /// entry-key slot and its retained bytes against the process-global budget
+    /// before publishing a new key. A refusal does not discard the charge — it
+    /// is re-recorded under the fixed-cardinality
     /// [`OVERFLOW_CONSUMER_SENTINEL`] row, which keeps every non-identity
     /// dimension (proxy, status, family, currency, namespace, prices) and
     /// therefore preserves the billable totals an operator invoices from.
+    /// Per-identity attribution is what is lost when a new row cannot be
+    /// admitted. The budget counts complete registry keys, not distinct
+    /// principals — one identity across multiple statuses/proxies/prices can
+    /// consume many slots.
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
@@ -1107,8 +1149,8 @@ impl ChargebackRegistry {
 
     /// Record one charge against an already-bounded identity.
     ///
-    /// `identity_admission` is `true` for a real billing identity (consumes an
-    /// identity slot) and `false` for the aggregate overflow row.
+    /// `identity_admission` is `true` for an ordinary billing row (consumes one
+    /// `max_entries` slot) and `false` for the aggregate overflow row.
     #[allow(clippy::too_many_arguments)]
     fn record_admitted(
         &self,
@@ -1183,7 +1225,7 @@ impl ChargebackRegistry {
                     bandwidth_received: bw_price_received,
                 },
             );
-            // Reserve the identity slot and its retained bytes BEFORE the key is
+            // Reserve the entry-key slot and its retained bytes BEFORE the key is
             // published, so concurrent cold-path inserts can never publish state
             // above the configured ceilings.
             let entry_bytes = entry_retained_bytes(
@@ -1200,7 +1242,7 @@ impl ChargebackRegistry {
                 self.maybe_invalidate_caches();
                 if identity_admission {
                     self.identity_overflow_total.fetch_add(1, Ordering::Relaxed);
-                    self.warn_on_admission("identity budget exhausted");
+                    self.warn_on_admission("entry budget exhausted");
                     self.record_admitted(
                         scope,
                         OVERFLOW_CONSUMER_SENTINEL,
@@ -1256,13 +1298,13 @@ impl ChargebackRegistry {
         self.maybe_invalidate_caches();
     }
 
-    /// Reserve one entry's retained bytes, and an identity slot when the entry
-    /// is a real billing identity.
+    /// Reserve one entry's retained bytes, and a retained-row slot when the
+    /// entry is an ordinary billing row (not the aggregate overflow).
     ///
-    /// Aggregate overflow rows deliberately skip the identity-slot ceiling:
+    /// Aggregate overflow rows deliberately skip the `max_entries` ceiling:
     /// their cardinality is bounded by configuration (proxy × status × protocol
     /// family × currency/namespace × price set), not by attacker-selectable
-    /// identities. They still reserve bytes, so the retained-byte ceiling stays
+    /// principals. They still reserve bytes, so the retained-byte ceiling stays
     /// a hard bound on total registry footprint.
     fn try_reserve(&self, entry_bytes: usize, identity_admission: bool) -> bool {
         if identity_admission {
@@ -1324,21 +1366,22 @@ impl ChargebackRegistry {
         );
     }
 
-    /// Distinct billing identities currently retained.
+    /// Billing rows (complete registry entry keys) currently reserved against
+    /// `max_entries`.
     #[doc(hidden)]
     #[allow(dead_code)] // asserted by external adversarial tests
     pub fn reserved_entries_for_tests(&self) -> usize {
         self.reserved_entries.load(Ordering::Acquire)
     }
 
-    /// Bytes currently reserved across identity and aggregate rows.
+    /// Bytes currently reserved across ordinary and aggregate rows.
     #[doc(hidden)]
     #[allow(dead_code)] // asserted by external adversarial tests
     pub fn retained_bytes_for_tests(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
     }
 
-    /// Configured identity ceiling. Lifecycle tests assert that construction
+    /// Configured retained-row ceiling. Lifecycle tests assert that construction
     /// leaves it untouched and only an accepted generation publishes it.
     #[doc(hidden)]
     #[allow(dead_code)]
@@ -1351,6 +1394,13 @@ impl ChargebackRegistry {
     #[allow(dead_code)]
     pub fn max_retained_bytes_for_test(&self) -> usize {
         self.max_retained_bytes.load(Ordering::Acquire)
+    }
+
+    /// Shard count the entry map was built with.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn shard_amount_for_tests(&self) -> usize {
+        self.shard_amount
     }
 
     fn maybe_invalidate_caches(&self) {
@@ -1686,7 +1736,7 @@ impl ChargebackRegistry {
         //     operator can alert on admission pressure without the diagnostics
         //     themselves becoming an exhaustion vector.
         output.push_str(
-            "# HELP ferrum_api_chargeback_registry_entries Distinct billing identities currently retained by the shared registry.\n",
+            "# HELP ferrum_api_chargeback_registry_entries Billing rows (complete registry entry keys) currently retained against max_entries.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_registry_entries gauge\n");
         output.push_str(&format!(
@@ -1694,7 +1744,7 @@ impl ChargebackRegistry {
             self.reserved_entries.load(Ordering::Relaxed)
         ));
         output.push_str(
-            "# HELP ferrum_api_chargeback_registry_max_entries Configured ceiling on retained billing identities.\n",
+            "# HELP ferrum_api_chargeback_registry_max_entries Configured ceiling on retained billing rows (complete registry entry keys).\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_registry_max_entries gauge\n");
         output.push_str(&format!(
@@ -1718,7 +1768,7 @@ impl ChargebackRegistry {
             self.max_retained_bytes.load(Ordering::Relaxed)
         ));
         output.push_str(
-            "# HELP ferrum_api_chargeback_identity_overflow_total Charges folded into the aggregate overflow row because the identity budget was exhausted.\n",
+            "# HELP ferrum_api_chargeback_identity_overflow_total Charges folded into the aggregate overflow row because a new billing row could not be admitted under max_entries (per-identity attribution lost).\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_identity_overflow_total counter\n");
         output.push_str(&format!(
@@ -1726,7 +1776,7 @@ impl ChargebackRegistry {
             self.identity_overflow_total.load(Ordering::Relaxed)
         ));
         output.push_str(
-            "# HELP ferrum_api_chargeback_dropped_charges_total Charges lost because neither an identity row nor the aggregate row could be admitted.\n",
+            "# HELP ferrum_api_chargeback_dropped_charges_total Charges lost because neither an ordinary billing row nor the aggregate row could be admitted.\n",
         );
         output.push_str("# TYPE ferrum_api_chargeback_dropped_charges_total counter\n");
         output.push_str(&format!(
@@ -2212,6 +2262,14 @@ impl ApiChargeback {
             scope,
             tunables,
         })
+    }
+
+    /// Shard count the process-global entry map was built with when this
+    /// instance resolved it (or the already-created singleton's fixed count).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn registry_shard_amount_for_tests(&self) -> usize {
+        self.registry.shard_amount_for_tests()
     }
 }
 
