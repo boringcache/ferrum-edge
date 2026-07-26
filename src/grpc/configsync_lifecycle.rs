@@ -686,6 +686,16 @@ pub fn evaluate_delta_against_subscription_base(
 /// may safely establish a base, but that must not authorize the fallback CP to
 /// replay deltas from the history between that snapshot and the applied
 /// watermark (an ABA rollback).
+///
+/// Deliberately source-blind: accepting a cross-source snapshot rewrites
+/// `AppliedSnapshotAuthority::source_cp_url` to that CP, so exempting the
+/// authority's own source would make this check inert in exactly the ABA case
+/// it exists for. A CP that legitimately lags is fenced until it catches back
+/// up, which is the fail-closed direction.
+///
+/// Only strictly older stamps are refused. Equal stamps, newer stamps, and an
+/// authority with no established watermark proceed to the ordinary
+/// subscription-base and parse/validate/apply gates.
 pub fn evaluate_delta_authority(
     authority: Option<&AppliedSnapshotAuthority>,
     incoming_committed: DateTime<Utc>,

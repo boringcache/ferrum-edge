@@ -4691,6 +4691,222 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     client_handle.abort();
 }
 
+/// A delta that only adds `proxy`, stamped at `poll_timestamp`.
+///
+/// The freshness fence reads the body stamp, so tests that exercise it must be
+/// able to place a delta before or after the applied watermark.
+fn add_proxy_delta_at(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+    IncrementalResult {
+        poll_timestamp,
+        ..add_proxy_delta(proxy)
+    }
+}
+
+/// Broadcast `delta` as a DELTA envelope whose version matches its body stamp.
+fn send_delta(
+    tx: &tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    delta: &IncrementalResult,
+) {
+    let version = delta.poll_timestamp.to_rfc3339();
+    let body = serde_json::to_string(delta).unwrap();
+    let _ = tx.send(delta_update(body, &version));
+}
+
+/// Wait until the DP reports an accepted config other than `previous`.
+///
+/// Only an *accepted* update moves this stamp, so it distinguishes a failover
+/// snapshot that established a delta base from one that was fenced.
+async fn wait_for_new_accepted_config(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    previous: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if connection_state.load().last_config_received_at != previous {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_the_base() {
+    // ABA rollback acceptance, driven through the real DP ConfigSync call path
+    // rather than the lifecycle helper alone:
+    //
+    //   A   primary CP publishes config at T0 with trust bundle X — applied,
+    //       freshness watermark T0
+    //   B   history the fallback CP never caught up with
+    //   A'  fallback CP's snapshot is content-equivalent to the applied payload
+    //       (same GatewayConfig content, same gateway-trust side channel) but
+    //       stamped T0-6h, so the identical-payload exception admits it as a
+    //       safe delta base while the watermark stays at T0
+    //
+    // Establishing that base must not authorize the fallback CP to replay a
+    // DELTA from the B history: applying it would roll the DP back underneath
+    // the config that superseded it. The delta must be refused before
+    // `apply_incremental` and the stream terminated.
+    let mut newer = create_test_config(3);
+    newer.loaded_at = Utc::now();
+    newer.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
+
+    let mut equivalent_older = create_test_config(3);
+    equivalent_older.loaded_at = Utc::now() - chrono::Duration::hours(6);
+    equivalent_older.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let (older_addr, older_tx, _older_handle) = start_test_cp_server(equivalent_older).await;
+
+    let proxy_state = create_test_proxy_state();
+    let newer_url = format!("http://127.0.0.1:{}", newer_addr.port());
+    let older_url = format!("http://127.0.0.1:{}", older_addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&newer_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![newer_url, older_url.clone()];
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
+        "DP should apply the primary CP's snapshot"
+    );
+    let watermark = proxy_state.config.load().loaded_at;
+    let accepted_at = connection_state.load().last_config_received_at;
+
+    // Fail over to the equivalent-but-older CP.
+    newer_handle.abort();
+    let base_taken = wait_for_new_accepted_config(&connection_state, accepted_at).await;
+    assert!(
+        base_taken,
+        "the equivalent older cross-source snapshot must be accepted as a delta base — \
+         without that the rest of this test would prove nothing about deltas"
+    );
+    assert!(
+        connection_state.load().cp_url == older_url,
+        "DP must be attached to the fallback CP after failover"
+    );
+
+    // The ABA delta: stamped inside the history the applied config already
+    // superseded, and structurally valid, so only the freshness fence stops it.
+    let rollback = create_test_proxy("aba-rollback", "/aba");
+    let stale = add_proxy_delta_at(rollback, Utc::now() - chrono::Duration::hours(3));
+    // Re-broadcast a few times: a delta sent while the DP is momentarily between
+    // attempts is simply dropped, which would pass this test for the wrong
+    // reason. Every delivery must be fenced.
+    for _ in 0..3 {
+        send_delta(&older_tx, &stale);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    assert!(
+        !wait_for_proxy_id(&proxy_state, "aba-rollback", Duration::from_secs(5)).await,
+        "a DELTA older than the applied authority watermark must never apply"
+    );
+    assert!(
+        proxy_state.config.load().loaded_at >= watermark,
+        "a refused DELTA must not roll the applied config's committed stamp backwards"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
+    // The freshness fence must be a floor, not a wedge. A stale DELTA is
+    // refused and terminates the stream; the DP then reconnects, re-establishes
+    // an authoritative base, and ordinary forward-progress deltas keep applying.
+    // Without the second half, a fence that rejected everything would pass.
+    let mut base = create_test_config(1);
+    base.loaded_at = Utc::now();
+    let (addr, update_tx, _server_handle) = start_test_cp_server(base).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![cp_url];
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 1, Duration::from_secs(10)).await,
+        "DP should apply the initial snapshot"
+    );
+    let watermark = proxy_state.config.load().loaded_at;
+
+    let rolled_back = create_test_proxy("stale-delta", "/stale-delta");
+    let stale = add_proxy_delta_at(rolled_back, watermark - chrono::Duration::hours(1));
+    send_delta(&update_tx, &stale);
+    assert!(
+        !wait_for_proxy_id(&proxy_state, "stale-delta", Duration::from_secs(5)).await,
+        "a DELTA stamped before the applied watermark must be refused before apply"
+    );
+    assert!(
+        proxy_state.config.load().loaded_at >= watermark,
+        "a refused DELTA must not roll the committed stamp backwards"
+    );
+
+    // The fence terminated the stream; the DP reconnects to the same CP and
+    // re-establishes a base. Re-broadcast until a subscriber is back on the
+    // stream — a broadcast sent while the DP is between attempts is dropped by
+    // design, which is a reconnect race, not a fence outcome.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut applied = false;
+    while std::time::Instant::now() < deadline {
+        let forward = create_test_proxy("fresh-delta", "/fresh-delta");
+        let fresh = add_proxy_delta_at(forward, Utc::now());
+        send_delta(&update_tx, &fresh);
+        if wait_for_proxy_id(&proxy_state, "fresh-delta", Duration::from_millis(500)).await {
+            applied = true;
+            break;
+        }
+    }
+    assert!(
+        applied,
+        "a DELTA at or after the watermark must still apply after a stale one was fenced"
+    );
+
+    client_handle.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn older_cross_source_payload_comparison_canonicalizes_the_candidate() {
     // The older-cross-source identical-payload exception compares a raw

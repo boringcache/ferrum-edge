@@ -405,6 +405,66 @@ fn equivalent_older_snapshot_does_not_authorize_aba_delta_rollback() {
     assert!(evaluate_delta_authority(Some(&fallback_authority), applied).is_ok());
 }
 
+#[test]
+fn delta_authority_fence_admits_equal_newer_and_unestablished_watermarks() {
+    // The fence is a freshness floor, not an ordering tightener: only stamps
+    // strictly older than the applied watermark are refused. A watermark that
+    // was never established (no authority, or an authority with no comparable
+    // version) has nothing to fence against, so the delta proceeds to the
+    // subscription-base gate and the ordinary parse/validate/apply path.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+
+    // Equal: a CP re-sending at the watermark is not a rollback.
+    assert!(evaluate_delta_authority(Some(&authority), applied).is_ok());
+    // Newer: ordinary forward progress.
+    assert!(
+        evaluate_delta_authority(Some(&authority), applied + chrono::Duration::seconds(1)).is_ok()
+    );
+    // One second older is still a rollback.
+    assert_eq!(
+        evaluate_delta_authority(Some(&authority), applied - chrono::Duration::seconds(1)),
+        Err(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: applied - chrono::Duration::seconds(1),
+        })
+    );
+
+    assert!(evaluate_delta_authority(None, applied - chrono::Duration::hours(9)).is_ok());
+    let unestablished = AppliedSnapshotAuthority {
+        version: None,
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Unknown,
+    };
+    assert!(
+        evaluate_delta_authority(Some(&unestablished), applied - chrono::Duration::hours(9)).is_ok()
+    );
+}
+
+#[test]
+fn delta_authority_fence_applies_to_the_same_source_that_holds_authority() {
+    // Deliberately source-blind. After a cross-source snapshot is accepted the
+    // authority's `source_cp_url` becomes that CP, so a source-exempt fence
+    // would be inert exactly in the ABA case it exists to stop. A lagging CP
+    // replaying its own history is fenced until it catches back up.
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-fallback:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+
+    assert!(matches!(
+        evaluate_delta_authority(Some(&authority), applied - chrono::Duration::minutes(1)),
+        Err(StaleSnapshotReject::OlderThanApplied { .. })
+    ));
+    assert!(evaluate_delta_authority(Some(&authority), applied).is_ok());
+}
+
 fn test_runtime_trust(domain: &str, ders: &[&[u8]]) -> RuntimeTrustBundleSet {
     RuntimeTrustBundleSet {
         local: TrustBundle {
