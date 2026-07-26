@@ -427,10 +427,11 @@ impl AdminState {
         self.cached_config.as_ref().map(|c| c.load_full())
     }
 
-    /// Check whether write operations are allowed. Returns an error response
-    /// if the admin API is read-only, the database is currently unavailable, or
-    /// the active pool is on sticky failover without
-    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES` (issue #3001).
+    /// Observe-only write-gate evaluation (issue #3001).
+    ///
+    /// Used by `/health` and policy tests. **Mutation handlers must call
+    /// [`Self::admit_write`] instead** so a reconnect cannot redirect an
+    /// already-admitted write onto a newly published failover topology.
     ///
     /// Observationally pure: does not mutate failover topology counters or
     /// risk markers. Opt-in enablement is recorded by the store when
@@ -445,7 +446,39 @@ impl AdminState {
         self.evaluate_write_gate().is_some()
     }
 
-    fn evaluate_write_gate(&self) -> Option<Response<Full<Bytes>>> {
+    /// Admit an Admin API mutation under a write-topology pin (issue #3001).
+    ///
+    /// Acquires a backend topology pin **before** evaluating sticky-failover
+    /// policy, and returns that pin so the caller retains it through
+    /// persistence and response construction. Ordering:
+    /// - If a failover reconnect publishes first, this returns the existing
+    ///   `503` fail-closed response (or admits under opt-in and pins failover).
+    /// - If this pin wins first, reconnect publication waits (SQL) or
+    ///   fail-fast defers (Mongo) until the permit drops, so the mutation
+    ///   cannot silently land on a different topology.
+    pub async fn admit_write(
+        &self,
+    ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            return Err(response);
+        }
+        if let Some(ref db) = self.db {
+            let permit = db.acquire_write_topology_permit().await;
+            let topology = db.failover_topology_status();
+            if !topology.primary_active && !topology.allow_writes {
+                return Err(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
+                    }),
+                ));
+            }
+            return Ok(permit);
+        }
+        Ok(crate::config::db_backend::DbWriteTopologyPermit::noop())
+    }
+
+    fn evaluate_non_topology_write_gate(&self) -> Option<Response<Full<Bytes>>> {
         if self.read_only {
             return Some(json_response(
                 StatusCode::FORBIDDEN,
@@ -459,6 +492,13 @@ impl AdminState {
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "Database is currently unavailable — admin API is temporarily read-only"}),
             ));
+        }
+        None
+    }
+
+    fn evaluate_write_gate(&self) -> Option<Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            return Some(response);
         }
         if let Some(ref db) = self.db {
             let topology = db.failover_topology_status();
@@ -4992,9 +5032,10 @@ async fn handle_update_credentials(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5104,9 +5145,10 @@ async fn handle_delete_credentials(
     cred_type: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5189,9 +5231,10 @@ async fn handle_append_credential(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5327,9 +5370,10 @@ async fn handle_delete_credential_by_index(
     index_str: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5619,9 +5663,10 @@ async fn handle_batch_create(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,
@@ -6445,9 +6490,10 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,

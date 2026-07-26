@@ -854,10 +854,11 @@ mod inner {
         // client can still open sockets, then removes them when the final old
         // bundle reference is dropped.
         connection: Arc<ArcSwap<MongoConnectionBundle>>,
-        // Admission operations hold the read side from lock acquisition
-        // through validation, mutation, and owner-qualified release. A
-        // reconnect must take the write side before swapping `connection`, so
-        // one protected operation can never straddle MongoDB generations.
+        // Admission operations and Admin write-topology permits hold the read
+        // side from acquisition through mutation completion / response
+        // construction. A reconnect must take the write side before swapping
+        // `connection`, so one protected operation can never straddle MongoDB
+        // generations (issue #3001 check-to-use race).
         connection_generation: Arc<tokio::sync::RwLock<()>>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
@@ -1422,8 +1423,9 @@ mod inner {
         /// - The generation `try_write` is acquired first (fail-fast, no
         ///   unbounded wait). A deferred reconnect leaves topology untouched.
         /// - When `failover_url_redacted` is `Some`, `mark_failover` runs
-        ///   *before* the ArcSwap so `check_write_allowed()` can never observe
-        ///   a failover connection while `primary_active` is still true.
+        ///   *before* the ArcSwap so `admit_write()` / `check_write_allowed()`
+        ///   can never observe a failover connection while `primary_active`
+        ///   is still true.
         /// - After the gate flips, publication cannot fail (swap is infallible
         ///   under the held guard), so there is no post-flip restore path.
         /// - Primary failback keeps marking primary *after* publish
@@ -5284,6 +5286,17 @@ mod inner {
 
         fn set_failover_allow_writes(&mut self, allow: bool) {
             self.failover_topology.set_allow_writes(allow);
+        }
+
+        async fn acquire_write_topology_permit(
+            &self,
+        ) -> crate::config::db_backend::DbWriteTopologyPermit {
+            // Shared read pin on the same generation gate reconnect uses for
+            // fail-fast `try_write`. An in-flight mutation therefore cannot be
+            // redirected to a newly published failover/primary connection, and
+            // reconnect stays fail-fast while pins are held.
+            let guard = self.connection_generation.clone().read_owned().await;
+            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
         }
 
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {

@@ -623,3 +623,241 @@ async fn test_check_write_allowed_opt_in_is_policy_pure() {
     );
     assert_eq!(db.failover_topology_status(), after);
 }
+
+#[tokio::test]
+async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
+    use ferrum_edge::_test_support::DbPoolConfig;
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::db_loader::DatabaseStore;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!store.failover_topology_status().primary_active);
+
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(store);
+    let state = AdminState {
+        db: Some(db),
+        jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: Some(db_flag),
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    };
+
+    let err = state
+        .admit_write()
+        .await
+        .expect_err("admit_write must fail closed on failover without opt-in");
+    assert_eq!(err.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
+    use ferrum_edge::_test_support::{
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
+        database_store_reconnect_as_failover_for_test,
+        database_store_set_reconnect_transition_hooks_for_test,
+    };
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::db_loader::DatabaseStore;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::oneshot;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    assert!(store.failover_topology_status().primary_active);
+
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(store.clone());
+    let state = AdminState {
+        db: Some(db),
+        jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: Some(db_flag),
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    };
+
+    let permit = state
+        .admit_write()
+        .await
+        .expect("primary admit_write must succeed");
+    assert!(
+        permit.is_pinned(),
+        "admit_write must return a live topology pin for SQL backends"
+    );
+
+    let (before_lock_tx, before_lock_rx) = oneshot::channel::<()>();
+    let holding = Arc::new(AtomicBool::new(false));
+    let before_lock_tx = Arc::new(StdMutex::new(Some(before_lock_tx)));
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let before_lock_tx = Arc::clone(&before_lock_tx);
+                move |topology| {
+                    let before_lock_tx = Arc::clone(&before_lock_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Failover {
+                            return;
+                        }
+                        if let Some(tx) = before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let holding = Arc::clone(&holding);
+                move |topology| {
+                    let holding = Arc::clone(&holding);
+                    Box::pin(async move {
+                        if topology == SqlReconnectTopology::Failover {
+                            holding.store(true, Ordering::SeqCst);
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let failover_store = store.clone();
+    let failover_url_task = failover_url.clone();
+    let failover_task = tokio::spawn(async move {
+        database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
+    });
+    before_lock_rx
+        .await
+        .expect("failover must reach write lock while admit pin is held");
+    assert!(
+        !holding.load(Ordering::SeqCst),
+        "reconnect must wait for the full mutation permit lifetime"
+    );
+    assert!(store.failover_topology_status().primary_active);
+
+    drop(permit);
+    failover_task
+        .await
+        .expect("join failover")
+        .expect("failover reconnect");
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+    assert!(!store.failover_topology_status().primary_active);
+}
+
+/// Every Admin API mutation path covered by the write gate must call
+/// `admit_write()` (topology pin). The sync `check_write_allowed()` remains
+/// observe-only for `/health` and policy tests.
+#[test]
+fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
+    let sources = [
+        include_str!("../../../src/admin/mod.rs"),
+        include_str!("../../../src/admin/crud.rs"),
+        include_str!("../../../src/admin/api_specs/handlers.rs"),
+        include_str!("../../../src/admin/tls_management.rs"),
+    ];
+    let joined = sources.join("\n");
+    assert!(
+        joined.contains("admit_write().await"),
+        "admin mutation handlers must call admit_write"
+    );
+    // Handler call sites must not use the sync gate alone.
+    for (name, src) in [
+        ("mod.rs", sources[0]),
+        ("crud.rs", sources[1]),
+        ("api_specs/handlers.rs", sources[2]),
+        ("tls_management.rs", sources[3]),
+    ] {
+        for (idx, line) in src.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.contains("check_write_allowed()")
+                && !trimmed.starts_with("//")
+                && !trimmed.starts_with("*")
+                && !trimmed.contains("fn check_write_allowed")
+                && !trimmed.contains("[`Self::check_write_allowed`]")
+                && !trimmed.contains("Self::check_write_allowed")
+            {
+                // Allow the method definition body reference only inside
+                // evaluate_write_gate / docs — any `state.check_write_allowed()`
+                // call in handlers is a regression of the check-to-use race.
+                assert!(
+                    !trimmed.contains("state.check_write_allowed()"),
+                    "{name}:{} still calls state.check_write_allowed(); mutations must use admit_write:\n{trimmed}",
+                    idx + 1
+                );
+            }
+        }
+    }
+}

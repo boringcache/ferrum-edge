@@ -613,9 +613,9 @@ pub type SqlReconnectTransitionHook = Arc<
 #[derive(Clone, Default)]
 pub struct SqlReconnectTransitionTestHooks {
     /// Invoked after a successful connect and immediately before awaiting the
-    /// reconnect transition mutex.
+    /// reconnect transition write lock.
     pub before_lock: Option<SqlReconnectTransitionHook>,
-    /// Invoked while the reconnect transition mutex is held, after pool
+    /// Invoked while the reconnect transition write lock is held, after pool
     /// publication (and after failover gate-before-publish), before deferred
     /// migrations and primary `mark_primary` finalize the transition.
     pub while_holding: Option<SqlReconnectTransitionHook>,
@@ -639,10 +639,13 @@ pub struct DatabaseStore {
     /// the unavailable primary topology. Also tracks sticky failover topology
     /// and the process-local opt-in divergence-risk marker (issue #3001).
     failover_topology: DbFailoverTopologyState,
-    /// Serializes SQL reconnect publication + topology transitions across
-    /// concurrent callers (DB polling/failover and DB TLS reload), including
-    /// the deferred-migration await window. Not taken on request hot paths.
-    reconnect_transition: Arc<tokio::sync::Mutex<()>>,
+    /// Write-locks serialize SQL reconnect publication + topology transitions
+    /// across concurrent callers (DB polling/failover and DB TLS reload),
+    /// including the deferred-migration await window. Admin mutations take a
+    /// shared read lock via [`DatabaseBackend::acquire_write_topology_permit`]
+    /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
+    /// read/request hot paths.
+    reconnect_transition: Arc<tokio::sync::RwLock<()>>,
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
     reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
@@ -1781,7 +1784,7 @@ impl DatabaseStore {
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
-            reconnect_transition: Arc::new(tokio::sync::Mutex::new(())),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
@@ -1841,7 +1844,7 @@ impl DatabaseStore {
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
             failover_topology: DbFailoverTopologyState::new(),
-            reconnect_transition: Arc::new(tokio::sync::Mutex::new(())),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
             reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
@@ -6545,7 +6548,7 @@ impl DatabaseStore {
     }
 
     /// Install (or clear) async test hooks around the reconnect transition
-    /// mutex. Production leaves this unset.
+    /// write lock. Production leaves this unset.
     #[allow(dead_code)] // exercised via external unit tests through the lib target
     pub fn set_reconnect_transition_hooks_for_test(
         &self,
@@ -6582,10 +6585,11 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        // Connect outside the transition mutex so concurrent reconnect
+        // Connect outside the transition write lock so concurrent reconnect
         // attempts can open sockets in parallel; only publication/topology
         // (including deferred migrations) is serialized. Request hot paths
-        // never take this lock.
+        // never take this lock; Admin mutations take a shared read pin via
+        // `acquire_write_topology_permit` instead.
         let new_pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             db_url,
@@ -6600,15 +6604,17 @@ impl DatabaseStore {
         };
         self.invoke_reconnect_transition_hook(|hooks| hooks.before_lock.as_ref(), topology_kind)
             .await;
-        let _transition_guard = self.reconnect_transition.lock().await;
+        // Exclusive write lock: waits for in-flight mutation topology pins
+        // (shared reads) and serializes concurrent reconnect publishers.
+        let _transition_guard = self.reconnect_transition.write().await;
 
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
         // look immediately available on failback and skip the one reconnect
         // that refreshes its connections after the topology transition.
         // Gate-before-publish: flip the write gate before ArcSwap so
-        // `check_write_allowed()` cannot observe a failover pool while
-        // `primary_active` is still true.
+        // `check_write_allowed()` / `admit_write()` cannot observe a failover
+        // pool while `primary_active` is still true.
         if topology == DatabaseTopology::Failover {
             self.failover_topology
                 .mark_failover(&Self::redact_url(db_url));
@@ -9121,6 +9127,15 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_failover_allow_writes(&mut self, allow: bool) {
         self.failover_topology.set_allow_writes(allow);
+    }
+
+    async fn acquire_write_topology_permit(
+        &self,
+    ) -> crate::config::db_backend::DbWriteTopologyPermit {
+        // Shared read pin: blocks reconnect write publication for the
+        // mutation's lifetime without serializing concurrent Admin writes.
+        let guard = self.reconnect_transition.clone().read_owned().await;
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {

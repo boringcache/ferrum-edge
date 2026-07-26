@@ -59,6 +59,36 @@ impl Default for DbFailoverTopologyStatus {
     }
 }
 
+/// Opaque Admin API mutation pin of the active config-store write topology.
+///
+/// Holding this value retains a shared read lock on the backend reconnect /
+/// connection-generation gate so a concurrent reconnect cannot publish a new
+/// topology (pool or Mongo connection) until the permit is dropped. Acquire via
+/// [`DatabaseBackend::acquire_write_topology_permit`] and retain through the
+/// full mutation persistence lifetime (issue #3001 check-to-use race).
+pub struct DbWriteTopologyPermit {
+    _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl DbWriteTopologyPermit {
+    /// Construct a pin that holds `guard` until dropped.
+    pub(crate) fn pinned(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self {
+            _guard: Some(guard),
+        }
+    }
+
+    /// No-op permit for backends / modes without a reconnect topology gate.
+    pub fn noop() -> Self {
+        Self { _guard: None }
+    }
+
+    /// Whether this permit holds a live topology pin (test/observe helper).
+    pub fn is_pinned(&self) -> bool {
+        self._guard.is_some()
+    }
+}
+
 /// Shared sticky-failover window state for SQL and MongoDB config stores.
 ///
 /// Tracks topology transitions and a process-local opt-in risk marker for
@@ -1340,6 +1370,16 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Apply `FERRUM_DB_FAILOVER_ALLOW_WRITES` after store construction.
     fn set_failover_allow_writes(&mut self, allow: bool) {
         let _ = allow;
+    }
+
+    /// Acquire a mutation-only pin of the current write topology.
+    ///
+    /// Holding the returned permit prevents reconnect publication from
+    /// redirecting this mutation onto a different topology. Default is a
+    /// no-op permit for backends that do not participate in sticky failover.
+    /// Ordinary read/request hot paths must not call this.
+    async fn acquire_write_topology_permit(&self) -> DbWriteTopologyPermit {
+        DbWriteTopologyPermit::noop()
     }
 
     /// Return connection pool statistics for observability.

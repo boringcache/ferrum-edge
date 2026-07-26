@@ -2881,9 +2881,10 @@ pub async fn handle_post_api_spec(
     actor: &AuditActor,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,
@@ -3039,9 +3040,10 @@ pub async fn handle_put_api_spec(
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,
@@ -3408,9 +3410,10 @@ pub async fn handle_delete_api_spec(
     namespace: &str,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,
