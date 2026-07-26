@@ -7206,6 +7206,7 @@ async fn json_acknowledgement_policy_distinguishes_reported_failures_from_succes
         // A present non-string status is ambiguous and must not count as success.
         (r#"{"status":true}"#, false),
         (r#"{"status":1}"#, false),
+        (r#"{"status":null}"#, false),
         ("not json at all", false),
     ] {
         let server = MockServer::start().await;

@@ -3381,7 +3381,7 @@ fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
         }
     }
     match ack.get("status") {
-        None | Some(Value::Null) => {}
+        None => {}
         Some(Value::String(status))
             if matches!(
                 status.to_ascii_lowercase().as_str(),
