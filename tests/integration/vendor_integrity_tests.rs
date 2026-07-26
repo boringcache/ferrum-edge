@@ -20,6 +20,12 @@
 //! pairs — not the manifest's byte layout, so the on-disk header, ordering, and
 //! whitespace are cosmetic. Content hash is SHA-256 over LF-normalized bytes.
 //!
+//! Crate-local `Cargo.lock` files under `vendor/` are ignored by default because
+//! documented standalone vendor tests (`cargo test --manifest-path
+//! vendor/.../Cargo.toml`) can create them as incidental local outputs. Explicit
+//! exceptions live in [`GOVERNED_VENDOR_LOCKFILES`]: those committed lockfiles
+//! pin a standalone regression dependency graph and must appear in the manifest.
+//!
 //! `.expect()`/`.unwrap()` are used freely here per the test-code exemption.
 
 use sha2::{Digest, Sha256};
@@ -30,6 +36,18 @@ use std::path::{Path, PathBuf};
 const MANIFEST_REL: &str = "vendor/VENDOR_INTEGRITY.sha256";
 const VENDOR_REL: &str = "vendor";
 
+/// Repo-relative paths of committed vendor `Cargo.lock` files that pin a
+/// documented standalone regression dependency graph and are therefore part of
+/// the governed supply-chain surface.
+///
+/// All other crate-local `Cargo.lock` files under `vendor/` remain ignored so
+/// incidental lockfiles from documented standalone tests for other vendored
+/// crates do not cause false drift failures. Prefer extending this allowlist
+/// over parent-name heuristics when a new vendor lockfile is intentionally
+/// committed.
+const GOVERNED_VENDOR_LOCKFILES: &[&str] =
+    &["vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock"];
+
 fn repo_root() -> PathBuf {
     // Runtime lookup (not `env!`) so this resolves correctly when the test runs
     // from a prebuilt nextest archive on a different runner via
@@ -38,7 +56,22 @@ fn repo_root() -> PathBuf {
     PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()))
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Whether a repo-relative path under `vendor/` participates in the drift
+/// manifest. Non-lockfile paths are always included (aside from the manifest
+/// itself, which `compute_entries` drops). `Cargo.lock` paths are included only
+/// when listed in [`GOVERNED_VENDOR_LOCKFILES`].
+fn should_hash_vendor_file(rel_path: &str) -> bool {
+    let name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name == "Cargo.lock" {
+        return GOVERNED_VENDOR_LOCKFILES.contains(&rel_path);
+    }
+    true
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).expect("read vendor dir") {
         let path = entry.expect("vendor dir entry").path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -49,12 +82,15 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             if name == "target" {
                 continue;
             }
-            collect_files(&path, out);
+            collect_files(root, &path, out);
         } else if path.is_file() {
-            // Skip crate-local lockfiles that those same standalone test commands
-            // generate; they aren't part of the vendored sources and would
-            // otherwise cause a false drift failure for local developers.
-            if name == "Cargo.lock" {
+            let rel = path
+                .strip_prefix(root)
+                .expect("vendor path under repo root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Skip incidental crate-local lockfiles; keep allowlisted ones.
+            if !should_hash_vendor_file(&rel) {
                 continue;
             }
             out.push(path);
@@ -81,7 +117,7 @@ fn compute_entries() -> BTreeMap<String, String> {
     let manifest_abs = root.join(MANIFEST_REL);
 
     let mut files = Vec::new();
-    collect_files(&vendor, &mut files);
+    collect_files(&root, &vendor, &mut files);
     files.retain(|p| *p != manifest_abs);
 
     files
@@ -182,4 +218,43 @@ fn vendor_integrity_manifest_matches() {
          Changes detected:\n{}",
         first_differences(&existing, &computed)
     );
+}
+
+#[test]
+fn governed_vendor_lockfile_allowlist_includes_dimpl() {
+    assert!(should_hash_vendor_file(
+        "vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock"
+    ));
+    assert!(
+        GOVERNED_VENDOR_LOCKFILES.contains(&"vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock"),
+        "dimpl's committed standalone regression lockfile must stay allowlisted"
+    );
+}
+
+#[test]
+fn incidental_vendor_lockfiles_are_not_hashed() {
+    // Documented standalone tests for other vendored crates may create these
+    // locally; they must not enter the drift set unless intentionally committed
+    // and added to GOVERNED_VENDOR_LOCKFILES.
+    for path in [
+        "vendor/h3-0.0.8-ferrum-patched/Cargo.lock",
+        "vendor/reqwest-0.13.3-ferrum-patched/Cargo.lock",
+        "vendor/tungstenite-0.29.0-ferrum-patched/Cargo.lock",
+        "vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.lock",
+    ] {
+        assert!(
+            !should_hash_vendor_file(path),
+            "incidental lockfile must stay ignored: {path}"
+        );
+    }
+}
+
+#[test]
+fn non_lockfile_vendor_paths_remain_hashed() {
+    assert!(should_hash_vendor_file(
+        "vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml"
+    ));
+    assert!(should_hash_vendor_file(
+        "vendor/h3-0.0.8-ferrum-patched/src/lib.rs"
+    ));
 }

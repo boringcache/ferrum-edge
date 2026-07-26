@@ -62,8 +62,13 @@ through the deterministic byte-owner hook.
 `vendor/dimpl-0.6.1-ferrum-patched/` is the complete crates.io 0.6.1 package,
 including source, tests, README, changelog, both licenses, and
 `.cargo_vcs_info.json`. `dimpl-0.6.1-ferrum.patch` is the unified source diff
-against the unmodified registry package. `VENDOR_INTEGRITY.sha256` records the
-LF-normalized digest of every governed vendored file.
+against the unmodified registry package. The committed crate-local `Cargo.lock`
+pins the dependency graph for the hosted standalone credential-security
+regression (`cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml
+...`). `VENDOR_INTEGRITY.sha256` records the LF-normalized digest of every
+governed vendored file, including that lockfile via the
+`GOVERNED_VENDOR_LOCKFILES` allowlist in
+`tests/integration/vendor_integrity_tests.rs`.
 
 The path patch is intentionally narrow: only `dimpl` is redirected. Existing
 dependency features and Ferrum's public DTLS behavior remain intact.

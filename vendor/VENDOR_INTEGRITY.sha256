@@ -11,6 +11,7 @@ c821cfbb361ff4c5d67d5567c4933b4ff76b7e1eb61257c5f1ab22a8316dd79d  vendor/dimpl-0
 212695f9b42c278cc2bbdc9ff159378d34c093c2150d5c6d95982c653e68bacb  vendor/dimpl-0.6.1-ferrum-patched/.vscode/settings.json
 c44c1e82acad138cdbd5863fb52bb3d0e8f5c7f6c0b659b2043b5611f632e7fe  vendor/dimpl-0.6.1-ferrum-patched/CHANGELOG.md
 11c443c0859cf563a68135cfc811c123c5d564651225eb44487347a12fcde5eb  vendor/dimpl-0.6.1-ferrum-patched/CLAUDE.md
+e6e01088110a9449721862af9875e9aa6ff249f72457c99c2a93fd29af156256  vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock
 6212f5859a3a5ae45c83675305cc7b5241ce96471736fd893548097f8a2cc0a3  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml
 df7c99c8ebd5b246bea89599a598c81db6db92599414630dee7e53e82284f0fd  vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml.orig
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  vendor/dimpl-0.6.1-ferrum-patched/LICENSE-APACHE.txt

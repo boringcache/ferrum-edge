@@ -127,10 +127,15 @@ feature). Each entry documents the confinement and the upstream we are waiting o
 
 ### 3. Vendor drift guard
 
-`tests/integration/vendor_integrity_tests.rs` hashes every file under `vendor/`
-(LF-normalized SHA-256) and compares it to `vendor/VENDOR_INTEGRITY.sha256`. It
-runs in the normal integration suite (the `protocols-data-plane` shard), so a
-PR that changes any vendored byte without regenerating the manifest **fails CI**.
+`tests/integration/vendor_integrity_tests.rs` hashes every governed file under
+`vendor/` (LF-normalized SHA-256) and compares it to
+`vendor/VENDOR_INTEGRITY.sha256`. Incidental crate-local `Cargo.lock` files
+created by documented standalone vendor tests are ignored by default; intentionally
+committed lockfiles that pin a standalone regression graph (currently
+`vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock`) are allowlisted in
+`GOVERNED_VENDOR_LOCKFILES` and must appear in the manifest. The guard runs in
+the normal integration suite (the `protocols-data-plane` shard), so a PR that
+changes any governed vendored byte without regenerating the manifest **fails CI**.
 This keeps the vendored diff reviewable: an unexpected edit to upstream code
 cannot slip in unnoticed.
 
