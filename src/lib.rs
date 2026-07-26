@@ -90,6 +90,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
     /// Exercise DP's crate-private concurrent listener supervisor without
@@ -2099,6 +2100,27 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
+    // ── config/batch_atomicity ───────────────────────────────────────────────
+    pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
+
+    /// Install (or clear, with `None`) a deterministic failure point inside the
+    /// atomic `POST /batch` graph write for one namespace.
+    ///
+    /// Fault injection is how the all-or-nothing claim is actually exercised:
+    /// a duplicate key can only fail where the duplicate is, while these faults
+    /// reach every dependency phase and every chunk boundary. Keyed per
+    /// namespace so tests sharing a process cannot perturb each other. Always
+    /// clear the fault when the test finishes.
+    pub fn set_atomic_batch_fault_for_test(namespace: &str, fault: Option<AtomicBatchFault>) {
+        crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
+    }
+
+    /// Shrink the per-chunk write size for one namespace so a small fixture can
+    /// still cross a chunk boundary. `None` restores the backend default.
+    pub fn set_atomic_batch_chunk_size_for_test(namespace: &str, chunk_size: Option<usize>) {
+        crate::config::batch_atomicity::set_atomic_batch_chunk_size(namespace, chunk_size);
+    }
+
     pub async fn await_pool_connect_with_timeout<F, T>(
         timeout_seconds: u64,
         connect: F,
@@ -3712,6 +3734,39 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
+    pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
+
+    /// Post-`load_programs` initialization failure must roll back BPF state.
+    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_post_load_init_failure_cleanup_for_test()
+    }
+
+    /// A `load_programs` failure created nothing, so it must NOT clean up.
+    pub fn node_agent_pre_load_failure_skips_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_pre_load_failure_skips_cleanup_for_test()
+    }
+
+    /// Kubernetes-client-style late failure after successful eBPF init.
+    pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_k8s_client_style_late_failure_cleanup_for_test()
+    }
+
+    /// Normal shutdown must invoke `cleanup_all` exactly once.
+    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_normal_shutdown_cleanup_once_for_test()
+    }
+
+    /// Cleanup failure must preserve the original startup/runtime error.
+    pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
     }
 
     // ── load_balancer first-wave counter seams ───────────────────────────────

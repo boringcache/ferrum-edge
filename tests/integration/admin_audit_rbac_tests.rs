@@ -1248,7 +1248,7 @@ async fn audit_list_coerces_zero_limit_to_server_default() {
 }
 
 #[tokio::test]
-async fn partial_batch_mutation_writes_audit_event() {
+async fn rejected_batch_mutation_writes_no_audit_event() {
     let tmp = TempDir::new().unwrap();
     let state = admin_state(make_store(&tmp).await);
     let (base, _shutdown) = start_admin(state).await;
@@ -1263,6 +1263,10 @@ async fn partial_batch_mutation_writes_audit_event() {
     .await;
     assert_eq!(status, 201, "upstream seed failed: {body:?}");
 
+    // `POST /batch` is all-or-nothing (issue #2401): the duplicate upstream
+    // rejects the whole graph, so the consumer ahead of it is never committed
+    // and there is no mutation to attribute in the audit log. This used to be a
+    // `207 Multi-Status` with the consumer durable.
     let batch = json!({
         "consumers": [{
             "id": "partial-batch-c1",
@@ -1271,24 +1275,27 @@ async fn partial_batch_mutation_writes_audit_event() {
         "upstreams": [upstream_payload("batch-duplicate-u1")]
     });
     let (status, body) = post_json(&base, "/batch", &admin, &batch).await;
-    assert_eq!(status, 207, "partial batch body: {body:?}");
-    assert_eq!(body["created"]["consumers"], 1);
-    assert_eq!(body["created"]["upstreams"], 0);
+    assert_eq!(status, 409, "rejected batch body: {body:?}");
+    assert!(
+        body.get("created").is_none(),
+        "a rejected atomic batch must not report created counts: {body:?}"
+    );
 
-    let audit_body = wait_for_audit_total(
+    let (status, consumer) = get_json(&base, "/consumers/partial-batch-c1", &admin).await;
+    assert_eq!(
+        status, 404,
+        "the consumer ahead of the duplicate must not survive: {consumer:?}"
+    );
+
+    let (status, audit_body) = get_json(
         &base,
         "/audit?resource_type=gateway_config&action=batch_create",
         &admin,
-        1,
     )
     .await;
-    assert_eq!(audit_body["total"], 1);
-
-    let items = audit_body["items"].as_array().expect("audit items");
-    let event = &items[0];
-    assert_eq!(event["actor"], "security-admin");
-    assert_eq!(event["action"], "batch_create");
-    assert_eq!(event["resource_type"], "gateway_config");
-    assert_eq!(event["diff"]["after"]["consumers"], 1);
-    assert_eq!(event["diff"]["after"]["upstreams"], 0);
+    assert_eq!(status, 200, "audit read failed: {audit_body:?}");
+    assert_eq!(
+        audit_body["total"], 0,
+        "a fully rejected batch must not write a batch_create audit event: {audit_body:?}"
+    );
 }

@@ -3331,19 +3331,53 @@ paths:
       operationId: batchCreate
       summary: Batch create resources
       description: |
-        Creates multiple resources in a single request. Each resource type is
-        persisted in a single database transaction, dramatically improving
-        throughput compared to individual create calls.
+        Creates multiple resources in a single request.
 
-        Resources are created in dependency order: consumers and upstreams
-        first, then proxies, then plugin configs. This ensures referential
-        integrity when plugins reference proxy IDs or consumer usernames.
+        **The submitted graph is applied all-or-nothing.** Every dependency
+        phase — consumers and upstreams, then proxies, then plugin configs, then
+        the proxy↔plugin associations — and every internal 1,000-record chunk
+        share one database transaction and one commit. If any part fails, no
+        resource from the request becomes durable and the response carries no
+        `created` counts, so retrying the identical payload is idempotent. This
+        endpoint never returns a partial success.
+
+        Resources are created in dependency order, so referential integrity
+        holds when proxies reference an upstream in the same request or plugin
+        configs reference a proxy in the same request.
 
         All fields within each resource follow the same schema as the
         individual create endpoints. IDs are auto-generated if omitted.
         Plaintext Basic-auth passwords require a configured
         `FERRUM_BASIC_AUTH_HMAC_SECRET` of at least 32 bytes; missing or weak
         operator configuration fails the batch with 500 before persistence.
+
+        ### Backend support
+
+        PostgreSQL, MySQL, and SQLite always support the guarantee. MongoDB
+        needs multi-document transactions, which require a replica set: set
+        `FERRUM_MONGO_REPLICA_SET` (or a `?replicaSet=` URL option). A standalone
+        MongoDB deployment is refused with `501` **before any mutation** rather
+        than applying part of the graph.
+
+        ### Failure responses
+
+        Every non-`201` status leaves the namespace as it was, and no failure
+        body ever carries `created` counts. Statuses raised by the persistence
+        attempt itself — `409`, `501`, and the datastore/lease `503`s — use
+        `BatchAtomicFailureResponse`: `error`, `"rollback": "not_needed"`
+        (persistence is one transaction, so there is never a partial graph to
+        compensate for), plus `detail` on `501`. Statuses raised before
+        persistence keep their shared shapes instead: `400` returns
+        `error` + `validation_errors`, and a namespace-admission `503` returns
+        the shared admission-unavailable body. `503` covers namespace-admission
+        contention, a lapsed admission lease, and a failed datastore write —
+        all retryable with the identical payload.
+
+        One residual case is not decidable by the server: if the commit itself
+        is acknowledged but the acknowledgement is lost in transit, the batch
+        is reported as a `503` even though the graph is durable. A retry of the
+        identical payload then reports `409` rather than `201`, which is the
+        signal to re-read the namespace before retrying again.
       tags: [Batch]
       requestBody:
         required: true
@@ -3358,20 +3392,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchCreateResponse"
-        "207":
-          description: Partial success — some resource types failed
-          content:
-            application/json:
-              schema:
-                allOf:
-                  - $ref: "#/components/schemas/BatchCreateResponse"
-                  - type: object
-                    properties:
-                      errors:
-                        type: array
-                        items:
-                          type: string
-                        description: Error messages for failed resource types
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3380,8 +3400,28 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: |
+            A resource in the graph conflicts with an existing resource
+            (duplicate ID, name, listen path, or consumer identity) or with
+            another resource in the same request. The whole graph is rejected
+            and nothing is persisted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchAtomicFailureResponse"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: |
+            The configured database deployment cannot persist a batch graph
+            all-or-nothing (standalone MongoDB has no multi-document
+            transactions). Refused before any mutation; `detail` names the
+            configuration to change.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchAtomicFailureResponse"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -11384,6 +11424,10 @@ components:
     BatchCreateResponse:
       type: object
       required: [created]
+      description: |
+        Returned only when the whole submitted graph committed. A failed batch
+        commits nothing and returns an error object without `created`, so these
+        counts always describe every resource in the request.
       properties:
         created:
           type: object
@@ -11401,11 +11445,29 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams created
-        errors:
-          type: array
-          items:
-            type: string
-          description: Present only on 207 Multi-Status; lists per-type error messages
+
+    BatchAtomicFailureResponse:
+      type: object
+      required: [error]
+      description: |
+        A batch that did not commit. No resource from the request is durable, so
+        the identical payload can be retried once the reported cause is
+        addressed.
+      properties:
+        error:
+          type: string
+          description: Stable, redacted reason the batch was not applied
+        detail:
+          type: string
+          description: |
+            Present on `501`: the deployment configuration to change so the
+            atomicity guarantee becomes available.
+        rollback:
+          type: string
+          enum: [not_needed]
+          description: |
+            Always `not_needed`. Persistence is one transaction, so a failure
+            never leaves a partial graph to compensate for.
 
     BackupResponse:
       type: object
