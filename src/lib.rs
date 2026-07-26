@@ -110,13 +110,13 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
-    pub fn take_compression_response_codec_permit_for_test(
+    pub fn take_compression_response_buffer_permit_for_test(
         ctx: &mut crate::plugins::RequestContext,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        ctx.take_compression_response_codec_permit()
+        ctx.take_compression_response_buffer_permit()
     }
 
-    /// Whether a compression instance reserved response codec admission for this
+    /// Whether a compression instance reserved response-buffer admission for this
     /// request in `before_proxy` (the early bound on the buffered population).
     pub fn compression_response_admission_reserved_for_test(
         ctx: &crate::plugins::RequestContext,
@@ -125,7 +125,7 @@ pub mod _test_support {
     }
 
     /// Whether `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission (so the response streams identity).
+    /// obtain bounded response-buffer admission (so the response streams identity).
     pub fn compression_response_admission_declined_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> bool {
@@ -133,7 +133,7 @@ pub mod _test_support {
     }
 
     /// Build the request-body-hook compatibility context. Used to prove the
-    /// reserved response codec permit stays on the donor (live) context rather
+    /// reserved response-buffer permit stays on the donor (live) context rather
     /// than being moved into this short-lived clone.
     pub fn clone_for_final_request_body_hooks_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -149,14 +149,16 @@ pub mod _test_support {
 
     pub fn reconcile_aborted_gateway_response_encoding_for_test(
         ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        body_len: usize,
-    ) {
+        response_body: &mut Vec<u8>,
+    ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
+            response_status,
             response_headers,
-            body_len,
-        );
+            response_body,
+        )
     }
 
     pub fn validate_correlation_id_composition_for_test(
@@ -974,8 +976,9 @@ pub mod _test_support {
         status_code: u16,
         headers: HashMap<String, String>,
         body: &[u8],
+        presentation_digest: Option<[u8; 32]>,
     ) -> Option<Vec<u8>> {
-        plugin.redis_payload_for_tests(status_code, headers, body)
+        plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────
@@ -1635,6 +1638,15 @@ pub mod _test_support {
         ctx.finalized_response_replay
     }
 
+    /// Stand in for the protocol entry paths, which copy this digest from the
+    /// request's plugin-cache view before any plugin runs.
+    pub fn set_response_presentation_policy_digest_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        digest: Option<[u8; 32]>,
+    ) {
+        ctx.set_response_presentation_policy_digest(digest);
+    }
+
     pub fn response_caching_current_total_size_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {
@@ -2184,6 +2196,43 @@ pub mod _test_support {
 
     pub fn is_config_validation_rejection(error: &anyhow::Error) -> bool {
         crate::config::validation_pipeline::is_config_validation_rejection(error)
+    }
+
+    pub fn is_row_decode_rejection(error: &anyhow::Error) -> bool {
+        crate::config::db_loader::is_row_decode_rejection(error)
+    }
+
+    pub fn row_decode_rejection_error(
+        resource_type: &'static str,
+        resource_id: Option<&str>,
+        message: &str,
+    ) -> anyhow::Error {
+        anyhow::Error::new(crate::config::db_loader::RowDecodeRejection {
+            resource_type,
+            resource_id: resource_id.map(str::to_string),
+            reason: message.to_string(),
+        })
+    }
+
+    pub fn is_poll_validation_rejection(error: &anyhow::Error) -> bool {
+        crate::modes::is_poll_validation_rejection(error)
+    }
+
+    pub async fn record_config_validation_rejection(
+        db: &std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        db_available: &std::sync::atomic::AtomicBool,
+        config_rejected: &std::sync::atomic::AtomicBool,
+        err: &anyhow::Error,
+        context: &str,
+    ) {
+        crate::modes::record_config_validation_rejection(
+            db,
+            db_available,
+            config_rejected,
+            err,
+            context,
+        )
+        .await
     }
 
     // ── config/mongo_store: classic (DocumentDB) migration-lease builders ─────
@@ -3669,6 +3718,57 @@ pub mod _test_support {
         crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
     }
 
+    /// Public mirror of the crate-private direct-H2 upload gate decision.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum DirectH2UploadGateForTest {
+        Forward,
+        RequestBodyTooLarge,
+        FailClosed,
+    }
+
+    /// Terminal outcome the size-limit adapter reports when it is dropped
+    /// without ever having been polled to a terminal state. Hyper's HTTP/2
+    /// client takes exactly that path for a known end-of-stream request body.
+    pub fn request_body_drop_outcome_for_test(
+        inner_is_end_stream: bool,
+    ) -> crate::proxy::body::RequestBodyOutcome {
+        crate::proxy::body::request_body_drop_outcome(inner_is_end_stream)
+    }
+
+    /// Gate a direct-H2 backend response on the terminal upload outcome.
+    /// `None` models a completion sender dropped without reporting.
+    pub fn direct_h2_upload_gate_for_test(
+        outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+    ) -> DirectH2UploadGateForTest {
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome) {
+            crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
+            crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
+                DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
+        }
+    }
+
+    /// Public mirror of the direct-H2 upload cancellation signal.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UploadCancelSignalForTest {
+        Cancelled,
+        Idle,
+    }
+
+    /// Drive exactly one cancellation poll of a size-limited request body,
+    /// using the same helper `SizeLimitedIncoming::poll_frame` calls.
+    pub fn poll_upload_cancel_for_test(
+        cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> UploadCancelSignalForTest {
+        match crate::proxy::body::poll_upload_cancel_once(cancel) {
+            crate::proxy::body::UploadCancelSignal::Cancelled => {
+                UploadCancelSignalForTest::Cancelled
+            }
+            crate::proxy::body::UploadCancelSignal::Idle => UploadCancelSignalForTest::Idle,
+        }
+    }
+
     pub fn effective_request_body_limit_for_protocol_for_test(
         is_grpc_request: bool,
         http_limit: usize,
@@ -3734,6 +3834,35 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    // ── modes/node_agent watcher exit (#2369) ────────────────────────────────
+    pub type NodeAgentPodWatcherEventForTest = Result<
+        kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Pod>,
+        kube::runtime::watcher::Error,
+    >;
+
+    pub async fn run_with_pod_stream_for_test<S, I>(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: Arc<crate::ebpf::NodeAgentMetrics>,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        pod_stream: S,
+        seed_pods: I,
+    ) -> Result<(), anyhow::Error>
+    where
+        S: futures_util::Stream<Item = NodeAgentPodWatcherEventForTest> + Unpin,
+        I: IntoIterator<Item = crate::ebpf::PodAttachmentState>,
+    {
+        crate::modes::node_agent::run_with_pod_stream_for_test(
+            backend,
+            config,
+            metrics,
+            shutdown_tx,
+            pod_stream,
+            seed_pods,
+        )
+        .await
     }
 
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────

@@ -102,6 +102,7 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -316,6 +317,37 @@ async fn viewer_restore_is_rejected_before_large_body_buffering() {
     );
 }
 
+/// `/batch` and `/restore` are the two bulk-write routes whose handlers carry no
+/// role check of their own, so their `admin` requirement has to hold from the
+/// route arm as well as from the pre-body admission gate. An `operator` may
+/// create a proxy or an upstream one at a time; neither of these is a permitted
+/// escalation of that.
+#[tokio::test]
+async fn operator_cannot_bulk_write_through_batch_or_restore() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let operator = token("op-user", Some("operator"));
+    for path in ["/batch", "/restore?confirm=true"] {
+        let (status, body) = post_raw(
+            &base,
+            path,
+            &operator,
+            br#"{"version":"1","proxies":[]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 403, "operator {path} body: {body:?}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("required role is 'admin'"),
+            "unexpected RBAC error body for {path}: {body:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn upstream_mutation_writes_queryable_audit_event() {
     let tmp = TempDir::new().unwrap();
@@ -462,6 +494,121 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
     assert_eq!(list_body["data"][0]["config"]["ramp"], true);
+}
+
+/// `ai_semantic_cache` in Redis mode carries two distinct secrets that a
+/// Viewer/Operator read and every audit diff must not disclose:
+///
+/// * `redis_integrity_key` — the HMAC-SHA256 secret that authenticates Redis
+///   cache envelopes. Disclosure lets any reader forge an envelope that the
+///   gateway will replay as a cache hit, so it is redacted wholesale.
+/// * `redis_url` credentials — Redis ACL credentials are documented as
+///   encodable in the URL (`redis://user:pass@host`). Userinfo is replaced and
+///   query/fragment data is removed; scheme/host/port/database stay visible as
+///   bounded diagnostics.
+///
+/// Full-Admin reads stay raw so rotation via read-modify-write keeps working.
+#[tokio::test]
+async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let integrity_key = "redis-integrity-secret-0123456789abcdef";
+    let redis_password = "redis-acl-password-0123456789";
+    let redis_query_secret = "query-secret-0123456789";
+    let redis_fragment_secret = "fragment-secret-0123456789";
+    let redis_url = format!(
+        "redis://cacheuser:{redis_password}@cache.internal:6379/3?token={redis_query_secret}#{redis_fragment_secret}"
+    );
+    let plugin = json!({
+        "id": "redis-cache-secret",
+        "plugin_name": "ai_semantic_cache",
+        "scope": "global",
+        "config": {
+            "sync_mode": "redis",
+            "redis_url": &redis_url,
+            "redis_integrity_key": integrity_key,
+            "ttl_seconds": 60
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let expected_url = "redis://redacted@cache.internal:6379/3";
+
+    for (role, actor) in [("viewer", &viewer), ("operator", &operator)] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/redis-cache-secret", actor).await;
+        assert_eq!(status, 200, "{role} plugin get failed: {projected:?}");
+        assert_eq!(
+            projected["config"]["redis_integrity_key"], "[REDACTED]",
+            "{role} read exposed the Redis integrity key: {projected:?}"
+        );
+        assert_eq!(
+            projected["config"]["redis_url"], expected_url,
+            "{role} read did not strip Redis URL userinfo: {projected:?}"
+        );
+        // Non-secret diagnostics survive the projection.
+        assert_eq!(projected["config"]["ttl_seconds"], 60);
+        assert_eq!(projected["config"]["sync_mode"], "redis");
+        let serialized = projected.to_string();
+        assert!(
+            !serialized.contains(integrity_key)
+                && !serialized.contains(redis_password)
+                && !serialized.contains(redis_query_secret)
+                && !serialized.contains(redis_fragment_secret),
+            "{role} response leaked Redis secret material: {projected:?}"
+        );
+    }
+
+    let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
+    let serialized = list_body.to_string();
+    assert!(
+        !serialized.contains(integrity_key)
+            && !serialized.contains(redis_password)
+            && !serialized.contains(redis_query_secret)
+            && !serialized.contains(redis_fragment_secret),
+        "viewer list leaked Redis secret material: {list_body:?}"
+    );
+    assert_eq!(list_body["data"][0]["config"]["redis_url"], expected_url);
+    assert_eq!(
+        list_body["data"][0]["config"]["redis_integrity_key"],
+        "[REDACTED]"
+    );
+
+    // Full Admin still sees the raw values so rotation by read-modify-write works.
+    let (status, admin_body) = get_json(&base, "/plugins/config/redis-cache-secret", &admin).await;
+    assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
+    assert_eq!(admin_body["config"]["redis_integrity_key"], integrity_key);
+    assert_eq!(admin_body["config"]["redis_url"], redis_url);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=redis-cache-secret",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["config"]["redis_integrity_key"],
+        "[REDACTED]"
+    );
+    assert_eq!(event["diff"]["after"]["config"]["redis_url"], expected_url);
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(integrity_key)
+            && !serialized.contains(redis_password)
+            && !serialized.contains(redis_query_secret)
+            && !serialized.contains(redis_fragment_secret),
+        "audit diff leaked Redis secret material: {event:?}"
+    );
 }
 
 #[tokio::test]

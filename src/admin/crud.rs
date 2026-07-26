@@ -23,7 +23,7 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
     validate_api_spec_restore_inputs,
 };
-use crate::config::db_loader::is_proxy_plugin_association_load_error;
+use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     backend_tls_sni_direct_h2_conflict_messages, first_effective_mesh_transport_conflict_with_mesh,
@@ -896,6 +896,107 @@ async fn persist_update_to_settlement<R: AdminResource>(
             &namespace,
             &written,
             Some(&previous),
+            WriteAction::Update { id: &id },
+        )
+        .await;
+    }
+    result
+}
+
+/// Issue #2997: DELETE of a reachable-but-undecodable row is the in-band repair
+/// path. The row cannot be hydrated for pre-delete snapshot / late-write
+/// compensation, and `load_namespace_snapshot` fails for the same reason, so
+/// delete by primary key under the admission lock and audit identity only.
+async fn persist_undecodable_delete_repair<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        guard,
+        http_client: _,
+        state,
+        actor,
+    } = context;
+    let success_db = db.clone();
+    let result =
+        match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id))
+            .await
+        {
+            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+                Ok(false) => Ok(false),
+                // Without a hydratable previous row or namespace snapshot we cannot
+                // compensate a late write. Fail closed rather than claiming success
+                // after an unverified admission loss.
+                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    "namespace config admission was lost during undecodable-row delete repair"
+                ))),
+                Err(persistence_error) => Err(persistence_error),
+            },
+            Err(error) => Err(error),
+        };
+    if matches!(&result, Ok(true)) {
+        let event = AuditEvent::new(
+            &actor,
+            "delete",
+            R::RESOURCE_NAME.replace(' ', "_"),
+            &id,
+            &namespace,
+            audit::delete_diff(json!({
+                "id": id,
+                "namespace": namespace,
+                "undecodable_row_repair": true,
+            })),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+            super::log_audit_enqueue_failure(&error);
+        }
+    }
+    result
+}
+
+/// Issue #2997: PUT overwrite of a reachable-but-undecodable row is an in-band
+/// repair path. The prior row cannot be hydrated for `prepare_for_update` /
+/// late-write compensation, so persist the request body by primary key under
+/// the admission lock and audit against a null before-image.
+async fn persist_undecodable_update_repair<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+    written: R,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        guard,
+        http_client: _,
+        state,
+        actor,
+    } = context;
+    let result =
+        match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
+            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+                Ok(false) => Ok(false),
+                // Without a hydratable previous row or namespace snapshot we cannot
+                // compensate a late write. Fail closed rather than claiming success
+                // after an unverified admission loss.
+                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    "namespace config admission was lost during undecodable-row update repair"
+                ))),
+                Err(persistence_error) => Err(persistence_error),
+            },
+            Err(error) => Err(error),
+        };
+    if matches!(&result, Ok(true)) {
+        finish_write_success(
+            db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            None,
             WriteAction::Update { id: &id },
         )
         .await;
@@ -2023,6 +2124,34 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Ok(None) => {
             return Ok(not_found_response::<R>());
         }
+        Err(error) if is_row_decode_rejection(&error) => {
+            // Issue #2997: the target row exists but cannot be decoded. Skip
+            // namespace-snapshot recovery (that load fails for the same row) and
+            // delete by id so admin remains the in-band repair path.
+            let persistence = match tokio::spawn(persist_undecodable_delete_repair::<R>(
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
+                id.to_string(),
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace undecodable-row delete persistence task failed: {error}"
+                )),
+            };
+            return match persistence {
+                Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
+                Ok(false) => Ok(not_found_response::<R>()),
+                Err(error) => Ok(R::map_delete_db_error(&error)),
+            };
+        }
         Err(error) => {
             return Ok(R::map_precheck_db_error(&error));
         }
@@ -2904,6 +3033,8 @@ fn redact_sensitive_plugin_config_fields(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 if is_sensitive_plugin_config_key(key) {
                     *child = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+                } else if is_credential_bearing_url_config_key(key) {
+                    redact_url_userinfo_in_place(child);
                 } else {
                     redact_sensitive_plugin_config_fields(child);
                 }
@@ -2925,6 +3056,14 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
 
     let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
     normalized == "key"
+        // HMAC signing material for Redis cache envelopes (`ai_semantic_cache`
+        // `redis_integrity_key`). Substring match so any future
+        // `*_integrity_key` signing secret is covered without another edit; the
+        // segment is only ever used for signing/authenticity keys. Also match
+        // the delimiter-collapsed form (`integrityKey` → `integritykey`) the
+        // same way `api_key`/`apikey` already does.
+        || normalized.contains("integrity_key")
+        || normalized.contains("integritykey")
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
@@ -2934,6 +3073,51 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("private_key")
         || normalized.contains("service_account_json")
         || normalized.contains("webhook")
+}
+
+/// Config keys whose value is a connection URL that may carry credentials in
+/// its userinfo component.
+///
+/// These are deliberately *not* wholesale-redacted: the scheme/host/port/path
+/// are the useful diagnostics an operator needs from a Viewer/Operator read or
+/// an audit diff. Userinfo is replaced and query/fragment data is removed (see
+/// [`redact_url_userinfo_in_place`]).
+///
+/// `redis_url` is documented as an accepted place to encode Redis
+/// ACL credentials (`redis://user:pass@host`), and every Redis-backed plugin
+/// (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`,
+/// `udp_rate_limiting`, `request_deduplication`, `graphql`,
+/// `grpc_method_router`, `ai_semantic_cache`) shares that key, so the match is
+/// by key name rather than per plugin. Also match the delimiter-collapsed
+/// form (`redisUrl` → `redisurl`) the same way `integrity_key`/`integritykey`
+/// already does, so a nested camelCase field cannot bypass projection.
+fn is_credential_bearing_url_config_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "redis_url" || normalized == "redisurl"
+}
+
+/// Strip URL userinfo in place, preserving scheme/host/port/path for Redis URLs.
+///
+/// Delegates to the same helper the Redis client uses for its connect/health
+/// log fields, so a value an operator reads back from the admin API is byte
+/// identical to the one in the logs.
+///
+/// Fails closed: a non-string value is replaced wholesale with the redaction
+/// marker rather than echoed, as is an unparseable string or any non-`redis`/
+/// `rediss` scheme (handled by the shared helper), because those values cannot
+/// be projected as safe Redis endpoint diagnostics. `null` is left alone —
+/// there is nothing to disclose.
+fn redact_url_userinfo_in_place(value: &mut Value) {
+    use crate::plugins::utils::redis_rate_limiter::redact_url_userinfo;
+
+    if value.is_null() {
+        return;
+    }
+    let Some(raw) = value.as_str() else {
+        *value = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        return;
+    };
+    *value = json!(redact_url_userinfo(raw));
 }
 
 pub(crate) async fn check_port_available(
@@ -4816,6 +5000,7 @@ async fn handle_write<R: AdminResource>(
         }
     };
 
+    let mut undecodable_update_repair = false;
     let existing = match action {
         WriteAction::Create => None,
         WriteAction::Update { id } => match R::db_get_for_write(db, namespace, id).await {
@@ -4826,6 +5011,13 @@ async fn handle_write<R: AdminResource>(
                 return Ok(not_found_response::<R>());
             }
             Ok(existing) => existing,
+            Err(error) if is_row_decode_rejection(&error) => {
+                // Issue #2997: row exists but cannot be hydrated. Proceed
+                // without prepare_for_update / late-write previous so PUT
+                // remains an in-band overwrite repair (must not be 503).
+                undecodable_update_repair = true;
+                None
+            }
             Err(error) => {
                 return Ok(R::map_precheck_db_error(&error));
             }
@@ -4876,6 +5068,19 @@ async fn handle_write<R: AdminResource>(
                 ));
             }
             Ok(None) => {}
+            // Issue #2997: an undecodable row still occupies the id — treat as
+            // conflict (409), not connectivity 503, so operators see a clear
+            // repair signal rather than a false outage.
+            Err(error) if is_row_decode_rejection(&error) => {
+                return Ok(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "{} with ID '{}' already exists",
+                        R::ID_CONFLICT_LABEL,
+                        resource.id()
+                    )}),
+                ));
+            }
             Err(error) => return Ok(R::map_precheck_db_error(&error)),
         }
     }
@@ -4951,39 +5156,66 @@ async fn handle_write<R: AdminResource>(
             }
         }
         WriteAction::Update { id } => {
-            let Some(previous) = existing.clone() else {
-                return Ok(super::json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": "Update persistence is missing the prior resource"}),
-                ));
-            };
-            let persistence = match tokio::spawn(persist_update_to_settlement(
-                OwnedWriteSettlementContext {
-                    db: db_arc.clone(),
-                    namespace: namespace.to_string(),
-                    guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
-                    state: state.clone(),
-                    actor: actor.clone(),
-                },
-                id.to_string(),
-                resource.clone(),
-                previous,
-            ))
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!(
-                    "namespace update persistence task failed: {error}"
-                )),
-            };
-            // The row vanished between the precheck and the write (concurrent
-            // delete). The backend recorded no change — report not-found
-            // rather than a phantom success (issue #2122 DB-M4).
-            match persistence {
-                Ok(false) => return Ok(not_found_response::<R>()),
-                Ok(true) => {}
-                Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+            if undecodable_update_repair {
+                let persistence = match tokio::spawn(persist_undecodable_update_repair(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                    resource.clone(),
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace undecodable-row update persistence task failed: {error}"
+                    )),
+                };
+                match persistence {
+                    Ok(false) => return Ok(not_found_response::<R>()),
+                    Ok(true) => {}
+                    Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+                }
+            } else {
+                let Some(previous) = existing.clone() else {
+                    return Ok(super::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &json!({"error": "Update persistence is missing the prior resource"}),
+                    ));
+                };
+                let persistence = match tokio::spawn(persist_update_to_settlement(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                    resource.clone(),
+                    previous,
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace update persistence task failed: {error}"
+                    )),
+                };
+                // The row vanished between the precheck and the write (concurrent
+                // delete). The backend recorded no change — report not-found
+                // rather than a phantom success (issue #2122 DB-M4).
+                match persistence {
+                    Ok(false) => return Ok(not_found_response::<R>()),
+                    Ok(true) => {}
+                    Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+                }
             }
         }
     }
@@ -5005,4 +5237,100 @@ fn validation_error_response<R: AdminResource>(field_errors: &[String]) -> Respo
             field_errors.join("; ")
         )}),
     )
+}
+
+#[cfg(test)]
+mod redis_plugin_projection_tests {
+    use super::{
+        is_credential_bearing_url_config_key, is_sensitive_plugin_config_key,
+        redact_sensitive_plugin_config_fields, redact_url_userinfo_in_place,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn integrity_key_matcher_covers_normalized_and_collapsed_forms() {
+        for key in [
+            "redis_integrity_key",
+            "Redis-Integrity-Key",
+            "redis.integrity.key",
+            "REDIS_INTEGRITY_KEY",
+            "redisIntegrityKey",
+            "integrity_key",
+            "integrityKey",
+        ] {
+            assert!(
+                is_sensitive_plugin_config_key(key),
+                "{key} should be treated as signing-material"
+            );
+        }
+        assert!(!is_sensitive_plugin_config_key("integrity_status"));
+        assert!(!is_sensitive_plugin_config_key("ttl_seconds"));
+    }
+
+    #[test]
+    fn redis_url_key_matcher_is_delimiter_insensitive() {
+        for key in [
+            "redis_url",
+            "Redis-Url",
+            "REDIS.URL",
+            "redis-url",
+            "redisUrl",
+            "RedisURL",
+        ] {
+            assert!(
+                is_credential_bearing_url_config_key(key),
+                "{key} should be treated as a credential-bearing URL"
+            );
+        }
+        assert!(!is_credential_bearing_url_config_key("redis_username"));
+        assert!(!is_credential_bearing_url_config_key("endpoint_url"));
+        assert!(!is_credential_bearing_url_config_key("redis_urls"));
+    }
+
+    #[test]
+    fn nested_integrity_keys_and_redis_urls_are_projected() {
+        let mut config = json!({
+            "ttl_seconds": 60,
+            "redis_integrity_key": "signing-secret-0123456789abcdef",
+            "providers": [{
+                "redisIntegrityKey": "nested-signing-secret-0123456789",
+                "Redis-Url": "redis://user:pass@cache.internal:6379/3?token=q#f",
+                "redisUrl": "redis://nested:nested-pass@other.internal:6379/1?tok=n#g"
+            }]
+        });
+        redact_sensitive_plugin_config_fields(&mut config);
+
+        assert_eq!(config["ttl_seconds"], 60);
+        assert_eq!(config["redis_integrity_key"], "[REDACTED]");
+        assert_eq!(config["providers"][0]["redisIntegrityKey"], "[REDACTED]");
+        assert_eq!(
+            config["providers"][0]["Redis-Url"],
+            "redis://redacted@cache.internal:6379/3"
+        );
+        assert_eq!(
+            config["providers"][0]["redisUrl"],
+            "redis://redacted@other.internal:6379/1"
+        );
+        let serialized = config.to_string();
+        assert!(
+            !serialized.contains("signing-secret")
+                && !serialized.contains("nested-signing")
+                && !serialized.contains("pass")
+                && !serialized.contains("nested-pass")
+                && !serialized.contains("token=q")
+                && !serialized.contains("tok=n"),
+            "nested projection leaked secret material: {config}"
+        );
+    }
+
+    #[test]
+    fn redis_url_projection_fails_closed_for_non_strings() {
+        let mut number = json!(42);
+        redact_url_userinfo_in_place(&mut number);
+        assert_eq!(number, "[REDACTED]");
+
+        let mut null = json!(null);
+        redact_url_userinfo_in_place(&mut null);
+        assert!(null.is_null());
+    }
 }

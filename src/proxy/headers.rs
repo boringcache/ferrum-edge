@@ -102,8 +102,47 @@ define_header_name_set! {
     /// then adding Ferrum's canonical value creates duplicate metadata. In
     /// particular, duplicated `X-Forwarded-For` can make a backend observe the
     /// untrusted client value twice after normal comma folding.
+    ///
+    /// RFC 7239 `Forwarded` is gated by [`is_proxy_owned_forwarding_header`] —
+    /// Ferrum regenerates it only when `FERRUM_ADD_FORWARDED_HEADER` is enabled,
+    /// so the always-on inventory stays limited to the `X-Forwarded-*` family.
     pub fn is_proxy_generated_forwarding_header;
     ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"]
+}
+
+/// Returns true when an inbound forwarding-identity header must be omitted from
+/// the outbound backend request because Ferrum will regenerate it.
+///
+/// Always covers the `X-Forwarded-*` family ([`is_proxy_generated_forwarding_header`]).
+/// When `add_forwarded_header` is true, also covers RFC 7239 `forwarded` so a
+/// client-supplied value cannot precede or coexist with the gateway-owned
+/// element — reqwest `RequestBuilder::header` appends, and H3 builders push into
+/// a `Vec`, so failing to strip first makes backend-visible shape flip across
+/// capability-path changes.
+///
+/// Primary dispatch maps normally carry lowercase names (hyper/`HeaderName`),
+/// but plugin-synthesised mixed-case keys can appear in the string `HashMap`.
+/// Ownership matching is ASCII case-insensitive and allocation-free so a
+/// hostile `Forwarded` / `X-Forwarded-For` / `FORWARDED` key cannot bypass the
+/// strip and precede the gateway-owned element on append/`Vec`-push transports.
+///
+/// Hot path: lowercase names hit the exact `matches!` inventory (or the
+/// lowercase `forwarded` compare) with no scan. The case-insensitive XFF sweep
+/// runs only when the name carries an uppercase ASCII byte.
+#[inline]
+pub fn is_proxy_owned_forwarding_header(name: &str, add_forwarded_header: bool) -> bool {
+    if is_proxy_generated_forwarding_header(name) {
+        return true;
+    }
+    if add_forwarded_header && name.eq_ignore_ascii_case("forwarded") {
+        return true;
+    }
+    // Mixed-case plugin keys bypass the lowercase-only XFF inventory above.
+    // Mirror the cross-protocol skip hot-path shape: uppercase gate first.
+    name.bytes().any(|b| b.is_ascii_uppercase())
+        && (name.eq_ignore_ascii_case("x-forwarded-for")
+            || name.eq_ignore_ascii_case("x-forwarded-proto")
+            || name.eq_ignore_ascii_case("x-forwarded-host"))
 }
 
 /// Whether client `Host` / authority should survive secondary-request filtering.
@@ -120,10 +159,16 @@ pub enum SecondaryRequestHostPolicy {
 /// Returns `true` when a materialised request header must not be copied onto a
 /// Ferrum-generated secondary request (mirror, load-test synthetic/fan-out).
 ///
-/// Applies the primary backend-request strip set, proxy-owned forwarding
-/// identity headers, RFC 9110 `Connection`-listed names (snapshot must be
-/// taken via [`parse_connection_listed_from_str_map`] before filtering), and
-/// the caller-selected [`SecondaryRequestHostPolicy`].
+/// Applies the primary backend-request strip set, every proxy forwarding
+/// identity header (the `X-Forwarded-*` family and RFC 7239 `Forwarded`),
+/// RFC 9110 `Connection`-listed names (snapshot must be taken via
+/// [`parse_connection_listed_from_str_map`] before filtering), and the
+/// caller-selected [`SecondaryRequestHostPolicy`].
+///
+/// Secondary requests do not regenerate Ferrum's forwarding identity. Strip
+/// `Forwarded` unconditionally, just as the secondary boundary already strips
+/// `X-Forwarded-*`, so a client-supplied identity cannot reach a mirror or
+/// synthetic/fan-out target even when primary RFC 7239 generation is disabled.
 ///
 /// Comparison is ASCII case-insensitive so plugin-synthesised mixed-case keys
 /// cannot bypass the boundary.
@@ -142,6 +187,7 @@ pub fn is_secondary_request_strip_header(
     }
     is_backend_request_strip_header(&name_lower)
         || is_proxy_generated_forwarding_header(&name_lower)
+        || name_lower == "forwarded"
 }
 
 /// Filter a materialised request header map for a Ferrum-generated secondary
@@ -743,6 +789,37 @@ mod tests {
         assert!(is_proxy_generated_forwarding_header("x-forwarded-host"));
         assert!(!is_proxy_generated_forwarding_header("forwarded"));
         assert!(!is_proxy_generated_forwarding_header("via"));
+    }
+
+    #[test]
+    fn proxy_owned_forwarding_header_fail_closes_forwarded_when_regenerating() {
+        // Fail-closed ownership: when Ferrum regenerates Forwarded, the client
+        // value must be stripped on every transport before the gateway element
+        // is written. When regeneration is off, client Forwarded may pass.
+        assert!(is_proxy_owned_forwarding_header("forwarded", true));
+        assert!(is_proxy_owned_forwarding_header("Forwarded", true));
+        assert!(is_proxy_owned_forwarding_header("FORWARDED", true));
+        assert!(!is_proxy_owned_forwarding_header("forwarded", false));
+        assert!(!is_proxy_owned_forwarding_header("Forwarded", false));
+        assert!(is_proxy_owned_forwarding_header("x-forwarded-for", false));
+        assert!(is_proxy_owned_forwarding_header("x-forwarded-for", true));
+        // Always-owned XFF family must also strip mixed-case plugin keys —
+        // reqwest appends, so a bypassed `X-Forwarded-For` precedes Ferrum's.
+        for name in [
+            "X-Forwarded-For",
+            "X-FORWARDED-FOR",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Host",
+        ] {
+            assert!(
+                is_proxy_owned_forwarding_header(name, false),
+                "{name} must be owned regardless of regeneration flag"
+            );
+            assert!(is_proxy_owned_forwarding_header(name, true));
+        }
+        assert!(!is_proxy_owned_forwarding_header("via", true));
+        assert!(!is_proxy_owned_forwarding_header("authorization", true));
+        assert!(!is_proxy_owned_forwarding_header("X-Forwarded", true));
     }
 
     #[test]

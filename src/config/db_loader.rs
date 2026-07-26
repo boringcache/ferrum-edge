@@ -76,8 +76,25 @@ pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_ro
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
+    /// Runtime / poll full loads. Undecodable rows become
+    /// [`RowDecodeRejection`] so poll loops keep last-known-good config and
+    /// leave admin writes open for in-band repair (issue #2997 / #2158).
     Runtime,
+    /// Snapshot restore integrity path. Undecodable rows become
+    /// [`SnapshotDataIntegrityError`] (not a poll-repair marker).
     RestoreSnapshot,
+    /// Synchronous admin-write admission validation. Undecodable rows must
+    /// fail the write with the actionable decode reason, but must **not**
+    /// carry [`RowDecodeRejection`] — that marker means "keep admin writable
+    /// / keep last-known-good" for background poll loops, not for the
+    /// admission check that is already running inside an admin write.
+    AdmissionValidation,
+    /// Pre-mutation baseline graph read taken by a repair-safe DELETE before it
+    /// removes the row. Undecodable rows keep [`RowDecodeRejection`] so the
+    /// delete path can recognise that the baseline is blocked by the very row
+    /// being repaired and fall back to the strictest empty baseline instead of
+    /// failing the write (issue #2997).
+    RepairDeleteBaseline,
 }
 
 impl FullLoadPurpose {
@@ -85,6 +102,8 @@ impl FullLoadPurpose {
         match self {
             Self::Runtime => "load_full_config",
             Self::RestoreSnapshot => "load_namespace_snapshot",
+            Self::AdmissionValidation => "validate_namespace_admission",
+            Self::RepairDeleteBaseline => "mtls_dns_repair_delete_baseline",
         }
     }
 
@@ -94,15 +113,116 @@ impl FullLoadPurpose {
         resource_id: Option<String>,
         error: anyhow::Error,
     ) -> anyhow::Error {
-        if self == Self::RestoreSnapshot {
-            anyhow::Error::new(SnapshotDataIntegrityError::new(
+        match self {
+            Self::RestoreSnapshot => anyhow::Error::new(SnapshotDataIntegrityError::new(
                 resource_type,
                 resource_id,
                 error,
-            ))
-        } else {
-            error
+            )),
+            Self::AdmissionValidation => {
+                // Peel any poll-loop marker attached by row_to_* wrappers so
+                // synchronous admission returns a plain decode failure.
+                demote_row_decode_rejection(error)
+            }
+            Self::Runtime | Self::RepairDeleteBaseline => {
+                if is_proxy_plugin_association_load_error(&error)
+                    || is_transient_database_error(&error)
+                {
+                    // Association integrity markers and connectivity/driver
+                    // faults must not be rebadged as RowDecodeRejection
+                    // (issue #2997 precision).
+                    error
+                } else {
+                    mark_row_decode_rejection(resource_type, resource_id, error)
+                }
+            }
         }
+    }
+}
+
+/// Marker for a reachable-SQL row whose column values could not be decoded into
+/// the domain model (malformed JSON, `ColumnDecode`, etc.).
+///
+/// Distinct from connectivity/driver failures and from
+/// [`ConfigValidationRejection`]: the database answered, but one or more rows
+/// are undecodable. Poll loops treat this like a validation rejection — keep
+/// last-known-good runtime config and leave admin writable after the migration
+/// gate — while startup still marks the load non-transient so backup bootstrap
+/// cannot mask a broken row (issue #2997).
+///
+/// `Display` includes the underlying decode/parse reason so operator-facing
+/// `to_string()` / `{}` sites (poll logs, admin surfaces that render the
+/// chain) keep the actionable detail without requiring `{:#}`. The reason is
+/// the prior error's Display text (parse/decode messages), never raw column
+/// bodies.
+#[derive(Debug)]
+pub(crate) struct RowDecodeRejection {
+    pub resource_type: &'static str,
+    pub resource_id: Option<String>,
+    pub reason: String,
+}
+
+impl std::fmt::Display for RowDecodeRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.resource_id {
+            Some(id) => write!(
+                f,
+                "SQL row decode rejected for {} '{}': {}",
+                self.resource_type, id, self.reason
+            ),
+            None => write!(
+                f,
+                "SQL row decode rejected for {}: {}",
+                self.resource_type, self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RowDecodeRejection {}
+
+/// Returns `true` when the error carries a [`RowDecodeRejection`] marker.
+///
+/// The marker is attached as the owned [`anyhow::Error`] payload (or as an
+/// anyhow context value) and is downcastable through the chain via
+/// [`anyhow::Error::is`].
+pub(crate) fn is_row_decode_rejection(err: &anyhow::Error) -> bool {
+    err.is::<RowDecodeRejection>()
+}
+
+/// Attach a [`RowDecodeRejection`] marker unless one is already present.
+///
+/// Builds a self-contained marker via [`anyhow::Error::new`] (not
+/// `.context(...)`) so top-level `Display` / `to_string()` carry the decode
+/// reason without relying on the `{:#}` alternate formatter, and so `{:#}`
+/// does not duplicate the reason through a source link.
+pub(crate) fn mark_row_decode_rejection(
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if is_row_decode_rejection(&error) {
+        error
+    } else {
+        let reason = error.to_string();
+        anyhow::Error::new(RowDecodeRejection {
+            resource_type,
+            resource_id,
+            reason,
+        })
+    }
+}
+
+/// Drop a [`RowDecodeRejection`] marker, preserving the actionable decode
+/// reason. Used by synchronous admission validation so admin-write failures
+/// are not classified as poll-loop repairable rejections.
+fn demote_row_decode_rejection(error: anyhow::Error) -> anyhow::Error {
+    if !is_row_decode_rejection(&error) {
+        return error;
+    }
+    match error.downcast::<RowDecodeRejection>() {
+        Ok(rejection) => anyhow::Error::msg(rejection.reason),
+        Err(error) => error,
     }
 }
 
@@ -1136,13 +1256,10 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
-        let proxies = self
-            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
-        let plugin_configs = self
-            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
+        let proxies = self.load_proxies_tx(namespace, purpose, tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, purpose, tx).await?;
         let mut candidate = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
@@ -1161,13 +1278,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         mut candidate: GatewayConfig,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         if !candidate.has_effective_mtls_dns_identity_policy() {
             return Ok(None);
         }
-        candidate.consumers = self
-            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
+        candidate.consumers = self.load_consumers_tx(namespace, purpose, tx).await?;
         candidate.normalize_fields();
         Ok(Some(candidate))
     }
@@ -1180,11 +1296,12 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(tx, namespace, purpose)
             .await?;
-        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate, purpose)
             .await
     }
 
@@ -1198,7 +1315,11 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1226,11 +1347,20 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1252,10 +1382,14 @@ impl DatabaseStore {
         validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         let mut candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         candidate.upstreams = self
-            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_upstreams_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         candidate.normalize_fields();
         let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
@@ -1277,7 +1411,12 @@ impl DatabaseStore {
         .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1287,16 +1426,38 @@ impl DatabaseStore {
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
+    /// Pre-mutation ambiguity baseline for a repair-safe DELETE.
+    ///
+    /// Issue #2997: this read happens BEFORE the row is removed, so it decodes
+    /// the very reachable-but-undecodable row the DELETE is repairing. Failing
+    /// here would make the in-band admin repair path impossible for exactly the
+    /// resource kinds whose rows are always read into this baseline (proxies and
+    /// plugin configs unconditionally, consumers under an effective `san_dns`
+    /// policy). Fall back to an EMPTY baseline instead — the strictest possible
+    /// comparison, because `introduces_new_mtls_dns_identity_conflict` then
+    /// requires the post-delete graph to be entirely conflict-free. The
+    /// post-mutation validator re-reads the graph and remains the authority, so
+    /// this can only tighten admission, never loosen it. Every non-decode
+    /// failure (connectivity, driver, association integrity) still aborts.
     async fn mtls_dns_identity_conflicts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<BTreeMap<String, BTreeSet<String>>, anyhow::Error> {
-        Ok(self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
-            .await?
-            .map(|candidate| candidate.mtls_dns_identity_conflicts())
-            .unwrap_or_default())
+        match self
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::RepairDeleteBaseline,
+            )
+            .await
+        {
+            Ok(candidate) => Ok(candidate
+                .map(|candidate| candidate.mtls_dns_identity_conflicts())
+                .unwrap_or_default()),
+            Err(error) if is_row_decode_rejection(&error) => Ok(BTreeMap::new()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Deletes are repair-safe when every remaining ambiguity was already
@@ -1311,7 +1472,11 @@ impl DatabaseStore {
         prior_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1338,11 +1503,20 @@ impl DatabaseStore {
         prior_mtls_dns_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -2411,7 +2585,16 @@ impl DatabaseStore {
             }
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(purpose.operation(), &plugins_by_proxy)
-            .map_err(|error| purpose.map_row_error("proxy_plugin", None, error))?;
+            .map_err(|error| {
+                // Match association-query handling: only remap for restore
+                // snapshots. Runtime keeps ProxyPluginAssociationLoadError so it
+                // is not misclassified as RowDecodeRejection.
+                if purpose == FullLoadPurpose::RestoreSnapshot {
+                    purpose.map_row_error("proxy_plugin", None, error)
+                } else {
+                    error
+                }
+            })?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -4540,6 +4723,14 @@ impl DatabaseStore {
             let fetched = rows.len();
             for row in rows {
                 let consumer_id: String = row.try_get("id")?;
+                // Skip the excluded consumer before parsing credentials so PUT
+                // overwrite repair of an undecodable row (issue #2997) is not
+                // blocked by its own corrupt body. Other malformed rows still
+                // fail closed below.
+                if exclude_consumer_id == Some(consumer_id.as_str()) {
+                    last_id = Some(consumer_id);
+                    continue;
+                }
                 let credentials_json = required_utf8_text_column(&row, "credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&credentials_json).map_err(|error| {
@@ -4549,19 +4740,16 @@ impl DatabaseStore {
                             error
                         )
                     })?;
-                let excluded = exclude_consumer_id == Some(consumer_id.as_str());
-                if !excluded
-                    && credentials.get("mtls_auth").is_some_and(|credential| {
-                        Consumer::credential_entries_from_value(credential)
-                            .iter()
-                            .any(|entry| {
-                                entry
-                                    .get("identity")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|identity| identity.trim() == canonical_identity)
-                            })
-                    })
-                {
+                if credentials.get("mtls_auth").is_some_and(|credential| {
+                    Consumer::credential_entries_from_value(credential)
+                        .iter()
+                        .any(|entry| {
+                            entry
+                                .get("identity")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|identity| identity.trim() == canonical_identity)
+                        })
+                }) {
                     return Ok(false);
                 }
                 last_id = Some(consumer_id);
@@ -9403,9 +9591,12 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         "tcps" => Ok(BackendScheme::Tcps),
         "udp" => Ok(BackendScheme::Udp),
         "dtls" => Ok(BackendScheme::Dtls),
-        _ => Err(format!(
-            "unsupported backend_scheme '{s}' (expected one of: http, https, tcp, tcps, udp, dtls)"
-        )),
+        // Do not embed the raw scheme column — hostile/oversized DB values must
+        // not reach poll/startup rejection logs (issue #2997 redaction).
+        _ => Err(
+            "unsupported backend_scheme (expected one of: http, https, tcp, tcps, udp, dtls)"
+                .to_string(),
+        ),
     }
 }
 
@@ -9418,6 +9609,15 @@ pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
 
 /// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
 fn row_to_proxy(
+    row: &AnyRow,
+    id: String,
+    plugins: Vec<PluginAssociation>,
+) -> Result<Proxy, anyhow::Error> {
+    row_to_proxy_inner(row, id.clone(), plugins)
+        .map_err(|error| mark_row_decode_rejection("proxy", Some(id), error))
+}
+
+fn row_to_proxy_inner(
     row: &AnyRow,
     id: String,
     plugins: Vec<PluginAssociation>,
@@ -9437,12 +9637,9 @@ fn row_to_proxy(
         anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
     })?;
     let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
-        anyhow::anyhow!(
-            "Proxy {}: failed to parse hosts JSON '{}': {}",
-            pid,
-            hosts_str,
-            e
-        )
+        // Do not embed the raw hosts column — poll/startup rejection logs
+        // surface this message (issue #2997 redaction).
+        anyhow::anyhow!("Proxy {}: failed to parse hosts JSON: {}", pid, e)
     })?;
 
     Ok(Proxy {
@@ -9719,6 +9916,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_consumer_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("consumer", id, error)
+    })
+}
+
+fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, anyhow::Error> {
     let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to read credentials column: {}",
@@ -9742,10 +9946,12 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         )
     })?;
     let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
+        // Never embed the raw acl_groups column in the error — poll rejection
+        // logs would otherwise leak row content (issue #2997).
         anyhow::anyhow!(
-            "Failed to parse acl_groups JSON for consumer: {} (raw: {})",
-            e,
-            acl_groups_str
+            "Consumer {}: failed to parse acl_groups JSON: {}",
+            id_preview,
+            e
         )
     })?;
 
@@ -9766,6 +9972,16 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_plugin_config_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("plugin_config", id, error)
+    })
+}
+
+fn row_to_plugin_config_inner(
+    row: &AnyRow,
+    id_preview: &str,
+) -> Result<PluginConfig, anyhow::Error> {
     let config_str = required_utf8_text_column(row, "config").map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to read config column: {}",
@@ -9822,6 +10038,13 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_upstream_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("upstream", id, error)
+    })
+}
+
+fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
     let targets_str = required_utf8_text_column(row, "targets").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read targets column: {}",
@@ -9845,13 +10068,11 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str.clone())).map_err(|e| {
-            anyhow::anyhow!(
-                "Upstream {}: failed to parse algorithm '{}': {}",
-                id_preview,
-                algo_str,
-                e
-            )
+        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|_| {
+            // Do not embed the raw algorithm column — hostile/oversized DB
+            // values must not reach poll/startup rejection logs through either
+            // this message or serde's unknown-variant error (issue #2997).
+            anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
         })?;
 
     let health_checks: Option<HealthCheckConfig> =
@@ -10218,6 +10439,134 @@ mod proxy_insert_sql_drift_tests {
             DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
             "submit_api_spec_bundle proxy INSERT placeholder count must match \
              PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
+        );
+    }
+}
+
+#[cfg(test)]
+mod row_decode_rejection_classification_tests {
+    use super::{
+        FullLoadPurpose, ProxyPluginAssociationLoadError, is_row_decode_rejection,
+        is_transient_database_error, mark_row_decode_rejection,
+    };
+
+    #[test]
+    fn association_load_error_is_not_rebadged_as_row_decode_rejection() {
+        let err = anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            "operation=load_full_config resource=proxy_plugins proxy_id=missing: association row references a proxy that was not present in the loaded proxy candidate".to_string(),
+        ));
+        let mapped = FullLoadPurpose::Runtime.map_row_error("proxy_plugin", None, err);
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "ProxyPluginAssociationLoadError must not become RowDecodeRejection: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn transient_sqlx_error_is_not_rebadged_as_row_decode_rejection() {
+        let err = anyhow::Error::new(sqlx::Error::PoolTimedOut);
+        assert!(is_transient_database_error(&err));
+        let mapped = FullLoadPurpose::Runtime.map_row_error("consumer", Some("c1".into()), err);
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "connectivity/driver faults must stay non-repairable: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn genuine_decode_failure_is_marked_for_poll_repair() {
+        let err = anyhow::anyhow!("Consumer c-bad: failed to parse credentials JSON: EOF");
+        let marked = mark_row_decode_rejection("consumer", Some("c-bad".into()), err);
+        assert!(is_row_decode_rejection(&marked));
+        assert!(
+            marked
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "top-level Display must carry the decode reason for operator {{}} sites: {marked}"
+        );
+        let mapped =
+            FullLoadPurpose::Runtime.map_row_error("consumer", Some("c-bad".into()), marked);
+        assert!(
+            is_row_decode_rejection(&mapped),
+            "undecodable rows must remain RowDecodeRejection: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn admission_validation_purpose_does_not_retain_row_decode_marker() {
+        // Admin-write admission shares load_*_tx helpers with runtime full
+        // loads, but must not leave RowDecodeRejection on the returned error:
+        // that marker means "poll: keep admin writable / last-known-good".
+        let err = anyhow::anyhow!(
+            "Consumer malformed: failed to parse credentials JSON: expected ident at line 1 column 2"
+        );
+        let marked = mark_row_decode_rejection("consumer", Some("malformed".into()), err);
+        assert!(is_row_decode_rejection(&marked));
+        let mapped = FullLoadPurpose::AdmissionValidation.map_row_error(
+            "consumer",
+            Some("malformed".into()),
+            marked,
+        );
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "admission must demote the poll marker: {mapped:#}"
+        );
+        assert!(
+            mapped
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "admission must still surface the decode reason: {mapped}"
+        );
+        assert!(
+            mapped.to_string().contains("malformed")
+                || mapped.to_string().contains("Consumer malformed"),
+            "admission must identify the offending consumer: {mapped}"
+        );
+    }
+
+    #[test]
+    fn decode_error_messages_must_not_embed_raw_column_bodies() {
+        let source = include_str!("db_loader.rs");
+        let consumer = source
+            .split("fn row_to_consumer_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn row_to_plugin_config(").next())
+            .expect("row_to_consumer_inner body");
+        assert!(
+            !consumer.contains("(raw: {})"),
+            "consumer decode errors must not embed raw column bodies"
+        );
+        let proxy = source
+            .split("fn row_to_proxy_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn row_to_consumer(").next())
+            .expect("row_to_proxy_inner body");
+        assert!(
+            !proxy.contains("hosts JSON '{}'"),
+            "proxy hosts decode errors must not embed the raw hosts column"
+        );
+        let parse_scheme = source
+            .split("pub(crate) fn parse_scheme(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) fn parse_auth_mode(").next())
+            .expect("parse_scheme body");
+        assert!(
+            !parse_scheme.contains("backend_scheme '{s}'")
+                && !parse_scheme.contains("backend_scheme '{}'"),
+            "proxy backend_scheme decode errors must not embed the raw scheme column"
+        );
+        let upstream = source
+            .split("fn row_to_upstream_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("row_to_upstream_inner body");
+        assert!(
+            !upstream.contains("algorithm '{}'"),
+            "upstream algorithm decode errors must not embed the raw algorithm column"
+        );
+        assert!(
+            !upstream.contains("failed to parse algorithm: {}"),
+            "upstream algorithm decode errors must not relay serde's raw unknown variant"
         );
     }
 }

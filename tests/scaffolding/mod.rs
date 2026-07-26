@@ -6,7 +6,8 @@
 //! - [`ports::reserve_port`] — a port held by a live `TcpListener` (no
 //!   drop-rebind race).
 //! - [`certs::TestCa`] — a self-signed test CA with `valid` / `expired` /
-//!   `not_yet_valid` / `wrong_san` / `self_signed` leaf-cert presets.
+//!   `not_yet_valid` / `wrong_san` / `client_auth` / `self_signed` leaf-cert
+//!   presets.
 //! - [`backends::ScriptedTcpBackend`] — TCP server replaying a script of
 //!   [`backends::TcpStep`]s.
 //! - [`backends::ScriptedTlsBackend`] — TLS-terminating wrapper, with
