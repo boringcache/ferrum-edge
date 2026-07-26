@@ -335,6 +335,10 @@ pub fn validate_mesh_config_update(
     // consistently unversioned and then bootstrap through the freshness gate
     // with no watermark. Genuinely absent revisions (both sides) remain valid
     // for unsequenced authorities.
+    //
+    // Distinguish raw empty (proto default / absent) from raw non-empty but
+    // blank (`"   "`): the latter is a *present* ill-formed envelope authority
+    // and must be refused, not silently treated as absent.
     if let Some(revision) = slice.revision.as_ref()
         && !revision.is_well_formed()
     {
@@ -344,26 +348,26 @@ pub fn validate_mesh_config_update(
             .to_string();
         return rejected(consumer, Reason::MalformedRevision, detail);
     }
-    if !update.config_authority.trim().is_empty() {
+    if !update.config_authority.is_empty() {
         let envelope = MeshConfigRevision::new(
             update.config_authority.as_str(),
             update.config_sequence,
         );
         if !envelope.is_well_formed() {
             let detail = "envelope config revision is present but ill-formed \
-                (over-long or control-character authority)"
+                (blank, over-long, or control-character authority)"
                 .to_string();
             return rejected(consumer, Reason::MalformedRevision, detail);
         }
     }
-    if update.config_authority.trim().is_empty() && update.config_sequence != 0 {
+    if update.config_authority.is_empty() && update.config_sequence != 0 {
         let detail = format!(
             "envelope config sequence {} has no config authority",
             update.config_sequence
         );
         return rejected(consumer, Reason::EnvelopeRevisionMismatch, detail);
     }
-    let envelope_revision = (!update.config_authority.trim().is_empty())
+    let envelope_revision = (!update.config_authority.is_empty())
         .then_some((update.config_authority.as_str(), update.config_sequence));
     // Ill-formed slice revisions were already refused above, so a remaining
     // `Some` is well-formed and safe to compare without a silent downgrade.

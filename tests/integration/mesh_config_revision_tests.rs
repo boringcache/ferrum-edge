@@ -803,6 +803,135 @@ fn malformed_embedded_revision_cannot_smuggle_past_validation_or_bootstrap() {
     );
 }
 
+/// Raw non-empty whitespace-only envelope authority is *present but ill-formed*,
+/// not proto-absent. Filtering on `.trim().is_empty()` would silently treat
+/// `config_authority="   "` + `config_sequence=0` with an absent embedded
+/// revision as consistently unversioned and let it pass.
+#[test]
+fn whitespace_only_envelope_authority_is_malformed_not_absent() {
+    let request = client_config().subscribe_request(ferrum_edge::FERRUM_VERSION);
+    let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+    let unversioned = slice_at("v-blank-envelope", None);
+
+    let whitespace_envelope = MeshConfigUpdate {
+        config_authority: "   ".to_string(),
+        config_sequence: 0,
+        ..update_for(&unversioned)
+    };
+
+    for consumer in [
+        MeshUpdateConsumer::Native,
+        MeshUpdateConsumer::RemoteDiscovery,
+    ] {
+        let rejection = validate_mesh_config_update(&whitespace_envelope, &expected, consumer)
+            .expect_err("whitespace-only envelope authority must be refused");
+        assert_eq!(
+            rejection.reason(),
+            MeshUpdateRejectReason::MalformedRevision,
+            "{}: dedicated malformed_revision reason",
+            consumer.as_metric_label()
+        );
+        // Static diagnostic only — do not echo the raw authority bytes.
+        assert!(
+            !rejection.detail().contains("   "),
+            "{}: diagnostics must not echo the blank authority text",
+            consumer.as_metric_label()
+        );
+        assert!(
+            rejection.detail().contains("ill-formed"),
+            "{}: diagnostic should name the ill-formed envelope class",
+            consumer.as_metric_label()
+        );
+    }
+
+    // Contrast: genuinely empty envelope + absent slice remains valid.
+    validate_mesh_config_update(
+        &update_for(&unversioned),
+        &expected,
+        MeshUpdateConsumer::Native,
+    )
+    .expect("raw-empty envelope with absent slice remains unrevisioned");
+}
+
+/// Full-load revision stamping is scope-domained (issue #2473):
+/// - Explicit Single/Set: max of scoped namespace cursors (same domain incremental
+///   polling advances). An unrelated namespace's global sequence must not make a
+///   restarted replica jump ahead of its identical running peer.
+/// - All: store-global high-water mark so a deleted namespace cannot rewind a
+///   restarted CP. In-process floor is preserved for both.
+#[test]
+fn explicit_scope_full_load_sequence_ignores_unrelated_global_high_water() {
+    use ferrum_edge::grpc::cp_server::CpScope;
+    use std::collections::HashSet;
+
+    let mut scoped = HashMap::new();
+    scoped.insert("alpha".to_string(), 10);
+    // Store-global advanced by an unrelated namespace the explicit scope never
+    // polls. Running Single/Set CP stays at 10 (no delta); restarted peer must
+    // also stamp 10, not 50.
+    let store_global = 50;
+
+    assert_eq!(
+        CpScope::Single("alpha".to_string()).mesh_full_load_sequence(&scoped, store_global, 0),
+        10,
+        "Single-scope restart must not jump to an unrelated global sequence"
+    );
+
+    let set = CpScope::Set(HashSet::from([
+        "alpha".to_string(),
+        "beta".to_string(),
+    ]));
+    let mut set_scoped = scoped.clone();
+    set_scoped.insert("beta".to_string(), 12);
+    assert_eq!(
+        set.mesh_full_load_sequence(&set_scoped, store_global, 0),
+        12,
+        "Set-scope full load uses max of explicit namespace cursors only"
+    );
+
+    // All-scope retains the store-global watermark when discovery shrinks.
+    let mut remaining = HashMap::new();
+    remaining.insert("alpha".to_string(), 10);
+    assert_eq!(
+        CpScope::All.mesh_full_load_sequence(&remaining, store_global, 0),
+        50,
+        "All-scope restart must keep store-global monotonicity after namespace loss"
+    );
+
+    // In-process floor protects full reload for both domains.
+    assert_eq!(
+        CpScope::Single("alpha".to_string()).mesh_full_load_sequence(&scoped, store_global, 20),
+        20
+    );
+    assert_eq!(
+        CpScope::All.mesh_full_load_sequence(&remaining, 15, 40),
+        40
+    );
+}
+
+/// `content_eq` ignores revision (ordering metadata). Existing MeshSubscribe
+/// subscribers must not receive a revision-only frame when content is unchanged —
+/// the CP dedupe path relies on this so scoped sequence convergence does not
+/// imply hot-path broadcast spam.
+#[test]
+fn content_eq_ignores_revision_so_unchanged_frames_stay_suppressed() {
+    let mut left = slice_at("v-content", Some(revision("db", 10)));
+    let mut right = left.clone();
+    right.revision = Some(revision("db", 50));
+    right.version = "different-wall-clock".to_string();
+
+    assert!(
+        left.content_eq(&right),
+        "revision/version-only differences must not count as content changes"
+    );
+
+    left.labels_ambiguous = true;
+    assert!(
+        !left.content_eq(&right),
+        "real content changes must still be detected"
+    );
+}
+
 // ── Live two-CP MeshSubscribe stream ───────────────────────────────────────
 
 /// An in-process control plane that replays a fixed script of frames and then

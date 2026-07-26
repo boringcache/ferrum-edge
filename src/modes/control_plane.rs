@@ -600,6 +600,7 @@ async fn load_full_config_multi(
 async fn load_full_config_multi_with_sequence(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
+    scope: &CpScope,
     mesh_authority: Option<&str>,
     mesh_sequence_floor: u64,
 ) -> Result<(GatewayConfig, HashMap<String, u64>), anyhow::Error> {
@@ -613,21 +614,24 @@ async fn load_full_config_multi_with_sequence(
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
+    // Sequence domain is scope-dependent (issue #2473):
+    // - Explicit Single/Set: max of the same per-namespace durable cursors
+    //   incremental polling advances from, so an unrelated namespace cannot make
+    //   a restarted replica jump ahead of its identical running peer.
+    // - All: store-global high-water mark, so a namespace that disappears after
+    //   its last resource is deleted cannot rewind a restarted CP.
+    // The in-process floor protects full reload while the process is alive.
     let mesh_sequence = if mesh_authority.is_some() {
-        db.latest_global_change_sequence()
-            .await?
-            .max(mesh_sequence_floor)
+        let store_global_sequence = if matches!(scope, CpScope::All) {
+            db.latest_global_change_sequence().await?
+        } else {
+            0
+        };
+        scope.mesh_full_load_sequence(&sequences, store_global_sequence, mesh_sequence_floor)
     } else {
         0
     };
     let mut config = load_full_config_multi(db, namespaces).await?;
-    // `config_changes.sequence` is a single globally monotonic change log, so
-    // its store-wide high-water mark is the snapshot generation. It must not be
-    // derived only from currently polled namespaces: under `CpScope::All` that
-    // set can shrink when a namespace is deleted, and a restarted CP has no
-    // in-process floor to remember the deleted namespace's newer sequence. The
-    // durable global cursor keeps publication monotonic across that restart;
-    // the floor also protects an in-process full reload.
     stamp_mesh_revision(&mut config, mesh_authority, mesh_sequence);
     Ok((config, sequences))
 }
@@ -1017,6 +1021,7 @@ pub async fn run(
     let (config, initial_change_sequences) = load_full_config_multi_with_sequence(
         db.as_ref(),
         &polled_namespaces,
+        &cp_scope,
         mesh_config_authority.as_deref(),
         0,
     )
@@ -1826,6 +1831,7 @@ pub async fn run(
                         match load_full_config_multi_with_sequence(
                             db_poll.as_ref(),
                             &nslist,
+                            &poll_scope,
                             poll_mesh_config_authority.as_deref(),
                             published_mesh_sequence(&config_poll),
                         )
@@ -2019,6 +2025,7 @@ pub async fn run(
                                         match load_full_config_multi_with_sequence(
                                             db_poll.as_ref(),
                                             &nslist,
+                                            &poll_scope,
                                             poll_mesh_config_authority.as_deref(),
                                             published_mesh_sequence(&config_poll),
                                         )
@@ -2153,6 +2160,7 @@ pub async fn run(
                                 match load_full_config_multi_with_sequence(
                                     db_poll.as_ref(),
                                     &nslist,
+                                    &poll_scope,
                                     poll_mesh_config_authority.as_deref(),
                                     published_mesh_sequence(&config_poll),
                                 )
@@ -2232,6 +2240,7 @@ pub async fn run(
                                                 match load_full_config_multi_with_sequence(
                                                     db_poll.as_ref(),
                                                     &nslist,
+                                                    &poll_scope,
                                                     poll_mesh_config_authority.as_deref(),
                                                     published_mesh_sequence(&config_poll),
                                                 )
