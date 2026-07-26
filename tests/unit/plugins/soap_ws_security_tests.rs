@@ -3973,7 +3973,10 @@ fn test_extreme_saml_skew_is_rejected_at_admission() {
         "reject_missing_security_header": false
     });
     let err = SoapWsSecurity::new(&config).expect_err("extreme SAML skew must be rejected");
-    assert!(err.contains("clock_skew_seconds"), "unexpected error: {err}");
+    assert!(
+        err.contains("clock_skew_seconds"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -3986,7 +3989,10 @@ fn test_timestamp_bound_boundaries() {
         },
         "reject_missing_security_header": false
     });
-    assert!(SoapWsSecurity::new(&ok).is_ok(), "maximum bounds must admit");
+    assert!(
+        SoapWsSecurity::new(&ok).is_ok(),
+        "maximum bounds must admit"
+    );
 
     let too_big = json!({
         "timestamp": { "require": true, "max_age_seconds": 86_401 },
@@ -4111,7 +4117,10 @@ fn test_malformed_credential_entries_are_rejected_not_dropped() {
         }
     });
     let err = SoapWsSecurity::new(&missing_password).expect_err("missing password must reject");
-    assert!(err.contains("password") && err.contains("is required"), "{err}");
+    assert!(
+        err.contains("password") && err.contains("is required"),
+        "{err}"
+    );
 
     let wrong_type = json!({
         "timestamp": { "require": false },
@@ -4178,7 +4187,10 @@ fn test_non_string_cert_path_entry_is_rejected() {
         "reject_missing_security_header": false
     });
     let err = SoapWsSecurity::new(&config).expect_err("non-string entry must reject");
-    assert!(err.contains("trusted_issuers[1]"), "unexpected error: {err}");
+    assert!(
+        err.contains("trusted_issuers[1]"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
