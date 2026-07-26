@@ -3442,9 +3442,9 @@ async fn test_websocket_ping_unresponsive_backend_yields_no_local_pong() {
 
     match next_ws_message_within(&mut ws, Duration::from_millis(750)).await {
         None => {}
-        Some(Ok(Message::Pong(data))) => panic!(
-            "gateway must not auto-Pong when backend is silent; got Pong {data:?}"
-        ),
+        Some(Ok(Message::Pong(data))) => {
+            panic!("gateway must not auto-Pong when backend is silent; got Pong {data:?}")
+        }
         Some(other) => panic!("unexpected frame while waiting for silence: {other:?}"),
     }
 
@@ -3658,14 +3658,9 @@ async fn test_h2_websocket_ping_unresponsive_backend_yields_no_local_pong() {
         .extension(hyper::ext::Protocol::from_static("websocket"))
         .body(Empty::<Bytes>::new())
         .expect("build H2 WebSocket CONNECT");
-    let response = sender
-        .send_request(request)
-        .await
-        .expect("send H2 CONNECT");
+    let response = sender.send_request(request).await.expect("send H2 CONNECT");
     assert_eq!(response.status(), http::StatusCode::OK);
-    let upgraded = hyper::upgrade::on(response)
-        .await
-        .expect("H2 upgrade");
+    let upgraded = hyper::upgrade::on(response).await.expect("H2 upgrade");
     let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
 
     ws.send(Message::Ping(vec![9, 6, 3].into()))
@@ -3729,14 +3724,9 @@ async fn test_h2_websocket_ping_responsive_backend_yields_exactly_one_pong() {
         .extension(hyper::ext::Protocol::from_static("websocket"))
         .body(Empty::<Bytes>::new())
         .expect("build H2 WebSocket CONNECT");
-    let response = sender
-        .send_request(request)
-        .await
-        .expect("send H2 CONNECT");
+    let response = sender.send_request(request).await.expect("send H2 CONNECT");
     assert_eq!(response.status(), http::StatusCode::OK);
-    let upgraded = hyper::upgrade::on(response)
-        .await
-        .expect("H2 upgrade");
+    let upgraded = hyper::upgrade::on(response).await.expect("H2 upgrade");
     let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
 
     let payload = vec![4, 5, 6];
