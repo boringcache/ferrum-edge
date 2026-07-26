@@ -122,13 +122,27 @@ define_header_name_set! {
 ///
 /// Primary dispatch maps normally carry lowercase names (hyper/`HeaderName`),
 /// but plugin-synthesised mixed-case keys can appear in the string `HashMap`.
-/// `Forwarded` matching is ASCII case-insensitive and allocation-free so a
-/// hostile `Forwarded` / `FORWARDED` key cannot bypass ownership and precede
-/// the gateway-owned element on append/`Vec`-push transports.
+/// Ownership matching is ASCII case-insensitive and allocation-free so a
+/// hostile `Forwarded` / `X-Forwarded-For` / `FORWARDED` key cannot bypass the
+/// strip and precede the gateway-owned element on append/`Vec`-push transports.
+///
+/// Hot path: lowercase names hit the exact `matches!` inventory (or the
+/// lowercase `forwarded` compare) with no scan. The case-insensitive XFF sweep
+/// runs only when the name carries an uppercase ASCII byte.
 #[inline]
 pub fn is_proxy_owned_forwarding_header(name: &str, add_forwarded_header: bool) -> bool {
-    is_proxy_generated_forwarding_header(name)
-        || (add_forwarded_header && name.eq_ignore_ascii_case("forwarded"))
+    if is_proxy_generated_forwarding_header(name) {
+        return true;
+    }
+    if add_forwarded_header && name.eq_ignore_ascii_case("forwarded") {
+        return true;
+    }
+    // Mixed-case plugin keys bypass the lowercase-only XFF inventory above.
+    // Mirror the cross-protocol skip hot-path shape: uppercase gate first.
+    name.bytes().any(|b| b.is_ascii_uppercase())
+        && (name.eq_ignore_ascii_case("x-forwarded-for")
+            || name.eq_ignore_ascii_case("x-forwarded-proto")
+            || name.eq_ignore_ascii_case("x-forwarded-host"))
 }
 
 /// Whether client `Host` / authority should survive secondary-request filtering.
@@ -782,8 +796,23 @@ mod tests {
         assert!(!is_proxy_owned_forwarding_header("Forwarded", false));
         assert!(is_proxy_owned_forwarding_header("x-forwarded-for", false));
         assert!(is_proxy_owned_forwarding_header("x-forwarded-for", true));
+        // Always-owned XFF family must also strip mixed-case plugin keys —
+        // reqwest appends, so a bypassed `X-Forwarded-For` precedes Ferrum's.
+        for name in [
+            "X-Forwarded-For",
+            "X-FORWARDED-FOR",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Host",
+        ] {
+            assert!(
+                is_proxy_owned_forwarding_header(name, false),
+                "{name} must be owned regardless of regeneration flag"
+            );
+            assert!(is_proxy_owned_forwarding_header(name, true));
+        }
         assert!(!is_proxy_owned_forwarding_header("via", true));
         assert!(!is_proxy_owned_forwarding_header("authorization", true));
+        assert!(!is_proxy_owned_forwarding_header("X-Forwarded", true));
     }
 
     #[test]

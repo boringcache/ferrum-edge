@@ -287,7 +287,7 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - Admin API IP allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`) — TCP-level rejection before TLS handshake or request processing
 - Admin API connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`, default 1024; optional per-IP `FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP`) — bounds management-plane connections independently of the data-plane `FERRUM_MAX_CONNECTIONS`; enforced after the CIDR allowlist and before the TLS handshake, with `ferrum_admin_active_connections` / `ferrum_admin_rejected_connections_total` metrics
 - Opt-in Via header (RFC 9110 §7.6.3) on request and response paths (`FERRUM_ADD_VIA_HEADER`)
-- Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`)
+- Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`); when enabled Ferrum owns the outbound value and discards client-supplied `Forwarded` on every backend transport
 - Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`)
 
 ## DNS Caching
