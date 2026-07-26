@@ -27,6 +27,11 @@
 //!   roots to validate peers without holding an SVID. Private-key issuance
 //!   remains gated exclusively on `FetchX509SVID`.
 //!
+//! Rotation delivery is capacity-one / latest-wins ([`super::latest_wins`]):
+//! slow consumers do not accumulate private-key-bearing responses, and
+//! stream cancel drops any pending slot immediately so rotation tasks exit
+//! without waiting on backpressure.
+//!
 //! Phase A wires up the gRPC service handlers and a `serve` entry point.
 //! Listener bind / shutdown integration with the rest of the binary lands
 //! in Phase C — Phase A keeps everything additive.
@@ -37,10 +42,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::Stream;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, warn};
 
+use super::latest_wins::{self, LatestWinsSender};
 use super::proto::spiffe_workload_api_server::{SpiffeWorkloadApi, SpiffeWorkloadApiServer};
 use super::proto::{
     JwtBundlesRequest, JwtBundlesResponse, JwtsvidRequest, JwtsvidResponse, ValidateJwtsvidRequest,
@@ -142,12 +147,27 @@ impl WorkloadApiService {
         }
     }
 
+    /// Wait for the next rotation epoch or stream cancel.
+    ///
+    /// When several epochs fire while the prior issuance is still in flight,
+    /// collapse them into a single wake so we mint/publish at most one newest
+    /// response per producer cycle (no FIFO of intermediate private keys).
     async fn wait_for_rotation_or_stream_close<T>(
         rx: &mut watch::Receiver<u64>,
-        tx: &tokio::sync::mpsc::UnboundedSender<Result<T, Status>>,
+        tx: &LatestWinsSender<T>,
     ) -> bool {
         tokio::select! {
-            changed = rx.changed() => changed.is_ok(),
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                // Drain any epochs that arrived while we were waking so one
+                // issuance observes the newest rotation state.
+                while rx.has_changed().is_ok_and(|changed| changed) {
+                    rx.borrow_and_update();
+                }
+                true
+            }
             _ = tx.closed() => false,
         }
     }
@@ -365,8 +385,12 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
 
-        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(initial));
+        let (tx, out_rx) = latest_wins::channel();
+        if !tx.publish(Ok(initial)) {
+            return Err(Status::cancelled(
+                "FetchX509SVID stream closed before start",
+            ));
+        }
 
         tokio::spawn(async move {
             loop {
@@ -378,7 +402,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 let identity = match Self::attest_with(&attestors, &peer).await {
                     Ok(id) => id,
                     Err(status) => {
-                        let _ = tx.send(Err(status));
+                        let _ = tx.publish(Err(status));
                         return;
                     }
                 };
@@ -392,7 +416,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 .await
                 {
                     Ok(resp) => {
-                        if tx.send(Ok(resp)).is_err() {
+                        // Latest-wins: replaces any unread prior response and
+                        // drops superseded private-key material immediately.
+                        if !tx.publish(Ok(resp)) {
                             return;
                         }
                     }
@@ -405,9 +431,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             }
         });
 
-        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
-            out_rx,
-        ))))
+        Ok(Response::new(Box::pin(out_rx.into_stream())))
     }
 
     type FetchX509BundlesStream =
@@ -436,8 +460,12 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
 
-        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(initial));
+        let (tx, out_rx) = latest_wins::channel();
+        if !tx.publish(Ok(initial)) {
+            return Err(Status::cancelled(
+                "FetchX509Bundles stream closed before start",
+            ));
+        }
 
         tokio::spawn(async move {
             loop {
@@ -448,7 +476,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                     .await
                 {
                     Ok(resp) => {
-                        if tx.send(Ok(resp)).is_err() {
+                        if !tx.publish(Ok(resp)) {
                             return;
                         }
                     }
@@ -459,9 +487,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             }
         });
 
-        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
-            out_rx,
-        ))))
+        Ok(Response::new(Box::pin(out_rx.into_stream())))
     }
 
     async fn fetch_jwtsvid(
@@ -489,8 +515,12 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         };
 
         let mut rx = self.rotation_signal.subscribe();
-        let (tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(initial));
+        let (tx, out_rx) = latest_wins::channel();
+        if !tx.publish(Ok(initial)) {
+            return Err(Status::cancelled(
+                "FetchJWTBundles stream closed before start",
+            ));
+        }
 
         tokio::spawn(async move {
             loop {
@@ -500,15 +530,13 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 let resp = JwtBundlesResponse {
                     bundles: Default::default(),
                 };
-                if tx.send(Ok(resp)).is_err() {
+                if !tx.publish(Ok(resp)) {
                     return;
                 }
             }
         });
 
-        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(
-            out_rx,
-        ))))
+        Ok(Response::new(Box::pin(out_rx.into_stream())))
     }
 
     async fn validate_jwtsvid(

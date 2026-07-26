@@ -11,7 +11,7 @@
 //! `major.minor` version compatibility between CP and DP.
 
 use arc_swap::ArcSwap;
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -49,12 +49,15 @@ use crate::k8s_controller::{
 use crate::modes::file::ListenerJoinHandle;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
+use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
 
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
 
-type CpGrpcIncomingStream =
+/// Stream of admitted CP gRPC connections handed to tonic's
+/// `serve_with_incoming_shutdown`.
+pub type CpGrpcIncomingStream =
     Pin<Box<dyn Stream<Item = Result<CpGrpcIo, std::io::Error>> + Send + 'static>>;
 
 async fn reconcile_plugin_migrations_after_cp_reconnect(
@@ -84,15 +87,38 @@ async fn reconcile_plugin_migrations_after_cp_reconnect(
     }
 }
 
-enum CpGrpcIo {
-    Plain(TcpStream),
+/// One admitted CP gRPC connection.
+///
+/// Each variant owns a [`ConnPermit`] from the shared CP gRPC
+/// [`ConnLimiter`]. The permit is acquired in the accept loop *before* any
+/// per-socket handshake work is allocated and is dropped with this value —
+/// i.e. when tonic finishes with the connection — so one permit bounds the
+/// pre-authentication handshake **and** the completed (possibly idle) HTTP/2
+/// session. See [`run_cp_grpc_tls_accept_loop`].
+///
+/// Public so external regression tests can drive the listener; all fields
+/// remain private.
+pub enum CpGrpcIo {
+    /// Plaintext connection (loopback or explicit `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`).
+    Plain(Box<CpGrpcPlainIo>),
+    /// TLS/mTLS connection with a completed handshake.
     Tls(Box<CpGrpcTlsIo>),
 }
 
-struct CpGrpcTlsIo {
+/// Plaintext CP gRPC connection plus its admission permit.
+pub struct CpGrpcPlainIo {
+    inner: TcpStream,
+    /// Released when this value drops; see [`CpGrpcIo`].
+    _permit: ConnPermit,
+}
+
+/// TLS/mTLS CP gRPC connection plus its admission permit.
+pub struct CpGrpcTlsIo {
     inner: tokio_rustls::server::TlsStream<TcpStream>,
     local_addr: Option<SocketAddr>,
     remote_addr: Option<SocketAddr>,
+    /// Released when this value drops; see [`CpGrpcIo`].
+    _permit: ConnPermit,
 }
 
 impl AsyncRead for CpGrpcIo {
@@ -102,7 +128,7 @@ impl AsyncRead for CpGrpcIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Plain(stream) => Pin::new(&mut stream.inner).poll_read(cx, buf),
             Self::Tls(stream) => Pin::new(&mut stream.inner).poll_read(cx, buf),
         }
     }
@@ -115,21 +141,21 @@ impl AsyncWrite for CpGrpcIo {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Plain(stream) => Pin::new(&mut stream.inner).poll_write(cx, buf),
             Self::Tls(stream) => Pin::new(&mut stream.inner).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Plain(stream) => Pin::new(&mut stream.inner).poll_flush(cx),
             Self::Tls(stream) => Pin::new(&mut stream.inner).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match &mut *self {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Plain(stream) => Pin::new(&mut stream.inner).poll_shutdown(cx),
             Self::Tls(stream) => Pin::new(&mut stream.inner).poll_shutdown(cx),
         }
     }
@@ -141,8 +167,8 @@ impl Connected for CpGrpcIo {
     fn connect_info(&self) -> Self::ConnectInfo {
         match self {
             Self::Plain(stream) => TcpConnectInfo {
-                local_addr: stream.local_addr().ok(),
-                remote_addr: stream.peer_addr().ok(),
+                local_addr: stream.inner.local_addr().ok(),
+                remote_addr: stream.inner.peer_addr().ok(),
             },
             Self::Tls(stream) => TcpConnectInfo {
                 local_addr: stream.local_addr,
@@ -152,15 +178,65 @@ impl Connected for CpGrpcIo {
     }
 }
 
-fn cp_grpc_plain_incoming(listener: tokio::net::TcpListener) -> CpGrpcIncomingStream {
-    Box::pin(TcpListenerStream::new(listener).map_ok(CpGrpcIo::Plain))
+/// Plaintext CP gRPC incoming stream, gated by the same shared
+/// [`ConnLimiter`] as the TLS listener.
+///
+/// A plaintext socket allocates no handshake task, but tonic still holds one
+/// connection (file descriptor + HTTP/2 state) per accepted socket for its
+/// whole lifetime, so the same bound applies. Admission is non-blocking: a
+/// refused socket is dropped and the stream continues, never stalling the
+/// accept path.
+pub fn cp_grpc_plain_incoming(
+    listener: tokio::net::TcpListener,
+    conn_limiter: Arc<ConnLimiter>,
+) -> CpGrpcIncomingStream {
+    let reject_log = Arc::new(std::sync::Mutex::new(
+        crate::util::accept_backoff::LogRateLimiter::new(),
+    ));
+    let admitted = TcpListenerStream::new(listener).filter_map(move |accepted| {
+        let conn_limiter = Arc::clone(&conn_limiter);
+        let reject_log = Arc::clone(&reject_log);
+        async move {
+            let stream = match accepted {
+                Ok(stream) => stream,
+                // Surface accept errors to tonic unchanged.
+                Err(error) => return Some(Err(error)),
+            };
+            // A socket whose peer address cannot be read cannot be accounted
+            // per-IP; it is already broken, so fail closed.
+            let Ok(remote_addr) = stream.peer_addr() else {
+                debug!("Dropping CP gRPC connection: peer address unavailable");
+                return None;
+            };
+            match conn_limiter.try_acquire(remote_addr.ip()) {
+                Ok(permit) => Some(Ok(CpGrpcIo::Plain(Box::new(CpGrpcPlainIo {
+                    inner: stream,
+                    _permit: permit,
+                })))),
+                Err(reason) => {
+                    log_cp_grpc_admission_rejection(&reject_log, remote_addr, reason);
+                    // Dropping the socket closes it immediately.
+                    None
+                }
+            }
+        }
+    });
+    Box::pin(admitted)
 }
 
-fn cp_grpc_tls_incoming(
+/// TLS/mTLS CP gRPC incoming stream.
+///
+/// The accept loop runs in its own task and forwards completed handshakes over
+/// a bounded channel; `conn_limiter` bounds how many sockets may be in that
+/// pipeline at once. The limiter is created once per process and shared across
+/// every certificate-reload generation (the cert rotates inside `tls_slot`, the
+/// listener and limiter do not), so a reload cannot reset or duplicate the cap.
+pub fn cp_grpc_tls_incoming(
     listener: tokio::net::TcpListener,
     tls_slot: crate::tls::SharedFrontendTls,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     handshake_timeout_seconds: u64,
+    conn_limiter: Arc<ConnLimiter>,
 ) -> CpGrpcIncomingStream {
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(run_cp_grpc_tls_accept_loop(
@@ -169,19 +245,72 @@ fn cp_grpc_tls_incoming(
         shutdown_rx,
         handshake_timeout_seconds,
         tx,
+        conn_limiter,
     ));
     Box::pin(ReceiverStream::new(rx))
 }
 
+/// Log one admission rejection, rate-limited to the first event plus a
+/// per-second summary so a flood cannot itself become the DoS.
+///
+/// Only the source IP and a fixed rejection label are recorded — never
+/// certificate material, JWTs, or any peer-supplied bytes (the peer is
+/// unauthenticated and has sent nothing at this point).
+fn log_cp_grpc_admission_rejection(
+    reject_log: &std::sync::Mutex<crate::util::accept_backoff::LogRateLimiter>,
+    remote_addr: SocketAddr,
+    reason: crate::util::conn_limit::ConnRejectReason,
+) {
+    let suppressed = {
+        let mut guard = match reject_log.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.on_event(crate::socket_opts::monotonic_now_ms())
+    };
+    if let Some(suppressed) = suppressed {
+        warn!(
+            suppressed,
+            remote_addr = %remote_addr.ip(),
+            reason = reason.as_label(),
+            "CP gRPC connection rejected: connection limit reached"
+        );
+    }
+}
+
+/// CP gRPC TLS accept loop with bounded pre-authentication admission
+/// (advisory GHSA-2xqr-7j7p-77qp).
+///
+/// A permit is acquired from `conn_limiter` **before** the per-socket
+/// handshake task is spawned. An unauthenticated client that opens sockets and
+/// withholds the TLS ClientHello therefore cannot allocate tasks, TLS state
+/// machines, or cloned server configurations beyond the configured bound: the
+/// excess socket is dropped (closed) in the accept loop itself. Acquisition is
+/// `try_acquire`, so a saturated limiter never blocks the accept loop — it
+/// fails closed and keeps accepting so legitimate peers are served as soon as
+/// permits free.
+///
+/// The permit moves into the spawned task and, on a successful handshake, into
+/// the [`CpGrpcTlsIo`] handed to tonic — so one permit covers the handshake and
+/// the served HTTP/2 session, and is released exactly once (RAII) on every exit
+/// path: handshake error, handshake timeout, empty TLS slot, channel-send
+/// failure, listener shutdown, or connection close.
+///
+/// `handshake_timeout_seconds`
+/// (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`) is retained as defense in
+/// depth: it retires slow handshakes so permits recycle, but it is not the
+/// concurrency bound.
 async fn run_cp_grpc_tls_accept_loop(
     listener: tokio::net::TcpListener,
     tls_slot: crate::tls::SharedFrontendTls,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     handshake_timeout_seconds: u64,
     tx: tokio::sync::mpsc::Sender<Result<CpGrpcIo, std::io::Error>>,
+    conn_limiter: Arc<ConnLimiter>,
 ) {
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
+    let reject_log = std::sync::Mutex::new(crate::util::accept_backoff::LogRateLimiter::new());
     loop {
         if *shutdown_rx.borrow() {
             return;
@@ -192,8 +321,23 @@ async fn run_cp_grpc_tls_accept_loop(
                 match accepted {
                     Ok((stream, remote_addr)) => {
                         accept_backoff.on_success();
+                        // Pre-authentication admission: bound the number of
+                        // live handshakes before allocating any per-socket
+                        // work. Over-limit sockets are closed here.
+                        let permit = match conn_limiter.try_acquire(remote_addr.ip()) {
+                            Ok(permit) => permit,
+                            Err(reason) => {
+                                log_cp_grpc_admission_rejection(&reject_log, remote_addr, reason);
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         let tls_config = tls_slot.load().as_ref().clone();
                         let tx = tx.clone();
+                        // `permit` is captured by this task and held for the
+                        // handshake; on success it moves into the IO object so
+                        // it also covers the served HTTP/2 session. Every other
+                        // exit path drops it here, releasing the slot.
                         tokio::spawn(async move {
                             let Some(tls_config) = tls_config else {
                                 debug!(
@@ -219,6 +363,7 @@ async fn run_cp_grpc_tls_accept_loop(
                                         inner,
                                         local_addr,
                                         remote_addr: Some(remote_addr),
+                                        _permit: permit,
                                     }));
                                     let _ = tx.send(Ok(io)).await;
                                 }
@@ -1827,6 +1972,31 @@ pub async fn run(
         .map_err(anyhow::Error::msg)?;
 
     let grpc_handle = if grpc_addr.port() != 0 {
+        // Pre-authentication admission for the CP gRPC listener (advisory
+        // GHSA-2xqr-7j7p-77qp). Built once here and shared by the plaintext
+        // listener, the TLS/mTLS accept loop, and every certificate-reload
+        // generation, so the cap is a property of the CP gRPC surface rather
+        // than of one listener instance or one certificate.
+        let grpc_conn_limiter = Arc::new(ConnLimiter::new(
+            env_config.cp_grpc_max_connections,
+            env_config.cp_grpc_max_connections_per_ip,
+        ));
+        crate::plugins::prometheus_metrics::global_registry()
+            .set_cp_grpc_conn_metrics(Arc::clone(&grpc_conn_limiter));
+        if env_config.cp_grpc_max_connections == 0 {
+            warn!(
+                "SECURITY: {} disables the CP gRPC connection cap — an unauthenticated client can \
+                 open sockets and withhold the TLS ClientHello until the process runs out of file \
+                 descriptors. Set a positive bound in production.",
+                crate::secrets::report_env_assignment("FERRUM_CP_GRPC_MAX_CONNECTIONS", "0")
+            );
+        } else {
+            info!(
+                max_connections = env_config.cp_grpc_max_connections,
+                max_connections_per_ip = env_config.cp_grpc_max_connections_per_ip,
+                "CP gRPC pre-authentication connection admission enabled"
+            );
+        }
         let grpc_tls_slot = if let (Some(_cert_path), Some(_key_path)) = (
             &env_config.cp_grpc_tls_cert_path,
             &env_config.cp_grpc_tls_key_path,
@@ -1937,9 +2107,10 @@ pub async fn run(
                     tls_slot,
                     grpc_accept_shutdown,
                     grpc_tls_handshake_timeout_seconds,
+                    grpc_conn_limiter,
                 )
             } else {
-                cp_grpc_plain_incoming(grpc_listener)
+                cp_grpc_plain_incoming(grpc_listener, grpc_conn_limiter)
             };
             let _ = grpc_started_tx.send(());
             let router = builder

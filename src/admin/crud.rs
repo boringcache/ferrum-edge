@@ -2904,6 +2904,8 @@ fn redact_sensitive_plugin_config_fields(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 if is_sensitive_plugin_config_key(key) {
                     *child = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+                } else if is_credential_bearing_url_config_key(key) {
+                    redact_url_userinfo_in_place(child);
                 } else {
                     redact_sensitive_plugin_config_fields(child);
                 }
@@ -2925,6 +2927,14 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
 
     let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
     normalized == "key"
+        // HMAC signing material for Redis cache envelopes (`ai_semantic_cache`
+        // `redis_integrity_key`). Substring match so any future
+        // `*_integrity_key` signing secret is covered without another edit; the
+        // segment is only ever used for signing/authenticity keys. Also match
+        // the delimiter-collapsed form (`integrityKey` → `integritykey`) the
+        // same way `api_key`/`apikey` already does.
+        || normalized.contains("integrity_key")
+        || normalized.contains("integritykey")
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
@@ -2934,6 +2944,51 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("private_key")
         || normalized.contains("service_account_json")
         || normalized.contains("webhook")
+}
+
+/// Config keys whose value is a connection URL that may carry credentials in
+/// its userinfo component.
+///
+/// These are deliberately *not* wholesale-redacted: the scheme/host/port/path
+/// are the useful diagnostics an operator needs from a Viewer/Operator read or
+/// an audit diff. Userinfo is replaced and query/fragment data is removed (see
+/// [`redact_url_userinfo_in_place`]).
+///
+/// `redis_url` is documented as an accepted place to encode Redis
+/// ACL credentials (`redis://user:pass@host`), and every Redis-backed plugin
+/// (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`,
+/// `udp_rate_limiting`, `request_deduplication`, `graphql`,
+/// `grpc_method_router`, `ai_semantic_cache`) shares that key, so the match is
+/// by key name rather than per plugin. Also match the delimiter-collapsed
+/// form (`redisUrl` → `redisurl`) the same way `integrity_key`/`integritykey`
+/// already does, so a nested camelCase field cannot bypass projection.
+fn is_credential_bearing_url_config_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "redis_url" || normalized == "redisurl"
+}
+
+/// Strip URL userinfo in place, preserving scheme/host/port/path for Redis URLs.
+///
+/// Delegates to the same helper the Redis client uses for its connect/health
+/// log fields, so a value an operator reads back from the admin API is byte
+/// identical to the one in the logs.
+///
+/// Fails closed: a non-string value is replaced wholesale with the redaction
+/// marker rather than echoed, as is an unparseable string or any non-`redis`/
+/// `rediss` scheme (handled by the shared helper), because those values cannot
+/// be projected as safe Redis endpoint diagnostics. `null` is left alone —
+/// there is nothing to disclose.
+fn redact_url_userinfo_in_place(value: &mut Value) {
+    use crate::plugins::utils::redis_rate_limiter::redact_url_userinfo;
+
+    if value.is_null() {
+        return;
+    }
+    let Some(raw) = value.as_str() else {
+        *value = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        return;
+    };
+    *value = json!(redact_url_userinfo(raw));
 }
 
 pub(crate) async fn check_port_available(
@@ -5005,4 +5060,100 @@ fn validation_error_response<R: AdminResource>(field_errors: &[String]) -> Respo
             field_errors.join("; ")
         )}),
     )
+}
+
+#[cfg(test)]
+mod redis_plugin_projection_tests {
+    use super::{
+        is_credential_bearing_url_config_key, is_sensitive_plugin_config_key,
+        redact_sensitive_plugin_config_fields, redact_url_userinfo_in_place,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn integrity_key_matcher_covers_normalized_and_collapsed_forms() {
+        for key in [
+            "redis_integrity_key",
+            "Redis-Integrity-Key",
+            "redis.integrity.key",
+            "REDIS_INTEGRITY_KEY",
+            "redisIntegrityKey",
+            "integrity_key",
+            "integrityKey",
+        ] {
+            assert!(
+                is_sensitive_plugin_config_key(key),
+                "{key} should be treated as signing-material"
+            );
+        }
+        assert!(!is_sensitive_plugin_config_key("integrity_status"));
+        assert!(!is_sensitive_plugin_config_key("ttl_seconds"));
+    }
+
+    #[test]
+    fn redis_url_key_matcher_is_delimiter_insensitive() {
+        for key in [
+            "redis_url",
+            "Redis-Url",
+            "REDIS.URL",
+            "redis-url",
+            "redisUrl",
+            "RedisURL",
+        ] {
+            assert!(
+                is_credential_bearing_url_config_key(key),
+                "{key} should be treated as a credential-bearing URL"
+            );
+        }
+        assert!(!is_credential_bearing_url_config_key("redis_username"));
+        assert!(!is_credential_bearing_url_config_key("endpoint_url"));
+        assert!(!is_credential_bearing_url_config_key("redis_urls"));
+    }
+
+    #[test]
+    fn nested_integrity_keys_and_redis_urls_are_projected() {
+        let mut config = json!({
+            "ttl_seconds": 60,
+            "redis_integrity_key": "signing-secret-0123456789abcdef",
+            "providers": [{
+                "redisIntegrityKey": "nested-signing-secret-0123456789",
+                "Redis-Url": "redis://user:pass@cache.internal:6379/3?token=q#f",
+                "redisUrl": "redis://nested:nested-pass@other.internal:6379/1?tok=n#g"
+            }]
+        });
+        redact_sensitive_plugin_config_fields(&mut config);
+
+        assert_eq!(config["ttl_seconds"], 60);
+        assert_eq!(config["redis_integrity_key"], "[REDACTED]");
+        assert_eq!(config["providers"][0]["redisIntegrityKey"], "[REDACTED]");
+        assert_eq!(
+            config["providers"][0]["Redis-Url"],
+            "redis://redacted@cache.internal:6379/3"
+        );
+        assert_eq!(
+            config["providers"][0]["redisUrl"],
+            "redis://redacted@other.internal:6379/1"
+        );
+        let serialized = config.to_string();
+        assert!(
+            !serialized.contains("signing-secret")
+                && !serialized.contains("nested-signing")
+                && !serialized.contains("pass")
+                && !serialized.contains("nested-pass")
+                && !serialized.contains("token=q")
+                && !serialized.contains("tok=n"),
+            "nested projection leaked secret material: {config}"
+        );
+    }
+
+    #[test]
+    fn redis_url_projection_fails_closed_for_non_strings() {
+        let mut number = json!(42);
+        redact_url_userinfo_in_place(&mut number);
+        assert_eq!(number, "[REDACTED]");
+
+        let mut null = json!(null);
+        redact_url_userinfo_in_place(&mut null);
+        assert!(null.is_null());
+    }
 }

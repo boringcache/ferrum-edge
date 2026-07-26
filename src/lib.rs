@@ -110,13 +110,13 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
-    pub fn take_compression_response_codec_permit_for_test(
+    pub fn take_compression_response_buffer_permit_for_test(
         ctx: &mut crate::plugins::RequestContext,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        ctx.take_compression_response_codec_permit()
+        ctx.take_compression_response_buffer_permit()
     }
 
-    /// Whether a compression instance reserved response codec admission for this
+    /// Whether a compression instance reserved response-buffer admission for this
     /// request in `before_proxy` (the early bound on the buffered population).
     pub fn compression_response_admission_reserved_for_test(
         ctx: &crate::plugins::RequestContext,
@@ -125,7 +125,7 @@ pub mod _test_support {
     }
 
     /// Whether `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission (so the response streams identity).
+    /// obtain bounded response-buffer admission (so the response streams identity).
     pub fn compression_response_admission_declined_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> bool {
@@ -133,7 +133,7 @@ pub mod _test_support {
     }
 
     /// Build the request-body-hook compatibility context. Used to prove the
-    /// reserved response codec permit stays on the donor (live) context rather
+    /// reserved response-buffer permit stays on the donor (live) context rather
     /// than being moved into this short-lived clone.
     pub fn clone_for_final_request_body_hooks_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -149,14 +149,16 @@ pub mod _test_support {
 
     pub fn reconcile_aborted_gateway_response_encoding_for_test(
         ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        body_len: usize,
-    ) {
+        response_body: &mut Vec<u8>,
+    ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
+            response_status,
             response_headers,
-            body_len,
-        );
+            response_body,
+        )
     }
 
     pub fn validate_correlation_id_composition_for_test(

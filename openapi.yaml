@@ -1450,6 +1450,16 @@ paths:
         `ferrum_admin_rejected_connections_total{reason}` (admin connections
         dropped by the cap, with `reason` one of `max_connections` /
         `max_connections_per_ip`).
+        Control-plane mode additionally exposes the CP gRPC
+        pre-authentication connection limiter:
+        `ferrum_cp_grpc_active_connections` (gauge of admitted CP gRPC
+        connections, counted from before the TLS/mTLS handshake through the
+        served HTTP/2 session), `ferrum_cp_grpc_max_connections` and
+        `ferrum_cp_grpc_max_connections_per_ip` (configured caps, `0` =
+        unlimited), and
+        `ferrum_cp_grpc_rejected_connections_total{reason}` (connections
+        closed before any handshake work was allocated, with the same closed
+        `reason` label set). No source-IP labels are emitted.
       tags: [Metrics]
       security:
         - bearerAuth: []
@@ -1471,6 +1481,12 @@ paths:
                 # HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.
                 # TYPE ferrum_admin_rejected_connections_total counter
                 ferrum_admin_rejected_connections_total{reason="max_connections"} 0
+                # HELP ferrum_cp_grpc_active_connections CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).
+                # TYPE ferrum_cp_grpc_active_connections gauge
+                ferrum_cp_grpc_active_connections 7
+                # HELP ferrum_cp_grpc_rejected_connections_total CP gRPC connections rejected before any handshake work was allocated, by reason.
+                # TYPE ferrum_cp_grpc_rejected_connections_total counter
+                ferrum_cp_grpc_rejected_connections_total{reason="max_connections"} 0
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -3182,7 +3198,11 @@ paths:
         redacted before it is written to the audit log. Sensitive plugin
         configuration is redacted as well; Loki endpoint paths/queries,
         authorization, and all custom-header values are never persisted in
-        the diff. Basic credential
+        the diff, Redis envelope signing keys (`redis_integrity_key` and any
+        other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
+        userinfo/query/fragment data is stripped while its
+        scheme/host/port/database are kept.
+        Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
 
@@ -6323,7 +6343,10 @@ components:
             their unmodeled values cannot be disclosed.
             Sensitive plugin configuration is also redacted; loki_logging
             endpoint paths/queries, authorization, and custom-header values
-            are never persisted.
+            are never persisted, `redis_integrity_key` (and any other
+            `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
+            `redis_url` userinfo/query/fragment data is stripped while
+            scheme/host/port/database are kept.
 
     AuditEventListResponse:
       type: object
@@ -16382,7 +16405,7 @@ components:
     CompressionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: compression — On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths rather than emitting mislabeled plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
+      description: "Plugin: compression — On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool acquired only immediately before the blocking worker, while response buffering for compression is admitted by an independent bounded response-buffer semaphore reserved in before_proxy and held across the encode (with ineligible owners leaving the slot on the context for sibling handoff), so a slow backend cannot starve request decompression; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total and ferrum_compression_response_buffer_{admitted,saturated}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths when identity remains acceptable, or replaces the response with 406 when the client excluded identity, rather than emitting mislabeled or explicitly refused plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
       properties:
         algorithms:
           type: array
@@ -19342,7 +19365,12 @@ components:
           description: "Storage backend: 'local' (in-memory DashMap) or 'redis' (centralized Redis)"
         redis_url:
           type: string
-          description: Redis connection URL (required when sync_mode is redis)
+          description: >-
+            Redis connection URL (required when sync_mode is redis). URL-embedded
+            userinfo is accepted but never disclosed: connection/health-check
+            logs and non-admin/audit projections keep only the scheme, host,
+            port, and database, replace the userinfo, and remove query/fragment
+            data. Full admin reads stay raw.
         redis_tls:
           type: boolean
           default: false
@@ -19385,8 +19413,11 @@ components:
             envelopes. Required when sync_mode is redis (fail closed if omitted).
             Minimum 32 bytes. Bound to the full status/header/body envelope and
             the Redis namespace/key context. Compared in constant time; never
-            logged. Rolling the key quarantines prior entries — there is no
-            legacy unauthenticated read path during build-out.
+            logged, and replaced by [REDACTED] in admin audit diffs and in
+            viewer/operator plugin-config reads (full admin reads stay raw so
+            rotation by read-modify-write works). Rolling the key quarantines
+            prior entries — there is no legacy unauthenticated read path during
+            build-out.
 
     AiTokenMetricsConfig:
       type: object
