@@ -2594,9 +2594,9 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     // thing that can dial the backend before the first RPC, so once its h2c
     // handshake has completed the accept ring is deterministic: connection 0 is
     // the probe (script 0), and the pooled sender for the single shard is the
-    // probe's. Bounded and non-fatal — if a future refactor stops probing, the
-    // wait simply falls through and the test keeps its original semantics
-    // rather than newly hanging.
+    // probe's. The bounded wait fails diagnostically if that current startup
+    // contract changes; falling through would restore the accept-order race this
+    // synchronization exists to eliminate.
     wait_for_probe_dial(&backend, Duration::from_secs(2)).await;
 
     let first = client
@@ -2649,8 +2649,6 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 /// `ScriptedGrpcBackend::connection_scripts` (assigned by accept order) or off
 /// which pooled sender the first request reuses must drain that probe first.
 ///
-/// Returns without failing on timeout: the probe is a gateway implementation
-/// detail, and a test must not start failing merely because it stopped running.
 async fn wait_for_probe_dial(backend: &ScriptedGrpcBackend, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -2663,6 +2661,13 @@ async fn wait_for_probe_dial(backend: &ScriptedGrpcBackend, timeout: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    panic!(
+        "startup capability probe did not complete within {timeout:?}; \
+         handshakes_completed={}, accepted_connections={}, backend_step_errors={:?}",
+        backend.handshakes_completed(),
+        backend.accepted_connections(),
+        backend.step_errors().await
+    );
 }
 
 /// #2934: retry attempts must preserve duplicate metadata field lines from
