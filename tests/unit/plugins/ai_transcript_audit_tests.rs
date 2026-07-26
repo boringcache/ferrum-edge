@@ -7379,6 +7379,73 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
     assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
 }
 
+/// After `max_records_per_minute` is saturated, a sampling-roll winner whose
+/// capture admission was precluded must not tee or pin reqwest dispatch — even
+/// though `commit_may_emit` is still true — while an admissible candidate
+/// under the same streaming policy still does both.
+#[tokio::test]
+async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": { "max_records_per_minute": 1 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+    let sse = Some("text/event-stream");
+
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+
+    let mut limited = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut limited, &headers, stream_body)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 1),
+        "rate-limited candidate must skip capture once the window is saturated"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&limited),
+        "rate-limited candidate must not pin reqwest dispatch"
+    );
+    assert!(
+        plugin.response_stream_inspector(&limited, 200, sse).is_none(),
+        "rate-limited candidate must not install an SSE inspector"
+    );
+
+    let admissible = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut hit = make_ctx();
+    set_prebuffered_body(&mut hit, stream_body);
+    let mut hit_headers = hit.headers.clone();
+    admissible.before_proxy(&mut hit, &mut hit_headers).await;
+    admissible
+        .on_final_request_body_with_context(&mut hit, &headers, stream_body)
+        .await;
+    assert!(admissible.forces_reqwest_dispatch(&hit));
+    assert!(admissible.response_stream_inspector(&hit, 200, sse).is_some());
+}
+
 /// A streamed (`stream: true`) transaction also pays exactly one request
 /// capture: staging classifies, the final request-body hook captures, and the
 /// SSE tee plus the stream-terminal record assembly add none.

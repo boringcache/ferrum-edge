@@ -1611,17 +1611,26 @@ impl AiTranscriptAudit {
     /// "just in case" would defeat sampled capture entirely).
     ///
     /// Every mode — `On` included — additionally requires that an exportable
-    /// record is still possible for this candidate (`commit_may_emit`). Teeing,
-    /// hashing, and accumulating an SSE prefix for a sampling loser that no
-    /// override can ever emit is pure amplification: `emit_decision` would
-    /// discard the result. This also keeps the mode off the reqwest-pinned
-    /// dispatch path, since `forces_reqwest_dispatch` shares this predicate.
+    /// record is still possible for this candidate (`commit_may_emit`) and that
+    /// capture admission has not already precluded export
+    /// ([`export_precluded`]). Teeing, hashing, and accumulating an SSE prefix
+    /// for a sampling loser or a rate-limited candidate that no override can ever
+    /// emit is pure amplification: `emit_decision` / `enqueue` would discard
+    /// the result. This also keeps the mode off the reqwest-pinned dispatch
+    /// path, since `forces_reqwest_dispatch` shares this predicate.
     fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
         if self.capture.streaming == StreamingCapture::Off {
             return false;
         }
         let sample_hit = self.staged_sample_hit(metadata);
         if !self.commit_may_emit(sample_hit) {
+            return false;
+        }
+        if metadata
+            .get(MD_RECORD_ID)
+            .and_then(|record_id| self.staging.get(record_id))
+            .is_some_and(|staged| export_precluded(Some(&staged)))
+        {
             return false;
         }
         if self.capture.streaming == StreamingCapture::On {
