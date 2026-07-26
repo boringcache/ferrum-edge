@@ -215,8 +215,12 @@ pub fn required_mongo_indexes() -> Vec<RequiredMongoIndex> {
     ));
     plan.push(keys_only("api_specs", doc! { "namespace": 1, "tags": 1 }));
 
-    // audit_events
-    plan.push(keys_only("audit_events", doc! { "namespace": 1, "ts": -1 }));
+    // audit_events — include `id` so list and retention prune share deterministic
+    // `(ts, id)` keyset behavior with SQL `idx_audit_events_namespace_ts_id`.
+    plan.push(keys_only(
+        "audit_events",
+        doc! { "namespace": 1, "ts": -1, "id": -1 },
+    ));
     plan.push(keys_only("audit_events", doc! { "actor": 1 }));
     plan.push(keys_only(
         "audit_events",
