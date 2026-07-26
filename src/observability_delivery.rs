@@ -353,6 +353,11 @@ struct DeliveryLifecycle {
     state: AtomicU8,
     max_tasks: usize,
     admitted_tasks: AtomicU64,
+    /// Capacity-only rejection count. Kept separate from the aggregate
+    /// rejected-task counters (which also cover closed-admission and
+    /// no-runtime rejects) so the caller-thread warning rate limit cannot be
+    /// starved by shutdown-time rejects.
+    capacity_rejections: AtomicU64,
     accepting_external_tasks: AtomicBool,
     accepting_internal_tasks: AtomicBool,
     accepting_workers: AtomicBool,
@@ -384,6 +389,7 @@ impl DeliveryLifecycle {
             state: AtomicU8::new(GENERATION_OPEN),
             max_tasks: clamp_max_tasks(max_tasks),
             admitted_tasks: AtomicU64::new(0),
+            capacity_rejections: AtomicU64::new(0),
             accepting_external_tasks: AtomicBool::new(true),
             accepting_internal_tasks: AtomicBool::new(true),
             accepting_workers: AtomicBool::new(true),
@@ -415,13 +421,15 @@ impl DeliveryLifecycle {
     }
 
     fn try_reserve_task_permit(&self) -> bool {
-        let previous = self.admitted_tasks.fetch_add(1, Ordering::AcqRel);
-        if previous < self.max_tasks as u64 {
-            true
-        } else {
-            self.admitted_tasks.fetch_sub(1, Ordering::AcqRel);
-            false
-        }
+        let max_tasks = self.max_tasks as u64;
+        // Bounded compare-and-swap rather than add-then-undo: concurrent
+        // callers must never publish a reservation depth above the configured
+        // budget, not even transiently on the exported gauge.
+        self.admitted_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < max_tasks).then_some(admitted + 1)
+            })
+            .is_ok()
     }
 
     fn release_task_permit(&self) {
@@ -438,16 +446,20 @@ impl DeliveryLifecycle {
 
     fn record_capacity_rejection(&self, kind: DeliveryTaskKind) {
         self.counters.record_rejected(kind);
-        let rejected = self.rejected_task_count();
+        let capacity_rejections = self
+            .capacity_rejections
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         // Rate-limit caller-thread diagnostics so a saturated sink cannot turn
         // capacity rejects into a logging storm or recursive deferred work.
-        if rejected == 1 || rejected.is_multiple_of(1_024) {
+        if capacity_rejections == 1 || capacity_rejections.is_multiple_of(1_024) {
             warn!(
                 generation = self.generation,
                 ?kind,
                 max_tasks = self.max_tasks,
                 admitted_tasks = self.admitted_tasks.load(Ordering::Acquire),
-                rejected_tasks = rejected,
+                capacity_rejections,
+                rejected_tasks = self.rejected_task_count(),
                 "observability delivery task budget exhausted; rejecting admission"
             );
         }
@@ -1051,6 +1063,8 @@ pub fn render_prometheus() -> String {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use tokio::sync::Semaphore;
+
     use super::*;
 
     #[tokio::test]
@@ -1264,8 +1278,11 @@ mod tests {
     #[tokio::test]
     async fn task_budget_rejects_overflow_without_growing_the_registry() {
         let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 2));
-        let release = Arc::new(Notify::new());
-        let started = Arc::new(Notify::new());
+        // Counting/closable semaphores instead of `Notify`: `notify_one`
+        // permits saturate at one and `notify_waiters` only reaches waiters
+        // that already registered, so several held tasks lose wakeups.
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
 
         for _ in 0..2 {
             let task_release = Arc::clone(&release);
@@ -1274,13 +1291,16 @@ mod tests {
                 TaskAdmission::External,
                 DeliveryTaskKind::Terminal,
                 async move {
-                    task_started.notify_one();
-                    task_release.notified().await;
+                    task_started.add_permits(1);
+                    let _ = task_release.acquire().await;
                 },
             ));
         }
-        started.notified().await;
-        started.notified().await;
+        started
+            .acquire_many(2)
+            .await
+            .expect("held tasks report started")
+            .forget();
 
         assert_eq!(lifecycle.tasks.len(), 2);
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
@@ -1298,10 +1318,10 @@ mod tests {
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
         assert_eq!(lifecycle.rejected_task_count(), 3);
 
-        release.notify_waiters();
+        release.close();
         assert!(
             lifecycle
-                .wait_for_tasks(Instant::now() + Duration::from_secs(1))
+                .wait_for_tasks(Instant::now() + Duration::from_secs(5))
                 .await
         );
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);

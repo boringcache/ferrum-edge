@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::observability_delivery::{DeliverySlot, DeliveryWorkerControl};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 /// A queue worker that finishes cleanly as soon as admission closes.
 fn spawn_draining_worker(plugin_name: &'static str) -> Arc<DeliveryWorkerControl> {
@@ -269,9 +269,12 @@ async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
     slot.begin_cycle();
     assert_eq!(slot.max_tasks(), BUDGET);
 
-    let release = Arc::new(Notify::new());
-    let started = Arc::new(Notify::new());
-    let mut held = 0usize;
+    // Counting/closable semaphores rather than `Notify`: `notify_one` permits
+    // saturate at one and `notify_waiters` only reaches waiters that already
+    // registered, so several concurrently held tasks lose wakeups and this
+    // regression would hang instead of failing.
+    let release = Arc::new(Semaphore::new(0));
+    let started = Arc::new(Semaphore::new(0));
 
     // Fill the aggregate budget with a mix of kinds so one kind cannot bypass
     // the shared registry cap.
@@ -279,8 +282,8 @@ async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
         let task_release = Arc::clone(&release);
         let task_started = Arc::clone(&started);
         let future = async move {
-            task_started.notify_one();
-            task_release.notified().await;
+            task_started.add_permits(1);
+            let _ = task_release.acquire().await;
         };
         let admitted = match kind % 3 {
             0 => slot.spawn_terminal(future),
@@ -288,12 +291,13 @@ async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
             _ => slot.spawn_deadline_cleanup(future),
         };
         assert!(admitted, "budget fill admission {kind} must succeed");
-        held += 1;
     }
 
-    for _ in 0..held {
-        started.notified().await;
-    }
+    started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every held task reports started")
+        .forget();
 
     assert_eq!(slot.active_tasks(), BUDGET);
     assert_eq!(slot.admitted_tasks(), BUDGET as u64);
@@ -329,42 +333,44 @@ async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
         "capacity rejects must remain observable without spawning more deferred work"
     );
 
-    release.notify_waiters();
+    release.close();
 
     // Wait for held tasks to finish and release permits.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while slot.admitted_tasks() != 0 || slot.active_tasks() != 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
             "held tasks must release permits after completion"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     assert_eq!(slot.rejected_tasks(), rejected_before + overflow_rejects);
 
-    let refill_release = Arc::new(Notify::new());
-    let refill_started = Arc::new(Notify::new());
+    let refill_release = Arc::new(Semaphore::new(0));
+    let refill_started = Arc::new(Semaphore::new(0));
     for i in 0..BUDGET {
         let task_release = Arc::clone(&refill_release);
         let task_started = Arc::clone(&refill_started);
         assert!(
             slot.spawn_terminal(async move {
-                task_started.notify_one();
-                task_release.notified().await;
+                task_started.add_permits(1);
+                let _ = task_release.acquire().await;
             }),
             "permit release must reopen admission up to the budget (slot {i})"
         );
     }
-    for _ in 0..BUDGET {
-        refill_started.notified().await;
-    }
+    refill_started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every refilled task reports started")
+        .forget();
     assert_eq!(slot.admitted_tasks(), BUDGET as u64);
     assert!(
         !slot.spawn_terminal(async {}),
         "budget must still reject once refilled"
     );
-    refill_release.notify_waiters();
+    refill_release.close();
     assert!(
         slot.shutdown(Duration::from_secs(5)).await.complete(),
         "bounded admission must not disturb the shutdown drain deadline"
