@@ -182,7 +182,9 @@ fn oversized_claim_is_ignored_when_external_identity_is_not_allowed() {
     .expect("consumer-only commit is accepted");
     assert!(outcome);
     assert_eq!(
-        ctx.identified_consumer.as_ref().map(|c| c.username.as_str()),
+        ctx.identified_consumer
+            .as_ref()
+            .map(|c| c.username.as_str()),
         Some("testuser")
     );
     assert_eq!(ctx.authenticated_identity, None);

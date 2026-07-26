@@ -3593,7 +3593,10 @@ fn test_zero_budget_values_are_rejected() {
         let error =
             ApiChargeback::new(&config, "ferrum").expect_err("zero budget must be rejected");
         assert!(error.contains(key), "unexpected error: {error}");
-        assert!(error.contains("greater than 0"), "unexpected error: {error}");
+        assert!(
+            error.contains("greater than 0"),
+            "unexpected error: {error}"
+        );
     }
 }
 

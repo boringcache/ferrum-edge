@@ -852,7 +852,8 @@ impl ChargebackRegistry {
         // reservations and are released by ordinary TTL eviction, while new
         // identities are refused (and folded into the aggregate row) until the
         // counters fall back under the new ceiling.
-        self.max_entries.store(max_entries.max(1), Ordering::Release);
+        self.max_entries
+            .store(max_entries.max(1), Ordering::Release);
         self.max_retained_bytes
             .store(max_retained_bytes.max(1), Ordering::Release);
         self.render_cache_ttl_secs
@@ -2109,7 +2110,11 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 
 impl ApiChargeback {
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
-        Self::new_with_shard_amount(config, namespace, crate::util::sharding::pool_shard_amount(0))
+        Self::new_with_shard_amount(
+            config,
+            namespace,
+            crate::util::sharding::pool_shard_amount(0),
+        )
     }
 
     /// Construct an instance, sizing the process-global registry's entry map
