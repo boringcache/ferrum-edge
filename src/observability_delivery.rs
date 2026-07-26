@@ -13,11 +13,13 @@
 //! budget (`FERRUM_LOG_DELIVERY_MAX_TASKS`). Admission reserves a permit with a
 //! lock-free counter *before* spawning or inserting into the task registry.
 //! When the budget is exhausted, spawn returns `false` immediately (non-blocking
-//! reject), increments the rejected-task counters, and may emit a rate-limited
-//! warning on the caller thread. Callers must treat rejection as the observable
-//! signal and must not spawn further deferred work to report the drop. Permits
-//! release when the task completes or is cancelled, so capacity recovers without
-//! waiting for shutdown. The shared shutdown-drain deadline is unchanged.
+//! reject), increments the aggregate and budget-specific rejected-task
+//! counters, and may emit a warning on the caller thread that is both sampled
+//! and bounded to one line per window. Callers must treat rejection as the
+//! observable signal and must not spawn further deferred work to report the
+//! drop. Permits release when the task completes or is cancelled, so capacity
+//! recovers without waiting for shutdown. The shared shutdown-drain deadline is
+//! unchanged.
 //!
 //! # Generations
 //!
@@ -231,6 +233,16 @@ impl DeliverySlot {
         self.current.load().rejected_task_count()
     }
 
+    /// Budget-exhaustion rejects only, for the current generation.
+    ///
+    /// The aggregate `rejected_tasks` counter also covers closed-admission and
+    /// no-runtime rejects, so operators cannot use it alone to tell whether
+    /// `FERRUM_LOG_DELIVERY_MAX_TASKS` is the limiting factor.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
+    pub fn capacity_rejected_tasks(&self) -> u64 {
+        self.current.load().capacity_rejection_count()
+    }
+
     fn snapshot(&self) -> Arc<DeliveryLifecycle> {
         self.current.load_full()
     }
@@ -358,6 +370,11 @@ struct DeliveryLifecycle {
     /// no-runtime rejects) so the caller-thread warning rate limit cannot be
     /// starved by shutdown-time rejects.
     capacity_rejections: AtomicU64,
+    /// Monotonic milliseconds at which the last capacity warning was emitted,
+    /// `0` before the first. Bounds the *rate* of caller-thread diagnostics;
+    /// the count gate alone only samples them, so a sustained flood could
+    /// still scale warnings with rejected traffic.
+    capacity_warn_last_ms: AtomicU64,
     accepting_external_tasks: AtomicBool,
     accepting_internal_tasks: AtomicBool,
     accepting_workers: AtomicBool,
@@ -390,6 +407,7 @@ impl DeliveryLifecycle {
             max_tasks: clamp_max_tasks(max_tasks),
             admitted_tasks: AtomicU64::new(0),
             capacity_rejections: AtomicU64::new(0),
+            capacity_warn_last_ms: AtomicU64::new(0),
             accepting_external_tasks: AtomicBool::new(true),
             accepting_internal_tasks: AtomicBool::new(true),
             accepting_workers: AtomicBool::new(true),
@@ -448,6 +466,36 @@ impl DeliveryLifecycle {
         );
     }
 
+    /// Budget-exhaustion rejects only. The aggregate `rejected_task_count`
+    /// also covers closed-admission and no-runtime rejects.
+    fn capacity_rejection_count(&self) -> u64 {
+        self.capacity_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Claim the capacity-warning window, returning `true` for the single
+    /// caller that may emit this window's line.
+    ///
+    /// The count gate in `record_capacity_rejection` only *samples* rejections,
+    /// so under a sustained flood the warning rate would still scale with
+    /// attacker-driven traffic. This adds an absolute ceiling of one line per
+    /// window per process, matching the mesh-authz idiom. Only the sampled
+    /// callers read the clock, so the reject path stays allocation- and
+    /// syscall-free.
+    fn claim_capacity_warning_window(&self) -> bool {
+        const WINDOW_MS: u64 = 5_000;
+        let now = crate::socket_opts::monotonic_now_ms();
+        let last = self.capacity_warn_last_ms.load(Ordering::Relaxed);
+        // Emit on the first event (`last == 0`) or after a full window. A single
+        // CAS claims the window; losers stay silent. `saturating_sub` guards a
+        // coarse clock that does not advance between calls.
+        if last != 0 && now.saturating_sub(last) < WINDOW_MS {
+            return false;
+        }
+        self.capacity_warn_last_ms
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
     fn record_capacity_rejection(&self, kind: DeliveryTaskKind) {
         self.counters.record_rejected(kind);
         let capacity_rejections = self
@@ -458,7 +506,9 @@ impl DeliveryLifecycle {
         // capacity rejects into a logging storm or recursive deferred work.
         // Process `warn!` flows through the non-blocking log sinks, not through
         // deferred delivery spawn, so this cannot re-enter admission.
-        if capacity_rejections == 1 || capacity_rejections.is_multiple_of(1_024) {
+        if (capacity_rejections == 1 || capacity_rejections.is_multiple_of(1_024))
+            && self.claim_capacity_warning_window()
+        {
             warn!(
                 generation = self.generation,
                 ?kind,
@@ -1052,6 +1102,7 @@ pub fn render_prometheus() -> String {
     let active_tasks = lifecycle.tasks.len();
     let admitted_tasks = lifecycle.admitted_tasks.load(Ordering::Acquire);
     let max_tasks = lifecycle.max_tasks;
+    let capacity_rejections = lifecycle.capacity_rejection_count();
     let active_workers = match lifecycle.workers.lock() {
         Ok(workers) => workers
             .values()
@@ -1082,6 +1133,9 @@ pub fn render_prometheus() -> String {
          # HELP ferrum_observability_delivery_rejected_tasks_total Delivery tasks rejected after lifecycle admission closed, task-budget exhaustion, or without a runtime.\n\
          # TYPE ferrum_observability_delivery_rejected_tasks_total counter\n\
          ferrum_observability_delivery_rejected_tasks_total {}\n\
+         # HELP ferrum_observability_delivery_capacity_rejected_tasks_total Delivery tasks rejected specifically because the aggregate task budget was exhausted.\n\
+         # TYPE ferrum_observability_delivery_capacity_rejected_tasks_total counter\n\
+         ferrum_observability_delivery_capacity_rejected_tasks_total {capacity_rejections}\n\
          # HELP ferrum_observability_delivery_cancelled_tasks_total Delivery tasks cancelled on shutdown-budget expiry or during spawn/cancel handoff races.\n\
          # TYPE ferrum_observability_delivery_cancelled_tasks_total counter\n\
          ferrum_observability_delivery_cancelled_tasks_total {}\n\
@@ -1368,6 +1422,24 @@ mod tests {
             lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
             },)
         );
+    }
+
+    /// The count gate alone only samples rejections, so a sustained overflow
+    /// would still scale warning lines with attacker-driven traffic. The window
+    /// claim is the absolute ceiling; only one caller may hold it at a time.
+    #[test]
+    fn capacity_warning_window_admits_one_line_per_window() {
+        let lifecycle = DeliveryLifecycle::with_limits(0, 1, 1);
+        assert!(
+            lifecycle.claim_capacity_warning_window(),
+            "the first capacity warning must always be emitted"
+        );
+        for _ in 0..1_000 {
+            assert!(
+                !lifecycle.claim_capacity_warning_window(),
+                "further warnings inside the same window must be suppressed"
+            );
+        }
     }
 
     #[test]

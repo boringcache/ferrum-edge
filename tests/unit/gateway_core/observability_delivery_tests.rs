@@ -377,6 +377,65 @@ async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
     );
 }
 
+/// Issue #3028 / GHSA-83h5-52mw-f33p: budget exhaustion must be distinguishable
+/// from the closed-admission rejects that happen normally at shutdown, or the
+/// aggregate reject counter cannot be alerted on for capacity at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_rejects_are_counted_separately_from_closed_admission_rejects() {
+    const BUDGET: usize = 2;
+
+    let slot = DeliverySlot::with_limits(0, BUDGET);
+    slot.begin_cycle();
+    assert_eq!(slot.capacity_rejected_tasks(), 0);
+
+    let release = Arc::new(Semaphore::new(0));
+    let started = Arc::new(Semaphore::new(0));
+    for i in 0..BUDGET {
+        let task_release = Arc::clone(&release);
+        let task_started = Arc::clone(&started);
+        assert!(
+            slot.spawn_terminal(async move {
+                task_started.add_permits(1);
+                let _ = task_release.acquire().await;
+            }),
+            "budget fill admission {i} must succeed"
+        );
+    }
+    started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every held task reports started")
+        .forget();
+
+    // Overflow while the budget is held: both the aggregate and the
+    // budget-specific counter advance together.
+    for _ in 0..5 {
+        assert!(!slot.spawn_mirror(async {}));
+    }
+    assert_eq!(slot.capacity_rejected_tasks(), 5);
+    assert_eq!(slot.rejected_tasks(), 5);
+
+    release.close();
+    assert!(
+        slot.shutdown(Duration::from_secs(5)).await.complete(),
+        "held tasks release on close so the drain completes"
+    );
+
+    // Post-drain admission is closed, not exhausted: the aggregate counter
+    // advances while the capacity counter stays put.
+    let capacity_after_drain = slot.capacity_rejected_tasks();
+    let rejected_after_drain = slot.rejected_tasks();
+    for _ in 0..4 {
+        assert!(!slot.spawn_terminal(async {}));
+    }
+    assert_eq!(
+        slot.capacity_rejected_tasks(),
+        capacity_after_drain,
+        "closed-admission rejects must not be attributed to the task budget"
+    );
+    assert_eq!(slot.rejected_tasks(), rejected_after_drain + 4);
+}
+
 #[tokio::test]
 async fn task_budget_override_applies_to_the_next_generation() {
     let slot = DeliverySlot::with_limits(0, 4);
