@@ -356,27 +356,45 @@ pub fn authentication_attempt_can_commit(
     let VerifyOutcome::Success {
         consumer,
         external_identity,
-        ..
+        external_identity_header,
     } = outcome
     else {
         return false;
     };
-    // Mirror the commit boundary: an oversized external identity is rejected
-    // there, so it can never become the accepted principal here either.
-    if allow_external_identity
-        && external_identity
+
+    // Mirror commit_authentication_attempt's principal filtering exactly: a
+    // display/header claim is meaningful only when the same attempt supplies a
+    // permitted nonblank external principal, and either principal-bearing field
+    // that would fail the size bound there must fail preflight here too.
+    let has_consumer = consumer
+        .as_ref()
+        .is_some_and(|consumer| !consumer.username.trim().is_empty());
+    let external_identity = if allow_external_identity {
+        external_identity
             .as_deref()
-            .is_some_and(|identity| identity.len() > MAX_AUTHENTICATED_IDENTITY_BYTES)
+            .filter(|identity| !identity.trim().is_empty())
+    } else {
+        None
+    };
+    let external_identity_header = external_identity.and_then(|_| {
+        external_identity_header
+            .as_deref()
+            .filter(|header| !header.trim().is_empty())
+    });
+
+    if !has_consumer && external_identity.is_none() {
+        return false;
+    }
+    if external_identity.is_some_and(|identity| identity.len() > MAX_AUTHENTICATED_IDENTITY_BYTES) {
+        return false;
+    }
+    if external_identity_header
+        .is_some_and(|header| header.len() > MAX_AUTHENTICATED_IDENTITY_BYTES)
     {
         return false;
     }
-    consumer
-        .as_ref()
-        .is_some_and(|consumer| !consumer.username.trim().is_empty())
-        || (allow_external_identity
-            && external_identity
-                .as_deref()
-                .is_some_and(|identity| !identity.trim().is_empty()))
+
+    true
 }
 
 fn request_principal_is_committed(ctx: &RequestContext) -> bool {

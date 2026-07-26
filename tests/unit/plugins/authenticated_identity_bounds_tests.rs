@@ -162,6 +162,152 @@ fn preflight_agrees_with_the_commit_boundary() {
     assert!(authentication_attempt_can_commit(&ctx, &allowed, true));
 }
 
+/// A valid primary external identity plus an oversized display/header claim
+/// must fail both preflight and final commit — otherwise OIDC session auth can
+/// rotate a refresh token after a true preflight and still be rejected.
+#[test]
+fn preflight_and_commit_agree_on_oversized_display_header() {
+    let header = "h".repeat(MAX_AUTHENTICATED_IDENTITY_BYTES + 1);
+    let outcome = VerifyOutcome::success(None, Some("alice".to_string()), Some(header));
+    let ctx = context();
+    assert!(
+        !authentication_attempt_can_commit(&ctx, &outcome, true),
+        "preflight must reject an oversized display/header claim"
+    );
+
+    let mut ctx = context();
+    let commit = commit_authentication_attempt(
+        &mut ctx,
+        AuthenticationAttempt::new(),
+        outcome,
+        "oidc_relying_party",
+        true,
+    );
+    assert!(
+        matches!(commit, Err(VerifyOutcome::Forbidden(_))),
+        "commit must reject the same oversized display/header claim"
+    );
+    assert_eq!(ctx.authenticated_identity, None);
+    assert_eq!(ctx.authenticated_identity_header, None);
+    assert!(ctx.auth_method.is_none());
+}
+
+/// An oversized header without a usable/permitted external principal must not
+/// block a mapped Consumer-only attempt: the display claim is meaningless then
+/// and is discarded at the commit boundary.
+#[test]
+fn oversized_header_without_external_identity_does_not_block_consumer() {
+    let consumer = std::sync::Arc::new(create_test_consumer());
+    let header = "h".repeat(MAX_AUTHENTICATED_IDENTITY_BYTES + 1);
+
+    // No external identity at all.
+    let outcome = VerifyOutcome::success(
+        Some(std::sync::Arc::clone(&consumer)),
+        None,
+        Some(header.clone()),
+    );
+    let ctx = context();
+    assert!(
+        authentication_attempt_can_commit(&ctx, &outcome, true),
+        "preflight must not treat an orphaned oversized header as a principal bound"
+    );
+    let mut ctx = context();
+    assert!(
+        commit_authentication_attempt(
+            &mut ctx,
+            AuthenticationAttempt::new(),
+            outcome,
+            "key_auth",
+            true,
+        )
+        .expect("consumer-only commit is accepted")
+    );
+    assert_eq!(
+        ctx.identified_consumer
+            .as_ref()
+            .map(|c| c.username.as_str()),
+        Some("testuser")
+    );
+    assert_eq!(ctx.authenticated_identity, None);
+    assert_eq!(ctx.authenticated_identity_header, None);
+
+    // Blank/whitespace-only external identity is also not a usable principal,
+    // so the oversized header remains discarded.
+    let outcome = VerifyOutcome::Success {
+        consumer: Some(std::sync::Arc::clone(&consumer)),
+        external_identity: Some("   \t".to_string()),
+        external_identity_header: Some(header.clone()),
+    };
+    let ctx = context();
+    assert!(authentication_attempt_can_commit(&ctx, &outcome, true));
+    let mut ctx = context();
+    assert!(
+        commit_authentication_attempt(
+            &mut ctx,
+            AuthenticationAttempt::new(),
+            outcome,
+            "key_auth",
+            true,
+        )
+        .expect("blank external identity discards the header")
+    );
+    assert_eq!(ctx.authenticated_identity, None);
+    assert_eq!(ctx.authenticated_identity_header, None);
+
+    // External identities disabled: oversized header must not block the Consumer.
+    let outcome =
+        VerifyOutcome::success(Some(consumer), Some("alice".to_string()), Some(header));
+    let ctx = context();
+    assert!(authentication_attempt_can_commit(&ctx, &outcome, false));
+    let mut ctx = context();
+    assert!(
+        commit_authentication_attempt(
+            &mut ctx,
+            AuthenticationAttempt::new(),
+            outcome,
+            "key_auth",
+            false,
+        )
+        .expect("external identities disabled still commits the Consumer")
+    );
+    assert_eq!(ctx.authenticated_identity, None);
+    assert_eq!(ctx.authenticated_identity_header, None);
+}
+
+/// Blank display/header normalization must stay aligned between preflight and
+/// commit: whitespace-only headers are discarded, not size-checked.
+#[test]
+fn blank_display_header_normalization_aligned_with_preflight() {
+    let blank_headers = ["", "   ", "\t\n", " \n\t "];
+    for blank in blank_headers {
+        let outcome = VerifyOutcome::Success {
+            consumer: None,
+            external_identity: Some("alice".to_string()),
+            external_identity_header: Some(blank.to_string()),
+        };
+        let ctx = context();
+        assert!(
+            authentication_attempt_can_commit(&ctx, &outcome, true),
+            "blank header {blank:?} must not fail preflight"
+        );
+        let mut ctx = context();
+        let committed = commit_authentication_attempt(
+            &mut ctx,
+            AuthenticationAttempt::new(),
+            outcome,
+            "jwks_auth",
+            true,
+        )
+        .expect("blank header is discarded, not rejected");
+        assert!(committed);
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+        assert_eq!(
+            ctx.authenticated_identity_header, None,
+            "blank header {blank:?} must normalize away"
+        );
+    }
+}
+
 /// When external identities are not permitted the claim is discarded before the
 /// bound applies, so a mapped Consumer still commits normally.
 #[test]
