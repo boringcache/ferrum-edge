@@ -13,14 +13,15 @@
 //! client gets a dedicated DTLS session with transparent encrypt/decrypt.
 //! Decrypted datagrams are forwarded to the backend (plain UDP or DTLS).
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
@@ -70,6 +71,10 @@ pub struct UdpProxyMetrics {
     pub datagrams_out: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// Client→backend datagrams dropped because a session's bounded
+    /// `on_udp_datagram` ingress queue was full or closed. Fail-closed:
+    /// overload never bypasses required hooks.
+    pub hook_ingress_drops: AtomicU64,
 }
 
 /// A UDP session tracking a single client's connection to a backend.
@@ -166,12 +171,33 @@ struct UdpSession {
     /// `Arc<UdpSession>` drops so listener-local caches cannot pin the global
     /// overload counter past session expiry.
     overload_guard: std::sync::Mutex<Option<crate::overload::ConnectionGuard>>,
+    /// Bounded client→backend ingress channel for sessions that run
+    /// `on_udp_datagram` hooks. The shared listener recv loop enqueues here
+    /// (never awaits hooks) so a slow Redis/I/O-bound plugin for one client
+    /// cannot stall every other session on the listener. `None` when the
+    /// session has no datagram hooks (inline forward path). Taken on session
+    /// expiry/stop so the per-session worker observes channel close promptly.
+    hook_ingress_tx: std::sync::Mutex<Option<mpsc::Sender<Bytes>>>,
+    /// Bytes currently queued in [`Self::hook_ingress_tx`], shared with the
+    /// ingress worker so the recv loop can enforce a per-session byte cap
+    /// without walking the channel.
+    hook_ingress_queued_bytes: Arc<AtomicUsize>,
 }
 
 impl UdpSession {
     fn release_overload_guard(&self) {
         let mut guard = self
             .overload_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.take();
+    }
+
+    /// Drop the hook-ingress sender so the per-session worker exits without
+    /// waiting for further client datagrams (paired with reply-task stop).
+    fn close_hook_ingress(&self) {
+        let mut guard = self
+            .hook_ingress_tx
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take();
@@ -323,6 +349,160 @@ const PENDING_SESSION_MAX_QUEUED_DATAGRAMS: usize = 16;
 /// `max_sessions * PENDING_SESSION_MAX_QUEUED_BYTES`, so a spoofed-source
 /// flood cannot grow memory past the same flood bound that limits sessions.
 const PENDING_SESSION_MAX_QUEUED_BYTES: usize = 16 * 1024;
+
+/// Per-session `on_udp_datagram` ingress channel depth (established sessions).
+/// The shared listener recv loop enqueues here and returns immediately; a
+/// dedicated per-session worker drains in arrival order, runs hooks, then
+/// forwards. Sized for a brief Redis/I/O stall without spawning one task per
+/// datagram. Paired with [`SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES`].
+const SESSION_HOOK_INGRESS_MAX_DATAGRAMS: usize = 256;
+
+/// Maximum total bytes queued per established session awaiting
+/// `on_udp_datagram` + backend forward. Together with
+/// `FERRUM_UDP_MAX_SESSIONS` this bounds worst-case retained hook-ingress
+/// memory to `max_sessions * SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES`. Over-cap
+/// datagrams are dropped (fail closed — never forwarded without hooks).
+const SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// Emit a rate-limited warning for hook-ingress drops (first drop, then every
+/// 100th). Omits client addresses so labels/log fields stay bounded.
+fn record_hook_ingress_drop(metrics: &UdpProxyMetrics, proxy_id: &str, listen_port: u16) {
+    let n = metrics.hook_ingress_drops.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        warn!(
+            proxy_id = %proxy_id,
+            listen_port,
+            drops = n,
+            "UDP datagram hook ingress queue full or closed; dropping datagram (fail closed)"
+        );
+    }
+}
+
+/// Enqueue one client→backend datagram onto a session's hook-ingress channel.
+///
+/// Returns `true` when admitted. Returns `false` (and increments
+/// [`UdpProxyMetrics::hook_ingress_drops`]) when the datagram or byte cap
+/// would be exceeded, or when the worker has stopped — never blocks the
+/// shared recv loop and never bypasses required hooks.
+fn enqueue_session_hook_datagram(
+    session: &UdpSession,
+    data: &[u8],
+    metrics: &UdpProxyMetrics,
+) -> bool {
+    let tx = {
+        let guard = session
+            .hook_ingress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_ref() {
+            Some(tx) => tx.clone(),
+            None => {
+                record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
+                return false;
+            }
+        }
+    };
+
+    let queued = &session.hook_ingress_queued_bytes;
+    let prev = queued.fetch_add(data.len(), Ordering::Relaxed);
+    if prev.saturating_add(data.len()) > SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES {
+        queued.fetch_sub(data.len(), Ordering::Relaxed);
+        record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
+        return false;
+    }
+
+    if tx.try_send(Bytes::copy_from_slice(data)).is_err() {
+        queued.fetch_sub(data.len(), Ordering::Relaxed);
+        record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
+        return false;
+    }
+    true
+}
+
+/// Per-session worker: drain hook-ingress FIFO, enforce `on_udp_datagram`, then
+/// forward. One task per session (not per datagram); exit when the sender is
+/// dropped or the session stop flag is set.
+fn spawn_session_hook_ingress_worker(
+    session: Arc<UdpSession>,
+    mut rx: mpsc::Receiver<Bytes>,
+    metrics: Arc<UdpProxyMetrics>,
+    client_addr: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let stop_notify = Arc::clone(&session.stop_notify);
+        loop {
+            if session
+                .stop_reply_task
+                .load(std::sync::atomic::Ordering::Acquire)
+                || session.expired.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+
+            let notified = stop_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if session
+                .stop_reply_task
+                .load(std::sync::atomic::Ordering::Acquire)
+                || session.expired.load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+
+            let data = tokio::select! {
+                maybe = rx.recv() => match maybe {
+                    Some(d) => d,
+                    None => break,
+                },
+                _ = notified => break,
+            };
+
+            let len = data.len();
+            session
+                .hook_ingress_queued_bytes
+                .fetch_sub(len, Ordering::Relaxed);
+
+            if !udp_datagram_allowed(
+                &session.datagram_plugins,
+                Arc::clone(&session.datagram_client_ip),
+                Arc::clone(&session.datagram_proxy_id),
+                session.datagram_proxy_name.clone(),
+                session.listen_port,
+                &data,
+                session.datagram_payload_kind,
+                UdpDatagramDirection::ClientToBackend,
+                Some(UdpMetadataSink::new(&session.metadata)),
+            )
+            .await
+            {
+                continue;
+            }
+
+            if let Err(e) = forward_client_datagram_to_backend(&session, &data).await {
+                debug!(
+                    proxy_id = %session.datagram_proxy_id,
+                    client = %client_addr,
+                    listen_port = session.listen_port,
+                    error = %e,
+                    "UDP hook-ingress forward error"
+                );
+                continue;
+            }
+            metrics.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            metrics.bytes_out.fetch_add(len as u64, Ordering::Relaxed);
+        }
+
+        // Drain any residual so queued-byte accounting cannot leak if the
+        // worker exits while the channel still holds payloads (sender may
+        // already be closed).
+        while let Ok(data) = rx.try_recv() {
+            session
+                .hook_ingress_queued_bytes
+                .fetch_sub(data.len(), Ordering::Relaxed);
+        }
+    });
+}
 
 /// Bounded FIFO of datagrams that arrived for a source while its session
 /// setup (DNS, `on_stream_connect` plugins, backend DTLS handshake) is still
@@ -2034,19 +2214,16 @@ async fn process_datagram(
         return Ok(());
     };
 
-    if !udp_datagram_allowed(
-        &session.datagram_plugins,
-        Arc::clone(&session.datagram_client_ip),
-        Arc::clone(&session.datagram_proxy_id),
-        session.datagram_proxy_name.clone(),
-        session.listen_port,
-        data,
-        session.datagram_payload_kind,
-        UdpDatagramDirection::ClientToBackend,
-        Some(UdpMetadataSink::new(&session.metadata)),
-    )
-    .await
-    {
+    if !session.datagram_plugins.is_empty() {
+        // Decouple potentially I/O-bound `on_udp_datagram` hooks from the
+        // shared listener recv/drain loop: enqueue onto this session's
+        // bounded ingress worker (fail closed on overload). Per-session
+        // FIFO preserves client ordering without one task per datagram.
+        if let Some(la) = local_addr {
+            let _ = session.local_addr.set(la);
+        }
+        *last_client = Some((client_addr, session.clone()));
+        let _ = enqueue_session_hook_datagram(&session, data, metrics);
         return Ok(());
     }
 
@@ -2450,6 +2627,7 @@ fn spawn_session_cleanup(
                                 &session.stop_reply_task,
                                 session.stop_notify.as_ref(),
                             );
+                            session.close_hook_ingress();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
                             session.release_overload_guard();
@@ -3779,6 +3957,13 @@ async fn create_session(
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let (metadata, correlation_ids) = stream_ctx.take_metadata_with_correlation_ids();
+    let (hook_ingress_tx, hook_ingress_rx) = if datagram_plugins.is_empty() {
+        (None, None)
+    } else {
+        let (tx, rx) = mpsc::channel(SESSION_HOOK_INGRESS_MAX_DATAGRAMS);
+        (Some(tx), Some(rx))
+    };
+    let hook_ingress_queued_bytes = Arc::new(AtomicUsize::new(0));
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3825,7 +4010,18 @@ async fn create_session(
         overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
             overload,
         ))),
+        hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
+        hook_ingress_queued_bytes,
     });
+
+    if let Some(rx) = hook_ingress_rx {
+        spawn_session_hook_ingress_worker(
+            Arc::clone(&session),
+            rx,
+            Arc::clone(metrics),
+            client_addr,
+        );
+    }
 
     sessions.insert(client_addr, session.clone());
     // Note: active_sessions is reserved by the receive loop before the
@@ -4224,6 +4420,7 @@ async fn create_session(
                                 reply_session
                                     .expired
                                     .store(true, std::sync::atomic::Ordering::Release);
+                                reply_session.close_hook_ingress();
                                 if reply_sessions
                                     .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
                                     .is_some()
@@ -4368,6 +4565,7 @@ async fn create_session(
         reply_session
             .expired
             .store(true, std::sync::atomic::Ordering::Release);
+        reply_session.close_hook_ingress();
         // Only decrement active_sessions if we actually removed THIS session
         // (the cleanup task may have already removed and decremented it, or a
         // newer session may have been re-created at the same client address —
@@ -4689,6 +4887,8 @@ mod tests {
             // Tests build sessions without an overload state; the guard slot
             // stays empty for unit tests that exercise summary emission only.
             overload_guard: std::sync::Mutex::new(None),
+            hook_ingress_tx: std::sync::Mutex::new(None),
+            hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -5433,6 +5633,62 @@ backend_tls_verify_server_cert: false
         );
     }
 
+    #[tokio::test]
+    async fn session_hook_ingress_enqueue_enforces_byte_and_count_caps() {
+        let metrics = Arc::new(super::UdpProxyMetrics::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::SESSION_HOOK_INGRESS_MAX_DATAGRAMS);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let mut session = make_udp_session();
+        session.hook_ingress_tx = std::sync::Mutex::new(Some(tx));
+        session.hook_ingress_queued_bytes = Arc::clone(&queued_bytes);
+
+        assert!(super::enqueue_session_hook_datagram(
+            &session,
+            b"one",
+            metrics.as_ref()
+        ));
+        assert_eq!(queued_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 0);
+
+        // Byte cap: refuse a datagram that would exceed the retained-byte bound.
+        let oversize = vec![0u8; super::SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES];
+        assert!(!super::enqueue_session_hook_datagram(
+            &session,
+            &oversize,
+            metrics.as_ref()
+        ));
+        assert_eq!(queued_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 1);
+
+        // Drain the admitted payload so the channel is empty for the count test.
+        let first = rx.recv().await.expect("admitted datagram");
+        assert_eq!(&first[..], b"one");
+        queued_bytes.fetch_sub(first.len(), Ordering::Relaxed);
+
+        // Fill to the datagram-count bound, then the next must fail closed.
+        for i in 0..super::SESSION_HOOK_INGRESS_MAX_DATAGRAMS {
+            assert!(
+                super::enqueue_session_hook_datagram(&session, &[i as u8], metrics.as_ref()),
+                "datagram {i} must fit under the count cap"
+            );
+        }
+        assert!(!super::enqueue_session_hook_datagram(
+            &session,
+            b"overflow",
+            metrics.as_ref()
+        ));
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 2);
+
+        // Closing the sender fails closed (worker gone / session torn down).
+        session.close_hook_ingress();
+        assert!(!super::enqueue_session_hook_datagram(
+            &session,
+            b"after-close",
+            metrics.as_ref()
+        ));
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 3);
+    }
+
     #[test]
     fn take_pending_datagrams_drains_in_order_then_removes_gate() {
         let pending = test_pending_map();
@@ -5639,6 +5895,8 @@ backend_tls_verify_server_cert: false
             overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
                 state,
             ))),
+            hook_ingress_tx: std::sync::Mutex::new(None),
+            hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
