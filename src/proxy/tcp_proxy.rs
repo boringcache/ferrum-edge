@@ -1006,6 +1006,17 @@ pub struct TcpListenerConfig {
     pub trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+pub(crate) fn find_listener_proxy<'a>(
+    config: &'a GatewayConfig,
+    proxy_namespace: &str,
+    proxy_id: &str,
+) -> Option<&'a Proxy> {
+    config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == proxy_id && proxy.namespace == proxy_namespace)
+}
+
 #[derive(Clone)]
 struct TcpAcceptLoopState {
     port: u16,
@@ -1120,10 +1131,11 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     // This avoids reading certificate files from disk on every connection.
     let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
         let current_config = config.load();
-        current_config
-            .proxies
-            .iter()
-            .find(|p| *p.id == *proxy_id)
+        find_listener_proxy(
+            &current_config,
+            proxy_namespace.as_ref(),
+            proxy_id.as_ref(),
+        )
             // Passthrough proxies relay raw bytes without originating backend
             // TLS; their listener must not fail because unrelated TLS material
             // (global CA bundle / upstream-resolved fields) is unreadable.

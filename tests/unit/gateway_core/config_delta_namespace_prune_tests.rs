@@ -627,3 +627,29 @@ fn stream_sni_resolution_keeps_same_id_proxies_in_two_namespaces_independent() {
         "neither surviving proxy is a catch-all, so an absent SNI must not bind one"
     );
 }
+
+#[test]
+fn tcp_listener_backend_tls_proxy_lookup_is_namespace_qualified() {
+    let mut prod = make_proxy("prod", "shared", "/prod");
+    prod.backend_tls_server_ca_cert_path = Some("/tenant/prod/ca.pem".to_string());
+    let mut staging = make_proxy("staging", "shared", "/staging");
+    staging.backend_tls_server_ca_cert_path = Some("/tenant/staging/ca.pem".to_string());
+    let config = GatewayConfig {
+        proxies: vec![prod, staging],
+        ..GatewayConfig::default()
+    };
+
+    let selected =
+        ferrum_edge::_test_support::tcp_listener_proxy_for_test(&config, "staging", "shared")
+            .expect("staging listener proxy must exist");
+    assert_eq!(selected.namespace, "staging");
+    assert_eq!(
+        selected.backend_tls_server_ca_cert_path.as_deref(),
+        Some("/tenant/staging/ca.pem"),
+        "the TCP listener must not prebuild backend TLS from prod's same-ID proxy"
+    );
+    assert!(
+        ferrum_edge::_test_support::tcp_listener_proxy_for_test(&config, "missing", "shared")
+            .is_none()
+    );
+}

@@ -1118,6 +1118,14 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    pub fn tcp_listener_proxy_for_test(
+        config: &crate::config::types::GatewayConfig,
+        proxy_namespace: &str,
+        proxy_id: &str,
+    ) -> Option<crate::config::types::Proxy> {
+        crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
+    }
+
     /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
     /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
     /// from civil/UTC wall clocks only. Used by parity regression tests for

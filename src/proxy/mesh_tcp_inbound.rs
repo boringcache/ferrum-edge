@@ -174,6 +174,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         proxy.effective_scheme(),
         consumer_index,
     );
+    stream_ctx.proxy_namespace = proxy.namespace.clone();
     stream_ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
         .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);

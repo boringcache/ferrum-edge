@@ -4424,6 +4424,33 @@ fn test_stream_proxy_duplicate_ports() {
 }
 
 #[test]
+fn test_stream_proxy_shared_port_validation_keeps_same_id_namespaces_distinct() {
+    let mut prod = make_proxy("shared", "/prod");
+    prod.namespace = "prod".to_string();
+    prod.backend_scheme = Some(BackendScheme::Tcp);
+    prod.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    prod.listen_port = Some(5432);
+    prod.passthrough = true;
+
+    let mut staging = make_proxy("shared", "/staging");
+    staging.namespace = "staging".to_string();
+    staging.backend_scheme = Some(BackendScheme::Tcp);
+    staging.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    staging.listen_port = Some(5432);
+    staging.passthrough = false;
+
+    let mut config = empty_config();
+    config.proxies = vec![prod, staging];
+    let errors = config.validate_stream_proxies().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("all proxies sharing a port must have passthrough: true")),
+        "the non-passthrough staging proxy must not be replaced by prod's same-ID entry"
+    );
+}
+
+#[test]
 fn test_http_proxy_must_not_set_listen_port() {
     let mut proxy = make_proxy("p1", "/api");
     proxy.listen_port = Some(8080);

@@ -75,6 +75,7 @@ impl CapturedMeshEgressLifecycle {
             proxy.effective_scheme(),
             Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
         );
+        stream_ctx.proxy_namespace = proxy.namespace.clone();
         stream_ctx.proxy_lifecycle_generation = epoch
             .plugin_cache
             .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);

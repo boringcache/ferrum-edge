@@ -4708,8 +4708,11 @@ impl GatewayConfig {
     ///   and at most one may have empty `hosts` (catch-all/default).
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        // Map port -> list of proxy IDs that use it
-        let mut port_proxies: HashMap<u16, Vec<&str>> = HashMap::new();
+        // Retain the exact proxy entries for each shared port. Proxy IDs are
+        // unique only within a namespace, so resolving these entries later by
+        // bare ID can select the wrong tenant and let an invalid mixed
+        // passthrough/PROXY-protocol/host configuration pass validation.
+        let mut port_proxies: HashMap<u16, Vec<&Proxy>> = HashMap::new();
 
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
@@ -4728,7 +4731,7 @@ impl GatewayConfig {
                         ));
                     }
                     Some(port) => {
-                        port_proxies.entry(port).or_default().push(&proxy.id);
+                        port_proxies.entry(port).or_default().push(proxy);
                     }
                 }
             } else if proxy.listen_port.is_some() {
@@ -4758,17 +4761,12 @@ impl GatewayConfig {
         }
 
         // Validate port sharing rules
-        for (port, proxy_ids) in &port_proxies {
-            if proxy_ids.len() <= 1 {
+        for (port, proxies_on_port) in &port_proxies {
+            if proxies_on_port.len() <= 1 {
                 continue; // No conflict for single-proxy ports
             }
 
             // All proxies sharing a port must have passthrough: true
-            let proxies_on_port: Vec<&Proxy> = proxy_ids
-                .iter()
-                .filter_map(|id| self.proxies.iter().find(|p| p.id == *id))
-                .collect();
-
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
             if !all_passthrough {
                 let non_pt: Vec<&str> = proxies_on_port
