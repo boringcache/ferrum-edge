@@ -2282,11 +2282,12 @@ impl Plugin for AiTranscriptAudit {
         }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // Sampling and emission require THIS instance's staging entry. Do not
+        // fall back to the shared peer-writable `MD_SAMPLE_HIT` key, and do not
+        // enqueue a staging-less record if the entry was swept or never owned.
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return;
+        };
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
         let (excerpt, truncated, hash) = if downstream_terminated {
@@ -2316,14 +2317,18 @@ impl Plugin for AiTranscriptAudit {
         }
 
         // A response already being streamed cannot run a new rejecting
-        // admission, so stream-terminal enqueue is best-effort.
-        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        // admission, so stream-terminal enqueue is best-effort. The atomic
+        // `remove` is the instance-scoped commit capability (same contract as
+        // `on_response_committed`): no local entry means no record.
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+            return;
+        };
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
             envelope,
             &ctx.metadata,
-            staging.as_ref(),
+            Some(&staging),
             excerpt,
             truncated,
             hash,
@@ -2331,7 +2336,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let status = match self.enqueue(record, staging.as_mut()) {
+        let status = match self.enqueue(record, Some(&mut staging)) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
