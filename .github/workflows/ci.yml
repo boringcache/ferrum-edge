@@ -1117,7 +1117,9 @@ jobs:
 
           mysql_ok=""
           for _ in $(seq 1 90); do
-            if docker exec ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum -pferrum --silent >/dev/null 2>&1; then
+            if docker exec ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum -pferrum --silent >/dev/null 2>&1 \
+              && docker exec ferrum-ci-mysql mysql -h 127.0.0.1 -uferrum -pferrum -D ferrum \
+                   -e "SELECT 1" >/dev/null 2>&1; then
               mysql_ok=1; break
             fi
             sleep 2
@@ -1125,6 +1127,13 @@ jobs:
           if [ -z "$mysql_ok" ]; then
             echo "::error::mysql did not become ready"; docker logs ferrum-ci-mysql; exit 1
           fi
+
+          # Functional cells share these containers. Grant CREATE/DROP so each
+          # cell can isolate onto a dedicated database name when needed, and so
+          # migrate/admin paths are not blocked by the default non-superuser
+          # MYSQL_USER privileges after a prior cell mutates schema state.
+          docker exec ferrum-ci-mysql mysql -uroot -pferrum -e \
+            "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
 
           echo "data-plane services ready (redis:6379, mongo:27017, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
           echo "parity backends: sqlite,postgres,mysql,mongodb,redis"

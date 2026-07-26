@@ -17,8 +17,9 @@
 //! `FERRUM_TEST_MONGO_URL` so missing backends fail closed. Local runs skip
 //! when those URLs/servers are absent.
 use crate::common::{
-    DbType, TestGateway, continue_if_backend_available, host_port_from_db_url, mysql_test_url,
-    postgres_test_url, spawn_http_identifying, tcp_endpoint_reachable,
+    DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
+    host_port_from_db_url, mysql_test_url, postgres_test_url, spawn_http_identifying,
+    tcp_endpoint_reachable,
 };
 use ferrum_edge::plugins::available_plugins;
 use reqwest::{Client, StatusCode};
@@ -200,6 +201,7 @@ async fn test_admin_sqlite_runtime_resource_crud_matrix() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_postgres_runtime_resource_crud_matrix() {
+    ensure_shared_sql_containers_resumed();
     let Some(postgres_url) = postgres_test_url() else {
         return;
     };
@@ -255,6 +257,7 @@ async fn test_admin_postgres_runtime_resource_crud_matrix() {
 #[tokio::test]
 #[ignore]
 async fn test_admin_mysql_runtime_resource_crud_matrix() {
+    ensure_shared_sql_containers_resumed();
     let Some(mysql_url) = mysql_test_url() else {
         return;
     };

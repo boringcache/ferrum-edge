@@ -34,8 +34,8 @@
 //! -- --ignored namespace`.
 
 use crate::common::{
-    DbType, TestGateway, continue_if_backend_available, host_port_from_db_url, mysql_test_url,
-    postgres_test_url, tcp_endpoint_reachable,
+    DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
+    host_port_from_db_url, mysql_test_url, postgres_test_url, tcp_endpoint_reachable,
 };
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -76,6 +76,7 @@ async fn resolve_db(backend: Backend) -> Option<DbType> {
     match backend {
         Backend::Sqlite => Some(DbType::Sqlite),
         Backend::Postgres => {
+            ensure_shared_sql_containers_resumed();
             let url = postgres_test_url()?;
             let host_port = host_port_from_db_url(&url);
             if !continue_if_backend_available(
@@ -88,6 +89,7 @@ async fn resolve_db(backend: Backend) -> Option<DbType> {
             Some(DbType::Postgres(url))
         }
         Backend::Mysql => {
+            ensure_shared_sql_containers_resumed();
             let url = mysql_test_url()?;
             let host_port = host_port_from_db_url(&url);
             if !continue_if_backend_available(

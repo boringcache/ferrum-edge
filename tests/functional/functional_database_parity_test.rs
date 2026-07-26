@@ -10,8 +10,8 @@
 //! absent unless that flag is set.
 
 use crate::common::{
-    DbType, TestGateway, continue_if_backend_available, host_port_from_db_url, mysql_test_url,
-    postgres_test_url, tcp_endpoint_reachable,
+    DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
+    host_port_from_db_url, mysql_test_url, postgres_test_url, tcp_endpoint_reachable,
 };
 use serde_json::json;
 use std::process::Command;
@@ -81,6 +81,7 @@ async fn assert_migrate_up_idempotent(db_type: &str, db_url: &str) {
 #[tokio::test]
 #[ignore]
 async fn test_postgres_migrate_up_is_idempotent() {
+    ensure_shared_sql_containers_resumed();
     let Some(url) = postgres_test_url() else {
         return;
     };
@@ -101,6 +102,7 @@ async fn test_postgres_migrate_up_is_idempotent() {
 #[tokio::test]
 #[ignore]
 async fn test_mysql_migrate_up_is_idempotent() {
+    ensure_shared_sql_containers_resumed();
     let Some(url) = mysql_test_url() else {
         return;
     };
@@ -141,6 +143,7 @@ fn docker_pause(container: &str) -> Option<DockerUnpauseGuard> {
 }
 
 async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
+    ensure_shared_sql_containers_resumed();
     if !continue_if_backend_available(
         label,
         Command::new("docker")

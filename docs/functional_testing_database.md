@@ -15,6 +15,13 @@ job instead of silently skipping.
 Local developers keep the historical opt-out: leave those required flags unset
 and omit backend URLs / containers; suites print `SKIPPED` and return success.
 
+Shared CI PostgreSQL/MySQL containers are resumed defensively at the start of
+SQL-backed cells (`ensure_shared_sql_containers_resumed`) so a prior
+connectivity-recovery `docker pause` cannot leave later cells frozen. MySQL
+row mappers decode TEXT/MEDIUMTEXT through UTF-8 helpers so sqlx-Any BLOB
+mapping cannot turn a successful write into a false admin 404 or poison later
+gateway full-loads on the shared database.
+
 | Behavior | SQLite | PostgreSQL | MySQL | MongoDB |
 |---|---|---|---|---|
 | Admin CRUD + polling + delete | `test_admin_sqlite_runtime_resource_crud_matrix` | `test_admin_postgres_runtime_resource_crud_matrix` | `test_admin_mysql_runtime_resource_crud_matrix` | `test_admin_mongodb_runtime_resource_crud_matrix` |

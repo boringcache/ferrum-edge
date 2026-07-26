@@ -245,6 +245,15 @@ wait_for_containers() {
         die "One or more containers failed to start. Run '$0 --cleanup' to remove them."
     fi
 
+    # Require a real authenticated query (not only ping) and grant CREATE so
+    # functional cells can isolate schema work when needed.
+    if ! docker exec "$MYSQL_CONTAINER" mysql -u "$DB_USER" "-p$DB_PASSWORD" -D "$DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
+        die "MySQL accepted ping but rejected authenticated queries against $DB_NAME."
+    fi
+    docker exec "$MYSQL_CONTAINER" mysql -u root "-p$DB_PASSWORD" -e \
+        "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;" \
+        >/dev/null
+
     log "All containers are healthy and ready for testing."
     log ""
     log "Connection details:"

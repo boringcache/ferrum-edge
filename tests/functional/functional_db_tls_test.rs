@@ -11,7 +11,9 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
-use crate::common::{DbType, TestGateway, continue_if_tls_fixture_available};
+use crate::common::{
+    DbType, TestGateway, continue_if_tls_fixture_available, ensure_shared_sql_containers_resumed,
+};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -480,6 +482,7 @@ async fn run_crud_and_proxy_tests(
 #[ignore]
 async fn test_postgresql_tls_verify_full() {
     println!("\n=== PostgreSQL TLS (verify-full via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
     if !continue_if_tls_fixture_available(
         "postgres",
@@ -534,6 +537,7 @@ async fn test_postgresql_tls_verify_full() {
 #[ignore]
 async fn test_postgresql_tls_require() {
     println!("\n=== PostgreSQL TLS (require — encrypted, no cert verification) ===\n");
+    ensure_shared_sql_containers_resumed();
 
     if !continue_if_tls_fixture_available(
         "postgres",
@@ -584,6 +588,7 @@ async fn test_postgresql_tls_require() {
 #[ignore]
 async fn test_mysql_tls_verify_identity() {
     println!("\n=== MySQL TLS (verify-full -> VERIFY_IDENTITY via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
     if !continue_if_tls_fixture_available(
         "mysql",
@@ -637,6 +642,7 @@ async fn test_mysql_tls_verify_identity() {
 #[ignore]
 async fn test_mysql_tls_required() {
     println!("\n=== MySQL TLS (require -> REQUIRED via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
     if !continue_if_tls_fixture_available(
         "mysql",

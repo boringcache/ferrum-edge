@@ -97,6 +97,26 @@ pub async fn tcp_endpoint_reachable(host_port: &str) -> bool {
     tokio::net::TcpStream::connect(host_port).await.is_ok()
 }
 
+/// Best-effort resume of shared CI database containers.
+///
+/// Connectivity-recovery cells intentionally `docker pause` the shared MySQL /
+/// PostgreSQL fixtures. If a prior attempt is interrupted before `Drop`
+/// unpauses, later cells see a frozen backend and fail gateway health waits.
+/// Calling this at the start of each SQL-backed cell keeps the matrix
+/// deterministic without weakening required-backend flags.
+pub fn ensure_shared_sql_containers_resumed() {
+    for container in [
+        "ferrum-ci-mysql",
+        "ferrum-ci-postgres",
+        "ferrum-test-mysql-tls",
+        "ferrum-test-pg-tls",
+    ] {
+        let _ = std::process::Command::new("docker")
+            .args(["unpause", container])
+            .output();
+    }
+}
+
 /// Extract `host:port` from a SQL or MongoDB connection URL for a readiness probe.
 pub fn host_port_from_db_url(url: &str) -> String {
     let stripped = url
