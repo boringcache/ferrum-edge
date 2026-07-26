@@ -101,12 +101,37 @@ impl AdminRequestLimits {
         }
     }
 
-    /// The configured body deadline, or `None` when disabled.
-    pub(crate) fn body_read_timeout(&self) -> Option<Duration> {
+    /// The configured body deadline for a standard (1 MiB) admin body, or
+    /// `None` when disabled.
+    fn body_read_timeout(&self) -> Option<Duration> {
         if self.body_read_timeout_seconds == 0 {
             return None;
         }
         Some(Duration::from_secs(self.body_read_timeout_seconds))
+    }
+
+    /// The effective body deadline for a route whose size cap is `max_bytes`.
+    ///
+    /// `body_read_timeout_seconds` is the budget for the standard 1 MiB admin
+    /// body. Charging that same wall-clock figure to the routes with a larger
+    /// cap would demand proportionally more upload throughput from exactly the
+    /// requests that legitimately carry the most bytes: at the defaults a
+    /// 1 MiB body may arrive at ~35 KiB/s, while `POST /restore` (100 MiB) and
+    /// `POST`/`PUT /api-specs` (25 MiB) would have to sustain ~3.4 MiB/s and
+    /// ~850 KiB/s respectively — enough to reject the ~80 MB backups
+    /// `/restore` exists to accept over an ordinary WAN link. It would also
+    /// make the knob unusable: raising it far enough for a slow restore would
+    /// loosen every 1 MiB route by the same factor.
+    ///
+    /// Scaling the deadline by the route's own cap makes the bound one shared
+    /// *minimum throughput* instead. Every route keeps a real deadline, the
+    /// buffered bytes stay capped by the size limit that produced the
+    /// multiplier, and raising a size cap moves its deadline with it.
+    pub(crate) fn body_read_timeout_for(&self, max_bytes: usize) -> Option<Duration> {
+        let base = self.body_read_timeout()?;
+        let cap_mib = max_bytes.div_ceil(1024 * 1024).max(1);
+        let multiplier = u32::try_from(cap_mib).unwrap_or(u32::MAX);
+        Some(base.saturating_mul(multiplier))
     }
 }
 
@@ -2170,7 +2195,9 @@ pub async fn handle_admin_request(
                 return Ok(resp);
             }
             let max_bytes = restore_max_mib * 1024 * 1024;
-            let deadline = state.admin_request_limits.body_read_timeout();
+            // Scaled by this route's size cap, so `/restore`'s 100 MiB body is
+            // not held to the same wall clock as a 1 MiB one.
+            let deadline = state.admin_request_limits.body_read_timeout_for(max_bytes);
             let collected = collect_body_with_limits(req.into_body(), max_bytes, deadline).await;
             match collected {
                 Ok(bytes) => bytes,
@@ -2181,7 +2208,9 @@ pub async fn handle_admin_request(
                     ));
                 }
                 Err(BodyCollectError::Timeout) => {
-                    let seconds = state.admin_request_limits.body_read_timeout_seconds;
+                    // Report the deadline that actually fired, not the
+                    // unscaled 1 MiB budget.
+                    let seconds = deadline.map(|d| d.as_secs()).unwrap_or_default();
                     warn!(
                         path = %path,
                         timeout_seconds = seconds,

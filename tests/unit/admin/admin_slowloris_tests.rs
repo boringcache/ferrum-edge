@@ -422,6 +422,38 @@ async fn tls_http1_slow_request_body_returns_408() {
     harness.shutdown().await;
 }
 
+/// The deadline is the budget for a *1 MiB* body; a route with a larger size
+/// cap scales it by that cap. `/restore` is capped at 100 MiB here, so with the
+/// same one-second base that releases a stalled `/admin/tls/validate` body with
+/// `408` above, a stalled `/restore` body must still be waiting well past the
+/// assertion window. Without the scaling, the ~80 MB backups `/restore` exists
+/// to accept would have to arrive 100x faster than every other admin body.
+#[tokio::test]
+async fn restore_body_deadline_scales_with_its_larger_size_cap() {
+    let state = admin_state(LONG, limits(SHORT));
+    let harness = AdminHarness::start_plain(state).await;
+    let token = token_with_role("admin");
+
+    let mut stream = harness.connect().await;
+    let head = h1_head("POST", "/restore", &token, 4096);
+    send(&mut stream, head.as_bytes()).await;
+    // A fragment of the announced body, then stall.
+    send(&mut stream, b"{\"pa").await;
+
+    // Several times the one-second base budget, and far short of the 100s the
+    // scaled deadline actually allows.
+    let window = Duration::from_secs(4);
+    let outcome = tokio::time::timeout(window, read_status(&mut stream)).await;
+    assert!(
+        outcome.is_err(),
+        "the 100 MiB /restore cap must scale its body deadline past the 1 MiB \
+         budget, but the request was answered with {outcome:?}"
+    );
+
+    drop(stream);
+    harness.shutdown().await;
+}
+
 /// Near-boundary success: a body that arrives in pieces but *completes* inside
 /// the deadline is served normally. The `400` is produced by the handler
 /// parsing the exact bytes sent, so this also proves the whole body reached it.

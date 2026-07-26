@@ -75,6 +75,13 @@ info:
     deadline expires is rejected with `408 Request Timeout` and its HTTP/1.1
     connection or HTTP/2 stream is released.
 
+    That value is the budget for a 1 MiB body. Endpoints with a larger size cap
+    scale the deadline by that cap, so the bound is one shared minimum
+    throughput rather than a flat wall clock that would demand 25x/100x the
+    upload rate from exactly the endpoints that legitimately carry the most
+    bytes. At the defaults: 30s for a 1 MiB body, 750s for a 25 MiB
+    `/api-specs` body, and 3000s for a 100 MiB `/restore` body.
+
     The body is read only for routes that consume it, and only after that
     route's role gate. An unknown path, a method the path does not route, a
     read/delete route, and a caller whose role the route would reject with

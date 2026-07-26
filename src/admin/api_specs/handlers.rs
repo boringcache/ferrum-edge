@@ -25,7 +25,7 @@ use crate::admin::api_specs::{
 };
 use crate::admin::audit::{self, AuditActor};
 use crate::admin::spec_codec;
-use crate::admin::{AdminState, log_audit_enqueue_failure};
+use crate::admin::{AdminRequestLimits, AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
     is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
@@ -1137,16 +1137,19 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
 // ---------------------------------------------------------------------------
 
 /// Collect an API-spec request body under the same size **and** time bounds as
-/// every other admin body (issue #2404). Spec bodies are the largest the admin
-/// plane accepts (default 25 MiB), which makes them the most attractive target
+/// every other admin body (issue #2404). Spec bodies are among the largest the
+/// admin plane accepts (default 25 MiB), which makes them an attractive target
 /// for a trickle-fed body that never completes, so the deadline matters here
-/// even more than on the 1 MiB routes.
+/// even more than on the 1 MiB routes. The deadline is derived from this
+/// route's own cap via `AdminRequestLimits::body_read_timeout_for`, so a
+/// 25 MiB spec is not held to the wall clock budgeted for a 1 MiB body.
 async fn collect_body(
     req: Request<Incoming>,
     max_mib: usize,
-    deadline: Option<std::time::Duration>,
+    limits: AdminRequestLimits,
 ) -> Result<Vec<u8>, ApiSpecError> {
     let max_bytes = max_mib.saturating_mul(1024).saturating_mul(1024);
+    let deadline = limits.body_read_timeout_for(max_bytes);
     match collect_body_with_limits(req.into_body(), max_bytes, deadline).await {
         Ok(bytes) => Ok(bytes),
         Err(BodyCollectError::TooLarge) => Err(ApiSpecError::PayloadTooLarge(max_mib)),
@@ -2890,8 +2893,7 @@ pub async fn handle_post_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body_deadline = state.admin_request_limits.body_read_timeout();
-    let body = match collect_body(req, max_mib, body_deadline).await {
+    let body = match collect_body(req, max_mib, state.admin_request_limits).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3058,8 +3060,7 @@ pub async fn handle_put_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body_deadline = state.admin_request_limits.body_read_timeout();
-    let body = match collect_body(req, max_mib, body_deadline).await {
+    let body = match collect_body(req, max_mib, state.admin_request_limits).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };

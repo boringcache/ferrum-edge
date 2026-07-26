@@ -2065,12 +2065,20 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
-    /// Absolute deadline (seconds) for reading an admin request body, applied
-    /// to every admin body-collecting handler including the API-spec ones.
-    /// A size cap alone does not bound *time*: a client that trickles one byte
-    /// per interval pins a task and its buffer indefinitely, and over HTTP/2 a
-    /// single connection can multiplex many such streams. `0` disables the
-    /// deadline (bodies are then bounded only by size). Default: 30 seconds.
+    /// Absolute deadline (seconds) for reading a **1 MiB** admin request body,
+    /// applied to every admin body-collecting handler including the API-spec
+    /// ones. A size cap alone does not bound *time*: a client that trickles one
+    /// byte per interval pins a task and its buffer indefinitely, and over
+    /// HTTP/2 a single connection can multiplex many such streams.
+    ///
+    /// Routes with a larger size cap scale the deadline by that cap, so the
+    /// bound is one shared minimum throughput rather than a flat wall clock
+    /// that would demand 25x/100x the upload rate from `POST`/`PUT /api-specs`
+    /// (`FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`) and `POST /restore`
+    /// (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`). At the defaults that is
+    /// 30 s for 1 MiB, 750 s for a 25 MiB spec, and 3000 s for a 100 MiB
+    /// restore. `0` disables the deadline on every route (bodies are then
+    /// bounded only by size). Default: 30 seconds.
     pub admin_body_read_timeout_seconds: u64,
 
     /// Server-advertised `SETTINGS_MAX_CONCURRENT_STREAMS` for admin HTTP/2
