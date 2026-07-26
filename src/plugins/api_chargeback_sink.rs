@@ -4913,15 +4913,38 @@ impl SpoolManager {
         generation: u64,
         fault: SpoolFsFault,
     ) -> Result<Self, String> {
+        Self::for_tests_with_owner_faults_and_ages(
+            cfg,
+            spec,
+            generation,
+            fault,
+            // Tests treat a foreign temp as immediately reconcilable unless a
+            // live in-process writer lease protects it.
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+        )
+    }
+
+    /// Same as [`Self::for_tests_with_owner_and_faults`] with explicit
+    /// stale-temp and claim-lease horizons, so age-gated recovery is exercised
+    /// without wall-clock sleeps.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner_faults_and_ages(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fault: SpoolFsFault,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+    ) -> Result<Self, String> {
         let manager = Self::new(
             cfg,
             spec.to_owner(),
             generation,
             Arc::new(SinkMetrics::default()),
-            // Tests treat a foreign temp as immediately reconcilable unless a
-            // live in-process writer lease protects it.
-            0,
-            SPOOL_CLAIM_LEASE_MIN_SECS,
+            stale_temp_age_secs,
+            claim_lease_secs,
             SpoolFsOps::REAL,
         )?;
         // Test callers model a committed/live sink and retain the historical
@@ -4978,6 +5001,30 @@ impl SpoolManager {
     #[allow(dead_code)] // external unit tests only
     pub fn encode_spool_path_component_for_tests(raw: &str) -> Result<String, String> {
         encode_spool_path_component(raw, "n")
+    }
+
+    /// Exercise the lexical containment guard that every managed create,
+    /// rename, and unlink runs before touching the filesystem.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn ensure_path_within_root_for_tests(root: &Path, candidate: &Path) -> Result<(), String> {
+        ensure_path_within_root(root, candidate)
+    }
+
+    /// Renew a held claim onto an explicit lease deadline so the rename half of
+    /// the claim protocol is covered deterministically.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn renew_claim_at_for_tests(
+        &self,
+        claim: &mut SpoolClaimHandle,
+        lease_deadline_unix: i64,
+    ) -> Result<(), String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.renew_claim_locked_at(claim, lease_deadline_unix)
     }
 
     /// Claim one replay candidate, returning `None` when another owner,
@@ -5663,9 +5710,22 @@ impl SpoolManager {
     /// chunks prevents the aggregate file-delivery time from outliving a lease
     /// that is intentionally derived from one bounded request/retry budget.
     fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), String> {
-        let durable = spool_claim_restore_path(claim.path())?;
         let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
         let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
+        self.renew_claim_locked_at(claim, lease_deadline)
+    }
+
+    /// Renew one live claim onto an explicit lease deadline.
+    ///
+    /// Split out from [`Self::renew_claim_locked`] so the rename half of the
+    /// protocol is exercised deterministically instead of only when a chunk
+    /// boundary happens to cross a wall-clock second.
+    fn renew_claim_locked_at(
+        &self,
+        claim: &mut SpoolClaimHandle,
+        lease_deadline: i64,
+    ) -> Result<(), String> {
+        let durable = spool_claim_restore_path(claim.path())?;
         let renewed = spool_claim_path(&durable, self.generation, lease_deadline)?;
         if renewed == claim.path {
             return Ok(());
@@ -6207,7 +6267,7 @@ impl<'a> SpoolWalk<'a> {
     }
 }
 
-fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
+fn quarantine_spool_file(spool: &SpoolManager, path: &Path) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -6215,6 +6275,14 @@ fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
     // Quarantine under the durable data name so the owner tag survives.
     let base = spool_artifact_base_name(name);
     let quarantine_path = path.with_file_name(format!("{base}.corrupt"));
+    // Quarantine is a rename inside the managed tree, so it takes the same
+    // writer lock and containment/symlink proof as every other spool mutation.
+    let _guard = spool
+        .write_lock
+        .lock()
+        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+    spool.assert_managed_path(path)?;
+    spool.assert_managed_path(&quarantine_path)?;
     fs::rename(path, &quarantine_path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to quarantine corrupt spool file '{}' to '{}': {error}",
@@ -6837,7 +6905,7 @@ async fn replay_spool_once(
                 spool
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
-                match quarantine_spool_file(&inflight) {
+                match quarantine_spool_file(spool, &inflight) {
                     Ok(quarantine_path) => {
                         warn!(
                             plugin = PLUGIN_NAME,
@@ -6872,12 +6940,9 @@ async fn replay_spool_once(
 
         match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                if let Err(error) = finalize_replayed_spool_file(
-                    spool,
-                    claim.path(),
-                    lines.len(),
-                    dead_letters,
-                ) {
+                if let Err(error) =
+                    finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)
+                {
                     // Permanent rejection could not publish dead-letter metadata.
                     // Release the claim so the original record remains
                     // replayable: durability of the payload outranks quarantine
@@ -6885,9 +6950,7 @@ async fn replay_spool_once(
                     let _guard = spool
                         .write_lock
                         .lock()
-                        .map_err(|_| {
-                            format!("{PLUGIN_NAME}: spool writer lock is poisoned")
-                        })?;
+                        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
                     spool.release_claim_locked(claim.path())?;
                     return Err(error);
                 }

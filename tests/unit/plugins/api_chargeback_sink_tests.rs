@@ -3186,6 +3186,10 @@ fn spool_path_component_rejects_or_encodes_escape_forms() {
         "/abs",
         "C:\\windows",
         "C:/windows",
+        // Drive-relative forms carry no separator at all and still resolve
+        // against a per-drive current directory on Windows.
+        "C:",
+        "d:data",
         r"\\?\C:\windows",
         r"\\.\pipe\x",
         "//unc/share",
@@ -3207,6 +3211,9 @@ fn spool_path_component_rejects_or_encodes_escape_forms() {
     let nul_err = SpoolManager::encode_spool_path_component_for_tests("x\0y")
         .expect_err("NUL must be rejected");
     assert!(nul_err.contains("NUL"));
+    let empty_err = SpoolManager::encode_spool_path_component_for_tests("   ")
+        .expect_err("a whitespace-only component must not become a path segment");
+    assert!(empty_err.contains("must not be empty"), "{empty_err}");
     assert_eq!(
         SpoolManager::encode_spool_path_component_for_tests("edge-0").unwrap(),
         "edge-0"
@@ -3833,6 +3840,207 @@ fn unexpired_peer_claim_is_left_alone_and_expired_one_is_recovered() {
     assert!(
         day.join(&expired_name).exists(),
         "recovery restores the durable replayable name"
+    );
+}
+
+/// Lexical containment guard run before every managed create/rename/unlink.
+fn within_root(candidate: &str) -> Result<(), String> {
+    SpoolManager::ensure_path_within_root_for_tests(Path::new("spool"), Path::new(candidate))
+}
+
+#[test]
+fn managed_path_containment_rejects_escape_and_absolute_replacement() {
+    // Ordinary managed descendants, including a no-op `.` component and a `..`
+    // that still resolves inside the root.
+    within_root("spool/20260524/a.ndjson").expect("a managed descendant is inside");
+    within_root("spool/./20260524").expect("a current-dir component is a no-op");
+    within_root("spool/a/../b").expect("an interior parent segment is allowed");
+
+    // `..` walking off the front of the candidate is rejected before any
+    // filesystem call.
+    let popped = within_root("spool/../../etc/passwd").expect_err("escape refused");
+    assert!(popped.contains("escapes root"), "{popped}");
+
+    // A sibling tree that merely shares a parent is outside the root.
+    let sibling = within_root("other/a.ndjson").expect_err("sibling refused");
+    assert!(sibling.contains("outside root"), "{sibling}");
+
+    // An absolute component replaces the join instead of extending it.
+    let absolute = within_root("/etc/shadow").expect_err("absolute refused");
+    assert!(absolute.contains("outside root"), "{absolute}");
+}
+
+#[test]
+fn claiming_a_foreign_or_non_replayable_spool_file_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    assert_eq!(spool.generation_for_tests(), 1);
+
+    let record = spool
+        .write_events(&[sample_event("evt-claimable")])
+        .unwrap();
+    let claim = spool
+        .claim_replay_file_for_tests(&record)
+        .unwrap()
+        .expect("the owner claims its own durable record");
+    assert!(claim.exists(), "the claim rename must have happened");
+    assert!(!record.exists(), "the durable name is consumed");
+
+    // A claim marker is not itself a replay candidate.
+    let non_replayable = spool
+        .claim_replay_file_for_tests(&claim)
+        .expect_err("an in-flight claim must not be re-claimed");
+    assert!(
+        non_replayable.contains("refusing to claim non-replayable spool file"),
+        "{non_replayable}"
+    );
+
+    // A record carrying another owner's tag is never claimable, read, or moved.
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let foreign_tag = "00112233445566778899aabbccddeeff";
+    assert_ne!(foreign_tag, default_test_owner_tag());
+    let foreign = day.join(format!("01ARZ3NDEKTSV4RRFFQ69G5FB7.{foreign_tag}.ndjson"));
+    fs::write(&foreign, b"{}\n").unwrap();
+    let refused = spool
+        .claim_replay_file_for_tests(&foreign)
+        .expect_err("a foreign-tagged record must not be claimable");
+    assert!(refused.contains("owned by another identity"), "{refused}");
+    assert!(foreign.exists(), "a foreign record must not be touched");
+
+    // Releasing a path that carries no claim marker is refused rather than
+    // renaming an arbitrary managed file.
+    let not_a_claim = spool
+        .release_inflight_file_for_tests(&foreign)
+        .expect_err("only claim markers can be released");
+    assert!(
+        not_a_claim.contains("missing a claim marker"),
+        "{not_a_claim}"
+    );
+    assert!(foreign.exists(), "a refused release mutates nothing");
+}
+
+#[test]
+fn unattributed_claim_is_recovered_only_after_its_lease_horizon() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    // A long lease horizon: an unparseable claim marker is treated as a peer's
+    // live work and left alone.
+    let patient = SpoolManager::for_tests_with_owner_faults_and_ages(
+        spool_settings(temp.path(), 1 << 20),
+        &spec,
+        41,
+        SpoolFsFault::None,
+        300,
+        3_600,
+    )
+    .unwrap();
+    let day = patient.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let data_name = owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB8");
+    let mangled = day.join(format!("{data_name}.claim-not-a-valid-marker.inflight"));
+    fs::write(&mangled, b"{}\n").unwrap();
+
+    patient.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        mangled.exists(),
+        "an unattributable claim inside its lease horizon must be left alone"
+    );
+    assert!(
+        !day.join(&data_name).exists(),
+        "nothing may be published back to the replayable name yet"
+    );
+
+    // The same marker past its horizon is recovered to the durable name.
+    let impatient = SpoolManager::for_tests_with_owner_faults_and_ages(
+        spool_settings(temp.path(), 1 << 20),
+        &spec,
+        42,
+        SpoolFsFault::None,
+        300,
+        0,
+    )
+    .unwrap();
+    assert!(
+        !mangled.exists(),
+        "an unattributable claim past its lease horizon is recovered"
+    );
+    assert!(
+        day.join(&data_name).exists(),
+        "recovery restores the durable replayable name"
+    );
+    assert_eq!(
+        impatient.list_replayable_spool_files_for_tests().unwrap(),
+        vec![day.join(&data_name)],
+        "the recovered record becomes replayable again"
+    );
+}
+
+#[test]
+fn claim_renewal_moves_the_lease_deadline_without_releasing_the_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-renew")]).unwrap();
+    let mut claim = spool
+        .hold_replay_claim_for_tests(&record)
+        .unwrap()
+        .expect("the owner claims its own durable record");
+    let first = claim.claim_path_for_tests().to_path_buf();
+
+    // 2100-01-01T00:00:00Z, unambiguously distinct from the initial deadline.
+    let far_future = 4_102_444_800i64;
+    spool
+        .renew_claim_at_for_tests(&mut claim, far_future)
+        .unwrap();
+    let renewed = claim.claim_path_for_tests().to_path_buf();
+    let renewed_name = renewed.file_name().unwrap().to_string_lossy().to_string();
+
+    assert_ne!(first, renewed, "renewal moves the lease deadline");
+    assert!(renewed_name.ends_with(&format!("-{far_future}.inflight")));
+    assert!(!first.exists(), "the previous claim name is gone");
+    assert!(renewed.exists(), "the renewed claim holds the record");
+    assert!(!record.exists(), "the durable name stays claimed");
+
+    // A live renewed claim is still protected from peer maintenance.
+    spool.prepare_live_storage_for_tests().unwrap();
+    assert!(
+        renewed.exists(),
+        "a live renewed claim must not be reclaimed by maintenance"
+    );
+
+    let released = spool
+        .release_inflight_file_for_tests(&renewed)
+        .unwrap()
+        .expect("release restores the durable record");
+    assert_eq!(released, record);
+    assert!(record.exists(), "the payload is replayable again");
+}
+
+#[tokio::test]
+async fn replay_removes_a_claimed_spool_file_with_no_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let empty = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB9"));
+    fs::write(&empty, b"\n   \n").unwrap();
+
+    // The unreachable address proves no delivery is attempted: the claimed file
+    // carries no rows, so it is finalized without a ClickHouse call.
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/insert")
+        .await
+        .expect("a row-less spool file must not fail the replay tick");
+
+    assert!(
+        !empty.exists(),
+        "a row-less spool file is claimed and removed"
+    );
+    assert!(
+        spool
+            .list_replayable_spool_files_for_tests()
+            .unwrap()
+            .is_empty(),
+        "no claim or durable remnant may be left behind"
     );
 }
 

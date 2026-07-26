@@ -617,11 +617,13 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
 - `chargeback_sink_snapshot_finalizations_pending`
-- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
+- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, in-flight claim, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
+- `chargeback_sink_spool_unbound_files` (records not bound to a live destination identity; never replayed or deleted)
+- `chargeback_sink_spool_unbound_namespaces`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 
