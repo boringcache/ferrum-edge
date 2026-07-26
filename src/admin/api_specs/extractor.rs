@@ -658,8 +658,7 @@ const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
     "error_truncate_chars",
 ];
 const X_FERRUM_VALIDATE_SIDE_KEYS: &[&str] = &["enabled", "content_types"];
-const OPENAPI_VALIDATOR_BYPASS_KEYS: &[&str] =
-    &["paths", "methods", "consumers", "header_present"];
+const OPENAPI_VALIDATOR_BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
 
 fn reject_unknown_validate_keys(
     object: &Map<String, Value>,
@@ -3217,32 +3216,26 @@ fn opaque_value_weight(value: &Value) -> (usize, usize) {
         Value::Bool(false) => (1, 5),
         Value::Number(number) => (1, number.to_string().len()),
         Value::String(value) => (1, value.len().saturating_add(2)),
-        Value::Array(values) => {
-            values
-                .iter()
-                .fold((1usize, 2usize), |weight, child| {
-                    let child = opaque_value_weight(child);
-                    (
-                        weight.0.saturating_add(child.0),
-                        weight.1.saturating_add(child.1).saturating_add(1),
-                    )
-                })
-        }
-        Value::Object(object) => {
-            object
-                .iter()
-                .fold((1usize, 2usize), |weight, (key, child)| {
-                    let child = opaque_value_weight(child);
-                    (
-                        weight.0.saturating_add(child.0),
-                        weight
-                            .1
-                            .saturating_add(key.len())
-                            .saturating_add(child.1)
-                            .saturating_add(4),
-                    )
-                })
-        }
+        Value::Array(values) => values.iter().fold((1usize, 2usize), |weight, child| {
+            let child = opaque_value_weight(child);
+            (
+                weight.0.saturating_add(child.0),
+                weight.1.saturating_add(child.1).saturating_add(1),
+            )
+        }),
+        Value::Object(object) => object
+            .iter()
+            .fold((1usize, 2usize), |weight, (key, child)| {
+                let child = opaque_value_weight(child);
+                (
+                    weight.0.saturating_add(child.0),
+                    weight
+                        .1
+                        .saturating_add(key.len())
+                        .saturating_add(child.1)
+                        .saturating_add(4),
+                )
+            }),
     }
 }
 

@@ -326,12 +326,8 @@ fn importer_resolves_multipart_encoding_header_and_schema_refs() {
         "\"requred\": true,\n        \"schema\": {\"$ref\": \"#/components/schemas/PartTokenValue\"}",
         1,
     );
-    let error = extract(
-        invalid_spec.as_bytes(),
-        Some(SpecFormat::Json),
-        "prod",
-    )
-    .expect_err("an unknown Header Object field must fail import");
+    let error = extract(invalid_spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("an unknown Header Object field must fail import");
     assert!(
         error.to_string().contains("requred"),
         "unexpected error: {error}"

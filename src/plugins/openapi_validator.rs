@@ -1020,11 +1020,9 @@ impl Plugin for OpenapiValidator {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
             && self.bypass_reason(ctx).is_none()
-            && self
-                .operation_for_context(ctx)
-                .is_some_and(|operation| {
-                    operation.has_response_schema() || self.fail_on_missing_response_schema
-                })
+            && self.operation_for_context(ctx).is_some_and(|operation| {
+                operation.has_response_schema() || self.fail_on_missing_response_schema
+            })
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -1134,9 +1132,7 @@ impl Plugin for OpenapiValidator {
             } else {
                 "missing"
             };
-            format!(
-                "{reason} for status {response_status} (Content-Type {content_type_state})"
-            )
+            format!("{reason} for status {response_status} (Content-Type {content_type_state})")
         };
         // Status selection first, so an exact declared status can never fall
         // through to a range or `default` response object on a media miss.
@@ -1353,7 +1349,9 @@ fn parse_request_validators(
         .and_then(Value::as_object)
         .ok_or_else(|| format!("openapi_validator: {path}.content must be an object"))?;
     if content.is_empty() {
-        return Err(format!("openapi_validator: {path}.content must not be empty"));
+        return Err(format!(
+            "openapi_validator: {path}.content must not be empty"
+        ));
     }
     for (content_type, media_value) in content {
         validate_media_type_key(content_type, &format!("{path}.content"))?;
@@ -1919,9 +1917,7 @@ fn parse_property_encoding(
             let is_header_object = header_object.is_some_and(|object| {
                 object.contains_key("schema") || object.contains_key("content")
             });
-            if is_header_object
-                && let Some(header_object) = header_object
-            {
+            if is_header_object && let Some(header_object) = header_object {
                 reject_unknown_keys(
                     header_object,
                     &format!("encoding['{property}'].headers['{header_name}']"),
@@ -4415,15 +4411,13 @@ fn fallback_validator_for_media_type<'a>(
 
 fn media_type_matches(expected: &str, actual: &str) -> bool {
     let range_matches = expected == "*/*"
-        || expected
-            .split_once('/')
-            .is_some_and(|(type_, subtype)| {
-                subtype == "*"
-                    && type_ != "*"
-                    && actual
-                        .split_once('/')
-                        .is_some_and(|(actual_type, _)| type_.eq_ignore_ascii_case(actual_type))
-            });
+        || expected.split_once('/').is_some_and(|(type_, subtype)| {
+            subtype == "*"
+                && type_ != "*"
+                && actual
+                    .split_once('/')
+                    .is_some_and(|(actual_type, _)| type_.eq_ignore_ascii_case(actual_type))
+        });
     expected.eq_ignore_ascii_case(actual)
         || range_matches
         || (expected == "application/json" && is_json_media_type(actual))

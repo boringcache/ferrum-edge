@@ -5819,7 +5819,10 @@ fn request_body_requires_one_of_the_two_documented_forms() {
             "request_body": {"content": {}}
         }]
     }));
-    assert!(error.contains("must not be empty"), "unexpected error: {error}");
+    assert!(
+        error.contains("must not be empty"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -5879,7 +5882,10 @@ fn normalized_duplicate_media_types_are_rejected() {
             }
         }]
     }));
-    assert!(error.contains("duplicate media type"), "unexpected error: {error}");
+    assert!(
+        error.contains("duplicate media type"),
+        "unexpected error: {error}"
+    );
 
     let error = config_error(json!({
         "error_response": {
@@ -6011,10 +6017,8 @@ async fn bypass_header_matching_remains_case_insensitive() {
     .unwrap();
 
     let mut ctx = post_ctx("/items");
-    ctx.headers.insert(
-        "X-Bypass-Validator".to_string(),
-        "any-value".to_string(),
-    );
+    ctx.headers
+        .insert("X-Bypass-Validator".to_string(), "any-value".to_string());
     let mut headers = ctx.headers.clone();
 
     assert!(!plugin.should_buffer_request_body(&ctx));
