@@ -470,9 +470,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
 /// * `redis_integrity_key` — the HMAC-SHA256 secret that authenticates Redis
 ///   cache envelopes. Disclosure lets any reader forge an envelope that the
 ///   gateway will replay as a cache hit, so it is redacted wholesale.
-/// * `redis_url` userinfo — Redis ACL credentials are documented as encodable
-///   in the URL (`redis://user:pass@host`). Only the userinfo is stripped;
-///   scheme/host/port/database stay visible as bounded diagnostics.
+/// * `redis_url` credentials — Redis ACL credentials are documented as
+///   encodable in the URL (`redis://user:pass@host`). Userinfo is replaced and
+///   query/fragment data is removed; scheme/host/port/database stay visible as
+///   bounded diagnostics.
 ///
 /// Full-Admin reads stay raw so rotation via read-modify-write keeps working.
 #[tokio::test]

@@ -2947,10 +2947,12 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
 /// (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`,
 /// `udp_rate_limiting`, `request_deduplication`, `graphql`,
 /// `grpc_method_router`, `ai_semantic_cache`) shares that key, so the match is
-/// by key name rather than per plugin.
+/// by key name rather than per plugin. Also match the delimiter-collapsed
+/// form (`redisUrl` → `redisurl`) the same way `integrity_key`/`integritykey`
+/// already does, so a nested camelCase field cannot bypass projection.
 fn is_credential_bearing_url_config_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
-    normalized == "redis_url"
+    normalized == "redis_url" || normalized == "redisurl"
 }
 
 /// Strip URL userinfo in place, preserving scheme/host/port/path for Redis URLs.
@@ -5078,7 +5080,14 @@ mod redis_plugin_projection_tests {
 
     #[test]
     fn redis_url_key_matcher_is_delimiter_insensitive() {
-        for key in ["redis_url", "Redis-Url", "REDIS.URL", "redis-url"] {
+        for key in [
+            "redis_url",
+            "Redis-Url",
+            "REDIS.URL",
+            "redis-url",
+            "redisUrl",
+            "RedisURL",
+        ] {
             assert!(
                 is_credential_bearing_url_config_key(key),
                 "{key} should be treated as a credential-bearing URL"
@@ -5086,6 +5095,7 @@ mod redis_plugin_projection_tests {
         }
         assert!(!is_credential_bearing_url_config_key("redis_username"));
         assert!(!is_credential_bearing_url_config_key("endpoint_url"));
+        assert!(!is_credential_bearing_url_config_key("redis_urls"));
     }
 
     #[test]
@@ -5095,7 +5105,8 @@ mod redis_plugin_projection_tests {
             "redis_integrity_key": "signing-secret-0123456789abcdef",
             "providers": [{
                 "redisIntegrityKey": "nested-signing-secret-0123456789",
-                "Redis-Url": "redis://user:pass@cache.internal:6379/3?token=q#f"
+                "Redis-Url": "redis://user:pass@cache.internal:6379/3?token=q#f",
+                "redisUrl": "redis://nested:nested-pass@other.internal:6379/1?tok=n#g"
             }]
         });
         redact_sensitive_plugin_config_fields(&mut config);
@@ -5107,12 +5118,18 @@ mod redis_plugin_projection_tests {
             config["providers"][0]["Redis-Url"],
             "redis://redacted@cache.internal:6379/3"
         );
+        assert_eq!(
+            config["providers"][0]["redisUrl"],
+            "redis://redacted@other.internal:6379/1"
+        );
         let serialized = config.to_string();
         assert!(
             !serialized.contains("signing-secret")
                 && !serialized.contains("nested-signing")
                 && !serialized.contains("pass")
-                && !serialized.contains("token=q"),
+                && !serialized.contains("nested-pass")
+                && !serialized.contains("token=q")
+                && !serialized.contains("tok=n"),
             "nested projection leaked secret material: {config}"
         );
     }

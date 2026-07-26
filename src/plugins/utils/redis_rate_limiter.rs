@@ -157,6 +157,7 @@ pub struct RedisConfig {
 /// error text. The derived impl printed both verbatim.
 impl std::fmt::Debug for RedisConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker = super::metadata_redaction::REDACTED_PLACEHOLDER;
         f.debug_struct("RedisConfig")
             .field("url", &self.redacted_url())
             .field("tls", &self.tls)
@@ -167,8 +168,8 @@ impl std::fmt::Debug for RedisConfig {
                 "health_check_interval_seconds",
                 &self.health_check_interval_seconds,
             )
-            .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("username", &self.username.as_ref().map(|_| marker))
+            .field("password", &self.password.as_ref().map(|_| marker))
             .finish()
     }
 }
