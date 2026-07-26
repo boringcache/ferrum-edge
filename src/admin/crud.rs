@@ -908,28 +908,23 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
         actor,
     } = context;
     let success_db = db.clone();
-    let result = match run_db_write_while_held(
-        guard.as_ref(),
-        R::db_delete(db.as_ref(), &namespace, &id),
-    )
-    .await
-    {
-        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-        Ok(NamespaceConfigAdmissionCompletion::Lost {
-            result,
-            error: _,
-        }) => match result {
-            Ok(false) => Ok(false),
-            // Without a hydratable previous row or namespace snapshot we cannot
-            // compensate a late write. Fail closed rather than claiming success
-            // after an unverified admission loss.
-            Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                "namespace config admission was lost during undecodable-row delete repair"
-            ))),
-            Err(persistence_error) => Err(persistence_error),
-        },
-        Err(error) => Err(error),
-    };
+    let result =
+        match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id))
+            .await
+        {
+            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+                Ok(false) => Ok(false),
+                // Without a hydratable previous row or namespace snapshot we cannot
+                // compensate a late write. Fail closed rather than claiming success
+                // after an unverified admission loss.
+                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    "namespace config admission was lost during undecodable-row delete repair"
+                ))),
+                Err(persistence_error) => Err(persistence_error),
+            },
+            Err(error) => Err(error),
+        };
     if matches!(&result, Ok(true)) {
         let event = AuditEvent::new(
             &actor,
