@@ -108,6 +108,35 @@ impl TestCa {
         )
     }
 
+    /// A leaf cert chained to this CA carrying the **ClientAuth** extended
+    /// key usage, for mTLS client-side presentation. `WebPkiClientVerifier`
+    /// rejects a `ServerAuth`-only leaf, so the `valid` preset cannot double
+    /// as a client certificate.
+    pub fn client_auth(
+        &self,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        let mut params = CertificateParams::new(vec!["localhost".to_string()])?;
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        params.not_before = OffsetDateTime::now_utc() - Duration::days(1);
+        params.not_after = OffsetDateTime::now_utc() + Duration::days(365);
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(IpAddr::from([127, 0, 0, 1])));
+
+        let leaf_key = KeyPair::generate()?;
+        let leaf = params.signed_by(&leaf_key, &self.issuer)?;
+        Ok((leaf.pem(), leaf_key.serialize_pem()))
+    }
+
     /// A leaf certificate that is **not** chained to this CA; signed by
     /// itself. The CA receiver is kept only so the API is symmetric with
     /// the other presets — callers use this to exercise "untrusted root".

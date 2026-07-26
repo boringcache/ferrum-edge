@@ -32,6 +32,12 @@ paths:
 - Exception: `api_chargeback` admits at most one effective instance per proxy
   after merge (shared `/charges` registry is exactly-once) and requires every
   enabled instance to agree on the process-global render/cleanup tunables.
+- Exception: `request_deduplication` and `mcp_gateway` may not be effective on
+  the same proxy. A dedup replay is a finalized representation served before
+  `mcp_gateway` runs, and MCP's public-URI rewrite comes from live upstream
+  discovery state that no persisted digest can witness
+  (`request_deduplication::validate_composition`, mirrored at runtime by
+  `ResponsePresentationPolicy::Dynamic`).
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

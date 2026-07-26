@@ -583,6 +583,7 @@ jobs:
               integration::admin_audit_rbac_tests
               integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
+              integration::admin_batch_atomicity_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
@@ -646,6 +647,7 @@ jobs:
               integration::mesh_sidecar_e2e_tests
               integration::mesh_subscribe_validation_tests
               integration::cp_dp_grpc_tests
+              integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
@@ -666,6 +668,7 @@ jobs:
               integration::db_incremental_poll_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
+              integration::db_row_decode_rejection_tests
               integration::vendor_integrity_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -1057,9 +1060,21 @@ jobs:
         # map to the runner's localhost exactly as the service containers did, so
         # the tests' localhost:6379 / localhost:27017 connections are unchanged.
         if: matrix.shard == 'data-plane'
+        #
+        # Two mongod instances on purpose: `POST /batch` is all-or-nothing
+        # (issue #2401), which on MongoDB needs multi-document transactions.
+        # The standalone instance covers the documented 501 refusal, and the
+        # single-node replica set covers the transactional path — neither can
+        # substitute for the other.
         run: |
           docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
           docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
+          # `--network host` with a real port: a replica-set member advertises
+          # its own host:port, and the driver reconnects to whatever is
+          # advertised. Behind a `-p` mapping it would advertise the container
+          # port and the driver would dial the wrong process.
+          docker run -d --name ferrum-ci-mongo-rs --network host \
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all
           # The runner used to gate steps on the services' --health-cmd; reproduce
           # that readiness wait using the tools shipped inside each image.
           redis_ok=""
@@ -1077,13 +1092,43 @@ jobs:
             fi
             sleep 2
           done
+          mongo_rs_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_ok=1; break
+            fi
+            sleep 2
+          done
           if [ -z "$redis_ok" ]; then
             echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
           fi
           if [ -z "$mongo_ok" ]; then
             echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
           fi
-          echo "data-plane services ready (redis:6379, mongo:27017)"
+          if [ -z "$mongo_rs_ok" ]; then
+            echo "::error::mongo replica set did not become ready"
+            docker logs ferrum-ci-mongo-rs; exit 1
+          fi
+          docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 --eval \
+            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27020"}]}) }'
+          mongo_rs_primary=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_primary=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "$mongo_rs_primary" ]; then
+            echo "::error::mongo replica set did not elect a primary"
+            docker logs ferrum-ci-mongo-rs; exit 1
+          fi
+          {
+            echo "FERRUM_TEST_MONGO_REPLICA_SET=rs0"
+            echo "FERRUM_TEST_MONGO_REPLICA_SET_URL=mongodb://localhost:27020/ferrum_test"
+          } >> "$GITHUB_ENV"
+          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020)"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────

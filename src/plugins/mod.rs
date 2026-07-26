@@ -1601,29 +1601,29 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
-/// Exclusive compression codec admission permit held on a request context.
+/// Exclusive compression response-buffer permit held on a request context.
 ///
 /// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
 /// permit is unique and must be transferred with `take()` / `mem::take` when a
 /// compatibility clone needs to own the reserved slot.
 #[derive(Default)]
-struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+struct HeldResponseBufferPermit(Option<tokio::sync::OwnedSemaphorePermit>);
 
-impl std::fmt::Debug for HeldCodecPermit {
+impl std::fmt::Debug for HeldResponseBufferPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("HeldCodecPermit")
+        f.debug_tuple("HeldResponseBufferPermit")
             .field(&self.0.is_some())
             .finish()
     }
 }
 
-impl Clone for HeldCodecPermit {
+impl Clone for HeldResponseBufferPermit {
     fn clone(&self) -> Self {
         Self(None)
     }
 }
 
-impl HeldCodecPermit {
+impl HeldResponseBufferPermit {
     fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
         self.0 = Some(permit);
     }
@@ -1631,6 +1631,106 @@ impl HeldCodecPermit {
     fn take(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         self.0.take()
     }
+}
+
+/// Complete provenance of the response-side presentation policy a finalized
+/// replay (`RequestContext::finalized_response_replay`) intentionally skips.
+///
+/// A retained representation may replay only while it is provably compatible
+/// with *every* such policy, which needs two independent halves:
+///
+/// - `gate` — content digest of the published RTDS response-side gate map.
+///   Gates flip at any moment with no config reload and no new plugin instance,
+///   so nothing else can witness them. Being content-derived rather than a
+///   pointer identity, it means the same thing in every process, which is what
+///   a representation retained in a shared store has to be compared against.
+/// - `presentation` — content digest of the effective *static* rules of every
+///   plugin whose response-body transform the replay skips, folded in
+///   configured execution order (see [`Plugin::response_presentation_policy`]
+///   for the enrolled set and the audited exclusions). Static rules cannot
+///   change under one live instance, but a representation persisted to Redis
+///   outlives the instance, the generation, and the process, so an unchanged
+///   gate map says nothing about whether the redaction/header/body rules still
+///   match. `None` means the effective presentation policy could not be
+///   established for this request — either no plugin-cache view was attached,
+///   or the proxy carries a plugin whose response-body rewrite is derived from
+///   live runtime state that no construction-time digest can describe
+///   ([`ResponsePresentationPolicy::Dynamic`]). Both are "unprovable", never
+///   "no policy".
+///
+/// Provability, then equality, is the whole security decision: replay is
+/// admitted only when both sides are complete *and* equal, so a change to
+/// either half — or the inability to establish either half — retires every
+/// representation captured under the old policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponsePolicyProvenance {
+    gate: [u8; 32],
+    presentation: Option<[u8; 32]>,
+}
+
+impl ResponsePolicyProvenance {
+    /// The two halves, or `None` when the presentation policy could not be
+    /// established and the provenance is therefore incomplete.
+    ///
+    /// Only a complete value may be retained for replay at all — in Redis,
+    /// which outlives this process, or in the local map, where a later request
+    /// under the same live policy would otherwise be served bytes whose
+    /// producing policy was never witnessed.
+    pub(crate) fn complete(&self) -> Option<([u8; 32], [u8; 32])> {
+        let presentation = self.presentation?;
+        Some((self.gate, presentation))
+    }
+
+    /// Whether this (live) provenance admits replaying a representation stored
+    /// under `stored`.
+    ///
+    /// An incomplete value matches nothing — including another incomplete
+    /// value. Two requests that both failed to establish the presentation
+    /// policy have not thereby proven they share one: "unknown" is not
+    /// evidence, and deriving `PartialEq` alone would have made
+    /// `None == None` silently admit exactly the replay this guard exists to
+    /// stop.
+    pub(crate) fn admits_replay_of(&self, stored: &Self) -> bool {
+        match (self.complete(), stored.complete()) {
+            (Some(live), Some(stored)) => live == stored,
+            _ => false,
+        }
+    }
+
+    /// Rebuild a value from a persisted record. Both halves are required, so a
+    /// payload that carried no provenance cannot be reconstructed at all.
+    pub(crate) fn from_persisted(gate: [u8; 32], presentation: [u8; 32]) -> Self {
+        Self {
+            gate,
+            presentation: Some(presentation),
+        }
+    }
+}
+
+/// How completely a plugin's response-side *presentation* policy can be
+/// described to a representation that will be replayed later.
+///
+/// See [`Plugin::response_presentation_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsePresentationPolicy {
+    /// The client-visible rewrite is a pure function of accepted static
+    /// configuration, captured by this content digest. Two processes loading
+    /// equivalent configuration derive the same value, so a retained
+    /// representation can be proven compatible anywhere.
+    Static([u8; 32]),
+    /// The client-visible rewrite is derived from live runtime state — data
+    /// this gateway refreshes from upstream on its own schedule, per session,
+    /// after the plugin was constructed — so no digest computed at construction
+    /// describes it, and no digest of *any* fixed size could without persisting
+    /// the runtime state itself.
+    ///
+    /// A proxy carrying such a plugin has no provable presentation policy at
+    /// all: the per-proxy fold collapses to `None` and every consumer that
+    /// would retain a finalized representation must fail closed. Config
+    /// admission rejects the composition outright
+    /// (`request_deduplication::validate_composition`); this variant is the
+    /// runtime backstop for the paths that only warn.
+    Dynamic,
 }
 
 /// Context passed through the plugin pipeline for a single request.
@@ -1790,6 +1890,13 @@ pub struct RequestContext {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// Lowercase `claim_headers` destinations already sanitized for this
+    /// request. Gateway-owned destinations are stripped exactly once, by the
+    /// first plugin instance that owns them, so a later instance sharing a
+    /// destination can never erase a verified value an earlier instance already
+    /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
+    /// configured.
+    pub(crate) sanitized_claim_header_destinations: HashSet<String>,
     /// Credential header names precomputed by the plugin cache for safe
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
@@ -1913,6 +2020,20 @@ pub struct RequestContext {
     /// the gates again at storage time — is what makes the stamp provenance
     /// rather than a guess. Kept private so request metadata cannot forge one.
     pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
+    /// Content digest of the effective *static* response-side presentation
+    /// policy for this request's proxy and protocol: every enrolled instance's
+    /// accepted config ([`Plugin::response_presentation_policy`]), folded in
+    /// configured execution order.
+    ///
+    /// Copied once from the request's plugin-cache view, so it describes
+    /// exactly the instances that will run on this request's response path.
+    /// `None` means the effective policy could not be established — either no
+    /// view was attached, or the proxy carries a
+    /// [`ResponsePresentationPolicy::Dynamic`] plugin whose rewrite comes from
+    /// live runtime state. A plugin that retains a representation for later
+    /// replay must fail closed on `None` rather than claim provenance it cannot
+    /// substantiate. Kept private so request metadata cannot forge one.
+    pub(crate) response_presentation_policy_digest: Option<[u8; 32]>,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -1967,7 +2088,7 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
-    /// Process-local compression instance that reserved response codec admission
+    /// Process-local compression instance that reserved response-buffer admission
     /// in `before_proxy`, before the response-buffer decision. First-wins across
     /// sibling instances so at most one response permit is held per request. The
     /// reservation is what bounds the population of response bodies admitted onto
@@ -1975,16 +2096,17 @@ pub struct RequestContext {
     /// reserved permit rather than acquiring a fresh one on the hot path.
     compression_response_admission_owner: Option<u64>,
     /// Set when `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission. The response then streams identity (or
+    /// obtain bounded response-buffer admission. The response then streams identity (or
     /// fails closed with 406 when identity is prohibited) instead of buffering
     /// for a compression it cannot run; `after_proxy` must not reacquire.
     compression_response_admission_declined: bool,
-    /// Reserved codec CPU admission permit for gateway response compression.
-    /// Reserved in `before_proxy` before the response-buffer decision and moved
-    /// into the `spawn_blocking` closure during the body transform. Drop
-    /// releases the slot if the transform never runs (cancellation). Clones
-    /// do not duplicate the exclusive permit.
-    compression_response_codec_permit: HeldCodecPermit,
+    /// Reserved response-buffer admission permit for gateway compression.
+    /// Codec CPU admission is acquired separately, immediately before the
+    /// blocking transform, and this permit is held across that transform so the
+    /// retained-body population never exceeds the response-buffer budget. Drop
+    /// releases this slot on cancellation; clones do not duplicate the
+    /// exclusive permit.
+    compression_response_buffer_permit: HeldResponseBufferPermit,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
     /// owning transform must emit these bytes so the backend never sees a
@@ -2354,6 +2476,7 @@ impl RequestContext {
             ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
@@ -2374,6 +2497,7 @@ impl RequestContext {
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
             response_policy_stamp: None,
+            response_presentation_policy_digest: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -2387,7 +2511,7 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
@@ -2683,27 +2807,41 @@ impl RequestContext {
         self.compression_response_admission_declined
     }
 
-    /// Drop this request's reserved response codec admission (permit + owner)
+    /// Drop this request's reserved response-buffer admission (permit + owner)
     /// when `instance_id` is the reserving instance. A no-op for siblings so a
     /// non-owner declining to compress never releases another instance's slot.
     pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
         if self.compression_response_admission_owner == Some(instance_id) {
             self.compression_response_admission_owner = None;
-            let _ = self.compression_response_codec_permit.take();
+            let _ = self.compression_response_buffer_permit.take();
         }
     }
 
-    pub(crate) fn set_compression_response_codec_permit(
+    /// Clear admission ownership for `instance_id` while leaving the reserved
+    /// buffer permit on the context. Used when this instance will not encode but
+    /// the body was already admitted onto the compression buffered path: a later
+    /// sibling with a broader config can take the same slot instead of briefly
+    /// leaving a retained body unaccounted for (or racing a fresh acquire).
+    pub(crate) fn relinquish_compression_response_admission_ownership_if_owner(
+        &mut self,
+        instance_id: u64,
+    ) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+        }
+    }
+
+    pub(crate) fn set_compression_response_buffer_permit(
         &mut self,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        self.compression_response_codec_permit.set(permit);
+        self.compression_response_buffer_permit.set(permit);
     }
 
-    pub(crate) fn take_compression_response_codec_permit(
+    pub(crate) fn take_compression_response_buffer_permit(
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.compression_response_codec_permit.take()
+        self.compression_response_buffer_permit.take()
     }
 
     pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
@@ -2726,7 +2864,7 @@ impl RequestContext {
         self.gateway_response_compression_algorithm = None;
         self.compression_response_encode_owner = None;
         self.compression_response_admission_owner = None;
-        let _ = self.compression_response_codec_permit.take();
+        let _ = self.compression_response_buffer_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -3120,6 +3258,7 @@ impl RequestContext {
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
@@ -3140,6 +3279,7 @@ impl RequestContext {
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
             response_policy_stamp: self.response_policy_stamp.clone(),
+            response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -3166,13 +3306,13 @@ impl RequestContext {
             compression_response_encode_owner: self.compression_response_encode_owner,
             compression_response_admission_owner: self.compression_response_admission_owner,
             compression_response_admission_declined: self.compression_response_admission_declined,
-            // The reserved response codec permit stays on the donor (live)
+            // The reserved response-buffer permit stays on the donor (live)
             // context: this compatibility clone runs only the request-body hooks,
             // never the response-body transform that consumes the permit. Moving
             // it here would drop the slot when this short-lived clone is dropped
             // (only `metadata`/WAF/AI state is copied back), releasing admission
             // while the live context still owns the response encode.
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),
@@ -3255,6 +3395,29 @@ impl RequestContext {
     pub(crate) fn response_policy_stamp_stable(&mut self) -> bool {
         let current = response_transformer::runtime_overlay::policy_stamp();
         self.pin_response_policy_stamp() == &current
+    }
+
+    /// Record the effective static response-presentation policy digest for this
+    /// request, taken from its plugin-cache view.
+    ///
+    /// Called once per request on the protocol entry paths, before any plugin
+    /// runs, so it always describes the same cache generation whose instances
+    /// will shape the response.
+    pub(crate) fn set_response_presentation_policy_digest(&mut self, digest: Option<[u8; 32]>) {
+        self.response_presentation_policy_digest = digest;
+    }
+
+    /// Complete replay provenance for this request's response-side presentation
+    /// policy: the pinned RTDS gate content plus the effective static rules.
+    ///
+    /// See `ResponsePolicyProvenance` for what each half proves and why both
+    /// are required.
+    pub(crate) fn response_policy_provenance(&mut self) -> ResponsePolicyProvenance {
+        let gate = self.pin_response_policy_stamp().fingerprint();
+        ResponsePolicyProvenance {
+            gate,
+            presentation: self.response_presentation_policy_digest,
+        }
     }
 
     pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
@@ -6306,6 +6469,74 @@ pub trait Plugin: Send + Sync {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) {
+    }
+
+    /// How completely this plugin's response-side *presentation* policy — the
+    /// client-facing body rewrites that a finalized replay
+    /// (`RequestContext::finalized_response_replay`) deliberately skips so
+    /// non-idempotent rules cannot run twice over an already-transformed
+    /// representation — can be described to a representation retained for
+    /// replay.
+    ///
+    /// Returning `Some` enrolls the instance in replay provenance. The plugin
+    /// cache folds every `Static` contribution, in configured execution order,
+    /// into one per-proxy digest
+    /// (`PluginCacheRequestView::response_presentation_policy_digest`) that
+    /// `request_deduplication` binds into every representation it retains; a
+    /// stored representation replays only while that digest still matches, so
+    /// newly configured redaction can never be skipped by a retained replay. A
+    /// single [`ResponsePresentationPolicy::Dynamic`] contribution collapses the
+    /// whole per-proxy fold to `None`, because a fold that silently omitted an
+    /// undescribable member would assert a completeness it does not have.
+    ///
+    /// `Static` implementations must derive the digest **only** from static
+    /// configuration — never from per-request data, live discovery state,
+    /// pointers, timestamps, or process-random state — so two processes loading
+    /// equivalent configuration derive the same value, and it must change
+    /// whenever any rule that shapes the client-visible representation changes.
+    /// Use `utils::policy_digest::static_config_digest` with a plugin-specific
+    /// domain separator. Return only the digest: the value is persisted outside
+    /// this process, so raw configuration must never be exposed here.
+    ///
+    /// Only response *body* transforms need enrollment. `after_proxy` header
+    /// hooks — including the rejection-path hooks a synthetic replay runs
+    /// through — still execute on a finalized replay, so header policy is
+    /// enforced live and is never skipped. (`response_transformer` consuming
+    /// `ctx.route_override_response_transform` without applying it on a
+    /// finalized replay is the deliberate counterpart: those route rules are
+    /// header-only and are already baked into the stored header map.)
+    ///
+    /// Every current implementor of `transform_response_body` /
+    /// `transform_response_body_with_context` has been audited against that
+    /// rule. Enrolled `Static`: `response_transformer`, `sse` — both rewrite
+    /// bodies purely from accepted configuration and hold no interior mutable
+    /// presentation state. Enrolled `Dynamic`: `mcp_gateway`.
+    /// Deliberately not enrolled, and why the skip drops no live decision:
+    ///
+    /// - `compression` — content coding, not presentation. A replay is
+    ///   delivered through the rejection path, where `after_proxy` declines to
+    ///   commit a `Content-Encoding` at all, so the skipped transform cannot
+    ///   leave a mislabeled body. The retained bytes are self-describing (the
+    ///   stored `Content-Encoding` travels with them) and `request_deduplication`
+    ///   binds `Accept-Encoding` into the request fingerprint, so a replay only
+    ///   ever reaches a client that advertised the stored coding.
+    /// - `grpc_web` — protocol framing with no static presentation
+    ///   configuration. The translation mode comes entirely from the request
+    ///   `Content-Type` (fingerprint-bound) and the response's own trailers,
+    ///   which are part of the retained bytes. Its one static knob,
+    ///   `expose_headers`, is CORS *header* policy applied in `after_proxy`.
+    /// - `ai_response_guard`, `ai_tool_governor` — their current-policy
+    ///   inspection re-runs over the replayed bytes and opts a mandatory
+    ///   transform back in through `requires_replay_response_body_transform`,
+    ///   failing closed when it cannot rewrite. Newly configured redaction is
+    ///   therefore applied to a replay under the *live* policy, which is
+    ///   strictly stronger than proving a stored digest still matches.
+    ///
+    /// The `Dynamic` case is `compression`/`grpc_web`'s opposite: neither of
+    /// those has any interior mutable state that shapes a body (their atomics
+    /// are instance counters and metrics), so exclusion stays sound.
+    fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
+        None
     }
 
     /// Returns `true` when this plugin defines deterministic response-header

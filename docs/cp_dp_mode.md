@@ -85,6 +85,32 @@ The gRPC channel supports three security modes:
 
 > **`FERRUM_DP_GRPC_TLS_NO_VERIFY` is not supported** and is rejected at startup when `true`: the tonic-managed gRPC client exposes no hook to skip server certificate verification, so the flag only ever provided false confidence. To test against a CP with a self-signed certificate, pin its CA via `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`.
 
+### Pre-authentication connection admission
+
+The CP gRPC listener bounds how many connections may exist before a peer has
+authenticated. A permit from a single, process-wide limiter is taken in the
+accept loop **before** the per-socket TLS/mTLS handshake task is created, and it
+is released only when the served HTTP/2 session ends. Over-limit sockets are
+closed immediately, with no task, TLS state machine, or cloned server
+configuration allocated for them.
+
+- `FERRUM_CP_GRPC_MAX_CONNECTIONS` (default `1024`) is the global bound.
+- `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` (default `64`) bounds one source IP so
+  a single host cannot consume the global budget. Raise it when many DPs reach
+  the CP through one NAT/egress address; `0` disables per-IP limiting. A value
+  greater than the global cap could never fire and is refused at startup.
+
+The limiter is shared by the plaintext listener, the TLS/mTLS listener, and
+every certificate-reload generation, so rotating the CP gRPC certificate neither
+resets nor duplicates the pool. `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`
+still bounds how long an individual handshake may take, but it is defense in
+depth — it recycles permits, it is not the concurrency bound.
+
+Both caps are observable on `/metrics` as `ferrum_cp_grpc_active_connections`,
+`ferrum_cp_grpc_max_connections`, `ferrum_cp_grpc_max_connections_per_ip`, and
+`ferrum_cp_grpc_rejected_connections_total{reason}`. No source-IP labels are
+emitted.
+
 ### Config Sync Flow
 
 1. DP connects to CP's gRPC endpoint with JWT authentication
@@ -215,6 +241,8 @@ in a failover set must use the same value.
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | No | PEM certificate for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
+| `FERRUM_CP_GRPC_MAX_CONNECTIONS` | No | Max concurrent CP gRPC connections, admitted **before** any TLS/mTLS handshake work is allocated and held through the served HTTP/2 session (default `1024`; `0` = unlimited) |
+| `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` | No | Max concurrent CP gRPC connections from one source IP (default `64`; `0` disables). Must not exceed `FERRUM_CP_GRPC_MAX_CONNECTIONS` |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
 | `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |

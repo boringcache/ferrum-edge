@@ -1232,6 +1232,10 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
     headers.insert("x-forwarded-proto".to_string(), "https".to_string());
     headers.insert("x-forwarded-host".to_string(), "evil.example".to_string());
     headers.insert(
+        "FoRwArDeD".to_string(),
+        "for=198.51.100.7;host=evil.example;proto=https".to_string(),
+    );
+    headers.insert(
         "connection".to_string(),
         "x-sensitive, keep-alive".to_string(),
     );
@@ -1261,6 +1265,7 @@ async fn test_generated_request_fidelity_and_header_sanitization() {
     assert!(!req_headers.contains_key("x-forwarded-for"));
     assert!(!req_headers.contains_key("x-forwarded-proto"));
     assert!(!req_headers.contains_key("x-forwarded-host"));
+    assert!(!req_headers.contains_key("forwarded"));
     assert!(!req_headers.contains_key("connection"));
     assert!(!req_headers.contains_key("x-sensitive"));
     assert!(!req_headers.contains_key("transfer-encoding"));
