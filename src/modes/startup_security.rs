@@ -208,8 +208,11 @@ pub fn load_crls_from_env(env_config: &EnvConfig) -> Result<CrlList, anyhow::Err
 
 /// Strict `FERRUM_ADMIN_ALLOWED_CIDRS` parse — shared by validate and serve.
 pub fn load_admin_allowed_cidrs(env_config: &EnvConfig) -> Result<TrustedProxies, anyhow::Error> {
-    TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-        .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))
+    TrustedProxies::parse_strict(
+        &env_config.admin_allowed_cidrs,
+        "FERRUM_ADMIN_ALLOWED_CIDRS",
+    )
+    .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))
 }
 
 /// `MetricsAuthPolicy::from_env` — shared by validate and serve.

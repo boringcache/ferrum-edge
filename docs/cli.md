@@ -145,7 +145,7 @@ The report withholds externally sourced values, not just the ones that appear in
    - Upstream reference validation
 3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
    - TLS policy (`TlsPolicy::from_env_config`) and CRLs (`FERRUM_TLS_CRL_FILE_PATH`) for file/database/cp/dp/mesh
-   - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy
+   - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy; node-agent validates these only when its plaintext admin listener is active, matching `run`
    - Frontend TLS material (missing, mismatched, expired, or malformed cert/key) when both `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH` are set (file/database/dp; mesh validates an explicit frontend pair via the same identity loader `run` uses)
    - Admin TLS material when admin HTTPS is enabled (`FERRUM_ADMIN_HTTPS_PORT != 0` and both admin cert/key paths are set)
    - DTLS frontend cert (+ optional client CA) expiry when both `FERRUM_DTLS_CERT_PATH` and `FERRUM_DTLS_KEY_PATH` are set (file/database/dp)

@@ -46,12 +46,13 @@ fn generate_expired_cert() -> (String, String) {
 }
 
 fn file_mode_env() -> EnvConfig {
-    let mut env = EnvConfig::default();
-    env.mode = OperatingMode::File;
     // Disable admin HTTPS by default so tests that don't set admin TLS paths
     // are not gated on the default port 9443 listener.
-    env.admin_https_port = 0;
-    env
+    EnvConfig {
+        mode: OperatingMode::File,
+        admin_https_port: 0,
+        ..EnvConfig::default()
+    }
 }
 
 #[test]
@@ -77,6 +78,26 @@ fn scope_for_cp_skips_frontend_and_dtls() {
     assert!(scope.admin_cidrs_and_metrics);
     assert!(!scope.frontend_tls);
     assert!(scope.admin_tls);
+    assert!(!scope.dtls);
+}
+
+#[test]
+fn scope_for_mesh_uses_mesh_frontend_but_skips_dtls() {
+    let scope = StartupSecurityScope::for_mode(&OperatingMode::Mesh);
+    assert!(scope.tls_policy_and_crls);
+    assert!(scope.admin_cidrs_and_metrics);
+    assert!(scope.frontend_tls);
+    assert!(scope.admin_tls);
+    assert!(!scope.dtls);
+}
+
+#[test]
+fn scope_for_node_agent_is_admin_only() {
+    let scope = StartupSecurityScope::for_mode(&OperatingMode::NodeAgent);
+    assert!(!scope.tls_policy_and_crls);
+    assert!(scope.admin_cidrs_and_metrics);
+    assert!(!scope.frontend_tls);
+    assert!(!scope.admin_tls);
     assert!(!scope.dtls);
 }
 
@@ -289,17 +310,80 @@ fn valid_admin_tls_pair_passes_when_https_enabled() {
 }
 
 #[test]
+fn partial_admin_tls_pair_is_ignored_when_https_listener_is_disabled() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        admin_https_port: 9443,
+        admin_tls_cert_path: Some("/nonexistent/admin.pem".to_string()),
+        admin_tls_key_path: None,
+        ..file_mode_env()
+    };
+
+    let materials =
+        load_startup_security(&env).expect("disabled admin HTTPS must not load partial material");
+    assert!(materials.admin_tls.is_none());
+}
+
+#[test]
 fn cp_scope_ignores_frontend_tls_paths() {
     ensure_crypto_provider();
-    let mut env = EnvConfig::default();
-    env.mode = OperatingMode::ControlPlane;
-    env.admin_https_port = 0;
     // Point frontend at a missing path — CP must not load it.
-    env.frontend_tls_cert_path = Some("/nonexistent/frontend.pem".to_string());
-    env.frontend_tls_key_path = Some("/nonexistent/frontend-key.pem".to_string());
+    let env = EnvConfig {
+        mode: OperatingMode::ControlPlane,
+        admin_https_port: 0,
+        frontend_tls_cert_path: Some("/nonexistent/frontend.pem".to_string()),
+        frontend_tls_key_path: Some("/nonexistent/frontend-key.pem".to_string()),
+        ..EnvConfig::default()
+    };
 
     load_startup_security_with_scope(&env, StartupSecurityScope::for_mode(&env.mode))
         .expect("CP scope must skip frontend TLS paths");
+}
+
+#[test]
+fn mesh_scope_ignores_dtls_material() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        dtls_cert_path: Some("/nonexistent/dtls.pem".to_string()),
+        dtls_key_path: Some("/nonexistent/dtls-key.pem".to_string()),
+        ..EnvConfig::default()
+    };
+
+    load_startup_security(&env).expect("mesh startup does not gate on DTLS material");
+}
+
+#[test]
+fn node_agent_admin_gate_matches_serving_listener_boundary() {
+    let disabled = EnvConfig {
+        mode: OperatingMode::NodeAgent,
+        node_agent_admin_enabled: false,
+        admin_http_port: 9000,
+        admin_allowed_cidrs: "not-a-cidr".to_string(),
+        metrics_allowed_cidrs: "also-not-a-cidr".to_string(),
+        ..EnvConfig::default()
+    };
+    load_startup_security(&disabled)
+        .expect("disabled node-agent admin must not parse admin security policy");
+
+    let port_disabled = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 0,
+        ..disabled.clone()
+    };
+    load_startup_security(&port_disabled)
+        .expect("port-zero node-agent admin must not parse admin security policy");
+
+    let active = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 9000,
+        ..disabled
+    };
+    let err = load_startup_security(&active)
+        .err()
+        .expect("active node-agent admin must reject malformed CIDRs");
+    assert!(format!("{err:#}").contains("FERRUM_ADMIN_ALLOWED_CIDRS"));
 }
 
 #[test]
