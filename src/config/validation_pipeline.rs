@@ -695,6 +695,20 @@ mod tests {
     }
 
     #[test]
+    fn rejecting_runtime_contract_includes_malformed_resource_namespaces() {
+        let mut proxy = runtime_proxy("hostile-ns", Some("/hostile"), "http");
+        // `|` is the runtime composite-key delimiter; a corrupt DB/file/CP
+        // snapshot must fail closed before any cache encodes the identity.
+        proxy.namespace = "tenant|prod".to_string();
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "namespace");
+    }
+
+    #[test]
     fn rejecting_runtime_contract_includes_regex_listen_paths() {
         let config = GatewayConfig {
             proxies: vec![runtime_proxy("bad-regex", Some("~(invalid[regex"), "http")],

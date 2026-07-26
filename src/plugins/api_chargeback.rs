@@ -447,10 +447,13 @@ fn effective_api_chargeback_plugins_by_proxy(
 )> {
     use crate::config::types::PluginScope;
 
-    let plugin_by_id: HashMap<&str, &crate::config::types::PluginConfig> = config
+    // Association plugin_config_id values are namespace-local to the proxy. A
+    // bare-id index would bind a proxy to another tenant's same-id
+    // api_chargeback config (mirrors effective_mtls_auth_plugins_by_proxy).
+    let plugin_by_key: HashMap<(&str, &str), &crate::config::types::PluginConfig> = config
         .plugin_configs
         .iter()
-        .map(|plugin| (plugin.id.as_str(), plugin))
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
     let global_chargeback: Vec<&crate::config::types::PluginConfig> = config
         .plugin_configs
@@ -470,14 +473,23 @@ fn effective_api_chargeback_plugins_by_proxy(
                 .plugins
                 .iter()
                 .filter_map(|association| {
-                    let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    let plugin = *plugin_by_key.get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))?;
                     let scope_applies = match plugin.scope {
-                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                        PluginScope::Proxy => {
+                            plugin.namespace == proxy.namespace
+                                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        }
                         // Config validation already requires proxy-group
                         // instances to omit proxy_id. Applicability here mirrors
                         // the runtime merge, which is driven by scope plus the
-                        // proxy's explicit plugin association.
-                        PluginScope::ProxyGroup => true,
+                        // proxy's explicit plugin association — still
+                        // namespace-local so same-id group configs stay isolated.
+                        PluginScope::ProxyGroup => {
+                            plugin.namespace == proxy.namespace && plugin.proxy_id.is_none()
+                        }
                         PluginScope::Global => false,
                     };
                     (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
@@ -485,6 +497,10 @@ fn effective_api_chargeback_plugins_by_proxy(
                 })
                 .collect();
             let effective = if local_chargeback.is_empty() {
+                // Globals are gateway-wide at runtime (`PluginCache` merges the
+                // single global list into every proxy in every namespace), so
+                // this must NOT be namespace-filtered — only the association
+                // lookup above is namespace-local.
                 global_chargeback.clone()
             } else {
                 local_chargeback

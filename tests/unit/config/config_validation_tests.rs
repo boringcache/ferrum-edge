@@ -533,6 +533,14 @@ fn cp_full_and_incremental_rejection_share_plugin_security_composition_validatio
         shared.contains("validate_plugin_security_composition_candidate("),
         "the shared rejecting contract must include plugin security composition"
     );
+    let rejecting_fn = shared
+        .find("pub(crate) fn collect_rejecting_runtime_config_errors(")
+        .expect("shared rejecting contract function");
+    let rejecting_body = &shared[rejecting_fn..];
+    assert!(
+        rejecting_body.contains("config.validate_resource_ids()"),
+        "shared rejecting contract must fail closed on malformed IDs/namespaces"
+    );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");
     let full_start = control_plane
