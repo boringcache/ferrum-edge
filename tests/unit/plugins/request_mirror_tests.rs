@@ -2394,6 +2394,10 @@ async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers()
     headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
     headers.insert("x-forwarded-proto".to_string(), "https".to_string());
     headers.insert("x-forwarded-host".to_string(), "evil.example".to_string());
+    headers.insert(
+        "FoRwArDeD".to_string(),
+        "for=198.51.100.7;host=evil.example;proto=https".to_string(),
+    );
     headers.insert("content-length".to_string(), "99".to_string());
     headers.insert("host".to_string(), "client.example".to_string());
     headers.insert(
@@ -2414,6 +2418,7 @@ async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers()
         "x-forwarded-for",
         "x-forwarded-proto",
         "x-forwarded-host",
+        "forwarded",
         "x-loadtesting-key",
         "authorization",
     ] {

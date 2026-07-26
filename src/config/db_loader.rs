@@ -50,6 +50,11 @@ use uuid::Uuid;
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
 #[allow(unused_imports)]
+pub use crate::config::batch_atomicity::{
+    AtomicBatchCounts, AtomicBatchFault, AtomicBatchGraph, AtomicBatchPhase,
+    BatchAdmissionLeaseLost,
+};
+#[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
     IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
@@ -5398,12 +5403,43 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = proxies.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of proxies into a caller-owned transaction.
+    ///
+    /// Shared by the chunk-per-transaction import path and the
+    /// single-transaction atomic batch graph write so both write identical rows
+    /// and change records. The caller owns the namespace admission lock, the
+    /// post-write admission re-validation, change-log compaction, and the
+    /// commit.
+    async fn insert_proxies_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxies: &[Proxy],
+        attach_plugins: bool,
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
         for proxy in proxies {
-            self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+            self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
                 .await?;
 
             let circuit_breaker_json = proxy
@@ -5523,7 +5559,7 @@ impl DatabaseStore {
                 .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
                 .bind(proxy.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
 
             if attach_plugins {
@@ -5531,27 +5567,16 @@ impl DatabaseStore {
                     sqlx::query(&assoc_sql)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)
-                        .execute(&mut *tx)
+                        .execute(&mut **tx)
                         .await?;
                 }
             }
-            self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
+            self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
                 .await?;
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_namespace_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = proxies.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     pub async fn batch_attach_proxy_plugins(
@@ -5564,12 +5589,6 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let assoc_exists_sql = self
-            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
-        let touch_proxy_sql =
-            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             let mut admission_namespaces: Vec<&str> =
@@ -5580,45 +5599,9 @@ impl DatabaseStore {
                 self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                     .await?;
             }
-            let mut seen = HashSet::new();
-            let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
             let mut touched_namespaces = HashSet::new();
-            for proxy in chunk {
-                for assoc in &proxy.plugins {
-                    if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
-                        continue;
-                    }
-                    let already_attached = sqlx::query(&assoc_exists_sql)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .is_some();
-                    if already_attached {
-                        continue;
-                    }
-                    sqlx::query(&assoc_sql)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .execute(&mut *tx)
-                        .await?;
-                    touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
-                    touched_namespaces.insert(proxy.namespace.clone());
-                }
-            }
-            if !touched_proxies.is_empty() {
-                let touch_ts = Utc::now().to_rfc3339();
-                for (proxy_id, namespace) in touched_proxies {
-                    sqlx::query(&touch_proxy_sql)
-                        .bind(&touch_ts)
-                        .bind(proxy_id)
-                        .bind(namespace)
-                        .execute(&mut *tx)
-                        .await?;
-                    self.record_config_change_tx(&mut tx, namespace, "proxy", proxy_id, "upsert")
-                        .await?;
-                }
-            }
+            self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
             if mode.validates_mtls_dns() {
                 for namespace in &admission_namespaces {
                     self.validate_namespace_admission_tx(&mut tx, namespace)
@@ -5632,6 +5615,62 @@ impl DatabaseStore {
         }
 
         self.check_slow_query("batch_attach_proxy_plugins", start);
+        Ok(())
+    }
+
+    /// Attach one chunk of proxy↔plugin associations inside a caller-owned
+    /// transaction. Idempotent per association, so a retry of the same graph
+    /// re-attaches nothing.
+    async fn attach_proxy_plugins_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxies: &[Proxy],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
+        let assoc_exists_sql = self
+            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
+        let assoc_sql =
+            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let touch_proxy_sql =
+            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
+        let mut seen = HashSet::new();
+        let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
+        for proxy in proxies {
+            for assoc in &proxy.plugins {
+                if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                    continue;
+                }
+                let already_attached = sqlx::query(&assoc_exists_sql)
+                    .bind(&proxy.id)
+                    .bind(&assoc.plugin_config_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some();
+                if already_attached {
+                    continue;
+                }
+                sqlx::query(&assoc_sql)
+                    .bind(&proxy.id)
+                    .bind(&assoc.plugin_config_id)
+                    .execute(&mut **tx)
+                    .await?;
+                touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
+                touched_namespaces.insert(proxy.namespace.clone());
+            }
+        }
+        if !touched_proxies.is_empty() {
+            let touch_ts = Utc::now().to_rfc3339();
+            for (proxy_id, namespace) in touched_proxies {
+                sqlx::query(&touch_proxy_sql)
+                    .bind(&touch_ts)
+                    .bind(proxy_id)
+                    .bind(namespace)
+                    .execute(&mut **tx)
+                    .await?;
+                self.record_config_change_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -5672,6 +5711,32 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_consumers_in_tx(&mut tx, consumers, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = consumers.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of consumers into a caller-owned transaction, including
+    /// the credential and identity index rows that must be written
+    /// transactionally with every consumer.
+    async fn insert_consumers_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        consumers: &[Consumer],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
@@ -5686,14 +5751,14 @@ impl DatabaseStore {
                 .bind(&acl_groups_json)
                 .bind(consumer.created_at.to_rfc3339())
                 .bind(consumer.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-            self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            self.insert_consumer_credential_index_tx(&mut *tx, consumer)
                 .await?;
-            self.insert_consumer_identity_index_tx(&mut tx, consumer)
+            self.insert_consumer_identity_index_tx(&mut *tx, consumer)
                 .await?;
             self.record_config_change_tx(
-                &mut tx,
+                &mut *tx,
                 &consumer.namespace,
                 "consumer",
                 &consumer.id,
@@ -5703,18 +5768,7 @@ impl DatabaseStore {
             touched_namespaces.insert(consumer.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = consumers.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     /// Batch-create multiple plugin configs. Graph-aware batches stay in one
@@ -5764,6 +5818,31 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_plugin_configs_in_tx(&mut tx, configs, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = configs.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of plugin configs into a caller-owned transaction,
+    /// including the proxy-scoped association row each one implies.
+    async fn insert_plugin_configs_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        configs: &[PluginConfig],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
@@ -5786,7 +5865,7 @@ impl DatabaseStore {
                 .bind(pc.priority_override.map(|v| v as i32))
                 .bind(pc.created_at.to_rfc3339())
                 .bind(pc.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
 
             if pc.scope == PluginScope::Proxy
@@ -5795,28 +5874,23 @@ impl DatabaseStore {
                 sqlx::query(&assoc_sql)
                     .bind(proxy_id)
                     .bind(&pc.id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
-            self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
-                .await?;
+            self.record_config_change_tx(
+                &mut *tx,
+                &pc.namespace,
+                "plugin_config",
+                &pc.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(pc.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_namespace_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = configs.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     /// Batch-create multiple upstreams, chunked into transactions of
@@ -5856,6 +5930,24 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_upstreams_in_tx(&mut tx, upstreams, &mut touched_namespaces)
+            .await?;
+
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = upstreams.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of upstreams into a caller-owned transaction.
+    async fn insert_upstreams_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstreams: &[Upstream],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
@@ -5903,10 +5995,10 @@ impl DatabaseStore {
                 .bind(&backend_tls_san_allow_list_json)
                 .bind(upstream.created_at.to_rfc3339())
                 .bind(upstream.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             self.record_config_change_tx(
-                &mut tx,
+                &mut *tx,
                 &upstream.namespace,
                 "upstream",
                 &upstream.id,
@@ -5916,12 +6008,178 @@ impl DatabaseStore {
             touched_namespaces.insert(upstream.namespace.clone());
         }
 
+        Ok(())
+    }
+
+    /// Persist an entire validated batch graph in one transaction.
+    ///
+    /// Every dependency phase and every bounded chunk inside a phase share this
+    /// single transaction, so a failure anywhere — including after a chunk
+    /// boundary — rolls the whole graph back and leaves nothing durable
+    /// (issue #2401). Chunking survives only to bound how many statements are
+    /// prepared and issued at a time; a chunk boundary commits nothing.
+    ///
+    /// Ordering inside the transaction:
+    /// 1. Lock every touched namespace's admission row, so no other namespace
+    ///    resource writer can commit until this transaction ends.
+    /// 2. Write consumers, then upstreams, then proxies (without associations),
+    ///    then plugin configs, then the proxy↔plugin associations.
+    /// 3. Re-validate the merged namespace admission graph against this exact
+    ///    transaction candidate.
+    /// 4. Re-verify the caller's namespace config-admission lease, so a lapsed
+    ///    lease aborts instead of committing a graph another writer may have
+    ///    invalidated.
+    /// 5. Compact the change log and commit once.
+    pub async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error> {
+        let start = Instant::now();
+        if graph.is_empty() {
+            return Ok(AtomicBatchCounts::default());
+        }
+        let (fault, chunk_size_override) =
+            crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
+        let chunk_size = chunk_size_override.unwrap_or(Self::BATCH_CHUNK_SIZE);
+        // The override registry already rejects zero, but `chunks(0)` panics,
+        // so clamp rather than trust it.
+        let chunk_size = chunk_size.max(1);
+        let admission_namespaces = graph.admission_namespaces();
+
+        let mut tx = self.pool().begin().await?;
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                .await?;
+        }
+        let mut touched_namespaces = HashSet::new();
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, 0)?;
+        for (index, chunk) in graph.consumers.chunks(chunk_size).enumerate() {
+            self.insert_consumers_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Upstreams, 0)?;
+        for (index, chunk) in graph.upstreams.chunks(chunk_size).enumerate() {
+            self.insert_upstreams_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Upstreams, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, 0)?;
+        for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
+            // Associations are attached in their own phase below so a plugin
+            // config submitted in the same graph is already present.
+            self.insert_proxies_in_tx(&mut tx, chunk, false, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::PluginConfigs, 0)?;
+        for (index, chunk) in graph.plugin_configs.chunks(chunk_size).enumerate() {
+            self.insert_plugin_configs_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::PluginConfigs, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::ProxyPluginAssociations, 0)?;
+        for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
+            self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(
+                fault,
+                AtomicBatchPhase::ProxyPluginAssociations,
+                index + 1,
+            )?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::AdmissionRevalidation, 0)?;
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+
+        // Ownership is re-read inside the transaction that is about to commit,
+        // while this transaction still holds every touched namespace's
+        // admission row. Any writer that could have invalidated the validated
+        // graph had to take the lease first, so a matching owner and generation
+        // here proves nobody interleaved.
+        if let Some(lease) = graph.admission_lease {
+            self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, &lease)
+                .await?;
+        }
+
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
         }
-        let count = upstreams.len();
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
         tx.commit().await?;
-        Ok(count)
+        self.check_slow_query("batch_create_config_graph_atomically", start);
+        Ok(AtomicBatchCounts {
+            consumers: graph.consumers.len(),
+            upstreams: graph.upstreams.len(),
+            proxies: graph.proxies.len(),
+            plugin_configs: graph.plugin_configs.len(),
+        })
+    }
+
+    fn check_atomic_batch_fault(
+        fault: Option<AtomicBatchFault>,
+        phase: AtomicBatchPhase,
+        completed_chunks: usize,
+    ) -> Result<(), anyhow::Error> {
+        match fault {
+            Some(fault) if fault.trips(phase, completed_chunks) => Err(fault.error()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Confirm inside `tx` that `lease` still owns the namespace's config
+    /// admission row and has not expired.
+    ///
+    /// `FOR UPDATE` pins the row until commit so a competing acquirer cannot
+    /// take the lease between this check and the commit. SQLite has no
+    /// `FOR UPDATE`, but this transaction already holds the database writer
+    /// lock (taken by `lock_mtls_dns_admission_for_owner_tx`), which gives the
+    /// same exclusion.
+    async fn verify_namespace_config_admission_lease_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        lease: &crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let now = self.config_admission_lease_now_sql();
+        let for_update = if self.db_type == "sqlite" {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let sql = self.q(&format!(
+            "SELECT 1 FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}{for_update}"
+        ));
+        let generation = i64::try_from(lease.generation).map_err(|_| {
+            anyhow::anyhow!("namespace config admission generation is out of range")
+        })?;
+        let held = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(lease.owner)
+            .bind(generation)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        if held {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(BatchAdmissionLeaseLost).context(format!(
+                "namespace '{namespace}' config admission lease generation {generation} was not held at commit"
+            )))
+        }
     }
 
     /// Delete all resources from all tables in a single transaction.
@@ -8879,6 +9137,14 @@ impl DatabaseBackend for DatabaseStore {
         plugins: &[crate::config::types::PluginAssociation],
     ) -> Result<Vec<String>, anyhow::Error> {
         DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
+    }
+
+    async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error> {
+        DatabaseStore::batch_create_config_graph_atomically(self, graph, mode).await
     }
 
     async fn batch_create_proxies(
