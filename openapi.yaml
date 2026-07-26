@@ -1450,6 +1450,16 @@ paths:
         `ferrum_admin_rejected_connections_total{reason}` (admin connections
         dropped by the cap, with `reason` one of `max_connections` /
         `max_connections_per_ip`).
+        Control-plane mode additionally exposes the CP gRPC
+        pre-authentication connection limiter:
+        `ferrum_cp_grpc_active_connections` (gauge of admitted CP gRPC
+        connections, counted from before the TLS/mTLS handshake through the
+        served HTTP/2 session), `ferrum_cp_grpc_max_connections` and
+        `ferrum_cp_grpc_max_connections_per_ip` (configured caps, `0` =
+        unlimited), and
+        `ferrum_cp_grpc_rejected_connections_total{reason}` (connections
+        closed before any handshake work was allocated, with the same closed
+        `reason` label set). No source-IP labels are emitted.
       tags: [Metrics]
       security:
         - bearerAuth: []
@@ -1471,6 +1481,12 @@ paths:
                 # HELP ferrum_admin_rejected_connections_total Admin connections rejected by the connection limiter, by reason.
                 # TYPE ferrum_admin_rejected_connections_total counter
                 ferrum_admin_rejected_connections_total{reason="max_connections"} 0
+                # HELP ferrum_cp_grpc_active_connections CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).
+                # TYPE ferrum_cp_grpc_active_connections gauge
+                ferrum_cp_grpc_active_connections 7
+                # HELP ferrum_cp_grpc_rejected_connections_total CP gRPC connections rejected before any handshake work was allocated, by reason.
+                # TYPE ferrum_cp_grpc_rejected_connections_total counter
+                ferrum_cp_grpc_rejected_connections_total{reason="max_connections"} 0
         "401":
           $ref: "#/components/responses/Unauthorized"
 

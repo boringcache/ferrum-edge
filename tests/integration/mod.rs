@@ -27,6 +27,7 @@ mod cni_tests;
 mod connection_pool_tests;
 mod consumer_identity_enforcement_tests;
 mod cp_dp_grpc_tests;
+mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
 mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
