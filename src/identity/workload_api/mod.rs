@@ -12,6 +12,7 @@
 
 pub mod client;
 pub mod fetch_loop;
+pub mod latest_wins;
 pub mod proto;
 pub mod server;
 
