@@ -2647,10 +2647,12 @@ struct ReassembledChoice {
     /// Number of `choices[]` entries applied to this bucket. A positional
     /// bucket fed by more than one delta is a cross-frame guess, not identity.
     deltas: usize,
-    /// Number of `delta.tool_calls` arrays applied to this choice. Counted per
-    /// applied array rather than per SSE frame so that several `choices`
-    /// entries collapsing onto the same choice bucket are recognized as
-    /// separate, uncorrelatable contributions.
+    /// Number of non-empty `delta.tool_calls` arrays applied to this choice.
+    /// Counted per applied array rather than per SSE frame so that several
+    /// `choices` entries collapsing onto the same choice bucket are recognized
+    /// as separate, uncorrelatable contributions. Empty arrays are ignored:
+    /// they contribute no correlatable fragment and must not poison a later
+    /// single unambiguous indexless call into withholding.
     tool_call_deltas: usize,
     /// Whether any applied tool-call entry lacked a usable provider `index`
     /// (absent → positional, or malformed → unattributed).
@@ -2815,6 +2817,13 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                     }
                     continue;
                 };
+                // Only non-empty arrays contribute tool-call identity. An empty
+                // `tool_calls: []` is a no-op delta: counting it would let a
+                // provider poison a later single unambiguous indexless call into
+                // withholding without introducing any correlatable fragment.
+                if tool_calls.is_empty() {
+                    continue;
+                }
                 accumulated.tool_call_deltas = accumulated.tool_call_deltas.saturating_add(1);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let Some(tool_call) = tool_call.as_object() else {
