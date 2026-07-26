@@ -14,10 +14,9 @@ mod tls_management;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, RETRY_AFTER};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -25,7 +24,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
@@ -53,11 +52,96 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use crate::tls::managed::ManagedTlsMaterialKind;
-use crate::util::body_limit::is_length_limit_error;
+use crate::util::body_limit::{BodyCollectError, collect_body_with_limits};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 pub use conn_limit::AdminConnLimiter;
+
+/// Default absolute deadline for reading an admin request body.
+pub const DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS: u64 = 30;
+/// Default `SETTINGS_MAX_CONCURRENT_STREAMS` advertised on admin HTTP/2.
+pub const DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 64;
+/// Default `SETTINGS_MAX_HEADER_LIST_SIZE` advertised on admin HTTP/2.
+pub const DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES: u32 = 65_536;
+
+/// Slowloris bounds for admin request heads and bodies.
+///
+/// These are grouped rather than flattened onto [`AdminState`] because they are
+/// one policy: how long a single admin request may take to *arrive*, and how
+/// much of a connection it may hold while it does. See issue #2404.
+#[derive(Debug, Clone, Copy)]
+pub struct AdminRequestLimits {
+    /// Absolute deadline (seconds) for collecting a request body. `0` disables
+    /// the deadline, leaving bodies bounded only by size.
+    pub body_read_timeout_seconds: u64,
+    /// Server-advertised `SETTINGS_MAX_CONCURRENT_STREAMS` for admin HTTP/2.
+    pub http2_max_concurrent_streams: u32,
+    /// Server-advertised `SETTINGS_MAX_HEADER_LIST_SIZE` for admin HTTP/2.
+    pub http2_max_header_list_size_bytes: u32,
+}
+
+impl Default for AdminRequestLimits {
+    fn default() -> Self {
+        Self {
+            body_read_timeout_seconds: DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
+            http2_max_concurrent_streams: DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
+            http2_max_header_list_size_bytes: DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES,
+        }
+    }
+}
+
+impl AdminRequestLimits {
+    /// Build the limits from parsed environment configuration.
+    pub fn from_env_config(env_config: &crate::config::EnvConfig) -> Self {
+        Self {
+            body_read_timeout_seconds: env_config.admin_body_read_timeout_seconds,
+            http2_max_concurrent_streams: env_config.admin_http2_max_concurrent_streams,
+            http2_max_header_list_size_bytes: env_config.admin_http2_max_header_list_size_bytes,
+        }
+    }
+
+    /// The configured body deadline for a standard (1 MiB) admin body, or
+    /// `None` when disabled.
+    fn body_read_timeout(&self) -> Option<Duration> {
+        if self.body_read_timeout_seconds == 0 {
+            return None;
+        }
+        Some(Duration::from_secs(self.body_read_timeout_seconds))
+    }
+
+    /// The effective body deadline for a route whose size cap is `max_bytes`.
+    ///
+    /// `body_read_timeout_seconds` is the budget for the standard 1 MiB admin
+    /// body. Charging that same wall-clock figure to the routes with a larger
+    /// cap would demand proportionally more upload throughput from exactly the
+    /// requests that legitimately carry the most bytes: at the defaults a
+    /// 1 MiB body may arrive at ~35 KiB/s, while `POST /restore` (100 MiB) and
+    /// `POST`/`PUT /api-specs` (25 MiB) would have to sustain ~3.4 MiB/s and
+    /// ~850 KiB/s respectively — enough to reject the ~80 MB backups
+    /// `/restore` exists to accept over an ordinary WAN link. It would also
+    /// make the knob unusable: raising it far enough for a slow restore would
+    /// loosen every 1 MiB route by the same factor.
+    ///
+    /// Scaling the deadline by the route's own cap makes the bound one shared
+    /// *minimum throughput* instead. Every route keeps a real deadline, the
+    /// buffered bytes stay capped by the size limit that produced the
+    /// multiplier, and raising a size cap moves its deadline with it.
+    pub(crate) fn body_read_timeout_for(&self, max_bytes: usize) -> Option<Duration> {
+        let base = self.body_read_timeout()?;
+        let cap_mib = max_bytes.div_ceil(1024 * 1024).max(1);
+        let multiplier = u32::try_from(cap_mib).unwrap_or(u32::MAX);
+        Some(base.saturating_mul(multiplier))
+    }
+}
+
+/// `408` for a request body that did not finish arriving inside
+/// `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS`. Shared so the generic admin body
+/// read and the API-spec body read report the bound identically.
+pub(crate) fn body_timeout_response(seconds: u64) -> Response<Full<Bytes>> {
+    let message = format!("Request body was not fully received within {seconds} seconds");
+    json_response(StatusCode::REQUEST_TIMEOUT, &json!({"error": message}))
+}
 
 /// Cached result of the database health check to avoid hitting the DB on every
 /// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
@@ -164,9 +248,11 @@ impl MetricsAuthPolicy {
     /// Build the policy from environment config, validating any configured CIDR
     /// list (invalid entries are a hard error, mirroring `admin_allowed_cidrs`).
     pub fn from_env(env: &crate::config::EnvConfig) -> Result<Self, String> {
-        let allowed_cidrs =
-            crate::proxy::client_ip::TrustedProxies::parse_strict(&env.metrics_allowed_cidrs)
-                .map_err(|e| format!("FERRUM_METRICS_ALLOWED_CIDRS: {e}"))?;
+        let allowed_cidrs = crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env.metrics_allowed_cidrs,
+            "FERRUM_METRICS_ALLOWED_CIDRS",
+        )
+        .map_err(|e| format!("FERRUM_METRICS_ALLOWED_CIDRS: {e}"))?;
         let bearer_token = env
             .metrics_bearer_token
             .as_ref()
@@ -266,23 +352,25 @@ pub struct AdminState {
     /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
     /// Set by the database- or CP-mode poll loop when the latest full config
-    /// load was rejected by the shared runtime-config *validation* contract (a
-    /// reachable backend served a semantically-invalid snapshot) rather than
-    /// failing on connectivity — and by file-mode SIGHUP reload when a
-    /// candidate fails read/parse/validation/apply. Orthogonal to `db_available`:
-    /// on a DB/CP validation rejection the backend is reachable and admin writes
-    /// are the in-band repair tool, so `db_available` stays `true` while this
-    /// flag rises. File mode has no DB (`db_available` is `None`, treated as
-    /// reachable for `/health` gating) and stays read-only; operators repair by
-    /// fixing the file and reloading. Cleared only by the next accepted
-    /// authoritative full reload (Applied or Unchanged). Surfaced only in the
-    /// authenticated `/health` detail (`config_rejected`) and coarsely as a
-    /// `"degraded"` status; `None` in modes without a reload rejection signal.
+    /// load was rejected by the shared runtime-config validation contract or by
+    /// typed SQL row decoding (a reachable backend served a semantically invalid
+    /// or undecodable snapshot) rather than failing on connectivity — and by
+    /// file-mode SIGHUP reload when a candidate fails read/parse/validation/apply.
+    /// Orthogonal to `db_available`: on a DB/CP validation or row-decode rejection
+    /// the backend is reachable and admin writes are the in-band repair tool, so
+    /// `db_available` stays `true` while this flag rises. File mode has no DB
+    /// (`db_available` is `None`, treated as reachable for `/health` gating) and
+    /// stays read-only; operators repair by fixing the file and reloading. Cleared
+    /// only by the next accepted authoritative full reload (Applied or Unchanged).
+    /// Surfaced only in the authenticated `/health` detail (`config_rejected`) and
+    /// coarsely as a `"degraded"` status; `None` in modes without a reload
+    /// rejection signal.
     ///
     /// The stored flag is deliberately sticky across a later connectivity outage;
     /// the `/health` handler suppresses the detailed `config_rejected` field while
     /// `db_available=false` so it never advertises the writable repair path when
-    /// admin writes are actually blocked. See issue #2158 (DB/CP) and #2979 (file).
+    /// admin writes are actually blocked. See issues #2158 and #2997 (DB/CP) and
+    /// #2979 (file).
     pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
@@ -317,9 +405,15 @@ pub struct AdminState {
     /// scope snapshot/counters powering `/mesh/egress-scope` and `/health`.
     pub mesh_runtime_state: Option<crate::modes::mesh::runtime::MeshRuntimeState>,
     /// Admin HTTP header read timeout (seconds). 0 disables.
+    ///
+    /// Applies to the HTTP/1.1 header read (hyper's own timer) *and*, through
+    /// [`AdminConnActivity`], to the HTTP/2 and version-sniff windows that
+    /// timer cannot reach. See [`serve_admin_io`].
     pub admin_http_header_read_timeout_seconds: u64,
     /// Admin TLS handshake timeout (seconds). 0 disables.
     pub admin_tls_handshake_timeout_seconds: u64,
+    /// Slowloris bounds for admin request bodies and HTTP/2 streams.
+    pub admin_request_limits: AdminRequestLimits,
     /// Configured backend IP egress policy (`FERRUM_BACKEND_ALLOW_IPS`). Used to
     /// validate plugin endpoint IPs at the admin boundary in modes without a
     /// `ProxyState` (e.g. control plane), so CP-accepted configs match what data
@@ -657,6 +751,231 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     }
 }
 
+/// Per-connection request-progress accounting used by the admin header/idle
+/// watchdog in [`serve_admin_io`].
+///
+/// hyper's `header_read_timeout` covers exactly one window: an HTTP/1.1 message
+/// head that is taking too long to arrive. Two windows on the admin listener
+/// are outside it and were previously unbounded (issue #2404):
+///
+/// * the version-sniff read that `hyper_util`'s auto builder performs before it
+///   knows whether the peer speaks HTTP/1.1 or HTTP/2 — a peer that connects
+///   and sends nothing never reaches the HTTP/1 timer at all; and
+/// * every HTTP/2 stream, where an incomplete `HEADERS`/`CONTINUATION` block
+///   holds a stream slot indefinitely and one connection can multiplex many of
+///   them.
+///
+/// Rather than reach into either protocol, the watchdog observes the one signal
+/// both share: whether the connection is *delivering requests*. `dispatched`
+/// counts request heads handed to the service; `in_flight` counts requests
+/// whose response body has not yet been written out. A connection that neither
+/// delivers a new request nor holds one in flight for a whole deadline window
+/// is making no progress and is closed — the same outcome hyper's HTTP/1 timer
+/// already produces for an idle or half-written head.
+struct AdminConnActivity {
+    /// Monotonically increasing count of request heads handed to the service.
+    dispatched: AtomicU64,
+    /// Requests currently between service entry and response-body drop.
+    in_flight: AtomicU64,
+    /// Monotonic milliseconds of the last dispatch or completion.
+    last_progress_ms: AtomicU64,
+}
+
+/// Point-in-time read of [`AdminConnActivity`].
+#[derive(Clone, Copy)]
+struct AdminConnActivitySnapshot {
+    dispatched: u64,
+    in_flight: u64,
+}
+
+impl AdminConnActivity {
+    fn new() -> Self {
+        Self {
+            dispatched: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            last_progress_ms: AtomicU64::new(crate::socket_opts::monotonic_now_ms()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_progress_ms
+            .store(crate::socket_opts::monotonic_now_ms(), Ordering::SeqCst);
+    }
+
+    /// Read `in_flight` **before** `dispatched`. A guard drop stores in the
+    /// opposite order (touch, then decrement), so observing `in_flight == 0`
+    /// here guarantees the completing request's progress stamp is already
+    /// visible to the `idle_for` read that follows.
+    fn snapshot(&self) -> AdminConnActivitySnapshot {
+        let in_flight = self.in_flight.load(Ordering::SeqCst);
+        let dispatched = self.dispatched.load(Ordering::SeqCst);
+        AdminConnActivitySnapshot {
+            dispatched,
+            in_flight,
+        }
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last = self.last_progress_ms.load(Ordering::SeqCst);
+        Duration::from_millis(crate::socket_opts::monotonic_now_ms().saturating_sub(last))
+    }
+}
+
+/// Marks one admin request as in flight for the whole time it occupies the
+/// connection: from service entry until hyper drops the response body (i.e.
+/// until the response has been written). Holding it through the write keeps the
+/// watchdog from closing a connection that is streaming a large `GET /backup`
+/// out to a slow reader.
+struct AdminActivityGuard(Arc<AdminConnActivity>);
+
+impl AdminActivityGuard {
+    fn new(activity: Arc<AdminConnActivity>) -> Self {
+        activity.dispatched.fetch_add(1, Ordering::SeqCst);
+        activity.in_flight.fetch_add(1, Ordering::SeqCst);
+        activity.touch();
+        Self(activity)
+    }
+}
+
+impl Drop for AdminActivityGuard {
+    fn drop(&mut self) {
+        // Stamp before releasing: see `AdminConnActivity::snapshot`.
+        self.0.touch();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Admin response body that keeps its [`AdminActivityGuard`] alive until hyper
+/// has finished writing the response and dropped the body.
+struct GuardedAdminBody {
+    inner: Full<Bytes>,
+    _guard: AdminActivityGuard,
+}
+
+impl GuardedAdminBody {
+    fn new(inner: Full<Bytes>, guard: AdminActivityGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl http_body::Body for GuardedAdminBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        // `Full<Bytes>` is `Unpin`, so the projection is a plain reborrow.
+        http_body::Body::poll_frame(std::pin::Pin::new(&mut self.get_mut().inner), cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
+    }
+}
+
+/// Drive one accepted admin connection (plaintext or TLS-terminated) to
+/// completion under the configured slowloris bounds.
+///
+/// Both admin listeners share this so their protections cannot drift:
+///
+/// * HTTP/1.1 keeps hyper's native `header_read_timeout` — unchanged.
+/// * HTTP/2 advertises bounded `SETTINGS_MAX_CONCURRENT_STREAMS` and
+///   `SETTINGS_MAX_HEADER_LIST_SIZE`, so one connection can neither multiplex
+///   unbounded streams nor accumulate an unbounded header block per stream.
+/// * A connection-level watchdog closes connections that stop making request
+///   progress, covering the version-sniff and HTTP/2 header windows hyper's
+///   HTTP/1 timer cannot see.
+///
+/// Returning drops the connection future, which closes the transport and
+/// releases the accept-loop's [`conn_limit::AdminConnPermit`].
+async fn serve_admin_io<I>(io: I, state: AdminState, client_ip: std::net::IpAddr)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
+    let limits = state.admin_request_limits;
+
+    let activity = Arc::new(AdminConnActivity::new());
+    let service_activity = Arc::clone(&activity);
+    let svc = service_fn(move |req: Request<Incoming>| {
+        let state = state.clone();
+        let guard = AdminActivityGuard::new(Arc::clone(&service_activity));
+        async move {
+            let response = handle_admin_request(req, state, client_ip).await?;
+            let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
+            Ok::<_, hyper::Error>(guarded)
+        }
+    });
+
+    // Auto builder on both listeners: TLS negotiates h2/http1.1 via ALPN and
+    // plaintext accepts HTTP/1.1 or h2c prior knowledge. Serving one protocol
+    // set from one builder is what lets the bounds below be identical on both.
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    if header_read_timeout_seconds > 0 {
+        let mut http1 = builder.http1();
+        http1.timer(hyper_util::rt::TokioTimer::new());
+        http1.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
+    }
+    builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .max_concurrent_streams(limits.http2_max_concurrent_streams)
+        .max_header_list_size(limits.http2_max_header_list_size_bytes);
+
+    let conn = builder.serve_connection(io, svc);
+    tokio::pin!(conn);
+
+    if header_read_timeout_seconds == 0 {
+        if let Err(e) = conn.await {
+            // Debug, not error: a slowloris flood would otherwise turn every
+            // aborted connection into an error-level log line.
+            debug!(error = %e, "Admin HTTP connection error");
+        }
+        return;
+    }
+
+    let deadline = Duration::from_secs(header_read_timeout_seconds);
+    let mut previous = activity.snapshot();
+    loop {
+        tokio::select! {
+            result = &mut conn => {
+                if let Err(e) = result {
+                    debug!(error = %e, "Admin HTTP connection error");
+                }
+                return;
+            }
+            _ = tokio::time::sleep(deadline) => {
+                let current = activity.snapshot();
+                // No request in flight, none delivered during the window just
+                // elapsed, and nothing has touched the connection for a full
+                // deadline: the peer is holding it open without making
+                // progress. Returning drops `conn` and closes the transport.
+                if current.in_flight == 0
+                    && current.dispatched == previous.dispatched
+                    && activity.idle_for() >= deadline
+                {
+                    debug!(
+                        client_ip = %client_ip,
+                        "Admin connection closed: no request progress within the deadline"
+                    );
+                    return;
+                }
+                previous = current;
+            }
+        }
+    }
+}
+
 /// Handle TLS connections for Admin API.
 async fn handle_admin_tls_connection(
     stream: tokio::net::TcpStream,
@@ -668,7 +987,6 @@ async fn handle_admin_tls_connection(
 
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
-    let header_read_timeout = state.admin_http_header_read_timeout_seconds;
     let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,
         stream,
@@ -679,33 +997,12 @@ async fn handle_admin_tls_connection(
     .await?;
     info!("Admin TLS connection established from {}", remote_addr.ip());
 
-    // Convert TLS stream to TokioIo for hyper
-    let io = hyper_util::rt::TokioIo::new(tls_stream);
-
-    // Use the same HTTP service function
-    let client_ip = remote_addr.ip();
-    let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-        let state = state.clone();
-        async move { handle_admin_request(req, state, client_ip).await }
-    });
-
-    // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
-    // The TLS config advertises both h2 and http/1.1, so clients can negotiate
-    // either protocol.
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    // This header timer only applies to the HTTP/1 admin path; this builder
-    // does not expose an equivalent HTTP/2 admin header deadline.
-    if header_read_timeout > 0 {
-        let mut http1 = builder.http1();
-        http1.timer(hyper_util::rt::TokioTimer::new());
-        http1.header_read_timeout(Duration::from_secs(header_read_timeout));
-    }
-    let conn = builder.serve_connection(io, svc);
-
-    if let Err(e) = conn.await {
-        error!("Admin HTTP connection error over TLS: {}", e);
-    }
+    serve_admin_io(
+        hyper_util::rt::TokioIo::new(tls_stream),
+        state,
+        remote_addr.ip(),
+    )
+    .await;
 
     Ok(())
 }
@@ -716,23 +1013,7 @@ async fn handle_admin_connection(
     remote_addr: SocketAddr,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let io = TokioIo::new(stream);
-    let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
-    let client_ip = remote_addr.ip();
-    let svc = service_fn(move |req: Request<Incoming>| {
-        let state = state.clone();
-        async move { handle_admin_request(req, state, client_ip).await }
-    });
-
-    let mut builder = http1::Builder::new();
-    if header_read_timeout_seconds > 0 {
-        builder.timer(hyper_util::rt::TokioTimer::new());
-        builder.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
-    }
-
-    if let Err(e) = builder.serve_connection(io, svc).await {
-        error!("Admin HTTP connection error: {}", e);
-    }
+    serve_admin_io(TokioIo::new(stream), state, remote_addr.ip()).await;
 
     Ok(())
 }
@@ -997,6 +1278,73 @@ fn paginated_get_list_route_role(method: &Method, segments: &[&str]) -> Option<O
         | ["admin", "tls", "crls"]
         | ["admin", "tls", "ocsp-responses"]
         | ["admin", "tls", "jwks"] => Some(Some(AdminRole::Operator)),
+        _ => None,
+    }
+}
+
+/// The admin routes whose handler actually reads the shared request body,
+/// paired with the role their route arm requires before that body is read.
+///
+/// `Some(None)` means the arm has no role gate; `Some(Some(role))` mirrors the
+/// `require_admin_role` call the arm makes. `None` means the route does not
+/// consume a body — including every unknown path, every method not routed on a
+/// known path, and every read/delete route.
+///
+/// This is the admission gate for body collection (issue #2404). A request that
+/// is not going to have its body *used* must never have it buffered: otherwise
+/// an unknown path, a wrong method, or a caller whose role the route would
+/// reject can still hold a collecting task and its buffer open for as long as
+/// it likes, and over HTTP/2 can do so on many streams of one connection. The
+/// in-arm `require_admin_role` gates stay authoritative and simply re-run
+/// idempotently; this table only decides whether the body is read at all.
+///
+/// Keep it in sync with the `&body_bytes` call sites in the route match below.
+fn body_consuming_route_role(method: &Method, segments: &[&str]) -> Option<Option<AdminRole>> {
+    // Every admin route that reads the shared body is a POST or a PUT, so any
+    // other method — including a wrong method on a known path — is refused a
+    // body read outright.
+    let is_post = method == Method::POST;
+    let is_put = method == Method::PUT;
+    if !is_post && !is_put {
+        return None;
+    }
+    // The TLS management surface keeps one source of truth for its roles; its
+    // body-carrying members are enumerated below and take the role from
+    // `tls_route_required_role`, falling back to the strictest role if the two
+    // tables ever drift.
+    let tls_role = || {
+        Some(Some(
+            tls_route_required_role(method, segments).unwrap_or(AdminRole::Admin),
+        ))
+    };
+    match segments {
+        ["proxies"] if is_post => Some(Some(AdminRole::Operator)),
+        ["proxies", _] if is_put => Some(Some(AdminRole::Operator)),
+        ["consumers"] if is_post => Some(Some(AdminRole::Admin)),
+        ["consumers", _] if is_put => Some(Some(AdminRole::Admin)),
+        ["consumers", _, "credentials", _] => Some(Some(AdminRole::Admin)),
+        ["plugins", "config"] if is_post => Some(Some(AdminRole::Operator)),
+        ["plugins", "config", _] if is_put => Some(Some(AdminRole::Operator)),
+        ["upstreams"] if is_post => Some(Some(AdminRole::Operator)),
+        ["upstreams", _] if is_put => Some(Some(AdminRole::Operator)),
+        ["batch"] | ["restore"] if is_post => Some(Some(AdminRole::Admin)),
+        ["mesh", "egress-scope", "test"] if is_post => Some(Some(AdminRole::Operator)),
+        ["admin", "tls", "acme", "certificates"] if is_post => tls_role(),
+        ["admin", "tls", "acme", "certificates", _] if is_put => tls_role(),
+        ["admin", "tls", "acme", "renew", _] if is_post => tls_role(),
+        ["admin", "tls", "acme", "orders"] if is_post => tls_role(),
+        ["admin", "tls", "acme", "orders", _, "finalize"] if is_post => tls_role(),
+        ["admin", "tls", "certificates"] if is_post => tls_role(),
+        ["admin", "tls", "certificates", _] if is_put => tls_role(),
+        ["admin", "tls", "ca-bundles"] if is_post => tls_role(),
+        ["admin", "tls", "ca-bundles", _] if is_put => tls_role(),
+        ["admin", "tls", "crls"] if is_post => tls_role(),
+        ["admin", "tls", "crls", _] if is_put => tls_role(),
+        ["admin", "tls", "ocsp-responses"] if is_post => tls_role(),
+        ["admin", "tls", "ocsp-responses", _] if is_put => tls_role(),
+        ["admin", "tls", "jwks"] if is_post => tls_role(),
+        ["admin", "tls", "jwks", _] if is_put => tls_role(),
+        ["admin", "tls", "validate"] if is_post => tls_role(),
         _ => None,
     }
 }
@@ -1397,13 +1745,14 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Config-rejection signal (issues #2158 / #2979): the latest full config
-        // load was rejected by the runtime-config validation contract (DB/CP) or
-        // a file-mode SIGHUP candidate failed read/parse/validation/apply while
-        // the previous generation kept serving. In DB/CP, admin writes remain
-        // ENABLED (they are the in-band repair path — `db_available` is left
-        // `true`), so surface the condition as a coarse `"degraded"` status plus
-        // a `config_rejected` detail flag. File mode has `db_available: None`
+        // Config-rejection signal (issues #2158 / #2997 / #2979): the latest
+        // full config load was rejected by the runtime-config validation
+        // contract or by typed SQL row decoding (DB/CP), or a file-mode SIGHUP
+        // candidate failed read/parse/validation/apply, while the previous
+        // generation kept serving. In DB/CP, admin writes remain ENABLED (they
+        // are the in-band repair path — `db_available` is left `true`), so
+        // surface the condition as a coarse `"degraded"` status plus a
+        // `config_rejected` detail flag. File mode has `db_available: None`
         // (treated as reachable below) and stays read-only; repair is a fixed
         // file + reload. The boolean detail is authenticated-only: it is added
         // to `health_status`, which the minimal unauthenticated body below does
@@ -1788,14 +2137,6 @@ pub async fn handle_admin_request(
         _ => {}
     }
 
-    if method == Method::POST
-        && matches!(segments_peek.as_slice(), ["restore"] | ["batch"])
-        && let Some(resp) = require_admin_role(&auth, AdminRole::Admin)
-    {
-        drop(req.into_body());
-        return Ok(resp);
-    }
-
     // Pagination lives in the request line, not the body, so validate it for the
     // GET list routes that consume it BEFORE the shared body read below. Without
     // this, `GET /proxies?limit=abc` carrying an oversized (and entirely unused)
@@ -1834,34 +2175,70 @@ pub async fn handle_admin_request(
             None => None,
         };
 
-    // Read body with size limit.
+    // Read the body only for routes that actually consume it, and only after
+    // the role their arm requires (issue #2404). Unknown paths, wrong methods
+    // on known paths, read/delete routes, and callers the route would reject
+    // with `403` all fall through with the receiver dropped, so hyper discards
+    // any remaining bytes and resets/closes rather than buffering them here.
+    //
     // /restore gets a configurable limit (default 100 MiB) for large-scale
-    // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
-    // all other endpoints use the standard 1 MiB limit.
+    // backups (30K+ proxies / 90K+ plugins can reach ~80 MB); all other
+    // endpoints use the standard 1 MiB limit. The size cap is paired with an
+    // absolute deadline so a body that never finishes arriving cannot pin the
+    // task, its buffer, and the connection or HTTP/2 stream indefinitely.
     let restore_max_mib: usize = if path == "/restore" {
         state.admin_restore_max_body_size_mib
     } else {
         1
     };
-    let max_body_size = restore_max_mib * 1024 * 1024;
-    let body_bytes = match Limited::new(req.into_body(), max_body_size).collect().await {
-        Ok(collected) => collected.to_bytes().to_vec(),
-        Err(e) => {
-            if is_length_limit_error(e.as_ref()) {
-                return Ok(json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),
-                ));
+    let body_bytes = match body_consuming_route_role(&method, segments_peek.as_slice()) {
+        Some(required_role) => {
+            if let Some(role) = required_role
+                && let Some(resp) = require_admin_role(&auth, role)
+            {
+                drop(req.into_body());
+                return Ok(resp);
             }
-            warn!(
-                path = %path,
-                error = %e,
-                "Admin request body collection failed"
-            );
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "Failed to read request body"}),
-            ));
+            let max_bytes = restore_max_mib * 1024 * 1024;
+            // Scaled by this route's size cap, so `/restore`'s 100 MiB body is
+            // not held to the same wall clock as a 1 MiB one.
+            let deadline = state.admin_request_limits.body_read_timeout_for(max_bytes);
+            let collected = collect_body_with_limits(req.into_body(), max_bytes, deadline).await;
+            match collected {
+                Ok(bytes) => bytes,
+                Err(BodyCollectError::TooLarge) => {
+                    return Ok(json_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),
+                    ));
+                }
+                Err(BodyCollectError::Timeout) => {
+                    // Report the deadline that actually fired, not the
+                    // unscaled 1 MiB budget.
+                    let seconds = deadline.map(|d| d.as_secs()).unwrap_or_default();
+                    warn!(
+                        path = %path,
+                        timeout_seconds = seconds,
+                        "Admin request body was not fully received before the deadline"
+                    );
+                    return Ok(body_timeout_response(seconds));
+                }
+                Err(BodyCollectError::Transport(e)) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "Admin request body collection failed"
+                    );
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": "Failed to read request body"}),
+                    ));
+                }
+            }
+        }
+        None => {
+            drop(req.into_body());
+            Vec::new()
         }
     };
 
@@ -2050,7 +2427,15 @@ pub async fn handle_admin_request(
 
         // Batch create
         (Method::POST, ["batch"]) => {
-            // Role check happens before body buffering (see pre-buffer gate above).
+            // The pre-body gate in `body_consuming_route_role` already applied
+            // this role so an unauthorized caller's body is never buffered.
+            // Re-run it here anyway: `handle_batch_create` has no role check of
+            // its own, so without this arm the admission table would be the
+            // *sole* authority on a bulk-write route, and a future edit to that
+            // table would silently open it. Idempotent — matches every other arm.
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             handle_batch_create(&state, &auth, &body_bytes, &namespace).await
         }
 
@@ -2063,7 +2448,14 @@ pub async fn handle_admin_request(
             handle_backup(&state, query.as_deref(), &namespace).await
         }
         (Method::POST, ["restore"]) => {
-            // Role check happens before body buffering (see pre-buffer gate above).
+            // As with `/batch`: the pre-body gate already ran, and this replays
+            // it because `handle_restore` has no role check of its own. Restore
+            // replaces all configuration in the namespace, so it must not be
+            // the one route whose authorization lives only in the body
+            // admission table.
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Admin) {
+                return Ok(resp);
+            }
             handle_restore(&state, &auth, &body_bytes, query.as_deref(), &namespace).await
         }
 

@@ -10440,8 +10440,11 @@ fn start_mesh_admin_listeners(
         listener_failures: serving_listener_failures,
     } = serving_signals;
     let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
+        crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env_config.admin_allowed_cidrs,
+            "FERRUM_ADMIN_ALLOWED_CIDRS",
+        )
+        .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
     );
     let metrics_auth = Arc::new(
         crate::admin::MetricsAuthPolicy::from_env(env_config)
@@ -10492,6 +10495,7 @@ fn start_mesh_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: Some(mesh_state),
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 

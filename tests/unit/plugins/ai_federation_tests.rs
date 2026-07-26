@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test;
 use ferrum_edge::plugins::ai_federation;
 use ferrum_edge::plugins::ai_federation::test_helpers;
 use ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics;
@@ -2832,6 +2833,9 @@ fn post_json_ctx_with_raw_body(body: String) -> RequestContext {
         "POST".to_string(),
         "/v1/chat".to_string(),
     );
+    // Stand in for the protocol entry path's plugin-cache presentation digest
+    // so dedup can retain a finalized representation under a provable policy.
+    set_response_presentation_policy_digest_for_test(&mut ctx, Some([0x5a; 32]));
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     ctx.request_body_bytes = Some(Bytes::from(body.clone()));
@@ -2845,6 +2849,7 @@ fn post_json_ctx_without_body() -> RequestContext {
         "POST".to_string(),
         "/v1/chat".to_string(),
     );
+    set_response_presentation_policy_digest_for_test(&mut ctx, Some([0x5a; 32]));
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     ctx
