@@ -538,9 +538,10 @@ impl DeliveryLifecycle {
             // it; if `cancel_remaining` won the race it already released.
             if self.tasks.remove(&task_id).is_none() {
                 permit.disarm();
+            } else {
+                self.counters.record_cancelled(kind);
             }
             self.tasks_changed.notify_one();
-            self.counters.record_cancelled(kind);
             return false;
         }
         // Successful handoff: registry/`TaskCompletion` owns release.
