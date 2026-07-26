@@ -456,6 +456,11 @@ fields are never logged.
   (floor 1 MiB). A planted large raw file or high-ratio archive inside the
   managed tree is quarantined as `.corrupt` without first being read or expanded
   without limit inside the billing process.
+- `spool.meta.json` is bounded separately at 64 KiB. It is the one managed file
+  read *before* ownership is established — on every prepare and every replay
+  listing — so it is reachable without first deriving this owner's tag. An
+  oversized manifest fails the ownership check closed (`spool.available=false`,
+  `chargeback_sink_spool_prepare_failures_total`) and mutates nothing.
 - Permanently rejected rows (and single-row 413 failures) are discarded only
   after one deterministic sibling `.rejected.meta` JSON document has been
   durably written for the source file. The document contains the aggregate

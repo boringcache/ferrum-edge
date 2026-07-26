@@ -3352,6 +3352,36 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
 }
 
 #[test]
+fn oversized_namespace_metadata_fails_closed_without_mutating_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let record = spool.write_events(&[sample_event("evt-owned")]).unwrap();
+
+    // A same-UID actor can inflate the manifest without knowing this owner's
+    // tag, because it is read before ownership is established. The bounded read
+    // must reject it rather than allocating it inside the billing process.
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let raw = fs::read_to_string(&meta_path).unwrap();
+    let mut planted = raw.as_bytes().to_vec();
+    planted.resize(256 * 1024, b' ');
+    fs::write(&meta_path, &planted).unwrap();
+
+    let err = spool
+        .list_replayable_spool_files_for_tests()
+        .expect_err("an oversized ownership manifest must fail closed");
+    assert!(err.contains("artifact bound"), "unexpected error: {err}");
+    assert!(
+        record.exists(),
+        "a rejected manifest must never delete billing records"
+    );
+
+    fs::write(&meta_path, raw).unwrap();
+    let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
+    assert_eq!(replayable, vec![record]);
+}
+
+#[test]
 fn foreign_owner_tagged_records_are_never_replayed_or_evicted() {
     let temp = tempfile::tempdir().unwrap();
     let event = sample_event("evt-own");
@@ -3454,11 +3484,11 @@ fn configured_spool_directory_symlink_is_rejected_before_write_probe() {
     let linked_spool = parent.path().join("spool-link");
     std::os::unix::fs::symlink(outside.path(), &linked_spool).unwrap();
 
-    let error =
-        match SpoolManager::for_tests(spool_settings(&linked_spool, 1024 * 1024), "node-a") {
-            Err(error) => error,
-            Ok(_) => panic!("a symlinked spool root must fail before its write probe"),
-        };
+    let error = match SpoolManager::for_tests(spool_settings(&linked_spool, 1024 * 1024), "node-a")
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a symlinked spool root must fail before its write probe"),
+    };
     assert!(
         error.contains("symlinked spool path"),
         "unexpected error: {error}"
@@ -3668,7 +3698,9 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
         !peer_tmp.exists(),
         "an expired peer-process temp is reconciled at first prepare"
     );
-    let written = reclaiming.write_events(std::slice::from_ref(&event)).unwrap();
+    let written = reclaiming
+        .write_events(std::slice::from_ref(&event))
+        .unwrap();
     assert!(written.exists());
 }
 

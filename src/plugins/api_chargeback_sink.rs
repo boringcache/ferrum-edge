@@ -130,6 +130,14 @@ const SPOOL_MIN_DECOMPRESSED_BYTES: u64 = 1024 * 1024;
 /// the ratio check: a ratio alone still permits a multi-gigabyte allocation
 /// when a same-UID attacker plants a large archive in the managed tree.
 const SPOOL_MAX_ARTIFACT_BYTES: u64 = HARD_MAX_BUFFER_MAX_BYTES as u64;
+/// Bound for the ownership manifest (`spool.meta.json`).
+///
+/// The manifest is a small fixed-shape record, but it is read *before* this
+/// owner's identity is established and on every prepare and replay listing, so
+/// it is the one managed file a same-UID actor can inflate without first
+/// deriving the owner tag. 64 KiB is orders of magnitude above the real record
+/// and keeps a planted manifest from allocating inside the billing process.
+const SPOOL_MAX_META_BYTES: u64 = 64 * 1024;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -5359,12 +5367,17 @@ impl SpoolManager {
             ));
         }
         reject_symlinked_spool_path(&path)?;
-        let bytes = fs::read(&path).map_err(|error| {
+        // The manifest is read before ownership is established, on every prepare
+        // and every replay listing, so it is the one managed file a same-UID
+        // actor can grow without first knowing this owner's tag. Bound it like
+        // any other spool artifact instead of reading it whole.
+        let file = File::open(&path).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: failed to read spool namespace metadata '{}': {error}",
                 path.display()
             )
         })?;
+        let bytes = read_spool_bytes_bounded(file, SPOOL_MAX_META_BYTES, &path)?;
         let meta: SpoolNamespaceMeta = serde_json::from_slice(&bytes).map_err(|error| {
             format!(
                 "{PLUGIN_NAME}: invalid spool namespace metadata '{}': {error}",
@@ -6627,11 +6640,7 @@ fn spool_decompression_limit(encoded_len: u64) -> u64 {
         .min(SPOOL_MAX_ARTIFACT_BYTES)
 }
 
-fn read_spool_bytes_bounded(
-    reader: impl Read,
-    limit: u64,
-    path: &Path,
-) -> Result<Vec<u8>, String> {
+fn read_spool_bytes_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::new();
     reader
         .take(limit.saturating_add(1))
@@ -6651,11 +6660,7 @@ fn read_spool_bytes_bounded(
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(
-    reader: impl Read,
-    limit: u64,
-    path: &Path,
-) -> Result<Vec<u8>, String> {
+fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
     let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
