@@ -253,4 +253,27 @@ fn mesh_md_proxy_config_transport_matches_carrier_semantics() {
         MESH_MD.contains("All ten translated kinds are covered"),
         "docs/mesh.md Istio CRD Status must keep the ten-kind claim"
     );
+    assert!(
+        MESH_MD.contains("ten Istio CRDs"),
+        "docs/mesh.md Migrating from Istio summary must count ten watched CRDs"
+    );
+    assert!(
+        MESH_MD.contains("The ten translated CRDs"),
+        "docs/mesh.md Migrating from Istio table must list ten translated CRDs"
+    );
+    assert!(
+        MESH_MD.contains("`ProxyConfig`"),
+        "docs/mesh.md Migrating from Istio summary must include ProxyConfig"
+    );
+    let stale_nine_kind = [
+        "nine Istio CRDs",
+        "The nine translated CRDs",
+        "all nine watched/translated Istio kinds",
+    ];
+    for phrase in stale_nine_kind {
+        assert!(
+            !MESH_MD.contains(phrase),
+            "docs/mesh.md must not retain stale nine-kind claim: {phrase}"
+        );
+    }
 }
