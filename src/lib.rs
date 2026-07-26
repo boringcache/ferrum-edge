@@ -102,8 +102,23 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
-    /// TCP SO_REUSEPORT accept-loop peer class (primary vs extra).
-    pub use crate::proxy::tcp_proxy::TcpAcceptLoopClass;
+    /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TcpAcceptLoopClass {
+        Primary,
+        Extra { index: usize },
+    }
+
+    impl TcpAcceptLoopClass {
+        fn into_production(self) -> crate::proxy::tcp_proxy::TcpAcceptLoopClass {
+            match self {
+                Self::Primary => crate::proxy::tcp_proxy::TcpAcceptLoopClass::Primary,
+                Self::Extra { index } => {
+                    crate::proxy::tcp_proxy::TcpAcceptLoopClass::Extra { index }
+                }
+            }
+        }
+    }
 
     /// Supervise TCP SO_REUSEPORT accept-loop peers the same way production does.
     pub async fn supervise_tcp_accept_loop_peers_for_test(
@@ -113,6 +128,10 @@ pub mod _test_support {
         )>,
         cancel_siblings: impl FnOnce(),
     ) -> Result<(), anyhow::Error> {
+        let peers = peers
+            .into_iter()
+            .map(|(class, handle)| (class.into_production(), handle))
+            .collect();
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
     }
 
