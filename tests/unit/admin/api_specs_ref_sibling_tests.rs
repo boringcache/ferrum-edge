@@ -105,7 +105,10 @@ fn annotation_only_ref_siblings_stay_flat() {
     assert_eq!(schema["type"], "string");
     assert_eq!(schema["description"], "override");
     assert_eq!(schema["x-owner"], "team");
-    assert!(schema.get("allOf").is_none(), "unexpected wrapper: {schema}");
+    assert!(
+        schema.get("allOf").is_none(),
+        "unexpected wrapper: {schema}"
+    );
 }
 
 #[test]
