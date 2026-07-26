@@ -34,12 +34,15 @@ paths:
   enabled instance to agree on the process-global render/cleanup/budget
   tunables (`max_entries` / `max_retained_bytes` included). The registry admits
   at most `max_entries` billing identities; refused identities fold into the
-  fixed-cardinality `__cardinality_overflow__` row rather than being dropped.
+  fixed-cardinality internal overflow row
+  (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
+  rather than being dropped. That sentinel is in the digest-form identity
+  class, so a real principal can never share its registry key.
 - Billing identities are never prefix-truncated. External identity claims above
   512 bytes are rejected at the authentication boundary
   (`commit_authentication_attempt`); anything still needing a bound inside
   chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
-  digest of the complete value).
+  digest of the complete value; marker-bearing values always digested).
 - Exception: `request_deduplication` and `mcp_gateway` may not be effective on
   the same proxy. A dedup replay is a finalized representation served before
   `mcp_gateway` runs, and MCP's public-URI rewrite comes from live upstream

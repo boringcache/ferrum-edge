@@ -62,7 +62,10 @@ pub fn bounded_display(value: &str, max_len: usize) -> &str {
 /// SHA-256 collision. A within-bound identity that itself contains the marker is
 /// therefore *also* replaced by its digest form — otherwise an actor who knows a
 /// victim's long identity could present its representation as a short identity
-/// and be billed into the victim's row.
+/// and be billed into the victim's row. Internal registry sentinels that need to
+/// stay unreachable from real principals (for example the api_chargeback
+/// cardinality-overflow row) must likewise live in the digest-form class, with a
+/// non-hex suffix so they cannot equal a genuine digest representation either.
 ///
 /// `max_len` below `BILLING_IDENTITY_DIGEST_SUFFIX_BYTES` leaves no room for a
 /// prefix; the representation is then the leading bytes of the digest alone.

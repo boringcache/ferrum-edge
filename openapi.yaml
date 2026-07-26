@@ -21032,8 +21032,11 @@ components:
         distinct billing identities and at most `max_retained_bytes` of state.
         New identities beyond either ceiling are not dropped — their charges are
         folded into a fixed-cardinality aggregate row whose `consumer` label is
-        the reserved value `__cardinality_overflow__`, preserving billable
-        totals while losing only per-identity attribution.
+        the internal sentinel
+        `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
+        preserving billable totals while losing only per-identity attribution.
+        That sentinel lives in the digest-form billing-identity class, so a real
+        authenticated or configured identity can never share its registry key.
         Billing identities are never prefix-truncated: an external identity
         claim above 512 bytes is rejected at authentication, and any remaining
         oversized value is represented as a prefix plus a domain-separated
@@ -21155,8 +21158,9 @@ components:
           description: |
             Hard ceiling on distinct billing identities retained by the shared
             /charges registry. Charges for a new identity beyond this ceiling
-            are folded into the fixed-cardinality `__cardinality_overflow__`
-            aggregate row instead of being dropped. 0 is rejected — there is no
+            are folded into the fixed-cardinality internal overflow aggregate
+            row (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
+            instead of being dropped. 0 is rejected — there is no
             unlimited mode. Process-global: every enabled api_chargeback
             instance must use the same value.
         max_retained_bytes:
@@ -21714,8 +21718,10 @@ components:
             overflow_consumer_id:
               type: string
               description: |
-                Reserved `consumer` value carrying aggregated overflow charges.
-              example: __cardinality_overflow__
+                Internal `consumer` value carrying aggregated overflow charges.
+                Lives in the digest-form billing-identity class so a real
+                principal can never share this registry key.
+              example: "__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1"
         consumers:
           type: object
           additionalProperties:

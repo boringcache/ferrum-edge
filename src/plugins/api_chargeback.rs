@@ -81,13 +81,22 @@ const MAX_REGISTRY_IDENTITY_BYTES: usize = 512;
 /// Consumer label used for the fixed-cardinality aggregate row that absorbs
 /// charges once the identity budget is exhausted.
 ///
-/// Chosen so it cannot collide with a real principal: Consumer usernames and
-/// identity claims that reach the registry are non-empty and this value is
-/// reserved. Charges folded here keep their proxy, status, protocol family,
-/// currency, namespace, and price dimensions, so billable totals survive
-/// admission refusal — only the per-identity attribution is lost, and the
-/// refusal is counted and exported.
-pub const OVERFLOW_CONSUMER_SENTINEL: &str = "__cardinality_overflow__";
+/// This is an *internal* registry representation, not a reserved username.
+/// It lives in the digest-form class used by
+/// [`bounded_billing_identity`](crate::plugins::chargeback::bounded_billing_identity)
+/// (it contains the `~sha256:` marker), so that helper never returns it
+/// verbatim for an external identity claim or operator-configured Consumer
+/// username. The suffix after the marker is deliberately *not* a 64-hex
+/// digest, so a genuine digest-form identity cannot equal this sentinel
+/// either. The human-looking label `__cardinality_overflow__` is therefore an
+/// ordinary principal that stays on its own row.
+///
+/// Charges folded here keep their proxy, status, protocol family, currency,
+/// namespace, and price dimensions, so billable totals survive admission
+/// refusal — only the per-identity attribution is lost, and the refusal is
+/// counted and exported.
+pub const OVERFLOW_CONSUMER_SENTINEL: &str =
+    "__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1";
 
 /// Default maximum number of retained registry entries.
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
@@ -1067,8 +1076,16 @@ impl ChargebackRegistry {
         // Bound the billing identity collision-resistantly: within the bound
         // this borrows and allocates nothing, and an oversized identity keeps a
         // digest of its complete value so two principals sharing a prefix stay
-        // distinct entries (GHSA-m28c-f3v5-26qg).
+        // distinct entries (GHSA-m28c-f3v5-26qg). Marker-bearing values —
+        // including any identity equal to [`OVERFLOW_CONSUMER_SENTINEL`] — are
+        // always digested, so a real principal can never share the internal
+        // overflow row's consumer label.
         let consumer = bounded_billing_identity(consumer, MAX_REGISTRY_IDENTITY_BYTES);
+        debug_assert_ne!(
+            consumer.as_ref(),
+            OVERFLOW_CONSUMER_SENTINEL,
+            "bounded billing identity must never equal the internal overflow sentinel"
+        );
         let proxy_id = bounded_billing_identity(proxy_id, MAX_REGISTRY_IDENTITY_BYTES);
         let proxy_name = bounded_display(proxy_name, MAX_REGISTRY_IDENTITY_BYTES);
         self.record_admitted(

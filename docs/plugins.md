@@ -1462,9 +1462,16 @@ configuration. The shared registry therefore admits at most `max_entries`
 distinct identities and at most `max_retained_bytes` of retained state. Once
 either ceiling is reached, further *new* identities are not dropped: their
 charges are folded into a fixed-cardinality aggregate row whose `consumer` label
-is the reserved value `__cardinality_overflow__`, keeping every other dimension
-(proxy, billable status, protocol family, currency, namespace, prices) intact so
-invoice totals still reconcile — only per-identity attribution is lost.
+is the internal sentinel
+`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
+keeping every other dimension (proxy, billable status, protocol family,
+currency, namespace, prices) intact so invoice totals still reconcile — only
+per-identity attribution is lost. That sentinel lives in the digest-form
+billing-identity class (`~sha256:` marker, non-hex suffix), so
+`bounded_billing_identity` can never return it for a real authenticated claim
+or operator-configured Consumer username — including one equal to the
+human-looking label `__cardinality_overflow__` or to the sentinel string
+itself.
 Already-admitted identities keep accumulating normally and capacity is recovered
 by ordinary `stale_entry_ttl_seconds` eviction. Admission pressure is exported
 as fixed-cardinality, identity-free series
@@ -1494,7 +1501,10 @@ Identity values that still need bounding inside the registry (for example a very
 long operator-configured Consumer username) keep a readable prefix plus a
 domain-separated SHA-256 digest of the complete value. A plain prefix is never
 used as a registry key, so two identities sharing a prefix can never collapse
-into one billed principal.
+into one billed principal. The overflow aggregate row uses a distinct internal
+sentinel in that same digest-form class, so neither an ordinary identity equal
+to `__cardinality_overflow__` nor one equal to the sentinel string itself can
+share the overflow row's key.
 
 **`proxy_name` contract:** exported `proxy_name` is live display metadata for the
 stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
@@ -1555,7 +1565,7 @@ are HTTP/gRPC only).
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
-| `max_entries` | Integer | `100000` | Hard ceiling on distinct billing identities retained by the shared registry. New identities beyond it are folded into the `__cardinality_overflow__` aggregate row instead of being dropped. Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
+| `max_entries` | Integer | `100000` | Hard ceiling on distinct billing identities retained by the shared registry. New identities beyond it are folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped. Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
 | `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering identity rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in

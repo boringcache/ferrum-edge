@@ -3515,6 +3515,155 @@ fn test_identity_budget_caps_entries_without_losing_charges() {
     assert_eq!(overflow, 48);
 }
 
+/// An ordinary/external identity equal to the old human-looking overflow label
+/// (or to the current internal sentinel string) must never share the aggregate
+/// overflow row. The sentinel lives in the digest-form class, so
+/// `bounded_billing_identity` remaps those values onto distinct principals.
+#[test]
+fn test_ordinary_identity_equal_to_overflow_label_does_not_collide() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+
+    const OLD_RESERVED_LOOKING: &str = "__cardinality_overflow__";
+    record_identity(&registry, OLD_RESERVED_LOOKING);
+    record_identity(&registry, OVERFLOW_CONSUMER_SENTINEL);
+
+    assert_eq!(registry.entries.len(), 2);
+    let consumers: Vec<String> = registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().consumer.to_string())
+        .collect();
+    assert!(
+        consumers.iter().any(|c| c == OLD_RESERVED_LOOKING),
+        "old human-looking label must remain a verbatim ordinary identity"
+    );
+    assert!(
+        consumers
+            .iter()
+            .any(|c| c != OLD_RESERVED_LOOKING && c != OVERFLOW_CONSUMER_SENTINEL),
+        "sentinel-equal identity must be digested away from the internal overflow row"
+    );
+    assert!(
+        consumers
+            .iter()
+            .all(|c| c.as_str() != OVERFLOW_CONSUMER_SENTINEL),
+        "no real principal may land on the internal overflow sentinel"
+    );
+
+    // Saturate the remaining identity slots and force overflow aggregation.
+    record_identity(&registry, "user-fill");
+    // max_entries=2: OLD + digested-sentinel already occupy both slots, so
+    // user-fill and further identities fold into overflow.
+    for index in 0..5 {
+        record_identity(&registry, &format!("overflow-extra-{index}"));
+    }
+
+    let overflow_entry = registry
+        .entries
+        .iter()
+        .find(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+        .expect("overflow aggregate row must exist after budget exhaustion");
+    let overflow_calls = overflow_entry
+        .value()
+        .call_count
+        .load(Ordering::Relaxed);
+    assert!(
+        overflow_calls >= 5,
+        "overflow row must retain folded charges, got {overflow_calls}"
+    );
+
+    let old_label_calls: u64 = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() == OLD_RESERVED_LOOKING)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(
+        old_label_calls, 1,
+        "ordinary identity equal to the old label must keep its own unmerged charge"
+    );
+
+    // Identity rows stay at the budget; overflow is fixed-cardinality (one row
+    // for these matching non-identity dimensions).
+    assert_eq!(registry.reserved_entries_for_tests(), 2);
+    assert_eq!(
+        registry
+            .entries
+            .iter()
+            .filter(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+            .count(),
+        1
+    );
+}
+
+/// An operator-configured Consumer username equal to the old reserved-looking
+/// label or the current internal sentinel must also stay off the overflow row.
+/// Both paths enter the registry through the same billing-identity bound.
+#[test]
+fn test_configured_consumer_username_equal_to_overflow_label_does_not_collide() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 4, TEST_MAX_BYTES);
+
+    const OLD_RESERVED_LOOKING: &str = "__cardinality_overflow__";
+    // Simulate Consumer.username values that look like (or equal) the overflow
+    // representation reaching record_http unchanged.
+    record_identity(&registry, OLD_RESERVED_LOOKING);
+    record_identity(&registry, OVERFLOW_CONSUMER_SENTINEL);
+    record_identity(&registry, "legitimate-consumer");
+
+    let by_consumer: HashMap<String, u64> = registry
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.value().consumer.to_string(),
+                entry.value().call_count.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+
+    assert_eq!(by_consumer.get(OLD_RESERVED_LOOKING), Some(&1));
+    assert_eq!(by_consumer.get("legitimate-consumer"), Some(&1));
+    assert!(
+        !by_consumer.contains_key(OVERFLOW_CONSUMER_SENTINEL),
+        "configured username equal to the sentinel must not create the overflow row"
+    );
+    assert_eq!(by_consumer.len(), 3);
+
+    // Force overflow and confirm the username rows stay separate while overflow
+    // absorbs only the refused identities.
+    registry.configure(5, 3600, 500, 3, TEST_MAX_BYTES);
+    for index in 0..10 {
+        record_identity(&registry, &format!("extra-{index}"));
+    }
+    assert_eq!(
+        by_consumer_calls(&registry, OLD_RESERVED_LOOKING),
+        1,
+        "configured username must not merge with overflow charges"
+    );
+    assert_eq!(by_consumer_calls(&registry, "legitimate-consumer"), 1);
+    assert!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL) >= 10);
+    assert_eq!(
+        registry
+            .entries
+            .iter()
+            .filter(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+            .count(),
+        1,
+        "overflow aggregation must remain fixed-cardinality"
+    );
+}
+
+fn by_consumer_calls(registry: &ChargebackRegistry, consumer: &str) -> u64 {
+    registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() == consumer)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum()
+}
+
 /// The retained-byte ceiling is hard: it holds even when the identity slot
 /// ceiling is generous.
 #[test]
