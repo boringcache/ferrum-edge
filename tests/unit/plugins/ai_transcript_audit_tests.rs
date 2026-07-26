@@ -1676,14 +1676,17 @@ async fn final_body_hook_refreshes_staged_capture_after_transforms() {
     );
     let mut proxy_headers = ctx.headers.clone();
     plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
-    let staged_hash = ctx
-        .metadata
-        .get("ai_transcript_audit.request_hash")
-        .cloned()
-        .expect("staged hash");
+    // Staging is classification-only: the pre-transform body is never hashed,
+    // so there is no digest to throw away when a transform rewrites the body.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.request_hash"),
+        "before_proxy must not hash the pre-transform body"
+    );
+    assert_eq!(plugin.capture_counters(), (0, 0));
 
-    // A request transform changed the body; the final hook must refresh the
-    // captured hash/excerpt/model with the final backend-visible bytes.
+    // A request transform changed the body; the final hook must capture the
+    // hash/excerpt/model from the final backend-visible bytes.
     let final_body =
         br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"transformed"}]}"#;
     let headers = json_headers();
@@ -1695,9 +1698,11 @@ async fn final_body_hook_refreshes_staged_capture_after_transforms() {
         .get("ai_transcript_audit.request_hash")
         .cloned()
         .expect("refreshed hash");
-    assert_ne!(
-        staged_hash, refreshed_hash,
-        "hash must track the final body"
+    assert_eq!(refreshed_hash.len(), 64);
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "a mutated body must still cost exactly one capture pass"
     );
 
     plugin
@@ -7089,4 +7094,342 @@ fn retained_record_contract_matches_documented_formula() {
         max_retained_record_bytes(100, 50, 200),
         100 + 200 + MAX_MODEL_BYTES + MAX_TOOL_NAMES_AGGREGATE_BYTES
     );
+}
+
+// ---------------------------------------------------------------------------
+// Capture admission and one-pass request hashing (issues #3067, #3053)
+// ---------------------------------------------------------------------------
+
+const CANDIDATE_KEY: &str = "ai_transcript_audit.candidate";
+const HASH_KEY: &str = "ai_transcript_audit.request_hash";
+const SINK_KEY: &str = "ai_transcript_audit.sink_status";
+
+/// One `ai_transcript_audit.*` transaction-metadata value, owned.
+fn audit_meta(ctx: &RequestContext, key: &str) -> Option<String> {
+    ctx.metadata.get(key).cloned()
+}
+
+/// Fill the pre-`before_proxy` buffered request-body metadata slot.
+fn set_prebuffered_body(ctx: &mut RequestContext, body: &[u8]) {
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    ctx.metadata.insert("request_body".to_string(), text);
+}
+
+/// `sampling.rate: 0` with both overrides disabled means no record can ever be
+/// emitted, so the request body must never reach the keyed HMAC, the redactor,
+/// the excerpt shaper, or the model/tool extractors. `capture_counters()`
+/// reports `(captures_performed, captures_skipped)`.
+#[tokio::test]
+async fn unemittable_candidate_pays_no_capture_work() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    // The candidate is still staged (a bounded slot plus correlation metadata)
+    // so buffer/dispatch decisions and the log fallback stay coherent.
+    assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
+
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (0, 1),
+        "an unemittable candidate must not reach the capture helpers"
+    );
+    assert_eq!(audit_meta(&ctx, HASH_KEY), None, "no HMAC, no hash");
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(audit_meta(&ctx, SINK_KEY).as_deref(), Some("skipped"));
+    assert_eq!(plugin.capture_counters(), (0, 1));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(requests.is_empty(), "no record may be exported");
+}
+
+/// An unchanged request body is HMACed exactly once across the whole hook
+/// chain: staging defers it, the final request-body hook performs it, and the
+/// reject-path and synthetic-short-circuit refresh hooks are no-ops instead of
+/// a second cryptographic pass followed by an equality comparison.
+#[tokio::test]
+async fn unchanged_request_body_is_hmaced_once_across_every_hook() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let secret = "fleet-stable-hmac-key-once";
+    let overrides = json!({ "redaction": { "hash_secret": secret } });
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (0, 0),
+        "staging must not hash the pre-transform body"
+    );
+
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+    let reference = keyed_reference(secret);
+    let expected = reference.keyed_hash_hex(ai_request_body());
+    assert_eq!(audit_meta(&ctx, HASH_KEY).as_deref(), Some(&*expected));
+
+    // The reject-path refresh and the synthetic-short-circuit refresh both see
+    // the same bytes again; neither may re-hash them.
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    let synthetic = "ferrum:synthetic_short_circuit".to_string();
+    ctx.metadata.insert(synthetic, "true".to_string());
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "an unchanged body must be HMACed exactly once"
+    );
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["request_hash"], json!(expected));
+    assert_eq!(records[0]["model"], "gpt-4o");
+}
+
+/// A `before_proxy` short-circuit never reaches the final request-body hook, so
+/// `after_proxy` performs the single capture over the provider-visible body and
+/// the later synthetic response hook does not repeat it.
+#[tokio::test]
+async fn short_circuit_capture_runs_once_on_the_reject_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(plugin.capture_counters(), (0, 0));
+
+    // A terminator rewrote the provider-visible body before responding.
+    let terminated =
+        br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"terminator"}]}"#;
+    set_prebuffered_body(&mut ctx, terminated);
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 502, &mut response_headers)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "the short-circuit path must capture the final body once"
+    );
+
+    let synthetic = "ferrum:synthetic_short_circuit".to_string();
+    ctx.metadata.insert(synthetic, "true".to_string());
+    let headers = json_headers();
+    plugin
+        .capture_final_response_body(&mut ctx, 502, &headers, br#"{"error":"x"}"#)
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "gpt-4o-mini");
+    let excerpt = records[0]["request_body"].as_str().expect("request body");
+    assert!(excerpt.contains("terminator"), "got: {excerpt}");
+}
+
+/// A saturated `max_records_per_minute` window stops paying capture cost: the
+/// limiter is consulted when the backend-visible body arrives, so dropped
+/// transactions never hash, redact, excerpt, or assemble anything — and no
+/// hash-less envelope is exported in their place.
+#[tokio::test]
+async fn saturated_records_per_minute_skips_capture_before_hashing() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "max_records_per_minute": 1 } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let status = audit_meta(&ctx, SINK_KEY).unwrap_or_default();
+        let hashed = audit_meta(&ctx, HASH_KEY).is_some();
+        outcomes.push((status, hashed));
+    }
+
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 2),
+        "only the record that fits the window budget may pay capture cost"
+    );
+    assert_eq!(outcomes[0], ("queued".to_string(), true));
+    assert_eq!(outcomes[1], ("dropped".to_string(), false));
+    assert_eq!(outcomes[2], ("dropped".to_string(), false));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let received = server.received_requests().await.unwrap_or_default();
+    let total: usize = received
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body.as_array().map(Vec::len))
+        .sum();
+    assert_eq!(total, 1, "no body-less envelope may be exported");
+}
+
+/// `streaming_response: true` tees every staged candidate — except one whose
+/// record can never be emitted. Hashing and accumulating an SSE prefix for it
+/// would be pure amplification, and it must also stay off the reqwest-pinned
+/// dispatch path.
+#[tokio::test]
+async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    let sse = Some("text/event-stream");
+    assert!(plugin.response_stream_inspector(&ctx, 200, sse).is_none());
+
+    // A sampled candidate under the same streaming policy still tees.
+    let sampled = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut hit = make_ctx();
+    set_prebuffered_body(&mut hit, ai_request_body());
+    let mut hit_headers = hit.headers.clone();
+    sampled.before_proxy(&mut hit, &mut hit_headers).await;
+    assert!(sampled.forces_reqwest_dispatch(&hit));
+    assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
+}
+
+/// A streamed (`stream: true`) transaction also pays exactly one request
+/// capture: staging classifies, the final request-body hook captures, and the
+/// SSE tee plus the stream-terminal record assembly add none.
+#[tokio::test]
+async fn streamed_transaction_pays_one_request_capture() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let streamed =
+        br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, streamed);
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(plugin.capture_counters(), (0, 0));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), streamed)
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+
+    let sse = Some("text/event-stream");
+    let inspector = plugin
+        .response_stream_inspector(&ctx, 200, sse)
+        .expect("sampled SSE must be teed");
+    let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("chain");
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_end().await;
+    let outcome = BodyOutcome::success(body.len() as u64);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &outcome)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "the response path must not re-capture the request"
+    );
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["request_hash"].is_string());
+    assert!(records[0]["response_hash"].is_string());
 }
