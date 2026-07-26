@@ -2644,9 +2644,6 @@ fn choice_slot_label(slot: ReassemblySlot) -> String {
 struct ReassembledChoice {
     content: String,
     tool_calls: BTreeMap<ReassemblySlot, ReassembledToolCall>,
-    /// Number of `choices[]` entries applied to this bucket. A positional
-    /// bucket fed by more than one delta is a cross-frame guess, not identity.
-    deltas: usize,
     /// Number of non-empty `delta.tool_calls` arrays applied to this choice.
     /// Counted per applied array rather than per SSE frame so that several
     /// `choices` entries collapsing onto the same choice bucket are recognized
@@ -2683,14 +2680,23 @@ impl ReassembledChoice {
 /// True when a choice bucket does not rest on provider-asserted identity.
 ///
 /// An indexed bucket is asserted and correlates across frames. A positional
-/// bucket is asserted only within one delta, so it becomes a guess as soon as a
-/// second delta lands in it. An unattributed bucket is never asserted: it holds
-/// exactly one occurrence and its neighbour fragments live in other buckets, so
-/// a key/value split across them could never be redacted as JSON.
-fn choice_identity_ambiguous(slot: ReassemblySlot, choice: &ReassembledChoice) -> bool {
+/// bucket is asserted only *within* the one delta that carried it, so it stays
+/// trustworthy only while the stream contains no other choice-bearing delta:
+/// the moment a second delta exists, some fragment in it — positional or
+/// indexed — may be the other half of this bucket's text, and exporting the two
+/// halves apart lets a sensitive JSON key and its value escape the recursive
+/// key redaction that only runs when the value parses. That is why the test is
+/// stream-wide (`multi_delta_stream`) rather than per-bucket: a per-bucket
+/// delta count misses a positional bucket whose continuation landed in a
+/// *different* bucket, which is exactly the mixed indexed/indexless stream a
+/// hostile provider can construct. An unattributed bucket is never asserted at
+/// all: it holds exactly one occurrence and its neighbour fragments live in
+/// other buckets, so a key/value split across them could never be redacted as
+/// JSON.
+fn choice_identity_ambiguous(slot: ReassemblySlot, multi_delta_stream: bool) -> bool {
     match slot {
         ReassemblySlot::Indexed(_) => false,
-        ReassemblySlot::Positional(_) => choice.deltas > 1,
+        ReassemblySlot::Positional(_) => multi_delta_stream,
         ReassemblySlot::Unattributed(_) => true,
     }
 }
@@ -2735,6 +2741,10 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<ReassemblySlot, ReassembledChoice> = BTreeMap::new();
     let mut unattributed_choices: u64 = 0;
+    // Number of deltas (frames) that carried at least one `choices[]` entry.
+    // Counted per frame, not per entry, because entries inside one array are
+    // distinct choices by construction while separate frames are not.
+    let mut choice_deltas: usize = 0;
     let mut malformed_fields: BTreeSet<&'static str> = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
@@ -2759,6 +2769,9 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
             continue;
         };
+        if !choices.is_empty() {
+            choice_deltas = choice_deltas.saturating_add(1);
+        }
         for (choice_position, choice) in choices.iter().enumerate() {
             // Identity-bearing: a present-but-malformed index must not collapse
             // onto choice 0 (that would concatenate unrelated completions), must
@@ -2780,7 +2793,6 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                 },
             };
             let accumulated = per_choice.entry(slot).or_default();
-            accumulated.deltas = accumulated.deltas.saturating_add(1);
             if let Some(finish_reason) = choice.get("finish_reason")
                 && !finish_reason.is_null()
             {
@@ -2916,9 +2928,10 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     // so no bucket's payload can be exported. Withholding (rather than joining
     // on a guess, or exporting the halves apart) is the only answer that leaks
     // neither direction.
+    let multi_delta_stream = choice_deltas > 1;
     let choices_ambiguous = per_choice
-        .iter()
-        .any(|(slot, choice)| choice_identity_ambiguous(*slot, choice));
+        .keys()
+        .any(|slot| choice_identity_ambiguous(*slot, multi_delta_stream));
     let mut completion_text = serde_json::Map::new();
     let mut response_tool_calls = serde_json::Map::new();
     let mut finish_reasons = serde_json::Map::new();

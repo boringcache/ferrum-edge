@@ -5254,6 +5254,66 @@ async fn absent_choice_indices_across_frames_are_not_asserted_identity() {
 }
 
 #[tokio::test]
+async fn indexless_choice_mixed_with_an_indexed_one_withholds_completion_text() {
+    // A positional bucket is only safe while nothing else in the stream could be
+    // its other half. Here the sensitive key arrives in an indexless choice and
+    // its value in an indexed one, so the two land in *different* buckets: no
+    // single bucket sees a second delta, yet exporting both verbatim hands the
+    // consumer `{"api_key":` and `"leak-me-please"}` as separate strings, and
+    // neither parses, so the recursive sensitive-key redaction never runs. The
+    // whole stream must be withheld.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"{\"api_key\":"}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"\"leak-me-please\"}"}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("leak-me-please"),
+        "mixed indexed/indexless choices must not export the fragments apart: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["completion_text"]["position:0"], "[REDACTED:ambiguous_choice]",
+        "{excerpt}"
+    );
+    assert_eq!(
+        parsed["completion_text"]["0"], "[REDACTED:ambiguous_choice]",
+        "the indexed half is withheld too — it may be the value of the other half: {excerpt}"
+    );
+    assert_eq!(parsed["choice_identity_ambiguous"], true, "{excerpt}");
+    assert_eq!(parsed["completion_text_withheld"], true, "{excerpt}");
+}
+
+#[tokio::test]
+async fn indexless_choice_mixed_with_an_indexed_one_withholds_tool_arguments() {
+    // Same split, one level down: each choice bucket sees exactly one
+    // `tool_calls` delta with a well-formed tool index, so per-choice tool
+    // ambiguity alone would clear both. Choice identity is what is unasserted,
+    // and it must withhold the arguments in every bucket.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"api_key\":"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"leak-me-please\"}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("leak-me-please"),
+        "tool arguments split across choice buckets must be withheld: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    for key in ["position:0", "0"] {
+        let call = &parsed["tool_calls"][key][0];
+        assert_eq!(
+            call["function"]["arguments"], "[REDACTED:ambiguous_tool_call]",
+            "{key}: {excerpt}"
+        );
+        assert_eq!(call["arguments_withheld"], true, "{key}: {excerpt}");
+    }
+    assert_eq!(parsed["choice_identity_ambiguous"], true, "{excerpt}");
+}
+
+#[tokio::test]
 async fn malformed_tool_call_index_is_captured_unattributed_not_dropped_or_merged() {
     // Dropping a fragment whose index is malformed would let a provider keep
     // tool arguments out of the audit record entirely; merging it positionally
