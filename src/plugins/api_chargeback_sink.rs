@@ -130,6 +130,10 @@ const SPOOL_MIN_DECOMPRESSED_BYTES: u64 = 1024 * 1024;
 /// the ratio check: a ratio alone still permits a multi-gigabyte allocation
 /// when a same-UID attacker plants a large archive in the managed tree.
 const SPOOL_MAX_ARTIFACT_BYTES: u64 = HARD_MAX_BUFFER_MAX_BYTES as u64;
+// `spool_decompression_limit` clamps into this range, and `clamp` panics when
+// the upper bound is below the lower one. Prove the ordering at compile time so
+// the replay path can never panic inside the billing process.
+const _: () = assert!(SPOOL_MIN_DECOMPRESSED_BYTES <= SPOOL_MAX_ARTIFACT_BYTES);
 /// Bound for the ownership manifest (`spool.meta.json`).
 ///
 /// The manifest is a small fixed-shape record, but it is read *before* this
@@ -6634,10 +6638,12 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
 /// The caller quarantines an undecodable record to `<data-name>.corrupt` rather
 /// than deleting it, so a rejected archive stays on disk for operator review.
 fn spool_decompression_limit(encoded_len: u64) -> u64 {
+    // `clamp` cannot panic here: both bounds are constants and
+    // `SPOOL_MIN_DECOMPRESSED_BYTES` (1 MiB) is far below
+    // `SPOOL_MAX_ARTIFACT_BYTES` (the retained-byte ceiling).
     encoded_len
         .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
-        .max(SPOOL_MIN_DECOMPRESSED_BYTES)
-        .min(SPOOL_MAX_ARTIFACT_BYTES)
+        .clamp(SPOOL_MIN_DECOMPRESSED_BYTES, SPOOL_MAX_ARTIFACT_BYTES)
 }
 
 fn read_spool_bytes_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
