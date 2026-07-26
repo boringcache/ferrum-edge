@@ -3641,7 +3641,9 @@ fn schema_recursion_and_size_budgets_are_bounded() {
         schema = json!({"type": "object", "properties": {"next": schema}});
     }
     let deep = json!({"json_schema": schema});
-    let error = BodyValidator::new(&deep).err().expect("over-deep is rejected");
+    let error = BodyValidator::new(&deep)
+        .err()
+        .expect("over-deep is rejected");
     assert!(error.contains("schema budget"), "{error}");
 
     // A wide schema past the node budget is rejected on size, not depth.
@@ -3651,7 +3653,9 @@ fn schema_recursion_and_size_budgets_are_bounded() {
     }
     let properties = serde_json::Value::Object(properties);
     let wide = json!({"json_schema": {"properties": properties}});
-    let error = BodyValidator::new(&wide).err().expect("over-wide is rejected");
+    let error = BodyValidator::new(&wide)
+        .err()
+        .expect("over-wide is rejected");
     assert!(error.contains("schema budget"), "{error}");
 }
 
