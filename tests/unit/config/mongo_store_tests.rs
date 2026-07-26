@@ -13,10 +13,16 @@ use ferrum_edge::_test_support::{
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
     mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
     mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
+    mongo_store_acquire_connection_generation_pin_for_test, mongo_store_new_unconnected_for_test,
+    mongo_store_published_database_name_for_test, mongo_store_try_publish_reconnected_bundle_for_test,
     mtls_dns_policy_requires_consumer_load,
 };
+use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::oneshot;
 
 const OWNER: &str = "test-owner-uuid";
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
@@ -860,18 +866,27 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         .split_once('{')
         .map(|(_, body)| body)
         .expect("publish_reconnected_bundle body");
-    let try_write_at = publish_body
+    let admin_try_write_at = publish_body
+        .find("admin_write_topology.try_write()")
+        .expect("publish_reconnected_bundle must fail-fast on the Admin write-topology guard first");
+    let generation_try_write_at = publish_body
         .find("connection_generation.try_write()")
-        .expect("publish_reconnected_bundle must fail-fast on the generation guard");
+        .expect("publish_reconnected_bundle must fail-fast on the generation guard second");
     let mark_at = publish_body
         .find("mark_failover(")
-        .expect("publish_reconnected_bundle must mark failover under the guard");
+        .expect("publish_reconnected_bundle must mark failover under the guards");
     let swap_at = publish_body
         .find("connection.swap(")
         .expect("publish_reconnected_bundle must ArcSwap the connection");
     assert!(
-        try_write_at < mark_at && mark_at < swap_at,
-        "generation try_write -> mark_failover -> connection.swap is the fail-closed order:\n{publish_body}"
+        admin_try_write_at < generation_try_write_at
+            && generation_try_write_at < mark_at
+            && mark_at < swap_at,
+        "admin try_write -> generation try_write -> mark_failover -> connection.swap is the fail-closed order:\n{publish_body}"
+    );
+    assert!(
+        !publish_body.contains(".write().await"),
+        "Mongo publication must stay fail-fast (try_write), never unbounded write().await:\n{publish_body}"
     );
 
     // Primary reconnect stays conservative: publish first, then mark_primary
@@ -945,7 +960,9 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         "SQL write admit must pin via reconnect_transition read_owned:\n{sql_acquire}"
     );
 
-    // Mongo write admit pins the same generation gate reconnect fail-fast writes.
+    // Mongo write admit pins the distinct Admin topology gate — never the
+    // admission `connection_generation` lock (Tokio fair RwLock is not
+    // reentrant; mutations nest into admission after the outer permit).
     let mongo_source = include_str!("../../../src/config/mongo_store.rs");
     let mongo_acquire = mongo_source
         .split("async fn acquire_write_topology_permit(")
@@ -953,8 +970,194 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         .and_then(|rest| rest.split("fn set_slow_query_threshold(").next())
         .expect("MongoStore::acquire_write_topology_permit body");
     assert!(
-        mongo_acquire.contains("connection_generation.clone().read_owned().await")
-            || mongo_acquire.contains("self.connection_generation.clone().read_owned().await"),
-        "Mongo write admit must pin via connection_generation read_owned:\n{mongo_acquire}"
+        mongo_acquire.contains("admin_write_topology.clone().read_owned().await")
+            || mongo_acquire.contains("self.admin_write_topology.clone().read_owned().await"),
+        "Mongo write admit must pin via admin_write_topology read_owned:\n{mongo_acquire}"
+    );
+    assert!(
+        !mongo_acquire.contains("connection_generation"),
+        "Mongo write admit must not nest on connection_generation:\n{mongo_acquire}"
+    );
+
+    // All Mongo publication paths funnel through publish_reconnected_bundle.
+    let install = mongo_sync_method("install_reconnected_bundle(");
+    assert!(
+        install.contains("publish_reconnected_bundle("),
+        "install_reconnected_bundle (primary reconnect / TLS reload) must publish via the shared helper"
+    );
+    assert!(
+        reconnect_failover.contains("publish_reconnected_bundle("),
+        "reconnect_failover must publish via the shared helper"
+    );
+}
+
+/// Issue #3001: Admin write-topology pins and admission generation pins are
+/// distinct fair RwLocks. Holding the outer Admin permit must fail-fast defer
+/// publication, while a nested admission acquire on `connection_generation`
+/// still completes (no same-lock reentrancy deadlock). Barriers make the
+/// reconnect-between-outer-and-inner interleaving deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    assert_eq!(mongo_store_published_database_name_for_test(&store), "test");
+    assert!(store.failover_topology_status().primary_active);
+
+    let permit = store.acquire_write_topology_permit().await;
+    assert!(
+        permit.is_pinned(),
+        "Mongo write admit must retain an admin_write_topology read pin"
+    );
+
+    let (admission_ready_tx, admission_ready_rx) = oneshot::channel::<()>();
+    let (release_admission_tx, release_admission_rx) = oneshot::channel::<()>();
+    let nested_ok = Arc::new(AtomicBool::new(false));
+
+    let admit_store = store.clone();
+    let nested_ok_task = Arc::clone(&nested_ok);
+    let admission_task = tokio::spawn(async move {
+        // Simulates Admin mutation CRUD entering acquire_durable_admission_lock
+        // while the outer write-topology permit is still held.
+        let admission_pin =
+            mongo_store_acquire_connection_generation_pin_for_test(&admit_store).await;
+        nested_ok_task.store(true, Ordering::SeqCst);
+        let _ = admission_ready_tx.send(());
+        let _ = release_admission_rx.await;
+        drop(admission_pin);
+    });
+
+    admission_ready_rx
+        .await
+        .expect("nested admission pin must complete while Admin permit is held");
+    assert!(
+        nested_ok.load(Ordering::SeqCst),
+        "nested connection_generation read must not deadlock behind the Admin permit"
+    );
+
+    let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "should_not_publish",
+        Some("mongodb://failover.example/test"),
+    )
+    .expect_err("Admin write-topology pin must fail-fast defer publication");
+    let blocked_msg = blocked.to_string();
+    assert!(
+        blocked_msg.contains("Admin write-topology permit"),
+        "deferred reconnect must name the Admin pin, got: {blocked_msg}"
+    );
+    assert!(
+        store.failover_topology_status().primary_active,
+        "deferred reconnect must leave topology untouched"
+    );
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "test",
+        "deferred reconnect must not ArcSwap the connection"
+    );
+
+    release_admission_tx.send(()).expect("release admission");
+    admission_task.await.expect("join admission task");
+    drop(permit);
+
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_admin_pin",
+        Some("mongodb://failover.example/test"),
+    )
+    .expect("publish must succeed after Admin + admission pins drop");
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_admin_pin"
+    );
+}
+
+/// Admission-only pins still fail-fast defer publication (generation gate),
+/// independent of the Admin write-topology lock.
+#[tokio::test(flavor = "current_thread")]
+async fn admission_pin_defers_publish_without_topology_change() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let admission_pin = mongo_store_acquire_connection_generation_pin_for_test(&store).await;
+
+    let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "blocked_by_admission",
+        Some("mongodb://failover.example/test"),
+    )
+    .expect_err("admission pin must fail-fast defer publication");
+    assert!(
+        blocked.to_string().contains("admission operation pins"),
+        "deferred reconnect must name the admission pin, got: {blocked}"
+    );
+    assert!(store.failover_topology_status().primary_active);
+    assert_eq!(mongo_store_published_database_name_for_test(&store), "test");
+
+    drop(admission_pin);
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "after_admission_pin",
+        Some("mongodb://failover.example/test"),
+    )
+    .expect("publish after admission pin drops");
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_admission_pin"
+    );
+}
+
+/// Concurrent reconnect attempt that races between outer Admin permit acquire
+/// and nested admission must observe fail-fast deferral (never hang), then
+/// succeed once both pins drop. Uses oneshot barriers — no timing sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    let permit = store.acquire_write_topology_permit().await;
+
+    let (outer_held_tx, outer_held_rx) = oneshot::channel::<()>();
+    let (publish_saw_defer_tx, publish_saw_defer_rx) = oneshot::channel::<()>();
+    let (release_pins_tx, release_pins_rx) = oneshot::channel::<()>();
+
+    let publish_store = store.clone();
+    let publish_task = tokio::spawn(async move {
+        outer_held_rx
+            .await
+            .expect("wait until Admin permit is held");
+        let first = mongo_store_try_publish_reconnected_bundle_for_test(
+            &publish_store,
+            "raced_publish",
+            Some("mongodb://failover.example/test"),
+        );
+        assert!(
+            first.is_err(),
+            "publish racing under Admin permit must fail-fast defer"
+        );
+        let _ = publish_saw_defer_tx.send(());
+        release_pins_rx.await.expect("wait for pin release");
+        mongo_store_try_publish_reconnected_bundle_for_test(
+            &publish_store,
+            "after_race",
+            Some("mongodb://failover.example/test"),
+        )
+    });
+
+    let _ = outer_held_tx.send(());
+    // Nested admission while outer permit held (the former self-deadlock window).
+    let admission_pin = mongo_store_acquire_connection_generation_pin_for_test(&store).await;
+    publish_saw_defer_rx
+        .await
+        .expect("publish task must observe fail-fast deferral without hanging");
+
+    drop(admission_pin);
+    drop(permit);
+    let _ = release_pins_tx.send(());
+
+    publish_task
+        .await
+        .expect("join publish")
+        .expect("publish after pins drop");
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "after_race"
     );
 }

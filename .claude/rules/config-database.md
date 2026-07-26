@@ -75,9 +75,12 @@ paths:
   process-local divergence-risk marker for the failover window (not a durable
   fence; cleared by restart). Topology/divergence signals use redacted URLs
   only. Mutation handlers admit under a write-topology pin (SQL reconnect
-  `RwLock` read / Mongo `connection_generation` read) retained for the full
-  persistence lifetime so a reconnect cannot redirect an already-admitted
-  write; observe-only `/health` uses the synchronous policy check.
+  `RwLock` read / Mongo distinct `admin_write_topology` `RwLock` read) retained
+  for the full persistence lifetime so a reconnect cannot redirect an
+  already-admitted write; Mongo admission continues to pin only
+  `connection_generation` (publication `try_write`s Admin topology then
+  generation, both fail-fast). Observe-only `/health` uses the synchronous
+  policy check.
 - Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.
 - `FERRUM_DB_READ_REPLICA_URL` is SQL-only and may offload eligible admin-only reads; writes and runtime polling always use primary. Replica query failure must mark the replica unavailable and retry the admin read on primary.
 - MongoDB replica-set failover comes from listing members in `FERRUM_DB_URL`; Ferrum's config store forces primary reads and ignores URL read preferences.

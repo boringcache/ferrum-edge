@@ -2132,6 +2132,38 @@ pub mod _test_support {
         store.reconnect_as_failover(db_url).await
     }
 
+    // ── config/mongo_store: Admin write-topology / publication test seams ────
+
+    /// Lazy Mongo store (no live MongoDB) for topology publication tests.
+    pub fn mongo_store_new_unconnected_for_test(
+        failover_urls: Vec<String>,
+    ) -> Result<crate::config::mongo_store::MongoStore, anyhow::Error> {
+        crate::config::mongo_store::MongoStore::new_unconnected_for_test(failover_urls)
+    }
+
+    /// Publish through Mongo's production Admin+admission fail-fast gates.
+    pub fn mongo_store_try_publish_reconnected_bundle_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        database_name: &str,
+        failover_url_redacted: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        store.try_publish_reconnected_bundle_for_test(database_name, failover_url_redacted)
+    }
+
+    /// Simulate an in-flight admission generation pin without talking to Mongo.
+    pub async fn mongo_store_acquire_connection_generation_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        store.acquire_connection_generation_pin_for_test().await
+    }
+
+    /// Active published Mongo database name (white-box accessor).
+    pub fn mongo_store_published_database_name_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> String {
+        store.published_database_name_for_test()
+    }
+
     // ── config/batch_atomicity ───────────────────────────────────────────────
     pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
 

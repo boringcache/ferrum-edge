@@ -854,12 +854,27 @@ mod inner {
         // client can still open sockets, then removes them when the final old
         // bundle reference is dropped.
         connection: Arc<ArcSwap<MongoConnectionBundle>>,
-        // Admission operations and Admin write-topology permits hold the read
-        // side from acquisition through mutation completion / response
-        // construction. A reconnect must take the write side before swapping
-        // `connection`, so one protected operation can never straddle MongoDB
-        // generations (issue #3001 check-to-use race).
+        // Admission operations hold the read side from acquisition through
+        // mutation completion / response construction. A reconnect must take
+        // the write side before swapping `connection`, so one protected
+        // admission can never straddle MongoDB generations.
+        //
+        // Distinct from [`Self::admin_write_topology`]: Tokio's fair
+        // `RwLock` is not reentrant, and Admin mutations that already hold a
+        // write-topology pin commonly enter CRUD/admission paths that also
+        // pin this generation. Nesting both on one lock self-deadlocks when a
+        // reconnect writer races between the outer permit and the inner
+        // admission acquire (issue #3001).
         connection_generation: Arc<tokio::sync::RwLock<()>>,
+        // Admin write-topology pin (issue #3001 check-to-use race). Mutations
+        // take the shared read side via
+        // [`DatabaseBackend::acquire_write_topology_permit`]; every connection
+        // publication path `try_write`s this lock *before*
+        // `connection_generation` (fail-fast, never nested with admission).
+        // Lock order on publication: `admin_write_topology` then
+        // `connection_generation`. Readers never take both locks nested on the
+        // same fair RwLock.
+        admin_write_topology: Arc<tokio::sync::RwLock<()>>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
@@ -960,6 +975,7 @@ mod inner {
             Ok(Self {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
@@ -1414,29 +1430,47 @@ mod inner {
             self.publish_reconnected_bundle(new_connection, replica_set_configured, None)
         }
 
-        /// Publish a rebuilt connection under the generation guard.
+        /// Publish a rebuilt connection under the Admin + admission gates.
         ///
         /// Transition contract (issue #3001, parity with SQL
         /// `DatabaseStore::reconnect_for_topology`):
         /// - Connection construction happens *before* this method, so a failed
         ///   build never changes topology.
-        /// - The generation `try_write` is acquired first (fail-fast, no
-        ///   unbounded wait). A deferred reconnect leaves topology untouched.
+        /// - Lock order (deadlock-free, both fail-fast `try_write`, no
+        ///   unbounded wait):
+        ///   1. `admin_write_topology` — blocks publication while an Admin
+        ///      mutation holds [`DatabaseBackend::acquire_write_topology_permit`]
+        ///   2. `connection_generation` — blocks publication while admission
+        ///      pins the current generation
+        ///   Readers never nest both locks on the same fair `RwLock`. Admin
+        ///   permits use only (1); admission uses only (2); publication takes
+        ///   exclusive sides in that order. A deferred reconnect leaves
+        ///   topology untouched.
         /// - When `failover_url_redacted` is `Some`, `mark_failover` runs
         ///   *before* the ArcSwap so `admit_write()` / `check_write_allowed()`
         ///   can never observe a failover connection while `primary_active`
         ///   is still true.
         /// - After the gate flips, publication cannot fail (swap is infallible
-        ///   under the held guard), so there is no post-flip restore path.
+        ///   under the held guards), so there is no post-flip restore path.
         /// - Primary failback keeps marking primary *after* publish
         ///   (`reconnect`): temporary write blocking on a primary connection
         ///   is acceptable; permitting writes on failover is not.
+        ///
+        /// Covered callers: [`Self::install_reconnected_bundle`] (primary
+        /// `reconnect` / TLS reload) and [`Self::reconnect_failover`]
+        /// (`try_failover_reconnect` failover URLs).
         fn publish_reconnected_bundle(
             &self,
             new_connection: MongoConnectionBundle,
             replica_set_configured: bool,
             failover_url_redacted: Option<&str>,
         ) -> Result<(), anyhow::Error> {
+            // Fail-fast: never wait for Admin mutation topology pins.
+            let _admin_topology_guard = self.admin_write_topology.try_write().map_err(|_| {
+                anyhow::anyhow!(
+                    "MongoDB reconnect deferred while an Admin write-topology permit pins the current connection"
+                )
+            })?;
             // Never swap generations while an admission guard is validating,
             // mutating, cleaning up, or spanning a restore rollback. In
             // particular, an uncertain write retains a read pin indefinitely;
@@ -1477,6 +1511,96 @@ mod inner {
                 Some(&crate::config::db_backend::redact_url(db_url)),
             )?;
             Ok(())
+        }
+
+        /// Lazy `MongoStore` for white-box topology/publication tests.
+        ///
+        /// Builds a driver `Client` against empty hosts (no live MongoDB). Used
+        /// by external unit tests through `_test_support` to prove Admin /
+        /// admission publication gating without network I/O.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn new_unconnected_for_test(
+            failover_urls: Vec<String>,
+        ) -> Result<Self, anyhow::Error> {
+            let settings = MongoConnSettings {
+                database_name: "test".to_string(),
+                app_name: None,
+                replica_set: None,
+                auth_mechanism: None,
+                server_selection_timeout_secs: Some(1),
+                connect_timeout_secs: Some(1),
+                tls_enabled: false,
+                tls_ca_cert_path: None,
+                tls_client_cert_path: None,
+                tls_client_key_path: None,
+                tls_insecure: false,
+            };
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            // Empty-host ClientOptions is lazy; construction does not dial.
+            let client = mongodb::Client::with_options(opts.clone()).map_err(|error| {
+                anyhow::anyhow!("Client::with_options rejected empty hosts: {error}")
+            })?;
+            let lease_client = mongodb::Client::with_options(opts).map_err(|error| {
+                anyhow::anyhow!("lease Client::with_options rejected empty hosts: {error}")
+            })?;
+            let db = client.database(&settings.database_name);
+            let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
+            Ok(Self {
+                connection: Arc::new(ArcSwap::from_pointee(connection)),
+                connection_generation: Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                persistent_admission_pins: Arc::new(DashMap::new()),
+                retained_admission_pins: Arc::new(DashMap::new()),
+                conn_settings: settings,
+                db_type_str: "mongodb".to_string(),
+                slow_query_threshold_ms: None,
+                cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
+                backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+                audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+                audit_max_rows_prune_gates: Arc::new(DashMap::new()),
+                failover_urls,
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                replica_set_configured: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        /// Publish a synthetic connection bundle through the production
+        /// publication helper (Admin + admission fail-fast gates).
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn try_publish_reconnected_bundle_for_test(
+            &self,
+            database_name: &str,
+            failover_url_redacted: Option<&str>,
+        ) -> Result<(), anyhow::Error> {
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let client = mongodb::Client::with_options(opts.clone()).map_err(|error| {
+                anyhow::anyhow!("Client::with_options rejected empty hosts: {error}")
+            })?;
+            let lease_client = mongodb::Client::with_options(opts).map_err(|error| {
+                anyhow::anyhow!("lease Client::with_options rejected empty hosts: {error}")
+            })?;
+            let db = client.database(database_name);
+            let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
+            self.publish_reconnected_bundle(connection, false, failover_url_redacted)
+        }
+
+        /// Admission-generation read pin used by external tests to simulate an
+        /// in-flight mTLS DNS admission without talking to MongoDB.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub async fn acquire_connection_generation_pin_for_test(
+            &self,
+        ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+            self.connection_generation.clone().read_owned().await
+        }
+
+        /// Active database name from the published connection bundle.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn published_database_name_for_test(&self) -> String {
+            self.db().name().to_string()
         }
 
         /// Aggregation-pipeline update that takes or holds a renewable lease.
@@ -5291,11 +5415,14 @@ mod inner {
         async fn acquire_write_topology_permit(
             &self,
         ) -> crate::config::db_backend::DbWriteTopologyPermit {
-            // Shared read pin on the same generation gate reconnect uses for
-            // fail-fast `try_write`. An in-flight mutation therefore cannot be
-            // redirected to a newly published failover/primary connection, and
-            // reconnect stays fail-fast while pins are held.
-            let guard = self.connection_generation.clone().read_owned().await;
+            // Shared read pin on the Admin-only topology gate. Distinct from
+            // `connection_generation` so mutations may later enter admission /
+            // CRUD paths that take that generation read without nesting the
+            // same fair Tokio `RwLock` (non-reentrant). Publication
+            // `try_write`s this lock first, then `connection_generation`, so
+            // an in-flight mutation cannot be redirected and reconnect stays
+            // fail-fast while either pin is held.
+            let guard = self.admin_write_topology.clone().read_owned().await;
             crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
         }
 
@@ -13299,6 +13426,7 @@ mod inner {
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
                 retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,
@@ -13405,6 +13533,18 @@ mod inner {
             assert!(blocked.to_string().contains("admission operation pins"));
             assert_eq!(store.db().name(), "test");
             drop(admission_pin);
+
+            let admin_pin = store.admin_write_topology.clone().read_owned().await;
+            let blocked_admin = store
+                .install_reconnected_bundle(connection_bundle("blocked_admin"), false)
+                .expect_err("an Admin write-topology pin must block bundle replacement");
+            assert!(blocked_admin.to_string().contains("Admin write-topology permit"));
+            assert_eq!(store.db().name(), "test");
+            // Nested admission acquire while Admin pin is held must not deadlock
+            // (distinct fair RwLocks).
+            let nested_admission = store.connection_generation.clone().read_owned().await;
+            drop(nested_admission);
+            drop(admin_pin);
 
             store
                 .install_reconnected_bundle(connection_bundle("after_failover"), false)

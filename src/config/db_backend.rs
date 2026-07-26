@@ -61,9 +61,13 @@ impl Default for DbFailoverTopologyStatus {
 
 /// Opaque Admin API mutation pin of the active config-store write topology.
 ///
-/// Holding this value retains a shared read lock on the backend reconnect /
-/// connection-generation gate so a concurrent reconnect cannot publish a new
-/// topology (pool or Mongo connection) until the permit is dropped. Acquire via
+/// Holding this value retains a shared read lock on the backend reconnect
+/// transition gate (SQL `reconnect_transition`) or Mongo Admin write-topology
+/// gate (`admin_write_topology`) so a concurrent reconnect cannot publish a new
+/// topology (pool or Mongo connection) until the permit is dropped. Mongo keeps
+/// this lock distinct from the admission `connection_generation` gate so
+/// mutations may safely enter CRUD/admission paths without nesting the same
+/// fair Tokio `RwLock`. Acquire via
 /// [`DatabaseBackend::acquire_write_topology_permit`] and retain through the
 /// full mutation persistence lifetime (issue #3001 check-to-use race).
 pub struct DbWriteTopologyPermit {
