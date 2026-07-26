@@ -1607,23 +1607,23 @@ pub(crate) struct WafInstanceScoreState {
 /// permit is unique and must be transferred with `take()` / `mem::take` when a
 /// compatibility clone needs to own the reserved slot.
 #[derive(Default)]
-struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+struct HeldResponseBufferPermit(Option<tokio::sync::OwnedSemaphorePermit>);
 
-impl std::fmt::Debug for HeldCodecPermit {
+impl std::fmt::Debug for HeldResponseBufferPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("HeldCodecPermit")
+        f.debug_tuple("HeldResponseBufferPermit")
             .field(&self.0.is_some())
             .finish()
     }
 }
 
-impl Clone for HeldCodecPermit {
+impl Clone for HeldResponseBufferPermit {
     fn clone(&self) -> Self {
         Self(None)
     }
 }
 
-impl HeldCodecPermit {
+impl HeldResponseBufferPermit {
     fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
         self.0 = Some(permit);
     }
@@ -1981,9 +1981,11 @@ pub struct RequestContext {
     compression_response_admission_declined: bool,
     /// Reserved response-buffer admission permit for gateway compression.
     /// Codec CPU admission is acquired separately, immediately before the
-    /// blocking transform. Drop releases this slot on cancellation; clones do
-    /// not duplicate the exclusive permit.
-    compression_response_codec_permit: HeldCodecPermit,
+    /// blocking transform, and this permit is held across that transform so the
+    /// retained-body population never exceeds the response-buffer budget. Drop
+    /// releases this slot on cancellation; clones do not duplicate the
+    /// exclusive permit.
+    compression_response_buffer_permit: HeldResponseBufferPermit,
     /// Validated plaintext staged by the rare buffered request-decode fallback
     /// (headers stripped in `before_proxy` without a mutable body view). The
     /// owning transform must emit these bytes so the backend never sees a
@@ -2386,7 +2388,7 @@ impl RequestContext {
             compression_response_encode_owner: None,
             compression_response_admission_owner: None,
             compression_response_admission_declined: false,
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: None,
             compression_response_encode_aborted: false,
             response_stream_id: None,
@@ -2688,21 +2690,21 @@ impl RequestContext {
     pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
         if self.compression_response_admission_owner == Some(instance_id) {
             self.compression_response_admission_owner = None;
-            let _ = self.compression_response_codec_permit.take();
+            let _ = self.compression_response_buffer_permit.take();
         }
     }
 
-    pub(crate) fn set_compression_response_codec_permit(
+    pub(crate) fn set_compression_response_buffer_permit(
         &mut self,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        self.compression_response_codec_permit.set(permit);
+        self.compression_response_buffer_permit.set(permit);
     }
 
-    pub(crate) fn take_compression_response_codec_permit(
+    pub(crate) fn take_compression_response_buffer_permit(
         &mut self,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.compression_response_codec_permit.take()
+        self.compression_response_buffer_permit.take()
     }
 
     pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
@@ -2725,7 +2727,7 @@ impl RequestContext {
         self.gateway_response_compression_algorithm = None;
         self.compression_response_encode_owner = None;
         self.compression_response_admission_owner = None;
-        let _ = self.compression_response_codec_permit.take();
+        let _ = self.compression_response_buffer_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -3171,7 +3173,7 @@ impl RequestContext {
             // it here would drop the slot when this short-lived clone is dropped
             // (only `metadata`/WAF/AI state is copied back), releasing admission
             // while the live context still owns the response encode.
-            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_response_buffer_permit: HeldResponseBufferPermit::default(),
             compression_staged_request_plaintext: std::mem::take(
                 &mut self.compression_staged_request_plaintext,
             ),

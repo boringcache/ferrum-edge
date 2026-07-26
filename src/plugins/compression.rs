@@ -28,7 +28,10 @@
 //! identity instead of pinning a (possibly unbounded) body onto the
 //! compression-only buffered path; `after_proxy` consumes the reserved permit
 //! and never reacquires once a streaming/identity path is chosen, failing closed
-//! with 406 only when identity is prohibited.
+//! with 406 only when identity is prohibited. The buffer permit is held across
+//! the encode (the collected body stays resident), while the codec permit is
+//! taken only for the `spawn_blocking` worker itself; codec saturation there
+//! aborts the encode and the shared transform loops restore identity.
 //! Response compression is also disabled when the gateway response-body limit is
 //! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
 //! admitted to compression buffering has a hard per-response byte bound.
@@ -112,6 +115,8 @@ static RESPONSE_BUFFER_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
 static CODEC_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static CODEC_SATURATED: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_BUFFER_SATURATED: AtomicU64 = AtomicU64::new(0);
 static CODEC_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
 static CODEC_WORKER_FAILURES: AtomicU64 = AtomicU64::new(0);
 
@@ -120,10 +125,13 @@ tokio::task_local! {
     /// instead of the process-global pool so saturation tests cannot starve
     /// unrelated parallel codec work.
     static TEST_CODEC_BUDGET: Arc<Semaphore>;
+    /// Test-only injected response-buffer budget, for the same isolation reason
+    /// as `TEST_CODEC_BUDGET`. The two seams nest so a test can pin buffer
+    /// admission and codec CPU admission independently.
     static TEST_RESPONSE_BUFFER_BUDGET: Arc<Semaphore>;
 }
 
-/// Run `f` with an isolated response-buffer admission budget.
+/// Run `f` with an isolated response-buffer admission budget of `permits` slots.
 #[allow(dead_code)]
 pub async fn with_test_response_buffer_budget<F, Fut, T>(permits: usize, f: F) -> T
 where
@@ -216,6 +224,10 @@ pub struct CompressionCodecMetrics {
     pub saturated: u64,
     pub join_failures: u64,
     pub worker_failures: u64,
+    /// Response-buffer admissions granted (independent of codec CPU admission).
+    pub response_buffer_admitted: u64,
+    /// Response-buffer admission refusals when the buffer budget is saturated.
+    pub response_buffer_saturated: u64,
 }
 
 /// Snapshot process-wide codec admission counters (also scraped via Prometheus).
@@ -225,6 +237,8 @@ pub fn compression_codec_metrics() -> CompressionCodecMetrics {
         saturated: CODEC_SATURATED.load(Ordering::Relaxed),
         join_failures: CODEC_JOIN_FAILURES.load(Ordering::Relaxed),
         worker_failures: CODEC_WORKER_FAILURES.load(Ordering::Relaxed),
+        response_buffer_admitted: RESPONSE_BUFFER_ADMITTED.load(Ordering::Relaxed),
+        response_buffer_saturated: RESPONSE_BUFFER_SATURATED.load(Ordering::Relaxed),
     }
 }
 
@@ -263,11 +277,19 @@ fn try_acquire_codec_permit() -> Result<OwnedSemaphorePermit, ()> {
 }
 
 fn try_acquire_response_buffer_permit() -> Result<OwnedSemaphorePermit, ()> {
-    TEST_RESPONSE_BUFFER_BUDGET
+    let budget = TEST_RESPONSE_BUFFER_BUDGET
         .try_with(Arc::clone)
-        .unwrap_or_else(|_| Arc::clone(&RESPONSE_BUFFER_BUDGET))
-        .try_acquire_owned()
-        .map_err(|_| ())
+        .unwrap_or_else(|_| Arc::clone(&RESPONSE_BUFFER_BUDGET));
+    match budget.try_acquire_owned() {
+        Ok(permit) => {
+            RESPONSE_BUFFER_ADMITTED.fetch_add(1, Ordering::Relaxed);
+            Ok(permit)
+        }
+        Err(_) => {
+            RESPONSE_BUFFER_SATURATED.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        }
+    }
 }
 
 /// Restore identity response headers when a committed gateway content coding
@@ -860,7 +882,7 @@ impl CompressionPlugin {
                     claimed,
                     "response admission owner changed within a sequential hook chain"
                 );
-                ctx.set_compression_response_codec_permit(permit);
+                ctx.set_compression_response_buffer_permit(permit);
             }
             Err(()) => {
                 ctx.mark_compression_response_admission_declined();
@@ -1763,10 +1785,10 @@ impl Plugin for CompressionPlugin {
                     // Consume the response-buffer reservation for this coding.
                     // Codec CPU admission is intentionally acquired only by the
                     // body transform, immediately before spawn_blocking, so slow
-                    // backend requests cannot starve request decompression.
-                    // The reservation in
-                    // `before_proxy` is what bounded entry onto the buffered path,
-                    // so a request that chose to stream must never reacquire:
+                    // backend requests cannot starve request decompression. The
+                    // reservation in `before_proxy` is what bounded entry onto
+                    // the buffered path, so a request that chose to stream must
+                    // never reacquire:
                     //   * this instance reserved it -> consume the held permit
                     //     (the common path; no reacquire on the hot path);
                     //   * admission was declined under pressure -> do NOT
@@ -1785,7 +1807,7 @@ impl Plugin for CompressionPlugin {
                     //     required a reservation at `before_proxy` time.
                     let buffer_permit = if ctx.owns_compression_response_admission(self.instance_id)
                     {
-                        ctx.take_compression_response_codec_permit()
+                        ctx.take_compression_response_buffer_permit()
                     } else if ctx.compression_response_admission_declined()
                         || ctx.has_compression_response_admission_owner()
                     {
@@ -1832,7 +1854,7 @@ impl Plugin for CompressionPlugin {
                         claimed,
                         "response encode owner changed within a sequential hook chain"
                     );
-                    ctx.set_compression_response_codec_permit(buffer_permit);
+                    ctx.set_compression_response_buffer_permit(buffer_permit);
 
                     // Retain the existing observable decision metadata.
                     ctx.metadata.insert(
@@ -1970,15 +1992,26 @@ impl Plugin for CompressionPlugin {
             return None;
         };
 
-        let Some(buffer_permit) = ctx.take_compression_response_codec_permit() else {
+        // The buffer permit is what admitted this body onto the compression-only
+        // buffered path. Hold it until the encode finishes: the collected body
+        // (and the compressed copy derived from it) stay resident for the whole
+        // transform, so releasing early would let the retained-bytes population
+        // exceed the response-buffer semaphore it is supposed to bound.
+        let Some(buffer_permit) = ctx.take_compression_response_buffer_permit() else {
             error!(
                 "compression: missing response-buffer admission permit for committed Content-Encoding '{encoding}'"
             );
             ctx.mark_compression_response_encode_aborted();
             return None;
         };
-        drop(buffer_permit);
+        // Codec CPU admission is acquired only here, immediately before the
+        // blocking worker, so a slow backend holding a buffer slot never pins a
+        // codec permit and cannot starve request decompression. Saturation after
+        // `Content-Encoding` was committed aborts the encode; shared H1/H2/H3
+        // transform loops then restore an identity representation rather than
+        // serving plaintext under a coded header.
         let Ok(permit) = try_acquire_codec_permit() else {
+            drop(buffer_permit);
             warn!("compression: codec admission saturated while encoding response body");
             ctx.mark_compression_response_encode_aborted();
             return None;
@@ -1998,7 +2031,12 @@ impl Plugin for CompressionPlugin {
         // Encoder / join failure marks abort so shared transform loops restore
         // an identity representation with correct headers instead of emitting
         // mislabeled plaintext.
-        match self.compress_response_body(body, encoding, permit).await {
+        let compressed = self.compress_response_body(body, encoding, permit).await;
+        // Release the buffer slot only once the compressed copy exists (or the
+        // encode failed): from here on nothing further is retained under this
+        // request's compression admission.
+        drop(buffer_permit);
+        match compressed {
             Some(compressed) => Some(compressed),
             None => {
                 ctx.mark_compression_response_encode_aborted();
