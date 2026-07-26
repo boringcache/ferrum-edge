@@ -671,7 +671,8 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "response",
             "streaming_response",
             "headers",
-            "tool_calls"
+            "tool_calls",
+            "stream_hash",
         ]
     );
     assert_eq!(
@@ -700,6 +701,10 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "max_request_bytes",
             "max_response_bytes",
             "max_stream_capture_bytes",
+            "max_redaction_scan_bytes",
+            "max_entry_bytes",
+            "buffer_max_bytes",
+            "max_stream_reservation_secs",
         ]
     );
     assert_eq!(
@@ -725,6 +730,9 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "retry_delay_ms",
             "on_buffer_full",
             "on_sink_error",
+            "ack_policy",
+            "ack_max_bytes",
+            "ack_timeout_ms",
         ]
     );
 }
@@ -2326,7 +2334,7 @@ async fn request_only_capture_rejects_before_dispatch_after_sink_becomes_unhealt
                 },
                 "sink": {
                     "type": "http",
-                    "endpoint_url": endpoint.clone(),
+                    "endpoint_url": endpoint,
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
                     "flush_interval_ms": 100,
@@ -4911,7 +4919,7 @@ async fn unhealthy_sink_rejects_unsampled_candidate_that_may_emit_at_commit() {
                 "sampling": { "rate": 0.0, "always_capture_on_error": true },
                 "sink": {
                     "type": "http",
-                    "endpoint_url": endpoint.clone(),
+                    "endpoint_url": endpoint,
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
                     "flush_interval_ms": 100,
@@ -6305,7 +6313,7 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
                 "sampling": { "rate": 0.0, "always_capture_on_error": false },
                 "sink": {
                     "type": "http",
-                    "endpoint_url": endpoint.clone(),
+                    "endpoint_url": endpoint,
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
                     "flush_interval_ms": 100,
@@ -7089,4 +7097,472 @@ fn retained_record_contract_matches_documented_formula() {
         max_retained_record_bytes(100, 50, 200),
         100 + 200 + MAX_MODEL_BYTES + MAX_TOOL_NAMES_AGGREGATE_BYTES
     );
+}
+
+// ---------------------------------------------------------------------------
+// Acknowledgement drain/validation, retained-byte budget, stream reservation
+// lifetime, bounded redaction, and capped streaming HMAC (#3048-#3052).
+// ---------------------------------------------------------------------------
+
+/// Drive one buffered request+response capture over `plugin` so exactly one
+/// record reaches the sink.
+async fn emit_one_record(plugin: &AiTranscriptAudit) -> RequestContext {
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    ctx
+}
+
+/// Poll the authenticated status snapshot until `sink_healthy` matches.
+async fn wait_for_sink_health(plugin: &AiTranscriptAudit, expected: bool) -> bool {
+    for _ in 0..100 {
+        if plugin.status_snapshot().sink_healthy == expected {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A 2xx whose acknowledgement body overruns the configured bound is an
+/// ambiguous delivery: health must NOT publish from the status line, and
+/// `on_sink_error: reject` must start rejecting.
+#[tokio::test]
+async fn oversized_acknowledgement_body_marks_sink_unhealthy_and_rejects() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("A".repeat(8192)))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "ack_max_bytes": 64,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    assert!(
+        plugin.status_snapshot().sink_healthy,
+        "a fresh instance starts healthy"
+    );
+
+    emit_one_record(&plugin).await;
+    assert!(
+        wait_for_sink_health(&plugin, false).await,
+        "a 2xx whose acknowledgement exceeded ack_max_bytes must not publish healthy"
+    );
+
+    // Fail-closed admission must observe the unhealthy sink.
+    let mut ctx = make_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "on_sink_error=reject must reject while the acknowledgement contract is failing"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected")
+    );
+}
+
+/// `ack_policy: json` rejects a 2xx acknowledgement that reports lost records,
+/// and accepts a clean one. Neither path may leak acknowledgement bytes.
+#[tokio::test]
+async fn json_acknowledgement_policy_distinguishes_reported_failures_from_success() {
+    for (body, expect_healthy) in [
+        (r#"{"status":"ok","errors":0}"#, true),
+        (r#"{"status":"ok","errors":3}"#, false),
+        (r#"{"status":"partial_failure"}"#, false),
+        ("not json at all", false),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({
+                    "sink": {
+                        "type": "http",
+                        "endpoint_url": endpoint.clone(),
+                        "allow_insecure_loopback": true,
+                        "batch_size": 1,
+                        "flush_interval_ms": 100,
+                        "max_retries": 0,
+                        "ack_policy": "json"
+                    }
+                }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        emit_one_record(&plugin).await;
+        // Wait for the batch to be delivered before reading health, so the
+        // "healthy" case is not just the untouched startup default.
+        let _ = wait_for_records(&server).await;
+        assert!(
+            wait_for_sink_health(&plugin, expect_healthy).await,
+            "acknowledgement {body:?} should publish sink_healthy={expect_healthy}"
+        );
+    }
+}
+
+/// The aggregate retained-byte budget bounds queued records even though the
+/// record COUNT capacity is nowhere near full.
+#[tokio::test]
+async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "buffer_max_bytes": 65536
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 50,
+                    // Count capacity stays far above what the byte budget admits.
+                    "buffer_capacity": 10000,
+                    "max_retries": 0
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut dropped = 0usize;
+    for _ in 0..24 {
+        let ctx = emit_one_record(&plugin).await;
+        if ctx
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str)
+            == Some("dropped")
+        {
+            dropped += 1;
+        }
+    }
+    let snapshot = plugin.status_snapshot();
+    assert!(
+        dropped > 0,
+        "aggregate retained bytes must bound admission before the count capacity does"
+    );
+    assert!(
+        snapshot.retained_byte_drops > 0,
+        "budget saturation must be observable on authenticated status"
+    );
+    assert!(
+        snapshot.retained_bytes <= snapshot.buffer_max_bytes,
+        "charged bytes {} exceeded the budget {}",
+        snapshot.retained_bytes,
+        snapshot.buffer_max_bytes
+    );
+}
+
+/// A record that is delivered releases its retained-byte lease.
+#[tokio::test]
+async fn delivered_record_releases_its_retained_bytes() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    emit_one_record(&plugin).await;
+    assert_eq!(wait_for_records(&server).await.len(), 1);
+
+    let mut released = false;
+    for _ in 0..100 {
+        if plugin.status_snapshot().retained_bytes == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(released, "a delivered record must release its byte lease");
+}
+
+/// An active stream that never terminates cannot hold its staging entry and
+/// reserved commit permit forever.
+#[tokio::test]
+async fn never_ending_stream_reservation_expires_and_releases_capacity() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "limits": { "max_stream_reservation_secs": 1 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "on_buffer_full": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut stuck = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut stuck, &json_headers(), ai_request_body())
+        .await;
+    // Reaching stream selection with a reserved commit permit is exactly the
+    // state the old sweeper exempted from the TTL unconditionally.
+    plugin.on_response_stream_selected(&stuck, 200, Some("text/event-stream"));
+    let held = plugin.status_snapshot().retained_bytes;
+    assert!(held > 0, "an active stream reservation charges bytes");
+    assert_eq!(plugin.status_snapshot().stream_reservations_expired, 0);
+
+    // The stream never terminates: no terminal hook, no `on_end`.
+    tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+
+    // Any later admission runs the amortized sweep.
+    let mut later = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut later, &json_headers(), ai_request_body())
+        .await;
+
+    let snapshot = plugin.status_snapshot();
+    assert_eq!(
+        snapshot.stream_reservations_expired, 1,
+        "the abandoned stream reservation must be reclaimed and counted"
+    );
+    assert_eq!(snapshot.max_stream_reservation_secs, 1);
+}
+
+/// A body larger than `limits.max_redaction_scan_bytes` must not be parsed,
+/// scanned, or copied for an excerpt: capture fails closed with an explicit,
+/// compiled-in reason while hashes and metadata still export.
+#[tokio::test]
+async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
+    let filler = "z".repeat(16_384);
+    let body =
+        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "max_redaction_scan_bytes": 4096
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert!(
+        record.get("request_body").is_none(),
+        "an over-limit body must not be redacted or exported: {record}"
+    );
+    assert_eq!(record["request_body_omitted_reason"], "redaction_scan_limit");
+    assert_eq!(record["request_body_truncated"], true);
+    assert!(
+        record["request_hash"].is_string(),
+        "the keyed request hash still exports"
+    );
+    assert!(
+        !serde_json::to_string(record).unwrap().contains(&filler),
+        "no part of the oversized payload may reach the sink"
+    );
+}
+
+/// The streamed keyed digest stops at the documented capture bound by default,
+/// and a capped digest is explicitly marked, byte-counted, and domain-separated
+/// from the full-stream digest of the same prefix.
+#[tokio::test]
+async fn streaming_hash_is_capped_by_default_and_marked_partial() {
+    async fn stream_record(stream_hash: &str, chunk: &[u8]) -> Value {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({
+                    "capture": { "streaming_response": true, "stream_hash": stream_hash },
+                    "limits": {
+                        "max_request_bytes": 1024,
+                        "max_response_bytes": 1024,
+                        "max_stream_capture_bytes": 1024
+                    }
+                }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+            .await;
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let _ = inspector.on_chunk(chunk).await;
+        let _ = inspector.on_end().await;
+        drop(inspector);
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1);
+        records[0].clone()
+    }
+
+    let chunk = vec![b'd'; 8192];
+    let capped = stream_record("capped", &chunk).await;
+    assert_eq!(capped["response_hash_scope"], "partial");
+    assert_eq!(capped["response_hash_bytes"], 1024);
+    assert_eq!(capped["response_body_truncated"], true);
+    assert_eq!(
+        capped["response_body_omitted_reason"],
+        "stream_truncation_boundary"
+    );
+
+    let full = stream_record("full", &chunk).await;
+    assert_eq!(full["response_hash_scope"], "full");
+    assert_eq!(full["response_hash_bytes"], 8192);
+    assert_ne!(
+        capped["response_hash"], full["response_hash"],
+        "a capped digest must be domain-separated from a full-stream digest"
+    );
+}
+
+/// The new bounds are admitted, range-checked, and cross-checked.
+#[tokio::test]
+async fn new_bound_configuration_is_range_checked() {
+    for overrides in [
+        json!({ "capture": { "stream_hash": "everything" } }),
+        json!({ "limits": { "max_redaction_scan_bytes": 16 } }),
+        json!({ "limits": { "max_redaction_scan_bytes": 99_999_999 } }),
+        json!({ "limits": { "max_stream_reservation_secs": 0 } }),
+        json!({ "limits": { "max_stream_reservation_secs": 999_999 } }),
+        json!({ "limits": { "max_entry_bytes": 2048 } }),
+        json!({ "limits": { "buffer_max_bytes": 1024 } }),
+    ] {
+        let config = config_with_sink("https://audit.example.com/x", overrides.clone());
+        assert!(
+            AiTranscriptAudit::new(&config, loopback_http_client()).is_err(),
+            "out-of-range bound must fail closed: {overrides}"
+        );
+    }
+    for sink_override in [
+        json!({ "ack_policy": "maybe" }),
+        json!({ "ack_max_bytes": 8 }),
+        json!({ "ack_max_bytes": 99_999_999 }),
+        json!({ "ack_timeout_ms": 0 }),
+        json!({ "ack_timeout_ms": 999_999 }),
+    ] {
+        let mut sink = json!({
+            "type": "http",
+            "endpoint_url": "https://audit.example.com/x"
+        });
+        for (key, value) in sink_override.as_object().expect("object") {
+            sink.as_object_mut()
+                .expect("object")
+                .insert(key.clone(), value.clone());
+        }
+        assert!(
+            AiTranscriptAudit::new(&json!({ "sink": sink }), loopback_http_client()).is_err(),
+            "out-of-range acknowledgement bound must fail closed: {sink_override}"
+        );
+    }
+
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("defaults are admissible");
+    let snapshot = plugin.status_snapshot();
+    assert_eq!(snapshot.stream_hash_scope, "capped");
+    assert_eq!(snapshot.ack_policy, "drain");
+    assert_eq!(snapshot.ack_max_bytes, 65_536);
+    assert_eq!(snapshot.ack_timeout_ms, 1_000);
+    assert_eq!(snapshot.max_stream_reservation_secs, 900);
+    assert_eq!(snapshot.max_redaction_scan_bytes, 1_048_576);
+    assert!(snapshot.max_entry_bytes >= snapshot.max_retained_record_bytes);
+    assert!(snapshot.buffer_max_bytes >= snapshot.max_entry_bytes);
 }

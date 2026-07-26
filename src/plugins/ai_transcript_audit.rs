@@ -44,11 +44,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
+use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use super::utils::response_body::{
+    BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
+};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger, LoggerHooks,
-    PluginHttpClient, build_batch_config, handle_http_batch_response, parse_http_endpoint,
-    validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
+    HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
+    parse_http_endpoint, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -84,6 +88,7 @@ pub const AI_TRANSCRIPT_AUDIT_CAPTURE_KEYS: &[&str] = &[
     "streaming_response",
     "headers",
     "tool_calls",
+    "stream_hash",
 ];
 
 /// Accepted keys under `sampling`.
@@ -111,6 +116,10 @@ pub const AI_TRANSCRIPT_AUDIT_LIMITS_KEYS: &[&str] = &[
     "max_request_bytes",
     "max_response_bytes",
     "max_stream_capture_bytes",
+    "max_redaction_scan_bytes",
+    "max_entry_bytes",
+    "buffer_max_bytes",
+    "max_stream_reservation_secs",
 ];
 
 /// Accepted keys under `privacy`.
@@ -138,6 +147,9 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "retry_delay_ms",
     "on_buffer_full",
     "on_sink_error",
+    "ack_policy",
+    "ack_max_bytes",
+    "ack_timeout_ms",
 ];
 
 /// Env-var namespace that transcript-sink custom headers may reference. A
@@ -149,8 +161,8 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
 const SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_";
 
 /// Deployment-safe hard maximum for `limits.max_request_bytes` (1 MiB). Aligns
-/// with shared logger `HARD_MAX_ENTRY_BYTES` so a single excerpt cannot exceed
-/// what sink byte budgets can sanely retain.
+/// with the shared logger entry ceiling so a single excerpt cannot exceed what
+/// sink byte budgets can sanely retain.
 pub const HARD_MAX_REQUEST_BYTES: usize = 1_048_576;
 /// Deployment-safe hard maximum for `limits.max_response_bytes` (1 MiB).
 pub const HARD_MAX_RESPONSE_BYTES: usize = 1_048_576;
@@ -171,16 +183,99 @@ pub const MAX_TOOL_NAME_BYTES: usize = 128;
 /// Hard bound on the aggregate UTF-8 bytes of all retained tool/function names.
 pub const MAX_TOOL_NAMES_AGGREGATE_BYTES: usize = 4_096;
 
-/// Above this many staged entries, opportunistically drop expired orphans (a
-/// request that never reached the `log` hook). The common path removes staging
-/// at emit/log time, so this only guards pathological cases.
-const STAGING_SWEEP_THRESHOLD: usize = 512;
+/// Hard maximum for `limits.max_redaction_scan_bytes` (8 MiB). Above this a
+/// single redacted capture could dominate a worker's CPU/allocation budget no
+/// matter how small the exported excerpt limit is.
+pub const HARD_MAX_REDACTION_SCAN_BYTES: usize = 8_388_608;
+/// Minimum admitted `limits.max_redaction_scan_bytes`. Keeps the bound above
+/// any realistic small AI request so an ordinary prompt is never skipped.
+pub const MIN_REDACTION_SCAN_BYTES: usize = 4_096;
+/// Default hard processing bound for redaction shaping (1 MiB). Bodies larger
+/// than this are never parsed/scanned/copied for a redacted excerpt; capture
+/// fails closed (body omitted with an explicit reason) instead.
+pub const DEFAULT_MAX_REDACTION_SCAN_BYTES: usize = 1_048_576;
+
+/// Fixed envelope allowance charged on top of the per-record body+metadata
+/// contract: record id, timestamps, namespace/proxy/consumer/path strings,
+/// token/cache/guardrail maps, and JSON framing.
+pub const RECORD_ENVELOPE_OVERHEAD_BYTES: usize = 8_192;
+/// Fixed allowance charged for one staged candidate on top of its excerpt and
+/// bounded model/tool metadata (record id, hashes, map/vec headers).
+pub const STAGING_ENTRY_OVERHEAD_BYTES: usize = 1_024;
+/// Retained copies charged for one admitted record: the queued `AuditRecord`
+/// plus the contiguous serialized batch payload built at flush time.
+pub const RECORD_RETAINED_COPIES: usize = 2;
+/// Default aggregate retained-byte budget for one plugin instance (128 MiB),
+/// covering staged candidates, pre-commit reservations, and queued records.
+///
+/// This is deliberately generous relative to the per-record contract: a
+/// fail-closed (`on_buffer_full: reject`) deployment reserves worst-case
+/// response bytes per in-flight candidate, and the budget must admit a normal
+/// concurrency level before it starts refusing. Operators who want a tighter
+/// memory ceiling lower `limits.buffer_max_bytes`; those with very large
+/// capture limits raise it toward [`HARD_MAX_RETAINED_BUFFER_BYTES`].
+pub const DEFAULT_RETAINED_BUFFER_MAX_BYTES: usize = 134_217_728;
+/// Hard maximum aggregate retained-byte budget for one plugin instance.
+pub const HARD_MAX_RETAINED_BUFFER_BYTES: usize = 268_435_456;
+/// Minimum admitted `limits.buffer_max_bytes`. Must still fit one maximal
+/// record, which is separately enforced against `max_entry_bytes`.
+pub const MIN_RETAINED_BUFFER_BYTES: usize = 65_536;
+/// Hard maximum for `limits.max_entry_bytes`.
+pub const HARD_MAX_RECORD_ENTRY_BYTES: usize = 16_777_216;
+
+/// Default bound on how long one active stream may hold a staging entry and its
+/// reserved commit permit (15 minutes). Long-lived SSE completions finish well
+/// inside this; an abandoned or never-ending stream does not hold a reservation
+/// forever.
+pub const DEFAULT_MAX_STREAM_RESERVATION_SECS: u64 = 900;
+/// Hard maximum for `limits.max_stream_reservation_secs` (24 hours).
+pub const HARD_MAX_STREAM_RESERVATION_SECS: u64 = 86_400;
+/// Minimum admitted `limits.max_stream_reservation_secs`.
+pub const MIN_STREAM_RESERVATION_SECS: u64 = 1;
+
+/// Default bound on the acknowledgement body drained and validated from the
+/// collector before sink health is published.
+pub const DEFAULT_ACK_MAX_BYTES: usize = 65_536;
+/// Hard maximum for `sink.ack_max_bytes`; shares the gateway-wide HTTP batch
+/// acknowledgement ceiling so no log sink can read a larger ACK.
+pub const HARD_MAX_ACK_BYTES: usize = HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES;
+/// Minimum admitted `sink.ack_max_bytes`.
+pub const MIN_ACK_BYTES: usize = 64;
+/// Default acknowledgement drain/validate timeout in milliseconds.
+pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 1_000;
+/// Hard maximum `sink.ack_timeout_ms`; a stalled ACK must never pin the flush
+/// worker for longer than this.
+pub const MAX_ACK_TIMEOUT_MS: u64 = 30_000;
+/// Minimum admitted `sink.ack_timeout_ms`.
+pub const MIN_ACK_TIMEOUT_MS: u64 = 1;
+
+/// Domain-separation suffix mixed into a keyed stream digest that covered only
+/// a bounded prefix of the response. A capped digest can therefore never be
+/// mistaken for — or collide with — a full-stream digest of the same bytes.
+const PARTIAL_STREAM_HASH_DOMAIN: &[u8] = b"\x00ferrum-transcript-partial-stream-v1:";
+
+/// `response_hash` covers the complete observed body.
+const HASH_SCOPE_FULL: &str = "full";
+/// `response_hash` covers only a bounded prefix (see `response_hash_bytes`).
+const HASH_SCOPE_PARTIAL: &str = "partial";
+
+/// Body omitted because the raw payload exceeded `limits.max_redaction_scan_bytes`
+/// and a safe bounded redaction of it was not possible.
+const OMIT_REASON_REDACTION_SCAN_LIMIT: &str = "redaction_scan_limit";
+/// Body omitted because a cap-truncated redacted stream could have cut through
+/// an unmatched secret prefix.
+const OMIT_REASON_STREAM_TRUNCATION: &str = "stream_truncation_boundary";
+/// Body omitted because the instance's aggregate retained-byte budget could not
+/// admit the refreshed excerpt.
+const OMIT_REASON_RETAINED_BYTE_BUDGET: &str = "retained_byte_budget";
+
 /// Hard bound for in-flight request excerpts and permits. At the default
 /// fail-open policy, excess candidates are omitted; fail-closed policies reject
 /// instead of forwarding a transaction that cannot be staged.
 const MAX_STAGING_ENTRIES: usize = 4096;
-/// Amortize orphan cleanup so request admission never repeats a full shared-map
-/// scan for every request while the live set remains above the threshold.
+/// Amortize orphan/reservation cleanup so request admission never repeats a
+/// full shared-map scan for every request. Clamped down at construction when
+/// `limits.max_stream_reservation_secs` is shorter than twice this interval.
 const STAGING_SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// Per-record retained-memory contract (bodies + bounded request-derived
@@ -261,6 +356,56 @@ enum StreamingCapture {
     Sampled,
 }
 
+/// How much of a streamed response the keyed HMAC covers.
+///
+/// **Security contract.** The exported `response_hash` is a *tamper-evidence
+/// and correlation* token over the transcript this plugin captured — it is not
+/// a full-body integrity attestation for the client's byte stream (the plugin
+/// forwards bytes it never re-derives, and abnormally terminated or downstream
+/// cut streams already omit the hash entirely). `Capped` therefore stops
+/// hashing at `limits.max_stream_capture_bytes`, matching the documented
+/// retention bound, and marks the digest `partial` with its exact covered byte
+/// count plus domain separation. Deployments that genuinely require a
+/// full-stream digest (for example an external evidence chain that re-hashes
+/// the provider's complete response) opt into `Full` explicitly and accept the
+/// unbounded per-byte keyed-hashing cost that comes with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamHashScope {
+    /// Hash the first `limits.max_stream_capture_bytes` only (default).
+    Capped,
+    /// Hash every streamed byte, however long the stream runs.
+    Full,
+}
+
+impl StreamHashScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            StreamHashScope::Capped => "capped",
+            StreamHashScope::Full => "full",
+        }
+    }
+}
+
+/// How a collector acknowledgement is validated before sink health is published.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AckPolicy {
+    /// Read the acknowledgement to EOF under the configured byte bound and
+    /// timeout, discarding the bytes. Content is not inspected.
+    Drain,
+    /// Additionally require the acknowledgement to be a JSON object that does
+    /// not report per-record failures.
+    Json,
+}
+
+impl AckPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            AckPolicy::Drain => "drain",
+            AckPolicy::Json => "json",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BufferFullPolicy {
     Drop,
@@ -313,6 +458,7 @@ struct CaptureConfig {
     streaming: StreamingCapture,
     headers: bool,
     tool_calls: bool,
+    stream_hash: StreamHashScope,
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +474,16 @@ struct LimitsConfig {
     max_request_bytes: usize,
     max_response_bytes: usize,
     max_stream_capture_bytes: usize,
+    /// Hard processing bound for redaction shaping. Raw payloads above this are
+    /// never parsed/scanned/copied; capture fails closed instead.
+    max_redaction_scan_bytes: usize,
+    /// Per-record retained-byte admission ceiling.
+    max_entry_bytes: usize,
+    /// Aggregate retained-byte budget across staging, reservations, and the
+    /// queued records of one plugin instance.
+    buffer_max_bytes: usize,
+    /// Maximum lifetime of one active stream's staging entry + commit permit.
+    max_stream_reservation: Duration,
 }
 
 impl LimitsConfig {
@@ -338,6 +494,32 @@ impl LimitsConfig {
             self.max_stream_capture_bytes,
         )
     }
+
+    /// Minimum admissible `max_entry_bytes`: the coherent per-record body +
+    /// bounded-metadata contract plus the fixed envelope allowance, charged for
+    /// every retained copy. Configuring below this would make every record
+    /// inadmissible, so it is rejected at construction rather than silently
+    /// dropping all traffic.
+    fn min_entry_bytes(self) -> usize {
+        accounted_record_bytes(
+            self.max_retained_record_bytes()
+                .saturating_add(RECORD_ENVELOPE_OVERHEAD_BYTES),
+        )
+    }
+}
+
+/// Retained copies charged for one admitted record (queued struct + serialized
+/// batch payload).
+const fn accounted_record_bytes(record_bytes: usize) -> usize {
+    record_bytes.saturating_mul(RECORD_RETAINED_COPIES)
+}
+
+/// Acknowledgement drain/validation bounds applied before sink health publishes.
+#[derive(Clone, Copy)]
+struct AckConfig {
+    policy: AckPolicy,
+    max_bytes: usize,
+    timeout: Duration,
 }
 
 /// Authenticated `/health`/`/status` snapshot of admitted capture ceilings.
@@ -357,6 +539,30 @@ pub struct AiTranscriptAuditSnapshot {
     pub max_tool_name_bytes: u64,
     pub max_tool_names_aggregate_bytes: u64,
     pub max_retained_record_bytes: u64,
+    /// Hard processing bound for redacted-capture shaping.
+    pub max_redaction_scan_bytes: u64,
+    /// Per-record retained-byte admission ceiling.
+    pub max_entry_bytes: u64,
+    /// Aggregate retained-byte budget for this instance.
+    pub buffer_max_bytes: u64,
+    /// Aggregate retained bytes currently charged (staging + reservations +
+    /// queued records). Live gauge, never content.
+    pub retained_bytes: u64,
+    /// Admissions refused because the aggregate retained-byte budget was full.
+    pub retained_byte_drops: u64,
+    /// Maximum lifetime of one active stream's staging entry + commit permit.
+    pub max_stream_reservation_secs: u64,
+    /// Stream reservations reclaimed by the sweeper after exceeding that
+    /// lifetime. A non-zero value means streams are outliving their bound.
+    pub stream_reservations_expired: u64,
+    /// `capped` or `full` — how much of a stream the keyed digest covers.
+    pub stream_hash_scope: &'static str,
+    /// `drain` or `json` — how a collector acknowledgement is validated.
+    pub ack_policy: &'static str,
+    pub ack_max_bytes: u64,
+    pub ack_timeout_ms: u64,
+    /// Whether the last completed batch delivery published a healthy sink.
+    pub sink_healthy: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -373,10 +579,19 @@ struct PrivacyConfig {
 struct AuditStaging {
     /// Holds one slot in the hard in-flight staging bound.
     _staging_permit: OwnedSemaphorePermit,
+    /// Aggregate retained-byte lease covering this staged candidate's excerpt
+    /// and bounded metadata. Released on every removal path (emit, discard,
+    /// TTL sweep, reservation expiry) because the lease drops with the entry.
+    retained_lease: Arc<ByteLease>,
+    /// Bytes currently charged by `retained_lease` (leases shrink, never grow;
+    /// a larger refreshed excerpt re-acquires).
+    retained_bytes: usize,
     captured_at: Instant,
     sample_hit: bool,
     request_excerpt: Option<String>,
     request_truncated: bool,
+    /// Compiled-in reason the request excerpt was withheld (never a value).
+    request_body_omitted_reason: Option<&'static str>,
     request_hash: Option<String>,
     request_model: Option<String>,
     request_model_truncated: bool,
@@ -389,10 +604,20 @@ struct AuditStaging {
     /// truncation/omission occurred; never raw excess bytes.
     tool_names_hash: Option<String>,
     commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
+    /// Retained-byte reservation (lease, reserved bytes) held alongside
+    /// `commit_permit` so a fail-closed admission that promised queue capacity
+    /// also promised the bytes that record will retain. Consumed (shrunk to the
+    /// exact record size) at enqueue; released with the entry on every other
+    /// path.
+    commit_lease: Option<(Arc<ByteLease>, usize)>,
     /// True only after the response path confirms that this transaction is
     /// actively streaming. A pre-commit reservation alone is not sufficient:
     /// requests abandoned before stream selection must remain TTL-collectable.
     stream_active: bool,
+    /// When `stream_active` was set. The sweeper bounds how long an active
+    /// stream may hold this entry and its reserved permit, so a never-ending
+    /// or terminal-hook-losing stream cannot pin capacity forever.
+    stream_active_since: Option<Instant>,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -401,7 +626,26 @@ struct AuditStaging {
 struct StreamCaptured {
     response_excerpt: Option<String>,
     response_truncated: bool,
+    response_body_omitted_reason: Option<&'static str>,
     response_hash: String,
+    /// `full` when the digest covered every streamed byte, `partial` when it
+    /// stopped at the configured stream-hash bound.
+    response_hash_scope: &'static str,
+    /// Exact number of response bytes the digest covered.
+    response_hash_bytes: u64,
+}
+
+/// Response-side capture handed to `build_record`. Bundled so every emission
+/// path (buffered, stream-terminal, log fallback) carries the same evidence
+/// fields and cannot drift apart.
+#[derive(Default)]
+struct ResponseCapture {
+    excerpt: Option<String>,
+    truncated: bool,
+    omitted_reason: Option<&'static str>,
+    hash: Option<String>,
+    hash_scope: Option<&'static str>,
+    hash_bytes: Option<u64>,
 }
 
 struct StreamSlot {
@@ -455,12 +699,24 @@ struct AuditRecord {
     request_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_hash: Option<String>,
+    /// `full` or `partial` — how much of the observed response the keyed
+    /// `response_hash` covers. Present whenever `response_hash` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_hash_scope: Option<&'static str>,
+    /// Exact byte count the keyed `response_hash` covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_hash_bytes: Option<u64>,
     request_body_truncated: bool,
     response_body_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_body: Option<String>,
+    /// Compiled-in reason a body excerpt was withheld (never a captured value).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_body_omitted_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_body_omitted_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     tokens: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -481,6 +737,51 @@ struct AuditRecord {
     tool_names_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+    /// Aggregate retained-byte lease for this queued record. Never exported;
+    /// released when the last clone drops — after a successful flush, after a
+    /// failed-batch hook discards it, or if the queue is dropped at shutdown.
+    #[serde(skip)]
+    retained_lease: Option<Arc<ByteLease>>,
+}
+
+impl AuditRecord {
+    /// Exact retained bytes of the owned strings/collections in this record,
+    /// plus the fixed envelope allowance, charged for every retained copy.
+    fn accounted_bytes(&self) -> usize {
+        let mut bytes = RECORD_ENVELOPE_OVERHEAD_BYTES;
+        for value in [
+            &self.request_body,
+            &self.response_body,
+            &self.request_hash,
+            &self.response_hash,
+            &self.model,
+            &self.model_hash,
+            &self.tool_names_hash,
+            &self.path,
+            &self.consumer_username,
+            &self.client_ip,
+            &self.proxy_id,
+            &self.proxy_name,
+        ] {
+            if let Some(value) = value {
+                bytes = bytes.saturating_add(value.len());
+            }
+        }
+        for name in &self.tool_names {
+            bytes = bytes.saturating_add(name.len());
+        }
+        for map in [&self.tokens, &self.cache, &self.guardrails] {
+            for (key, value) in map {
+                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            }
+        }
+        if let Some(headers) = self.headers.as_ref() {
+            for (key, value) in headers {
+                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+            }
+        }
+        accounted_record_bytes(bytes)
+    }
 }
 
 fn is_zero_u32(value: &u32) -> bool {
@@ -584,6 +885,8 @@ struct HttpFlushConfig {
     custom_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     http_client: PluginHttpClient,
     sink_healthy: Arc<AtomicBool>,
+    /// Acknowledgement bound/timeout/validation applied before health publishes.
+    ack: AckConfig,
 }
 
 /// One segment of a custom-header value template.
@@ -626,12 +929,24 @@ pub struct AiTranscriptAudit {
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
     staging_permits: Arc<Semaphore>,
+    /// Aggregate retained-byte budget covering staged candidates, pre-commit
+    /// reservations, and queued records. Record-count capacity alone cannot
+    /// bound attacker-shaped payload retention.
+    retained_budget: Arc<ByteBudget>,
+    /// Stream reservations reclaimed by the sweeper after exceeding the
+    /// configured maximum reservation age.
+    stream_reservations_expired: Arc<AtomicU64>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
     /// `true` when at least one capture path is enabled (validated in `new`).
     active: bool,
     staging_ttl: Duration,
+    /// Amortization interval between staging sweeps. Normally
+    /// [`STAGING_SWEEP_INTERVAL_SECS`], but never longer than half the
+    /// configured stream-reservation bound — a 60s sweep would make a short
+    /// `limits.max_stream_reservation_secs` meaningless.
+    staging_sweep_interval_secs: u64,
     /// Monotonic process-relative second at which another staging sweep may run.
     next_staging_sweep_at: AtomicU64,
     /// Process-local id published into authenticated `/health` after commit.
@@ -682,12 +997,24 @@ impl AiTranscriptAudit {
         )?;
         let capture_obj = cfg_object(config, "capture", "capture")?.unwrap_or(&empty);
         let streaming = cfg_streaming(capture_obj, "streaming_response")?;
+        let stream_hash_value = cfg_str(capture_obj, "stream_hash", "capture")?.unwrap_or("capped");
+        let stream_hash = match stream_hash_value {
+            "capped" => StreamHashScope::Capped,
+            "full" => StreamHashScope::Full,
+            other => {
+                return Err(format!(
+                    "ai_transcript_audit: 'capture.stream_hash' must be 'capped' or 'full' \
+                     (got {other:?})"
+                ));
+            }
+        };
         let capture = CaptureConfig {
             request: cfg_bool(capture_obj, "request", true, "capture")?,
             response: cfg_bool(capture_obj, "response", true, "capture")?,
             streaming,
             headers: cfg_bool(capture_obj, "headers", false, "capture")?,
             tool_calls: cfg_bool(capture_obj, "tool_calls", true, "capture")?,
+            stream_hash,
         };
         if !capture.request && !capture.response && streaming == StreamingCapture::Off {
             return Err(
@@ -903,6 +1230,47 @@ impl AiTranscriptAudit {
             }
         };
 
+        // ---- acknowledgement contract ----
+        // Sink health must never be published from response headers alone: a
+        // 2xx whose acknowledgement stalls, overruns its bound, or fails
+        // transport is an ambiguous delivery, and under `on_sink_error: reject`
+        // fail-closed admission would otherwise keep admitting traffic against
+        // a demonstrably failing collector.
+        let ack_policy = match cfg_str(sink_obj, "ack_policy", "sink")?.unwrap_or("drain") {
+            "drain" => AckPolicy::Drain,
+            "json" => AckPolicy::Json,
+            other => {
+                return Err(format!(
+                    "ai_transcript_audit: 'sink.ack_policy' must be 'drain' or 'json' \
+                     (got {other:?})"
+                ));
+            }
+        };
+        let ack_max_bytes = cfg_positive_usize_capped(
+            sink_obj,
+            "ack_max_bytes",
+            DEFAULT_ACK_MAX_BYTES,
+            "sink",
+            HARD_MAX_ACK_BYTES,
+        )?;
+        if ack_max_bytes < MIN_ACK_BYTES {
+            return Err(format!(
+                "ai_transcript_audit: 'sink.ack_max_bytes' must be >= {MIN_ACK_BYTES}"
+            ));
+        }
+        let ack_timeout_ms = cfg_u64(sink_obj, "ack_timeout_ms", DEFAULT_ACK_TIMEOUT_MS, "sink")?;
+        if !(MIN_ACK_TIMEOUT_MS..=MAX_ACK_TIMEOUT_MS).contains(&ack_timeout_ms) {
+            return Err(format!(
+                "ai_transcript_audit: 'sink.ack_timeout_ms' must be between \
+                 {MIN_ACK_TIMEOUT_MS} and {MAX_ACK_TIMEOUT_MS}"
+            ));
+        }
+        let ack = AckConfig {
+            policy: ack_policy,
+            max_bytes: ack_max_bytes,
+            timeout: Duration::from_millis(ack_timeout_ms),
+        };
+
         // ---- deferred background worker ----
         let shard_amount = http_client.pool_shard_amount();
         let sink_healthy = Arc::new(AtomicBool::new(true));
@@ -912,9 +1280,13 @@ impl AiTranscriptAudit {
             custom_headers: Arc::new(Vec::new()),
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
+            ack,
         };
         let batch_config = build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults)?;
 
+        let staging_sweep_interval_secs = STAGING_SWEEP_INTERVAL_SECS
+            .min(limits.max_stream_reservation.as_secs() / 2)
+            .max(1);
         let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = std::env::var("FERRUM_NAMESPACE")
             .ok()
@@ -938,11 +1310,17 @@ impl AiTranscriptAudit {
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
             staging_permits: Arc::new(Semaphore::new(MAX_STAGING_ENTRIES)),
+            retained_budget: Arc::new(ByteBudget::new(
+                "ai_transcript_audit",
+                limits.buffer_max_bytes,
+            )),
+            stream_reservations_expired: Arc::new(AtomicU64::new(0)),
             pending_streams: Arc::new(DashMap::with_shard_amount(shard_amount)),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
             staging_ttl: Duration::from_secs(60 * 60),
+            staging_sweep_interval_secs,
             next_staging_sweep_at: AtomicU64::new(0),
             status_id: OnceLock::new(),
         })
@@ -969,6 +1347,18 @@ impl AiTranscriptAudit {
             max_tool_name_bytes: MAX_TOOL_NAME_BYTES as u64,
             max_tool_names_aggregate_bytes: MAX_TOOL_NAMES_AGGREGATE_BYTES as u64,
             max_retained_record_bytes: self.limits.max_retained_record_bytes() as u64,
+            max_redaction_scan_bytes: self.limits.max_redaction_scan_bytes as u64,
+            max_entry_bytes: self.limits.max_entry_bytes as u64,
+            buffer_max_bytes: self.limits.buffer_max_bytes as u64,
+            retained_bytes: self.retained_budget.used() as u64,
+            retained_byte_drops: self.retained_budget.drops_total(),
+            max_stream_reservation_secs: self.limits.max_stream_reservation.as_secs(),
+            stream_reservations_expired: self.stream_reservations_expired.load(Ordering::Relaxed),
+            stream_hash_scope: self.capture.stream_hash.as_str(),
+            ack_policy: self.flush_config.ack.policy.as_str(),
+            ack_max_bytes: self.flush_config.ack.max_bytes as u64,
+            ack_timeout_ms: self.flush_config.ack.timeout.as_millis() as u64,
+            sink_healthy: self.sink_healthy.load(Ordering::Relaxed),
         }
     }
 
@@ -990,21 +1380,104 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn enqueue(&self, record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
+    fn enqueue(&self, mut record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
         if !self.rate_limiter.try_acquire() {
             return SinkOutcome::Dropped;
         }
-        if let Some(permit) = staging.and_then(|staging| staging.commit_permit.take()) {
+        // Charge the aggregate retained-byte budget BEFORE the record is
+        // published to the queue. A record-count capacity alone cannot bound
+        // attacker-shaped payload retention (queue depth x per-record bytes),
+        // so admission is (count AND bytes), enforced atomically.
+        let accounted = record.accounted_bytes();
+        let (permit, staged_lease) = match staging {
+            Some(staging) => (staging.commit_permit.take(), staging.commit_lease.take()),
+            None => (None, None),
+        };
+        if accounted > self.limits.max_entry_bytes {
+            // Cannot happen while capture limits hold the per-record contract;
+            // refuse rather than retain an unaccounted record if it ever does.
+            self.retained_budget
+                .record_drop("record exceeded the admitted per-record retained-byte limit");
+            drop(permit);
+            drop(staged_lease);
+            return self.saturated_outcome();
+        }
+        let lease = match staged_lease {
+            // A fail-closed admission already reserved bytes for this record.
+            Some((lease, reserved)) if accounted <= reserved => {
+                lease.shrink_to(accounted);
+                lease
+            }
+            // The staged request excerpt grew after the reservation was taken
+            // (a request transform refreshed it). Re-acquire the exact amount
+            // if the budget allows; otherwise honor the reservation without
+            // exceeding it by withholding the variable-size excerpts, so a
+            // fail-closed promise is never paid for with unaccounted bytes.
+            Some((lease, reserved)) => match self.retained_budget.try_acquire(accounted) {
+                Some(exact) => exact,
+                None => {
+                    record.request_body = None;
+                    record.request_body_omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
+                    if record.accounted_bytes() > reserved {
+                        record.response_body = None;
+                        record.response_body_omitted_reason =
+                            Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
+                    }
+                    lease.shrink_to(record.accounted_bytes().min(reserved));
+                    lease
+                }
+            },
+            None => match self.retained_budget.try_acquire(accounted) {
+                Some(lease) => lease,
+                None => {
+                    drop(permit);
+                    return self.saturated_outcome();
+                }
+            },
+        };
+        record.retained_lease = Some(lease);
+
+        if let Some(permit) = permit {
             permit.send(record);
             return SinkOutcome::Queued;
         }
         if self.logger.try_send(record) {
             SinkOutcome::Queued
-        } else if self.on_buffer_full == BufferFullPolicy::Reject {
+        } else {
+            self.saturated_outcome()
+        }
+    }
+
+    /// Shared saturation verdict for the queue and the retained-byte budget:
+    /// fail-open configurations drop, fail-closed configurations reject.
+    fn saturated_outcome(&self) -> SinkOutcome {
+        if self.on_buffer_full == BufferFullPolicy::Reject {
             SinkOutcome::Rejected
         } else {
             SinkOutcome::Dropped
         }
+    }
+
+    /// Reserve the retained bytes a record this fail-closed admission promised
+    /// to enqueue could still grow to: the already-measured staged bytes plus
+    /// the worst-case response excerpt this configuration permits. Paired with
+    /// the queue permit so a promise of capacity is a promise of both a slot
+    /// and the bytes that slot will hold; `enqueue` shrinks it to the exact
+    /// size once the record is built.
+    fn reserve_commit_lease(&self, staged_bytes: usize) -> Option<(Arc<ByteLease>, usize)> {
+        let projected = accounted_record_bytes(
+            staged_bytes
+                .saturating_add(
+                    self.limits
+                        .max_response_bytes
+                        .max(self.limits.max_stream_capture_bytes),
+                )
+                .saturating_add(RECORD_ENVELOPE_OVERHEAD_BYTES),
+        )
+        .min(self.limits.max_entry_bytes);
+        self.retained_budget
+            .try_acquire(projected)
+            .map(|lease| (lease, projected))
     }
 
     fn commit_may_emit(&self, sample_hit: bool) -> bool {
@@ -1031,7 +1504,15 @@ impl AiTranscriptAudit {
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
                 return reject_audit_unavailable();
             };
+            // Both halves of the promise or neither: dropping `permit` here
+            // returns the queue slot.
+            let Some(reservation) = self.reserve_commit_lease(staging.retained_bytes) else {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                return reject_audit_unavailable();
+            };
             staging.commit_permit = Some(permit);
+            staging.commit_lease = Some(reservation);
         }
         if self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed)
@@ -1092,7 +1573,13 @@ impl AiTranscriptAudit {
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
                 return reject_audit_unavailable();
             };
+            let Some(reservation) = self.reserve_commit_lease(staging.retained_bytes) else {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                return reject_audit_unavailable();
+            };
             staging.commit_permit = Some(permit);
+            staging.commit_lease = Some(reservation);
         }
         if self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed)
@@ -1104,8 +1591,18 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
+    /// Reclaim staging entries whose owner will never return: orphaned
+    /// candidates past `staging_ttl`, and active-stream entries that have held
+    /// a reserved commit permit longer than `limits.max_stream_reservation`.
+    ///
+    /// The sweep runs on the same amortized 60s interval as before but is no
+    /// longer gated on a 512-entry high-water mark: a handful of never-ending
+    /// streams can exhaust the reserved queue slots without ever approaching
+    /// that threshold, so an entry-count gate would let the leak the bound
+    /// exists to stop pass through untouched. The scan is bounded by
+    /// [`MAX_STAGING_ENTRIES`] once a minute.
     fn sweep_staging(&self) {
-        if self.staging.len() < STAGING_SWEEP_THRESHOLD {
+        if self.staging.is_empty() {
             return;
         }
         let now_seconds = process_monotonic_seconds();
@@ -1115,7 +1612,7 @@ impl AiTranscriptAudit {
                 .next_staging_sweep_at
                 .compare_exchange(
                     next,
-                    now_seconds.saturating_add(STAGING_SWEEP_INTERVAL_SECS),
+                    now_seconds.saturating_add(self.staging_sweep_interval_secs),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
@@ -1125,10 +1622,44 @@ impl AiTranscriptAudit {
         }
         let now = Instant::now();
         let ttl = self.staging_ttl;
+        let max_reservation = self.limits.max_stream_reservation;
+        let mut expired_reservations: u64 = 0;
         self.staging.retain(|_, staging| {
-            (staging.stream_active && staging.commit_permit.is_some())
-                || now.duration_since(staging.captured_at) < ttl
+            if staging.stream_active && staging.commit_permit.is_some() {
+                // An active stream is exempt from the orphan TTL, but not from
+                // a lifetime of its own. `stream_active_since` is stamped by
+                // `on_response_stream_selected`; fall back to `captured_at` if
+                // an entry was somehow marked active without it, so an unset
+                // field can never mean "immortal".
+                let started = staging.stream_active_since.unwrap_or(staging.captured_at);
+                let held = now.duration_since(started);
+                if held < max_reservation {
+                    return true;
+                }
+                expired_reservations = expired_reservations.saturating_add(1);
+                // Dropping the entry releases the reserved queue permit, the
+                // staging semaphore permit, and both retained-byte leases. A
+                // stream that later terminates still emits a record — it just
+                // carries no request-side excerpt (see
+                // `on_response_stream_terminated`).
+                return false;
+            }
+            now.duration_since(staging.captured_at) < ttl
         });
+        if expired_reservations > 0 {
+            let total = self
+                .stream_reservations_expired
+                .fetch_add(expired_reservations, Ordering::Relaxed)
+                .saturating_add(expired_reservations);
+            tracing::warn!(
+                plugin = "ai_transcript_audit",
+                expired = expired_reservations,
+                total_expired = total,
+                max_reservation_secs = max_reservation.as_secs(),
+                "ai_transcript_audit: reclaimed streaming audit reservations that exceeded \
+                 limits.max_stream_reservation_secs"
+            );
+        }
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
@@ -1148,8 +1679,14 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {
-        shape_bytes(self.mode, &self.redactor, raw, max_bytes)
+    fn shape_body(&self, raw: &[u8], max_bytes: usize) -> ShapedBody {
+        shape_bytes(
+            self.mode,
+            &self.redactor,
+            raw,
+            max_bytes,
+            self.limits.max_redaction_scan_bytes,
+        )
     }
 
     /// Classify `body` and stage the audit candidate: writes the
@@ -1249,20 +1786,50 @@ impl AiTranscriptAudit {
         } else {
             BoundedToolNames::default()
         };
-        let (request_excerpt, request_truncated) = if self.capture.request {
+        let shaped = if self.capture.request {
             self.shape_body(body, self.limits.max_request_bytes)
         } else {
-            (None, false)
+            ShapedBody::default()
+        };
+        let (request_excerpt, request_truncated, request_body_omitted_reason) =
+            (shaped.excerpt, shaped.truncated, shaped.omitted_reason);
+
+        // Charge the aggregate retained-byte budget for this staged candidate
+        // before it is published into the shared map. Staging is one of the
+        // three retention states (staging, pre-commit reservation, queued
+        // record) the budget must cover; the lease releases with the entry on
+        // every removal path, including the TTL/reservation sweeps.
+        let staged_bytes = staged_retained_bytes(
+            request_excerpt.as_deref().map_or(0, str::len),
+            bounded_model.value.as_deref().map_or(0, str::len),
+            tool_names_bytes(&bounded_tools.names),
+        );
+        let Some(retained_lease) = self.retained_budget.try_acquire(staged_bytes) else {
+            self.discard_staged_candidate(ctx);
+            let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
+                || self.on_sink_error == SinkErrorPolicy::Reject;
+            ctx.metadata.insert(
+                MD_SINK_STATUS.to_string(),
+                if fail_closed { "rejected" } else { "dropped" }.to_string(),
+            );
+            return if fail_closed {
+                reject_audit_unavailable()
+            } else {
+                PluginResult::Continue
+            };
         };
 
         self.staging.insert(
             record_id,
             AuditStaging {
                 _staging_permit: staging_permit,
+                retained_lease,
+                retained_bytes: staged_bytes,
                 captured_at: Instant::now(),
                 sample_hit,
                 request_excerpt,
                 request_truncated,
+                request_body_omitted_reason,
                 request_hash: Some(request_hash),
                 request_model: bounded_model.value,
                 request_model_truncated: bounded_model.truncated,
@@ -1272,7 +1839,9 @@ impl AiTranscriptAudit {
                 tool_names_omitted: bounded_tools.omitted,
                 tool_names_hash: bounded_tools.hash,
                 commit_permit: None,
+                commit_lease: None,
                 stream_active: false,
+                stream_active_since: None,
             },
         );
         PluginResult::Continue
@@ -1301,29 +1870,73 @@ impl AiTranscriptAudit {
             return;
         }
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
-            let (request_excerpt, request_truncated) = if self.capture.request {
+            let shaped = if self.capture.request {
                 self.shape_body(body, self.limits.max_request_bytes)
             } else {
-                (None, false)
+                ShapedBody::default()
             };
-            staged.request_excerpt = request_excerpt;
-            staged.request_truncated = request_truncated;
+            let mut request_excerpt = shaped.excerpt;
+            let mut request_truncated = shaped.truncated;
+            let mut request_body_omitted_reason = shaped.omitted_reason;
             staged.request_hash = Some(request_hash.clone());
             let redact_before_bound = self.mode != AuditMode::FullBody;
             let bounded_model = parsed
                 .as_ref()
                 .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
                 .unwrap_or_default();
+            let mut bounded_tools = None;
+            if self.capture.tool_calls {
+                bounded_tools = Some(
+                    parsed
+                        .as_ref()
+                        .map(|json| {
+                            extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+
+            // Re-charge the aggregate budget for the refreshed content. Leases
+            // shrink but never grow, so growth re-acquires the whole new amount
+            // and drops the old lease afterwards — briefly double-charged,
+            // which errs toward refusing rather than over-retaining. A refused
+            // growth withholds the larger excerpt (with an explicit reason)
+            // instead of retaining unaccounted bytes; the request hash and
+            // bounded metadata still export.
+            let tool_bytes: usize = match bounded_tools.as_ref() {
+                Some(bounded) => tool_names_bytes(&bounded.names),
+                None => tool_names_bytes(&staged.tool_names),
+            };
+            let model_bytes = bounded_model.value.as_deref().map_or(0, str::len);
+            let refreshed_bytes = staged_retained_bytes(
+                request_excerpt.as_deref().map_or(0, str::len),
+                model_bytes,
+                tool_bytes,
+            );
+            if refreshed_bytes <= staged.retained_bytes {
+                staged.retained_lease.shrink_to(refreshed_bytes);
+                staged.retained_bytes = refreshed_bytes;
+            } else if let Some(lease) = self.retained_budget.try_acquire(refreshed_bytes) {
+                staged.retained_lease = lease;
+                staged.retained_bytes = refreshed_bytes;
+            } else {
+                request_excerpt = None;
+                request_truncated = true;
+                request_body_omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
+                let without_excerpt = staged_retained_bytes(0, model_bytes, tool_bytes);
+                if without_excerpt <= staged.retained_bytes {
+                    staged.retained_lease.shrink_to(without_excerpt);
+                    staged.retained_bytes = without_excerpt;
+                }
+            }
+
+            staged.request_excerpt = request_excerpt;
+            staged.request_truncated = request_truncated;
+            staged.request_body_omitted_reason = request_body_omitted_reason;
             staged.request_model = bounded_model.value;
             staged.request_model_truncated = bounded_model.truncated;
             staged.request_model_hash = bounded_model.hash;
-            if self.capture.tool_calls {
-                let bounded_tools = parsed
-                    .as_ref()
-                    .map(|json| {
-                        extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
-                    })
-                    .unwrap_or_default();
+            if let Some(bounded_tools) = bounded_tools {
                 staged.tool_names = bounded_tools.names;
                 staged.tool_names_truncated = bounded_tools.truncated;
                 staged.tool_names_omitted = bounded_tools.omitted;
@@ -1573,9 +2186,7 @@ impl AiTranscriptAudit {
         envelope: EnvelopeOwned,
         metadata: &HashMap<String, String>,
         staging: Option<&AuditStaging>,
-        response_excerpt: Option<String>,
-        response_truncated: bool,
-        response_hash: Option<String>,
+        response: ResponseCapture,
         sampled: bool,
         reason: &'static str,
         response_headers: Option<&HashMap<String, String>>,
@@ -1589,6 +2200,7 @@ impl AiTranscriptAudit {
 
         let request_excerpt = staging.and_then(|s| s.request_excerpt.clone());
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
+        let request_body_omitted_reason = staging.and_then(|s| s.request_body_omitted_reason);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
         // Request-derived model/tool values were already redacted over their
         // full observed strings and then bounded while staging (or while
@@ -1656,11 +2268,15 @@ impl AiTranscriptAudit {
             sampled,
             capture_reason: reason,
             request_hash,
-            response_hash,
+            response_hash: response.hash,
+            response_hash_scope: response.hash_scope,
+            response_hash_bytes: response.hash_bytes,
             request_body_truncated: request_truncated,
-            response_body_truncated: response_truncated,
+            response_body_truncated: response.truncated,
             request_body: request_excerpt,
-            response_body: response_excerpt,
+            response_body: response.excerpt,
+            request_body_omitted_reason,
+            response_body_omitted_reason: response.omitted_reason,
             tokens: harvest.tokens,
             cache: harvest.cache,
             guardrails: harvest.guardrails,
@@ -1671,6 +2287,9 @@ impl AiTranscriptAudit {
             tool_names_omitted,
             tool_names_hash,
             headers,
+            // Charged by `enqueue`, which is the single admission point where
+            // a built record becomes retained queue state.
+            retained_lease: None,
         }
     }
 
@@ -1784,7 +2403,15 @@ impl Plugin for AiTranscriptAudit {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         });
-        register_status_snapshot(id, self.status_snapshot_for_id(id));
+        register_status_snapshot(
+            id,
+            StatusSource {
+                base: self.status_snapshot_for_id(id),
+                retained_budget: Arc::clone(&self.retained_budget),
+                stream_reservations_expired: Arc::clone(&self.stream_reservations_expired),
+                sink_healthy: Arc::clone(&self.sink_healthy),
+            },
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -2148,10 +2775,20 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         }
-        let (response_excerpt, response_truncated) = if captures_response_body {
+        let shaped = if captures_response_body {
             self.shape_body(body, self.limits.max_response_bytes)
         } else {
-            (None, false)
+            ShapedBody::default()
+        };
+        // A buffered body is complete by construction, so its digest always
+        // covers every observed byte.
+        let response = ResponseCapture {
+            excerpt: shaped.excerpt,
+            truncated: shaped.truncated,
+            omitted_reason: shaped.omitted_reason,
+            hash_scope: response_hash.as_ref().map(|_| HASH_SCOPE_FULL),
+            hash_bytes: response_hash.as_ref().map(|_| body.len() as u64),
+            hash: response_hash,
         };
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
@@ -2159,9 +2796,7 @@ impl Plugin for AiTranscriptAudit {
             envelope,
             &ctx.metadata,
             staging.as_ref(),
-            response_excerpt,
-            response_truncated,
-            response_hash,
+            response,
             sample_hit,
             reason,
             Some(response_headers),
@@ -2207,11 +2842,16 @@ impl Plugin for AiTranscriptAudit {
         if self.stream_commit_selected(ctx, response_status, content_type) {
             if let Some(mut staging) = self.staging.get_mut(record_id) {
                 staging.stream_active = true;
+                // Start the reservation clock. The sweeper reclaims the entry
+                // (and its permit/leases) if this stream never terminates or
+                // loses its terminal hook.
+                staging.stream_active_since = Some(Instant::now());
             }
             return;
         }
         if let Some(mut staging) = self.staging.get_mut(record_id) {
             staging.commit_permit.take();
+            staging.commit_lease.take();
         }
     }
 
@@ -2268,6 +2908,17 @@ impl Plugin for AiTranscriptAudit {
             redactor: Arc::clone(&self.redactor),
             mode: self.mode,
             max_bytes: self.limits.max_stream_capture_bytes,
+            max_scan_bytes: self.limits.max_redaction_scan_bytes,
+            // `capped` (default) stops keyed hashing at the documented capture
+            // bound so an indefinitely long stream cannot keep an audit HMAC
+            // running for the life of the connection; `full` is the explicit
+            // opt-in for a whole-stream digest.
+            hash_budget: match self.capture.stream_hash {
+                StreamHashScope::Capped => Some(self.limits.max_stream_capture_bytes),
+                StreamHashScope::Full => None,
+            },
+            hashed_bytes: 0,
+            hash_capped: false,
             accumulated: Vec::new(),
             truncated: false,
             registered: false,
@@ -2294,6 +2945,7 @@ impl Plugin for AiTranscriptAudit {
         // unexpectedly orphaned terminal record can be reclaimed after its TTL.
         if let Some(mut staging) = self.staging.get_mut(&record_id) {
             staging.stream_active = false;
+            staging.stream_active_since = None;
         }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
@@ -2304,18 +2956,29 @@ impl Plugin for AiTranscriptAudit {
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
-        let (excerpt, truncated, hash) = if downstream_terminated {
-            (None, true, None)
+        let response = if downstream_terminated {
+            ResponseCapture {
+                truncated: true,
+                ..ResponseCapture::default()
+            }
         } else {
             match captured {
-                Some(captured) => (
-                    captured.response_excerpt,
-                    captured.response_truncated,
-                    Some(captured.response_hash),
-                ),
-                None => (None, true, None), // abnormal end: on_end never ran
+                Some(captured) => ResponseCapture {
+                    excerpt: captured.response_excerpt,
+                    truncated: captured.response_truncated,
+                    omitted_reason: captured.response_body_omitted_reason,
+                    hash_scope: Some(captured.response_hash_scope),
+                    hash_bytes: Some(captured.response_hash_bytes),
+                    hash: Some(captured.response_hash),
+                },
+                // abnormal end: on_end never ran
+                None => ResponseCapture {
+                    truncated: true,
+                    ..ResponseCapture::default()
+                },
             }
         };
+        let hash = response.hash.clone();
         if let Some(response_hash) = hash.as_ref() {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
@@ -2339,9 +3002,7 @@ impl Plugin for AiTranscriptAudit {
             envelope,
             &ctx.metadata,
             staging.as_ref(),
-            excerpt,
-            truncated,
-            hash,
+            response,
             sample_hit,
             reason,
             None,
@@ -2393,9 +3054,7 @@ impl Plugin for AiTranscriptAudit {
             envelope,
             &summary.metadata,
             Some(&staging),
-            None,
-            false,
-            None,
+            ResponseCapture::default(),
             sample_hit,
             reason,
             None,
@@ -2414,6 +3073,14 @@ struct AuditStreamInspector {
     redactor: Arc<PiiRedactor>,
     mode: AuditMode,
     max_bytes: usize,
+    max_scan_bytes: usize,
+    /// `Some(limit)` stops keyed hashing after `limit` bytes; `None` hashes the
+    /// whole stream (explicit `capture.stream_hash: full` opt-in).
+    hash_budget: Option<usize>,
+    /// Bytes actually fed into the keyed hasher.
+    hashed_bytes: u64,
+    /// Set once bytes were observed but deliberately not hashed.
+    hash_capped: bool,
     accumulated: Vec<u8>,
     hasher: KeyedBodyHasher,
     truncated: bool,
@@ -2434,7 +3101,29 @@ impl AuditStreamInspector {
 impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         self.ensure_registered();
-        self.hasher.update(chunk);
+        // Bound audit CPU, not just audit memory: once the keyed digest has
+        // covered its budget, further bytes are irrelevant to the record we can
+        // emit, so stop hashing entirely rather than keeping an HMAC running
+        // for the whole connection.
+        match self.hash_budget {
+            None => {
+                self.hasher.update(chunk);
+                self.hashed_bytes = self.hashed_bytes.saturating_add(chunk.len() as u64);
+            }
+            Some(limit) => {
+                let hashed = self.hashed_bytes as usize;
+                if hashed < limit {
+                    let take = (limit - hashed).min(chunk.len());
+                    self.hasher.update(&chunk[..take]);
+                    self.hashed_bytes = self.hashed_bytes.saturating_add(take as u64);
+                    if take < chunk.len() {
+                        self.hash_capped = true;
+                    }
+                } else if !chunk.is_empty() {
+                    self.hash_capped = true;
+                }
+            }
+        }
         if self.accumulated.len() < self.max_bytes {
             let remaining = self.max_bytes - self.accumulated.len();
             let take = remaining.min(chunk.len());
@@ -2451,22 +3140,42 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         self.ensure_registered();
-        let response_hash =
-            std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher()).finalize_hex();
+        let mut hasher = std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher());
+        // Domain-separate a capped digest with its exact covered byte count, so
+        // a partial digest can never be presented as — or collide with — the
+        // full-stream digest of the same prefix.
+        if self.hash_capped {
+            hasher.update(PARTIAL_STREAM_HASH_DOMAIN);
+            hasher.update(&self.hashed_bytes.to_be_bytes());
+        }
+        let response_hash = hasher.finalize_hex();
         // A cap-truncated redacted stream can cut through an unbounded secret or
         // a custom pattern, leaving only a raw prefix that no regex can match.
         // Omit the excerpt rather than exporting a boundary fragment. Full-body
         // mode is the explicit raw-capture opt-in and still returns the cap.
-        let (response_excerpt, _) = if self.truncated && self.mode.redacts_body() {
-            (None, true)
+        let shaped = if self.truncated && self.mode.redacts_body() {
+            ShapedBody::omitted(OMIT_REASON_STREAM_TRUNCATION)
         } else {
-            shape_bytes(self.mode, &self.redactor, &self.accumulated, self.max_bytes)
+            shape_bytes(
+                self.mode,
+                &self.redactor,
+                &self.accumulated,
+                self.max_bytes,
+                self.max_scan_bytes,
+            )
         };
         if let Ok(mut guard) = self.slot.captured.lock() {
             *guard = Some(StreamCaptured {
-                response_excerpt,
+                response_excerpt: shaped.excerpt,
                 response_truncated: self.truncated,
+                response_body_omitted_reason: shaped.omitted_reason,
                 response_hash,
+                response_hash_scope: if self.hash_capped {
+                    HASH_SCOPE_PARTIAL
+                } else {
+                    HASH_SCOPE_FULL
+                },
+                response_hash_bytes: self.hashed_bytes,
             });
         }
         ResponseStreamAction::Forward(Bytes::new())
@@ -2506,17 +3215,180 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
     // for this plugin every record in that batch was silently lost — under
     // `on_sink_error: reject` the sink must go unhealthy so audited traffic
     // stops flowing unaudited. Recovery keeps the existing probe model: the
-    // next successful batch send flips `sink_healthy` back to true.
-    match response {
-        Ok(resp) => {
-            cfg.sink_healthy
-                .store(resp.status().is_success(), Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp)).await
-        }
+    // next fully acknowledged batch send flips `sink_healthy` back to true.
+    let response = match response {
+        Ok(response) => response,
         Err(err) => {
             cfg.sink_healthy.store(false, Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)).await
+            return Err(format!("ai_transcript_audit batch failed: {err}"));
         }
+    };
+    let status = response.status();
+    // Headers alone do not prove delivery. Drain and validate the
+    // acknowledgement under an explicit byte bound and timeout FIRST, then
+    // publish health from the complete outcome — a 2xx whose ACK stalls,
+    // overruns its bound, or fails transport is an ambiguous delivery and must
+    // not leave fail-closed admission believing the sink is healthy.
+    let ack = drain_and_validate_ack(&cfg.ack, response).await;
+    classify_batch_delivery(cfg, entry_count, status, ack)
+}
+
+/// Compiled-in acknowledgement failure classes. These strings are the ONLY
+/// acknowledgement detail that reaches logs or errors — collector response
+/// bytes are never buffered into a diagnostic, so a collector cannot echo
+/// captured transcript content back into gateway logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckFailure {
+    LimitExceeded,
+    Timeout,
+    TransportFailure,
+    NotJsonObject,
+    ReportedFailures,
+}
+
+impl AckFailure {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::LimitExceeded => "acknowledgement body exceeded sink.ack_max_bytes",
+            Self::Timeout => "acknowledgement body drain timed out (sink.ack_timeout_ms)",
+            Self::TransportFailure => "acknowledgement body transport failure",
+            Self::NotJsonObject => "acknowledgement body was not a JSON object",
+            Self::ReportedFailures => "acknowledgement body reported rejected records",
+        }
+    }
+}
+
+/// Read the collector acknowledgement under `ack.max_bytes` / `ack.timeout` and
+/// apply the configured validation policy. Never retains or logs body bytes.
+async fn drain_and_validate_ack(
+    ack: &AckConfig,
+    response: reqwest::Response,
+) -> Result<u64, AckFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > ack.max_bytes as u64)
+    {
+        return Err(AckFailure::LimitExceeded);
+    }
+    match ack.policy {
+        AckPolicy::Drain => {
+            match tokio::time::timeout(
+                ack.timeout,
+                measure_response_body_bounded(response, ack.max_bytes),
+            )
+            .await
+            {
+                Err(_) => Err(AckFailure::Timeout),
+                Ok(Ok(bytes)) => {
+                    // The response (and its pooled connection) dropped when the
+                    // measure future completed; let the idle-pool reclaim run
+                    // before the worker issues the next batch.
+                    tokio::task::yield_now().await;
+                    Ok(bytes)
+                }
+                Ok(Err(BoundedReadError::LimitExceeded { .. })) => Err(AckFailure::LimitExceeded),
+                Ok(Err(BoundedReadError::Stream(_))) => Err(AckFailure::TransportFailure),
+            }
+        }
+        AckPolicy::Json => {
+            match tokio::time::timeout(
+                ack.timeout,
+                read_response_body_bounded(response, ack.max_bytes),
+            )
+            .await
+            {
+                Err(_) => Err(AckFailure::Timeout),
+                Ok(Ok(bytes)) => {
+                    let len = bytes.len() as u64;
+                    validate_ack_json(&bytes)?;
+                    tokio::task::yield_now().await;
+                    Ok(len)
+                }
+                Ok(Err(BoundedReadError::LimitExceeded { .. })) => Err(AckFailure::LimitExceeded),
+                Ok(Err(BoundedReadError::Stream(_))) => Err(AckFailure::TransportFailure),
+            }
+        }
+    }
+}
+
+/// Field names a collector may use to report per-record failures inside an
+/// otherwise-2xx acknowledgement.
+const ACK_FAILURE_COUNT_KEYS: &[&str] = &["errors", "failed", "rejected", "error_count"];
+
+/// `ack_policy: json` contract: the acknowledgement must be a JSON object that
+/// does not report rejected records. No value from the body is ever surfaced.
+fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
+    let Ok(Value::Object(ack)) = serde_json::from_slice::<Value>(bytes) else {
+        return Err(AckFailure::NotJsonObject);
+    };
+    for key in ACK_FAILURE_COUNT_KEYS {
+        match ack.get(*key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Number(count)) if count.as_u64() == Some(0) => {}
+            Some(Value::Array(entries)) if entries.is_empty() => {}
+            Some(Value::Bool(false)) => {}
+            Some(_) => return Err(AckFailure::ReportedFailures),
+        }
+    }
+    if let Some(Value::String(status)) = ack.get("status")
+        && !matches!(
+            status.to_ascii_lowercase().as_str(),
+            "ok" | "success" | "accepted" | "created" | "partial_ok"
+        )
+    {
+        return Err(AckFailure::ReportedFailures);
+    }
+    Ok(())
+}
+
+/// Publish sink health from the COMPLETE delivery outcome and return the
+/// batch verdict.
+///
+/// Hysteresis/recovery contract:
+/// - health goes false on any ambiguous or failed delivery (transport error,
+///   non-2xx status, or a 2xx whose acknowledgement did not validate) with no
+///   damping — fail-closed admission must react on the first failure;
+/// - health goes true only after a 2xx whose acknowledgement fully drained and
+///   validated. Each retry attempt re-publishes, so a batch that succeeds on
+///   attempt N restores health at attempt N and not before.
+fn classify_batch_delivery(
+    cfg: &HttpFlushConfig,
+    entry_count: usize,
+    status: reqwest::StatusCode,
+    ack: Result<u64, AckFailure>,
+) -> Result<(), String> {
+    let healthy = status.is_success() && ack.is_ok();
+    cfg.sink_healthy.store(healthy, Ordering::Relaxed);
+
+    if !status.is_success() {
+        let detail = ack.err().map(AckFailure::diagnostic);
+        if status.is_client_error()
+            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            tracing::warn!(
+                "ai_transcript_audit batch discarded due to {} response ({} entries lost){}",
+                status,
+                entry_count,
+                detail.map(|d| format!("; {d}")).unwrap_or_default(),
+            );
+            return Ok(());
+        }
+        return Err(format!(
+            "ai_transcript_audit batch failed with status {status}{}",
+            detail.map(|d| format!("; {d}")).unwrap_or_default(),
+        ));
+    }
+
+    match ack {
+        Ok(_) => Ok(()),
+        // A 2xx we could not fully acknowledge is not a delivery. Return an
+        // error so the batch is retried under the configured retry policy
+        // instead of being silently accounted as sent.
+        Err(failure) => Err(format!(
+            "ai_transcript_audit batch acknowledgement failed after status {status}; {}",
+            failure.diagnostic(),
+        )),
     }
 }
 
@@ -2559,28 +3431,77 @@ fn reject_audit_unavailable() -> PluginResult {
     }
 }
 
-/// Shape a captured payload into an excerpt. Returns the shaped excerpt (or
-/// `None` for non-body modes) and whether it was truncated.
+/// Aggregate UTF-8 bytes of the retained tool-name set.
+fn tool_names_bytes(names: &[String]) -> usize {
+    names.iter().map(String::len).sum()
+}
+
+/// Retained bytes charged for one staged candidate: its excerpt, bounded model
+/// and tool-name strings, and a fixed allowance for the record id, keyed
+/// hashes, and collection headers held alongside them.
+fn staged_retained_bytes(excerpt_bytes: usize, model_bytes: usize, tool_bytes: usize) -> usize {
+    excerpt_bytes
+        .saturating_add(model_bytes)
+        .saturating_add(tool_bytes)
+        .saturating_add(STAGING_ENTRY_OVERHEAD_BYTES)
+}
+
+/// A shaped body excerpt plus the evidence fields that describe what was, and
+/// was not, exported.
+#[derive(Default)]
+struct ShapedBody {
+    excerpt: Option<String>,
+    truncated: bool,
+    /// Compiled-in reason the excerpt was withheld. Never a captured value.
+    omitted_reason: Option<&'static str>,
+}
+
+impl ShapedBody {
+    fn omitted(reason: &'static str) -> Self {
+        Self {
+            excerpt: None,
+            truncated: true,
+            omitted_reason: Some(reason),
+        }
+    }
+}
+
+/// Shape a captured payload into an excerpt.
 ///
-/// Ordering matters for `redacted_body`: redaction runs over the FULL buffered
+/// Ordering matters for `redacted_body`: redaction runs over the buffered
 /// payload first and the redacted text is capped afterwards, so a sensitive
 /// value straddling the `max_bytes` boundary can never leak as an unmatched
-/// raw prefix. (`full_body` deliberately captures raw excerpts, so it caps
-/// first and skips the extra scan.)
+/// raw prefix. That ordering is only safe while the *input* is bounded — the
+/// exported cap otherwise bounds output text but not the parse/scan/copy work
+/// behind it, so a huge JSON tail beyond the exported prefix could force a
+/// full-body redaction pass for a few kilobytes of excerpt. `max_scan_bytes`
+/// is that independent hard processing bound: above it the excerpt is withheld
+/// (fail closed with an explicit reason) rather than scanned, because a
+/// prefix-only redaction of a truncated body can cut through an unmatched
+/// secret and a raw prefix is exactly what redaction exists to prevent.
+///
+/// (`full_body` is the deliberate raw-capture opt-in, so it caps first — on a
+/// UTF-8 boundary — and never scans beyond the cap at all.)
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
     raw: &[u8],
     max_bytes: usize,
-) -> (Option<String>, bool) {
+    max_scan_bytes: usize,
+) -> ShapedBody {
     if !mode.captures_body() {
-        return (None, false);
+        return ShapedBody::default();
     }
     let mut truncated = raw.len() > max_bytes;
     let shaped = if mode.redacts_body() {
+        if raw.len() > max_scan_bytes {
+            return ShapedBody::omitted(OMIT_REASON_REDACTION_SCAN_LIMIT);
+        }
         redact_body_decoded_json_strings(redactor, raw)
     } else {
-        String::from_utf8_lossy(&raw[..raw.len().min(max_bytes)]).into_owned()
+        // Cut the raw bytes on a UTF-8 boundary so the capped excerpt stays
+        // valid text instead of ending in a replacement character.
+        String::from_utf8_lossy(utf8_prefix(raw, max_bytes)).into_owned()
     };
     let shaped = if shaped.len() > max_bytes {
         truncated = true;
@@ -2588,7 +3509,35 @@ fn shape_bytes(
     } else {
         shaped
     };
-    (Some(shaped), truncated)
+    ShapedBody {
+        excerpt: Some(shaped),
+        truncated,
+        omitted_reason: None,
+    }
+}
+
+/// Largest prefix of `raw` that is at most `max_bytes` long and does not split
+/// a UTF-8 sequence. Invalid input degrades to the plain byte prefix (the
+/// caller renders it lossily either way).
+fn utf8_prefix(raw: &[u8], max_bytes: usize) -> &[u8] {
+    if raw.len() <= max_bytes {
+        return raw;
+    }
+    let candidate = &raw[..max_bytes];
+    match std::str::from_utf8(candidate) {
+        Ok(_) => candidate,
+        Err(error) => {
+            // `error_len().is_none()` means the slice ends mid-sequence; cut
+            // back to the last complete character. A genuinely invalid byte
+            // (`error_len().is_some()`) is not a boundary problem, so keep the
+            // full prefix and let lossy decoding mark it.
+            if error.error_len().is_none() {
+                &candidate[..error.valid_up_to()]
+            } else {
+                candidate
+            }
+        }
+    }
 }
 
 fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> String {
@@ -3711,11 +4660,85 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
              ({aggregate}) must be <= {HARD_MAX_CAPTURE_BYTES_AGGREGATE}"
         ));
     }
-    Ok(LimitsConfig {
+    let max_redaction_scan_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "max_redaction_scan_bytes",
+        DEFAULT_MAX_REDACTION_SCAN_BYTES,
+        "limits",
+        HARD_MAX_REDACTION_SCAN_BYTES,
+    )?;
+    if max_redaction_scan_bytes < MIN_REDACTION_SCAN_BYTES {
+        return Err(format!(
+            "ai_transcript_audit: 'limits.max_redaction_scan_bytes' must be >= \
+             {MIN_REDACTION_SCAN_BYTES}"
+        ));
+    }
+    let max_stream_reservation_secs = cfg_u64(
+        limits_obj,
+        "max_stream_reservation_secs",
+        DEFAULT_MAX_STREAM_RESERVATION_SECS,
+        "limits",
+    )?;
+    if !(MIN_STREAM_RESERVATION_SECS..=HARD_MAX_STREAM_RESERVATION_SECS)
+        .contains(&max_stream_reservation_secs)
+    {
+        return Err(format!(
+            "ai_transcript_audit: 'limits.max_stream_reservation_secs' must be between \
+             {MIN_STREAM_RESERVATION_SECS} and {HARD_MAX_STREAM_RESERVATION_SECS}"
+        ));
+    }
+
+    let mut limits = LimitsConfig {
         max_request_bytes,
         max_response_bytes,
         max_stream_capture_bytes,
-    })
+        max_redaction_scan_bytes,
+        // Placeholders; resolved below once the per-record contract is known.
+        max_entry_bytes: 0,
+        buffer_max_bytes: 0,
+        max_stream_reservation: Duration::from_secs(max_stream_reservation_secs),
+    };
+
+    // Aggregate retained-byte admission. A record-count queue bound alone lets
+    // `buffer_capacity` x attacker-shaped record bytes accumulate whenever the
+    // collector slows down, so admission is (count AND bytes).
+    let min_entry_bytes = limits.min_entry_bytes();
+    let max_entry_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "max_entry_bytes",
+        min_entry_bytes.min(HARD_MAX_RECORD_ENTRY_BYTES),
+        "limits",
+        HARD_MAX_RECORD_ENTRY_BYTES,
+    )?;
+    if max_entry_bytes < min_entry_bytes {
+        return Err(format!(
+            "ai_transcript_audit: 'limits.max_entry_bytes' ({max_entry_bytes}) must be >= \
+             {min_entry_bytes}, the retained-byte contract implied by the configured capture \
+             limits; a smaller value would make every record inadmissible"
+        ));
+    }
+    let buffer_max_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "buffer_max_bytes",
+        DEFAULT_RETAINED_BUFFER_MAX_BYTES,
+        "limits",
+        HARD_MAX_RETAINED_BUFFER_BYTES,
+    )?;
+    if buffer_max_bytes < MIN_RETAINED_BUFFER_BYTES {
+        return Err(format!(
+            "ai_transcript_audit: 'limits.buffer_max_bytes' must be >= {MIN_RETAINED_BUFFER_BYTES}"
+        ));
+    }
+    if buffer_max_bytes < max_entry_bytes {
+        return Err(format!(
+            "ai_transcript_audit: 'limits.buffer_max_bytes' ({buffer_max_bytes}) must be >= \
+             'limits.max_entry_bytes' ({max_entry_bytes}); otherwise no record could ever be \
+             admitted"
+        ));
+    }
+    limits.max_entry_bytes = max_entry_bytes;
+    limits.buffer_max_bytes = buffer_max_bytes;
+    Ok(limits)
 }
 
 fn cfg_positive_usize_capped(
@@ -3736,17 +4759,39 @@ fn cfg_positive_usize_capped(
 
 static NEXT_STATUS_ID: AtomicU64 = AtomicU64::new(0);
 
-fn active_status_snapshots() -> &'static Mutex<BTreeMap<u64, AiTranscriptAuditSnapshot>> {
-    static SNAPSHOTS: OnceLock<Mutex<BTreeMap<u64, AiTranscriptAuditSnapshot>>> = OnceLock::new();
+/// Live status source for one committed instance. Admitted ceilings are frozen
+/// at commit; retention/expiry/health gauges are read through shared atomics so
+/// authenticated `/health` reports the current state rather than a stale copy.
+struct StatusSource {
+    base: AiTranscriptAuditSnapshot,
+    retained_budget: Arc<ByteBudget>,
+    stream_reservations_expired: Arc<AtomicU64>,
+    sink_healthy: Arc<AtomicBool>,
+}
+
+impl StatusSource {
+    fn render(&self) -> AiTranscriptAuditSnapshot {
+        let mut snapshot = self.base.clone();
+        snapshot.retained_bytes = self.retained_budget.used() as u64;
+        snapshot.retained_byte_drops = self.retained_budget.drops_total();
+        snapshot.stream_reservations_expired =
+            self.stream_reservations_expired.load(Ordering::Relaxed);
+        snapshot.sink_healthy = self.sink_healthy.load(Ordering::Relaxed);
+        snapshot
+    }
+}
+
+fn active_status_snapshots() -> &'static Mutex<BTreeMap<u64, StatusSource>> {
+    static SNAPSHOTS: OnceLock<Mutex<BTreeMap<u64, StatusSource>>> = OnceLock::new();
     SNAPSHOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn register_status_snapshot(id: u64, snapshot: AiTranscriptAuditSnapshot) {
+fn register_status_snapshot(id: u64, source: StatusSource) {
     let mut guard = match active_status_snapshots().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.insert(id, snapshot);
+    guard.insert(id, source);
 }
 
 fn unregister_status_snapshot(id: u64) {
@@ -3764,7 +4809,7 @@ pub fn snapshots() -> Vec<AiTranscriptAuditSnapshot> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.values().cloned().collect()
+    guard.values().map(StatusSource::render).collect()
 }
 
 impl Drop for AiTranscriptAudit {
