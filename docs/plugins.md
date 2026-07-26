@@ -2533,15 +2533,19 @@ and so is anything above the cap. The window bound keeps the value representable
 as a monotonic duration, as a signed Redis `EXPIRE` TTL (`2 × window + 1`), and
 as the stale-state retention horizon; unbounded values previously wrapped into a
 zero/negative TTL that deleted the counter on every increment and removed
-enforcement entirely. The request-cap bound exists because the local sliding
-window retains one timestamp per admitted request until it ages out, so the cap
-is what bounds per-key memory. Unknown top-level keys are rejected.
+enforcement entirely. Local sliding-window state uses a fixed ring of aggregate
+count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so per-key memory
+stays O(1) in the request cap; the request-cap bound is an operational ceiling
+on budgets and Redis/header arithmetic, not a timestamp-log size limit. Unknown
+top-level keys are rejected.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
 **Algorithm selection** (automatic):
 - Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
-- Windows > 5 seconds → sliding window with exact request-timestamp tracking (O(n) memory per key, no boundary-burst vulnerability)
+- Windows > 5 seconds → bounded aggregate sliding window (fixed 64 count buckets
+  per key; oldest live bucket counted in full so enforcement stays fail-closed
+  relative to an exact timestamp log, without boundary-burst of a pure fixed window)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

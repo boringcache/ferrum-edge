@@ -33,11 +33,43 @@ pub const MAX_RATE_LIMIT_WINDOW_SECONDS: u64 = 31 * 24 * 60 * 60;
 
 /// Largest accepted request cap for one rate-limit window.
 ///
-/// The local sliding window retains one [`Instant`] (16 bytes) per admitted
-/// request until it ages out, so the per-key worst case is bounded by this
-/// value. Anything larger turns a single hot identity into attacker-driven,
-/// request-controlled memory growth inside one window.
+/// Caps configured budgets at an operationally sane ceiling so Redis counter
+/// math, diagnostics, and operator-facing remaining/limit headers stay within
+/// predictable ranges. Local sliding-window memory is bounded independently by
+/// [`SLIDING_WINDOW_BUCKET_COUNT`] aggregate buckets per key — not by retaining
+/// one timestamp per admitted request.
 pub const MAX_RATE_LIMIT_MAX_REQUESTS: u64 = 1_000_000;
+
+/// Fixed number of aggregate count buckets covering one local sliding window.
+///
+/// Independent of [`MAX_RATE_LIMIT_MAX_REQUESTS`]: each hot key retains at most
+/// this many `u64` counters (plus a handful of scalar fields), so sustained
+/// traffic under a maximally configured identity cannot grow per-key state
+/// with the admission count. The oldest live bucket is counted in full, which
+/// is slightly stricter than an exact timestamp log and therefore fail-closed.
+pub const SLIDING_WINDOW_BUCKET_COUNT: usize = 64;
+
+/// Local windows at or below this many whole seconds use a token bucket;
+/// longer windows use the bounded aggregate [`SlidingWindow`].
+pub const LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS: u64 = 5;
+
+/// Which local algorithm a window duration selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalWindowAlgorithm {
+    TokenBucket,
+    SlidingAggregate,
+}
+
+/// Map a window duration onto the local algorithm used by ordinary HTTP,
+/// GraphQL, and gRPC-method shared window state.
+#[inline]
+pub fn local_window_algorithm(duration: Duration) -> LocalWindowAlgorithm {
+    if duration.as_secs() <= LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS {
+        LocalWindowAlgorithm::TokenBucket
+    } else {
+        LocalWindowAlgorithm::SlidingAggregate
+    }
+}
 
 /// Reject a configured window that is zero or beyond [`MAX_RATE_LIMIT_WINDOW_SECONDS`].
 ///
@@ -960,7 +992,17 @@ impl FixedWindow {
 
 #[derive(Debug)]
 pub struct SlidingWindow {
-    timestamps: VecDeque<Instant>,
+    /// Ring of per-sub-interval request counts. Length is always
+    /// [`SLIDING_WINDOW_BUCKET_COUNT`] and never grows with admissions.
+    buckets: [u64; SLIDING_WINDOW_BUCKET_COUNT],
+    /// Absolute monotonic bucket index of the newest live slot.
+    current_bucket: u64,
+    /// Origin for bucket-index math; set on first admission.
+    epoch: Option<Instant>,
+    /// Cached sum of live bucket counts.
+    total: u64,
+    /// Most recent admission, used for idle/activity checks without scanning.
+    last_activity: Option<Instant>,
     window_duration: Duration,
     limit: u64,
 }
@@ -968,53 +1010,109 @@ pub struct SlidingWindow {
 impl SlidingWindow {
     pub fn new(limit: u64, window_duration: Duration) -> Self {
         Self {
-            timestamps: VecDeque::new(),
+            buckets: [0; SLIDING_WINDOW_BUCKET_COUNT],
+            current_bucket: 0,
+            epoch: None,
+            total: 0,
+            last_activity: None,
             window_duration,
             limit,
         }
     }
 
+    /// Fixed upper bound on retained aggregate buckets for any key/window.
+    #[inline]
+    pub const fn bucket_capacity() -> usize {
+        SLIDING_WINDOW_BUCKET_COUNT
+    }
+
+    /// Number of aggregate bucket slots retained (always [`bucket_capacity`]).
+    #[inline]
+    pub fn retained_buckets(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Admissions currently counted inside the live window.
+    #[inline]
+    pub fn counted_requests(&self) -> u64 {
+        self.total
+    }
+
     /// Check whether the window would allow a request without incrementing.
-    /// Evicts stale entries to ensure an accurate count.
+    /// Advances the bucket ring so the counted total reflects `now`.
     pub fn would_allow(&mut self, now: Instant) -> bool {
-        self.evict(now);
-        (self.timestamps.len() as u64) < self.limit
+        self.advance(now);
+        self.total < self.limit
     }
 
     /// Record a request in the window (caller must have checked `would_allow` first).
     pub fn increment(&mut self, now: Instant) {
-        self.timestamps.push_back(now);
+        if self.epoch.is_none() {
+            self.epoch = Some(now);
+            self.current_bucket = 0;
+        }
+        self.advance(now);
+        let slot = (self.current_bucket % SLIDING_WINDOW_BUCKET_COUNT as u64) as usize;
+        self.buckets[slot] = self.buckets[slot].saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        self.last_activity = Some(now);
     }
 
     pub fn remaining(&self) -> u64 {
-        self.limit.saturating_sub(self.timestamps.len() as u64)
+        self.limit.saturating_sub(self.total)
     }
 
     pub fn has_recent_activity(&self, now: Instant) -> bool {
-        self.timestamps
-            .back()
-            .is_some_and(|last| now.duration_since(*last) < self.window_duration)
-    }
-
-    fn evict(&mut self, now: Instant) {
-        // `now - window` panics (aborts in release profiles) when the window is
-        // longer than the process' monotonic clock has been running. Admission
-        // bounds the window, but the subtraction must still be checked: a
-        // freshly booted host plus a legitimately long window (up to
-        // `MAX_RATE_LIMIT_WINDOW_SECONDS`) can land before the `Instant` epoch.
-        // No representable cutoff means nothing recorded so far can be older
-        // than the window, so there is nothing to evict.
-        let Some(cutoff) = now.checked_sub(self.window_duration) else {
-            return;
+        let Some(last) = self.last_activity else {
+            return false;
         };
-        while let Some(front) = self.timestamps.front() {
-            if *front < cutoff {
-                self.timestamps.pop_front();
-            } else {
-                break;
-            }
+        match now.checked_duration_since(last) {
+            Some(elapsed) => elapsed < self.window_duration,
+            // `now` before `last` should not happen on a monotonic clock; treat
+            // as still active so cleanup stays fail-closed.
+            None => true,
         }
     }
+
+    fn advance(&mut self, now: Instant) {
+        let Some(epoch) = self.epoch else {
+            return;
+        };
+        // Checked: a clock that appears to move backwards relative to `epoch`
+        // must not panic, and leaves the current ring untouched.
+        let Some(elapsed) = now.checked_duration_since(epoch) else {
+            return;
+        };
+        let new_bucket = absolute_sliding_bucket(elapsed, self.window_duration);
+        if new_bucket <= self.current_bucket {
+            return;
+        }
+        let steps = new_bucket.saturating_sub(self.current_bucket);
+        if steps >= SLIDING_WINDOW_BUCKET_COUNT as u64 {
+            self.buckets = [0; SLIDING_WINDOW_BUCKET_COUNT];
+            self.total = 0;
+        } else {
+            let mut bucket = self.current_bucket;
+            for _ in 0..steps {
+                bucket = bucket.saturating_add(1);
+                let slot = (bucket % SLIDING_WINDOW_BUCKET_COUNT as u64) as usize;
+                self.total = self.total.saturating_sub(self.buckets[slot]);
+                self.buckets[slot] = 0;
+            }
+        }
+        self.current_bucket = new_bucket;
+    }
+}
+
+/// Map elapsed time onto the absolute bucket index spanning `window`.
+///
+/// Uses `u128` nanosecond math so `elapsed * BUCKET_COUNT` cannot wrap before
+/// the division by the (admission-bounded) window length.
+fn absolute_sliding_bucket(elapsed: Duration, window: Duration) -> u64 {
+    let window_nanos = window.as_nanos().max(1);
+    let elapsed_nanos = elapsed.as_nanos();
+    let indexed = elapsed_nanos.saturating_mul(SLIDING_WINDOW_BUCKET_COUNT as u128) / window_nanos;
+    u64::try_from(indexed).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug)]
@@ -1118,10 +1216,11 @@ impl HttpWindowState {
 fn new_http_window_states(specs: &[RateLimitWindowSpec]) -> Vec<HttpWindowState> {
     specs
         .iter()
-        .map(|spec| {
-            if spec.duration.as_secs() <= 5 {
+        .map(|spec| match local_window_algorithm(spec.duration) {
+            LocalWindowAlgorithm::TokenBucket => {
                 HttpWindowState::Bucket(TokenBucket::from_window(spec.limit, spec.duration))
-            } else {
+            }
+            LocalWindowAlgorithm::SlidingAggregate => {
                 HttpWindowState::Sliding(SlidingWindow::new(spec.limit, spec.duration))
             }
         })
@@ -2373,6 +2472,78 @@ mod tests {
         let outcome = window.outcome(8, 4, 0.25);
         assert!(outcome.allowed);
         assert_eq!(outcome.remaining, Some(0));
+    }
+
+    #[test]
+    fn local_window_algorithm_threshold_matches_http_construction() {
+        assert_eq!(
+            local_window_algorithm(Duration::from_secs(5)),
+            LocalWindowAlgorithm::TokenBucket
+        );
+        assert_eq!(
+            local_window_algorithm(Duration::from_secs(6)),
+            LocalWindowAlgorithm::SlidingAggregate
+        );
+    }
+
+    #[test]
+    fn sliding_window_state_stays_bucket_bounded_under_sustained_hot_key() {
+        // GHSA-jjjw-rqjm-fvf3: one hot key at a high cap must not retain one
+        // Instant per admission. Aggregate buckets are a fixed ring.
+        let mut window = SlidingWindow::new(100_000, Duration::from_secs(60));
+        let t0 = Instant::now();
+        for i in 0..50_000u64 {
+            assert!(window.would_allow(t0), "admission {i} must pass");
+            window.increment(t0);
+            assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+            assert_eq!(window.retained_buckets(), SlidingWindow::bucket_capacity());
+        }
+        assert_eq!(window.counted_requests(), 50_000);
+        assert_eq!(window.remaining(), 50_000);
+        // Fill to the limit and prove deny without growing state.
+        while window.would_allow(t0) {
+            window.increment(t0);
+            assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+        }
+        assert!(!window.would_allow(t0));
+        assert_eq!(window.counted_requests(), 100_000);
+        assert_eq!(window.remaining(), 0);
+        assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+    }
+
+    #[test]
+    fn sliding_window_enforces_limit_boundary_and_ages_out() {
+        let mut window = SlidingWindow::new(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(window.would_allow(t0));
+            window.increment(t0);
+        }
+        assert!(!window.would_allow(t0));
+        assert_eq!(window.remaining(), 0);
+
+        let Some(later) = t0.checked_add(Duration::from_secs(61)) else {
+            return;
+        };
+        assert!(
+            window.would_allow(later),
+            "full window age-out must clear the aggregate count"
+        );
+        assert_eq!(window.counted_requests(), 0);
+        assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+    }
+
+    #[test]
+    fn sliding_window_advance_uses_checked_time_arithmetic() {
+        // A freshly constructed window with no epoch must not panic when
+        // asked about a time that cannot subtract the full window from now.
+        let mut window = SlidingWindow::new(1, Duration::from_secs(MAX_RATE_LIMIT_WINDOW_SECONDS));
+        let now = Instant::now();
+        assert!(window.would_allow(now));
+        window.increment(now);
+        assert!(!window.would_allow(now));
+        assert!(window.has_recent_activity(now));
+        assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
     }
 
     #[test]

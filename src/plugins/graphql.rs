@@ -445,8 +445,9 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
     // Bound both axes before they reach the shared dynamic HTTP window: an
     // extreme window underflows local `Instant` subtraction and overflows the
-    // signed Redis TTL, and an extreme cap lets one hot key retain an unbounded
-    // number of per-request timestamps.
+    // signed Redis TTL, and an extreme cap is rejected so budgets stay within
+    // the shared production maxima. Local sliding-window memory itself is
+    // bounded by a fixed aggregate-bucket ring, not by one timestamp per request.
     let label = format!("graphql: {field}['{key}']");
     let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
     let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)?;

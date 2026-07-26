@@ -16592,8 +16592,9 @@ components:
           maximum: 1000000
           description: >-
             Maximum requests permitted within `window_seconds`. Capped at
-            1000000: the local sliding window retains one timestamp per
-            admitted request until it ages out, so this bounds per-key memory.
+            1000000 as an operational budget ceiling. Local sliding-window
+            memory is bounded independently by a fixed aggregate-bucket ring
+            per key, not by one timestamp per admitted request.
 
     RateLimitingConfig:
       type: object
@@ -22128,8 +22129,9 @@ components:
           minimum: 1
           maximum: 1000000
           description: >-
-            Maximum requests allowed in the window. Capped at 1000000 so one hot
-            key cannot retain an unbounded number of per-request timestamps.
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64
@@ -22154,8 +22156,9 @@ components:
           minimum: 1
           maximum: 1000000
           description: >-
-            Maximum requests allowed in the window. Capped at 1000000 so one hot
-            key cannot retain an unbounded number of per-request timestamps.
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64

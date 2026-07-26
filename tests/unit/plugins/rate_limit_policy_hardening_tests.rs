@@ -10,12 +10,16 @@
 //!   received the same default Redis prefix, so independent policies
 //!   incremented and rejected against each other's counters.
 
+use std::time::{Duration, Instant};
+
 use ferrum_edge::_test_support::{
     create_rate_limit_plugin_with_config_id, rate_limit_redis_key_prefix,
 };
 use ferrum_edge::plugins::utils::rate_limit::{
-    MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS, single_window_ttl_seconds,
-    two_window_ttl_seconds,
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS,
+    LocalLimiter, LocalWindowAlgorithm, MAX_RATE_LIMIT_MAX_REQUESTS,
+    MAX_RATE_LIMIT_WINDOW_SECONDS, RateLimitWindowSpec, SLIDING_WINDOW_BUCKET_COUNT, SlidingWindow,
+    local_window_algorithm, single_window_ttl_seconds, two_window_ttl_seconds,
 };
 use ferrum_edge::plugins::{PluginHttpClient, create_plugin};
 use serde_json::{Value, json};
@@ -440,4 +444,85 @@ fn the_production_factory_threads_the_config_id_into_every_rate_limit_plugin() {
         create_rate_limit_plugin_with_config_id(plugin_name, &config, None)
             .unwrap_or_else(|error| panic!("{plugin_name}: standalone id must admit: {error}"));
     }
+}
+
+// ── GHSA-jjjw-rqjm-fvf3: bounded aggregate local sliding window ─────────────
+
+#[test]
+fn sliding_window_retained_state_is_fixed_under_sustained_hot_key() {
+    // The advisory's residual: one Instant per admission let a hot key grow
+    // with max_requests. Aggregate buckets stay at SLIDING_WINDOW_BUCKET_COUNT.
+    let mut window = SlidingWindow::new(250_000, Duration::from_secs(60));
+    let now = Instant::now();
+    for i in 0..200_000u64 {
+        assert!(window.would_allow(now), "hot-key admission {i} must pass");
+        window.increment(now);
+        assert_eq!(
+            window.retained_buckets(),
+            SLIDING_WINDOW_BUCKET_COUNT,
+            "retained bucket slots must not grow with admissions"
+        );
+    }
+    assert_eq!(window.counted_requests(), 200_000);
+    assert_eq!(window.retained_buckets(), SlidingWindow::bucket_capacity());
+}
+
+#[test]
+fn sliding_window_enforces_configured_boundary() {
+    let mut window = SlidingWindow::new(4, Duration::from_secs(30));
+    let now = Instant::now();
+    for _ in 0..4 {
+        assert!(window.would_allow(now));
+        window.increment(now);
+    }
+    assert!(!window.would_allow(now), "limit+1 must deny");
+    assert_eq!(window.remaining(), 0);
+    assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+}
+
+#[test]
+fn http_graphql_grpc_shared_windows_select_bounded_sliding_aggregate() {
+    // Ordinary HTTP / GraphQL / gRPC-method windows > 5s all route through
+    // `new_http_window_states` → SlidingWindow. Prove the shared selector and
+    // that construction still admits those plugins onto the shared path.
+    let sliding = Duration::from_secs(LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS + 1);
+    assert_eq!(
+        local_window_algorithm(sliding),
+        LocalWindowAlgorithm::SlidingAggregate
+    );
+    assert_eq!(
+        local_window_algorithm(Duration::from_secs(LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS)),
+        LocalWindowAlgorithm::TokenBucket
+    );
+
+    rate_limiting(json!({
+        "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 1000}]
+    }))
+    .expect("HTTP rate_limiting must construct sliding-window specs");
+    graphql(json!({
+        "type_rate_limits": {"query": {"max_requests": 1000, "window_seconds": 60}}
+    }))
+    .expect("graphql must construct shared dynamic HTTP sliding windows");
+    grpc_method_router(json!({
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 1000, "window_seconds": 60}}
+    }))
+    .expect("grpc_method_router must construct shared dynamic HTTP sliding windows");
+    udp_rate_limiting(json!({"datagrams_per_second": 10, "window_seconds": 60}))
+        .expect("udp_rate_limiting still constructs through shared bounds/helpers");
+
+    // Shared limiter path: DynamicHttpRateLimitAlgorithm + SlidingAggregate
+    // admits up to the configured boundary and then denies, without depending
+    // on per-request timestamp growth.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 5,
+        duration: Duration::from_secs(60),
+    }]);
+    let limiter = LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), 1);
+    let now = Instant::now();
+    for i in 0..5 {
+        let outcome = limiter.check_at("hot-key".to_string(), &op, now);
+        assert!(outcome.allowed, "shared admission {i} must pass");
+    }
+    let denied = limiter.check_at("hot-key".to_string(), &op, now);
+    assert!(!denied.allowed, "shared path must enforce the boundary");
 }

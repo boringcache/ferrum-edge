@@ -134,7 +134,9 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - Every rate-limit window is bounded by `MAX_RATE_LIMIT_WINDOW_SECONDS`
   (2678400) and every request cap by `MAX_RATE_LIMIT_MAX_REQUESTS` (1000000);
   TTL/retention math uses the saturating helpers in
-  `src/plugins/utils/rate_limit.rs`. Rate-limit plugin roots are closed key sets.
+  `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
+  `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
+  timestamp per request. Rate-limit plugin roots are closed key sets.
 - Redis outage falls back to in-memory and reconnects in the background.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
