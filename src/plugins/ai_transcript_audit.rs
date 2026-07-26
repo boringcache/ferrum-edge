@@ -3090,7 +3090,9 @@ fn semantic_cache_telemetry_suffix(key: &str) -> Option<&'static str> {
     let (instance_id, suffix) = rest.split_once('.')?;
     if instance_id.is_empty()
         || instance_id.len() > MAX_INSTANCE_ID_DIGITS
+        || (instance_id.len() > 1 && instance_id.starts_with('0'))
         || !instance_id.bytes().all(|byte| byte.is_ascii_digit())
+        || instance_id.parse::<u64>().is_err()
     {
         return None;
     }
@@ -3125,9 +3127,7 @@ fn cache_telemetry_value_admitted(suffix: &str, value: &str) -> bool {
     }
     match suffix {
         "cache_status" => matches!(value, "HIT" | "MISS" | "BYPASS"),
-        // Only `semantic` is emitted today; `exact` is accepted as the natural
-        // counterpart so naming the exact-hit path later is not a silent drop.
-        "cache_match" => matches!(value, "exact" | "semantic"),
+        "cache_match" => value == "semantic",
         "cache_similarity" => value
             .parse::<f64>()
             .is_ok_and(|similarity| similarity.is_finite() && (0.0..=1.0).contains(&similarity)),

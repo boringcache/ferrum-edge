@@ -2931,11 +2931,14 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         // Non-numeric / oversized instance ids are not producer output.
         ("ai_semantic_cache.abc.cache_status", "HIT"),
         ("ai_semantic_cache.999999999999999999999.cache_status", "HIT"),
+        ("ai_semantic_cache.18446744073709551616.cache_status", "HIT"),
+        ("ai_semantic_cache.007.cache_status", "HIT"),
         // Prefix-without-separator collision the old predicate accepted.
         ("ai_cache_hijack", "leaked"),
         // Grammar matches but the value is outside the producer's domain.
         ("ai_semantic_cache.9.cache_status", "who is the ceo of acme"),
         ("ai_semantic_cache.9.cache_match", "arbitrary"),
+        ("ai_semantic_cache.10.cache_match", "exact"),
         ("ai_semantic_cache.9.cache_similarity", "not-a-number"),
         ("ai_semantic_cache.10.cache_similarity", "12.5"),
         // Sibling namespace under the dedup producer.
