@@ -19,10 +19,28 @@ use crate::plugin_cache::PluginCacheInner;
 use crate::router_cache::HostRouteTable;
 use crate::router_cache::RouterCache;
 
+thread_local! {
+    /// Reusable scratch buffer for `namespace|proxy_id` runtime keys used by
+    /// [`RequestEpoch::proxy_by_namespaced_id`].
+    ///
+    /// The borrow is strictly synchronous inside the lookup helper, is never
+    /// held across an `await`, and never re-enters: the returned reference
+    /// borrows the epoch's config, not this buffer. This keeps stream/request
+    /// proxy resolution allocation-free in steady state.
+    static PROXY_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
+
 #[derive(Clone)]
 pub struct RequestEpoch {
     pub(crate) config: Arc<GatewayConfig>,
-    pub(crate) proxy_index_by_id: Arc<HashMap<String, usize>>,
+    /// `namespace|id` -> index into `config.proxies`.
+    ///
+    /// Proxy IDs are unique only *within* a namespace, so this index must stay
+    /// keyed by the full `(namespace, id)` identity. A bare-ID index silently
+    /// drops one of two same-ID proxies and lets stream/SNI traffic resolve the
+    /// other tenant's proxy (issue #3094).
+    pub(crate) proxy_index_by_key: Arc<HashMap<String, usize>>,
     pub(crate) route_table: Arc<HostRouteTable>,
     pub(crate) plugin_cache: Arc<PluginCacheInner>,
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
@@ -33,21 +51,37 @@ pub struct RequestEpoch {
 }
 
 impl RequestEpoch {
-    pub(crate) fn proxy_by_id(&self, id: &str) -> Option<&Proxy> {
-        self.proxy_index_by_id
-            .get(id)
-            .and_then(|idx| self.config.proxies.get(*idx))
-            .filter(|proxy| proxy.id == id)
+    /// Namespace-qualified proxy lookup.
+    ///
+    /// This is the only proxy-by-identity accessor: every runtime caller must
+    /// know which namespace owns the proxy it is resolving. The returned
+    /// reference borrows the published config snapshot, so the thread-local
+    /// scratch borrow is released before the caller sees the result.
+    pub(crate) fn proxy_by_namespaced_id(&self, namespace: &str, id: &str) -> Option<&Proxy> {
+        let index = PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(&mut key, namespace, id);
+            self.proxy_index_by_key.get(key.as_str()).copied()
+        })?;
+        self.config
+            .proxies
+            .get(index)
+            .filter(|proxy| proxy.id == id && proxy.namespace == namespace)
     }
 }
 
-pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<String, usize>> {
+pub(crate) fn build_proxy_index_by_key(config: &GatewayConfig) -> Arc<HashMap<String, usize>> {
     Arc::new(
         config
             .proxies
             .iter()
             .enumerate()
-            .map(|(idx, proxy)| (proxy.id.clone(), idx))
+            .map(|(idx, proxy)| {
+                (
+                    crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id),
+                    idx,
+                )
+            })
             .collect(),
     )
 }
@@ -238,7 +272,7 @@ mod tests {
         let current = store.load();
         RequestEpochStore::new(RequestEpoch {
             config: Arc::clone(&current.config),
-            proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
             route_table: Arc::clone(&current.route_table),
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),
@@ -508,17 +542,74 @@ mod tests {
     }
 
     #[test]
+    fn proxy_index_resolves_same_id_in_two_namespaces_independently() {
+        let mut tenant_a = proxy("shared", "/a", vec![]);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = proxy("shared", "/b", vec![]);
+        tenant_b.namespace = "tenant-b".to_string();
+        let store = epoch_store(config(
+            vec![tenant_a.clone(), tenant_b.clone()],
+            vec![],
+            vec![],
+        ));
+
+        let epoch = store.load();
+        assert_eq!(
+            epoch
+                .proxy_by_namespaced_id("tenant-a", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/a"))
+        );
+        assert_eq!(
+            epoch
+                .proxy_by_namespaced_id("tenant-b", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/b"))
+        );
+        assert!(epoch.proxy_by_namespaced_id("ferrum", "shared").is_none());
+
+        // Removing tenant-a's proxy must not let a tenant-a lookup fall through
+        // to tenant-b's same-ID proxy.
+        let remaining = config(vec![tenant_b], vec![], vec![]);
+        store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(remaining.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&remaining),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: true,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("removal should publish: {error}"));
+
+        let after = store.load();
+        assert!(after.proxy_by_namespaced_id("tenant-a", "shared").is_none());
+        assert_eq!(
+            after
+                .proxy_by_namespaced_id("tenant-b", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/b"))
+        );
+    }
+
+    #[test]
     fn proxy_by_id_index_tracks_published_config_snapshots() {
         let initial = config(vec![proxy("p1", "/one", vec![])], vec![], vec![]);
         let store = epoch_store(initial);
         let before = store.load();
         assert_eq!(
             before
-                .proxy_by_id("p1")
+                .proxy_by_namespaced_id("ferrum", "p1")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/one"))
         );
-        assert!(before.proxy_by_id("p2").is_none());
+        assert!(before.proxy_by_namespaced_id("ferrum", "p2").is_none());
 
         let next_config = config(
             vec![
@@ -548,13 +639,13 @@ mod tests {
         let after_config_update = store.load();
         assert_eq!(
             after_config_update
-                .proxy_by_id("p1")
+                .proxy_by_namespaced_id("ferrum", "p1")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/one-renamed"))
         );
         assert_eq!(
             after_config_update
-                .proxy_by_id("p2")
+                .proxy_by_namespaced_id("ferrum", "p2")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/two"))
         );
@@ -566,7 +657,7 @@ mod tests {
         let after_lb_update = store.load();
         assert_eq!(
             after_lb_update
-                .proxy_by_id("p2")
+                .proxy_by_namespaced_id("ferrum", "p2")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/two"))
         );
@@ -1427,7 +1518,7 @@ impl RequestEpochStore {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
-            proxy_index_by_id: build_proxy_index_by_id(&config),
+            proxy_index_by_key: build_proxy_index_by_key(&config),
             config: Arc::new(config),
             config_generation: 1,
             route_generation: 1,
@@ -1453,7 +1544,7 @@ impl RequestEpochStore {
             return Ok(None);
         };
 
-        let proxy_index_by_id = build_proxy_index_by_id(&staged.config);
+        let proxy_index_by_key = build_proxy_index_by_key(&staged.config);
         let lb_generation = if staged.lb_changed {
             next_lb_generation(current.lb_generation)?
         } else {
@@ -1461,7 +1552,7 @@ impl RequestEpochStore {
         };
         let next = Arc::new(RequestEpoch {
             config: staged.config,
-            proxy_index_by_id,
+            proxy_index_by_key,
             route_table: staged.route_table,
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
@@ -1516,7 +1607,7 @@ impl RequestEpochStore {
         let lb_generation = next_lb_generation(current.lb_generation)?;
         let next = Arc::new(RequestEpoch {
             config: Arc::clone(&current.config),
-            proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
             route_table: Arc::clone(&current.route_table),
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),

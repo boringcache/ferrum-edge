@@ -10395,8 +10395,14 @@ components:
                 listener is serving.
               items:
                 type: object
-                required: [proxy_id, listen_port, error, kind]
+                required: [namespace, proxy_id, listen_port, error, kind]
                 properties:
+                  namespace:
+                    type: string
+                    description: |
+                      Namespace owning the proxy. Proxy IDs are unique only
+                      within a namespace, so `(namespace, proxy_id, listen_port)`
+                      is the identity of an entry.
                   proxy_id:
                     type: string
                     description: ID of the proxy whose stream listener is not serving.

@@ -5356,6 +5356,15 @@ pub struct StreamConnectionContext {
     /// metadata is only a compatibility projection of this lifecycle state.
     correlation_ids: CorrelationIdState,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id` for this connection/session.
+    ///
+    /// Proxy IDs are unique only within a namespace, so every proxy-keyed
+    /// runtime lookup (plugin cache, lifecycle generation, adaptive buffer)
+    /// must be qualified by this. Stamped by the TCP/UDP accept paths from the
+    /// listener's exact identity, and replaced with the matched candidate's
+    /// namespace when SNI resolves a shared passthrough port. Defaults to the
+    /// gateway default namespace for externally constructed contexts.
+    pub proxy_namespace: String,
     pub proxy_name: Option<String>,
     /// Ownership generation captured at stream admission. Carried into
     /// [`StreamTransactionSummary`] so `proxy_alerts` can reject disconnect
@@ -5446,6 +5455,7 @@ impl StreamConnectionContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             correlation_ids: CorrelationIdState::default(),
             proxy_id,
+            proxy_namespace: crate::config::types::default_namespace(),
             proxy_name,
             proxy_lifecycle_generation: None,
             listen_port,

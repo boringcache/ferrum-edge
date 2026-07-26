@@ -26,6 +26,7 @@ use crate::backend_conn_limit::{
     BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
 };
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
 
@@ -911,6 +912,11 @@ pub struct TcpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id`. Supplied by the stream listener manager
+    /// from the desired listener's exact identity — never inferred, because a
+    /// same-ID proxy in another namespace would otherwise capture this
+    /// listener's runtime state (issue #3094).
+    pub proxy_namespace: String,
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
@@ -951,8 +957,12 @@ pub struct TcpListenerConfig {
     pub started: Arc<AtomicBool>,
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the ClientHello selects which proxy to route to.
-    /// When `None`, uses the single `proxy_id` (existing behavior).
-    pub sni_proxy_ids: Option<Vec<String>>,
+    /// When `None`, uses the single `proxy_id`/`proxy_namespace` (existing behavior).
+    ///
+    /// Candidates are namespace-qualified: one shared passthrough port may host
+    /// same-ID proxies owned by different namespaces, so resolution must select
+    /// on `(namespace, id)` rather than on a bare ID.
+    pub sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     /// Adaptive buffer tracker for dynamic copy buffer sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -1000,6 +1010,10 @@ pub struct TcpListenerConfig {
 struct TcpAcceptLoopState {
     port: u16,
     proxy_id: Arc<str>,
+    /// Namespace owning `proxy_id`. Carried from the listener's desired
+    /// identity so every epoch lookup and every piece of proxy-keyed runtime
+    /// state is resolved on the exact `(namespace, id)` pair.
+    proxy_namespace: Arc<str>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
@@ -1013,7 +1027,7 @@ struct TcpAcceptLoopState {
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    sni_proxy_ids: Option<Vec<String>>,
+    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     tcp_fastopen_enabled: bool,
     overload: Arc<crate::overload::OverloadState>,
@@ -1040,6 +1054,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
+        proxy_namespace,
         config,
         dns_cache,
         request_epoch,
@@ -1099,6 +1114,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
+    let proxy_namespace: Arc<str> = Arc::from(proxy_namespace);
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
@@ -1131,6 +1147,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     let loop_state = TcpAcceptLoopState {
         port,
         proxy_id: proxy_id.clone(),
+        proxy_namespace: proxy_namespace.clone(),
         dns_cache,
         request_epoch,
         health_checker,
@@ -1256,6 +1273,7 @@ async fn run_tcp_accept_loop(
 
                 let port = state.port;
                 let proxy_id = state.proxy_id.clone();
+                let proxy_namespace = state.proxy_namespace.clone();
                 let dns_cache = state.dns_cache.clone();
                 let request_epoch = state.request_epoch.clone();
                 let health_checker = state.health_checker.clone();
@@ -1313,7 +1331,7 @@ async fn run_tcp_accept_loop(
                     // consumption from one snapshot and route with another.
                     let epoch = request_epoch.load();
                     let proxy_protocol_enabled = epoch
-                        .proxy_by_id(proxy_id.as_ref())
+                        .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
                         .and_then(|p| p.stream_proxy_protocol)
                         .unwrap_or(false);
 
@@ -1377,7 +1395,8 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                             &node_waypoint_identity_warn_limiter,
                         );
-                    let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
+                    let base_proxy =
+                        epoch.proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
@@ -1396,6 +1415,12 @@ async fn run_tcp_accept_loop(
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                     );
+                    // Authoritative owning namespace for this connection. SNI
+                    // resolution on a shared passthrough port may replace both
+                    // `proxy_id` and this field with the matched candidate's
+                    // identity; the disconnect path below reads it back so
+                    // plugin/lifecycle lookups stay on the right tenant.
+                    stream_ctx.proxy_namespace = proxy_namespace.to_string();
                     stream_ctx.proxy_lifecycle_generation = base_proxy.and_then(|p| {
                         epoch
                             .plugin_cache
@@ -1430,6 +1455,7 @@ async fn run_tcp_accept_loop(
                         stream,
                         remote_addr,
                         &proxy_id,
+                        &proxy_namespace,
                         &epoch,
                         &health_checker,
                         &dns_cache,
@@ -1462,12 +1488,16 @@ async fn run_tcp_accept_loop(
                     // config reloads; using the connection epoch preserves a
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
-                    let final_proxy = epoch.proxy_by_id(&final_proxy_id);
-                    let proxy_namespace = final_proxy
-                        .map(|p| p.namespace.clone())
-                        .unwrap_or_else(crate::config::types::default_namespace);
+                    // `stream_ctx.proxy_namespace` is the exact namespace this
+                    // connection was admitted under (listener identity, or the
+                    // SNI-matched candidate's namespace). Never re-derive it by
+                    // scanning: a same-ID proxy in another namespace would be
+                    // indistinguishable.
+                    let final_proxy_namespace = stream_ctx.proxy_namespace.clone();
+                    let final_proxy =
+                        epoch.proxy_by_namespaced_id(&final_proxy_namespace, &final_proxy_id);
                     let proxy_key = crate::config::db_backend::namespaced_runtime_key(
-                        &proxy_namespace,
+                        &final_proxy_namespace,
                         &final_proxy_id,
                     );
                     let plugins = epoch
@@ -1576,7 +1606,7 @@ async fn run_tcp_accept_loop(
                             None
                         };
                         let summary = StreamTransactionSummary {
-                            namespace: proxy_namespace,
+                            namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
                             proxy_name,
@@ -1817,6 +1847,9 @@ async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    // Namespace owning the listener's `proxy_id`. Replaced per connection when
+    // SNI resolves a different namespace-qualified candidate.
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -1827,7 +1860,7 @@ async fn handle_tcp_connection(
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -1859,6 +1892,7 @@ async fn handle_tcp_connection(
         client_stream,
         remote_addr,
         proxy_id,
+        proxy_namespace,
         epoch,
         health_checker,
         dns_cache,
@@ -2099,6 +2133,7 @@ async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -2111,7 +2146,7 @@ async fn handle_tcp_connection_inner(
     start: Instant,
     backend_info: &mut TcpBackendInfo,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -2137,8 +2172,11 @@ async fn handle_tcp_connection_inner(
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
     // the ClientHello to extract SNI before looking up the proxy config.
-    let _resolved_proxy_id: Option<String>;
-    let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
+    // A shared passthrough port may host same-ID proxies from different
+    // namespaces, so the match is a full `(namespace, id)` identity and both
+    // halves replace the listener's defaults for the rest of this connection.
+    let listener_namespace = proxy_namespace;
+    let resolved_identity: Option<NamespacedResourceId> = if let Some(sni_ids) = sni_proxy_ids {
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
@@ -2149,21 +2187,29 @@ async fn handle_tcp_connection_inner(
                     sni,
                     stream_ctx.listen_port
                 )
-            })?;
-        _resolved_proxy_id = Some(matched.to_string());
-        // Update stream_ctx to reflect the resolved proxy
-        stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = epoch.proxy_by_id(matched).and_then(|p| p.name.clone());
-        _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
+            })?
+            .clone();
+        // Update stream_ctx to reflect the resolved proxy identity.
+        stream_ctx.proxy_namespace = matched.namespace.clone();
+        stream_ctx.proxy_id = matched.id.clone();
+        stream_ctx.proxy_name = epoch
+            .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+            .and_then(|p| p.name.clone());
+        Some(matched)
     } else {
-        _resolved_proxy_id = None;
-        proxy_id
+        None
+    };
+    let (proxy_namespace, proxy_id) = match &resolved_identity {
+        Some(resolved) => (resolved.namespace.as_str(), resolved.id.as_str()),
+        None => (listener_namespace, proxy_id),
     };
 
     // Look up the proxy config and extract only the fields we need.
     let proxy = epoch
-        .proxy_by_id(proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
+        .proxy_by_namespaced_id(proxy_namespace, proxy_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config")
+        })?;
 
     let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();

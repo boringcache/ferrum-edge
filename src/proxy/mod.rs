@@ -5658,7 +5658,7 @@ impl ProxyState {
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
         let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
             config: Arc::new(config.clone()),
-            proxy_index_by_id: crate::request_epoch::build_proxy_index_by_id(&config),
+            proxy_index_by_key: crate::request_epoch::build_proxy_index_by_key(&config),
             route_table: RouterCache::build_route_table_snapshot(&config),
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),

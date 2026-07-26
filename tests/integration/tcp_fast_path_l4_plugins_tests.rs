@@ -339,6 +339,7 @@ async fn try_spawn_fast_path_gateway(
             port: listen_port,
             bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             proxy_id: PROXY_ID.to_string(),
+            proxy_namespace: ferrum_edge::config::types::default_namespace(),
             config: config_swap,
             dns_cache,
             request_epoch,

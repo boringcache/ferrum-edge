@@ -523,3 +523,107 @@ fn service_discovery_task_ownership_is_namespace_qualified() {
     assert_eq!(staging, "staging|shared");
     assert_ne!(prod, staging);
 }
+
+/// Passthrough TCP stream proxy fixture: shares a listen port with same-ID
+/// proxies in other namespaces and routes by SNI host.
+fn make_passthrough_stream_proxy(namespace: &str, id: &str, port: u16, host: &str) -> Proxy {
+    let mut proxy = make_proxy(namespace, id, "/unused");
+    proxy.listen_path = None;
+    proxy.hosts = vec![host.to_string()];
+    proxy.backend_scheme = Some(BackendScheme::Tcp);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    proxy.listen_port = Some(port);
+    proxy.passthrough = true;
+    proxy.circuit_breaker = None;
+    proxy
+}
+
+fn epoch_store_for(config: GatewayConfig) -> ferrum_edge::request_epoch::RequestEpochStore {
+    let plugin_cache = PluginCache::new(&config).expect("plugin cache builds");
+    let consumer_index = ferrum_edge::consumer_index::ConsumerIndex::new(&config.consumers);
+    let lb_cache = LoadBalancerCache::new(&config);
+    ferrum_edge::request_epoch::RequestEpochStore::from_runtime_parts(
+        config,
+        &plugin_cache,
+        &consumer_index,
+        &lb_cache,
+    )
+}
+
+/// Runtime lookup boundary (not just the cache constructors): two namespaces
+/// share one proxy ID and one passthrough listen port, and the SNI resolver
+/// used by the TCP/UDP accept paths must select the correct tenant. Removing
+/// one namespace's proxy must make its candidate stop resolving instead of
+/// silently falling through to the surviving same-ID proxy.
+#[test]
+fn stream_sni_resolution_keeps_same_id_proxies_in_two_namespaces_independent() {
+    let prod_candidate = NamespacedResourceId::new("prod", "shared");
+    let staging_candidate = NamespacedResourceId::new("staging", "shared");
+    let candidates = vec![prod_candidate.clone(), staging_candidate.clone()];
+
+    let both = GatewayConfig {
+        proxies: vec![
+            make_passthrough_stream_proxy("prod", "shared", 19100, "prod.example.test"),
+            make_passthrough_stream_proxy("staging", "shared", 19100, "staging.example.test"),
+        ],
+        ..GatewayConfig::default()
+    };
+    let store = epoch_store_for(both);
+    let epoch = store.load();
+
+    assert_eq!(
+        ferrum_edge::proxy::sni::resolve_proxy_by_sni_in_epoch(
+            Some("prod.example.test"),
+            &candidates,
+            &epoch
+        ),
+        Some(&prod_candidate),
+        "each namespace's host predicate must select its own same-ID proxy"
+    );
+    assert_eq!(
+        ferrum_edge::proxy::sni::resolve_proxy_by_sni_in_epoch(
+            Some("staging.example.test"),
+            &candidates,
+            &epoch
+        ),
+        Some(&staging_candidate)
+    );
+
+    // Reload with the staging tenant removed. Its candidate must no longer
+    // resolve at all — neither to itself nor to prod's same-ID proxy — and the
+    // surviving prod proxy must keep resolving.
+    let prod_only = GatewayConfig {
+        proxies: vec![make_passthrough_stream_proxy(
+            "prod",
+            "shared",
+            19100,
+            "prod.example.test",
+        )],
+        ..GatewayConfig::default()
+    };
+    let reloaded_store = epoch_store_for(prod_only);
+    let reloaded = reloaded_store.load();
+
+    assert_eq!(
+        ferrum_edge::proxy::sni::resolve_proxy_by_sni_in_epoch(
+            Some("staging.example.test"),
+            &candidates,
+            &reloaded
+        ),
+        None,
+        "a removed tenant's host must not fall through to the surviving same-ID proxy"
+    );
+    assert_eq!(
+        ferrum_edge::proxy::sni::resolve_proxy_by_sni_in_epoch(
+            Some("prod.example.test"),
+            &candidates,
+            &reloaded
+        ),
+        Some(&prod_candidate)
+    );
+    assert_eq!(
+        ferrum_edge::proxy::sni::resolve_proxy_by_sni_in_epoch(None, &candidates, &reloaded),
+        None,
+        "neither surviving proxy is a catch-all, so an absent SNI must not bind one"
+    );
+}
