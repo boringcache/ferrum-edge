@@ -387,6 +387,10 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
     // Bind client A first so we know its source IP for the gated plugin.
+    // Client B uses a distinct loopback address (127.0.0.2): `UdpDatagramContext`
+    // exposes client IP only, while sessions are keyed by full SocketAddr, so two
+    // sockets on 127.0.0.1 would share an IP identity and poison seen_fast/seen_slow
+    // even though their per-session hook workers remain independent.
     let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
     let client_a_ip = Arc::from(
         client_a
@@ -400,7 +404,20 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     let gateway = spawn_udp_gateway_with_retry(backend_port, Arc::clone(&client_a_ip)).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
 
-    let client_b = UdpSocket::bind("127.0.0.1:0").await.expect("client B bind");
+    let client_b = UdpSocket::bind("127.0.0.2:0").await.expect("client B bind");
+    assert_ne!(
+        client_a
+            .local_addr()
+            .expect("client A addr")
+            .ip()
+            .to_canonical(),
+        client_b
+            .local_addr()
+            .expect("client B addr")
+            .ip()
+            .to_canonical(),
+        "clients must have distinct IPs so the gated hook can attribute payloads"
+    );
 
     // Establish both sessions with fast (non-gated) datagrams first. The bug
     // is in the established-session recv path, not first-datagram setup.
