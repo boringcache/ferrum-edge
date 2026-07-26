@@ -3590,8 +3590,9 @@ fn test_zero_budget_values_are_rejected() {
             "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
             key: 0,
         });
-        let error =
-            ApiChargeback::new(&config, "ferrum").expect_err("zero budget must be rejected");
+        let error = ApiChargeback::new(&config, "ferrum")
+            .err()
+            .expect("zero budget must be rejected");
         assert!(error.contains(key), "unexpected error: {error}");
         assert!(
             error.contains("greater than 0"),

@@ -2109,6 +2109,7 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 }
 
 impl ApiChargeback {
+    #[allow(dead_code)] // Used by external tests; production uses new_with_shard_amount.
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
         Self::new_with_shard_amount(
             config,
