@@ -830,6 +830,13 @@ impl HealthChecker {
         }
     }
 
+    /// Test-only view of whether one active-probe state key is present.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn has_active_target_state_for_test(&self, key: &str) -> bool {
+        self.active_target_states.contains_key(key)
+    }
+
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
     /// whose stored deadline has elapsed, scoped to that proxy entry only.
     ///
