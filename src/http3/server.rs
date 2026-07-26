@@ -408,8 +408,8 @@ fn build_h3_quinn_server_config(
     // exactly u32::MAX (2^32-1). A finite TLS early-data byte cap is not
     // expressible on QUIC; Ferrum's method allowlist in handle_h3_connection()
     // remains the application-layer admission control. Mapping here keeps
-    // startup and live reload fail-closed: quinn panics on any other size, so
-    // we never pass the policy's finite aspirational value through.
+    // startup and live reload fail-closed: quinn rejects any other size, so we
+    // never pass the policy's finite aspirational value through.
     server_tls_config.max_early_data_size = match tls_policy.early_data_max_size {
         0 => 0,
         _ => u32::MAX,
