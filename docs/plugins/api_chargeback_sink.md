@@ -421,7 +421,19 @@ candidates; when only claimed or foreign-owned files remain, an admission that
 cannot fit fails closed instead of destroying them. Recovery at prepare time
 returns a claim to its durable name only when this process demonstrably abandoned
 it (same `process_tag`, no live lease) or when a peer's lease deadline has
-passed, so two owners can never deliver the same file concurrently.
+passed.
+
+Within one process the exclusion is absolute: a live claim holds an in-memory
+lease, so no other accepted generation can recover it. Across processes sharing a
+volume the exclusion is the atomic rename plus a *time* bound, not a proof that
+the peer stopped: a peer stalled past its lease (host pause, `SIGSTOP`, or clock
+skew between replicas) can still be delivering a claim another process has
+recovered. The lease is sized at four times the accepted worst-case delivery
+budget and renewed before every chunk so that window is not reachable by ordinary
+slow delivery, and the residual case is a duplicate insert — not a lost or
+misrouted record — which the stable `event_id` / `ReplacingMergeTree` idempotency
+contract deduplicates. A claim is never delivered to a destination other than the
+one its `owner_tag` names.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not

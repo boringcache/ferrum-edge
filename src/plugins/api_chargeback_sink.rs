@@ -5609,10 +5609,16 @@ impl SpoolManager {
 
     /// Return crash-left in-flight claims to their durable replayable names.
     ///
-    /// Live claims held by this process are skipped outright. A claim written by
-    /// another process (or by an earlier run of this one) is recovered only after
-    /// its lease deadline passes, so two owners can never deliver the same file
-    /// concurrently.
+    /// Live claims held by this process are skipped outright, so in-process
+    /// exclusion is absolute. A claim written by another process (or by an
+    /// earlier run of this one) is recovered only after its lease deadline
+    /// passes. That cross-process bound is temporal, not a proof the peer
+    /// stopped: a peer stalled past its lease can still be delivering. The lease
+    /// is four times the accepted worst-case delivery budget and is renewed per
+    /// chunk so ordinary slow delivery cannot reach that window, and the
+    /// residual outcome is a duplicate insert the stable `event_id` /
+    /// `ReplacingMergeTree` contract deduplicates — never a misrouted or lost
+    /// record, because the owner tag still gates the destination.
     fn recover_expired_claims(&self) -> Result<(), String> {
         let mut claims = Vec::new();
         self.collect(&mut claims, SpoolFileClass::Inflight)?;
