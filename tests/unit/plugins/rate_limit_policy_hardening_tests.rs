@@ -307,7 +307,8 @@ fn udp_rate_limiting_rejects_the_extreme_window_that_survived_checked_multiplica
 fn ai_rate_limiter_rejects_unbounded_window() {
     let config = json!({"token_limit": 10, "window_seconds": u64::MAX});
     let error = create_plugin("ai_rate_limiter", &config)
-        .expect_err("u64::MAX AI token window must fail admission");
+        .err()
+        .expect("u64::MAX AI token window must fail admission");
     assert!(error.contains("window_seconds"), "{error}");
 }
 
