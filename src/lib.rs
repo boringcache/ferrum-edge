@@ -90,6 +90,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
     /// Exercise DP's crate-private concurrent listener supervisor without
@@ -3712,6 +3713,39 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
+    pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
+
+    /// Post-`load_programs` initialization failure must roll back BPF state.
+    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_post_load_init_failure_cleanup_for_test()
+    }
+
+    /// A `load_programs` failure created nothing, so it must NOT clean up.
+    pub fn node_agent_pre_load_failure_skips_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_pre_load_failure_skips_cleanup_for_test()
+    }
+
+    /// Kubernetes-client-style late failure after successful eBPF init.
+    pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_k8s_client_style_late_failure_cleanup_for_test()
+    }
+
+    /// Normal shutdown must invoke `cleanup_all` exactly once.
+    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_normal_shutdown_cleanup_once_for_test()
+    }
+
+    /// Cleanup failure must preserve the original startup/runtime error.
+    pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
     }
 
     // ── load_balancer first-wave counter seams ───────────────────────────────
