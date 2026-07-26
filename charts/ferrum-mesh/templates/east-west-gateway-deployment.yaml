@@ -1,4 +1,9 @@
 {{- if .Values.eastWest.enabled }}
+{{- $tcpHandler := dict "tcpSocket" (dict "port" "tls-passthru") -}}
+{{- $liveHandler := .Values.eastWest.probes.liveness.override | default dict -}}
+{{- if not $liveHandler }}{{- $liveHandler = $tcpHandler -}}{{- end -}}
+{{- $readyHandler := .Values.eastWest.probes.readiness.override | default dict -}}
+{{- if not $readyHandler }}{{- $readyHandler = $tcpHandler -}}{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,6 +42,7 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.eastWest.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
 ---
 apiVersion: v1
 kind: Service
