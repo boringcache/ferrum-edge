@@ -37,6 +37,24 @@ use tokio::sync::Barrier;
 /// the plugin only ever compares it for equality.
 const TEST_PRESENTATION_DIGEST: Option<[u8; 32]> = Some([0x5a; 32]);
 
+
+/// RequestContext as the protocol entry paths build it when the proxy has no
+/// dynamic presentation policy: bound to a fixed stand-in digest.
+fn new_ctx(method: &str, path: &str) -> RequestContext {
+    new_ctx_from("127.0.0.1", method, path)
+}
+
+fn new_ctx_from(client_ip: &str, method: &str, path: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        client_ip.to_string(),
+        method.to_string(),
+        path.to_string(),
+    );
+    set_response_presentation_policy_digest_for_test(&mut ctx, TEST_PRESENTATION_DIGEST);
+    ctx
+}
+
+
 struct AppendingResponseTransform;
 
 struct FailingMandatoryReplayTransform;
@@ -247,11 +265,7 @@ async fn mark_both_fresh(
 }
 
 fn body_ctx(method: &str, path: &str, body: &'static [u8]) -> RequestContext {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        method.to_string(),
-        path.to_string(),
-    );
+    let mut ctx = new_ctx(method, path);
     ctx.request_body_bytes = Some(Bytes::from_static(body));
     ctx
 }
@@ -581,11 +595,7 @@ async fn test_get_request_passes_through() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("GET", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "abc-123".to_string());
 
@@ -598,11 +608,7 @@ async fn test_post_without_key_passes_through() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -616,11 +622,7 @@ async fn test_enforce_required_rejects_missing_key() {
     });
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -646,11 +648,7 @@ async fn test_first_request_passes_then_replay() {
     let plugin = make_plugin(config);
 
     // First request with idempotency key — should pass through
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "key-1".to_string());
 
@@ -668,11 +666,7 @@ async fn test_first_request_passes_then_replay() {
         .await;
 
     // Second request with same key — should replay
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "key-1".to_string());
 
@@ -703,11 +697,7 @@ async fn test_first_request_passes_then_replay() {
 /// static response-presentation policy of the plugin-cache generation that will
 /// run on its response path.
 fn policy_bound_ctx(digest: Option<[u8; 32]>) -> RequestContext {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     set_response_presentation_policy_digest_for_test(&mut ctx, digest);
     ctx
 }
@@ -738,7 +728,7 @@ fn redaction_transformer(value: &str) -> serde_json::Value {
         "runtime_overlay_scope": "redaction",
         "rules": [{
             "operation": "update",
-            "target": "headers",
+            "target": "header",
             "key": "x-account",
             "value": value,
         }],
@@ -808,8 +798,10 @@ async fn replay_is_rejected_when_static_redaction_rules_change_under_an_unchange
     );
 
     let mut first_ctx = policy_bound_ctx(Some(before));
-    let mut headers =
-        HashMap::from([("idempotency-key".to_string(), "static-rule-change".to_string())]);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "static-rule-change".to_string(),
+    )]);
     assert!(matches!(
         plugin.before_proxy(&mut first_ctx, &mut headers).await,
         PluginResult::Continue
@@ -851,7 +843,7 @@ async fn replay_survives_a_rebuild_of_equivalent_response_policy() {
         "rules": [{
             "key": "x-account",
             "value": "[redacted]",
-            "target": "headers",
+            "target": "header",
             "operation": "update",
         }],
         "runtime_overlay_scope": "redaction",
@@ -862,8 +854,10 @@ async fn replay_survives_a_rebuild_of_equivalent_response_policy() {
     );
 
     let mut first_ctx = policy_bound_ctx(Some(stored_under));
-    let mut headers =
-        HashMap::from([("idempotency-key".to_string(), "equivalent-policy".to_string())]);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "equivalent-policy".to_string(),
+    )]);
     assert!(matches!(
         plugin.before_proxy(&mut first_ctx, &mut headers).await,
         PluginResult::Continue
@@ -873,7 +867,13 @@ async fn replay_survives_a_rebuild_of_equivalent_response_policy() {
     let mut replay_ctx = policy_bound_ctx(Some(rebuilt));
     let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
     assert!(
-        matches!(result, PluginResult::RejectBinary { status_code: 201, .. }),
+        matches!(
+            result,
+            PluginResult::RejectBinary {
+                status_code: 201,
+                ..
+            }
+        ),
         "an equivalent policy must still replay, got {result:?}"
     );
     assert!(finalized_response_replay_for_test(&replay_ctx));
@@ -885,12 +885,12 @@ async fn replay_survives_a_rebuild_of_equivalent_response_policy() {
 #[test]
 fn presentation_policy_digest_is_order_sensitive_across_transformer_instances() {
     let first = json!({
-        "rules": [{"operation": "remove", "target": "headers", "key": "x-internal"}],
+        "rules": [{"operation": "remove", "target": "header", "key": "x-internal"}],
     });
     let second = json!({
         "rules": [{
             "operation": "add",
-            "target": "headers",
+            "target": "header",
             "key": "x-internal",
             "value": "public",
         }],
@@ -934,7 +934,10 @@ fn presentation_digest_for_plugin_specs(specs: &[(&str, serde_json::Value)]) -> 
         .filter_map(|plugin| match plugin.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => Some((plugin.name(), digest)),
             Some(ResponsePresentationPolicy::Dynamic) => {
-                panic!("{} has no statically provable policy to fold", plugin.name())
+                panic!(
+                    "{} has no statically provable policy to fold",
+                    plugin.name()
+                )
             }
             None => None,
         })
@@ -1042,13 +1045,10 @@ fn mcp_gateway_reports_a_dynamic_presentation_policy() {
 fn internally_disabled_mcp_gateway_reports_no_presentation_policy() {
     let mut config = mcp_gateway_config("http://mcp-alpha:8080");
     config["enabled"] = serde_json::Value::Bool(false);
-    let plugin = create_plugin_with_http_client(
-        "mcp_gateway",
-        &config,
-        PluginHttpClient::default(),
-    )
-    .expect("disabled mcp_gateway config must be valid")
-    .expect("disabled mcp_gateway must remain a built-in plugin");
+    let plugin =
+        create_plugin_with_http_client("mcp_gateway", &config, PluginHttpClient::default())
+            .expect("disabled mcp_gateway config must be valid")
+            .expect("disabled mcp_gateway must remain a built-in plugin");
 
     assert_eq!(
         plugin.response_presentation_policy(),
@@ -1124,8 +1124,10 @@ async fn provable_stored_policy_does_not_replay_under_an_unprovable_live_policy(
 
     let stored_under = presentation_digest_for(&[redaction_transformer("[redacted]")]);
     let mut first_ctx = policy_bound_ctx(Some(stored_under));
-    let mut headers =
-        HashMap::from([("idempotency-key".to_string(), "provable-then-not".to_string())]);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "provable-then-not".to_string(),
+    )]);
     assert!(matches!(
         plugin.before_proxy(&mut first_ctx, &mut headers).await,
         PluginResult::Continue
@@ -1177,7 +1179,7 @@ async fn replay_survives_an_equivalent_rebuild_of_a_multi_plugin_presentation_po
                 "rules": [{
                     "key": "x-account",
                     "value": "[redacted]",
-                    "target": "headers",
+                    "target": "header",
                     "operation": "update",
                 }],
                 "runtime_overlay_scope": "redaction",
@@ -1190,8 +1192,10 @@ async fn replay_survives_an_equivalent_rebuild_of_a_multi_plugin_presentation_po
     );
 
     let mut first_ctx = policy_bound_ctx(Some(stored_under));
-    let mut headers =
-        HashMap::from([("idempotency-key".to_string(), "equivalent-multi".to_string())]);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "equivalent-multi".to_string(),
+    )]);
     assert!(matches!(
         plugin.before_proxy(&mut first_ctx, &mut headers).await,
         PluginResult::Continue
@@ -1294,11 +1298,7 @@ fn redis_persistence_is_refused_without_complete_provenance() {
 #[tokio::test]
 async fn committed_replay_skips_second_response_body_transform() {
     let dedup = make_plugin(json!({}));
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
     assert!(matches!(
@@ -1317,11 +1317,7 @@ async fn committed_replay_skips_second_response_body_transform() {
         PluginResult::Continue
     ));
 
-    let mut replay_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut replay_ctx = new_ctx("POST", "/api");
     let mut replay_headers =
         HashMap::from([("idempotency-key".to_string(), "finalized".to_string())]);
     let replay = dedup
@@ -1341,11 +1337,7 @@ async fn committed_replay_skips_second_response_body_transform() {
         "finalized replays must still run response inspection"
     );
 
-    let mut ordinary_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ordinary_ctx = new_ctx("POST", "/api");
     let ordinary = PluginResult::RejectBinary {
         status_code: 200,
         body: Bytes::from_static(b"presented-once"),
@@ -1366,11 +1358,7 @@ async fn committed_replay_runs_current_ai_response_redaction() {
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let stale_body = br#"{"choices":[{"message":{"content":"Contact user@example.com"}}]}"#;
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/chat".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/chat");
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
     assert!(matches!(
@@ -1390,11 +1378,7 @@ async fn committed_replay_runs_current_ai_response_redaction() {
     }))
     .unwrap();
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(guard)];
-    let mut replay_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/chat".to_string(),
-    );
+    let mut replay_ctx = new_ctx("POST", "/chat");
     let mut replay_headers =
         HashMap::from([("idempotency-key".to_string(), "guard-replay".to_string())]);
     let replay = dedup
@@ -1443,11 +1427,7 @@ async fn committed_replay_runs_current_tool_argument_redaction() {
     .to_string()
     .into_bytes();
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/chat".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/chat");
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
     assert!(matches!(
@@ -1478,11 +1458,7 @@ async fn committed_replay_runs_current_tool_argument_redaction() {
     )
     .unwrap();
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(governor)];
-    let mut replay_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/chat".to_string(),
-    );
+    let mut replay_ctx = new_ctx("POST", "/chat");
     let mut replay_headers =
         HashMap::from([("idempotency-key".to_string(), "governor-replay".to_string())]);
     let replay = dedup
@@ -1508,11 +1484,7 @@ async fn committed_replay_runs_current_tool_argument_redaction() {
 #[tokio::test]
 async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() {
     let dedup = make_plugin(json!({}));
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers = HashMap::from([(
         "idempotency-key".to_string(),
         "failed-redaction".to_string(),
@@ -1533,11 +1505,7 @@ async fn committed_replay_fails_closed_when_required_transform_cannot_rewrite() 
         PluginResult::Continue
     ));
 
-    let mut replay_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut replay_ctx = new_ctx("POST", "/api");
     let mut replay_headers = HashMap::from([(
         "idempotency-key".to_string(),
         "failed-redaction".to_string(),
@@ -1581,11 +1549,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
     let plugin = make_plugin(json!({}));
 
     // First request acquires the in-flight marker and a dedup key.
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "key-1".to_string());
 
@@ -1616,11 +1580,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_under_dedup_key() {
 
     // A second request with the SAME key is treated as Fresh — it passes
     // through to the backend rather than replaying the synthetic body.
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "key-1".to_string());
 
@@ -1645,11 +1605,7 @@ async fn finalize_empty_synthetic_and_assert_second_request_continues(
     let dedup = Arc::new(make_plugin(json!({})));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/orders");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), idempotency_key.to_string());
     assert!(matches!(
@@ -1686,11 +1642,7 @@ async fn finalize_empty_synthetic_and_assert_second_request_continues(
         "empty/204 synthetic successes must not be stored as completed responses"
     );
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/orders");
     let mut retry_headers = HashMap::new();
     retry_headers.insert("idempotency-key".to_string(), idempotency_key.to_string());
     let retry = dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await;
@@ -1715,11 +1667,7 @@ async fn h3_deferred_committed_hooks_keep_finalized_signal_for_empty_synthetic_s
     let dedup = Arc::new(make_plugin(json!({})));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/orders");
     let mut headers = HashMap::new();
     headers.insert(
         "idempotency-key".to_string(),
@@ -1759,11 +1707,7 @@ async fn h3_deferred_committed_hooks_keep_finalized_signal_for_empty_synthetic_s
     ctx.metadata
         .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/orders");
     let mut retry_headers = HashMap::new();
     retry_headers.insert(
         "idempotency-key".to_string(),
@@ -1784,11 +1728,7 @@ async fn non_2xx_plugin_reject_retains_dedup_inflight_until_ttl() {
     })));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/orders");
     let mut headers = HashMap::new();
     headers.insert(
         "idempotency-key".to_string(),
@@ -1822,11 +1762,7 @@ async fn non_2xx_plugin_reject_retains_dedup_inflight_until_ttl() {
         "non-2xx rejects must not set the finalized-synthetic success signal"
     );
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/orders");
     let mut retry_headers = HashMap::new();
     retry_headers.insert(
         "idempotency-key".to_string(),
@@ -1844,11 +1780,7 @@ async fn non_2xx_plugin_reject_retains_dedup_inflight_until_ttl() {
     );
 
     request_deduplication_expire_inflight_entries_for_test(&dedup);
-    let mut after_ttl_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut after_ttl_ctx = new_ctx("POST", "/orders");
     let mut after_ttl_headers = HashMap::new();
     after_ttl_headers.insert(
         "idempotency-key".to_string(),
@@ -1870,11 +1802,7 @@ async fn late_finalized_synthetic_release_does_not_clear_successor_marker() {
     })));
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/orders");
     let mut first_headers = HashMap::new();
     first_headers.insert(
         "idempotency-key".to_string(),
@@ -1889,11 +1817,7 @@ async fn late_finalized_synthetic_release_does_not_clear_successor_marker() {
     // the key available for a successor with a new owner token.
     request_deduplication_expire_inflight_entries_for_test(&dedup);
 
-    let mut successor_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut successor_ctx = new_ctx("POST", "/orders");
     let mut successor_headers = HashMap::new();
     successor_headers.insert(
         "idempotency-key".to_string(),
@@ -1919,11 +1843,7 @@ async fn late_finalized_synthetic_release_does_not_clear_successor_marker() {
     )
     .await;
 
-    let mut conflict_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut conflict_ctx = new_ctx("POST", "/orders");
     let mut conflict_headers = HashMap::new();
     conflict_headers.insert(
         "idempotency-key".to_string(),
@@ -1958,11 +1878,7 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
     let plugin = make_plugin(json!({}));
 
     // First request acquires the in-flight marker and a dedup key.
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "ext-op-key".to_string());
     assert!(matches!(
@@ -2007,11 +1923,7 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
     // A retry with the SAME key must be rejected as a completed non-replayable
     // operation (409 "cannot be replayed safely"), NOT treated as fresh (which
     // would re-run the side effect) and NOT returned as a bare in-flight 409.
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "ext-op-key".to_string());
     match plugin.before_proxy(&mut ctx2, &mut headers2).await {
@@ -2056,11 +1968,7 @@ async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     )
     .unwrap();
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers = HashMap::new();
     first_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
     assert!(matches!(
@@ -2084,11 +1992,7 @@ async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
         .on_response_committed(&mut first_ctx, status, &response_headers, &body)
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::new();
     retry_headers.insert("idempotency-key".to_string(), "side-effect-key".to_string());
     match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
@@ -2132,11 +2036,7 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
     )
     .unwrap();
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::from([
         ("idempotency-key-a".to_string(), "owner-a".to_string()),
         ("idempotency-key-b".to_string(), "owner-b".to_string()),
@@ -2184,11 +2084,7 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
         (&first, "idempotency-key-a", "owner-a"),
         (&second, "idempotency-key-b", "owner-b"),
     ] {
-        let mut retry_ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/api".to_string(),
-        );
+        let mut retry_ctx = new_ctx("POST", "/api");
         let mut retry_headers = HashMap::from([
             ("idempotency-key-a".to_string(), "owner-a".to_string()),
             ("idempotency-key-b".to_string(), "owner-b".to_string()),
@@ -2227,11 +2123,7 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     ctx.set_raw_query_string("role=user&role=admin".to_string());
     let mut headers = HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
     for dedup in [&first, &second] {
@@ -2257,11 +2149,7 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
     }
 
     for dedup in [&first, &second] {
-        let mut retry_ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/api".to_string(),
-        );
+        let mut retry_ctx = new_ctx("POST", "/api");
         retry_ctx.set_raw_query_string("role=user&role=admin".to_string());
         let mut retry_headers =
             HashMap::from([("idempotency-key".to_string(), "correctable".to_string())]);
@@ -2286,11 +2174,7 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
     )
     .unwrap();
     let compressed = gzip_body(b"opaque");
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     ctx.request_body_bytes = Some(Bytes::copy_from_slice(&compressed));
     let mut headers = HashMap::from([
         ("idempotency-key".to_string(), "encoded".to_string()),
@@ -2315,11 +2199,7 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     retry_ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
     let mut retry_headers = HashMap::from([
         ("idempotency-key".to_string(), "encoded".to_string()),
@@ -2351,11 +2231,7 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
     ctx.metadata.insert(
         ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
@@ -2381,11 +2257,7 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     retry_ctx.request_body_bytes = Some(Bytes::from_static(b"opaque-compressed"));
     let mut retry_headers =
         HashMap::from([("idempotency-key".to_string(), "stripped".to_string())]);
@@ -2413,11 +2285,7 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     // Raw query is otherwise valid; the transform marker alone drives the reject.
     ctx.set_raw_query_string("page=1&sort=asc".to_string());
     ctx.metadata.insert(
@@ -2443,11 +2311,7 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     retry_ctx.set_raw_query_string("page=1&sort=asc".to_string());
     retry_ctx.metadata.insert(
         QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
@@ -2485,11 +2349,7 @@ async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() 
     )
     .unwrap();
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut ctx, &mut headers).await,
@@ -2509,11 +2369,7 @@ async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() 
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers =
         HashMap::from([("idempotency-key".to_string(), "pre-wire".to_string())]);
     assert!(matches!(
@@ -2536,11 +2392,7 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
     )
     .unwrap();
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers =
         HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
     assert!(matches!(
@@ -2561,11 +2413,7 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers =
         HashMap::from([("idempotency-key".to_string(), "literal-denial".to_string())]);
     assert!(matches!(
@@ -2599,11 +2447,7 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
     )
     .unwrap();
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
     assert!(matches!(
@@ -2625,11 +2469,7 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
     // A distinct active request saturates max_entries before the terminal
     // response publishes. The owned completion must remain replayable instead
     // of being selected as the only capacity-eviction candidate.
-    let mut second_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/other".to_string(),
-    );
+    let mut second_ctx = new_ctx("POST", "/other");
     let mut second_headers =
         HashMap::from([("idempotency-key".to_string(), "ordinary-b".to_string())]);
     assert!(matches!(
@@ -2648,11 +2488,7 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
         .on_response_committed(&mut first_ctx, status, &response_headers, &body)
         .await;
 
-    let mut replay_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut replay_ctx = new_ctx("POST", "/api");
     let mut replay_headers =
         HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
     match dedup
@@ -2679,11 +2515,7 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
     // in-flight tombstone, so a later Redis outage/lock expiry cannot allow the
     // external side effect to execute again.
     complete_response(&dedup, &mut second_ctx).await;
-    let mut tombstone_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut tombstone_ctx = new_ctx("POST", "/api");
     let mut tombstone_headers =
         HashMap::from([("idempotency-key".to_string(), "terminal-a".to_string())]);
     assert!(matches!(
@@ -2719,11 +2551,7 @@ async fn oversized_terminal_serverless_response_retains_inflight_protection() {
     )
     .unwrap();
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers =
         HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
     assert!(matches!(
@@ -2746,11 +2574,7 @@ async fn oversized_terminal_serverless_response_retains_inflight_protection() {
         .await;
     assert_eq!(dedup.tracked_keys_count(), Some(1));
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers =
         HashMap::from([("idempotency-key".to_string(), "oversized-key".to_string())]);
     assert!(matches!(
@@ -2785,11 +2609,7 @@ async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
     )
     .unwrap();
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api");
     let mut first_headers = HashMap::from([(
         "idempotency-key".to_string(),
         "oversized-fallback-key".to_string(),
@@ -2817,11 +2637,7 @@ async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
         .await;
     assert_eq!(dedup.tracked_keys_count(), Some(1));
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::from([(
         "idempotency-key".to_string(),
         "oversized-fallback-key".to_string(),
@@ -2982,11 +2798,7 @@ async fn two_instances_streamed_completion_releases_independently(
     first: RequestDeduplication,
     second: RequestDeduplication,
 ) {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/orders");
     let mut headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
     mark_both_fresh(&first, &second, &mut ctx, &mut headers).await;
     assert!(first.should_buffer_response_body(&ctx));
@@ -3021,11 +2833,7 @@ async fn two_instances_streamed_completion_releases_independently(
     assert!(request_identity(&second, &ctx).is_none());
     assert_eq!(second.tracked_keys_count(), Some(0));
 
-    let mut retry_a = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_a = new_ctx("POST", "/orders");
     let mut retry_a_headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
     assert!(
         matches!(
@@ -3035,11 +2843,7 @@ async fn two_instances_streamed_completion_releases_independently(
         "clean streamed completion must not leave a stale in-flight conflict for key A"
     );
 
-    let mut retry_b = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_b = new_ctx("POST", "/orders");
     let mut retry_b_headers = dual_keyed_headers("stream-a", "stream-b", "orders.example", 0);
     assert!(
         matches!(
@@ -3075,11 +2879,7 @@ async fn two_instances_interrupted_stream_retains_independently(
     first: RequestDeduplication,
     second: RequestDeduplication,
 ) {
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/orders");
     let mut headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
     mark_both_fresh(&first, &second, &mut ctx, &mut headers).await;
 
@@ -3103,11 +2903,7 @@ async fn two_instances_interrupted_stream_retains_independently(
     assert!(request_identity(&second, &ctx).is_some());
     assert_eq!(second.tracked_keys_count(), Some(1));
 
-    let mut retry_a = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_a = new_ctx("POST", "/orders");
     let mut retry_a_headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
     assert!(
         matches!(
@@ -3120,11 +2916,7 @@ async fn two_instances_interrupted_stream_retains_independently(
         "interrupted stream for key A must keep blocking retries until TTL"
     );
 
-    let mut retry_b = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/orders".to_string(),
-    );
+    let mut retry_b = new_ctx("POST", "/orders");
     let mut retry_b_headers = dual_keyed_headers("hold-a", "hold-b", "orders.example", 0);
     assert!(
         matches!(
@@ -3164,11 +2956,7 @@ async fn test_concurrent_duplicate_returns_conflict() {
     let plugin = make_plugin(config);
 
     // First request marks key as in-flight
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "inflight-key".to_string());
 
@@ -3176,11 +2964,7 @@ async fn test_concurrent_duplicate_returns_conflict() {
     assert!(matches!(result, PluginResult::Continue));
 
     // Second request with same key while first is still in-flight
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "inflight-key".to_string());
 
@@ -3206,11 +2990,7 @@ async fn test_concurrent_first_requests_only_one_reaches_backend() {
         let plugin = Arc::clone(&plugin);
         let barrier = Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
-            let mut ctx = RequestContext::new(
-                "127.0.0.1".to_string(),
-                "POST".to_string(),
-                "/api".to_string(),
-            );
+            let mut ctx = new_ctx("POST", "/api");
             let mut headers = HashMap::new();
             headers.insert("idempotency-key".to_string(), "race-key".to_string());
 
@@ -3241,11 +3021,7 @@ async fn test_different_keys_independent() {
     let plugin = make_plugin(config);
 
     // First request
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "key-a".to_string());
 
@@ -3253,11 +3029,7 @@ async fn test_different_keys_independent() {
     assert!(matches!(result, PluginResult::Continue));
 
     // Different key — should also pass
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "key-b".to_string());
 
@@ -3270,11 +3042,7 @@ async fn test_put_method_deduplicates() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "PUT".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("PUT", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "put-key".to_string());
 
@@ -3291,11 +3059,7 @@ async fn test_custom_applicable_methods() {
     let plugin = make_plugin(config);
 
     // POST should pass through (not in applicable_methods)
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "key-1".to_string());
 
@@ -3304,11 +3068,7 @@ async fn test_custom_applicable_methods() {
     assert!(request_identity(&plugin, &ctx).is_none());
 
     // DELETE should be deduplication-eligible
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "DELETE".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("DELETE", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "key-2".to_string());
 
@@ -3329,22 +3089,14 @@ async fn test_response_buffering_only_for_fresh_dedup_keys() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut get_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api".to_string(),
-    );
+    let mut get_ctx = new_ctx("GET", "/api");
     let mut get_headers = HashMap::new();
     get_headers.insert("idempotency-key".to_string(), "get-key".to_string());
     let result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!plugin.should_buffer_response_body(&get_ctx));
 
-    let mut keyless_post_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut keyless_post_ctx = new_ctx("POST", "/api");
     let mut keyless_post_headers = HashMap::new();
     let result = plugin
         .before_proxy(&mut keyless_post_ctx, &mut keyless_post_headers)
@@ -3352,11 +3104,7 @@ async fn test_response_buffering_only_for_fresh_dedup_keys() {
     assert!(matches!(result, PluginResult::Continue));
     assert!(!plugin.should_buffer_response_body(&keyless_post_ctx));
 
-    let mut keyed_post_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut keyed_post_ctx = new_ctx("POST", "/api");
     let mut keyed_post_headers = HashMap::new();
     keyed_post_headers.insert("idempotency-key".to_string(), "post-key".to_string());
     let result = plugin
@@ -3371,11 +3119,7 @@ async fn test_response_buffering_releases_event_stream_content_type() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "stream-key".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -3407,11 +3151,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -3432,11 +3172,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     // A duplicate request arriving while the stream is still active must be
     // rejected with 409 — the in-flight lock is exactly the protection this
     // plugin promises for the still-running request.
-    let mut dup_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut dup_ctx = new_ctx("POST", "/api");
     let mut dup_headers = HashMap::new();
     dup_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin.before_proxy(&mut dup_ctx, &mut dup_headers).await;
@@ -3460,11 +3196,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
         "a cleanly completed streamed SSE response must release the in-flight marker instead of waiting for TTL"
     );
 
-    let mut after_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut after_ctx = new_ctx("POST", "/api");
     let mut after_headers = HashMap::new();
     after_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin
@@ -3503,11 +3235,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
     )
     .unwrap();
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert(
         "idempotency-key".to_string(),
@@ -3531,11 +3259,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
         "an uncertain serverless side effect must retain the streamed fallback marker until TTL"
     );
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::new();
     retry_headers.insert(
         "idempotency-key".to_string(),
@@ -3562,11 +3286,7 @@ async fn test_streamed_event_stream_retains_inflight_marker_on_client_disconnect
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -3584,11 +3304,7 @@ async fn test_streamed_event_stream_retains_inflight_marker_on_client_disconnect
         "an interrupted streamed SSE response must keep the in-flight marker until TTL so a same-key retry cannot re-execute"
     );
 
-    let mut after_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut after_ctx = new_ctx("POST", "/api");
     let mut after_headers = HashMap::new();
     after_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin
@@ -3612,11 +3328,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
         "inflight_ttl_seconds": 1
     }));
 
-    let mut original_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut original_ctx = new_ctx("POST", "/api");
     let mut original_headers = HashMap::new();
     original_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin
@@ -3626,11 +3338,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
 
     request_deduplication_expire_inflight_entries_for_test(&plugin);
 
-    let mut successor_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut successor_ctx = new_ctx("POST", "/api");
     let mut successor_headers = HashMap::new();
     successor_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin
@@ -3646,11 +3354,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
         .on_response_stream_terminated(&mut original_ctx, 200, &BodyOutcome::success(32))
         .await;
 
-    let mut duplicate_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut duplicate_ctx = new_ctx("POST", "/api");
     let mut duplicate_headers = HashMap::new();
     duplicate_headers.insert("idempotency-key".to_string(), "sse-key".to_string());
     let result = plugin
@@ -3685,11 +3389,7 @@ async fn test_buffered_response_transitions_inflight_to_completed() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), "json-key".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -3728,11 +3428,7 @@ async fn test_completion_clears_inflight_then_replays() {
     let plugin = make_plugin(config);
 
     // First request marks key as in-flight
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "lifecycle-key".to_string());
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -3746,11 +3442,7 @@ async fn test_completion_clears_inflight_then_replays() {
         .await;
 
     // Now duplicate request should REPLAY, not get 409 Conflict
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "lifecycle-key".to_string());
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
@@ -3775,11 +3467,7 @@ async fn test_response_below_entry_limit_is_retained() {
         "max_total_size_bytes": 8192
     }));
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert(
         "idempotency-key".to_string(),
@@ -3790,11 +3478,7 @@ async fn test_response_below_entry_limit_is_retained() {
     complete_response_with_body(&plugin, &mut ctx1, b"small retained response").await;
     assert!(assert_completed_size_exact(&plugin) > 0);
 
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert(
         "idempotency-key".to_string(),
@@ -3817,11 +3501,7 @@ async fn test_oversized_response_is_not_retained_and_clears_inflight() {
         "max_total_size_bytes": 8192
     }));
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "oversized-entry".to_string());
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -3831,11 +3511,7 @@ async fn test_oversized_response_is_not_retained_and_clears_inflight() {
     assert_eq!(plugin.tracked_keys_count(), Some(0));
     assert_eq!(assert_completed_size_exact(&plugin), 0);
 
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "oversized-entry".to_string());
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
@@ -3853,11 +3529,7 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
     }));
     let body = vec![b'a'; 500];
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "total-cap-a".to_string());
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -3869,11 +3541,7 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
         "first entry should fit under the configured total cap, got {first_size}"
     );
 
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "total-cap-b".to_string());
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
@@ -3883,11 +3551,7 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
     assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert_eq!(assert_completed_size_exact(&plugin), first_size);
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::new();
     retry_headers.insert("idempotency-key".to_string(), "total-cap-b".to_string());
     let result = plugin
@@ -3922,11 +3586,7 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
     }));
     let body = vec![b'a'; 500];
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert(
         "idempotency-key".to_string(),
@@ -3941,11 +3601,7 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
         "first entry should fit under the configured total cap, got {first_size}"
     );
 
-    let mut ctx2 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx("POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert(
         "idempotency-key".to_string(),
@@ -3958,11 +3614,7 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
     assert_eq!(assert_completed_size_exact(&plugin), first_size);
     assert_eq!(plugin.tracked_keys_count(), Some(2));
 
-    let mut retry_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut retry_ctx = new_ctx("POST", "/api");
     let mut retry_headers = HashMap::new();
     retry_headers.insert(
         "idempotency-key".to_string(),
@@ -3989,11 +3641,7 @@ async fn test_inflight_marker_carries_timestamp() {
     let plugin = make_plugin(config);
 
     for i in 0..5 {
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/api".to_string(),
-        );
+        let mut ctx = new_ctx("POST", "/api");
         let mut headers = HashMap::new();
         headers.insert(
             "idempotency-key".to_string(),
@@ -4016,11 +3664,7 @@ async fn test_completed_entries_evict_over_capacity_on_insert() {
     let plugin = make_plugin(config);
 
     for i in 0..3 {
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/api".to_string(),
-        );
+        let mut ctx = new_ctx("POST", "/api");
         let mut headers = HashMap::new();
         headers.insert("idempotency-key".to_string(), format!("completed-{i}"));
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -4045,11 +3689,7 @@ async fn test_expired_completed_entries_release_retained_bytes() {
         "max_total_size_bytes": 8192
     }));
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "expires-size".to_string());
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -4059,11 +3699,7 @@ async fn test_expired_completed_entries_release_retained_bytes() {
 
     request_deduplication_expire_completed_entries_for_test(&plugin);
 
-    let mut cleanup_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut cleanup_ctx = new_ctx("POST", "/api");
     let mut cleanup_headers = HashMap::new();
     cleanup_headers.insert("idempotency-key".to_string(), "cleanup-trigger".to_string());
     let result = plugin
@@ -4082,11 +3718,7 @@ async fn test_active_inflight_entries_survive_capacity_pressure() {
     let plugin = make_plugin(config);
 
     for i in 0..3 {
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "POST".to_string(),
-            "/api".to_string(),
-        );
+        let mut ctx = new_ctx("POST", "/api");
         let mut headers = HashMap::new();
         headers.insert("idempotency-key".to_string(), format!("inflight-{i}"));
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -4095,11 +3727,7 @@ async fn test_active_inflight_entries_survive_capacity_pressure() {
 
     assert_eq!(plugin.tracked_keys_count(), Some(3));
 
-    let mut duplicate_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut duplicate_ctx = new_ctx("POST", "/api");
     let mut duplicate_headers = HashMap::new();
     duplicate_headers.insert("idempotency-key".to_string(), "inflight-0".to_string());
     let result = plugin
@@ -4125,11 +3753,7 @@ async fn test_replay_strips_set_cookie_session_hijack_protection() {
     let plugin = make_plugin(config);
 
     // First client: cache a response carrying a session cookie.
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api/checkout".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api/checkout");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "shared-key".to_string());
     let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -4149,11 +3773,7 @@ async fn test_replay_strips_set_cookie_session_hijack_protection() {
 
     // Second client (anonymous, same idempotency key): must NOT receive
     // user A's Set-Cookie even though replay returns user A's body.
-    let mut ctx2 = RequestContext::new(
-        "10.0.0.99".to_string(),
-        "POST".to_string(),
-        "/api/checkout".to_string(),
-    );
+    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api/checkout");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "shared-key".to_string());
 
@@ -4201,11 +3821,7 @@ async fn test_replay_strips_authorization_and_trace_headers() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "auth-key".to_string());
     let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -4230,11 +3846,7 @@ async fn test_replay_strips_authorization_and_trace_headers() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
         .await;
 
-    let mut ctx2 = RequestContext::new(
-        "10.0.0.99".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "auth-key".to_string());
 
@@ -4294,11 +3906,7 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
     let config = json!({});
     let plugin = make_plugin(config);
 
-    let mut ctx1 = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx1 = new_ctx("POST", "/api");
     let mut headers1 = HashMap::new();
     headers1.insert("idempotency-key".to_string(), "case-key".to_string());
     let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
@@ -4313,11 +3921,7 @@ async fn test_replay_strips_set_cookie_case_insensitively() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, b"{}")
         .await;
 
-    let mut ctx2 = RequestContext::new(
-        "10.0.0.99".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx2 = new_ctx_from("10.0.0.99", "POST", "/api");
     let mut headers2 = HashMap::new();
     headers2.insert("idempotency-key".to_string(), "case-key".to_string());
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
@@ -4348,21 +3952,13 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
     keyed_post.headers = keyed_headers("body-key", "api.example", 7);
     assert!(plugin.should_buffer_request_body(&keyed_post));
 
-    let keyless_without_declared_body = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let keyless_without_declared_body = new_ctx("POST", "/api");
     assert!(
         !plugin.should_buffer_request_body(&keyless_without_declared_body),
         "keyless optional requests must not lose streaming semantics"
     );
 
-    let mut keyless_declared_body = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut keyless_declared_body = new_ctx("POST", "/api");
     keyless_declared_body
         .headers
         .insert("content-length".to_string(), "7".to_string());
@@ -4371,21 +3967,13 @@ async fn test_keyed_applicable_methods_buffer_request_body_for_fingerprint() {
         "keyless optional requests must not be rejected by body buffering limits before this plugin ignores them"
     );
 
-    let required_keyless = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let required_keyless = new_ctx("POST", "/api");
     let required_plugin = make_plugin(json!({
         "enforce_required": true
     }));
     assert!(required_plugin.should_buffer_request_body(&required_keyless));
 
-    let mut keyed_get = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api".to_string(),
-    );
+    let mut keyed_get = new_ctx("GET", "/api");
     keyed_get.headers = keyed_headers("body-key", "api.example", 0);
     assert!(!plugin.should_buffer_request_body(&keyed_get));
 }
@@ -4414,11 +4002,7 @@ async fn test_keyed_idempotency_header_can_fingerprint_prebuffered_body() {
 async fn test_keyed_idempotency_header_buffers_implicit_http2_body() {
     let plugin = make_plugin(json!({}));
 
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api");
     ctx.headers.insert(
         "idempotency-key".to_string(),
         "implicit-body-key".to_string(),
@@ -4758,11 +4342,7 @@ async fn test_reused_key_equivalent_gzip_body_replays() {
     let logical_body = br#"{"order":1}"#;
     let compressed_body = gzip_body(logical_body);
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api/orders".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api/orders");
     first_ctx.request_body_bytes = Some(Bytes::from(compressed_body.clone()));
     let mut first_headers = keyed_headers("gzip-body-key", "api.example", compressed_body.len());
     first_headers.insert("content-encoding".to_string(), "gzip".to_string());
@@ -4789,11 +4369,7 @@ async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
     let logical_body = vec![b'a'; 1024 * 1024 + 1];
     let compressed_body = gzip_body(&logical_body);
 
-    let mut first_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api/orders".to_string(),
-    );
+    let mut first_ctx = new_ctx("POST", "/api/orders");
     first_ctx.request_body_bytes = Some(Bytes::from(compressed_body.clone()));
     let mut first_headers =
         keyed_headers("large-gzip-body-key", "api.example", compressed_body.len());
@@ -4806,11 +4382,7 @@ async fn test_large_gzip_body_uses_wire_fingerprint_fallback() {
     ));
     complete_response(&plugin, &mut first_ctx).await;
 
-    let mut second_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api/orders".to_string(),
-    );
+    let mut second_ctx = new_ctx("POST", "/api/orders");
     second_ctx.request_body_bytes = Some(Bytes::from(logical_body));
     let mut second_headers = keyed_headers("large-gzip-body-key", "api.example", 1024 * 1024 + 1);
 
@@ -4887,11 +4459,7 @@ async fn test_reused_key_different_body_returns_409() {
 #[tokio::test]
 async fn test_declared_body_unavailable_rejects_fingerprinting() {
     let plugin = make_plugin(json!({}));
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "POST".to_string(),
-        "/api/orders".to_string(),
-    );
+    let mut ctx = new_ctx("POST", "/api/orders");
     let mut headers = keyed_headers("missing-body", "api.example", 12);
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -4928,19 +4496,13 @@ fn test_redis_cached_response_without_policy_provenance_is_rejected() {
 #[test]
 fn test_redis_cached_response_with_malformed_policy_provenance_is_rejected() {
     let short_gate = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"abcd","presentation":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"},"status_code":201,"headers":{},"body":"e30="}"#;
-    assert!(!request_deduplication_redis_cached_response_payload_is_valid(
-        short_gate
-    ));
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(short_gate));
 
     let non_hex_presentation = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","presentation":"zzzz2233445566778899aabbccddeeff00112233445566778899aabbccddeeff"},"status_code":201,"headers":{},"body":"e30="}"#;
-    assert!(!request_deduplication_redis_cached_response_payload_is_valid(
-        non_hex_presentation
-    ));
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(non_hex_presentation));
 
     let half_present = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"},"status_code":201,"headers":{},"body":"e30="}"#;
-    assert!(!request_deduplication_redis_cached_response_payload_is_valid(
-        half_present
-    ));
+    assert!(!request_deduplication_redis_cached_response_payload_is_valid(half_present));
 }
 
 #[test]

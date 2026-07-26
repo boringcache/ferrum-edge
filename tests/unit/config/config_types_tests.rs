@@ -5297,7 +5297,10 @@ fn dedup_and_mcp_gateway_on_one_proxy_are_rejected() {
         "unexpected errors: {joined}"
     );
     // Operators need both offending ids to act on the error.
-    assert!(joined.contains("dedup1") && joined.contains("mcp1"), "{joined}");
+    assert!(
+        joined.contains("dedup1") && joined.contains("mcp1"),
+        "{joined}"
+    );
     assert!(joined.contains("p1"), "{joined}");
 }
 

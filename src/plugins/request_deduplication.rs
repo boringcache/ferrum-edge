@@ -193,9 +193,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
-fn dynamic_response_presentation_is_active(
-    plugin: &crate::config::types::PluginConfig,
-) -> bool {
+fn dynamic_response_presentation_is_active(plugin: &crate::config::types::PluginConfig) -> bool {
     if !plugin.enabled {
         return false;
     }
@@ -203,11 +201,13 @@ fn dynamic_response_presentation_is_active(
         // `mcp_gateway` retains an explicit, validated inner enable switch.
         // When false, none of its request or response hooks apply, so there is
         // no dynamic presentation policy to make deduplication unprovable.
-        "mcp_gateway" => plugin
-            .config
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            != Some(false),
+        "mcp_gateway" => {
+            plugin
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        }
         _ => true,
     }
 }

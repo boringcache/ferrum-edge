@@ -6,7 +6,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrum_edge::_test_support::clone_log_metadata;
+use ferrum_edge::_test_support::{
+    clone_log_metadata, set_response_presentation_policy_digest_for_test,
+};
 use ferrum_edge::config::types::DEFAULT_NAMESPACE;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -85,6 +87,9 @@ fn make_ctx() -> RequestContext {
         "POST".to_string(),
         "/v1/chat/completions".to_string(),
     );
+    // Stand in for the protocol entry path's plugin-cache presentation digest
+    // so dedup can retain a finalized representation under a provable policy.
+    set_response_presentation_policy_digest_for_test(&mut ctx, Some([0x5a; 32]));
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     ctx

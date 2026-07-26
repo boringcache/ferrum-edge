@@ -4516,8 +4516,7 @@ impl GatewayConfig {
             errors.extend(chargeback_errors);
         }
 
-        if let Err(dedup_errors) =
-            crate::plugins::request_deduplication::validate_composition(self)
+        if let Err(dedup_errors) = crate::plugins::request_deduplication::validate_composition(self)
         {
             errors.extend(dedup_errors);
         }

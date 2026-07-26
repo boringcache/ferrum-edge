@@ -3219,7 +3219,8 @@ impl Plugin for McpGateway {
     /// (`request_deduplication::validate_composition`); this is the runtime
     /// backstop for admission paths that only warn.
     fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
-        self.enabled.then_some(super::ResponsePresentationPolicy::Dynamic)
+        self.enabled
+            .then_some(super::ResponsePresentationPolicy::Dynamic)
     }
 
     fn modifies_request_headers(&self) -> bool {
