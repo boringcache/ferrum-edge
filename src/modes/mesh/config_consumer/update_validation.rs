@@ -71,6 +71,9 @@ pub enum MeshUpdateRejectReason {
     InvalidSliceJson,
     /// The envelope `version` disagrees with the embedded `MeshSlice.version`.
     EnvelopeVersionMismatch,
+    /// The envelope `config_authority`/`config_sequence` disagree with the
+    /// embedded `MeshSlice.revision` (issue #2473).
+    EnvelopeRevisionMismatch,
     /// The slice is scoped to a different node than the subscription.
     NodeIdMismatch,
     /// The slice is scoped to a different namespace than the subscription.
@@ -89,6 +92,7 @@ impl MeshUpdateRejectReason {
             Self::UnexpectedHeartbeat => "unexpected_heartbeat",
             Self::InvalidSliceJson => "invalid_slice_json",
             Self::EnvelopeVersionMismatch => "envelope_version_mismatch",
+            Self::EnvelopeRevisionMismatch => "envelope_revision_mismatch",
             Self::NodeIdMismatch => "node_id_mismatch",
             Self::NamespaceMismatch => "namespace_mismatch",
             Self::WorkloadScopeMismatch => "workload_scope_mismatch",
@@ -118,9 +122,10 @@ impl MeshUpdateRejectReason {
             | Self::NamespaceMismatch
             | Self::WorkloadScopeMismatch
             | Self::WaypointScopeMismatch => true,
-            Self::UnexpectedHeartbeat | Self::InvalidSliceJson | Self::EnvelopeVersionMismatch => {
-                false
-            }
+            Self::UnexpectedHeartbeat
+            | Self::InvalidSliceJson
+            | Self::EnvelopeVersionMismatch
+            | Self::EnvelopeRevisionMismatch => false,
         }
     }
 }
@@ -309,6 +314,26 @@ pub fn validate_mesh_config_update(
         return rejected(consumer, Reason::EnvelopeVersionMismatch, detail);
     }
 
+    // Same duplicate-stamp contract for the ordering revision (issue #2473):
+    // the envelope carries a copy of the slice's own `(authority, sequence)`.
+    // A frame whose envelope and slice disagree is internally inconsistent, so
+    // it is refused rather than silently ordered by one of the two values.
+    let envelope_revision = (!update.config_authority.trim().is_empty())
+        .then(|| (update.config_authority.as_str(), update.config_sequence));
+    let slice_revision = slice
+        .revision
+        .as_ref()
+        .filter(|revision| revision.is_well_formed())
+        .map(|revision| (revision.authority.as_str(), revision.sequence));
+    if envelope_revision != slice_revision {
+        let detail = format!(
+            "envelope revision {} does not match slice revision {}",
+            render_revision(envelope_revision),
+            render_revision(slice_revision)
+        );
+        return rejected(consumer, Reason::EnvelopeRevisionMismatch, detail);
+    }
+
     Ok(slice)
 }
 
@@ -352,6 +377,15 @@ fn diagnostic_value(value: &str) -> String {
         rendered.push_str(" (truncated)");
     }
     rendered
+}
+
+/// Render an `(authority, sequence)` pair for a diagnostic, bounding the
+/// control-plane-supplied authority exactly like any other echoed value.
+fn render_revision(revision: Option<(&str, u64)>) -> String {
+    match revision {
+        Some((authority, sequence)) => format!("{}/{sequence}", diagnostic_value(authority)),
+        None => "<absent>".to_string(),
+    }
 }
 
 fn optional_diagnostic_value(value: Option<&str>) -> String {

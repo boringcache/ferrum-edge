@@ -1096,7 +1096,11 @@ fn apply_pending_xds_slice(
             &config.namespace,
         );
     }
-    consumer.apply_slice(pending.slice);
+    if !consumer.apply_slice(pending.slice) {
+        // The freshness gate refused it (issue #2473); it already logged the
+        // reason. Do not claim an apply that did not happen.
+        return;
+    }
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
@@ -1142,8 +1146,27 @@ impl XdsConfigConsumer {
         &self.state
     }
 
-    pub fn apply_slice(&self, slice: MeshSlice) {
-        self.state.install_slice(slice);
+    /// Install a rebuilt slice, subject to the shared config-revision freshness
+    /// gate (issue #2473).
+    ///
+    /// Returns `true` when the slice became live. A quarantined slice is a
+    /// no-op: the previously installed slice keeps serving (make-before-break
+    /// is preserved — the ADS accumulator is untouched, so the next coherent
+    /// response from a caught-up CP still applies). The gate already recorded
+    /// the reason-labelled metric and the sanitized diagnostic, so this only
+    /// adds the xDS-side context.
+    pub fn apply_slice(&self, slice: MeshSlice) -> bool {
+        match self.state.install_slice(slice) {
+            crate::modes::mesh::runtime::MeshSliceInstall::Installed => true,
+            crate::modes::mesh::runtime::MeshSliceInstall::Quarantined(rejection) => {
+                tracing::warn!(
+                    reason = rejection.reason().as_metric_label(),
+                    "Quarantined an xDS-built mesh slice on config-revision ordering; \
+                     keeping the last-good slice"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -1415,6 +1438,11 @@ fn reverse_translate(
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
+        // Issue #2473: the authoritative ordering revision rides its own ECDS
+        // carrier so an xDS-built slice materializes the same freshness
+        // metadata a native-built one does and passes through the SAME
+        // `MeshRuntimeState::install_slice` gate.
+        revision: recovered.config_revision,
         // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
         // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
         // CP) or the slice genuinely has no workloads.
@@ -1576,6 +1604,11 @@ struct RecoveredSliceCarriers {
     declared_ingress_http_ports: usize,
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
+    /// Authoritative config revision (issue #2473) recovered from the
+    /// `ConfigRevision` carrier. `None` when the CP's config authority is
+    /// unordered (or predates the carrier) — the DP freshness gate then treats
+    /// the rebuilt slice exactly like a native slice with no `revision`.
+    config_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
@@ -1809,6 +1842,7 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
             recovered.declared_ingress_http_ports = value
         }
+        MeshSliceCarrier::ConfigRevision(value) => recovered.config_revision = Some(value),
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
             recovered.ambient_udp_source_workloads = value

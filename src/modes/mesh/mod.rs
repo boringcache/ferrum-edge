@@ -16,6 +16,7 @@ pub mod node_waypoint;
 pub mod outbound_enforcement;
 pub mod policy;
 pub mod policy_deny_log;
+pub mod revision;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
@@ -9175,6 +9176,11 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
+    // Config-revision freshness policy (issue #2473). Installed before any
+    // consumer is spawned so the first slice is already gated.
+    mesh_state.set_revision_policy(crate::modes::mesh::revision::MeshRevisionPolicy {
+        foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
+    });
     let federation_activation = FederationActivation::from_env_config(&env_config);
 
     let mut background_handles = Vec::new();

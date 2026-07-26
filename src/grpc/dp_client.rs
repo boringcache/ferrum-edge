@@ -2611,6 +2611,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         };
 
         let filtered = filter_config_to_namespace(&mut cfg, "production");
@@ -2642,6 +2643,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);

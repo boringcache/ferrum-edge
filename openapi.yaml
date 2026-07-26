@@ -2856,7 +2856,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [slice]
+                required: [slice, revision]
                 properties:
                   slice:
                     type: object
@@ -3011,6 +3011,118 @@ paths:
                           True when the converged required-type versions are not
                           all identical — normal under resource warming after an
                           incremental (e.g. policy/workload-only ECDS) update.
+                  revision:
+                    type: object
+                    description: |
+                      Authoritative config-revision state for this DP's
+                      multi-CP freshness gate. `accepted` is the
+                      `(authority, sequence)` of the slice currently serving;
+                      `quarantined` describes the most recent slice the gate
+                      refused (a lagging fallback CP, a foreign ordering
+                      domain, or a slice carrying no revision while one is
+                      accepted). Always present in mesh mode.
+
+                      This block is JWT-gated on purpose: the authority string
+                      and sequence numbers are control-plane-supplied, so
+                      `/metrics` carries only the fixed-cardinality
+                      `ferrum_mesh_config_revision_rejections_total{reason}`
+                      counter and `ferrum_mesh_config_revision_adoptions_total`.
+                    required:
+                      - rejected_total
+                      - adopted_total
+                      - foreign_authority_adopt_secs
+                      - quarantine_active
+                    properties:
+                      accepted:
+                        type: object
+                        description: |
+                          Revision of the slice currently accepted. Omitted
+                          when this DP has never accepted a revisioned slice
+                          (unversioned config authority, or pre-first-slice).
+                        required: [authority, sequence]
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Ordering domain
+                              (`FERRUM_MESH_CONFIG_AUTHORITY_ID` on the CP).
+                              Sequences are only comparable within one
+                              authority.
+                          sequence:
+                            type: integer
+                            format: int64
+                            minimum: 0
+                            description: |
+                              Durable config-change sequence within
+                              `authority`. Monotonic; never a wall clock.
+                      quarantined:
+                        type: object
+                        description: |
+                          Most recent slice the freshness gate refused.
+                          Retained until a slice is accepted. Omitted when the
+                          gate has refused nothing since the last accept.
+                        required:
+                          - authority
+                          - sequence
+                          - reason
+                          - consecutive
+                          - first_seen_at
+                          - last_seen_at
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Refused authority, control-character-stripped and
+                              truncated to 64 characters. `<absent>` when the
+                              refused slice carried no revision.
+                          sequence:
+                            type: integer
+                            format: int64
+                            minimum: 0
+                          reason:
+                            type: string
+                            enum:
+                              [stale_revision, incomparable_authority, missing_revision]
+                          consecutive:
+                            type: integer
+                            format: int64
+                            minimum: 1
+                            description: |
+                              Consecutive refusals of this same
+                              (authority, reason) pair.
+                          first_seen_at:
+                            type: string
+                            format: date-time
+                          last_seen_at:
+                            type: string
+                            format: date-time
+                      rejected_total:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                        description: |
+                          Slices the gate has refused since process start.
+                      adopted_total:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                        description: |
+                          Foreign authorities adopted after the grace period.
+                      foreign_authority_adopt_secs:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                        description: |
+                          Effective `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`.
+                          `0` disables adoption, leaving
+                          `POST /mesh/config-revision/reset` as the only
+                          recovery from an incomparable authority.
+                      quarantine_active:
+                        type: boolean
+                        description: |
+                          True while the gate is holding the last-good slice
+                          against a refused candidate — the "stale fallback
+                          quarantined" operator signal.
               examples:
                 config-drift-populated:
                   value:
@@ -3050,6 +3162,21 @@ paths:
                       missing_required_types: []
                       converged: true
                       version_skew: true
+                    revision:
+                      accepted:
+                        authority: db
+                        sequence: 4821
+                      quarantined:
+                        authority: db
+                        sequence: 4780
+                        reason: stale_revision
+                        consecutive: 3
+                        first_seen_at: "2026-05-18T19:30:02Z"
+                        last_seen_at: "2026-05-18T19:32:05Z"
+                      rejected_total: 3
+                      adopted_total: 0
+                      foreign_authority_adopt_secs: 300
+                      quarantine_active: true
                 config-drift-pre-convergence:
                   summary: Mesh mode active but no slice accepted yet
                   value:
@@ -3068,8 +3195,87 @@ paths:
                         extension_configs: 0
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
+                    revision:
+                      rejected_total: 0
+                      adopted_total: 0
+                      foreign_authority_adopt_secs: 300
+                      quarantine_active: false
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh runtime state (not in mesh mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /mesh/config-revision/reset:
+    post:
+      operationId: resetMeshConfigRevision
+      summary: Clear this DP's accepted mesh config revision (freshness gate)
+      description: |
+        Clears the last-accepted authoritative config revision so the next
+        mesh slice from ANY config authority is eligible again.
+
+        The DP orders slices by `(authority, sequence)` and refuses one that is
+        older than — or from a different ordering domain than — the accepted
+        revision, so a lagging fallback control plane cannot roll the data
+        plane back to a stale generation during an HA failover. A **foreign**
+        authority is adopted automatically once it has been observed
+        continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`. A sequence
+        rewind **inside one authority** is never auto-adopted, because it is
+        indistinguishable from the rollback the gate exists to prevent — this
+        endpoint is the documented recovery for that case (a config store
+        restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`).
+
+        Installs nothing by itself: the next slice still has to pass
+        subscription binding and update validation. The reset is logged with
+        the calling token's subject and the cleared revision.
+
+        Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
+      tags: [Mesh Config Drift]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Accepted revision cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [reset]
+                  cleared_revision:
+                    type: object
+                    nullable: true
+                    description: |
+                      The revision that was cleared, or `null` when the gate
+                      held no accepted revision.
+                    required: [authority, sequence]
+                    properties:
+                      authority:
+                        type: string
+                      sequence:
+                        type: integer
+                        format: int64
+                        minimum: 0
+              examples:
+                cleared:
+                  value:
+                    status: reset
+                    cleared_revision:
+                      authority: db
+                      sequence: 4821
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: No active mesh runtime state (not in mesh mode)
           content:

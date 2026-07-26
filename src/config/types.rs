@@ -2521,6 +2521,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    /// Authoritative mesh config revision for this snapshot (issue #2473).
+    ///
+    /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the
+    /// ConfigSync `config_json` wire (which is `deny_unknown_fields` on both
+    /// peers) and cannot break a mixed-patch CP/DP rollout. The mesh CP stamps
+    /// it from the durable `config_changes` sequence on every accepted full
+    /// load and delta, and `MeshSlice::from_gateway_config` copies it onto the
+    /// slice, which IS the wire contract the mesh data plane orders by.
+    ///
+    /// `None` means "this snapshot came from an authority with no shared
+    /// monotonic sequence" (K8s CRD controller, file source, tests); slices
+    /// built from it carry no revision and the DP gate stays inert unless it
+    /// has already accepted a revisioned slice.
+    #[serde(skip)]
+    pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

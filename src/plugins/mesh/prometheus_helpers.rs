@@ -46,6 +46,9 @@ static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
 > = LazyLock::new(DashMap::new);
 static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_CONFIG_REVISION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
@@ -554,6 +557,31 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Count a mesh slice the DP freshness gate quarantined before replacing live
+/// state (issue #2473): an older revision from the accepted authority, a
+/// revision from a foreign ordering domain, or a slice carrying no usable
+/// revision at all while a revisioned one is accepted.
+///
+/// `reason` is a compile-time constant
+/// (`MeshRevisionRejectReason::as_metric_label`), so the series' cardinality is
+/// fixed and no control-plane-supplied authority string or sequence number can
+/// reach `/metrics`. Those values ride the JWT-authenticated
+/// `GET /mesh/config-drift` `revision` block and the structured `warn!` instead
+/// — ordering detail goes to authenticated surfaces, not to scraping.
+pub fn increment_mesh_config_revision_rejection(reason: &'static str) {
+    MESH_CONFIG_REVISION_REJECTIONS
+        .entry(reason)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a foreign config authority the DP adopted after the configured grace
+/// period (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`). Label-free on purpose:
+/// the adopted authority is a CP-supplied string.
+pub fn increment_mesh_config_revision_adoption() {
+    MESH_CONFIG_REVISION_ADOPTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -761,6 +789,32 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             ));
         }
     }
+
+    if !MESH_CONFIG_REVISION_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_config_revision_rejections_total Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_config_revision_rejections_total counter\n");
+        for entry in MESH_CONFIG_REVISION_REJECTIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_config_revision_rejections_total{{reason=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key()),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    output.push_str(
+        "# HELP ferrum_mesh_config_revision_adoptions_total Foreign mesh config authorities adopted after the configured grace period.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_config_revision_adoptions_total counter\n");
+    render_mesh_process_metric(
+        output,
+        "ferrum_mesh_config_revision_adoptions_total",
+        MESH_CONFIG_REVISION_ADOPTIONS.load(Ordering::Relaxed),
+        gateway_ns_label,
+    );
 
     if !MESH_FEDERATION_POLL_FAILURES.is_empty() {
         output.push_str(

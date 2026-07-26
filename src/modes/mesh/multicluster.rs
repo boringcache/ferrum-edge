@@ -4317,6 +4317,17 @@ mod tests {
                     .map_err(|e| Status::internal(format!("serialize slice: {e}")))?,
                 ferrum_version: crate::FERRUM_VERSION.to_string(),
                 heartbeat: false,
+                config_authority: self
+                    .slice
+                    .revision
+                    .as_ref()
+                    .map(|revision| revision.authority.clone())
+                    .unwrap_or_default(),
+                config_sequence: self
+                    .slice
+                    .revision
+                    .as_ref()
+                    .map_or(0, |revision| revision.sequence),
             };
             let heartbeat = MeshConfigUpdate {
                 version: self.slice.version.clone(),
@@ -4324,6 +4335,8 @@ mod tests {
                 mesh_slice_json: String::new(),
                 ferrum_version: crate::FERRUM_VERSION.to_string(),
                 heartbeat: true,
+                config_authority: String::new(),
+                config_sequence: 0,
             };
 
             let items: Vec<Result<MeshConfigUpdate, Status>> = match self.behavior {

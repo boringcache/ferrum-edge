@@ -200,6 +200,7 @@ For remote-cluster discovery specifically, `GET /mesh/remote-clusters` names eac
 
 - RED: `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms` (carry SPIFFE identity + `connection_security_policy` labels).
 - Config freshness: `ferrum_mesh_config_last_received_timestamp_seconds{namespace}`.
+- Config ordering: `ferrum_mesh_config_revision_rejections_total{reason}` (`stale_revision` / `incomparable_authority` / `missing_revision`) and `ferrum_mesh_config_revision_adoptions_total` — see [Authoritative Config Revisions And Stale-Fallback Rejection](#authoritative-config-revisions-and-stale-fallback-rejection). Fixed cardinality; the CP-supplied authority/sequence detail stays on the JWT-gated `GET /mesh/config-drift` `revision` block.
 - Identity: `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_mtls_handshake_failures_total{reason}`.
 - Inbound posture: `ferrum_mesh_inbound_plaintext_allowed` — `1` when the mesh inbound listener was allowed up without enforced mTLS (dev opt-out posture; production mode refuses it), `0` otherwise.
 - Federation: `ferrum_mesh_federation_poll_failures_total`, `ferrum_mesh_federation_last_success_timestamp_seconds`, `ferrum_mesh_federation_bundle_age_seconds`.
@@ -1442,6 +1443,60 @@ Operator playbook:
 - **Spot a wedged xDS DP**: when `convergence.converged` is `false` with a non-empty `convergence.missing_required_types` on a starting DP, the first slice is blocked waiting on those types — cross-check `ferrum_xds_first_slice_nacks_total` for a malformed required resource (NACK loop) versus a CP that is simply not sending that type (no NACKs, type stays missing).
 
 A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
+
+## Authoritative Config Revisions And Stale-Fallback Rejection
+
+Multi-CP failover must never move a data plane *backwards*. A fallback control plane that missed a poll, is partitioned from the config store, or is simply lagging still serves a structurally valid slice — and installing it would reinstate deleted routes, endpoints, authorization policies, or trust material until failback. The slice `version` cannot arbitrate that: it is a rendering of the serving CP's local `GatewayConfig.loaded_at` wall clock, so it is not comparable across replicas, clock skew, or process restarts.
+
+Mesh slices therefore carry an authoritative **config revision** alongside `version`:
+
+```
+revision = (authority, sequence)
+```
+
+- **`authority`** names the ordering *domain*. Sequences are only comparable within one authority. Every CP replica reading the same config store advertises the same value (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, default `db`), which is exactly what makes a primary's and a fallback's slices comparable.
+- **`sequence`** is the durable `config_changes` change-log sequence — the same cursor CP incremental polling already treats as authoritative. It is not a clock and not a process-local counter: it survives CP restarts and is identical on every replica of one store.
+
+The revision rides `MeshConfigUpdate.config_authority` / `config_sequence` on the native `MeshSubscribe` envelope (a duplicate of the slice's own value, validated for agreement exactly like `version`) and, on the xDS path, its own ECDS carrier (`ConfigRevisionCarrier`) so a native-built and an xDS-built slice materialize identical ordering metadata and pass through the same data-plane gate.
+
+### Comparison contract
+
+The data plane records the revision of the slice it accepted and compares every candidate **before** the `ArcSwap` replacement:
+
+| accepted | candidate | outcome |
+|---|---|---|
+| none | anything | install (bootstrap) |
+| some | no revision | **quarantine** (`missing_revision`) |
+| same authority | `sequence >` accepted | install |
+| same authority | `sequence ==` accepted | install (reconnect replay / republish) |
+| same authority | `sequence <` accepted | **quarantine** (`stale_revision`) |
+| other authority | any | **quarantine** (`incomparable_authority`) |
+
+Equal sequences must install: reconnecting to the same CP replays that CP's initial slice at the unchanged revision, and quarantining it would break every ordinary reconnect.
+
+A quarantined candidate mutates nothing — the last-good slice keeps serving, the receive metric and `last_received_at` do not advance, and no watcher is woken. On the native stream a quarantine also **drops the stream** so multi-CP failover moves off the lagging control plane; staying attached would only let it keep serving stale generations. On the xDS path the ADS accumulator is untouched, so the next coherent response from a caught-up CP still applies (make-before-break preserved).
+
+### Intentional rollback
+
+Rolling configuration back is a **write**: it allocates new change-log sequences, so it reaches data planes as a *higher* revision carrying older content and installs normally. Replaying an old generation to move a data plane backwards is never a supported operation.
+
+### Reset semantics (no permanent lockout)
+
+Two escape hatches, both explicit:
+
+- A **foreign authority** observed continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` (default 300 s, `0` disables) is adopted with a `warn!` and a bump of `ferrum_mesh_config_revision_adoptions_total`. This covers CP state loss and a deliberate source reset without an operator round trip.
+- `POST /mesh/config-revision/reset` (JWT + `operator` role) clears the accepted revision so the next slice from any authority is eligible. This is the documented recovery for the one case that is never auto-adopted: a sequence rewind *inside* one authority — a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`. Auto-adopting that would be indistinguishable from the rollback the gate exists to prevent. The reset installs nothing itself; the next slice still has to pass subscription binding and update validation.
+
+### Observability
+
+- `/metrics` (unauthenticated tier): `ferrum_mesh_config_revision_rejections_total{reason}` with `reason` ∈ `stale_revision` / `incomparable_authority` / `missing_revision`, and `ferrum_mesh_config_revision_adoptions_total`. Fixed cardinality — no CP-supplied authority string or sequence number reaches this surface.
+- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted `(authority, sequence)`, the most recent quarantine (sanitized authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on.
+
+### Scope and residuals
+
+- **Unsequenced authorities.** A CP running the Kubernetes CRD controller (`FERRUM_K8S_CONTROLLER_ENABLED=true`) publishes **no** revision: the controller reconciles CRDs into the in-memory snapshot on its own cadence with no cross-replica monotonic sequence to order against (a max-over-live-objects `metadata.resourceVersion` *decreases* when the highest-versioned object is deleted, and per-replica high-water marks diverge). Mixing sequenced DB snapshots with unsequenced controller snapshots inside one authority would make the gate flap, so such a CP publishes nothing and data planes apply no cross-CP ordering — the pre-existing behavior. Giving the K8s authority a shared monotonic revision (an informer list/bookmark `resourceVersion` watermark) is follow-up work. The same applies to `FERRUM_MESH_CONFIG_PROTOCOL=file`, which is inherently local and ordered by the operator's own edits.
+- **One store per authority, and matching CP scope.** Two CPs pointed at *different* config stores while advertising the same `FERRUM_MESH_CONFIG_AUTHORITY_ID` is a misconfiguration the gate cannot detect — their sequences are not comparable but claim to be. Give distinct stores distinct authority ids. Likewise, the replicas a data plane lists in `FERRUM_DP_CP_GRPC_URLS` should share a `FERRUM_CP_NAMESPACES` scope: the published sequence is the highest `config_changes` sequence across the namespaces a CP polls, so a narrower-scoped replica can legitimately report a lower generation and be quarantined until the next write. Each CP's own published sequence is monotonic (a floor keeps a shrinking `CpScope::All` namespace set from moving it backwards).
+- **Remote-cluster discovery.** The multicluster remote-endpoint poller validates the envelope/slice revision agreement through the same shared validator, but applies no ordering gate: it dials one `control_plane_url` per cluster with no multi-CP failover, so the cross-replica rollback vector does not arise there. Ordering remote endpoint imports is follow-up work.
 
 ## DestinationRule
 

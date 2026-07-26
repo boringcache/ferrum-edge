@@ -18,6 +18,10 @@ use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
+use crate::modes::mesh::revision::{
+    MeshConfigRevision, MeshRevisionDiagnostics, MeshRevisionGate, MeshRevisionPolicy,
+    MeshRevisionRejection,
+};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
 
@@ -218,6 +222,38 @@ pub struct MeshRuntimeState {
     /// Latest xDS resource-warming convergence snapshot, published by the xDS
     /// client. `None` in native mode and before the first ADS response.
     xds_convergence: Arc<ArcSwap<Option<Arc<XdsConvergenceSnapshot>>>>,
+    /// Authoritative config-revision freshness gate (issue #2473). Every slice
+    /// install runs through it BEFORE the `ArcSwap` replacement, so a lagging
+    /// fallback CP cannot roll this data plane back to an older generation.
+    /// Cold path only — nothing on the proxy request path reads it.
+    revision_gate: Arc<MeshRevisionGate>,
+}
+
+/// Outcome of [`MeshRuntimeState::install_slice`].
+///
+/// Deliberately NOT `#[must_use]`: local, inherently ordered installers (the
+/// file source, tests) legitimately ignore it, while the two control-plane-fed
+/// consumers (native `MeshSubscribe`, xDS ADS) match on it. The gate itself is
+/// unconditional — the enum only reports what it decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshSliceInstall {
+    /// The slice replaced live state.
+    Installed,
+    /// The slice was quarantined; the previously installed slice keeps serving.
+    Quarantined(MeshRevisionRejection),
+}
+
+impl MeshSliceInstall {
+    pub const fn installed(&self) -> bool {
+        matches!(self, Self::Installed)
+    }
+
+    pub fn rejection(&self) -> Option<&MeshRevisionRejection> {
+        match self {
+            Self::Installed => None,
+            Self::Quarantined(rejection) => Some(rejection),
+        }
+    }
 }
 
 impl MeshRuntimeState {
@@ -237,7 +273,37 @@ impl MeshRuntimeState {
             federation_store: FederationStore::new(),
             remote_endpoint_store: RemoteEndpointStore::new(),
             xds_convergence: Arc::new(ArcSwap::new(Arc::new(None))),
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         }
+    }
+
+    /// Install the operator's revision-gate policy
+    /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`). Called once during mesh
+    /// startup, before any consumer is spawned.
+    pub fn set_revision_policy(&self, policy: MeshRevisionPolicy) {
+        self.revision_gate.set_policy(policy);
+    }
+
+    /// Revision of the slice currently accepted by the freshness gate, or
+    /// `None` when no revisioned slice has been accepted.
+    pub fn accepted_revision(&self) -> Option<MeshConfigRevision> {
+        self.revision_gate.accepted()
+    }
+
+    /// Operator diagnostics for `GET /mesh/config-drift`'s `revision` block.
+    pub fn revision_diagnostics(&self) -> MeshRevisionDiagnostics {
+        self.revision_gate.diagnostics()
+    }
+
+    /// Clear the accepted revision (operator escape hatch behind
+    /// `POST /mesh/config-revision/reset`). Returns the cleared revision.
+    ///
+    /// This is the documented recovery for a sequence rewind INSIDE one
+    /// authority — a config store restored from backup without bumping
+    /// `FERRUM_MESH_CONFIG_AUTHORITY_ID`. It never installs anything itself: it
+    /// only makes the next slice from any authority eligible again.
+    pub fn reset_accepted_revision(&self) -> Option<MeshConfigRevision> {
+        self.revision_gate.reset()
     }
 
     /// Publish the latest xDS resource-warming convergence snapshot. Called by
@@ -318,7 +384,24 @@ impl MeshRuntimeState {
     }
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.
-    pub fn install_slice(&self, slice: MeshSlice) {
+    ///
+    /// Fail-closed on config-revision ordering (issue #2473): the candidate's
+    /// [`MeshSlice::revision`] is admitted by the freshness gate BEFORE the
+    /// `ArcSwap` replacement, so a slice that is older than — or from a
+    /// different ordering domain than — the accepted revision never becomes
+    /// live. A quarantined candidate mutates nothing: the previously installed
+    /// slice keeps serving, no receive metric is recorded, no `last_install_at`
+    /// stamp advances, and no revision watcher is woken. The gate is
+    /// unconditional and lives here rather than in any one consumer, so the
+    /// native `MeshSubscribe` client, the xDS ADS client, and any future
+    /// installer share exactly one ordering decision.
+    pub fn install_slice(&self, slice: MeshSlice) -> MeshSliceInstall {
+        if let Err(rejection) = self
+            .revision_gate
+            .admit(slice.revision.as_ref(), Utc::now())
+        {
+            return MeshSliceInstall::Quarantined(rejection);
+        }
         crate::plugins::mesh::prometheus_helpers::record_mesh_config_received(&slice.namespace);
         self.current.store(Arc::new(Some(slice)));
         // Stamp the receive timestamp before publishing the revision bump so
@@ -330,6 +413,7 @@ impl MeshRuntimeState {
         if !was_first {
             self.first_ready.notify_waiters();
         }
+        MeshSliceInstall::Installed
     }
 
     /// Publish a slice after the mesh proxy runtime accepts it.

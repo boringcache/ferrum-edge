@@ -44,6 +44,7 @@ use crate::grpc::mesh_registry::{
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::modes::file::ListenerJoinHandle;
+use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
@@ -599,6 +600,8 @@ async fn load_full_config_multi(
 async fn load_full_config_multi_with_sequence(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
+    mesh_authority: Option<&str>,
+    mesh_sequence_floor: u64,
 ) -> Result<(GatewayConfig, HashMap<String, u64>), anyhow::Error> {
     let mut sequences = HashMap::new();
     if namespaces.is_empty() {
@@ -610,8 +613,79 @@ async fn load_full_config_multi_with_sequence(
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
-    let config = load_full_config_multi(db, namespaces).await?;
+    let mut config = load_full_config_multi(db, namespaces).await?;
+    // `config_changes.sequence` is a single globally monotonic change log, so
+    // the highest sequence across the polled namespaces is this snapshot's
+    // generation. The floor keeps that generation monotonic across polls: under
+    // `CpScope::All` the polled namespace SET can shrink (a namespace is
+    // deleted), and a bare max over the surviving namespaces would move the
+    // published revision BACKWARDS — which every subscribed data plane would
+    // correctly quarantine as a rollback.
+    stamp_mesh_revision(
+        &mut config,
+        mesh_authority,
+        sequences
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(mesh_sequence_floor),
+    );
     Ok((config, sequences))
+}
+
+/// Resolve the mesh config ORDERING DOMAIN this control plane advertises
+/// (issue #2473).
+///
+/// The domain is the durable config store, not the process: every CP replica
+/// polling the same database sees the same `config_changes` sequences, so they
+/// must advertise the same authority for a mesh data plane to compare their
+/// slices at all. `FERRUM_MESH_CONFIG_AUTHORITY_ID` lets operators name it
+/// explicitly — and, critically, lets a deliberate source reset (restore from
+/// backup, migration to a new store) be published as a NEW domain instead of
+/// silently rewinding sequence numbers inside the old one.
+///
+/// Returns `None` when the CP has no single sequenced authority, which today
+/// means the Kubernetes CRD controller is enabled: it reconciles CRDs straight
+/// into the in-memory snapshot on its own cadence, with no cross-replica
+/// monotonic sequence to order against (a max-over-live-objects
+/// `metadata.resourceVersion` decreases when the highest-versioned object is
+/// deleted, and per-replica high-water marks diverge). Mixing sequenced DB
+/// snapshots with unsequenced controller snapshots in one authority would make
+/// the data-plane gate flap, so such a CP publishes NO revision at all and the
+/// gate stays inert — the pre-#2473 behavior, documented in `docs/mesh.md`.
+fn resolve_mesh_config_authority(env_config: &EnvConfig) -> Option<String> {
+    if env_config.k8s_controller_enabled {
+        info!(
+            "K8s CRD controller is enabled — this CP publishes no authoritative mesh \
+             config revision, so mesh data planes apply no cross-CP freshness \
+             ordering (see docs/mesh.md)"
+        );
+        return None;
+    }
+    let authority = env_config.mesh_config_authority_id.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+/// Stamp the derived, CP-in-memory-only mesh config revision onto a snapshot.
+///
+/// `None` authority clears the field so an unsequenced snapshot can never
+/// inherit a stale revision from whatever it replaced.
+/// Highest mesh config revision sequence this CP has already published, or `0`
+/// before the first stamped snapshot.
+fn published_mesh_sequence(config: &ArcSwap<GatewayConfig>) -> u64 {
+    config
+        .load()
+        .mesh_revision
+        .as_ref()
+        .map_or(0, |revision| revision.sequence)
+}
+
+fn stamp_mesh_revision(config: &mut GatewayConfig, authority: Option<&str>, sequence: u64) {
+    config.mesh_revision = authority.map(|authority| MeshConfigRevision::new(authority, sequence));
 }
 
 fn prepare_cp_full_snapshot(mut config: GatewayConfig) -> Result<GatewayConfig, anyhow::Error> {
@@ -938,8 +1012,18 @@ pub async fn run(
         );
     }
 
+    // Ordering domain for mesh config revisions (issue #2473). Resolved once at
+    // startup so every snapshot this CP publishes — startup load, poll delta,
+    // full reload — advertises the same authority.
+    let mesh_config_authority = resolve_mesh_config_authority(&env_config);
     let (config, initial_change_sequences) =
-        load_full_config_multi_with_sequence(db.as_ref(), &polled_namespaces).await?;
+        load_full_config_multi_with_sequence(
+            db.as_ref(),
+            &polled_namespaces,
+            mesh_config_authority.as_deref(),
+            0,
+        )
+        .await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),
@@ -1593,6 +1677,7 @@ pub async fn run(
     // Deltas are broadcast as DELTA updates; DPs apply them via apply_incremental.
     // Falls back to FULL_SNAPSHOT on incremental poll failure.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
+    let poll_mesh_config_authority = mesh_config_authority.clone();
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
     let db_available_poll = db_available.clone();
@@ -1738,7 +1823,14 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
-                        match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                        match load_full_config_multi_with_sequence(
+                            db_poll.as_ref(),
+                            &nslist,
+                            poll_mesh_config_authority.as_deref(),
+                            published_mesh_sequence(&config_poll),
+                        )
+                        .await
+                        {
                             Ok((new_config, sequences)) => {
                                 if !reconcile_plugin_migrations_after_cp_reconnect(
                                     &db_poll,
@@ -1874,6 +1966,20 @@ pub async fn run(
                                 // Mirrors database mode's validate-before-swap
                                 // contract via ProxyState::apply_incremental.
                                 let mut new_config = (*config_poll.load_full()).clone();
+                                // Advance the authoritative mesh revision from
+                                // the delta's durable change cursor before the
+                                // snapshot is published (issue #2473). `max`
+                                // guards a cursor-less delta so the revision is
+                                // monotonic even then.
+                                stamp_mesh_revision(
+                                    &mut new_config,
+                                    poll_mesh_config_authority.as_deref(),
+                                    new_config
+                                        .mesh_revision
+                                        .as_ref()
+                                        .map_or(0, |revision| revision.sequence)
+                                        .max(result.sequence_cursor),
+                                );
                                 apply_incremental_to_config(&mut new_config, result.clone());
                                 new_config.normalize_fields();
                                 new_config.resolve_upstream_tls();
@@ -1912,6 +2018,8 @@ pub async fn run(
                                         match load_full_config_multi_with_sequence(
                                             db_poll.as_ref(),
                                             &nslist,
+                                            poll_mesh_config_authority.as_deref(),
+                                            published_mesh_sequence(&config_poll),
                                         )
                                         .await
                                         {
@@ -2041,7 +2149,14 @@ pub async fn run(
                                     );
                                 }
                                 // Fallback to full config load + full snapshot broadcast
-                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                match load_full_config_multi_with_sequence(
+                                    db_poll.as_ref(),
+                                    &nslist,
+                                    poll_mesh_config_authority.as_deref(),
+                                    published_mesh_sequence(&config_poll),
+                                )
+                                .await
+                                {
                                     Ok((new_config, sequences)) => {
                                         if !reconcile_plugin_migrations_after_cp_reconnect(
                                             &db_poll,
@@ -2113,7 +2228,14 @@ pub async fn run(
                                             Ok(_url) => {
                                                 plugin_migrations_need_reconcile = true;
                                                 db_available_poll.store(false, Ordering::Relaxed);
-                                                match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
+                                                match load_full_config_multi_with_sequence(
+                                                    db_poll.as_ref(),
+                                                    &nslist,
+                                                    poll_mesh_config_authority.as_deref(),
+                                                    published_mesh_sequence(&config_poll),
+                                                )
+                                                .await
+                                                {
                                                     Ok((new_config, sequences)) => {
                                                         if !reconcile_plugin_migrations_after_cp_reconnect(
                                                             &db_poll,

@@ -1360,6 +1360,26 @@ pub struct EnvConfig {
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
+    /// CP-side: ordering domain this control plane advertises for authoritative
+    /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
+    ///
+    /// Every CP replica reading the SAME config store must advertise the SAME
+    /// value, because the sequence numbers they publish come from that store's
+    /// shared `config_changes` change log. Bump it after a deliberate source
+    /// reset (restore from backup, migration to a new store) so data planes see
+    /// a new ordering domain rather than a silent sequence rewind. Empty
+    /// disables revision publication entirely. Ignored when the K8s CRD
+    /// controller is enabled (that authority has no shared monotonic sequence).
+    pub mesh_config_authority_id: String,
+    /// DP-side: seconds a foreign config authority must be observed
+    /// continuously before the mesh data plane adopts it
+    /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`, issue #2473).
+    ///
+    /// The no-permanent-lockout bound for control-plane state loss and
+    /// deliberate source resets. `0` disables adoption, leaving
+    /// `POST /mesh/config-revision/reset` as the only recovery. A sequence
+    /// rewind INSIDE one authority is never auto-adopted.
+    pub mesh_config_revision_adopt_secs: u64,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization in
     /// `EgressGateway` topology. Default `false`. When enabled, the per-port
     /// stream egress listeners terminate SVID-mTLS (reusing the mesh-inbound
@@ -2479,6 +2499,10 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
+            mesh_config_authority_id:
+                crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string(),
+            mesh_config_revision_adopt_secs:
+                crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
             mesh_egress_stream_allow_plaintext: false,
             mesh_peer_auth_live_reload_enabled: false,
@@ -2901,6 +2925,8 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
+            mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
@@ -3559,6 +3585,8 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
+            mesh_config_authority_id,
+            mesh_config_revision_adopt_secs,
             mesh_egress_stream_enabled,
             mesh_egress_stream_allow_plaintext,
             mesh_peer_auth_live_reload_enabled,
