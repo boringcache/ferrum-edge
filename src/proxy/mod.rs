@@ -32361,7 +32361,10 @@ async fn proxy_to_backend_http2(
     };
     let map_h2_err = {
         let resolved_ip = resolved_ip.clone();
-        let proxy_id = proxy.id.clone();
+        // Borrowed, not cloned: the closure is consumed inside this function,
+        // so a per-request String allocation on the direct-H2 dispatch path
+        // would be pure hot-path waste.
+        let proxy_id = proxy.id.as_str();
         let body_size_exceeded = Arc::clone(&body_size_exceeded);
         move |e: hyper::Error| {
             // A locally-generated 413 is not a wire failure: keep
@@ -32386,7 +32389,7 @@ async fn proxy_to_backend_http2(
             // connection_error tracks request_reached_wire instead of being
             // hardcoded true with a post-wire ProtocolError class.
             (
-                direct_h2_send_request_error_response(&proxy_id, e, resolved_ip),
+                direct_h2_send_request_error_response(proxy_id, e, resolved_ip),
                 None,
             )
         }

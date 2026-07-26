@@ -2682,10 +2682,6 @@ async fn proxy_grpc_streaming_dispatch(
         headers.insert(hyper::header::HOST, val);
     }
 
-    if let Some(deadline) = grpc_deadline_at {
-        apply_remaining_grpc_timeout_header(&mut headers, deadline);
-    }
-
     // For the streaming path, send_request() covers both body upload and
     // response header wait. Unlike the buffered path (where body sends
     // instantly so backend_read_timeout_ms ≈ response wait), the streaming
@@ -2738,6 +2734,12 @@ async fn proxy_grpc_streaming_dispatch(
             }
         }
     };
+
+    // Remaining-budget rewrite AFTER acquisition, for the same reason as the
+    // buffered path: a cold dial must not be re-added to the client's budget.
+    if let Some(deadline) = grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(&mut headers, deadline);
+    }
 
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
@@ -3008,9 +3010,6 @@ pub(crate) async fn proxy_grpc_request_core(
     //    backend that previously succeeded, so the two phases stay independent —
     //    matching the long-standing operator semantics and the streaming path.
     let client_grpc_deadline_at = grpc_deadline_at;
-    if let Some(deadline) = client_grpc_deadline_at {
-        apply_remaining_grpc_timeout_header(&mut headers, deadline);
-    }
     let per_phase_read_ms =
         if client_grpc_deadline_at.is_none() && proxy.backend_read_timeout_ms > 0 {
             Some(proxy.backend_read_timeout_ms)
@@ -3049,6 +3048,16 @@ pub(crate) async fn proxy_grpc_request_core(
     } else {
         grpc_pool.get_sender(proxy).await?
     };
+
+    // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
+    // acquisition. Computing it before the dial would forward a value that
+    // over-states the budget by however long the connect/handshake took (up to
+    // `backend_connect_timeout_ms` on a cold pool, or the whole retry backoff
+    // on a redial), which is the same re-arming class of error #2933 fixes,
+    // just at a smaller scale. Every attempt still gets exactly one rewrite.
+    if let Some(deadline) = client_grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline);
+    }
 
     // A client deadline remains one absolute end-to-end ceiling. Layer the
     // operator read timeout over response processing only, after connection
@@ -3414,7 +3423,9 @@ pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
 /// Rewrite the outbound `grpc-timeout` header to the remaining budget of a
 /// receipt-anchored absolute deadline.
 ///
-/// Call once per backend attempt (including the first). Retries must forward
+/// Call once per backend attempt (including the first), as late as possible —
+/// after the sender has been acquired — so the dial/handshake time is not
+/// silently handed back to the backend. Retries must forward
 /// the decremented remaining timeout rather than re-arming the client's
 /// original relative value. Formatting (millisecond precision when it fits the
 /// gRPC 8-digit wire limit, otherwise coarsened to seconds/minutes/hours) is
@@ -4132,8 +4143,11 @@ mod tests {
             "the request-scoped typed deadline must be the sole absolute source"
         );
         assert!(
-            body.contains("apply_remaining_grpc_timeout_header(&mut headers, deadline)"),
-            "each attempt must forward a decremented remaining grpc-timeout"
+            body.contains(
+                "apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline)"
+            ),
+            "each attempt must forward a decremented remaining grpc-timeout, \
+             measured after pool acquisition"
         );
         assert!(
             !body.contains("grpc_deadline_at.or_else(||"),
