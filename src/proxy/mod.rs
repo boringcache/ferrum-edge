@@ -39582,10 +39582,8 @@ mod tests {
 
         let t0 = chrono::Utc::now();
         let t1 = t0 + chrono::Duration::seconds(1);
-        let upstream_id_a =
-            crate::modes::mesh::mesh_outbound_tcp_upstream_id("a", "b-c", 3306);
-        let upstream_id_b =
-            crate::modes::mesh::mesh_outbound_tcp_upstream_id("a-b", "c", 3306);
+        let upstream_id_a = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a", "b-c", 3306);
+        let upstream_id_b = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a-b", "c", 3306);
         assert_eq!(
             upstream_id_a, upstream_id_b,
             "the generated id join is intentionally lossy"
@@ -39593,8 +39591,7 @@ mod tests {
 
         let make_upstream =
             |namespace: &str, timeout_ms: u64, updated_at: chrono::DateTime<chrono::Utc>| {
-                let mut upstream =
-                    upstream_with_targets(&upstream_id_a, &[("10.0.0.9", 3306)]);
+                let mut upstream = upstream_with_targets(&upstream_id_a, &[("10.0.0.9", 3306)]);
                 upstream.namespace = namespace.to_string();
                 upstream.created_at = updated_at;
                 upstream.updated_at = updated_at;

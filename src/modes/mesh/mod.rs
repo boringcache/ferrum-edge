@@ -1855,13 +1855,9 @@ fn materialize_east_west_gateway_proxies(
 
             let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
 
-            if let Some(existing) = config
-                .proxies
-                .iter_mut()
-                .find(|candidate| {
-                    candidate.namespace == proxy.namespace && candidate.id == proxy.id
-                })
-            {
+            if let Some(existing) = config.proxies.iter_mut().find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            }) {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -1934,13 +1930,9 @@ fn materialize_east_west_gateway_proxies(
     }
 
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| {
-                candidate.namespace == upstream.namespace && candidate.id == upstream.id
-            })
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -1951,9 +1943,7 @@ fn materialize_east_west_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| {
-                candidate.namespace == proxy.namespace && candidate.id == proxy.id
-            })
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -3866,8 +3856,7 @@ fn materialize_sidecar_ingress_listener_proxies(
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
         if config.proxies.iter().any(|p| {
-            if (p.namespace == listener.owner_namespace
-                && sibling_ids.contains(p.id.as_str()))
+            if (p.namespace == listener.owner_namespace && sibling_ids.contains(p.id.as_str()))
                 || p.dispatch_kind.is_stream()
             {
                 return false;
@@ -7685,13 +7674,9 @@ fn materialize_egress_gateway_proxies(
 
     // Merge upstreams: replace existing by ID or append.
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| {
-                candidate.namespace == upstream.namespace && candidate.id == upstream.id
-            })
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -7703,9 +7688,7 @@ fn materialize_egress_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| {
-                candidate.namespace == proxy.namespace && candidate.id == proxy.id
-            })
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -14985,8 +14968,7 @@ mod tests {
     fn mesh_outbound_materialization_qualifies_lossy_generated_ids() {
         let service_and_workload =
             |namespace: &str, name: &str, address: &str| -> (MeshService, Workload) {
-                let spiffe =
-                    format!("spiffe://cluster.local/ns/{namespace}/sa/{name}");
+                let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{name}");
                 let mut service = http_mesh_service(name, 8080, &spiffe);
                 service.namespace = namespace.to_string();
 
@@ -15026,7 +15008,10 @@ mod tests {
             .filter(|upstream| upstream.id == upstream_id_a)
             .map(|upstream| upstream.namespace.as_str())
             .collect();
-        assert_eq!(proxy_namespaces, std::collections::HashSet::from(["a", "a-b"]));
+        assert_eq!(
+            proxy_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
+        );
         assert_eq!(
             upstream_namespaces,
             std::collections::HashSet::from(["a", "a-b"])
