@@ -574,16 +574,10 @@ impl CpRejectedDeltaTracker {
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
-/// Resources are matched by their `namespace` field; removed IDs are
-/// partitioned via lookups built from the CP's current accepted config so
-/// deletions reach the right per-namespace channel. Consumer lookup keys are
-/// `(namespace, id)` because consumer IDs are namespace-local.
+/// Resources are matched by their `namespace` field. Removal keys carry
+/// namespace end-to-end so deletions route without a pre-delete id lookup.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
-    proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<(String, String), String>,
-    plugin_config_ns: &std::collections::HashMap<String, String>,
-    upstream_ns: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, IncrementalResult> {
     use std::collections::HashMap;
 
@@ -632,81 +626,36 @@ fn partition_incremental_by_namespace(
             .added_or_modified_upstreams
             .push(u);
     }
-    for id in result.removed_proxy_ids {
-        if let Some(ns) = proxy_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_proxy_ids
-                .push(id);
-        }
+    for key in result.removed_proxy_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_proxy_ids
+            .push(key);
     }
     for key in result.removed_consumer_ids {
-        if let Some(ns) = consumer_ns.get(&(key.namespace.clone(), key.id.clone())) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_consumer_ids
-                .push(key);
-        }
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_consumer_ids
+            .push(key);
     }
-    for id in result.removed_plugin_config_ids {
-        if let Some(ns) = plugin_config_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_plugin_config_ids
-                .push(id);
-        }
+    for key in result.removed_plugin_config_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_plugin_config_ids
+            .push(key);
     }
-    for id in result.removed_upstream_ids {
-        if let Some(ns) = upstream_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_upstream_ids
-                .push(id);
-        }
+    for key in result.removed_upstream_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_upstream_ids
+            .push(key);
     }
 
     buckets
-}
-
-/// Build resource-key-to-namespace lookups from a full config snapshot. Used by
-/// the multi-namespace incremental path so removal IDs (which don't carry
-/// their own namespace, except consumers) can still be routed to the right
-/// per-namespace broadcast channel. Consumer keys include namespace because
-/// consumer ids are only unique within a namespace.
-#[allow(clippy::type_complexity)]
-fn build_namespace_lookups(
-    config: &GatewayConfig,
-) -> (
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<(String, String), String>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-) {
-    let proxy_ns = config
-        .proxies
-        .iter()
-        .map(|p| (p.id.clone(), p.namespace.clone()))
-        .collect();
-    let consumer_ns = config
-        .consumers
-        .iter()
-        .map(|c| ((c.namespace.clone(), c.id.clone()), c.namespace.clone()))
-        .collect();
-    let plugin_config_ns = config
-        .plugin_configs
-        .iter()
-        .map(|pc| (pc.id.clone(), pc.namespace.clone()))
-        .collect();
-    let upstream_ns = config
-        .upstreams
-        .iter()
-        .map(|u| (u.id.clone(), u.namespace.clone()))
-        .collect();
-    (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns)
 }
 
 pub async fn run(
@@ -1261,9 +1210,13 @@ pub async fn run(
                 .http2_max_pending_accept_reset_streams(Some(
                     grpc_http2_max_pending_accept_reset_streams,
                 ))
-                .http2_max_local_error_reset_streams(Some(
-                    grpc_http2_max_local_error_reset_streams,
-                ));
+                .http2_max_local_error_reset_streams(Some(grpc_http2_max_local_error_reset_streams))
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(
+                    crate::grpc::configsync_lifecycle::CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+                )))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(
+                    crate::grpc::configsync_lifecycle::CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+                )));
             let shutdown_signal = async move {
                 while !*grpc_shutdown.borrow() {
                     if grpc_shutdown.changed().await.is_err() {
@@ -1678,8 +1631,7 @@ pub async fn run(
                         // / `Set` this is the explicit list (no DB call).
                         // For `All`, authoritative namespace discovery runs
                         // once per tick — bounded cost vs. the per-resource
-                        // queries that dominate poll time. Snapshot the current
-                        // config for per-namespace deletion routing.
+                        // queries that dominate poll time.
                         let current_snapshot = config_poll.load_full();
                         let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
@@ -1690,12 +1642,6 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
-                        let (
-                            current_proxy_ns,
-                            current_consumer_ns,
-                            current_plugin_config_ns,
-                            current_upstream_ns,
-                        ) = build_namespace_lookups(&current_snapshot);
                         // Incremental poll — only fetch changes since last poll
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
@@ -1860,13 +1806,8 @@ pub async fn run(
                                 // partition (= identical to pre-T2-A
                                 // behavior). For `Set`/`All` each DP sees
                                 // only its own namespace's resources.
-                                let partitions = partition_incremental_by_namespace(
-                                    result.clone(),
-                                    &current_proxy_ns,
-                                    &current_consumer_ns,
-                                    &current_plugin_config_ns,
-                                    &current_upstream_ns,
-                                );
+                                let partitions =
+                                    partition_incremental_by_namespace(result.clone());
                                 for (ns, ns_delta) in &partitions {
                                     CpGrpcServer::broadcast_namespace_delta(
                                         poll_broadcasts.as_ref(),
@@ -2660,53 +2601,26 @@ mod tests {
     }
 
     #[test]
-    fn partition_incremental_routes_removed_ids_with_pre_delete_lookup() {
-        let mut proxy = make_proxy("p1");
-        proxy.namespace = "tenant-a".to_string();
-        let current = GatewayConfig {
-            proxies: vec![proxy],
-            ..Default::default()
-        };
-        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
-            build_namespace_lookups(&current);
+    fn partition_incremental_routes_removed_ids_by_namespace_key() {
         let mut result = empty_incremental();
-        result.removed_proxy_ids = vec!["p1".to_string()];
+        result.removed_proxy_ids = vec![NamespacedResourceId::new("tenant-a", "p1")];
 
-        let partitions = partition_incremental_by_namespace(
-            result,
-            &proxy_ns,
-            &consumer_ns,
-            &plugin_config_ns,
-            &upstream_ns,
-        );
+        let partitions = partition_incremental_by_namespace(result);
         let tenant_delta = partitions
             .get("tenant-a")
-            .expect("removed proxy should be routed to its previous namespace");
-        assert_eq!(tenant_delta.removed_proxy_ids, vec!["p1"]);
+            .expect("removed proxy should be routed to its namespace");
+        assert_eq!(
+            tenant_delta.removed_proxy_ids,
+            vec![NamespacedResourceId::new("tenant-a", "p1")]
+        );
     }
 
     #[test]
     fn partition_incremental_routes_duplicate_consumer_ids_by_namespace() {
-        let mut prod = make_consumer("c1");
-        prod.namespace = "prod".to_string();
-        let mut staging = make_consumer("c1");
-        staging.namespace = "staging".to_string();
-        let current = GatewayConfig {
-            consumers: vec![prod, staging],
-            ..Default::default()
-        };
-        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
-            build_namespace_lookups(&current);
         let mut result = empty_incremental();
         result.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
 
-        let partitions = partition_incremental_by_namespace(
-            result,
-            &proxy_ns,
-            &consumer_ns,
-            &plugin_config_ns,
-            &upstream_ns,
-        );
+        let partitions = partition_incremental_by_namespace(result);
 
         assert!(!partitions.contains_key("prod"));
         assert_eq!(
@@ -2788,7 +2702,7 @@ mod tests {
             ..Default::default()
         };
         let mut inc = empty_incremental();
-        inc.removed_proxy_ids = vec!["p1".to_string()];
+        inc.removed_proxy_ids = vec![NamespacedResourceId::new("ferrum", "p1")];
         apply_incremental_to_config(&mut config, inc);
         assert_eq!(config.proxies.len(), 1);
         assert_eq!(config.proxies[0].id, "p2");
@@ -2817,7 +2731,7 @@ mod tests {
             ..Default::default()
         };
         let mut inc = empty_incremental();
-        inc.removed_proxy_ids = vec!["remove".to_string()];
+        inc.removed_proxy_ids = vec![NamespacedResourceId::new("ferrum", "remove")];
         inc.added_or_modified_proxies = vec![make_proxy("added")];
         inc.removed_consumer_ids = vec![NamespacedResourceId::new("ferrum", "c1")];
         inc.added_or_modified_consumers = vec![make_consumer("c2")];
@@ -2867,6 +2781,44 @@ mod tests {
                 .expect("staging consumer must be updated")
                 .username,
             "updated-staging"
+        );
+    }
+
+    #[test]
+    fn apply_incremental_keys_proxies_by_namespace_and_id() {
+        let mut prod = make_proxy("shared");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_proxy("shared");
+        staging.namespace = "staging".to_string();
+        let mut updated_staging = staging.clone();
+        updated_staging.backend_port = 9999;
+        let mut config = GatewayConfig {
+            proxies: vec![prod, staging],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![updated_staging];
+
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.proxies.len(), 2);
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "prod")
+                .expect("prod proxy must remain")
+                .backend_port,
+            8080
+        );
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "staging")
+                .expect("staging proxy must be updated")
+                .backend_port,
+            9999
         );
     }
 

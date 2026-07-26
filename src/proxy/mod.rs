@@ -8333,16 +8333,17 @@ impl ProxyState {
         let old_config = self.config.load_full();
         let mut new_config = (*old_config).clone();
 
-        // Remove deleted resources
+        // Remove deleted resources by (namespace, id) so a misrouted removal
+        // cannot delete a same-id object belonging to another namespace.
         if !result.removed_proxy_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_proxy_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .proxies
-                .retain(|p| !removed.contains(p.id.as_str()));
+                .retain(|p| !removed.contains(&(p.namespace.as_str(), p.id.as_str())));
         }
         if !result.removed_consumer_ids.is_empty() {
             let removed: std::collections::HashSet<(&str, &str)> = result
@@ -8355,46 +8356,47 @@ impl ProxyState {
             });
         }
         if !result.removed_plugin_config_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_plugin_config_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .plugin_configs
-                .retain(|pc| !removed.contains(pc.id.as_str()));
+                .retain(|pc| !removed.contains(&(pc.namespace.as_str(), pc.id.as_str())));
             for proxy in &mut new_config.proxies {
-                proxy
-                    .plugins
-                    .retain(|assoc| !removed.contains(assoc.plugin_config_id.as_str()));
+                proxy.plugins.retain(|assoc| {
+                    !removed.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                });
             }
         }
         if !result.removed_upstream_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_upstream_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .upstreams
-                .retain(|u| !removed.contains(u.id.as_str()));
+                .retain(|u| !removed.contains(&(u.namespace.as_str(), u.id.as_str())));
         }
 
         // Upsert added/modified resources using HashMap index for O(1) lookups
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
         if !result.added_or_modified_proxies.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (p.id.clone(), i))
+                .map(|(i, p)| ((p.namespace.clone(), p.id.clone()), i))
                 .collect();
             for proxy in result.added_or_modified_proxies {
-                if let Some(&pos) = idx.get(&proxy.id) {
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.proxies[pos] = proxy;
                 } else {
-                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
             }
@@ -8419,34 +8421,36 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_plugin_configs.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .plugin_configs
                 .iter()
                 .enumerate()
-                .map(|(i, pc)| (pc.id.clone(), i))
+                .map(|(i, pc)| ((pc.namespace.clone(), pc.id.clone()), i))
                 .collect();
             for pc in result.added_or_modified_plugin_configs {
-                if let Some(&pos) = idx.get(&pc.id) {
+                let key = (pc.namespace.clone(), pc.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.plugin_configs[pos] = pc;
                 } else {
-                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    idx.insert(key, new_config.plugin_configs.len());
                     new_config.plugin_configs.push(pc);
                 }
             }
         }
 
         if !result.added_or_modified_upstreams.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .upstreams
                 .iter()
                 .enumerate()
-                .map(|(i, u)| (u.id.clone(), i))
+                .map(|(i, u)| ((u.namespace.clone(), u.id.clone()), i))
                 .collect();
             for upstream in result.added_or_modified_upstreams {
-                if let Some(&pos) = idx.get(&upstream.id) {
+                let key = (upstream.namespace.clone(), upstream.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.upstreams[pos] = upstream;
                 } else {
-                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    idx.insert(key, new_config.upstreams.len());
                     new_config.upstreams.push(upstream);
                 }
             }
@@ -8760,6 +8764,40 @@ impl ProxyState {
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+
+    /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
+    /// does before it swaps, so the result is content-comparable against
+    /// [`Self::current_config`].
+    ///
+    /// `update_config` normalizes fields, resolves upstream TLS, quarantines
+    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// **before** storing the snapshot. A raw CP-delivered candidate has not
+    /// been through those node-local steps, so comparing it directly against
+    /// the applied config reports a spurious mismatch on any node whose
+    /// identity or credential state triggers one of them — most visibly a DP
+    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// plugin config exists only on the applied side.
+    ///
+    /// The ConfigSync older-cross-source identical-payload exception
+    /// (`configsync_lifecycle::authoritative_snapshot_payload_matches`) depends
+    /// on that comparison, so it must canonicalize first or the exception is
+    /// silently inert and every equivalent failover snapshot is fenced.
+    ///
+    /// Quarantine diagnostics are intentionally discarded: this is a read-only
+    /// comparison helper on a clone, and `update_config` logs them on the real
+    /// apply path.
+    pub fn canonicalize_snapshot_for_comparison(&self, config: &GatewayConfig) -> GatewayConfig {
+        let mut candidate = config.clone();
+        candidate.normalize_fields();
+        candidate.resolve_upstream_tls();
+        let _ = candidate.quarantine_invalid_hmac_credentials();
+        inject_gateway_workload_metrics_if_svid(
+            &mut candidate,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
+        candidate
     }
 }
 
@@ -11677,6 +11715,44 @@ impl EffectiveWsSizeLimits {
             max_size,
         ))
     }
+
+    /// Global frame/message capacity overflow Close when no plugin rule supplied
+    /// the binding ceiling. Bounded, non-secret empty reason (RFC 6455 1009).
+    pub(crate) fn global_capacity_close_for_error(
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                (*size, *max_size, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                (*size, *max_size, "message")
+            }
+            _ => return None,
+        };
+        Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
+pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Size,
+        // Empty reason stays within the 123-byte control-frame budget and never
+        // echoes peer-controlled or secret material.
+        reason: "".into(),
+    }
+}
+
+/// Defined idle-timeout policy Close published once for both relay halves.
+pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "idle timeout".into(),
+    }
 }
 
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
@@ -12433,6 +12509,15 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Publish one defined policy Close before cancel so
+                            // both halves attempt the same meaningful teardown
+                            // (1001) instead of asymmetric 1005/1006.
+                            let close = publish_ws_policy_close(
+                                &policy_close_ctb,
+                                &cancel_ctb,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut backend_sink, close).await;
                             break;
                         }
                     };
@@ -12600,6 +12685,25 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -12669,6 +12773,14 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Mirror of c2b: publish once, then bounded polite
+                            // write so the client observes the same 1001 Close.
+                            let close = publish_ws_policy_close(
+                                &policy_close_btc,
+                                &cancel_btc,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut ws_sink, close).await;
                             break;
                         }
                     };
@@ -12809,6 +12921,25 @@ where
                                     size,
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
@@ -33796,6 +33927,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;
     use crate::plugins::ai_federation::AiFederation;
@@ -42667,7 +42799,7 @@ mod tests {
                 added_or_modified_consumers: Vec::new(),
                 removed_consumer_ids: Vec::new(),
                 added_or_modified_plugin_configs: Vec::new(),
-                removed_plugin_config_ids: vec!["pc1".to_string()],
+                removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: 0,
