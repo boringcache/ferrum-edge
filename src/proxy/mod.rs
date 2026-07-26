@@ -18626,6 +18626,50 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    // Classify before the canonical-path boundary so a refusal uses the
+    // client's wire representation. WebSocket Upgrade / Extended CONNECT wins
+    // over any hostile Content-Type, matching backend dispatch and the H3
+    // frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
+    // Retain the representation just classified, exactly as the H3 frontend
+    // does right after it builds its context. Without this the marker existed
+    // only when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
+    // deployment — the backend speaks gRPC-Web itself and the translator is
+    // deliberately absent — left `client_grpc_framing_representation` with
+    // nothing to read. A backend that omits `Content-Type` (or a response hook
+    // that strips it) then reached the buffered representation gate as untyped
+    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
+    // response body rule was configured. The classification is taken from the
+    // immutable inbound content-type before any hook runs, so it records the
+    // client's own representation and never a rewritten one.
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
+    }
+
     // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
     // transport-level checks above — which bound the work by the operator's
     // URL-length limit and settle smuggling/authority questions first — and
@@ -18651,6 +18695,20 @@ async fn handle_proxy_request_inner(
                 "Rejected request: ambiguous percent-encoded request path"
             );
             record_request(&state, 400);
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                    &[],
+                ));
+            }
+            if request_uses_grpc_content_type {
+                return Ok(grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                ));
+            }
             return Ok(build_response(
                 StatusCode::BAD_REQUEST,
                 rejection.client_error_body(),
@@ -18662,7 +18720,7 @@ async fn handle_proxy_request_inner(
             // Move the original target into the context for `hmac_auth`; the
             // canonical form replaces it everywhere else.
             let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
-            ctx.set_raw_path(raw_path);
+            ctx.set_raw_path_for_hmac(raw_path);
             canonical
         }
         None => path,
@@ -18864,48 +18922,6 @@ async fn handle_proxy_request_inner(
     });
     ctx.request_authority = request_authority;
 
-    // Classify before routing so route/method rejects can use the client's wire
-    // representation. WebSocket Upgrade / Extended CONNECT wins over any
-    // hostile Content-Type, matching backend dispatch and the H3 frontend.
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
-    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
-    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
-    // Retain the representation just classified, exactly as the H3 frontend does
-    // right after it builds its context. Without this the marker existed only
-    // when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
-    // deployment — the backend speaks gRPC-Web itself and the translator is
-    // deliberately absent — left `client_grpc_framing_representation` with
-    // nothing to read. A backend that omits `Content-Type` (or a response hook
-    // that strips it) then reached the buffered representation gate as untyped
-    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
-    // response body rule was configured. The classification is taken from the
-    // immutable inbound content-type before any hook runs, so it records the
-    // client's own representation and never a rewritten one.
-    if let Some(content_type) = grpc_web_response_content_type {
-        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
-    }
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
 

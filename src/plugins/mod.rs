@@ -1661,10 +1661,11 @@ pub struct RequestContext {
     /// path than the backend executes (advisory `GHSA-69xf-42xm-4w4f`).
     pub path: String,
     /// The client's request target exactly as received, retained only when
-    /// canonicalization changed it. Read through [`Self::raw_path`], and only
-    /// by signature schemes that bind the literal bytes the client signed
-    /// (`hmac_auth`). Never route or authorize on this value.
-    raw_path: Option<String>,
+    /// canonicalization changed it. This private field is accessible only to
+    /// the descendant `hmac_auth` module through an opaque, debug-redacted
+    /// wrapper. Its wire signature binds the literal bytes the client signed.
+    /// Never route, authorize, or log this value.
+    raw_path: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -3803,23 +3804,8 @@ impl RequestContext {
     /// changed it. Frontends call this once, at the boundary, immediately
     /// before overwriting [`Self::path`] with the canonical form.
     #[inline]
-    pub(crate) fn set_raw_path(&mut self, raw_path: String) {
-        self.raw_path = Some(raw_path);
-    }
-
-    /// The request target as the client sent it.
-    ///
-    /// This exists for signature schemes that bind the literal bytes on the
-    /// wire (`hmac_auth` signs `METHOD + path + query`), which cannot verify
-    /// against a rewritten spelling. Nothing else may consume it: routing and
-    /// every policy surface run on [`Self::path`] so a raw spelling can never
-    /// select a different route, operation, or rule than the backend executes.
-    ///
-    /// Falls back to the canonical path when canonicalization was a no-op,
-    /// which is the case for every request whose target has no percent escape.
-    #[inline]
-    pub fn raw_path(&self) -> &str {
-        self.raw_path.as_deref().unwrap_or(self.path.as_str())
+    pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
+        self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are

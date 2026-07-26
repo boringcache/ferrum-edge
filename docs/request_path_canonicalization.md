@@ -134,8 +134,10 @@ HTTP/1.1, HTTP/2, and HTTP/3 run the check at the same point in the request
 ordering — after transport-level validation (URL length, query-parameter count,
 `check_protocol_headers`, `check_host_authority_consistency`) and before
 routing, every plugin phase, and backend dispatch. All three accept and reject
-the same set of targets. HTTP/3 shapes the rejection for gRPC / gRPC-Web the
-same way its other `400` rejections are shaped.
+the same set of targets. Plain HTTP receives the fixed, non-echoing `400`;
+native gRPC receives a trailers-only `INVALID_ARGUMENT`; and gRPC-Web receives
+HTTP `200` with `INVALID_ARGUMENT` in its body trailer frame on every supported
+frontend protocol.
 
 ## ACME HTTP-01 serving
 
@@ -182,12 +184,13 @@ paths and are not canonicalized; write them against the canonical form.
 ## Raw target
 
 The client's original target is retained on the request context only when
-canonicalization changed it, and is readable through
-`RequestContext::raw_path()`. Its single sanctioned consumer is `hmac_auth`,
-whose signing string binds the literal bytes the client signed and so cannot
-verify against a rewritten spelling. Nothing else may consume it: routing and
-every policy surface run on the canonical path, so a raw spelling can never
-select a different route, operation, or rule than the backend executes.
+canonicalization changed it. The field has no general context accessor and its
+contents are held in an opaque, debug-redacted wrapper whose single consumer is
+a private helper inside `hmac_auth`. That signing string binds the literal bytes
+the client signed and so cannot verify against a rewritten spelling. Nothing
+else can consume or accidentally debug-log it: routing and every policy surface
+run on the canonical path, so a raw spelling can never select a different
+route, operation, or rule than the backend executes.
 
 Canonicalization runs before any plugin, so a raw target that is refused never
 reaches `hmac_auth` at all. The raw path it signs is therefore always one the

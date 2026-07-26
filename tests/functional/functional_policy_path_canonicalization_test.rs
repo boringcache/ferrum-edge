@@ -11,13 +11,14 @@
 //! per-protocol difference is itself a bypass.
 
 use crate::common::TestGateway;
-use crate::scaffolding::clients::Http3Client;
+use crate::scaffolding::clients::{GetOptions, Http3Client, Http3Response};
 
 use bytes::Bytes;
 use ferrum_edge::tls::acme::{
     AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus,
     AcmeOrderStore,
 };
+use http::{HeaderMap, Method, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -304,6 +305,106 @@ async fn send_h3(client: &Http3Client, https_port: u16, target: &str) -> u16 {
     }
 }
 
+struct RpcResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+async fn collect_rpc_response(response: hyper::Response<hyper::body::Incoming>) -> RpcResponse {
+    let (parts, body) = response.into_parts();
+    let body = body
+        .collect()
+        .await
+        .expect("collect RPC rejection body")
+        .to_bytes();
+    RpcResponse {
+        status: parts.status,
+        headers: parts.headers,
+        body,
+    }
+}
+
+async fn send_h1_rpc(proxy_port: u16, target: &str, content_type: &str) -> RpcResponse {
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect h1 RPC");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("h1 RPC handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(target)
+        .header("host", format!("127.0.0.1:{proxy_port}"))
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::new()))
+        .expect("build h1 RPC request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send h1 RPC request");
+    let response = collect_rpc_response(response).await;
+    drop(sender);
+    conn_task.abort();
+    response
+}
+
+async fn send_h2_rpc(proxy_port: u16, target: &str, content_type: &str) -> RpcResponse {
+    let stream = TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect h2 RPC");
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .expect("h2 RPC handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("http://127.0.0.1:{proxy_port}{target}"))
+        .header("content-type", content_type)
+        .body(Full::new(Bytes::new()))
+        .expect("build h2 RPC request");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send h2 RPC request");
+    let response = collect_rpc_response(response).await;
+    drop(sender);
+    conn_task.abort();
+    response
+}
+
+async fn send_h3_rpc(
+    client: &Http3Client,
+    https_port: u16,
+    target: &str,
+    content_type: &str,
+) -> Http3Response {
+    let url = format!("https://127.0.0.1:{https_port}{target}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let options = GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", content_type);
+        match client.get_with_options(&url, options).await {
+            Ok(response) => return response,
+            Err(error) if Instant::now() < deadline => {
+                let _ = error;
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("H3 RPC {url} did not complete: {error}"),
+        }
+    }
+}
+
 // ============================================================================
 // Cases
 // ============================================================================
@@ -537,6 +638,137 @@ async fn functional_policy_path_canonicalization_is_identical_across_h1_h2_h3() 
         "no stray backend traffic should remain"
     );
 
+    gateway.shutdown();
+}
+
+fn assert_native_grpc_path_rejection(
+    protocol: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    assert_eq!(status, StatusCode::OK, "{protocol}: gRPC uses HTTP 200");
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc"),
+        "{protocol}: native gRPC content type"
+    );
+    assert_eq!(
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("3"),
+        "{protocol}: canonical-path rejection is INVALID_ARGUMENT"
+    );
+    assert!(body.is_empty(), "{protocol}: trailers-only body");
+}
+
+fn assert_grpc_web_path_rejection(
+    protocol: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{protocol}: gRPC-Web errors use HTTP 200"
+    );
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web+proto"),
+        "{protocol}: gRPC-Web response representation"
+    );
+    assert!(
+        !headers.contains_key("grpc-status") && !headers.contains_key("grpc-message"),
+        "{protocol}: terminal metadata stays in the body trailer frame"
+    );
+
+    let mut remaining = body;
+    let mut trailer = None;
+    while remaining.len() >= 5 {
+        let flag = remaining[0];
+        let length =
+            u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]]) as usize;
+        assert!(
+            remaining.len() >= 5 + length,
+            "{protocol}: complete gRPC-Web frame"
+        );
+        let payload = &remaining[5..5 + length];
+        if flag == 0x80 {
+            trailer = Some(payload);
+            break;
+        }
+        remaining = &remaining[5 + length..];
+    }
+    let trailer = trailer.unwrap_or_else(|| panic!("{protocol}: missing gRPC-Web trailer frame"));
+    let trailer = String::from_utf8_lossy(trailer);
+    assert!(
+        trailer.contains("grpc-status: 3\r\n"),
+        "{protocol}: canonical-path rejection is INVALID_ARGUMENT: {trailer:?}"
+    );
+    assert!(
+        !trailer.contains("%2F"),
+        "{protocol}: response must not echo attacker-controlled target bytes"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_policy_path_rejection_preserves_rpc_wire_shapes() {
+    const TARGET: &str = "/canon/a%2Fb";
+    const GRPC: &str = "application/grpc";
+    const GRPC_WEB: &str = "application/grpc-web+proto";
+
+    let backend = RecordingBackend::start().await;
+    let (mut gateway, https_port) = spawn_gateway(backend.port, None).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let proxy_port = gateway.proxy_port;
+    let _ = backend.take_targets();
+
+    let h1_web = send_h1_rpc(proxy_port, TARGET, GRPC_WEB).await;
+    assert_grpc_web_path_rejection("H1 gRPC-Web", h1_web.status, &h1_web.headers, &h1_web.body);
+
+    let h2_grpc = send_h2_rpc(proxy_port, TARGET, GRPC).await;
+    assert_native_grpc_path_rejection("H2 gRPC", h2_grpc.status, &h2_grpc.headers, &h2_grpc.body);
+    let h2_web = send_h2_rpc(proxy_port, TARGET, GRPC_WEB).await;
+    assert_grpc_web_path_rejection("H2 gRPC-Web", h2_web.status, &h2_web.headers, &h2_web.body);
+
+    let h3 = Http3Client::insecure().expect("H3 client");
+    let h3_grpc = send_h3_rpc(&h3, https_port, TARGET, GRPC).await;
+    assert_native_grpc_path_rejection(
+        "H3 gRPC",
+        h3_grpc.status,
+        &h3_grpc.headers,
+        &h3_grpc.body_bytes,
+    );
+    assert!(
+        h3_grpc.trailers.is_none(),
+        "H3 gRPC rejection is trailers-only initial headers"
+    );
+    let h3_web = send_h3_rpc(&h3, https_port, TARGET, GRPC_WEB).await;
+    assert_grpc_web_path_rejection(
+        "H3 gRPC-Web",
+        h3_web.status,
+        &h3_web.headers,
+        &h3_web.body_bytes,
+    );
+    assert!(
+        h3_web.trailers.is_none(),
+        "H3 gRPC-Web must not emit native trailers"
+    );
+
+    assert!(
+        backend.take_targets().is_empty(),
+        "canonical-path RPC rejects must never reach a backend"
+    );
     gateway.shutdown();
 }
 
