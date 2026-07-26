@@ -11711,6 +11711,44 @@ impl EffectiveWsSizeLimits {
             max_size,
         ))
     }
+
+    /// Global frame/message capacity overflow Close when no plugin rule supplied
+    /// the binding ceiling. Bounded, non-secret empty reason (RFC 6455 1009).
+    pub(crate) fn global_capacity_close_for_error(
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                (*size, *max_size, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                (*size, *max_size, "message")
+            }
+            _ => return None,
+        };
+        Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
+pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Size,
+        // Empty reason stays within the 123-byte control-frame budget and never
+        // echoes peer-controlled or secret material.
+        reason: "".into(),
+    }
+}
+
+/// Defined idle-timeout policy Close published once for both relay halves.
+pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "idle timeout".into(),
+    }
 }
 
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
@@ -12467,6 +12505,15 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Publish one defined policy Close before cancel so
+                            // both halves attempt the same meaningful teardown
+                            // (1001) instead of asymmetric 1005/1006.
+                            let close = publish_ws_policy_close(
+                                &policy_close_ctb,
+                                &cancel_ctb,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut backend_sink, close).await;
                             break;
                         }
                     };
@@ -12634,6 +12681,25 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -12703,6 +12769,14 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Mirror of c2b: publish once, then bounded polite
+                            // write so the client observes the same 1001 Close.
+                            let close = publish_ws_policy_close(
+                                &policy_close_btc,
+                                &cancel_btc,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut ws_sink, close).await;
                             break;
                         }
                     };
@@ -12843,6 +12917,25 @@ where
                                     size,
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
