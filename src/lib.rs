@@ -1602,6 +1602,102 @@ pub mod _test_support {
         plugin.staging_metadata_key_for_tests(suffix)
     }
 
+    pub fn ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        plugin.apply_redis_quarantine_delete_outcome_for_tests(cache_key, fingerprint, delete_ok);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_expire_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.expire_redis_quarantine_for_tests(cache_key);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_len_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_len_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_delete_failures_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_delete_failures_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressions_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_suppressions_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_cap_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_cap_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_ttl_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> std::time::Duration {
+        plugin.redis_quarantine_ttl_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_is_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_is_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_matches_active_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: &[u8; 32],
+    ) -> bool {
+        plugin.redis_quarantine_matches_active_for_tests(cache_key, fingerprint)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_content_for_test(
+        data: &[u8],
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_content_for_tests(
+            data,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test(
+        length: usize,
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_oversized_for_tests(
+            length,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test() -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_empty_for_tests(
+        )
+    }
+
+    pub fn ai_semantic_cache_clear_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.clear_redis_quarantine_for_tests(cache_key);
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
