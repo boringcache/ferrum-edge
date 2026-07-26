@@ -100,11 +100,14 @@ fn every_unreserved_and_sub_delim_escape_is_decoded() {
 
 #[test]
 fn escapes_of_characters_illegal_in_a_path_are_rejected() {
-    // A space, `{`, `[`, or any non-ASCII byte cannot be written literally in a
-    // request target. Retaining the escape would forward `/api%20name` while
-    // policy read `/api%20name` and a decoding backend resolved `/api name` —
-    // exactly the policy/backend mismatch this module exists to remove — so the
-    // target is refused instead.
+    // An escaped space, `{`, `[`, or non-ASCII byte is outside the `pchar`
+    // decode set. Retaining the escape would forward `/api%20name` while policy
+    // read `/api%20name` and a decoding backend resolved `/api name` — exactly
+    // the policy/backend mismatch this module exists to remove — and decoding it
+    // would emit a byte the backend URL parser cannot carry or re-encodes, so
+    // the forwarded request line would not be the canonical string either. The
+    // target is refused instead. (This governs escapes: the same byte sent
+    // literally is accepted, see the `src/policy_path.rs` module docs.)
     for path in [
         "/api%20name",
         "/api%7bname",

@@ -61,7 +61,7 @@ risking disagreement with the backend:
 | `encoded_backslash`      | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
 | `literal_backslash`      | `/a\b`           | The Rust `url` parser — which parses the backend URL on the reqwest dispatch paths — treats `\` as a path separator for special HTTP(S) URLs, as do several backend stacks. A literal `\` is the same route-structure mismatch an encoded one is. |
 | `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
-| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte cannot appear literally in a request target (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would produce an untransmittable target. Neither is a single coordinate, so the target is refused. |
+| `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte is outside the `pchar` decode set (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would emit a byte the backend URL parser cannot carry (space, controls) or percent-encodes again (`"`, `{`, `}`, non-ASCII), so the forwarded request line would not be the canonical string. Neither is a single coordinate, so the target is refused. This rule governs *escapes*; see [Literal non-`pchar` bytes](#literal-non-pchar-bytes) for the same bytes sent literally. |
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`    | A percent escape produced a `.` or `..` segment. |
 | `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..` | A `.` or `..` segment written literally. See below. |
 
@@ -80,25 +80,53 @@ meaning. The target is refused instead. A `.` inside a segment is an ordinary
 path character: `/v1.0/users` and `/a/.hidden/b` are unaffected; only a
 *complete* `.` or `..` segment is a dot segment.
 
+## Literal non-`pchar` bytes
+
+The `unrepresentable_escape` rule above governs percent *escapes*, not literal
+bytes, and the two sets are not the same. `http`'s request-target parser — used
+by hyper for HTTP/1.1 and HTTP/2 and by the HTTP/3 frontend — permits several
+non-`pchar` bytes literally in a path: `"`, `{`, `}`, `[`, `]`, `^`, `|`, and any
+byte sequence that is valid UTF-8. Those arrive as ordinary path bytes and are
+accepted. So a literal `/café` is served while `/caf%C3%A9` receives `400`, and
+`/a{b` is served while `/a%7Bb` receives `400`.
+
+That is deliberate — refusing an escape the gateway cannot forward as one
+coordinate does not require also refusing a byte a client may legally send
+literally — but it bounds what the invariants below claim. The `url` crate's
+path percent-encode set covers controls, space, `"`, `<`, `>`, `` ` ``, `#`,
+`?`, `{`, `}`, and every non-ASCII byte, so when a canonical path carrying a
+literal one of those is parsed into the backend URL, the forwarded request line
+carries the percent-encoded spelling rather than the canonical bytes.
+Percent-encoding only ever expands one byte into `%XX`; it can never synthesize
+a `/`, `?`, or `#`, and a decoding backend resolves it straight back to the
+canonical byte. Segment structure is therefore still preserved and policy still
+reads exactly what a decoding backend resolves — but the canonical path is not
+always byte-for-byte identical to the forwarded request line.
+
 ## Invariants this buys
 
 1. **Structure preservation.** Because every escape that could decode to a
    separator is rejected, and because `\` and dot segments — the two literal
    spellings a URL parser re-reads as structure — are rejected too, the
-   canonical path has exactly the segment structure of the raw target *and*
-   survives the backend URL parser unchanged. Routing, `openapi_validator`
-   parameter segments (`[^/]+`), and the backend cannot disagree about how many
-   segments a request has or which of them the request line ends up naming.
+   canonical path has exactly the segment structure of the raw target, and the
+   backend URL parser cannot change that structure either: the only edit it
+   makes to a canonical path is percent-encoding a literal byte from its path
+   encode set, which expands one byte into `%XX` and can never produce a `/`,
+   `?`, or `#`. Routing, `openapi_validator` parameter segments (`[^/]+`), and
+   the backend cannot disagree about how many segments a request has or which of
+   them the request line ends up naming.
 2. **Decode idempotence.** `canonicalize(canonicalize(p)) == canonicalize(p)`,
    and a further decode of a canonical path is a no-op — there is no escape
    left to decode.
 3. **One coordinate system.** Only `pchar`-legal bytes are decoded and no
    escape survives, so the canonical path is itself a valid HTTP request target
    *and* is byte-identical to what a decoding backend resolves. Policy
-   evaluation and backend forwarding use the same string; `strip_listen_path`
-   offsets measured by the router are valid offsets into the forwarded path.
+   evaluation and backend forwarding start from the same string, and
+   `strip_listen_path` offsets measured by the router are valid offsets into it.
    There is no spelling left on which a policy rule and the application can
-   disagree.
+   disagree. (The one edit the backend URL parser may still make — percent-
+   encoding a literal byte from its path encode set — is reversed by the
+   decoding backend, so both ends still read the canonical bytes.)
 
 ## Protocol parity
 
@@ -185,16 +213,21 @@ This is a behavior change for four shapes of traffic that previously succeeded:
   a segment (`/v1.0/users`, `/a/.hidden`) is unaffected.
 - Targets with a literal backslash now receive `400` (`literal_backslash`),
   alongside the encoded `%5C` form.
-- Targets carrying an escape of a character that cannot be written literally in
-  a path — `%20` for space, `%7B`/`%5B` for brackets, and any percent-encoded
-  non-ASCII text such as `/caf%C3%A9` — now receive `400`
-  (`unrepresentable_escape`). This is the broadest of the four: **percent-encoded
-  spaces and non-ASCII path segments are no longer accepted at all.** The
-  gateway has no way to hold one such target that both policy and a decoding
-  backend read the same way, so it refuses rather than authorize a spelling the
-  application may resolve differently. APIs that need spaces or non-ASCII text
-  in a resource identifier must carry that value in the query string, a header,
-  or a body field, or use a `pchar`-legal identifier in the path.
+- Targets carrying an escape of a byte outside the `pchar` decode set — `%20`
+  for space, `%7B`/`%5B` for brackets, and any percent-encoded non-ASCII text
+  such as `/caf%C3%A9` — now receive `400` (`unrepresentable_escape`). This is
+  the broadest of the four: **percent-encoded spaces and percent-encoded
+  non-ASCII path segments are no longer accepted at all.** The gateway will not
+  retain the escape (policy would read a spelling the application resolves
+  differently) and will not decode it (the decoded byte is one the backend URL
+  parser cannot carry or re-encodes), so it refuses. APIs that need spaces or
+  non-ASCII text in a resource identifier should carry that value in the query
+  string, a header, or a body field, or use a `pchar`-legal identifier in the
+  path. Note that this is a rule about escapes: a client that sends non-ASCII
+  path bytes *literally* — `/café` rather than `/caf%C3%A9` — is still served,
+  because `http`'s request-target parser accepts valid UTF-8 literally. See
+  [Literal non-`pchar` bytes](#literal-non-pchar-bytes). Standard HTTP clients
+  percent-encode such paths, so most callers will see the `400`.
 
 There is no configuration switch for any of them. A per-deployment opt-out would
 mean policy is computed differently depending on config, which is the class of

@@ -336,9 +336,9 @@ fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
         "expected regex-form rejection, got {errs:?}"
     );
 
-    // An escape of a character that cannot appear literally in a path (`%20`
-    // for space, `%7B` for a brace, `%C3%A9` for `é`) cannot be decoded into
-    // the forwarded target either, so the runtime refuses those request paths
+    // An escape of a byte outside the `pchar` decode set (`%20` for space,
+    // `%7B` for a brace, `%C3%A9` for `é`) can neither be retained nor decoded
+    // into the forwarded target, so the runtime refuses those request paths
     // outright and such a listen_path is dead config.
     for path in ["/api%20name", "/api/%7Bid%7D", "/caf%C3%A9"] {
         proxy.listen_path = Some(path.into());

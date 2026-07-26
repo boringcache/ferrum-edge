@@ -36,15 +36,21 @@
 //!    double encoding) is [`PolicyPathRejection::DoubleEncoding`]. Combined with rule 2 this means
 //!    a second decode of the canonical path can never introduce a separator,
 //!    so "decoded once" and "decoded twice" describe the same route.
-//! 4. **Every escape decodes to a byte that is legal literally in a path.**
-//!    An escape the canonical path could not spell literally — encoded space,
-//!    `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `|`, `}`, and every
-//!    non-ASCII byte, whether or not it is part of a valid UTF-8 sequence — is
+//! 4. **Only a `pchar`-legal escape is decoded; every other escape is
+//!    refused.** An escape of a byte outside the decode table — space, `"`,
+//!    `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `|`, `}`, and every non-ASCII
+//!    byte, whether or not it is part of a valid UTF-8 sequence — is
 //!    [`PolicyPathRejection::UnrepresentableEscape`]. Retaining such an escape
 //!    would put a *different* string on the wire than the one policy read:
 //!    the gateway would evaluate `/api%20name` while a decoding backend
 //!    resolves `/api name`, which is the same policy/backend semantic
-//!    mismatch this module exists to remove.
+//!    mismatch this module exists to remove. Decoding it is not an answer
+//!    either: the decoded byte is one the backend URL parser cannot carry at
+//!    all (space, controls) or one it percent-encodes again (`"`, `{`, `}`,
+//!    non-ASCII), so the forwarded request line would not be the canonical
+//!    string. Refusing keeps the *decoded* alphabet to bytes that survive that
+//!    parser byte-for-byte. See "Literal non-`pchar` bytes" below for what this
+//!    rule does and does not say about a byte sent literally.
 //! 5. **No `.` or `..` path segment survives, literal or escaped.** A segment
 //!    that became `.`/`..` only through a percent escape (`/a/%2e%2e/b`) is
 //!    [`PolicyPathRejection::AmbiguousDotSegment`]; one written literally
@@ -78,6 +84,29 @@
 //! the gateway and the backend can disagree.
 //!
 //! The function is idempotent: `canonicalize(canonicalize(p)) == canonicalize(p)`.
+//!
+//! # Literal non-`pchar` bytes
+//!
+//! Rule 4 governs *escapes*, not literal bytes, and the two sets are not the
+//! same. `http`'s request-target parser (`http::uri::PathAndQuery`, used by
+//! hyper for H1/H2 and by the h3 frontend) permits several non-`pchar` bytes
+//! literally in a path: `"`, `{`, `}`, `[`, `]`, `^`, `|`, and any byte
+//! sequence that is valid UTF-8. Those reach the canonicalizer as ordinary
+//! path bytes, clear the scan, and are accepted — so a literal `/café` is
+//! served while `/caf%C3%A9` is refused, and `/a{b` is served while `/a%7Bb`
+//! is refused.
+//!
+//! That asymmetry is deliberate and safe, but it bounds what the contract above
+//! claims. The `url` crate's path percent-encode set covers controls,
+//! space, `"`, `<`, `>`, `` ` ``, `#`, `?`, `{`, `}`, and every non-ASCII byte,
+//! so when a canonical path carrying a literal one of those is parsed into the
+//! backend URL, the forwarded request line is the percent-encoded spelling
+//! rather than the canonical bytes. Percent-encoding only ever expands one byte
+//! into `%XX`; it can never synthesize a `/`, `?`, or `#`, and a decoding
+//! backend resolves it straight back to the canonical byte. So segment
+//! structure is still preserved and policy still reads what a decoding backend
+//! resolves — but the canonical path is *not* always byte-for-byte the
+//! forwarded request line. Only the accepted escape alphabet is.
 //!
 //! # Fast path
 //!
@@ -129,9 +158,13 @@ pub enum PolicyPathRejection {
     LiteralBackslash,
     /// An encoded C0 control character or `DEL` (includes `%00`).
     EncodedControl,
-    /// An escape of a byte that cannot appear literally in a request target
-    /// (space, `{`, `[`, any non-ASCII byte, …). Keeping the escape would make
-    /// the forwarded spelling differ from the string policy evaluated.
+    /// An escape of a byte outside the `pchar` decode table (space, `{`, `[`,
+    /// any non-ASCII byte, …). Keeping the escape would make the forwarded
+    /// spelling differ from the string policy evaluated; decoding it would emit
+    /// a byte the backend URL parser cannot carry or re-encodes, so the
+    /// forwarded request line would not be the canonical string either. This
+    /// governs escapes only — such a byte sent *literally* is accepted (see the
+    /// module docs).
     UnrepresentableEscape,
     /// A percent escape produced a `.` or `..` path segment.
     AmbiguousDotSegment,
@@ -204,10 +237,12 @@ impl PolicyPathRejection {
 /// therefore decoded: RFC 3986 `pchar` minus `pct-encoded`, i.e.
 /// `unreserved / sub-delims / ":" / "@"`.
 ///
-/// This table is exhaustive for what canonicalization accepts. An escape of
-/// any other byte is refused, because the escape could not be rendered
-/// literally in the forwarded request target and a retained escape is a second
-/// spelling the backend may read differently than policy did.
+/// This table is exhaustive for what canonicalization *decodes*. An escape of
+/// any other byte is refused: a retained escape is a second spelling the
+/// backend may read differently than policy did, and a decoded one would be a
+/// byte the backend URL parser either cannot carry or percent-encodes again, so
+/// neither reading leaves one coordinate. (Some of those bytes are still
+/// accepted when sent literally — see the module docs.)
 ///
 /// `/` is deliberately absent — an encoded `/` is rejected with its own
 /// dedicated reason, because decoding it would add a segment the raw target
@@ -392,12 +427,15 @@ fn canonicalize(
             b'/' | b'?' | b'#' => return Err(PolicyPathRejection::EncodedSeparator),
             b'\\' => return Err(PolicyPathRejection::EncodedBackslash),
             0x00..=0x1F | 0x7F => return Err(PolicyPathRejection::EncodedControl),
-            // Anything left that is not `pchar`-legal cannot be written
-            // literally into the forwarded request target. Retaining the
-            // escape would leave policy reading `/api%20name` while a decoding
-            // backend resolves `/api name`, so the target is refused instead.
-            // This also covers every non-ASCII byte, valid UTF-8 sequence or
-            // not, so there is no decoded byte stream left to UTF-8 validate.
+            // Anything left is outside the decode table. Retaining the escape
+            // would leave policy reading `/api%20name` while a decoding backend
+            // resolves `/api name`; decoding it would emit a byte the backend
+            // URL parser cannot carry (space, controls) or re-encodes (`{`,
+            // non-ASCII), so the forwarded request line would not be the
+            // canonical string. Either way it is two coordinates, so the target
+            // is refused. This also covers every non-ASCII byte, valid UTF-8
+            // sequence or not, so there is no decoded byte stream left to UTF-8
+            // validate.
             _ if !DECODE_TO_LITERAL[value as usize] => {
                 return Err(PolicyPathRejection::UnrepresentableEscape);
             }

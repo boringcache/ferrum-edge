@@ -4270,9 +4270,9 @@ fn test_listen_path_encodings_rejects_literal_dot_segments_and_backslashes() {
 
 #[test]
 fn test_listen_path_encodings_rejects_escapes_that_cannot_be_forwarded_literally() {
-    // A space, brace, or non-ASCII byte cannot be written literally into a
-    // canonical request path, so the runtime refuses any request that spells
-    // one — a `listen_path` carrying it can only ever be dead config.
+    // An escaped space, brace, or non-ASCII byte is outside the `pchar` decode
+    // set, so the runtime refuses any request that spells one — a `listen_path`
+    // carrying such an escape can only ever be dead config.
     let mut config = empty_config();
     config.proxies = vec![
         make_proxy("good", "/api"),

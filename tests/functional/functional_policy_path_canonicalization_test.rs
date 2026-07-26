@@ -340,10 +340,10 @@ const CASES: &[Case] = &[
         backend_target: Backend::Exact("/canon/admin"),
         why: "fully encoded spelling is the same policy path",
     },
-    // An escape of a character that cannot appear literally in a path is
-    // refused: it could not be decoded into the forwarded target, and keeping
-    // it escaped would leave policy reading `/canon/a%20b` while a decoding
-    // backend resolves `/canon/a b`.
+    // An escape of a byte outside the `pchar` decode set is refused: decoding it
+    // would emit a byte the backend URL parser cannot carry or re-encodes, and
+    // keeping it escaped would leave policy reading `/canon/a%20b` while a
+    // decoding backend resolves `/canon/a b`.
     Case {
         target: "/canon/a%20b",
         status: 400,
