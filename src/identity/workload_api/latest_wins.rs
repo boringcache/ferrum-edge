@@ -124,7 +124,6 @@ impl<T> Drop for LatestWinsSender<T> {
 
 impl<T> LatestWinsReceiver<T> {
     /// Number of unread values currently retained (0 or 1).
-    #[allow(dead_code)] // external unit-test contract for the capacity-one bound
     pub fn pending_len(&self) -> usize {
         self.inner.pending.load(Ordering::Acquire)
     }
