@@ -7,8 +7,9 @@
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::startup_security::{
     StartupSecurityScope, load_startup_security, load_startup_security_with_scope,
-    mesh_inbound_modes_need_client_ca, try_load_frontend_tls,
-    validate_dtls_material, validate_mesh_inbound_client_ca_if_applicable,
+    mesh_inbound_modes_need_client_ca, mesh_inbound_server_identity_configured,
+    try_load_frontend_tls, validate_dtls_material,
+    validate_mesh_inbound_client_ca_if_applicable,
 };
 use ferrum_edge::tls::{TlsPolicy, load_crls};
 use rcgen::{CertificateParams, KeyPair};
@@ -372,7 +373,8 @@ fn mesh_terminating_missing_client_ca_fails_closed() {
     };
 
     // Default topology is sidecar (terminating). No-slice startup uses
-    // PERMISSIVE, so run would load the configured client CA.
+    // PERMISSIVE, so run would load the configured client CA even with no
+    // server identity (before the plaintext Ok(None) return).
     let err = load_startup_security(&env)
         .err()
         .expect("missing mesh client CA must fail on terminating topology");
@@ -384,7 +386,7 @@ fn mesh_terminating_missing_client_ca_fails_closed() {
 }
 
 #[test]
-fn mesh_terminating_malformed_client_ca_fails_closed() {
+fn mesh_terminating_malformed_client_ca_without_identity_matches_run_plaintext() {
     ensure_crypto_provider();
     let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
     env_guard.unset("FERRUM_MESH_TOPOLOGY");
@@ -398,9 +400,84 @@ fn mesh_terminating_malformed_client_ca_fails_closed() {
         ..EnvConfig::default()
     };
 
-    let err = load_startup_security(&env)
+    assert!(
+        !mesh_inbound_server_identity_configured(&env).unwrap(),
+        "fixture must have no configured mesh server identity"
+    );
+    // Run loads CA bytes on the no-slice PERMISSIVE snapshot, then
+    // `load_mesh_frontend_tls` returns Ok(None) before PEM-parsing the CA.
+    load_startup_security(&env).expect(
+        "readable malformed client CA with no identity must match run's permissive plaintext path",
+    );
+}
+
+#[test]
+fn mesh_malformed_client_ca_rejected_with_explicit_frontend_identity() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let ca_path = write_pem(&dir, "bad-client-ca.pem", "not-a-certificate\n");
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_cert_path: Some(write_pem(&dir, "frontend.crt", "unused-for-identity-gate\n")),
+        frontend_tls_key_path: Some(write_pem(&dir, "frontend.key", "unused-for-identity-gate\n")),
+        frontend_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+
+    assert!(mesh_inbound_server_identity_configured(&env).unwrap());
+    let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
         .err()
-        .expect("malformed mesh client CA must fail on terminating topology");
+        .expect("malformed CA must PEM-fail when explicit frontend identity is configured");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mesh client CA bundle"),
+        "expected mesh client CA PEM/expiry failure, got: {msg}"
+    );
+}
+
+#[test]
+fn mesh_malformed_client_ca_rejected_with_gateway_svid_identity() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let ca_path = write_pem(&dir, "bad-client-ca.pem", "not-a-certificate\n");
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        gateway_svid_cert_path: Some(write_pem(&dir, "svid.crt", "unused-for-identity-gate\n")),
+        gateway_svid_key_path: Some(write_pem(&dir, "svid.key", "unused-for-identity-gate\n")),
+        frontend_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+
+    assert!(mesh_inbound_server_identity_configured(&env).unwrap());
+    let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
+        .err()
+        .expect("malformed CA must PEM-fail when gateway SVID identity is configured");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mesh client CA bundle"),
+        "expected mesh client CA PEM/expiry failure, got: {msg}"
+    );
+}
+
+#[test]
+fn mesh_malformed_client_ca_rejected_with_mesh_ca_backend_identity() {
+    ensure_crypto_provider();
+    let dir = TempDir::new().unwrap();
+    let ca_path = write_pem(&dir, "bad-client-ca.pem", "not-a-certificate\n");
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        mesh_ca_backend: "spire".to_string(),
+        frontend_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+
+    assert!(mesh_inbound_server_identity_configured(&env).unwrap());
+    let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
+        .err()
+        .expect("malformed CA must PEM-fail when mesh CA backend identity is configured");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("mesh client CA bundle"),
@@ -441,22 +518,25 @@ fn mesh_mtls_disabled_skips_unused_client_ca() {
 }
 
 #[test]
-fn mesh_valid_client_ca_passes_on_terminating_topology() {
+fn mesh_valid_client_ca_with_identity_passes_on_terminating_topology() {
     ensure_crypto_provider();
     let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
     env_guard.unset("FERRUM_MESH_TOPOLOGY");
 
     let dir = TempDir::new().unwrap();
-    let (cert_pem, _key_pem) = generate_self_signed_cert();
+    let (cert_pem, key_pem) = generate_self_signed_cert();
     let ca_path = write_pem(&dir, "client-ca.pem", &cert_pem);
     let env = EnvConfig {
         mode: OperatingMode::Mesh,
         admin_https_port: 0,
+        frontend_tls_cert_path: Some(write_pem(&dir, "frontend.crt", &cert_pem)),
+        frontend_tls_key_path: Some(write_pem(&dir, "frontend.key", &key_pem)),
         frontend_tls_client_ca_bundle_path: Some(ca_path),
         ..EnvConfig::default()
     };
 
-    load_startup_security(&env).expect("valid mesh client CA must pass on terminating topology");
+    load_startup_security(&env)
+        .expect("valid mesh client CA with explicit identity must pass on terminating topology");
 }
 
 #[test]
