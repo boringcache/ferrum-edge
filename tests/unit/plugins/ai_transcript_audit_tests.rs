@@ -15,6 +15,9 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
+    HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES,
+    HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES,
+    MAX_TOOL_NAMES_AGGREGATE_BYTES, max_retained_record_bytes, snapshots,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
@@ -5134,3 +5137,564 @@ async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
 // `http_batch_response_drain_tests.rs` (asserts `HttpBatchDrainOutcome::LimitExceeded`).
 // A caller-level wall-clock check cannot distinguish capped abort from an
 // uncapped EOF read of ~1.1 MiB, so the redundant audit fixture was removed.
+
+// ---------------------------------------------------------------------------
+// Capture hard maxima, aggregate admission, and bounded model/tool metadata
+// (issues #3045 / #3046)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capture_limit_hard_maxima_boundary_admission() {
+    let client = loopback_http_client();
+    for (key, hard_max) in [
+        ("max_request_bytes", HARD_MAX_REQUEST_BYTES),
+        ("max_response_bytes", HARD_MAX_RESPONSE_BYTES),
+        ("max_stream_capture_bytes", HARD_MAX_STREAM_CAPTURE_BYTES),
+    ] {
+        let below = config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { (key): hard_max - 1 } }),
+        );
+        AiTranscriptAudit::new(&below, client.clone()).expect("below hard max must admit");
+
+        let at = config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { (key): hard_max } }),
+        );
+        AiTranscriptAudit::new(&at, client.clone()).expect("exact hard max must admit");
+
+        let above = config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { (key): hard_max + 1 } }),
+        );
+        let err = AiTranscriptAudit::new(&above, client.clone())
+            .err()
+            .expect("above hard max must reject");
+        assert!(
+            err.contains(key) && err.contains("hard maximum"),
+            "got: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn capture_limit_aggregate_admission_boundaries() {
+    let client = loopback_http_client();
+    // Individually under each hard max, aggregate exactly at the hard sum.
+    let at = config_with_sink(
+        "https://audit.example.com/x",
+        json!({
+            "limits": {
+                "max_request_bytes": HARD_MAX_REQUEST_BYTES,
+                "max_response_bytes": HARD_MAX_RESPONSE_BYTES - 1,
+                "max_stream_capture_bytes": 1
+            }
+        }),
+    );
+    AiTranscriptAudit::new(&at, client.clone()).expect("exact aggregate must admit");
+
+    let above = config_with_sink(
+        "https://audit.example.com/x",
+        json!({
+            "limits": {
+                "max_request_bytes": HARD_MAX_REQUEST_BYTES,
+                "max_response_bytes": HARD_MAX_RESPONSE_BYTES,
+                "max_stream_capture_bytes": 1
+            }
+        }),
+    );
+    let err = AiTranscriptAudit::new(&above, client.clone())
+        .err()
+        .expect("over-aggregate must reject");
+    assert!(
+        err.contains("must be <=") && err.contains(&HARD_MAX_CAPTURE_BYTES_AGGREGATE.to_string()),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn platform_max_capture_limit_rejected_fail_closed() {
+    let config = config_with_sink(
+        "https://audit.example.com/x",
+        json!({ "limits": { "max_request_bytes": u64::MAX } }),
+    );
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("platform-max limit must reject");
+    assert!(
+        err.contains("max_request_bytes") && err.contains("hard maximum"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_status_exposes_admitted_limits_without_content() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 2048,
+                    "max_stream_capture_bytes": 4096
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let before = snapshots();
+    assert!(
+        !before.iter().any(|snap| snap.max_request_bytes == 1024
+            && snap.max_response_bytes == 2048
+            && snap.max_stream_capture_bytes == 4096),
+        "uncommitted construction must not publish status"
+    );
+
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let snap = plugin.status_snapshot();
+    assert_eq!(snap.max_request_bytes, 1024);
+    assert_eq!(snap.max_response_bytes, 2048);
+    assert_eq!(snap.max_stream_capture_bytes, 4096);
+    assert_eq!(snap.hard_max_request_bytes, HARD_MAX_REQUEST_BYTES as u64);
+    assert_eq!(
+        snap.hard_max_capture_bytes_aggregate,
+        HARD_MAX_CAPTURE_BYTES_AGGREGATE as u64
+    );
+    assert_eq!(snap.max_model_bytes, MAX_MODEL_BYTES as u64);
+    assert_eq!(snap.max_tool_names, MAX_TOOL_NAMES as u64);
+    assert_eq!(snap.max_tool_name_bytes, MAX_TOOL_NAME_BYTES as u64);
+    assert_eq!(
+        snap.max_tool_names_aggregate_bytes,
+        MAX_TOOL_NAMES_AGGREGATE_BYTES as u64
+    );
+    assert_eq!(
+        snap.max_retained_record_bytes,
+        max_retained_record_bytes(1024, 2048, 4096) as u64
+    );
+    let published = snapshots();
+    assert!(
+        published
+            .iter()
+            .any(|entry| entry.instance_id == snap.instance_id),
+        "committed instance must appear in authenticated snapshots"
+    );
+    let encoded = serde_json::to_string(&snap).expect("status serializes");
+    assert!(!encoded.contains("gpt"));
+    assert!(!encoded.contains("ssn"));
+    assert!(!encoded.contains("messages"));
+    drop(plugin);
+    assert!(
+        !snapshots()
+            .iter()
+            .any(|entry| entry.instance_id == snap.instance_id),
+        "drop must unregister status"
+    );
+}
+
+#[tokio::test]
+async fn huge_model_is_bounded_with_truncation_hash() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &mock.uri(),
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "limits": { "max_request_bytes": 512 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // The excess bytes must differ from the retained prefix: a single-character
+    // fixture cannot observe a bypass, because any slice past the ceiling is
+    // trivially "contained" in the bounded prefix.
+    let huge_model = "m".repeat(MAX_MODEL_BYTES) + &"z".repeat(4096);
+    let body =
+        format!(r#"{{"model":"{huge_model}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&mock).await;
+    let model = records[0]["model"].as_str().expect("model");
+    assert_eq!(model.len(), MAX_MODEL_BYTES);
+    assert!(!model.contains(&huge_model[MAX_MODEL_BYTES..MAX_MODEL_BYTES + 16]));
+    assert_eq!(records[0]["model_truncated"], true);
+    let hash = records[0]["model_hash"].as_str().expect("model_hash");
+    assert_eq!(hash.len(), 64);
+    assert!(records[0].get("request_body").is_some());
+}
+
+#[tokio::test]
+async fn huge_tool_count_and_name_lengths_are_bounded() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &mock.uri(),
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "capture": { "tool_calls": true },
+                "limits": { "max_request_bytes": 256 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // Excess bytes differ from the retained prefix so the per-name and
+    // record-wide leak assertions below can actually observe a bypass.
+    let long_name = "t".repeat(MAX_TOOL_NAME_BYTES) + &"z".repeat(64);
+    let mut tools = Vec::new();
+    for index in 0..(MAX_TOOL_NAMES + 32) {
+        let name = if index == 0 {
+            long_name.clone()
+        } else {
+            format!("tool_{index:04}")
+        };
+        tools.push(json!({"type":"function","function":{"name": name}}));
+    }
+    // Also add many large names that would blow the aggregate budget.
+    for index in 0..64 {
+        let name = format!("{}{index}", "a".repeat(MAX_TOOL_NAME_BYTES));
+        tools.push(json!({"type":"function","function":{"name": name}}));
+    }
+    // Pad the prompt past `max_request_bytes` so the `full_body` raw request
+    // excerpt (an explicit opt-in that legitimately keeps raw bytes) can never
+    // reach the tool array; the record-wide assertion then only observes the
+    // bounded `tool_names`.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role":"user","content": "h".repeat(512)}],
+        "tools": tools
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&mock).await;
+    let names = records[0]["tool_names"].as_array().expect("tool_names");
+    assert!(names.len() <= MAX_TOOL_NAMES);
+    let mut aggregate = 0usize;
+    for name in names {
+        let name = name.as_str().expect("name str");
+        assert!(name.len() <= MAX_TOOL_NAME_BYTES);
+        aggregate += name.len();
+        assert!(!name.contains(&long_name[MAX_TOOL_NAME_BYTES..]));
+    }
+    assert!(aggregate <= MAX_TOOL_NAMES_AGGREGATE_BYTES);
+    assert_eq!(records[0]["tool_names_truncated"], true);
+    assert!(records[0]["tool_names_omitted"].as_u64().unwrap() > 0);
+    let hash = records[0]["tool_names_hash"].as_str().expect("hash");
+    assert_eq!(hash.len(), 64);
+    let encoded = serde_json::to_string(&records[0]).unwrap();
+    assert!(!encoded.contains(&long_name[MAX_TOOL_NAME_BYTES..MAX_TOOL_NAME_BYTES + 8]));
+}
+
+#[tokio::test]
+async fn truncation_metadata_stable_serialization_omits_false_flags() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &mock.uri(),
+            json!({ "mode": "full_body", "allow_full_body": true }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    let body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"get_weather"}}]}"#;
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&mock).await;
+    assert!(records[0].get("model_truncated").is_none());
+    assert!(records[0].get("model_hash").is_none());
+    assert!(records[0].get("tool_names_truncated").is_none());
+    assert!(records[0].get("tool_names_omitted").is_none());
+    assert!(records[0].get("tool_names_hash").is_none());
+    assert_eq!(records[0]["model"], "gpt-4o");
+    assert_eq!(records[0]["tool_names"], json!(["get_weather"]));
+}
+
+#[tokio::test]
+async fn metadata_only_mode_still_bounds_model_and_tools() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &mock.uri(),
+            json!({
+                "mode": "metadata_only",
+                "capture": { "tool_calls": true },
+                "limits": { "max_request_bytes": 64 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let huge_model = "Z".repeat(MAX_MODEL_BYTES * 8);
+    let tools: Vec<Value> = (0..(MAX_TOOL_NAMES + 8))
+        .map(|index| json!({"type":"function","function":{"name": format!("fn_{index}")}}))
+        .collect();
+    let body = json!({
+        "model": huge_model,
+        "messages": [{"role":"user","content":"x"}],
+        "tools": tools
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&mock).await;
+    assert!(records[0].get("request_body").is_none());
+    let model = records[0]["model"].as_str().unwrap();
+    assert!(model.len() <= MAX_MODEL_BYTES);
+    assert_eq!(records[0]["model_truncated"], true);
+    assert!(records[0]["tool_names"].as_array().unwrap().len() <= MAX_TOOL_NAMES);
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
+#[tokio::test]
+async fn model_and_tool_pii_crossing_bound_is_redacted_before_truncation() {
+    // Pad so the SSN straddles the model/tool ceilings: truncate-then-redact
+    // would export the unmatched raw prefix ("123-45"). Protected modes must
+    // redact the full observed string first; full_body may keep the raw prefix.
+    let ssn = "123-45-6789";
+    let model_pad = MAX_MODEL_BYTES - 6;
+    let tool_pad = MAX_TOOL_NAME_BYTES - 6;
+    // The pad ends on a non-word character so the SSN is a real `\b`-delimited
+    // span: a digit run glued to word characters is not PII to the builtin
+    // pattern, and the fixture would prove nothing about ordering.
+    let model_lead = "m".repeat(model_pad - 1) + "/";
+    let tool_lead = "t".repeat(tool_pad - 1) + "/";
+    let huge_model = format!("{model_lead}{ssn}");
+    let huge_tool = format!("{tool_lead}{ssn}");
+    // Straddle check: the retained window ends mid-SSN.
+    assert!(huge_model[..MAX_MODEL_BYTES].ends_with("123-45"));
+    assert!(huge_tool[..MAX_TOOL_NAME_BYTES].ends_with("123-45"));
+
+    let body = json!({
+        "model": huge_model.clone(),
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name": huge_tool.clone()}}]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let secret = "fleet-stable-hmac-key";
+
+    for mode in [
+        json!({ "mode": "redacted_body" }),
+        json!({ "mode": "metadata_only" }),
+    ] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let mut overrides = mode.clone();
+        if let Some(obj) = overrides.as_object_mut() {
+            obj.insert("capture".to_string(), json!({ "tool_calls": true }));
+            obj.insert("redaction".to_string(), json!({ "hash_secret": secret }));
+        }
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, overrides.clone()),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "overrides: {overrides}");
+
+        let model = records[0]["model"].as_str().expect("model");
+        assert!(
+            model.len() <= MAX_MODEL_BYTES,
+            "model must stay hard-bounded ({overrides}): len={}",
+            model.len()
+        );
+        assert!(
+            !model.contains("123-45") && !model.contains("123-4"),
+            "raw SSN prefix leaked through model after bound ({overrides}): {model}"
+        );
+        assert_eq!(records[0]["model_truncated"], true);
+        assert_eq!(
+            records[0]["model_hash"].as_str().expect("model_hash"),
+            keyed_reference(secret).keyed_hash_hex(huge_model.as_bytes()),
+            "truncation hash must cover the full original model ({overrides})"
+        );
+
+        let tool = records[0]["tool_names"][0].as_str().expect("tool name");
+        assert!(
+            tool.len() <= MAX_TOOL_NAME_BYTES,
+            "tool name must stay hard-bounded ({overrides}): len={}",
+            tool.len()
+        );
+        assert!(
+            !tool.contains("123-45") && !tool.contains("123-4"),
+            "raw SSN prefix leaked through tool name after bound ({overrides}): {tool}"
+        );
+        assert_eq!(records[0]["tool_names_truncated"], true);
+        assert!(records[0]["tool_names_hash"].as_str().is_some());
+    }
+
+    // full_body keeps the bounded raw prefix (explicit opt-in), including the
+    // unmatched SSN fragment that protected modes must not export.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "capture": { "tool_calls": true },
+                "redaction": { "hash_secret": secret }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let model = records[0]["model"].as_str().expect("model");
+    assert_eq!(model, &huge_model[..MAX_MODEL_BYTES]);
+    assert!(model.ends_with("123-45"));
+    assert_eq!(records[0]["model_truncated"], true);
+    assert_eq!(
+        records[0]["model_hash"].as_str().expect("model_hash"),
+        keyed_reference(secret).keyed_hash_hex(huge_model.as_bytes())
+    );
+    let tool = records[0]["tool_names"][0].as_str().expect("tool name");
+    assert_eq!(tool, &huge_tool[..MAX_TOOL_NAME_BYTES]);
+    assert!(tool.ends_with("123-45"));
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
+#[tokio::test]
+async fn custom_redaction_expansion_is_not_reapplied_after_bounding() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let placeholder = "X".repeat(MAX_MODEL_BYTES * 2);
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "metadata_only",
+                "capture": { "tool_calls": true },
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [{ "name": "every_char", "regex": "." }],
+                    "placeholder": placeholder,
+                    "hash_redacted_values": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid expanding redactor");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let body = serde_json::to_vec(&json!({
+        "model": "m",
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": [{"type":"function","function":{"name":"t"}}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let model = records[0]["model"].as_str().expect("model");
+    let tool = records[0]["tool_names"][0].as_str().expect("tool");
+    assert_eq!(model.len(), MAX_MODEL_BYTES);
+    assert_eq!(tool.len(), MAX_TOOL_NAME_BYTES);
+    assert!(model.bytes().all(|byte| byte == b'X'));
+    assert!(tool.bytes().all(|byte| byte == b'X'));
+    assert_eq!(records[0]["model_truncated"], true);
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
+#[test]
+fn retained_record_contract_matches_documented_formula() {
+    assert_eq!(
+        max_retained_record_bytes(65536, 65536, 65536),
+        65536 + 65536 + MAX_MODEL_BYTES + MAX_TOOL_NAMES_AGGREGATE_BYTES
+    );
+    assert_eq!(
+        max_retained_record_bytes(100, 50, 200),
+        100 + 200 + MAX_MODEL_BYTES + MAX_TOOL_NAMES_AGGREGATE_BYTES
+    );
+}
