@@ -719,12 +719,15 @@ struct AlignedCounterRow(Vec<AtomicU8>);
 /// [`CMS_AGE_CHUNK`] cells. That keeps route-lookup latency bounded even while
 /// the thread-local `CACHE_KEY_BUF` borrow is held on the hit path.
 ///
-/// Chunk mutation is single-owner and non-blocking: `age_step` CASes an
-/// `age_owner` flag; losers return immediately. The owner halves a chunk, then
-/// publishes the reduced `age_remaining` cursor — so `age_remaining == 0` is
-/// never visible until that chunk's cell RMWs have finished. That prevents a
-/// concurrent re-arm from starting the next generation while the prior pass is
-/// still mutating cells (overlapping generations / double-halving).
+/// Chunk mutation is single-owner and non-blocking: `age_step` first loads the
+/// idle signals (`age_remaining` / `age_pending`) with relaxed reads and returns
+/// without touching `age_owner` when both are idle — the common route-lookup
+/// path. Only when work may be owed does it CAS `age_owner`; losers return
+/// immediately. The owner halves a chunk, then publishes the reduced
+/// `age_remaining` cursor — so `age_remaining == 0` is never visible until that
+/// chunk's cell RMWs have finished. That prevents a concurrent re-arm from
+/// starting the next generation while the prior pass is still mutating cells
+/// (overlapping generations / double-halving).
 ///
 /// Cold-path [`Self::reset`] (cache reload) joins the same protocol: it
 /// bounded-spins until it exclusively owns `age_owner`, then clears cells /
@@ -766,6 +769,10 @@ struct CountMinSketch {
     /// concurrency tests can observe a blocked reset without sleeping.
     #[cfg(test)]
     age_owner_acquire_spins: AtomicUsize,
+    /// Test-only: `age_owner` CAS attempts from [`Self::age_step`] (not reset).
+    /// Idle fast-path returns must leave this at zero.
+    #[cfg(test)]
+    age_step_owner_cas_attempts: AtomicUsize,
 }
 
 impl CountMinSketch {
@@ -792,6 +799,8 @@ impl CountMinSketch {
             age_owner: CachePadded::new(AtomicBool::new(false)),
             #[cfg(test)]
             age_owner_acquire_spins: AtomicUsize::new(0),
+            #[cfg(test)]
+            age_step_owner_cas_attempts: AtomicUsize::new(0),
         }
     }
 
@@ -867,15 +876,31 @@ impl CountMinSketch {
     /// Halve at most [`CMS_AGE_CHUNK`] cells of an in-progress aging pass.
     ///
     /// Non-blocking single-owner protocol: only one thread mutates cells at a
-    /// time. Contended callers fail the `age_owner` CAS and return immediately
-    /// (no mutex, spawn, or allocation). The owner halves up to one chunk, then
-    /// publishes the reduced cursor — so a new generation cannot observe idle
-    /// and re-arm until every claimed chunk from the prior generation has
-    /// finished its cell RMWs. Per-call work stays ≤ `CMS_AGE_CHUNK` regardless
-    /// of sketch width. When the cursor is idle and a pass is pending, re-arms
-    /// and ages the first follow-up chunk in the same call (still within budget).
+    /// time. When both the cursor and pending flag are idle, returns after two
+    /// relaxed loads without writing `age_owner` (route-lookup idle fast path).
+    /// A concurrent arm that races after those loads is picked up on a later
+    /// call. Contended callers that observe owed work fail the `age_owner` CAS
+    /// and return immediately (no mutex, spawn, or allocation). The owner
+    /// halves up to one chunk, then publishes the reduced cursor — so a new
+    /// generation cannot observe idle and re-arm until every claimed chunk from
+    /// the prior generation has finished its cell RMWs. Per-call work stays ≤
+    /// `CMS_AGE_CHUNK` regardless of sketch width. When the cursor is idle and
+    /// a pass is pending, re-arms and ages the first follow-up chunk in the
+    /// same call (still within budget).
     #[inline]
     fn age_step(&self) {
+        // Idle fast path: shared loads only. Do not CAS `age_owner` when no
+        // aging work is armed or pending — otherwise every route-cache lookup
+        // would contend on a single written cache line.
+        if self.age_remaining.load(Ordering::Relaxed) == 0
+            && !self.age_pending.load(Ordering::Relaxed)
+        {
+            return;
+        }
+
+        #[cfg(test)]
+        self.age_step_owner_cas_attempts
+            .fetch_add(1, Ordering::Relaxed);
         if !self.try_acquire_age_owner() {
             return;
         }
@@ -3305,6 +3330,66 @@ mod tests {
     fn cms_age_chunk_constant_is_explicit() {
         assert_eq!(CountMinSketch::AGE_CHUNK, 256);
         assert_eq!(CMS_AGE_CHUNK, 256);
+    }
+
+    #[test]
+    fn cms_idle_age_step_skips_owner_cas() {
+        // Idle increments must not CAS `age_owner` (shared loads only). Armed
+        // and pending cycles must still attempt ownership and make progress.
+        let cms = CountMinSketch::new(1024, u64::MAX);
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+        assert!(!cms.age_pending.load(Ordering::Relaxed));
+
+        cms.age_step_owner_cas_attempts.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            cms.age_step();
+            let _ = cms.increment("idle-driver");
+        }
+        assert_eq!(
+            cms.age_step_owner_cas_attempts.load(Ordering::Relaxed),
+            0,
+            "idle age_step / increment must not attempt age_owner acquisition"
+        );
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), 0);
+
+        // Armed pass: must CAS and age one chunk.
+        cms.arm_aging();
+        let total_cells = cms.total_cells();
+        assert_eq!(cms.age_remaining.load(Ordering::Relaxed), total_cells);
+        cms.age_step_owner_cas_attempts.store(0, Ordering::Relaxed);
+        cms.age_step();
+        assert!(
+            cms.age_step_owner_cas_attempts.load(Ordering::Relaxed) >= 1,
+            "armed age_step must attempt age_owner acquisition"
+        );
+        assert_eq!(
+            cms.age_remaining.load(Ordering::Relaxed),
+            total_cells - CountMinSketch::AGE_CHUNK,
+            "armed owner must age exactly one chunk"
+        );
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
+
+        // Pending re-arm with idle cursor: must CAS, consume pending, and start
+        // a follow-up pass with bounded first-chunk work.
+        cms.age_remaining.store(0, Ordering::Relaxed);
+        cms.age_pending.store(true, Ordering::Relaxed);
+        cms.age_step_owner_cas_attempts.store(0, Ordering::Relaxed);
+        cms.age_step();
+        assert!(
+            cms.age_step_owner_cas_attempts.load(Ordering::Relaxed) >= 1,
+            "pending age_step must attempt age_owner acquisition"
+        );
+        assert!(
+            !cms.age_pending.load(Ordering::Relaxed),
+            "pending bit consumed when the follow-up pass arms"
+        );
+        assert_eq!(
+            cms.age_remaining.load(Ordering::Relaxed),
+            total_cells - CountMinSketch::AGE_CHUNK,
+            "pending re-arm must age the first follow-up chunk"
+        );
+        assert!(!cms.age_owner.load(Ordering::Relaxed));
     }
 
     #[test]
