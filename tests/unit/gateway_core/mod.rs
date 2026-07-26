@@ -10,6 +10,7 @@ mod consumer_index_tests;
 mod cp_listener_supervision_tests;
 mod cp_server_tests;
 mod date_cache_tests;
+mod db_poll_supervision_tests;
 mod dns_tests;
 mod dp_client_tests;
 mod dp_listener_supervision_tests;
