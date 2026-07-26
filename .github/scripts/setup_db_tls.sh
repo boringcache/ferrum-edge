@@ -235,16 +235,28 @@ wait_for_containers() {
     local pg_ok=0
     local mysql_ok=0
 
+    # Probe over TCP (`-h 127.0.0.1`), not the Unix socket. The official
+    # postgres entrypoint runs an initialization server with
+    # `listen_addresses=''`, so a socket `pg_isready` reports ready mid-init and
+    # the server then restarts underneath the caller.
     wait_for_healthy "$PG_CONTAINER" \
-        pg_isready -U "$DB_USER" -d "$DB_NAME" || pg_ok=1
+        pg_isready -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" || pg_ok=1
 
     # Prefer MYSQL_PWD over -p on argv so `ps` / failure dumps do not echo the
     # fixture password (connection URLs are already logged redacted below).
+    #
+    # Same shape as the plaintext CI readiness loop: `mysqladmin ping` alone
+    # passes against the entrypoint's temporary initialization server, which
+    # runs with `--skip-networking` and has not yet created MYSQL_USER /
+    # MYSQL_DATABASE. Gate on a TCP-authenticated `SELECT 1` as $DB_USER and
+    # retry it, so readiness can only succeed against the final server.
     local mysql_elapsed=0
     log "Waiting for $MYSQL_CONTAINER to become healthy (timeout: ${HEALTH_TIMEOUT}s) ..."
     while (( mysql_elapsed < HEALTH_TIMEOUT )); do
         if MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
-            mysqladmin ping -u root &>/dev/null; then
+                mysqladmin ping -h 127.0.0.1 -u "$DB_USER" --silent &>/dev/null \
+            && MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
+                mysql -h 127.0.0.1 -u "$DB_USER" -D "$DB_NAME" -e "SELECT 1" &>/dev/null; then
             log "$MYSQL_CONTAINER is ready (${mysql_elapsed}s)."
             mysql_ok=0
             break
@@ -254,7 +266,7 @@ wait_for_containers() {
         mysql_ok=1
     done
     if (( mysql_ok != 0 )); then
-        err "$MYSQL_CONTAINER did not become healthy within ${HEALTH_TIMEOUT}s."
+        err "$MYSQL_CONTAINER did not accept authenticated queries against $DB_NAME within ${HEALTH_TIMEOUT}s."
         log "Container logs:"
         docker logs --tail 30 "$MYSQL_CONTAINER" >&2
     fi
@@ -263,12 +275,7 @@ wait_for_containers() {
         die "One or more containers failed to start. Run '$0 --cleanup' to remove them."
     fi
 
-    # Require a real authenticated query (not only ping) and grant CREATE so
-    # functional cells can isolate schema work when needed.
-    if ! MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
-        mysql -u "$DB_USER" -D "$DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
-        die "MySQL accepted ping but rejected authenticated queries against $DB_NAME."
-    fi
+    # Grant CREATE/DROP so functional cells can isolate schema work when needed.
     MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" mysql -u root -e \
         "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;" \
         >/dev/null

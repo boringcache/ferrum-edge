@@ -1157,9 +1157,12 @@ jobs:
             echo "FERRUM_TEST_MONGO_REPLICA_SET_URL=mongodb://localhost:27020/ferrum_test"
           } >> "$GITHUB_ENV"
 
+          # `-h 127.0.0.1`: the postgres entrypoint's initialization server runs
+          # with `listen_addresses=''`, so a socket-only pg_isready reports ready
+          # mid-init and the server then restarts underneath the tests.
           pg_ok=""
           for _ in $(seq 1 60); do
-            if docker exec ferrum-ci-postgres pg_isready -U ferrum -d ferrum >/dev/null 2>&1; then
+            if docker exec ferrum-ci-postgres pg_isready -h 127.0.0.1 -U ferrum -d ferrum >/dev/null 2>&1; then
               pg_ok=1; break
             fi
             sleep 2

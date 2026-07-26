@@ -2346,7 +2346,13 @@ fn delete_paths_set_postgres_snapshot_isolation_before_other_tx_statements() {
 }
 
 fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) {
-    let compact_body: String = body.split_whitespace().collect();
+    // Long column names push the call past rustfmt's width, so it wraps the
+    // arguments and appends a trailing comma:
+    //   optional_utf8_text_column(\n row,\n "backend_tls_client_cert_path",\n )?
+    // Collapse whitespace *and* that trailing comma so the guard matches the
+    // wrapped and single-line forms identically.
+    let collapsed: String = body.split_whitespace().collect();
+    let compact_body = collapsed.replace(",)", ")");
     let via_helper = format!("optional_utf8_text_column(row,\"{column}\")?");
     let via_try_get = format!("try_get::<Option<String>,_>(\"{column}\")?");
     assert!(

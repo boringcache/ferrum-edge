@@ -257,6 +257,11 @@ async fn run_connectivity_recovery(db: DbType, container: &str, label: &str) {
 #[tokio::test]
 #[ignore]
 async fn test_postgres_connectivity_recovery_after_container_pause() {
+    // Resume before provisioning: `provision_isolated_sql_database` runs
+    // `docker exec` against the shared container, which hangs on a container a
+    // killed prior pause-cell left frozen. `run_connectivity_recovery` resumes
+    // too, but only after that exec has already run.
+    ensure_shared_sql_containers_resumed();
     let Some(url) = postgres_test_url() else {
         return;
     };
@@ -267,6 +272,8 @@ async fn test_postgres_connectivity_recovery_after_container_pause() {
 #[tokio::test]
 #[ignore]
 async fn test_mysql_connectivity_recovery_after_container_pause() {
+    // See the PostgreSQL cell: resume before the provisioning `docker exec`.
+    ensure_shared_sql_containers_resumed();
     let Some(url) = mysql_test_url() else {
         return;
     };
