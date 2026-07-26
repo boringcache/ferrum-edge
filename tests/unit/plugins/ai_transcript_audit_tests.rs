@@ -934,6 +934,7 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             "sink": {
                 "type": "http",
                 "endpoint_url": saturated_endpoint,
+                "allow_insecure_loopback": true,
                 "on_buffer_full": "reject"
             }
         }),
