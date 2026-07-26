@@ -9912,7 +9912,7 @@ mod row_decode_rejection_classification_tests {
             marked
                 .to_string()
                 .contains("failed to parse credentials JSON"),
-            "top-level Display must carry the decode reason for operator {} sites: {marked}"
+            "top-level Display must carry the decode reason for operator {{}} sites: {marked}"
         );
         let mapped =
             FullLoadPurpose::Runtime.map_row_error("consumer", Some("c-bad".into()), marked);
