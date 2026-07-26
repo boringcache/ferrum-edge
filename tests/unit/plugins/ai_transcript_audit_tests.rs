@@ -5028,8 +5028,7 @@ async fn empty_tool_call_array_never_forces_the_raw_frame_fallback() {
         "{excerpt}"
     );
     assert_eq!(
-        parsed["tool_calls"]["0"][0]["arguments_withheld"],
-        true,
+        parsed["tool_calls"]["0"][0]["arguments_withheld"], true,
         "{excerpt}"
     );
     assert!(!excerpt.contains("call_y"), "{excerpt}");
@@ -5059,8 +5058,7 @@ async fn repeated_indexless_tool_calls_withhold_arguments_instead_of_falling_bac
     assert_eq!(calls.len(), 1, "{excerpt}");
     assert_eq!(calls[0]["arguments_withheld"], true, "{excerpt}");
     assert_eq!(
-        calls[0]["function"]["arguments"],
-        "[REDACTED:ambiguous_tool_call]",
+        calls[0]["function"]["arguments"], "[REDACTED:ambiguous_tool_call]",
         "{excerpt}"
     );
 }
@@ -5095,19 +5093,16 @@ async fn malformed_choice_indices_never_share_one_unattributed_bucket() {
         );
         for key in ["0", "unattributed:0", "unattributed:1"] {
             assert_eq!(
-                completion_text[key],
-                "[REDACTED:ambiguous_choice]",
+                completion_text[key], "[REDACTED:ambiguous_choice]",
                 "index {malformed_index} key {key}: {excerpt}"
             );
         }
         assert_eq!(
-            parsed["choice_identity_ambiguous"],
-            true,
+            parsed["choice_identity_ambiguous"], true,
             "index {malformed_index}: {excerpt}"
         );
         assert_eq!(
-            parsed["completion_text_withheld"],
-            true,
+            parsed["completion_text_withheld"], true,
             "index {malformed_index}: {excerpt}"
         );
         assert_eq!(
@@ -5144,8 +5139,7 @@ async fn complete_sensitive_arguments_followed_by_junk_are_not_concatenated() {
         assert_eq!(call["occurrence"], occurrence as u64, "{excerpt}");
         assert_eq!(call["arguments_withheld"], true, "{excerpt}");
         assert_eq!(
-            call["function"]["arguments"],
-            "[REDACTED:ambiguous_tool_call]",
+            call["function"]["arguments"], "[REDACTED:ambiguous_tool_call]",
             "{excerpt}"
         );
     }
@@ -5198,13 +5192,11 @@ async fn absent_choice_index_is_positional_within_one_delta_only() {
     .await;
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
     assert_eq!(
-        parsed["completion_text"]["position:0"],
-        "first",
+        parsed["completion_text"]["position:0"], "first",
         "{excerpt}"
     );
     assert_eq!(
-        parsed["completion_text"]["position:1"],
-        "second",
+        parsed["completion_text"]["position:1"], "second",
         "{excerpt}"
     );
     assert!(
@@ -5236,8 +5228,7 @@ async fn absent_choice_indices_across_frames_are_not_asserted_identity() {
     );
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
     assert_eq!(
-        parsed["completion_text"]["position:0"],
-        "[REDACTED:ambiguous_choice]",
+        parsed["completion_text"]["position:0"], "[REDACTED:ambiguous_choice]",
         "{excerpt}"
     );
     assert_eq!(parsed["choice_identity_ambiguous"], true, "{excerpt}");
@@ -5609,8 +5600,7 @@ async fn repeated_indexless_tool_call_frames_stay_reassembled_with_withheld_argu
     for call in calls {
         assert_eq!(call["arguments_withheld"], true, "{excerpt}");
         assert_eq!(
-            call["function"]["arguments"],
-            "[REDACTED:ambiguous_tool_call]",
+            call["function"]["arguments"], "[REDACTED:ambiguous_tool_call]",
             "{excerpt}"
         );
     }
