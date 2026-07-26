@@ -90,6 +90,8 @@ coarse unauthenticated responses.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false.
 
+In **file** mode, if a SIGHUP reload candidate fails read, parse, validation, or apply, the gateway likewise keeps serving the last known-good config and raises the same `config_rejected` signal: authenticated `/health` reports `config_rejected: true` with `status: "degraded"` (boolean detail authenticated-only; coarse `degraded` also visible unauthenticated). File-mode admin stays read-only; operators repair by fixing the config file and reloading. The flag clears on the next Applied or Unchanged reload.
+
 In **CP, DP, and mesh modes**, if a supervised serving-listener task exits with an error *after* the gateway became ready (the CP gRPC server; a DP proxy/admin HTTP/HTTPS/H3 listener; or a mesh traffic/admin listener), `/health` returns 503 with `status: "unavailable"` and `ready: false`. This is a **sticky** signal: it is set once and never cleared, so it survives a later readiness restore. Mesh authenticated `/health`/`/status` and `/overload` responses include `listener_failures` with `failures_total` and per-listener `listener`, `listen_port`, `kind`, and a deliberately sanitized `error`; raw error strings are not retained. Unauthenticated health/status responses remain exactly `status` plus `ready`, and unauthenticated overload remains `{level}`.
 
 **Recommended split:** point liveness at `/live` and readiness at `/health`; route detailed diagnostics scraping through an authenticated path.
@@ -255,6 +257,8 @@ Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are a
 `GET/POST /admin/tls/ocsp-responses`, `GET/PUT/DELETE /admin/tls/ocsp-responses/{id}`
 
 `GET/POST /admin/tls/jwks`, `GET/PUT/DELETE /admin/tls/jwks/{id}`
+
+Record IDs are **globally unique** across those typed collections (one shared store map keyed by ID, not namespaced by kind). Create with `allow_overwrite=true` and every typed `PUT` require the existing record kind to match the route kind; a cross-kind collision returns `409 Conflict` with a stable error of the form `managed TLS record '{id}' already exists with kind {existing}, cannot overwrite with kind {requested}`. Typed `GET`/`DELETE` still reject a kind mismatch with `400 Bad Request`. Same-kind replacement is allowed even when the record is referenced: admission validates the new material before persistence, and TLS source watchers atomically activate or retain the previous runtime config.
 
 Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
 
@@ -557,14 +561,20 @@ Returns the connection status to the Control Plane:
     "status": "online",
     "is_primary": true,
     "connected_since": "2025-01-15T10:30:00Z",
-    "last_config_received_at": "2025-01-15T10:35:00Z"
+    "last_config_received_at": "2025-01-15T10:35:00Z",
+    "config_diverged": false,
+    "config_diverged_since": null,
+    "config_divergence_recoveries_total": 0
   }
 }
 ```
 
 - **`status`**: `online` when the gRPC stream to the CP is active, `offline` when disconnected (e.g., CP is down, DP is in backoff retry).
 - **`is_primary`**: `true` when connected to the primary (first) CP URL, `false` when connected to a fallback CP (multi-CP failover).
-- **`last_config_received_at`**: Timestamp of the last successfully applied config update (full snapshot or delta) from the CP. `null` if no config has been received yet on the current connection.
+- **`last_config_received_at`**: Timestamp of the last successfully *accepted* config update (full snapshot or delta) from the CP. Rejected resource deltas do not advance this stamp. `null` if no config has been accepted yet.
+- **`config_diverged`**: Sticky operator signal set when a non-empty ConfigSync DELTA is rejected. Cleared only after an authoritative FULL_SNAPSHOT is accepted. Last-known-good config continues to serve while `true`.
+- **`config_diverged_since`**: When sticky divergence was first raised (`null` when not diverged).
+- **`config_divergence_recoveries_total`**: Count of divergence → FULL_SNAPSHOT recovery transitions.
 
 ### Database/File Mode Response
 
