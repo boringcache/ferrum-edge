@@ -9,10 +9,14 @@
 //! Three variants:
 //!   - SQLite (always available, no external DB required)
 //!   - PostgreSQL (requires `ferrum-scale-test-pg` Docker container)
-//!   - MongoDB (requires `ferrum-scale-test-mongo` Docker container)
+//!   - MongoDB (requires a `ferrum-scale-test-mongo` Docker container running as
+//!     a single-node replica set, plus `FERRUM_MONGO_REPLICA_SET`)
 //!
 //! All variants use the batch admin API (`POST /batch`) to create resources
 //! in bulk (100 at a time per resource type) for dramatically faster setup.
+//! `POST /batch` is all-or-nothing (issue #2401), so on MongoDB it needs
+//! multi-document transactions and therefore a replica set; a standalone mongod
+//! refuses the import with `501`.
 //!
 //! Run with:
 //!   cargo test --test functional_tests functional_scale_perf -- --ignored --nocapture
@@ -225,6 +229,14 @@ impl ScalePerfHarness {
         // backends ignore this var, so it is only set for the MongoDB variant.
         if let Some(database) = mongo_database {
             command.env("FERRUM_MONGO_DATABASE", database);
+            // `POST /batch` is all-or-nothing (issue #2401), which on MongoDB
+            // needs multi-document transactions — i.e. a replica set. The CI
+            // container is initiated as a single-node replica set and exports
+            // its name here; a standalone mongod would refuse the batch import
+            // with 501 instead of silently applying part of a graph.
+            if let Ok(replica_set) = std::env::var("FERRUM_MONGO_REPLICA_SET") {
+                command.env("FERRUM_MONGO_REPLICA_SET", replica_set);
+            }
         }
         let child = command.spawn()?;
 
@@ -404,7 +416,9 @@ async fn create_batch(
             .json(&batch_body)
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch consumer create failed: {} - {}", status, body).into());
@@ -419,7 +433,9 @@ async fn create_batch(
             .json(&batch_body)
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch proxy create failed: {} - {}", status, body).into());
@@ -434,7 +450,9 @@ async fn create_batch(
             .json(&batch_body)
             .send()
             .await?;
-        if !resp.status().is_success() && resp.status().as_u16() != 207 {
+        // `POST /batch` is all-or-nothing: any non-2xx means nothing was
+        // applied, so there is no partial-success status to tolerate.
+        if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(format!("Batch plugin create failed: {} - {}", status, body).into());
@@ -906,14 +924,21 @@ async fn test_scale_perf_30k_proxies_mongodb() {
     );
     println!("============================================================\n");
 
-    // Check for the MongoDB container
-    // Start with: docker run -d --name ferrum-scale-test-mongo \
-    //   -p 27117:27017 mongo:7
+    // Check for the MongoDB container. Resources are provisioned through
+    // `POST /batch`, which is all-or-nothing (issue #2401) and therefore needs
+    // MongoDB multi-document transactions — i.e. a replica set, not a
+    // standalone mongod. `--network host` keeps the member's advertised
+    // host:port reachable from this process.
     if !is_container_running("ferrum-scale-test-mongo") {
         println!("SKIPPED: ferrum-scale-test-mongo container not running.");
         println!("Start it with:");
-        println!("  docker run -d --name ferrum-scale-test-mongo \\");
-        println!("    -p 27117:27017 mongo:7");
+        println!("  docker run -d --name ferrum-scale-test-mongo --network host \\");
+        println!("    mongo:7 --replSet rs0 --port 27117 --bind_ip_all");
+        println!("  docker exec ferrum-scale-test-mongo mongosh --port 27117 --eval \\");
+        println!(
+            "    'rs.initiate({{_id: \"rs0\", members: [{{_id: 0, host: \"localhost:27117\"}}]}})'"
+        );
+        println!("  export FERRUM_MONGO_REPLICA_SET=rs0");
         return;
     }
 
@@ -932,6 +957,8 @@ async fn test_scale_perf_30k_proxies_mongodb() {
             "ferrum-scale-test-mongo",
             "mongosh",
             "--quiet",
+            "--port",
+            "27117",
             "--eval",
             "db.getSiblingDB('ferrum_scale').dropDatabase()",
         ])

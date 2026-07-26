@@ -136,6 +136,15 @@ impl MongoTestHarness {
         &mut self,
         mongo_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.try_start_gateway_plaintext_with_replica_set(mongo_url, None)
+            .await
+    }
+
+    async fn try_start_gateway_plaintext_with_replica_set(
+        &mut self,
+        mongo_url: &str,
+        replica_set: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let binary_path = find_binary()?;
 
         let mut command = Command::new(binary_path);
@@ -152,6 +161,9 @@ impl MongoTestHarness {
             .env("FERRUM_LOG_LEVEL", "info")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(replica_set) = replica_set {
+            command.env("FERRUM_MONGO_REPLICA_SET", replica_set);
+        }
         configure_coverage_gateway_command(&mut command);
         let child = command.spawn()?;
 
@@ -165,6 +177,44 @@ impl MongoTestHarness {
                 Err(e)
             }
         }
+    }
+
+    /// Start the gateway against a MongoDB replica set.
+    ///
+    /// `POST /batch` needs multi-document transactions, which require a replica
+    /// set (or mongos); `FERRUM_MONGO_REPLICA_SET` is what makes the store
+    /// advertise that capability.
+    async fn start_gateway_replica_set(
+        &mut self,
+        mongo_url: &str,
+        replica_set: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .try_start_gateway_plaintext_with_replica_set(mongo_url, Some(replica_set))
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "start_gateway_replica_set attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        self.reallocate_ports().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway (replica set) after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
     }
 
     /// Start the gateway with TLS-encrypted MongoDB connection.
@@ -833,4 +883,227 @@ async fn test_mongodb_mtls_connection() {
     run_crud_and_proxy_tests(&harness, backend_port, "mtls").await;
 
     println!("\n=== MongoDB mTLS Test PASSED ===\n");
+}
+
+// ==========================================================================
+// Test: POST /batch atomicity semantics per MongoDB topology (issue #2401)
+// ==========================================================================
+
+/// One graph that spans every dependency phase: an upstream, a proxy that
+/// references it, and a proxy-scoped plugin config attached to that proxy.
+fn batch_graph(run_id: &str, upstream_id: &str) -> serde_json::Value {
+    json!({
+        "consumers": [{
+            "id": format!("batch-consumer-{run_id}"),
+            "username": format!("batch-user-{run_id}"),
+        }],
+        "upstreams": [{
+            "id": upstream_id,
+            "name": format!("batch-upstream-{run_id}"),
+            "targets": [{"host": "10.0.0.10", "port": 8080, "weight": 100}],
+            "algorithm": "round_robin",
+        }],
+        "proxies": [{
+            "id": format!("batch-proxy-{run_id}"),
+            "name": format!("batch-proxy-{run_id}"),
+            "listen_path": format!("/batch-atomic-{run_id}"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+            "upstream_id": upstream_id,
+            "plugins": [{"plugin_config_id": format!("batch-plugin-{run_id}")}],
+        }],
+        "plugin_configs": [{
+            "id": format!("batch-plugin-{run_id}"),
+            "plugin_name": "request_size_limiting",
+            "scope": "proxy",
+            "proxy_id": format!("batch-proxy-{run_id}"),
+            "enabled": true,
+            "config": {"max_bytes": 1048576},
+        }],
+    })
+}
+
+async fn resource_exists(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    path: &str,
+) -> bool {
+    let resp = client
+        .get(format!("{}{}", harness.admin_base_url, path))
+        .header("Authorization", auth_header)
+        .send()
+        .await
+        .expect("admin GET");
+    resp.status().as_u16() != 404
+}
+
+/// Standalone MongoDB has no multi-document transactions, so `POST /batch`
+/// cannot be applied all-or-nothing. It must be refused with `501` **before any
+/// mutation** rather than falling back to per-family writes that can strand half
+/// a graph.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_batch_atomicity_refused_on_standalone() {
+    println!("\n=== MongoDB Standalone Batch Refusal Test ===\n");
+
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("Start gateway with standalone MongoDB");
+
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let run_id = Uuid::new_v4().to_string()[..8].to_string();
+    let upstream_id = format!("batch-upstream-{run_id}");
+    let graph = batch_graph(&run_id, &upstream_id);
+
+    let resp = client
+        .post(format!("{}/batch", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .json(&graph)
+        .send()
+        .await
+        .expect("POST /batch");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status, 501,
+        "standalone MongoDB must refuse POST /batch: {body:?}"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FERRUM_MONGO_REPLICA_SET"),
+        "the refusal must name the configuration that enables the guarantee: {body:?}"
+    );
+    println!("  OK: standalone refusal returns 501 with remediation");
+
+    // Refused before any mutation: not one resource from the graph exists.
+    for path in [
+        format!("/consumers/batch-consumer-{run_id}"),
+        format!("/upstreams/{upstream_id}"),
+        format!("/proxies/batch-proxy-{run_id}"),
+        format!("/plugins/config/batch-plugin-{run_id}"),
+    ] {
+        assert!(
+            !resource_exists(&client, &harness, &auth_header, &path).await,
+            "refused batch must not have written {path}"
+        );
+    }
+    println!("  OK: nothing was written before the refusal");
+    println!("\n=== MongoDB Standalone Batch Refusal Test PASSED ===\n");
+}
+
+/// Replica-set MongoDB persists the whole graph in one transaction. A duplicate
+/// in a later dependency phase must roll back the earlier phases, and the
+/// corrected retry must apply cleanly.
+///
+/// Requires a replica set. Set `FERRUM_TEST_MONGO_REPLICA_SET` (and optionally
+/// `FERRUM_TEST_MONGO_REPLICA_SET_URL`) to run it; skipped otherwise, because a
+/// plain `mongo:7` container cannot start a transaction.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
+    println!("\n=== MongoDB Replica-Set Batch Atomicity Test ===\n");
+
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set — no replica set available");
+        return;
+    };
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_replica_set(&mongo_url, &replica_set)
+        .await
+        .expect("Start gateway with MongoDB replica set");
+
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let run_id = Uuid::new_v4().to_string()[..8].to_string();
+
+    // Seed the upstream the graph will collide with. Consumers are written
+    // before upstreams, so the collision fails a *later* dependency phase.
+    let taken_upstream = format!("batch-taken-upstream-{run_id}");
+    let resp = client
+        .post(format!("{}/upstreams", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .json(&json!({
+            "id": &taken_upstream,
+            "name": &taken_upstream,
+            "targets": [{"host": "10.0.0.10", "port": 8080, "weight": 100}],
+            "algorithm": "round_robin",
+        }))
+        .send()
+        .await
+        .expect("seed upstream");
+    let seed_status = resp.status();
+    assert!(seed_status.is_success(), "seed upstream: {seed_status}");
+
+    let conflicting = batch_graph(&run_id, &taken_upstream);
+    let resp = client
+        .post(format!("{}/batch", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .json(&conflicting)
+        .send()
+        .await
+        .expect("POST /batch");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status, 409,
+        "a duplicate in the graph must reject the whole graph: {body:?}"
+    );
+    assert!(
+        body.get("created").is_none(),
+        "a rejected graph must not report created counts: {body:?}"
+    );
+
+    // The consumer phase ran before the collision; nothing may survive.
+    for path in [
+        format!("/consumers/batch-consumer-{run_id}"),
+        format!("/proxies/batch-proxy-{run_id}"),
+        format!("/plugins/config/batch-plugin-{run_id}"),
+    ] {
+        assert!(
+            !resource_exists(&client, &harness, &auth_header, &path).await,
+            "a rolled-back MongoDB batch must not leave {path}"
+        );
+    }
+    println!("  OK: an earlier phase was rolled back with the failing one");
+
+    // Corrected retry: the identical consumer/proxy/plugin IDs still apply,
+    // which is only possible because the failed attempt committed nothing.
+    let fixed_upstream = format!("batch-fixed-upstream-{run_id}");
+    let resp = client
+        .post(format!("{}/batch", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .json(&batch_graph(&run_id, &fixed_upstream))
+        .send()
+        .await
+        .expect("POST /batch retry");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(status, 201, "corrected retry must succeed: {body:?}");
+    assert_eq!(body["created"]["consumers"], 1);
+    assert_eq!(body["created"]["upstreams"], 1);
+    assert_eq!(body["created"]["proxies"], 1);
+    assert_eq!(body["created"]["plugin_configs"], 1);
+    println!("  OK: corrected retry applied the whole graph");
+    println!("\n=== MongoDB Replica-Set Batch Atomicity Test PASSED ===\n");
 }
