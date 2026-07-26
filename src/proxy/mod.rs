@@ -32127,29 +32127,34 @@ async fn proxy_to_backend_http2(
     } else {
         usize::MAX
     };
-    let (body, body_completion_rx) = if state.max_request_body_size_bytes > 0 {
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        (
-            body::SizeLimitedIncoming::new_with_counter_and_completion(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-                completion_tx,
-            ),
-            Some(completion_rx),
-        )
-    } else {
-        (
-            body::SizeLimitedIncoming::new_with_counter(
-                body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-            ),
-            None,
-        )
-    };
+    let (body, body_completion_rx, mut body_cancel_tx) =
+        if state.max_request_body_size_bytes > 0 {
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            (
+                body::SizeLimitedIncoming::new_with_counter_and_completion(
+                    body,
+                    max_request_body_size,
+                    Arc::clone(&body_size_exceeded),
+                    Arc::clone(ctx_bytes_sent_observed),
+                    completion_tx,
+                    cancel_rx,
+                ),
+                Some(completion_rx),
+                Some(cancel_tx),
+            )
+        } else {
+            (
+                body::SizeLimitedIncoming::new_with_counter(
+                    body,
+                    max_request_body_size,
+                    Arc::clone(&body_size_exceeded),
+                    Arc::clone(ctx_bytes_sent_observed),
+                ),
+                None,
+                None,
+            )
+        };
 
     // Set the URI
     parts.uri = uri;
@@ -32412,6 +32417,15 @@ async fn proxy_to_backend_http2(
                 match tokio::time::timeout_at(upload_deadline, body_completion_rx).await {
                     Ok(received) => received.ok(),
                     Err(_) => {
+                        // `send_request` has already yielded response headers,
+                        // so hyper moved the request body into a detached H2
+                        // pipe task. Dropping this handler or the response does
+                        // not cancel that upload. Wake the adapter explicitly;
+                        // its terminal error resets the backend stream and
+                        // releases the inbound client body.
+                        if let Some(cancel_tx) = body_cancel_tx.take() {
+                            let _ = cancel_tx.send(());
+                        }
                         if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                             return request_body_too_large();
                         }
@@ -32440,6 +32454,9 @@ async fn proxy_to_backend_http2(
             // "0 = no timeout" contract shared with the buffered upload paths.
             None => body_completion_rx.await.ok(),
         };
+        // Normal completion: dropping the sender makes the adapter stop
+        // polling the cancellation channel without changing its outcome.
+        drop(body_cancel_tx.take());
         match classify_direct_h2_upload_outcome(outcome) {
             DirectH2UploadGate::Forward => {}
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),

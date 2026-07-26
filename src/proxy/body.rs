@@ -11,6 +11,7 @@ use http_body::Frame;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1517,6 +1518,11 @@ pub struct SizeLimitedIncoming {
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     exceeded: Arc<AtomicBool>,
     completion: Option<tokio::sync::oneshot::Sender<RequestBodyOutcome>>,
+    /// Wakes the detached hyper H2 upload pipe when the response-side gate
+    /// times out after receiving early backend headers. Returning an error from
+    /// `poll_frame` makes hyper reset the backend stream and drop the inbound
+    /// client body instead of leaving that pipe task pinned in the pool.
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Outcome to report when the adapter is dropped without having reached a
@@ -1588,6 +1594,7 @@ impl SizeLimitedIncoming {
             bytes_seen,
             exceeded,
             completion: None,
+            cancel: None,
         }
     }
 
@@ -1605,6 +1612,7 @@ impl SizeLimitedIncoming {
         exceeded: Arc<AtomicBool>,
         bytes_seen: Arc<std::sync::atomic::AtomicU64>,
         completion: tokio::sync::oneshot::Sender<RequestBodyOutcome>,
+        cancel: tokio::sync::oneshot::Receiver<()>,
     ) -> Self {
         Self {
             inner: incoming,
@@ -1612,6 +1620,7 @@ impl SizeLimitedIncoming {
             bytes_seen,
             exceeded,
             completion: Some(completion),
+            cancel: Some(cancel),
         }
     }
 
@@ -1683,6 +1692,25 @@ impl http_body::Body for SizeLimitedIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        let cancel_poll = this
+            .cancel
+            .as_mut()
+            .map(|cancel| Pin::new(cancel).poll(cx));
+        match cancel_poll {
+            Some(Poll::Ready(Ok(()))) => {
+                this.cancel = None;
+                this.signal_completion(RequestBodyOutcome::Abandoned);
+                return Poll::Ready(Some(Err(
+                    "request body forwarding cancelled after upload timeout".into(),
+                )));
+            }
+            Some(Poll::Ready(Err(_))) => {
+                // The response-side gate completed normally and dropped its
+                // sender. Stop polling the cancellation channel.
+                this.cancel = None;
+            }
+            Some(Poll::Pending) | None => {}
+        }
         match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {

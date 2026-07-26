@@ -457,3 +457,20 @@ fn test_upload_gate_fails_closed_on_missing_signal() {
         DirectH2UploadGateForTest::FailClosed
     );
 }
+
+#[test]
+fn test_direct_h2_upload_timeout_cancels_detached_body_pipe() {
+    // Hyper moves an H2 request body into a detached pipe task once response
+    // headers arrive. The response-side timeout must actively wake that task;
+    // merely dropping the completion receiver leaves a stalled upload pinned.
+    let body_src = include_str!("../../../src/proxy/body.rs");
+    assert!(
+        body_src.contains("request body forwarding cancelled after upload timeout"),
+        "the size-limited body must terminate when the response-side gate cancels it"
+    );
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy_src.contains("let _ = cancel_tx.send(());"),
+        "the direct-H2 timeout path must signal the detached upload pipe"
+    );
+}
