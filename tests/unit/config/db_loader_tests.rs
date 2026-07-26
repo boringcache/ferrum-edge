@@ -460,9 +460,16 @@ fn test_parse_scheme_rejects_unknown_or_removed_aliases() {
     for value in [
         "ftp", "", "nonsense", "ws", "wss", "grpc", "grpcs", "h3", "tcp_tls",
     ] {
-        assert!(
-            parse_scheme(value).is_err(),
+        let err = parse_scheme(value).expect_err(&format!(
             "{value:?} should not be accepted as backend_scheme"
+        ));
+        assert!(
+            !err.contains(value) || value.is_empty(),
+            "scheme rejection must not embed the raw column body: {err}"
+        );
+        assert!(
+            err.contains("unsupported backend_scheme"),
+            "scheme rejection must stay actionable: {err}"
         );
     }
 }
@@ -1423,6 +1430,16 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
         error
             .to_string()
             .contains("failed to parse credentials JSON")
+    );
+    // Excluding the undecodable row itself must not fail — PUT overwrite
+    // repair with mTLS credentials needs to skip its own corrupt body
+    // (issue #2997).
+    assert!(
+        store
+            .check_mtls_identity_unique("ferrum", "other.example.com", Some("legacy"))
+            .await
+            .expect("excluded undecodable consumer must not block self uniqueness"),
+        "excluded undecodable consumer is not a conflict"
     );
 }
 

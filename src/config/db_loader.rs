@@ -4663,6 +4663,14 @@ impl DatabaseStore {
             let fetched = rows.len();
             for row in rows {
                 let consumer_id: String = row.try_get("id")?;
+                // Skip the excluded consumer before parsing credentials so PUT
+                // overwrite repair of an undecodable row (issue #2997) is not
+                // blocked by its own corrupt body. Other malformed rows still
+                // fail closed below.
+                if exclude_consumer_id == Some(consumer_id.as_str()) {
+                    last_id = Some(consumer_id);
+                    continue;
+                }
                 let credentials_json: String = row.try_get("credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&credentials_json).map_err(|error| {
@@ -4672,19 +4680,16 @@ impl DatabaseStore {
                             error
                         )
                     })?;
-                let excluded = exclude_consumer_id == Some(consumer_id.as_str());
-                if !excluded
-                    && credentials.get("mtls_auth").is_some_and(|credential| {
-                        Consumer::credential_entries_from_value(credential)
-                            .iter()
-                            .any(|entry| {
-                                entry
-                                    .get("identity")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|identity| identity.trim() == canonical_identity)
-                            })
-                    })
-                {
+                if credentials.get("mtls_auth").is_some_and(|credential| {
+                    Consumer::credential_entries_from_value(credential)
+                        .iter()
+                        .any(|entry| {
+                            entry
+                                .get("identity")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|identity| identity.trim() == canonical_identity)
+                        })
+                }) {
                     return Ok(false);
                 }
                 last_id = Some(consumer_id);
@@ -9259,9 +9264,12 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         "tcps" => Ok(BackendScheme::Tcps),
         "udp" => Ok(BackendScheme::Udp),
         "dtls" => Ok(BackendScheme::Dtls),
-        _ => Err(format!(
-            "unsupported backend_scheme '{s}' (expected one of: http, https, tcp, tcps, udp, dtls)"
-        )),
+        // Do not embed the raw scheme column — hostile/oversized DB values must
+        // not reach poll/startup rejection logs (issue #2997 redaction).
+        _ => Err(
+            "unsupported backend_scheme (expected one of: http, https, tcp, tcps, udp, dtls)"
+                .to_string(),
+        ),
     }
 }
 
@@ -10174,6 +10182,16 @@ mod row_decode_rejection_classification_tests {
         assert!(
             !proxy.contains("hosts JSON '{}'"),
             "proxy hosts decode errors must not embed the raw hosts column"
+        );
+        let parse_scheme = source
+            .split("pub(crate) fn parse_scheme(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) fn parse_auth_mode(").next())
+            .expect("parse_scheme body");
+        assert!(
+            !parse_scheme.contains("backend_scheme '{s}'")
+                && !parse_scheme.contains("backend_scheme '{}'"),
+            "proxy backend_scheme decode errors must not embed the raw scheme column"
         );
         let upstream = source
             .split("fn row_to_upstream_inner(")
