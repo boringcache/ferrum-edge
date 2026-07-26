@@ -677,3 +677,39 @@ fn every_policy_governed_reqwest_builder_disables_ambient_proxies() {
         "expected to find every policy-governed client builder family, only found {checked}"
     );
 }
+
+#[test]
+fn health_check_fallback_propagates_construction_failure_without_panic() {
+    let source = POLICY_GOVERNED_CLIENT_SOURCES
+        .iter()
+        .find(|(path, _)| *path == "src/health_check.rs")
+        .map(|(_, source)| *source)
+        .expect("health_check.rs is a policy-governed client source");
+    let start = source
+        .find("fn build_dns_cached_fallback_client(")
+        .expect("health-check fallback helper present");
+    let rest = &source[start..];
+    let end = rest
+        .find("\nfn accept_health_check_client(")
+        .expect("health-check accept helper present");
+    let helper = &rest[..end];
+    assert!(
+        helper.contains("Result<reqwest::Client, reqwest::Error>"),
+        "health-check fallback must propagate construction failure as Result"
+    );
+    assert!(
+        !helper.contains("panic!"),
+        "health-check fallback must not panic on construction failure"
+    );
+    let code_mentions_default_ctor = helper.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//")
+            && !trimmed.starts_with("///")
+            && !trimmed.starts_with('*')
+            && trimmed.contains("Client::new()")
+    });
+    assert!(
+        !code_mentions_default_ctor,
+        "health-check fallback must not re-enable ambient proxies via Client::new()"
+    );
+}

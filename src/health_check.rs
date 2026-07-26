@@ -215,7 +215,11 @@ pub struct HealthChecker {
     pub passive_health: Arc<DashMap<String, Arc<ProxyHealthState>>>,
     /// Default HTTP client for active health check probes (no mTLS).
     /// Used when the upstream has no TLS config.
-    default_http_client: Arc<reqwest::Client>,
+    ///
+    /// `None` when every fail-closed builder path failed: HTTP probes then
+    /// fail closed (report unhealthy) rather than panicking or inheriting
+    /// ambient proxies via the ambient-proxy-aware default constructor.
+    default_http_client: Option<Arc<reqwest::Client>>,
     /// JoinHandles for the current generation of active-check /
     /// passive-recovery tasks. Modes may drain these via
     /// [`Self::take_active_check_handles`] so they can `await` them during
@@ -317,12 +321,15 @@ impl HealthChecker {
     /// operator has set `FERRUM_TLS_NO_VERIFY=true`, the default client is
     /// rebuilt by [`set_global_tls_config`] before traffic flows.
     pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
-        let client = build_health_check_client(pool_config, Some(dns_cache.clone()), false);
+        let client = accept_health_check_client(
+            build_health_check_client(pool_config, Some(dns_cache.clone()), false),
+            "default health-check HTTP client",
+        );
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
-            default_http_client: Arc::new(client),
+            default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
             task_generation: Arc::new(AtomicU64::new(0)),
@@ -359,20 +366,24 @@ impl HealthChecker {
         // Rebuild the default client when no-verify is set so HTTPS probes
         // through the no-TLS-config path honour the operator opt-in.
         if tls_no_verify {
-            let client =
-                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify);
-            self.default_http_client = Arc::new(client);
+            self.default_http_client = accept_health_check_client(
+                build_health_check_client(&self.pool_config, self.dns_cache.clone(), tls_no_verify),
+                "default health-check HTTP client (tls_no_verify rebuild)",
+            );
         }
     }
 
     /// Create a health checker without DNS cache (for tests).
     fn without_dns_cache(pool_config: &PoolConfig) -> Self {
-        let client = build_health_check_client(pool_config, None, false);
+        let client = accept_health_check_client(
+            build_health_check_client(pool_config, None, false),
+            "default health-check HTTP client",
+        );
         Self {
             active_unhealthy_targets: Arc::new(DashMap::new()),
             active_target_states: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
-            default_http_client: Arc::new(client),
+            default_http_client: client,
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
             task_generation: Arc::new(AtomicU64::new(0)),
@@ -504,8 +515,12 @@ impl HealthChecker {
                             shutdown_rx: shutdown_rx.as_ref(),
                             generation,
                         };
-                        let handle =
-                            self.start_active_check(start, active, &upstream_client, &tls_config);
+                        let handle = self.start_active_check(
+                            start,
+                            active,
+                            upstream_client.as_ref(),
+                            &tls_config,
+                        );
                         new_aborts.push(handle.abort_handle());
                         new_handles.push(handle);
                     }
@@ -944,11 +959,15 @@ impl HealthChecker {
     /// applies when the operator has explicitly opted into no-verify, and
     /// even then only on plaintext probes by construction). HTTP probes can
     /// safely reuse the default client.
+    ///
+    /// Returns `None` when client construction fails closed; HTTP probes then
+    /// report unhealthy without dialing (TCP/UDP/gRPC probes do not need this
+    /// client).
     fn build_upstream_health_client(
         &self,
         tls_config: &BackendTlsConfig,
         use_tls: bool,
-    ) -> Arc<reqwest::Client> {
+    ) -> Option<Arc<reqwest::Client>> {
         let has_tls_config = tls_config.client_cert_path.is_some()
             || tls_config.client_key_path.is_some()
             || tls_config.server_ca_cert_path.is_some()
@@ -961,16 +980,18 @@ impl HealthChecker {
             return self.default_http_client.clone();
         }
 
-        let client = build_health_check_client_with_tls(
-            &self.pool_config,
-            self.dns_cache.clone(),
-            tls_config,
-            &self.global_tls_ca_bundle_path,
-            &self.global_backend_tls_client_cert_path,
-            &self.global_backend_tls_client_key_path,
-            self.global_tls_no_verify,
-        );
-        Arc::new(client)
+        accept_health_check_client(
+            build_health_check_client_with_tls(
+                &self.pool_config,
+                self.dns_cache.clone(),
+                tls_config,
+                &self.global_tls_ca_bundle_path,
+                &self.global_backend_tls_client_cert_path,
+                &self.global_backend_tls_client_key_path,
+                self.global_tls_no_verify,
+            ),
+            "upstream TLS health-check HTTP client",
+        )
     }
 
     /// Start an active health check background task for a target.
@@ -978,7 +999,7 @@ impl HealthChecker {
         &self,
         start: ActiveCheckStartParams<'_>,
         config: &ActiveHealthCheck,
-        upstream_client: &Arc<reqwest::Client>,
+        upstream_client: Option<&Arc<reqwest::Client>>,
         tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
         // Destructure by value: taking `start` by reference would bind
@@ -1005,7 +1026,7 @@ impl HealthChecker {
         let host = target.host.clone();
         let port = target.port;
         let healthy_status_codes = config.healthy_status_codes.clone();
-        let client = upstream_client.clone();
+        let client = upstream_client.cloned();
         let scheme = if config.use_tls { "https" } else { "http" };
         let url = format_probe_url(scheme, &host, port, &config.http_path);
         let udp_payload = config
@@ -1089,7 +1110,20 @@ impl HealthChecker {
                             // reqwest routes hostnames through the
                             // DnsCacheResolver (which screens); literal IPs skip
                             // it and were screened by `egress_denied` above.
-                            http_probe(&client, &url, timeout, &healthy_status_codes).await
+                            match client.as_ref() {
+                                Some(client) => {
+                                    http_probe(client, &url, timeout, &healthy_status_codes).await
+                                }
+                                None => {
+                                    warn!(
+                                        target = %host,
+                                        "HTTP health probe fail-closed: health-check client unavailable"
+                                    );
+                                    ProbeOutcome::failure(
+                                        "health-check HTTP client construction failed",
+                                    )
+                                }
+                            }
                         }
                         // TCP/UDP/gRPC dial directly (TcpStream/UdpSocket/tonic),
                         // bypassing the DnsCacheResolver, so resolve through the
@@ -1794,7 +1828,7 @@ fn build_health_check_client(
     pool_config: &PoolConfig,
     dns_cache: Option<DnsCache>,
     no_verify: bool,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, reqwest::Error> {
     if no_verify {
         warn!("health_check: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
     }
@@ -1829,7 +1863,7 @@ fn build_health_check_client(
     }
 
     match builder.build() {
-        Ok(client) => client,
+        Ok(client) => Ok(client),
         Err(e) => {
             tracing::error!(
                 "Failed to build health check HTTP client: {}. \
@@ -1848,12 +1882,14 @@ fn build_health_check_client(
 /// plugin calls do not silently fall through to system DNS — every probe
 /// would otherwise burn an ephemeral port through a fresh OS resolver.
 ///
-/// If even this minimal builder fails, retry a bare no-proxy/no-redirect client
-/// before aborting client construction (an exceptional, doubly-degraded path).
+/// If even this minimal builder fails, retry a bare no-proxy/no-redirect client.
+/// If that also fails, return `Err` so callers fail closed (HTTP probes report
+/// unhealthy) rather than panicking or falling back to the ambient-proxy-aware
+/// default constructor.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     context: &'static str,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, reqwest::Error> {
     // Carry the no-redirect policy into the degraded fallback too: a 3xx to an
     // IP literal would otherwise skip the DnsCacheResolver and the egress screen,
     // bouncing the probe to a denied address (same rationale as the primary
@@ -1865,22 +1901,52 @@ fn build_dns_cached_fallback_client(
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
     }
-    builder.build().unwrap_or_else(|e| {
-        tracing::error!(
-            "Failed to build minimal DNS-cached fallback {} client: {}. \
-             Using a redirect-disabled minimal client as a last resort — DNS will bypass the gateway cache.",
-            context,
-            e
-        );
-        // Last resort: still disable redirects and ambient proxies.
-        reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|e2| {
-                panic!("Failed to build fail-closed minimal health-check client: {e2}")
-            })
-    })
+    match builder.build() {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            tracing::error!(
+                "Failed to build minimal DNS-cached fallback {} client: {}. \
+                 Retrying a redirect-disabled minimal client as a last resort — DNS will bypass the gateway cache.",
+                context,
+                e
+            );
+            // Last resort: still disable redirects and ambient proxies. Never
+            // fall back to the ambient-proxy-aware default constructor and never
+            // panic — propagate the error so HTTP probes fail closed.
+            match reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            {
+                Ok(client) => Ok(client),
+                Err(e2) => {
+                    tracing::error!(
+                        "Failed to build fail-closed minimal {} client: {}. \
+                         HTTP health probes will fail closed without a usable client.",
+                        context,
+                        e2
+                    );
+                    Err(e2)
+                }
+            }
+        }
+    }
+}
+
+/// Accept a built health-check client or log and return `None` so probes fail closed.
+fn accept_health_check_client(
+    result: Result<reqwest::Client, reqwest::Error>,
+    context: &str,
+) -> Option<Arc<reqwest::Client>> {
+    match result {
+        Ok(client) => Some(Arc::new(client)),
+        Err(e) => {
+            tracing::error!(
+                "Fail-closed: {context} unavailable ({e}); affected HTTP health probes will report unhealthy"
+            );
+            None
+        }
+    }
 }
 
 /// Build a health check HTTP client with upstream-specific TLS configuration.
@@ -1895,7 +1961,7 @@ fn build_health_check_client_with_tls(
     global_cert_path: &Option<String>,
     global_key_path: &Option<String>,
     global_no_verify: bool,
-) -> reqwest::Client {
+) -> Result<reqwest::Client, reqwest::Error> {
     let skip_verify = !tls_config.verify_server_cert || global_no_verify;
 
     let mut builder = reqwest::Client::builder()
@@ -1982,7 +2048,7 @@ fn build_health_check_client_with_tls(
     }
 
     match builder.build() {
-        Ok(client) => client,
+        Ok(client) => Ok(client),
         Err(e) => {
             tracing::error!(
                 "Failed to build TLS health check HTTP client: {}. \
@@ -2352,6 +2418,7 @@ mod tests {
             let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
             build_health_check_client(&pool_config, None, false)
+                .expect("health-check client should build")
         };
 
         let _ = client
@@ -2384,6 +2451,7 @@ mod tests {
                 &None,
                 false,
             )
+            .expect("TLS health-check client should build")
         };
 
         let _ = client
@@ -2406,6 +2474,7 @@ mod tests {
             let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
             build_dns_cached_fallback_client(None, "test")
+                .expect("fallback health-check client should build")
         };
 
         let _ = client
@@ -2442,7 +2511,8 @@ mod tests {
         let port = spawn_self_signed_https_server().await;
         let pool_config = PoolConfig::default();
 
-        let client = build_health_check_client(&pool_config, None, false);
+        let client = build_health_check_client(&pool_config, None, false)
+            .expect("default health-check client should build");
         let result = client
             .get(format!("https://127.0.0.1:{}/", port))
             .timeout(Duration::from_secs(5))
@@ -2465,7 +2535,8 @@ mod tests {
         let port = spawn_self_signed_https_server().await;
         let pool_config = PoolConfig::default();
 
-        let client = build_health_check_client(&pool_config, None, true);
+        let client = build_health_check_client(&pool_config, None, true)
+            .expect("no_verify health-check client should build");
         let result = client
             .get(format!("https://127.0.0.1:{}/", port))
             .timeout(Duration::from_secs(5))
@@ -2491,6 +2562,8 @@ mod tests {
         // Before opt-in: default client must reject.
         let pre = checker
             .default_http_client
+            .as_ref()
+            .expect("default health-check client should be present")
             .get(format!("https://127.0.0.1:{}/", port))
             .timeout(Duration::from_secs(5))
             .send()
@@ -2503,6 +2576,8 @@ mod tests {
         // After opt-in: rebuilt default client must accept.
         let post = checker
             .default_http_client
+            .as_ref()
+            .expect("rebuilt default health-check client should be present")
             .get(format!("https://127.0.0.1:{}/", port))
             .timeout(Duration::from_secs(5))
             .send()
@@ -2517,15 +2592,17 @@ mod tests {
         // provided — i.e., the minimal builder configuration with only the
         // resolver attached actually succeeds.
         let dns_cache = DnsCache::new(DnsConfig::default());
-        let _client = build_dns_cached_fallback_client(Some(dns_cache), "test");
-        // No panic, no Err, no ambient-proxy last-resort path: success.
+        let _client = build_dns_cached_fallback_client(Some(dns_cache), "test")
+            .expect("fallback client with DNS cache should build");
+        // No panic, no ambient-proxy last-resort path: success.
     }
 
     #[test]
     fn fallback_client_builds_without_dns_cache() {
         // Verify the helper still succeeds when no DNS cache is available
         // (this exercises the `from_pool_config` cache-less code path).
-        let _client = build_dns_cached_fallback_client(None, "test");
+        let _client = build_dns_cached_fallback_client(None, "test")
+            .expect("fallback client without DNS cache should build");
     }
 
     #[test]
@@ -2536,7 +2613,8 @@ mod tests {
         // connect failure).
         let dns_cache = DnsCache::new(DnsConfig::default());
         let pool_config = PoolConfig::default();
-        let _client = build_health_check_client(&pool_config, Some(dns_cache), false);
+        let _client = build_health_check_client(&pool_config, Some(dns_cache), false)
+            .expect("health-check client should build");
     }
 
     #[tokio::test]
@@ -2546,7 +2624,8 @@ mod tests {
         // the resolver and used system DNS, the cache would stay empty.
         let dns_cache = DnsCache::new(DnsConfig::default());
         let initial_len = dns_cache.cache_len();
-        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()), "test");
+        let client = build_dns_cached_fallback_client(Some(dns_cache.clone()), "test")
+            .expect("fallback client should build");
 
         // Issue a request to a well-known hostname. The connection itself will
         // either succeed or fail (we don't care); what matters is that the
@@ -2568,6 +2647,69 @@ mod tests {
              via ambient proxying, the cache would stay empty.",
             initial_len,
             after_len
+        );
+    }
+
+    #[test]
+    fn accept_health_check_client_preserves_built_client() {
+        let client = build_dns_cached_fallback_client(None, "test")
+            .expect("fallback client should build");
+        assert!(
+            accept_health_check_client(Ok(client), "test").is_some(),
+            "successful builds must remain available to HTTP probes"
+        );
+    }
+
+    /// Pin the fail-closed contract in source: the health-check fallback must
+    /// not panic and must not fall back to the ambient-proxy-aware default
+    /// constructor.
+    #[test]
+    fn health_check_fallback_source_fails_closed_without_panic_or_client_new() {
+        let source = include_str!("health_check.rs");
+        let start = source
+            .find("fn build_dns_cached_fallback_client(")
+            .expect("fallback helper present");
+        let rest = &source[start..];
+        let end = rest
+            .find("\nfn accept_health_check_client(")
+            .expect("accept helper follows fallback");
+        let helper = &rest[..end];
+        assert!(
+            helper.contains("Result<reqwest::Client, reqwest::Error>"),
+            "fallback helper must return Result so construction failure propagates"
+        );
+        assert!(
+            helper.contains(".no_proxy()"),
+            "fallback helper must disable ambient proxies"
+        );
+        assert!(
+            !helper.contains("panic!"),
+            "fallback helper must not panic on construction failure"
+        );
+        assert!(
+            !helper.contains("unwrap_or_else"),
+            "fallback helper must not unwrap fallible builds into panic or ambient-proxy defaults"
+        );
+        // Ignore comments/docs: only executable lines may not call the ambient
+        // default constructor (which inherits HTTP_PROXY/HTTPS_PROXY/ALL_PROXY).
+        let code_mentions_default_ctor = helper.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("//")
+                && !trimmed.starts_with("///")
+                && !trimmed.starts_with('*')
+                && trimmed.contains("Client::new()")
+        });
+        assert!(
+            !code_mentions_default_ctor,
+            "fallback helper must not re-enable ambient proxies via Client::new()"
+        );
+        assert!(
+            source.contains("health-check HTTP client construction failed"),
+            "HTTP probes must fail closed when the client is unavailable"
+        );
+        assert!(
+            source.contains("default_http_client: Option<Arc<reqwest::Client>>"),
+            "construction failure must be representable without panicking"
         );
     }
 }
