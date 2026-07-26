@@ -117,7 +117,10 @@ impl MeshUpdateRejectReason {
     /// lets multi-CP failover move to the next control plane. A **content**
     /// failure (unparseable JSON, envelope/slice version disagreement, a stray
     /// heartbeat-marked frame) is per-frame: drop the frame, keep the last-good
-    /// slice, and stay connected so a corrected broadcast still converges.
+    /// slice, and stay connected so a corrected broadcast still converges. A
+    /// malformed *revision* is stream-terminal despite being carried inside
+    /// content: it compromises the ordering domain itself, so failover must
+    /// leave that control plane just like a stale revision does.
     /// Neither outcome ever mutates runtime state.
     ///
     /// The one-shot remote-discovery fetch ignores this split and fails the
@@ -129,12 +132,12 @@ impl MeshUpdateRejectReason {
             | Self::NodeIdMismatch
             | Self::NamespaceMismatch
             | Self::WorkloadScopeMismatch
-            | Self::WaypointScopeMismatch => true,
+            | Self::WaypointScopeMismatch
+            | Self::MalformedRevision => true,
             Self::UnexpectedHeartbeat
             | Self::InvalidSliceJson
             | Self::EnvelopeVersionMismatch
-            | Self::EnvelopeRevisionMismatch
-            | Self::MalformedRevision => false,
+            | Self::EnvelopeRevisionMismatch => false,
         }
     }
 }
@@ -344,18 +347,16 @@ pub fn validate_mesh_config_update(
     {
         // Static detail only — do not echo the hostile authority text.
         let detail = "embedded slice revision is present but ill-formed \
-            (blank, over-long, or control-character authority)"
+            (blank, surrounding-whitespace, over-long, or control-character authority)"
             .to_string();
         return rejected(consumer, Reason::MalformedRevision, detail);
     }
     if !update.config_authority.is_empty() {
-        let envelope = MeshConfigRevision::new(
-            update.config_authority.as_str(),
-            update.config_sequence,
-        );
+        let envelope =
+            MeshConfigRevision::new(update.config_authority.as_str(), update.config_sequence);
         if !envelope.is_well_formed() {
             let detail = "envelope config revision is present but ill-formed \
-                (blank, over-long, or control-character authority)"
+                (blank, surrounding-whitespace, over-long, or control-character authority)"
                 .to_string();
             return rejected(consumer, Reason::MalformedRevision, detail);
         }

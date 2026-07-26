@@ -13166,6 +13166,10 @@ async fn apply_mesh_slice_generation(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
 ) -> bool {
+    // Capture before any asynchronous preparation. An operator reset that
+    // lands while this generation is being built invalidates the token, so a
+    // late successful apply cannot resurrect the cleared freshness watermark.
+    let revision_apply_token = mesh_state.begin_revision_apply(base_slice);
     if has_termination_listener && !live_reload_enabled {
         let fixed_policy = proxy_state.mesh_inbound_tls_policy.load();
         if let Some((port, mode)) = newly_selectable_inbound_peer_auth_port_requires_reload(
@@ -13309,7 +13313,13 @@ async fn apply_mesh_slice_generation(
             if accepted && let Some((resolver, snapshot)) = staged_policy_scopes {
                 resolver.install_policy_scope_snapshot(snapshot);
             }
-            record_mesh_slice_apply_result(mesh_state, last_applied_slice, base_slice, accepted);
+            record_mesh_slice_apply_result(
+                mesh_state,
+                last_applied_slice,
+                base_slice,
+                accepted,
+                revision_apply_token,
+            );
             if accepted {
                 publish_gateway_active_trust_bundles(
                     proxy_state,
@@ -13421,11 +13431,13 @@ fn start_mesh_slice_apply_task(
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed && !remote_changed {
+                    let revision_apply_token = mesh_state.begin_revision_apply(slice);
                     record_mesh_slice_apply_result(
                         &mesh_state,
                         &mut last_applied_slice,
                         slice,
                         true,
+                        revision_apply_token,
                     );
                     debug!(
                         mesh_slice_version = %slice.version,
@@ -13556,9 +13568,10 @@ fn record_mesh_slice_apply_result(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     slice: &MeshSlice,
     applied: bool,
+    revision_apply_token: Option<revision::MeshRevisionApplyToken>,
 ) {
     if applied {
-        mesh_state.record_applied_slice(slice);
+        mesh_state.record_applied_slice_with_token(slice, revision_apply_token);
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
@@ -23481,7 +23494,13 @@ mod tests {
             labels: [("app".to_string(), "api".to_string())].into(),
             ..MeshSlice::default()
         };
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, false);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            false,
+            None,
+        );
         assert!(last_applied_slice.is_none());
         assert!(mesh_state.applied_snapshot().as_ref().is_none());
         assert!(!mesh_slice_matches_last_applied(
@@ -23493,7 +23512,13 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            true,
+            None,
+        );
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
@@ -23520,12 +23545,12 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true, None);
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &v2
         ));
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true, None);
 
         let applied = mesh_state.applied_snapshot();
         assert_eq!(

@@ -4915,11 +4915,10 @@ impl DatabaseStore {
     }
 
     pub async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
-        let row = sqlx::query(
-            "SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes",
-        )
-        .fetch_one(&self.pool())
-        .await?;
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes")
+                .fetch_one(&self.pool())
+                .await?;
         let max_sequence: i64 = row.try_get("max_sequence")?;
         Ok(max_sequence.max(0) as u64)
     }

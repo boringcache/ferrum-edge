@@ -3064,7 +3064,6 @@ paths:
                               truncated to 64 characters.
                           sequence:
                             type: integer
-                            format: int64
                             minimum: 0
                             description: |
                               Durable config-change sequence within
@@ -3086,7 +3085,6 @@ paths:
                               Sanitized exactly like `accepted.authority`.
                           sequence:
                             type: integer
-                            format: int64
                             minimum: 0
                       quarantined:
                         type: object
@@ -3110,7 +3108,6 @@ paths:
                               refused slice carried no revision.
                           sequence:
                             type: integer
-                            format: int64
                             minimum: 0
                           reason:
                             type: string
@@ -3123,7 +3120,6 @@ paths:
                               ]
                           consecutive:
                             type: integer
-                            format: int64
                             minimum: 1
                             description: |
                               Consecutive refusals of this same
@@ -3136,19 +3132,16 @@ paths:
                             format: date-time
                       rejected_total:
                         type: integer
-                        format: int64
                         minimum: 0
                         description: |
                           Slices the gate has refused since process start.
                       adopted_total:
                         type: integer
-                        format: int64
                         minimum: 0
                         description: |
                           Foreign authorities adopted after the grace period.
                       foreign_authority_adopt_secs:
                         type: integer
-                        format: int64
                         minimum: 0
                         description: |
                           Effective `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`.
@@ -3266,7 +3259,9 @@ paths:
         revision, so a lagging fallback control plane cannot roll the data
         plane back to a stale generation during an HA failover. A **foreign**
         authority is adopted automatically once it has been observed
-        continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`. A sequence
+        continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`; that grace
+        uses a monotonic process clock, so wall-clock jumps cannot expire it
+        early. A sequence
         rewind **inside one authority** is never auto-adopted, because it is
         indistinguishable from the rollback the gate exists to prevent — this
         endpoint is the documented recovery for that case (a config store
@@ -3313,7 +3308,6 @@ paths:
                           rendering.
                       sequence:
                         type: integer
-                        format: int64
                         minimum: 0
               examples:
                 cleared:

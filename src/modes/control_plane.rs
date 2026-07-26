@@ -1349,7 +1349,7 @@ fn resolve_mesh_config_authority(env_config: &EnvConfig) -> Option<String> {
         );
         return None;
     }
-    let authority = env_config.mesh_config_authority_id.trim();
+    let authority = env_config.mesh_config_authority_id.as_str();
     if authority.is_empty() {
         return None;
     }

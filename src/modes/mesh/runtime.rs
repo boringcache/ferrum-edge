@@ -19,8 +19,8 @@ use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_w
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
 use crate::modes::mesh::revision::{
-    MeshConfigRevision, MeshRevisionDiagnostics, MeshRevisionGate, MeshRevisionPolicy,
-    MeshRevisionRejection,
+    MeshConfigRevision, MeshRevisionApplyToken, MeshRevisionDiagnostics, MeshRevisionGate,
+    MeshRevisionPolicy, MeshRevisionRejection,
 };
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
@@ -440,7 +440,32 @@ impl MeshRuntimeState {
     /// Committing first means any observer woken by the applied-slice watcher
     /// already sees a watermark consistent with the slice it is about to read.
     pub fn record_applied_slice(&self, slice: &MeshSlice) {
-        self.revision_gate.commit_applied(slice.revision.as_ref());
+        let token = self.revision_gate.begin_apply(slice.revision.as_ref());
+        self.record_applied_slice_with_token(slice, token);
+    }
+
+    /// Capture the config-revision apply capability before asynchronous proxy
+    /// preparation begins. A concurrent operator reset invalidates the token,
+    /// so completion of pre-reset work cannot restore the cleared watermark.
+    pub(crate) fn begin_revision_apply(
+        &self,
+        slice: &MeshSlice,
+    ) -> Option<MeshRevisionApplyToken> {
+        self.revision_gate.begin_apply(slice.revision.as_ref())
+    }
+
+    /// Commit a runtime-accepted slice with the capability captured before its
+    /// asynchronous apply began.
+    pub(crate) fn record_applied_slice_with_token(
+        &self,
+        slice: &MeshSlice,
+        token: Option<MeshRevisionApplyToken>,
+    ) {
+        if let Some(token) = token {
+            let _ = self
+                .revision_gate
+                .commit_applied(slice.revision.as_ref(), token);
+        }
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
         // acceptance. Rejected slices must not mutate live log/transformer
         // state while the proxy keeps serving the previous accepted config.
@@ -522,6 +547,43 @@ mod tests {
 
     fn install_slice_for_test(state: &MeshRuntimeState, slice: MeshSlice) {
         state.install_slice(slice);
+    }
+
+    #[test]
+    fn reset_invalidates_an_in_flight_revision_apply_token() {
+        let state = MeshRuntimeState::new();
+        let candidate = MeshSlice {
+            revision: Some(MeshConfigRevision::new("db", 10)),
+            ..MeshSlice::default()
+        };
+        assert!(state.install_slice(candidate.clone()).installed());
+        let token = state
+            .begin_revision_apply(&candidate)
+            .expect("the admitted candidate mints an apply token");
+
+        assert_eq!(
+            state.reset_accepted_revision(),
+            Some(MeshConfigRevision::new("db", 10))
+        );
+        state.record_applied_slice_with_token(&candidate, Some(token));
+
+        assert!(
+            state.accepted_revision().is_none(),
+            "a pre-reset apply completion must not resurrect accepted"
+        );
+        assert!(
+            state.applied_revision().is_none(),
+            "a pre-reset apply completion must not recreate the rollback target"
+        );
+        assert_eq!(
+            state
+                .applied_snapshot()
+                .as_ref()
+                .as_ref()
+                .and_then(|slice| slice.revision.as_ref()),
+            Some(&MeshConfigRevision::new("db", 10)),
+            "the proxy-accepted content remains observable even though reset keeps the ordering baseline clear"
+        );
     }
 
     #[test]

@@ -50,9 +50,7 @@ use ferrum_edge::modes::mesh::config_consumer::native_client::{
 use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
 };
-use ferrum_edge::modes::mesh::config_consumer::xds_client::{
-    XdsClientConfig, XdsConfigConsumer,
-};
+use ferrum_edge::modes::mesh::config_consumer::xds_client::{XdsClientConfig, XdsConfigConsumer};
 use ferrum_edge::modes::mesh::revision::{
     MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder, MeshRevisionPolicy,
     MeshRevisionRejectReason,
@@ -330,6 +328,7 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
 /// lockout path for control-plane state loss and deliberate source resets.
 #[test]
 fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
+    let monotonic_t0 = std::time::Instant::now();
     let gate = MeshRevisionGate::new();
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 300,
@@ -343,7 +342,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
         .expect("bootstrap installs");
 
     let rejection = gate
-        .admit(Some(&revision("db-restored", 1)), t0)
+        .admit_at(Some(&revision("db-restored", 1)), t0, monotonic_t0)
         .expect_err("a foreign authority is quarantined on first sight");
     assert_eq!(
         rejection.reason(),
@@ -351,30 +350,34 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     );
 
     // Still inside the grace window.
-    gate.admit(
+    gate.admit_at(
         Some(&revision("db-restored", 2)),
-        t0 + chrono::Duration::seconds(299),
+        t0 + chrono::Duration::days(30),
+        monotonic_t0 + std::time::Duration::from_secs(299),
     )
-    .expect_err("still inside the adoption grace window");
+    .expect_err("a forward wall-clock jump cannot expire the monotonic grace window");
     assert_eq!(gate.accepted().map(|r| r.authority), Some("db".to_string()));
 
     // A DIFFERENT foreign authority restarts the observation window, so a
     // flapping set of foreign CPs cannot accumulate grace.
-    gate.admit(
+    gate.admit_at(
         Some(&revision("db-other", 7)),
         t0 + chrono::Duration::seconds(300),
+        monotonic_t0 + std::time::Duration::from_secs(300),
     )
     .expect_err("a different foreign authority restarts the window");
-    gate.admit(
+    gate.admit_at(
         Some(&revision("db-restored", 3)),
         t0 + chrono::Duration::seconds(301),
+        monotonic_t0 + std::time::Duration::from_secs(301),
     )
     .expect_err("the original foreign authority also restarts its window");
 
     let order = gate
-        .admit(
+        .admit_at(
             Some(&revision("db-restored", 4)),
             t0 + chrono::Duration::seconds(601),
+            monotonic_t0 + std::time::Duration::from_secs(601),
         )
         .expect("a continuously observed foreign authority is adopted");
     assert_eq!(order, MeshRevisionOrder::Incomparable);
@@ -457,7 +460,10 @@ fn xds_consumer_surfaces_stale_revision_as_stream_terminal() {
     let state = MeshRuntimeState::new();
     let consumer = XdsConfigConsumer::new(
         XdsClientConfig {
-            cp_urls: vec!["http://cp-a:50051".to_string(), "http://cp-b:50051".to_string()],
+            cp_urls: vec![
+                "http://cp-a:50051".to_string(),
+                "http://cp-b:50051".to_string(),
+            ],
             node_id: NODE_ID.to_string(),
             cluster: "default".to_string(),
             namespace: NAMESPACE.to_string(),
@@ -724,6 +730,7 @@ fn malformed_embedded_revision_cannot_smuggle_past_validation_or_bootstrap() {
 
     let cases = [
         ("blank", revision("   ", 7)),
+        ("surrounding-whitespace", revision(" db", 7)),
         ("overlong", revision(&"a".repeat(129), 7)),
         (
             "control-character",
@@ -755,6 +762,11 @@ fn malformed_embedded_revision_cannot_smuggle_past_validation_or_bootstrap() {
                 consumer.as_metric_label()
             );
             assert!(
+                rejection.terminates_stream(),
+                "{label}/{}: a malformed ordering domain must force CP failover",
+                consumer.as_metric_label()
+            );
+            assert!(
                 !rejection.detail().contains('\n'),
                 "{label}: diagnostics must not echo raw hostile authority text"
             );
@@ -772,10 +784,7 @@ fn malformed_embedded_revision_cannot_smuggle_past_validation_or_bootstrap() {
             "{label}: install_slice must quarantine, not bootstrap"
         );
         assert_eq!(
-            outcome
-                .rejection()
-                .expect("quarantine recorded")
-                .reason(),
+            outcome.rejection().expect("quarantine recorded").reason(),
             MeshRevisionRejectReason::MalformedRevision
         );
         assert!(
@@ -831,6 +840,11 @@ fn whitespace_only_envelope_authority_is_malformed_not_absent() {
             "{}: dedicated malformed_revision reason",
             consumer.as_metric_label()
         );
+        assert!(
+            rejection.terminates_stream(),
+            "{}: a whitespace-only ordering domain must force CP failover",
+            consumer.as_metric_label()
+        );
         // Static diagnostic only — do not echo the raw authority bytes.
         assert!(
             !rejection.detail().contains("   "),
@@ -877,10 +891,7 @@ fn explicit_scope_full_load_sequence_ignores_unrelated_global_high_water() {
         "Single-scope restart must not jump to an unrelated global sequence"
     );
 
-    let set = CpScope::Set(HashSet::from([
-        "alpha".to_string(),
-        "beta".to_string(),
-    ]));
+    let set = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
     let mut set_scoped = scoped.clone();
     set_scoped.insert("beta".to_string(), 12);
     assert_eq!(
@@ -903,10 +914,7 @@ fn explicit_scope_full_load_sequence_ignores_unrelated_global_high_water() {
         CpScope::Single("alpha".to_string()).mesh_full_load_sequence(&scoped, store_global, 20),
         20
     );
-    assert_eq!(
-        CpScope::All.mesh_full_load_sequence(&remaining, 15, 40),
-        40
-    );
+    assert_eq!(CpScope::All.mesh_full_load_sequence(&remaining, 15, 40), 40);
 }
 
 /// `content_eq` ignores revision (ordering metadata). Existing MeshSubscribe

@@ -98,6 +98,7 @@
 //!   prevent.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -123,7 +124,7 @@ pub const DEFAULT_CONFIG_AUTHORITY_ID: &str = "db";
 /// Carried on [`crate::modes::mesh::slice::MeshSlice::revision`], duplicated on
 /// the `MeshConfigUpdate` envelope, and on the xDS path recovered through the
 /// `ConfigRevision` ECDS carrier so native and xDS materialize identically.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MeshConfigRevision {
     /// Ordering domain. Sequences are only comparable within one authority.
     pub authority: String,
@@ -141,8 +142,9 @@ impl MeshConfigRevision {
 
     /// Whether the wire-supplied shape is usable for ordering.
     ///
-    /// A blank, over-long, or control-character-bearing authority is
-    /// **ill-formed**, not merely unusable for comparison. Callers that admit
+    /// A blank, surrounding-whitespace, over-long, or
+    /// control-character-bearing authority is **ill-formed**, not merely
+    /// unusable for comparison. Callers that admit
     /// or install slices ([`MeshRevisionGate::admit`], centralized
     /// `MeshConfigUpdate` validation) must refuse a *present* ill-formed
     /// revision outright — never silently downgrade it to "absent", which
@@ -159,7 +161,8 @@ impl MeshConfigRevision {
     /// an ordering domain. Real authority ids are opaque printable labels
     /// (`FERRUM_MESH_CONFIG_AUTHORITY_ID`), so nothing legitimate is excluded.
     pub fn is_well_formed(&self) -> bool {
-        !self.authority.trim().is_empty()
+        !self.authority.is_empty()
+            && self.authority.trim() == self.authority
             && self.authority.len() <= MAX_AUTHORITY_LEN
             && !self.authority.chars().any(char::is_control)
     }
@@ -225,10 +228,10 @@ pub enum MeshRevisionRejectReason {
     IncomparableAuthority,
     /// No usable revision at all while a revisioned slice is accepted.
     MissingRevision,
-    /// A revision is present on the wire but ill-formed (blank / over-long /
-    /// control-character authority). Must never be silently downgraded to
-    /// "absent" and must never bootstrap — that would contradict the
-    /// fail-closed malformed-revision boundary (issue #2473).
+    /// A revision is present on the wire but ill-formed (blank / surrounding
+    /// whitespace / over-long / control-character authority). Must never be
+    /// silently downgraded to "absent" and must never bootstrap — that would
+    /// contradict the fail-closed malformed-revision boundary (issue #2473).
     MalformedRevision,
 }
 
@@ -367,7 +370,15 @@ struct GateState {
     /// Foreign authority under observation for adoption, with the instant it
     /// was first seen. Reset whenever a slice is accepted or a DIFFERENT
     /// foreign authority appears.
-    foreign_watch: Option<(String, DateTime<Utc>)>,
+    foreign_watch: Option<(String, Instant)>,
+    /// Incremented by every operator reset. Apply work captures the epoch
+    /// before it starts and may commit only while the epoch still matches, so
+    /// an in-flight pre-reset apply cannot resurrect the cleared watermark.
+    reset_epoch: u64,
+    /// Epoch in which `accepted` was admitted. `None` when the accepted slot is
+    /// empty after reset; used to mint apply tokens only for a candidate that
+    /// actually passed the current epoch's freshness gate.
+    accepted_epoch: Option<u64>,
     rejected_total: u64,
     adopted_total: u64,
 }
@@ -383,6 +394,14 @@ struct GateState {
 pub struct MeshRevisionGate {
     state: Mutex<GateState>,
     policy: Mutex<MeshRevisionPolicy>,
+}
+
+/// Capability captured before a received slice enters the asynchronous proxy
+/// apply path. A reset invalidates every outstanding token by advancing the
+/// gate epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeshRevisionApplyToken {
+    epoch: u64,
 }
 
 impl Default for MeshRevisionGate {
@@ -428,10 +447,32 @@ impl MeshRevisionGate {
     /// length-bounded. The raw string never escapes.
     pub fn reset(&self) -> Option<MeshConfigRevision> {
         let mut state = self.lock_state();
+        state.reset_epoch = state.reset_epoch.wrapping_add(1);
+        state.accepted_epoch = None;
         state.quarantined = None;
         state.foreign_watch = None;
         state.applied = None;
         state.accepted.take().as_ref().map(sanitized_revision)
+    }
+
+    /// Capture permission for this exact accepted candidate to enter an
+    /// asynchronous runtime apply.
+    ///
+    /// The token remains valid across newer admissions in the same epoch: an
+    /// N apply that began before N+1 arrived may still become the serving
+    /// generation while N+1 waits. An operator reset advances the epoch and
+    /// invalidates both, preventing either completion from undoing the reset.
+    pub(crate) fn begin_apply(
+        &self,
+        candidate: Option<&MeshConfigRevision>,
+    ) -> Option<MeshRevisionApplyToken> {
+        let candidate = candidate.filter(|revision| revision.is_well_formed());
+        let state = self.lock_state();
+        if state.accepted.as_ref() != candidate {
+            return None;
+        }
+        let epoch = state.accepted_epoch?;
+        Some(MeshRevisionApplyToken { epoch })
     }
 
     /// Commit the watermark for a slice the proxy runtime ACCEPTED.
@@ -441,11 +482,19 @@ impl MeshRevisionGate {
     /// without a config delta and the watermark must still record that this
     /// revision is the live one. Also raises `accepted` when it is somehow
     /// behind (an installer that bypassed [`Self::admit`], or the first slice
-    /// applied after an operator reset), so the two slots can never disagree in
-    /// the direction that would quarantine the generation actually serving.
-    pub fn commit_applied(&self, revision: Option<&MeshConfigRevision>) {
+    /// applied while a newer candidate is already received), so the two slots
+    /// can never disagree in the direction that would quarantine the
+    /// generation actually serving. A reset invalidates the captured token.
+    pub(crate) fn commit_applied(
+        &self,
+        revision: Option<&MeshConfigRevision>,
+        token: MeshRevisionApplyToken,
+    ) -> bool {
         let revision = revision.filter(|revision| revision.is_well_formed());
         let mut state = self.lock_state();
+        if token.epoch != state.reset_epoch {
+            return false;
+        }
         state.applied = revision.cloned();
         let raise_accepted = match revision {
             Some(candidate) => matches!(
@@ -456,7 +505,9 @@ impl MeshRevisionGate {
         };
         if raise_accepted {
             state.accepted = revision.cloned();
+            state.accepted_epoch = Some(token.epoch);
         }
+        true
     }
 
     /// Finalize a candidate the proxy runtime REFUSED.
@@ -517,6 +568,24 @@ impl MeshRevisionGate {
         candidate: Option<&MeshConfigRevision>,
         now: DateTime<Utc>,
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
+        self.admit_at(candidate, now, Instant::now())
+    }
+
+    /// Admission with an explicit monotonic observation instant.
+    ///
+    /// Production callers use [`Self::admit`]. This seam exists so adversarial
+    /// ordering tests can advance the adoption clock without sleeping. Foreign
+    /// authority adoption is deliberately based on this monotonic clock rather
+    /// than `DateTime<Utc>`: NTP/manual wall-clock jumps must not prematurely
+    /// expire the fail-closed grace period. Wall time remains only for
+    /// operator-facing first/last-seen diagnostics.
+    #[doc(hidden)]
+    pub fn admit_at(
+        &self,
+        candidate: Option<&MeshConfigRevision>,
+        now: DateTime<Utc>,
+        monotonic_now: Instant,
+    ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
         let adopt_secs = self.policy().foreign_authority_adopt_secs;
         let mut state = self.lock_state();
         // A *present* ill-formed revision must not be silently downgraded to
@@ -530,6 +599,8 @@ impl MeshRevisionGate {
 
         if order.installs() && !malformed {
             state.accepted = candidate.filter(|r| r.is_well_formed()).cloned();
+            let epoch = state.reset_epoch;
+            state.accepted_epoch = Some(epoch);
             state.quarantined = None;
             state.foreign_watch = None;
             return Ok(order);
@@ -547,14 +618,19 @@ impl MeshRevisionGate {
             let first_seen = match state.foreign_watch.as_ref() {
                 Some((authority, first_seen)) if authority == &candidate.authority => *first_seen,
                 _ => {
-                    state.foreign_watch = Some((candidate.authority.clone(), now));
-                    now
+                    state.foreign_watch = Some((candidate.authority.clone(), monotonic_now));
+                    monotonic_now
                 }
             };
-            let observed_secs = now.signed_duration_since(first_seen).num_seconds().max(0) as u64;
+            let observed_secs = monotonic_now
+                .checked_duration_since(first_seen)
+                .unwrap_or_default()
+                .as_secs();
             if observed_secs >= adopt_secs {
                 state.adopted_total = state.adopted_total.saturating_add(1);
                 state.accepted = Some(candidate.clone());
+                let epoch = state.reset_epoch;
+                state.accepted_epoch = Some(epoch);
                 state.quarantined = None;
                 state.foreign_watch = None;
                 crate::plugins::mesh::prometheus_helpers::increment_mesh_config_revision_adoption();

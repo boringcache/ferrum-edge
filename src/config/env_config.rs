@@ -4556,16 +4556,17 @@ impl EnvConfig {
     fn validate(&mut self) -> Result<(), String> {
         if matches!(&self.mode, OperatingMode::ControlPlane)
             && !self.k8s_controller_enabled
-            && !self.mesh_config_authority_id.trim().is_empty()
+            && !self.mesh_config_authority_id.is_empty()
         {
             let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
-                self.mesh_config_authority_id.trim(),
+                self.mesh_config_authority_id.as_str(),
                 0,
             );
             if !authority.is_well_formed() {
                 return Err(format!(
                     "FERRUM_MESH_CONFIG_AUTHORITY_ID must be empty or a \
-                     printable, control-character-free value no longer than {} bytes",
+                     printable, control-character-free value with no surrounding \
+                     whitespace and no longer than {} bytes",
                     crate::modes::mesh::revision::MAX_AUTHORITY_LEN
                 ));
             }
