@@ -18661,7 +18661,8 @@ async fn handle_proxy_request_inner(
         Some(canonical) => {
             // Move the original target into the context for `hmac_auth`; the
             // canonical form replaces it everywhere else.
-            ctx.set_raw_path(std::mem::replace(&mut ctx.path, canonical.clone()));
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path(raw_path);
             canonical
         }
         None => path,

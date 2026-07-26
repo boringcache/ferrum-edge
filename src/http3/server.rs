@@ -1323,7 +1323,8 @@ async fn handle_h3_request(
     };
     let path = match canonicalized_path {
         Some(canonical) => {
-            ctx.set_raw_path(std::mem::replace(&mut ctx.path, canonical.clone()));
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path(raw_path);
             canonical
         }
         None => path,
