@@ -26,8 +26,8 @@ use super::utils::auth_flow::{
     constant_time_eq, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
-    parse_claim_headers,
+    ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
+    emit_claim_headers_to_attempt, parse_claim_headers,
 };
 use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
 use super::utils::jwks_cache::get_or_create_jwks_store;
@@ -147,6 +147,9 @@ struct ProviderRuntime {
     consumer_identity_claim: String,
     consumer_header_claim: String,
     claim_headers: Vec<ClaimHeaderMapping>,
+    /// Gateway-owned `claim_headers` destination set for this provider,
+    /// precomputed for the `before_proxy` sanitize step.
+    claim_header_destinations: ClaimHeaderDestinations,
     required_scopes: Vec<String>,
     required_roles: Vec<String>,
     scope_claim: String,
@@ -740,6 +743,15 @@ impl OidcRelyingParty {
             None
         };
 
+        let claim_headers = parse_claim_headers(
+            provider_obj,
+            "claim_headers",
+            "oidc_relying_party",
+            CLAIM_HEADER_METADATA_PREFIX,
+        )?;
+        let claim_header_destinations =
+            ClaimHeaderDestinations::from_mapping_groups(std::iter::once(claim_headers.as_slice()));
+
         let provider = Arc::new(ProviderRuntime {
             issuer,
             discovery,
@@ -765,12 +777,8 @@ impl OidcRelyingParty {
                 "provider[0]",
             )?
             .unwrap_or_else(|| "sub".to_string()),
-            claim_headers: parse_claim_headers(
-                provider_obj,
-                "claim_headers",
-                "oidc_relying_party",
-                CLAIM_HEADER_METADATA_PREFIX,
-            )?,
+            claim_headers,
+            claim_header_destinations,
             required_scopes: parse_string_array(provider_obj, "required_scopes", "provider[0]")?,
             required_roles: parse_string_array(provider_obj, "required_roles", "provider[0]")?,
             scope_claim: optional_string(provider_obj, "scope_claim", "provider[0]")?
@@ -1798,7 +1806,7 @@ impl super::Plugin for OidcRelyingParty {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
         PluginResult::Continue
     }
     async fn after_proxy(

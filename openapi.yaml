@@ -13588,7 +13588,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Per-provider claim path to upstream header mappings
+                description: >-
+                  Per-provider claim path to upstream header mappings. Destination
+                  headers are gateway-owned and always sanitized: every configured
+                  destination is removed from the client request (case-insensitively)
+                  before verified claim values are installed, so an absent, null,
+                  empty, or wrong-type claim leaves the header absent instead of
+                  forwarding client-supplied input.
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
@@ -13634,7 +13640,13 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Global claim path to upstream header mappings
+          description: >-
+            Global claim path to upstream header mappings. Destination headers are
+            gateway-owned and always sanitized: every configured destination is
+            removed from the client request (case-insensitively) before verified
+            claim values are installed, so an absent, null, empty, or wrong-type
+            claim leaves the header absent instead of forwarding client-supplied
+            input.
         claim_headers_separator:
           type: string
           default: ","
@@ -13777,7 +13789,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Claim path to upstream header mappings
+                description: >-
+                  Claim path to upstream header mappings. Destination headers are
+                  gateway-owned and always sanitized: every configured destination is
+                  removed from the client request (case-insensitively) before verified
+                  claim values are installed, so an absent, null, empty, or wrong-type
+                  claim leaves the header absent instead of forwarding client-supplied
+                  input.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -13896,6 +13914,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
+                description: >-
+                  Session claim path to upstream header mappings. Destination headers
+                  are gateway-owned and always sanitized: every configured destination
+                  is removed from the client request (case-insensitively) before
+                  verified claim values are installed, so an absent, null, empty, or
+                  wrong-type claim leaves the header absent instead of forwarding
+                  client-supplied input.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -18330,7 +18355,7 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load)."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
