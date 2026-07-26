@@ -1027,11 +1027,7 @@ impl RequestDeduplication {
         // replay one another's operation.
         if let Some(proxy) = ctx.matched_proxy.as_ref() {
             hash_framed(&mut hasher, "matched_proxy", b"1");
-            hash_framed(
-                &mut hasher,
-                "proxy_namespace",
-                proxy.namespace.as_bytes(),
-            );
+            hash_framed(&mut hasher, "proxy_namespace", proxy.namespace.as_bytes());
             hash_framed(&mut hasher, "proxy_id", proxy.id.as_bytes());
         } else {
             // Frame presence explicitly rather than reserving a sentinel that
