@@ -1040,6 +1040,69 @@ async fn latest_wins_receiver_drop_clears_pending_and_wakes_closed() {
 }
 
 #[tokio::test]
+async fn latest_wins_publish_after_cancel_is_rejected_and_drops_payload() {
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Secret(Arc<AtomicUsize>);
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = latest_wins::channel::<Secret>();
+    drop(rx);
+
+    assert!(
+        !tx.publish(Secret(Arc::clone(&drops))),
+        "publish after cancel must report the receiver is gone"
+    );
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "a rejected publish must drop its private-key-bearing payload immediately, \
+         not park it in an orphaned slot"
+    );
+}
+
+#[tokio::test]
+async fn latest_wins_publish_racing_receiver_drop_never_retains_payload() {
+    // Regression: the cancel flag must be published under the slot lock. If it
+    // is stored only after the lock is released, a publish that acquires the
+    // lock in between sees `receiver_gone == false`, lands its value in the
+    // just-cleared slot, and that payload stays alive until the producer next
+    // notices the closure — for the client relay, until the agent sends
+    // another frame. Whichever side wins the lock, no value may be retained
+    // while the sender is still alive.
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Secret(Arc<AtomicUsize>);
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for round in 0..256 {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = latest_wins::channel::<Secret>();
+        let dropper = std::thread::spawn(move || drop(rx));
+        let _accepted = tx.publish(Secret(Arc::clone(&drops)));
+        dropper.join().expect("receiver dropper thread panicked");
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "round {round}: payload retained in an orphaned slot after stream cancel"
+        );
+        drop(tx);
+    }
+}
+
+#[tokio::test]
 async fn fetch_x509svid_slow_consumer_coalesces_rotations_to_newest_state() {
     use ferrum_edge::identity::workload_api::proto::X509svidRequest;
     use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;

@@ -187,10 +187,8 @@ impl WorkloadApiClient {
                 if !out_tx.publish(bundle_res) {
                     return;
                 }
-                if was_ok {
-                    if let Some(notify) = notify_tx.take() {
-                        let _ = notify.send(());
-                    }
+                if was_ok && let Some(notify) = notify_tx.take() {
+                    let _ = notify.send(());
                 }
             }
             // Sender drop ends the stream after any final pending value.

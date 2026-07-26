@@ -188,11 +188,20 @@ impl<T> Drop for LatestWinsReceiver<T> {
                 .slot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Publish the gone flag *under the slot lock*, before clearing.
+            // `publish` re-checks the flag while holding the same lock, so a
+            // concurrent publisher either observes the cancel and drops its
+            // own value, or lands in the slot before we clear it here. Storing
+            // the flag after releasing the lock leaves a window in which a
+            // publish slips into the just-cleared slot and its
+            // private-key-bearing payload is retained until the producer next
+            // notices the closure — which for the client relay means until the
+            // agent sends another frame, i.e. unbounded.
+            self.inner.receiver_gone.store(true, Ordering::Release);
             // Drop any pending secret-bearing payload promptly on cancel.
             slot.value = None;
             self.inner.pending.store(0, Ordering::Release);
         }
-        self.inner.receiver_gone.store(true, Ordering::Release);
         self.inner.receiver_gone_notify.notify_waiters();
         self.inner.data.notify_waiters();
     }
