@@ -678,6 +678,40 @@ pub fn evaluate_delta_against_subscription_base(
     }
 }
 
+/// Refuse a DELTA whose committed body timestamp predates the monotonic
+/// authority watermark.
+///
+/// This check is required even after a FULL_SNAPSHOT was accepted on the
+/// current subscription. An older, content-equivalent cross-source snapshot
+/// may safely establish a base, but that must not authorize the fallback CP to
+/// replay deltas from the history between that snapshot and the applied
+/// watermark (an ABA rollback).
+///
+/// Deliberately source-blind: accepting a cross-source snapshot rewrites
+/// `AppliedSnapshotAuthority::source_cp_url` to that CP, so exempting the
+/// authority's own source would make this check inert in exactly the ABA case
+/// it exists for. A CP that legitimately lags is fenced until it catches back
+/// up, which is the fail-closed direction.
+///
+/// Only strictly older stamps are refused. Equal stamps, newer stamps, and an
+/// authority with no established watermark proceed to the ordinary
+/// subscription-base and parse/validate/apply gates.
+pub fn evaluate_delta_authority(
+    authority: Option<&AppliedSnapshotAuthority>,
+    incoming_committed: DateTime<Utc>,
+) -> Result<(), StaleSnapshotReject> {
+    let Some(applied) = authority.and_then(|authority| authority.version) else {
+        return Ok(());
+    };
+    if incoming_committed < applied {
+        return Err(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: incoming_committed,
+        });
+    }
+    Ok(())
+}
+
 /// Why a non-empty DELTA must terminate the stream (issue #2394).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaRejectionKind {
@@ -885,9 +919,10 @@ pub enum ConfigSyncAttemptOutcome {
     /// inconsistent, rejected, or a pre-snapshot DELTA). Fail over with
     /// accumulating backoff; never treat as delivered config.
     InvalidSubscriptionBase,
-    /// A DELTA carried an envelope/body timestamp mismatch or an
-    /// implausibly-future committed timestamp. Fail over with accumulating
-    /// backoff so a skewed or hostile CP cannot poison the freshness watermark.
+    /// A DELTA carried an envelope/body timestamp mismatch, an
+    /// implausibly-future committed timestamp, or a stamp older than the
+    /// applied authority watermark. Fail over with accumulating backoff so a
+    /// skewed, hostile, or lagging CP cannot poison or roll back freshness.
     InvalidDeltaFreshness,
     /// An unusable FULL_SNAPSHOT arrived after a base was already accepted, or a
     /// non-empty DELTA was rejected. Keep serving last-known-good config, reset
