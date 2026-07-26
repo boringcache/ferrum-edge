@@ -3383,7 +3383,7 @@ async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
     .repeat_each_connection()
     .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
     .step(TcpStep::Write(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbridged".to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbridged".to_vec(),
     ))
     .step(TcpStep::Drop)
     .spawn()
