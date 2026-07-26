@@ -2854,6 +2854,59 @@ fn backend_tls_sni_buffering_screen_admits_unconstructable_configs() {
     assert!(rejections.is_empty(), "{msg}");
 }
 
+/// Plugin config ids may be reused across namespaces; SNI admission must
+/// resolve proxy associations in the proxy's namespace only.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_reused_plugin_id_in_other_namespace() {
+    let mut local = sni_proxy_plugin("shared-pc-id", "compression", serde_json::json!({}));
+    local.namespace = "tenant-a".to_string();
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let mut foreign = sni_proxy_plugin("shared-pc-id", "compression", decompress);
+    foreign.namespace = "tenant-b".to_string();
+    let mut config = sni_config_with_plugins(vec![foreign, local]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("other-namespace plugin id false rejection: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Global buffering plugins in another namespace must not reject this proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_global_plugins_in_other_namespace() {
+    let empty = serde_json::json!({});
+    let mut foreign = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
+    foreign.namespace = "tenant-b".to_string();
+    let mut config = sni_config_with_plugins(vec![foreign]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("other-namespace global false rejection: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Same-namespace inherited globals must still reject plain-HTTPS SNI proxies.
+#[test]
+fn backend_tls_sni_buffering_screen_rejects_same_namespace_global_plugins() {
+    let empty = serde_json::json!({});
+    let mut global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
+    global.namespace = "tenant-a".to_string();
+    let mut config = sni_config_with_plugins(vec![global]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("same-namespace global not screened: {rejections:?}");
+    assert!(global_hit && inherited, "{msg}");
+}
+
 /// A proxy without a plain-HTTPS SNI override is never screened at all, so a
 /// buffering plugin on it must stay admitted.
 #[test]

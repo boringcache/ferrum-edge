@@ -3247,9 +3247,9 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         ));
     }
 
-    // Effective plugins for this proxy: associations + globals (unless a
-    // local instance shadows that plugin name — mirror PluginCache merging
-    // for the buffering screen only).
+    // Effective plugins for this proxy: associations + globals in the proxy's
+    // namespace (unless a local instance shadows that plugin name — mirror
+    // PluginCache tenancy and merge rules for the buffering screen only).
     //
     // The screener owns an HTTP client, so build it lazily: proxies without an
     // effective plugin config never pay for one, and non-SNI proxies already
@@ -3257,28 +3257,33 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
     let mut local_names: HashSet<&str> = HashSet::new();
     for assoc in &proxy.plugins {
-        if let Some(pc) = plugin_configs
-            .iter()
-            .find(|pc| pc.id == assoc.plugin_config_id)
-        {
-            let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
-            // Mirror PluginCache: only locals that would enter (or deliberately
-            // clear) the merge list shadow a same-named global. Disabled
-            // configs and construction failures do not.
-            if effect.shadows_same_named_global {
-                local_names.insert(pc.plugin_name.as_str());
-            }
-            if effect.forces_buffering {
-                errors.push(format!(
-                    "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                     request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                    proxy.id, pc.id
-                ));
-            }
+        let Some(pc) = plugin_configs.iter().find(|pc| {
+            pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
+        }) else {
+            continue;
+        };
+        match pc.scope {
+            PluginScope::Global => continue,
+            PluginScope::Proxy if pc.proxy_id.as_deref() != Some(proxy.id.as_str()) => continue,
+            PluginScope::Proxy | PluginScope::ProxyGroup => {}
+        }
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        // Mirror PluginCache: only locals that would enter (or deliberately
+        // clear) the merge list shadow a same-named global. Disabled
+        // configs and construction failures do not.
+        if effect.shadows_same_named_global {
+            local_names.insert(pc.plugin_name.as_str());
+        }
+        if effect.forces_buffering {
+            errors.push(format!(
+                "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
+                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
+                proxy.id, pc.id
+            ));
         }
     }
     for pc in plugin_configs {
-        if pc.scope != PluginScope::Global {
+        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
             continue;
         }
         if local_names.contains(pc.plugin_name.as_str()) {
