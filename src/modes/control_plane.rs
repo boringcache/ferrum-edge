@@ -3523,8 +3523,10 @@ mod tests {
         let old_loaded_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let fresh_loaded_at = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
 
-        let mut previous = GatewayConfig::default();
-        previous.loaded_at = old_loaded_at;
+        let mut previous = GatewayConfig {
+            loaded_at: old_loaded_at,
+            ..Default::default()
+        };
         let mut a_old = make_proxy("a-old");
         a_old.namespace = "ns-a".to_string();
         let mut b_old = make_proxy("b-old");
@@ -3532,8 +3534,10 @@ mod tests {
         previous.proxies.push(a_old);
         previous.proxies.push(b_old);
 
-        let mut ns_b = GatewayConfig::default();
-        ns_b.loaded_at = fresh_loaded_at;
+        let mut ns_b = GatewayConfig {
+            loaded_at: fresh_loaded_at,
+            ..Default::default()
+        };
         let mut b_new = make_proxy("b-new");
         b_new.namespace = "ns-b".to_string();
         ns_b.proxies.push(b_new);
