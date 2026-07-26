@@ -1410,6 +1410,31 @@ mod inner {
             new_connection: MongoConnectionBundle,
             replica_set_configured: bool,
         ) -> Result<(), anyhow::Error> {
+            self.publish_reconnected_bundle(new_connection, replica_set_configured, None)
+        }
+
+        /// Publish a rebuilt connection under the generation guard.
+        ///
+        /// Transition contract (issue #3001, parity with SQL
+        /// `DatabaseStore::reconnect_for_topology`):
+        /// - Connection construction happens *before* this method, so a failed
+        ///   build never changes topology.
+        /// - The generation `try_write` is acquired first (fail-fast, no
+        ///   unbounded wait). A deferred reconnect leaves topology untouched.
+        /// - When `failover_url_redacted` is `Some`, `mark_failover` runs
+        ///   *before* the ArcSwap so `check_write_allowed()` can never observe
+        ///   a failover connection while `primary_active` is still true.
+        /// - After the gate flips, publication cannot fail (swap is infallible
+        ///   under the held guard), so there is no post-flip restore path.
+        /// - Primary failback keeps marking primary *after* publish
+        ///   (`reconnect`): temporary write blocking on a primary connection
+        ///   is acceptable; permitting writes on failover is not.
+        fn publish_reconnected_bundle(
+            &self,
+            new_connection: MongoConnectionBundle,
+            replica_set_configured: bool,
+            failover_url_redacted: Option<&str>,
+        ) -> Result<(), anyhow::Error> {
             // Never swap generations while an admission guard is validating,
             // mutating, cleaning up, or spanning a restore rollback. In
             // particular, an uncertain write retains a read pin indefinitely;
@@ -1420,6 +1445,9 @@ mod inner {
                     "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
                 )
             })?;
+            if let Some(redacted) = failover_url_redacted {
+                self.failover_topology.mark_failover(redacted);
+            }
             let _old_connection = self.connection.swap(Arc::new(new_connection));
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
@@ -1440,9 +1468,12 @@ mod inner {
                 self.conn_settings.tls_insecure,
             )
             .await?;
-            self.install_reconnected_bundle(new_connection, replica_set_configured)?;
-            self.failover_topology
-                .mark_failover(&crate::config::db_backend::redact_url(db_url));
+            // Gate-before-publish: see `publish_reconnected_bundle` contract.
+            self.publish_reconnected_bundle(
+                new_connection,
+                replica_set_configured,
+                Some(&crate::config::db_backend::redact_url(db_url)),
+            )?;
             Ok(())
         }
 
@@ -13397,6 +13428,67 @@ mod inner {
                  (proxies/consumers/plugin_configs/upstreams) all flow through \
                  db(), so a stale handle would mean every read still goes to \
                  the dead primary even after a successful reconnect"
+            );
+        }
+
+        /// Issue #3001: failover publish must flip the write gate before the
+        /// connection ArcSwap, and a deferred reconnect must not change
+        /// topology (gate-before-publish under the generation guard).
+        #[tokio::test(flavor = "current_thread")]
+        async fn failover_publish_flips_gate_before_connection_and_defers_without_flip() {
+            let store = make_test_store(vec![]);
+            assert!(
+                store.failover_topology.primary_active(),
+                "test store starts on primary topology"
+            );
+
+            let connection_bundle = |database_name: &str| {
+                let opts = mongodb::options::ClientOptions::builder()
+                    .hosts(vec![])
+                    .build();
+                let client = mongodb::Client::with_options(opts.clone()).unwrap();
+                let lease_client = mongodb::Client::with_options(opts).unwrap();
+                let db = client.database(database_name);
+                MongoConnectionBundle::new(client, db, lease_client, Vec::new())
+            };
+
+            let admission_pin = store.connection_generation.clone().read_owned().await;
+            let blocked = store
+                .publish_reconnected_bundle(
+                    connection_bundle("must_not_publish"),
+                    false,
+                    Some("mongodb://***/failover"),
+                )
+                .expect_err(
+                    "an admission pin must defer failover publish without flipping topology",
+                );
+            assert!(blocked.to_string().contains("admission operation pins"));
+            assert!(
+                store.failover_topology.primary_active(),
+                "deferred failover reconnect must leave primary_active=true so topology stays accurate"
+            );
+            assert_eq!(store.db().name(), "test");
+            drop(admission_pin);
+
+            store
+                .publish_reconnected_bundle(
+                    connection_bundle("failover_db"),
+                    false,
+                    Some("mongodb://***/failover"),
+                )
+                .expect("failover publish must succeed once the generation pin is released");
+            assert!(
+                !store.failover_topology.primary_active(),
+                "successful failover publish must mark the write gate before exposing the connection"
+            );
+            assert_eq!(
+                store.db().name(),
+                "failover_db",
+                "failover connection must be published only after the gate flips"
+            );
+            assert!(
+                !store.failover_topology.allow_writes(),
+                "default FERRUM_DB_FAILOVER_ALLOW_WRITES=false must keep admin writes fail-closed"
             );
         }
 

@@ -32,6 +32,26 @@ fn mongo_method(name: &str) -> &str {
     &MONGO_STORE_SOURCE[start..start + marker.len() + end]
 }
 
+fn mongo_sync_method(name: &str) -> &str {
+    mongo_fn_body(&format!("        fn {name}"))
+}
+
+/// Extract a method body stopping at the next inherent `fn` or `async fn`
+/// at the same indentation (avoids spilling into neighboring sync helpers).
+fn mongo_fn_body(marker: &str) -> &str {
+    let start = MONGO_STORE_SOURCE
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing method marker {marker}"));
+    let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+    let end = tail
+        .find("\n        fn ")
+        .into_iter()
+        .chain(tail.find("\n        async fn "))
+        .min()
+        .unwrap_or(tail.len());
+    &MONGO_STORE_SOURCE[start..start + marker.len() + end]
+}
+
 fn expiry_millis() -> i64 {
     NOW_MILLIS + mongo_migration_lease_duration_millis()
 }
@@ -790,4 +810,86 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
             "{method_name} must persist the caller-provided canonical form without re-normalizing"
         );
     }
+}
+
+/// Issue #3001: Mongo failover must flip the write gate before publishing the
+/// connection (SQL `reconnect_for_topology` parity). Default-disabled admin
+/// writes must never observe a failover connection while `primary_active`
+/// still reads true. Deferred reconnects must not change topology.
+#[test]
+fn reconnect_failover_marks_topology_before_publishing_connection() {
+    let reconnect_failover = mongo_fn_body("        async fn reconnect_failover(");
+    assert!(
+        reconnect_failover.contains("build_connection_bundle("),
+        "reconnect_failover must build the connection before any topology change"
+    );
+    assert!(
+        reconnect_failover.contains("publish_reconnected_bundle("),
+        "reconnect_failover must publish through the ordered helper"
+    );
+    assert!(
+        reconnect_failover.contains("Some(&crate::config::db_backend::redact_url(db_url))")
+            || reconnect_failover.contains("Some(&redact_url(db_url))"),
+        "reconnect_failover must pass the failover URL into publish so the gate flips before ArcSwap:\n{reconnect_failover}"
+    );
+    // Must not reintroduce the old post-publish mark_failover call site.
+    let after_publish = reconnect_failover
+        .split("publish_reconnected_bundle(")
+        .nth(1)
+        .expect("publish call");
+    assert!(
+        !after_publish.contains("mark_failover("),
+        "mark_failover must not run after publication in reconnect_failover:\n{reconnect_failover}"
+    );
+
+    let publish = mongo_sync_method("publish_reconnected_bundle(");
+    let publish_body = publish
+        .split_once('{')
+        .map(|(_, body)| body)
+        .expect("publish_reconnected_bundle body");
+    let try_write_at = publish_body
+        .find("connection_generation.try_write()")
+        .expect("publish_reconnected_bundle must fail-fast on the generation guard");
+    let mark_at = publish_body
+        .find("mark_failover(")
+        .expect("publish_reconnected_bundle must mark failover under the guard");
+    let swap_at = publish_body
+        .find("connection.swap(")
+        .expect("publish_reconnected_bundle must ArcSwap the connection");
+    assert!(
+        try_write_at < mark_at && mark_at < swap_at,
+        "generation try_write -> mark_failover -> connection.swap is the fail-closed order:\n{publish_body}"
+    );
+
+    // Primary reconnect stays conservative: publish first, then mark_primary
+    // (temporary write blocking on a primary connection is acceptable).
+    let reconnect = mongo_fn_body("        async fn reconnect(");
+    let install_at = reconnect
+        .find("install_reconnected_bundle(")
+        .expect("reconnect must publish via install_reconnected_bundle");
+    let mark_primary_at = reconnect
+        .find("mark_primary(")
+        .expect("reconnect must mark primary after publish");
+    assert!(
+        install_at < mark_primary_at,
+        "primary failback must mark_primary only after publication:\n{reconnect}"
+    );
+
+    // SQL parity: failover topology flips before pool publication.
+    let sql_source = include_str!("../../../src/config/db_loader.rs");
+    let sql_reconnect = sql_source
+        .split("async fn reconnect_for_topology(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    /// Extract the hostname").next())
+        .expect("DatabaseStore::reconnect_for_topology body");
+    let sql_mark = sql_reconnect
+        .find("mark_failover(")
+        .expect("SQL failover path must call mark_failover");
+    let sql_swap = sql_reconnect
+        .find("self.pool.swap(")
+        .expect("SQL failover path must swap the pool");
+    assert!(
+        sql_mark < sql_swap,
+        "SQL reconnect_for_topology must mark_failover before pool.swap:\n{sql_reconnect}"
+    );
 }
