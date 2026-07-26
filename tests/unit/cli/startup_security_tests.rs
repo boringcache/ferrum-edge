@@ -105,7 +105,9 @@ fn missing_frontend_cert_fails_closed() {
     env.frontend_tls_cert_path = Some(dir.path().join("missing-cert.pem").display().to_string());
     env.frontend_tls_key_path = Some(key_path);
 
-    let err = load_startup_security(&env).expect_err("missing frontend cert must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("missing frontend cert must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid TLS configuration"),
@@ -126,7 +128,9 @@ fn mismatched_frontend_key_fails_closed() {
     env.frontend_tls_cert_path = Some(cert_path);
     env.frontend_tls_key_path = Some(key_path);
 
-    let err = load_startup_security(&env).expect_err("mismatched key must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("mismatched key must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid TLS configuration"),
@@ -143,7 +147,9 @@ fn malformed_crl_fails_closed() {
     let mut env = file_mode_env();
     env.tls_crl_file_path = Some(crl_path);
 
-    let err = load_startup_security(&env).expect_err("malformed CRL must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("malformed CRL must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("CRL") || msg.contains("PEM"),
@@ -157,7 +163,9 @@ fn malformed_admin_cidrs_fails_closed() {
     let mut env = file_mode_env();
     env.admin_allowed_cidrs = "10.0.0.1, not-a-cidr".to_string();
 
-    let err = load_startup_security(&env).expect_err("malformed admin CIDRs must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("malformed admin CIDRs must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("FERRUM_ADMIN_ALLOWED_CIDRS"),
@@ -171,7 +179,9 @@ fn malformed_metrics_cidrs_fails_closed() {
     let mut env = file_mode_env();
     env.metrics_allowed_cidrs = "not-a-cidr".to_string();
 
-    let err = load_startup_security(&env).expect_err("malformed metrics CIDRs must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("malformed metrics CIDRs must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("FERRUM_METRICS_ALLOWED_CIDRS"),
@@ -191,7 +201,9 @@ fn expired_frontend_cert_fails_closed() {
     env.frontend_tls_cert_path = Some(cert_path);
     env.frontend_tls_key_path = Some(key_path);
 
-    let err = load_startup_security(&env).expect_err("expired frontend cert must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("expired frontend cert must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid TLS configuration"),
@@ -249,7 +261,9 @@ fn missing_admin_tls_cert_fails_when_https_enabled() {
     env.admin_tls_cert_path = Some(dir.path().join("missing-admin.pem").display().to_string());
     env.admin_tls_key_path = Some(key_path);
 
-    let err = load_startup_security(&env).expect_err("missing admin cert must fail");
+    let err = load_startup_security(&env)
+        .err()
+        .expect("missing admin cert must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("Invalid admin TLS configuration"),
