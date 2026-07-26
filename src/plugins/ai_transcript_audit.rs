@@ -26,6 +26,7 @@
 //! `ai_semantic_firewall` for enforcement.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use http::header::{HeaderName, HeaderValue};
+use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -191,20 +192,33 @@ pub const HARD_MAX_REDACTION_SCAN_BYTES: usize = 8_388_608;
 /// any realistic small AI request so an ordinary prompt is never skipped.
 pub const MIN_REDACTION_SCAN_BYTES: usize = 4_096;
 /// Default hard processing bound for redaction shaping (1 MiB). Bodies larger
-/// than this are never parsed/scanned/copied for a redacted excerpt; capture
-/// fails closed (body omitted with an explicit reason) instead.
+/// than this are never parsed/scanned/copied for a redacted excerpt; the
+/// excerpt fails closed (omitted with an explicit reason) instead.
 pub const DEFAULT_MAX_REDACTION_SCAN_BYTES: usize = 1_048_576;
 
-/// Fixed envelope allowance charged on top of the per-record body+metadata
-/// contract: record id, timestamps, namespace/proxy/consumer/path strings,
-/// token/cache/guardrail maps, and JSON framing.
+/// Fixed envelope allowance used to derive the default serialized-entry bound:
+/// record id, timestamps, namespace/proxy/consumer/path strings,
+/// token/cache/guardrail maps, and JSON field framing.
 pub const RECORD_ENVELOPE_OVERHEAD_BYTES: usize = 8_192;
 /// Fixed allowance charged for one staged candidate on top of its excerpt and
 /// bounded model/tool metadata (record id, hashes, map/vec headers).
 pub const STAGING_ENTRY_OVERHEAD_BYTES: usize = 1_024;
-/// Retained copies charged for one admitted record: the queued `AuditRecord`
-/// plus the contiguous serialized batch payload built at flush time.
+/// Attacker-shaped serialized copies charged for one admitted record: its
+/// pre-serialized queue payload plus its bytes in the contiguous HTTP batch.
+/// Retry clones share the queue payload and attempts run sequentially.
 pub const RECORD_RETAINED_COPIES: usize = 2;
+/// Maximum expansion of one input byte when serde_json escapes it (`\u00XX`).
+/// This is used only to derive a default/minimum serialized-entry ceiling from
+/// the operator's raw capture-byte contract; actual admission is exact bounded
+/// serialization.
+pub const JSON_WORST_CASE_EXPANSION: usize = 6;
+/// Per-record share of JSON-array framing. Across a non-empty batch, charging
+/// one byte to each of two retained copies covers `[` + commas + `]`.
+pub const RECORD_BATCH_FRAMING_BYTES: usize = 1;
+/// Fixed delivery-state allowance for the queue item, its shared `Bytes`
+/// allocation, the original/attempt batch vector slots, and lease handles.
+/// Attacker-shaped content is charged exactly in addition to this allowance.
+pub const RECORD_DELIVERY_OVERHEAD_BYTES: usize = 128;
 /// Default aggregate retained-byte budget for one plugin instance (128 MiB),
 /// covering staged candidates, pre-commit reservations, and queued records.
 ///
@@ -217,8 +231,8 @@ pub const RECORD_RETAINED_COPIES: usize = 2;
 pub const DEFAULT_RETAINED_BUFFER_MAX_BYTES: usize = 134_217_728;
 /// Hard maximum aggregate retained-byte budget for one plugin instance.
 pub const HARD_MAX_RETAINED_BUFFER_BYTES: usize = 268_435_456;
-/// Minimum admitted `limits.buffer_max_bytes`. Must still fit one maximal
-/// record, which is separately enforced against `max_entry_bytes`.
+/// Minimum admitted `limits.buffer_max_bytes`. The configured value must also
+/// fit the complete retained charge for one maximal serialized record.
 pub const MIN_RETAINED_BUFFER_BYTES: usize = 65_536;
 /// Hard maximum for `limits.max_entry_bytes`.
 pub const HARD_MAX_RECORD_ENTRY_BYTES: usize = 16_777_216;
@@ -474,10 +488,10 @@ struct LimitsConfig {
     max_request_bytes: usize,
     max_response_bytes: usize,
     max_stream_capture_bytes: usize,
-    /// Hard processing bound for redaction shaping. Raw payloads above this are
-    /// never parsed/scanned/copied; capture fails closed instead.
+    /// Hard processing bound for redacted request classification/extraction and
+    /// body shaping. Raw payloads above this are never parsed/scanned/copied.
     max_redaction_scan_bytes: usize,
-    /// Per-record retained-byte admission ceiling.
+    /// Per-record serialized JSON admission ceiling.
     max_entry_bytes: usize,
     /// Aggregate retained-byte budget across staging, reservations, and the
     /// queued records of one plugin instance.
@@ -495,23 +509,35 @@ impl LimitsConfig {
         )
     }
 
-    /// Minimum admissible `max_entry_bytes`: the coherent per-record body +
-    /// bounded-metadata contract plus the fixed envelope allowance, charged for
-    /// every retained copy. Configuring below this would make every record
-    /// inadmissible, so it is rejected at construction rather than silently
-    /// dropping all traffic.
+    /// Minimum admissible serialized `max_entry_bytes`: the coherent
+    /// per-record body + bounded-metadata contract plus the fixed envelope
+    /// allowance, expanded for worst-case JSON escaping. Actual record
+    /// admission uses exact bounded serialization and may be smaller.
     fn min_entry_bytes(self) -> usize {
-        accounted_record_bytes(
+        max_serialized_record_bytes(
             self.max_retained_record_bytes()
                 .saturating_add(RECORD_ENVELOPE_OVERHEAD_BYTES),
         )
     }
+
+    fn max_entry_retained_bytes(self) -> usize {
+        accounted_record_bytes(self.max_entry_bytes)
+    }
 }
 
-/// Retained copies charged for one admitted record (queued struct + serialized
-/// batch payload).
-const fn accounted_record_bytes(record_bytes: usize) -> usize {
-    record_bytes.saturating_mul(RECORD_RETAINED_COPIES)
+/// Conservative serialized ceiling derived from an unescaped byte contract.
+pub const fn max_serialized_record_bytes(unescaped_bytes: usize) -> usize {
+    unescaped_bytes.saturating_mul(JSON_WORST_CASE_EXPANSION)
+}
+
+/// Exact aggregate retained charge for one pre-serialized record while it is
+/// queued or flushing. The immutable queue payload is shared by every retry
+/// clone; only one exact-capacity contiguous HTTP batch exists at a time.
+pub const fn accounted_record_bytes(serialized_bytes: usize) -> usize {
+    serialized_bytes
+        .saturating_add(RECORD_BATCH_FRAMING_BYTES)
+        .saturating_mul(RECORD_RETAINED_COPIES)
+        .saturating_add(RECORD_DELIVERY_OVERHEAD_BYTES)
 }
 
 /// Acknowledgement drain/validation bounds applied before sink health publishes.
@@ -541,8 +567,10 @@ pub struct AiTranscriptAuditSnapshot {
     pub max_retained_record_bytes: u64,
     /// Hard processing bound for redacted-capture shaping.
     pub max_redaction_scan_bytes: u64,
-    /// Per-record retained-byte admission ceiling.
+    /// Per-record bounded serialized JSON ceiling.
     pub max_entry_bytes: u64,
+    /// Maximum aggregate retained charge for one entry at `max_entry_bytes`.
+    pub max_entry_retained_bytes: u64,
     /// Aggregate retained-byte budget for this instance.
     pub buffer_max_bytes: u64,
     /// Aggregate retained bytes currently charged (staging + reservations +
@@ -603,7 +631,7 @@ struct AuditStaging {
     /// Keyed hash over every observed tool name (including omitted) when
     /// truncation/omission occurred; never raw excess bytes.
     tool_names_hash: Option<String>,
-    commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
+    commit_permit: Option<BatchingLoggerPermit<QueuedAuditRecord>>,
     /// Retained-byte reservation (lease, reserved bytes) held alongside
     /// `commit_permit` so a fail-closed admission that promised queue capacity
     /// also promised the bytes that record will retain. Consumed (shrunk to the
@@ -666,8 +694,9 @@ struct StreamSlot {
     downstream_terminated: AtomicBool,
 }
 
-/// A single exported audit record.
-#[derive(Clone, Serialize)]
+/// A single exported audit record. It exists only during bounded record
+/// assembly; queue publication converts it into [`QueuedAuditRecord`].
+#[derive(Serialize)]
 struct AuditRecord {
     version: u32,
     record_id: String,
@@ -737,50 +766,67 @@ struct AuditRecord {
     tool_names_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
-    /// Aggregate retained-byte lease for this queued record. Never exported;
-    /// released when the last clone drops — after a successful flush, after a
-    /// failed-batch hook discards it, or if the queue is dropped at shutdown.
-    #[serde(skip)]
-    retained_lease: Option<Arc<ByteLease>>,
 }
 
-impl AuditRecord {
-    /// Exact retained bytes of the owned strings/collections in this record,
-    /// plus the fixed envelope allowance, charged for every retained copy.
-    fn accounted_bytes(&self) -> usize {
-        let mut bytes = RECORD_ENVELOPE_OVERHEAD_BYTES;
-        for value in [
-            &self.request_body,
-            &self.response_body,
-            &self.request_hash,
-            &self.response_hash,
-            &self.model,
-            &self.model_hash,
-            &self.tool_names_hash,
-            &self.path,
-            &self.consumer_username,
-            &self.client_ip,
-            &self.proxy_id,
-            &self.proxy_name,
-        ] {
-            if let Some(value) = value {
-                bytes = bytes.saturating_add(value.len());
-            }
+/// One bounded, pre-serialized audit record retained by the batching queue.
+///
+/// `Bytes` makes every shared-logger retry clone a fixed-size refcount
+/// increment instead of a deep clone of attacker-shaped strings/maps/vectors.
+/// The lease remains live across queueing, exact-capacity batch assembly, the
+/// HTTP request, retries, and the failed-batch hook.
+#[derive(Clone)]
+struct QueuedAuditRecord {
+    json: Bytes,
+    _lease: Arc<ByteLease>,
+}
+
+impl QueuedAuditRecord {
+    fn as_bytes(&self) -> &[u8] {
+        &self.json
+    }
+}
+
+/// Allocation-free first pass for exact bounded JSON serialization.
+///
+/// Counting before allocation makes JSON escaping/framing part of admission,
+/// and lets the second pass allocate exactly the bytes it will retain. This
+/// avoids both Vec growth slack and an unbounded `serde_json::to_vec` temporary.
+struct BoundedJsonCounter {
+    bytes: usize,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedJsonCounter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: 0,
+            max_bytes,
+            limit_exceeded: false,
         }
-        for name in &self.tool_names {
-            bytes = bytes.saturating_add(name.len());
+    }
+}
+
+impl Write for BoundedJsonCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buf.len()) else {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "serialized audit record exceeded its byte limit",
+            ));
+        };
+        if next > self.max_bytes {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "serialized audit record exceeded its byte limit",
+            ));
         }
-        for map in [&self.tokens, &self.cache, &self.guardrails] {
-            for (key, value) in map {
-                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
-            }
-        }
-        if let Some(headers) = self.headers.as_ref() {
-            for (key, value) in headers {
-                bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
-            }
-        }
-        accounted_record_bytes(bytes)
+        self.bytes = next;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -924,7 +970,7 @@ pub struct AiTranscriptAudit {
     /// empty/invalid secret or header value fails activation (the generation is
     /// never published) rather than being silently skipped at send time.
     custom_header_specs: Vec<CustomHeaderSpec>,
-    logger: DeferredBatchingLogger<AuditRecord>,
+    logger: DeferredBatchingLogger<QueuedAuditRecord>,
     endpoint_hostname: String,
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
@@ -1349,6 +1395,7 @@ impl AiTranscriptAudit {
             max_retained_record_bytes: self.limits.max_retained_record_bytes() as u64,
             max_redaction_scan_bytes: self.limits.max_redaction_scan_bytes as u64,
             max_entry_bytes: self.limits.max_entry_bytes as u64,
+            max_entry_retained_bytes: self.limits.max_entry_retained_bytes() as u64,
             buffer_max_bytes: self.limits.buffer_max_bytes as u64,
             retained_bytes: self.retained_budget.used() as u64,
             retained_byte_drops: self.retained_budget.drops_total(),
@@ -1380,70 +1427,30 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn enqueue(&self, mut record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
+    fn enqueue(&self, record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
         if !self.rate_limiter.try_acquire() {
             return SinkOutcome::Dropped;
         }
-        // Charge the aggregate retained-byte budget BEFORE the record is
-        // published to the queue. A record-count capacity alone cannot bound
-        // attacker-shaped payload retention (queue depth x per-record bytes),
-        // so admission is (count AND bytes), enforced atomically.
-        let accounted = record.accounted_bytes();
         let (permit, staged_lease) = match staging {
             Some(staging) => (staging.commit_permit.take(), staging.commit_lease.take()),
             None => (None, None),
         };
-        if accounted > self.limits.max_entry_bytes {
-            // Cannot happen while capture limits hold the per-record contract;
-            // refuse rather than retain an unaccounted record if it ever does.
-            self.retained_budget
-                .record_drop("record exceeded the admitted per-record retained-byte limit");
-            drop(permit);
-            drop(staged_lease);
-            return self.saturated_outcome();
-        }
+        let provisional = self.limits.max_entry_retained_bytes();
         let lease = match staged_lease {
-            // A fail-closed admission already reserved bytes for this record.
-            Some((lease, reserved)) if accounted <= reserved => {
-                lease.shrink_to(accounted);
-                lease
+            // Fail-closed admission reserves the full serialized-entry charge,
+            // so later metadata growth cannot turn an admitted response into an
+            // under-accounted enqueue.
+            Some((lease, reserved)) if reserved >= provisional => lease,
+            Some((lease, _)) => {
+                drop(lease);
+                drop(permit);
+                self.retained_budget
+                    .record_drop("record reservation was below the serialized-entry charge");
+                return self.saturated_outcome();
             }
-            // The staged request excerpt grew after the reservation was taken
-            // (a request transform refreshed it). Re-acquire the exact amount
-            // if the budget allows; otherwise withhold variable-size excerpts
-            // and reuse the reservation only when the remaining accounted
-            // bytes still fit. If bounded metadata/envelope alone still
-            // exceeds the reserved lease, refuse rather than queue an
-            // under-accounted record.
-            Some((lease, reserved)) => match self.retained_budget.try_acquire(accounted) {
-                Some(exact) => exact,
-                None => {
-                    // Exact growth reacquire failed. Withhold variable-size
-                    // excerpts so a fail-closed reservation is never paid for
-                    // with unaccounted bytes. If bounded metadata/envelope
-                    // alone still exceeds the reserved lease, refuse rather
-                    // than queue an under-accounted record.
-                    record.request_body = None;
-                    record.request_body_omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
-                    if record.accounted_bytes() > reserved {
-                        record.response_body = None;
-                        record.response_body_omitted_reason =
-                            Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
-                    }
-                    let final_accounted = record.accounted_bytes();
-                    if final_accounted > reserved {
-                        drop(lease);
-                        drop(permit);
-                        self.retained_budget.record_drop(
-                            "record exceeded its reserved retained-byte lease after withholding excerpts",
-                        );
-                        return self.saturated_outcome();
-                    }
-                    lease.shrink_to(final_accounted);
-                    lease
-                }
-            },
-            None => match self.retained_budget.try_acquire(accounted) {
+            // Fail-open admission takes the worst-case lease before
+            // serialization, then shrinks it to the exact immutable payload.
+            None => match self.retained_budget.try_acquire(provisional) {
                 Some(lease) => lease,
                 None => {
                     drop(permit);
@@ -1451,13 +1458,49 @@ impl AiTranscriptAudit {
                 }
             },
         };
-        record.retained_lease = Some(lease);
+
+        let mut counter = BoundedJsonCounter::new(self.limits.max_entry_bytes);
+        if serde_json::to_writer(&mut counter, &record).is_err() {
+            self.retained_budget.record_drop(if counter.limit_exceeded {
+                "serialized record exceeded limits.max_entry_bytes"
+            } else {
+                "record serialization failed"
+            });
+            drop(permit);
+            return self.saturated_outcome();
+        }
+        let serialized_bytes = counter.bytes;
+        if serialized_bytes > self.limits.max_entry_bytes {
+            self.retained_budget
+                .record_drop("serialized record exceeded limits.max_entry_bytes");
+            drop(permit);
+            return self.saturated_outcome();
+        }
+        let exact_charge = accounted_record_bytes(serialized_bytes);
+        if exact_charge > provisional {
+            self.retained_budget
+                .record_drop("serialized record exceeded its retained-byte reservation");
+            drop(permit);
+            return self.saturated_outcome();
+        }
+        lease.shrink_to(exact_charge);
+        let mut json = Vec::with_capacity(serialized_bytes);
+        if serde_json::to_writer(&mut json, &record).is_err() || json.len() != serialized_bytes {
+            self.retained_budget
+                .record_drop("record serialization changed between bounded passes");
+            drop(permit);
+            return self.saturated_outcome();
+        }
+        let queued = QueuedAuditRecord {
+            json: Bytes::from(json),
+            _lease: lease,
+        };
 
         if let Some(permit) = permit {
-            permit.send(record);
+            permit.send(queued);
             return SinkOutcome::Queued;
         }
-        if self.logger.try_send(record) {
+        if self.logger.try_send(queued) {
             SinkOutcome::Queued
         } else {
             self.saturated_outcome()
@@ -1474,23 +1517,13 @@ impl AiTranscriptAudit {
         }
     }
 
-    /// Reserve the retained bytes a record this fail-closed admission promised
-    /// to enqueue could still grow to: the already-measured staged bytes plus
-    /// the worst-case response excerpt this configuration permits. Paired with
-    /// the queue permit so a promise of capacity is a promise of both a slot
-    /// and the bytes that slot will hold; `enqueue` shrinks it to the exact
-    /// size once the record is built.
-    fn reserve_commit_lease(&self, staged_bytes: usize) -> Option<(Arc<ByteLease>, usize)> {
-        let projected = accounted_record_bytes(
-            staged_bytes
-                .saturating_add(
-                    self.limits
-                        .max_response_bytes
-                        .max(self.limits.max_stream_capture_bytes),
-                )
-                .saturating_add(RECORD_ENVELOPE_OVERHEAD_BYTES),
-        )
-        .min(self.limits.max_entry_bytes);
+    /// Reserve the complete retained charge a record may consume at the
+    /// admitted serialized-entry ceiling. Paired with the queue permit so a
+    /// promise of capacity is a promise of both a slot and every attacker-shaped
+    /// byte the queue, retry clone, and HTTP request can retain; `enqueue`
+    /// shrinks it after exact bounded serialization.
+    fn reserve_commit_lease(&self) -> Option<(Arc<ByteLease>, usize)> {
+        let projected = self.limits.max_entry_retained_bytes();
         self.retained_budget
             .try_acquire(projected)
             .map(|lease| (lease, projected))
@@ -1522,7 +1555,7 @@ impl AiTranscriptAudit {
             };
             // Both halves of the promise or neither: dropping `permit` here
             // returns the queue slot.
-            let Some(reservation) = self.reserve_commit_lease(staging.retained_bytes) else {
+            let Some(reservation) = self.reserve_commit_lease() else {
                 ctx.metadata
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
                 return reject_audit_unavailable();
@@ -1589,7 +1622,7 @@ impl AiTranscriptAudit {
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
                 return reject_audit_unavailable();
             };
-            let Some(reservation) = self.reserve_commit_lease(staging.retained_bytes) else {
+            let Some(reservation) = self.reserve_commit_lease() else {
                 ctx.metadata
                     .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
                 return reject_audit_unavailable();
@@ -1611,12 +1644,12 @@ impl AiTranscriptAudit {
     /// candidates past `staging_ttl`, and active-stream entries that have held
     /// a reserved commit permit longer than `limits.max_stream_reservation`.
     ///
-    /// The sweep runs on the same amortized 60s interval as before but is no
-    /// longer gated on a 512-entry high-water mark: a handful of never-ending
-    /// streams can exhaust the reserved queue slots without ever approaching
-    /// that threshold, so an entry-count gate would let the leak the bound
-    /// exists to stop pass through untouched. The scan is bounded by
-    /// [`MAX_STAGING_ENTRIES`] once a minute.
+    /// The sweep runs on an amortized interval (normally 60s, shortened for a
+    /// smaller stream-reservation limit) but is no longer gated on a 512-entry
+    /// high-water mark: a handful of never-ending streams can exhaust the
+    /// reserved queue slots without ever approaching that threshold, so an
+    /// entry-count gate would let the leak the bound exists to stop pass
+    /// through untouched. Every scan is bounded by [`MAX_STAGING_ENTRIES`].
     fn sweep_staging(&self) {
         if self.staging.is_empty() {
             return;
@@ -1731,8 +1764,18 @@ impl AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
-        let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
+        // In redacted mode the scan bound is also the classification/extraction
+        // bound. Check it before serde_json so an oversized body cannot force a
+        // full parse/allocation and then disappear as "non-AI". Every oversized
+        // JSON POST is conservatively audited as a possible AI request.
+        let scan_limited =
+            self.mode.redacts_body() && body.len() > self.limits.max_redaction_scan_bytes;
+        let parsed: Option<Value> = if scan_limited {
+            None
+        } else {
+            serde_json::from_slice(body).ok()
+        };
+        let is_ai = scan_limited || parsed.as_ref().is_some_and(json_looks_like_ai_request);
         if !is_ai {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
@@ -1787,7 +1830,8 @@ impl AiTranscriptAudit {
         // response buffer decision streams rather than stalls (buffering a
         // stream holds it until EOF, and under retry the buffered->stream
         // content-type downgrade is disabled).
-        if parsed
+        if scan_limited
+            || parsed
             .as_ref()
             .and_then(|json| json.get("stream"))
             .and_then(Value::as_bool)
@@ -1886,8 +1930,17 @@ impl AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
-        if !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
+        // Mirror `stage_candidate`: a redacted-mode body above the scan limit
+        // is never parsed for classification, model/tool extraction, or the
+        // stream flag. It remains conservatively in audit scope.
+        let scan_limited =
+            self.mode.redacts_body() && body.len() > self.limits.max_redaction_scan_bytes;
+        let parsed: Option<Value> = if scan_limited {
+            None
+        } else {
+            serde_json::from_slice(body).ok()
+        };
+        if !scan_limited && !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
             self.discard_staged_candidate(ctx);
             return;
         }
@@ -1966,8 +2019,7 @@ impl AiTranscriptAudit {
                     // metadata; shrink to the post-omission footprint of those
                     // prior values so the lease still matches retained strings.
                     apply_refreshed_metadata = false;
-                    let prior_model_bytes =
-                        staged.request_model.as_deref().map_or(0, str::len);
+                    let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
                     let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
                     let prior_without_excerpt =
                         staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
@@ -2000,7 +2052,8 @@ impl AiTranscriptAudit {
         // (`buffered_response_capture_wanted`), so — mirroring
         // `ai_tool_governor` — the marker must track the final body in BOTH
         // directions.
-        if parsed
+        if scan_limited
+            || parsed
             .as_ref()
             .and_then(|json| json.get("stream"))
             .and_then(Value::as_bool)
@@ -2337,9 +2390,6 @@ impl AiTranscriptAudit {
             tool_names_omitted,
             tool_names_hash,
             headers,
-            // Charged by `enqueue`, which is the single admission point where
-            // a built record becomes retained queue state.
-            retained_lease: None,
         }
     }
 
@@ -2430,9 +2480,11 @@ impl Plugin for AiTranscriptAudit {
         flush_config.custom_headers = Arc::new(materialized);
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
-                healthy.store(false, Ordering::Relaxed);
-            })),
+            on_failed_batch: Some(Arc::new(
+                move |_batch: Vec<QueuedAuditRecord>, _error: String| {
+                    healthy.store(false, Ordering::Relaxed);
+                },
+            )),
             ..LoggerHooks::default()
         };
         self.logger.start_with_hooks(
@@ -2528,7 +2580,10 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) && self.requires_response_committed_hook() {
+        if flag(&ctx.metadata, MD_STREAM_REQUEST)
+            && self.capture.streaming != StreamingCapture::Off
+            && self.requires_response_committed_hook()
+        {
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
@@ -2575,7 +2630,10 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) && self.requires_response_committed_hook() {
+        if flag(&ctx.metadata, MD_STREAM_REQUEST)
+            && self.capture.streaming != StreamingCapture::Off
+            && self.requires_response_committed_hook()
+        {
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
@@ -2644,7 +2702,9 @@ impl Plugin for AiTranscriptAudit {
                 return stream_admission;
             }
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+        if flag(&ctx.metadata, MD_STREAM_REQUEST)
+            && self.capture.streaming != StreamingCapture::Off
+        {
             // Stream admission above is selective: unsampled successful
             // streams must not consume buffered-response capacity.
             PluginResult::Continue
@@ -3244,9 +3304,15 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
 // ---- sink ----
 
-async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<(), String> {
+async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Result<(), String> {
     let entry_count = batch.len();
-    let mut request = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
+    let body = build_batch_body(&batch);
+    let mut request = cfg
+        .http_client
+        .get()
+        .post(&cfg.endpoint_url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
     // Headers were fully validated and materialized at activation
     // (`materialize_sink_headers`), so there is no per-batch env expansion,
     // template parsing, or fallible construction here — a required header can
@@ -3280,7 +3346,38 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
     // overruns its bound, or fails transport is an ambiguous delivery and must
     // not leave fail-closed admission believing the sink is healthy.
     let ack = drain_and_validate_ack(&cfg.ack, response).await;
-    classify_batch_delivery(cfg, entry_count, status, ack)
+    let result = classify_batch_delivery(cfg, entry_count, status, ack);
+    // Keep every entry lease alive until the request body and acknowledgement
+    // are finished. Releasing earlier would let new queue admissions consume
+    // the bytes while reqwest still retains the contiguous batch.
+    drop(batch);
+    result
+}
+
+/// Assemble one JSON array from already-serialized entries.
+///
+/// Capacity is exact, so Vec growth cannot retain an uncharged spare buffer.
+/// The original `batch` remains borrowed/alive for the complete HTTP attempt;
+/// retry clones share each entry's immutable `Bytes`.
+fn build_batch_body(batch: &[QueuedAuditRecord]) -> Vec<u8> {
+    let framing = if batch.is_empty() {
+        2
+    } else {
+        batch.len().saturating_add(1)
+    };
+    let total = batch
+        .iter()
+        .fold(framing, |bytes, entry| bytes.saturating_add(entry.json.len()));
+    let mut body = Vec::with_capacity(total);
+    body.push(b'[');
+    for (index, entry) in batch.iter().enumerate() {
+        if index != 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(entry.as_bytes());
+    }
+    body.push(b']');
+    body
 }
 
 /// Compiled-in acknowledgement failure classes. These strings are the ONLY
@@ -4767,8 +4864,9 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
     if max_entry_bytes < min_entry_bytes {
         return Err(format!(
             "ai_transcript_audit: 'limits.max_entry_bytes' ({max_entry_bytes}) must be >= \
-             {min_entry_bytes}, the retained-byte contract implied by the configured capture \
-             limits; a smaller value would make every record inadmissible"
+             {min_entry_bytes}, the worst-case serialized JSON contract implied by the configured \
+             capture limits; a smaller value could make a record within that contract \
+             inadmissible"
         ));
     }
     let buffer_max_bytes = cfg_positive_usize_capped(
@@ -4783,11 +4881,12 @@ fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
             "ai_transcript_audit: 'limits.buffer_max_bytes' must be >= {MIN_RETAINED_BUFFER_BYTES}"
         ));
     }
-    if buffer_max_bytes < max_entry_bytes {
+    let max_entry_retained_bytes = accounted_record_bytes(max_entry_bytes);
+    if buffer_max_bytes < max_entry_retained_bytes {
         return Err(format!(
             "ai_transcript_audit: 'limits.buffer_max_bytes' ({buffer_max_bytes}) must be >= \
-             'limits.max_entry_bytes' ({max_entry_bytes}); otherwise no record could ever be \
-             admitted"
+             the maximum retained charge for 'limits.max_entry_bytes' \
+             ({max_entry_retained_bytes}); otherwise no record could ever be admitted"
         ));
     }
     limits.max_entry_bytes = max_entry_bytes;

@@ -19,7 +19,8 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
     HARD_MAX_CAPTURE_BYTES_AGGREGATE, HARD_MAX_REQUEST_BYTES, HARD_MAX_RESPONSE_BYTES,
     HARD_MAX_STREAM_CAPTURE_BYTES, MAX_MODEL_BYTES, MAX_TOOL_NAME_BYTES, MAX_TOOL_NAMES,
-    MAX_TOOL_NAMES_AGGREGATE_BYTES, max_retained_record_bytes, snapshots,
+    MAX_TOOL_NAMES_AGGREGATE_BYTES, accounted_record_bytes, max_retained_record_bytes,
+    max_serialized_record_bytes, snapshots,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
@@ -7264,7 +7265,7 @@ async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
                     "max_request_bytes": 1024,
                     "max_response_bytes": 1024,
                     "max_stream_capture_bytes": 1024,
-                    "buffer_max_bytes": 65536
+                    "buffer_max_bytes": 180000
                 },
                 "sink": {
                     "type": "http",
@@ -7285,7 +7286,7 @@ async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
     plugin.commit_background_tasks();
 
     let mut dropped = 0usize;
-    for _ in 0..24 {
+    for _ in 0..256 {
         let ctx = emit_one_record(&plugin).await;
         if ctx
             .metadata
@@ -7313,6 +7314,86 @@ async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
     );
 }
 
+/// Queue admission serializes once under the entry cap, charges the exact
+/// escaped JSON bytes for both retained copies, and sends that immutable
+/// representation without reqwest re-serializing it.
+#[tokio::test]
+async fn serialized_record_bytes_are_exactly_charged_during_delivery() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "limits": {
+                    "max_request_bytes": 4096,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "buffer_max_bytes": 1048576
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 50,
+                    "max_retries": 0
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let escape_heavy = "\\\"\n".repeat(1024);
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": escape_heavy}]
+    }))
+    .expect("body");
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let mut request_body = None;
+    for _ in 0..100 {
+        if let Some(requests) = server.received_requests().await
+            && let Some(request) = requests.last()
+        {
+            request_body = Some(request.body.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let request_body = request_body.expect("collector request");
+    let batch: Value = serde_json::from_slice(&request_body).expect("JSON batch");
+    let record = &batch.as_array().expect("batch")[0];
+    let serialized_record_bytes = serde_json::to_vec(record).expect("record JSON").len();
+    assert_eq!(
+        request_body.len(),
+        serialized_record_bytes + 2,
+        "the HTTP body must be the admitted record plus exact single-entry array framing"
+    );
+    assert_eq!(
+        plugin.status_snapshot().retained_bytes,
+        accounted_record_bytes(serialized_record_bytes) as u64,
+        "the live lease must cover the queued payload, HTTP body, framing, and delivery state"
+    );
+}
+
 /// Refusing refresh growth must never retain newly enlarged model/tool strings
 /// without a covering lease: the old staged entry stays small, the budget has
 /// no headroom for growth, and both the exported record and `retained_bytes`
@@ -7326,11 +7407,12 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
             &endpoint,
             json!({
                 "mode": "full_body",
+                "allow_full_body": true,
                 "limits": {
                     "max_request_bytes": 1024,
                     "max_response_bytes": 1024,
                     "max_stream_capture_bytes": 1024,
-                    "buffer_max_bytes": 65536
+                    "buffer_max_bytes": 180000
                 },
                 "sink": {
                     "type": "http",
@@ -7372,7 +7454,7 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     // Saturate the aggregate budget with other staged candidates so a refresh
     // growth reacquire (which briefly double-charges) has no headroom.
     let mut fillers = Vec::new();
-    for _ in 0..80 {
+    for _ in 0..240 {
         let mut filler = make_ctx();
         filler.metadata.insert(
             "request_body".to_string(),
@@ -7443,7 +7525,9 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     assert_eq!(records.len(), 1, "expected the repaired record to export");
     let record = &records[0];
     assert_eq!(
-        record.get("request_body_omitted_reason").and_then(Value::as_str),
+        record
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
         Some("retained_byte_budget"),
         "refused growth must withhold the enlarged excerpt"
     );
@@ -7476,11 +7560,11 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     );
 }
 
-/// After exact reacquire fails and bodies are withheld, a record whose
-/// remaining accounted bytes still exceed the fail-closed reservation must not
-/// be queued under-accounted.
+/// Fail-closed pre-commit admission reserves the complete maximum serialized
+/// delivery charge, so late metadata growth cannot make the eventual queue
+/// publication under-accounted.
 #[tokio::test]
-async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
+async fn fail_closed_reservation_covers_the_full_serialized_entry_charge() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
@@ -7492,11 +7576,12 @@ async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
             &endpoint,
             json!({
                 "mode": "full_body",
+                "allow_full_body": true,
                 "limits": {
                     "max_request_bytes": 1024,
                     "max_response_bytes": 1024,
                     "max_stream_capture_bytes": 1024,
-                    "buffer_max_bytes": 65536
+                    "buffer_max_bytes": 180000
                 },
                 "sink": {
                     "type": "http",
@@ -7521,7 +7606,8 @@ async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
     plugin
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
-    // Take the fail-closed commit reservation against the small staged footprint.
+    let staged_bytes = plugin.status_snapshot().retained_bytes;
+    // Take the fail-closed commit reservation before the response is immutable.
     let admission = plugin
         .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
@@ -7529,40 +7615,18 @@ async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
         matches!(admission, PluginResult::Continue),
         "pre-commit admission must succeed: {admission:?}"
     );
-
-    // Fill remaining budget so enqueue cannot reacquire an exact larger lease.
-    let filler_body = br#"{"model":"a","messages":[{"role":"user","content":"pad"}]}"#;
-    let mut fillers = Vec::new();
-    for _ in 0..80 {
-        let mut filler = make_ctx();
-        filler.metadata.insert(
-            "request_body".to_string(),
-            String::from_utf8_lossy(filler_body).into_owned(),
-        );
-        let mut proxy_headers = filler.headers.clone();
-        plugin.before_proxy(&mut filler, &mut proxy_headers).await;
-        if filler
-            .metadata
-            .get("ai_transcript_audit.candidate")
-            .map(String::as_str)
-            != Some("true")
-        {
-            break;
-        }
-        fillers.push(filler);
-        let snap = plugin.status_snapshot();
-        if snap.buffer_max_bytes.saturating_sub(snap.retained_bytes) < 4_096 {
-            break;
-        }
-    }
-
-    // Grow harvested metadata after the reservation was taken so accounted
-    // bytes still exceed `reserved` even once request/response bodies are
-    // withheld.
-    ctx.metadata.insert(
-        "ai_prompt_shield.decision".to_string(),
-        "G".repeat(4_096),
+    let reserved = plugin.status_snapshot();
+    assert_eq!(
+        reserved.retained_bytes - staged_bytes,
+        reserved.max_entry_retained_bytes,
+        "fail-closed admission must reserve the full queue + delivery charge"
     );
+
+    // Grow harvested metadata after the reservation was taken. Exact bounded
+    // serialization must shrink the full reservation, not reacquire or queue
+    // attacker-shaped data outside the lease.
+    ctx.metadata
+        .insert("ai_prompt_shield.decision".to_string(), "G".repeat(4_096));
 
     plugin
         .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
@@ -7571,19 +7635,14 @@ async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
         ctx.metadata
             .get("ai_transcript_audit.sink_status")
             .map(String::as_str),
-        Some("rejected"),
-        "an under-accounted post-withholding record must fail closed"
+        Some("queued"),
+        "the fully reserved record should remain admissible"
     );
     let snap = plugin.status_snapshot();
     assert!(
         snap.retained_bytes <= snap.buffer_max_bytes,
-        "rejected under-accounted enqueue must not leave the budget over-retained"
+        "exact serialization must stay within the aggregate retained-byte budget"
     );
-    assert!(
-        snap.retained_byte_drops > 0,
-        "refusing the under-accounted record must be observable"
-    );
-    let _ = fillers;
 }
 
 /// A record that is delivered releases its retained-byte lease.
@@ -7680,6 +7739,7 @@ async fn expired_stream_reservation_reclaims_pending_stream_state() {
             &endpoint,
             json!({
                 "mode": "full_body",
+                "allow_full_body": true,
                 "capture": { "streaming_response": true },
                 "limits": { "max_stream_reservation_secs": 1 },
                 "sink": {
@@ -7732,11 +7792,7 @@ async fn expired_stream_reservation_reclaims_pending_stream_state() {
     // A late terminal hook must not resurrect the reclaimed pending capture
     // as exported response evidence.
     plugin
-        .on_response_stream_terminated(
-            &mut stuck,
-            200,
-            &BodyOutcome::success(chunk.len() as u64),
-        )
+        .on_response_stream_terminated(&mut stuck, 200, &BodyOutcome::success(chunk.len() as u64))
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let requests = server.received_requests().await.unwrap_or_default();
@@ -7757,14 +7813,17 @@ async fn expired_stream_reservation_reclaims_pending_stream_state() {
     );
 }
 
-/// A body larger than `limits.max_redaction_scan_bytes` must not be parsed,
-/// scanned, or copied for an excerpt: capture fails closed with an explicit,
-/// compiled-in reason while hashes and metadata still export.
+/// An oversized redacted JSON POST is conservatively audited without JSON
+/// parsing/model/tool extraction. Even malformed JSON cannot disappear as
+/// "non-AI", and fail-closed byte admission still applies.
 #[tokio::test]
-async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
-    let filler = "z".repeat(16_384);
-    let body =
-        format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{filler}"}}]}}"#);
+async fn oversized_redacted_json_skips_parse_work_and_remains_fail_closed() {
+    let payload_marker = "OVERSIZED-PAYLOAD-MUST-NOT-EXPORT";
+    let body = format!(
+        r#"{{"model":"MODEL-MUST-NOT-EXTRACT","tools":[{{"function":{{"name":"TOOL-MUST-NOT-EXTRACT"}}}}],"messages":[{{"content":"{}{}""#,
+        payload_marker,
+        "z".repeat(16_384)
+    );
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -7776,7 +7835,16 @@ async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
                     "max_request_bytes": 1024,
                     "max_response_bytes": 1024,
                     "max_stream_capture_bytes": 1024,
-                    "max_redaction_scan_bytes": 4096
+                    "max_redaction_scan_bytes": 4096,
+                    "buffer_max_bytes": 180000
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "on_buffer_full": "reject"
                 }
             }),
         ),
@@ -7786,10 +7854,48 @@ async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     let mut ctx = make_ctx();
-    let headers = json_headers();
-    plugin
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(ai_request_body().to_vec()).expect("UTF-8 request"),
+    );
+    let mut headers = json_headers();
+    let initial = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(initial, PluginResult::Continue),
+        "the initial candidate should stage"
+    );
+    // Exercise the refresh path with the final backend-visible body. If refresh
+    // parsed this intentionally malformed payload, it would discard the
+    // candidate as non-JSON instead of preserving omission evidence.
+    let admission = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
         .await;
+    assert!(
+        matches!(admission, PluginResult::Continue),
+        "the first conservative candidate should reserve fail-closed capacity"
+    );
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "an unparsed oversized request is conservatively treated as potentially streaming"
+    );
+
+    // The first candidate holds the full fail-closed serialized-entry
+    // reservation. A second oversized request must not bypass that same gate.
+    let mut saturated = make_ctx();
+    let rejected = plugin
+        .on_final_request_body_with_context(&mut saturated, &headers, body.as_bytes())
+        .await;
+    assert!(
+        matches!(
+            rejected,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "oversized conservative classification must still enforce fail-closed byte admission"
+    );
+
     plugin
         .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
@@ -7799,7 +7905,7 @@ async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
     let record = &records[0];
     assert!(
         record.get("request_body").is_none(),
-        "an over-limit body must not be redacted or exported: {record}"
+        "an over-limit body must not be parsed, redacted, or exported: {record}"
     );
     assert_eq!(
         record["request_body_omitted_reason"],
@@ -7811,7 +7917,17 @@ async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
         "the keyed request hash still exports"
     );
     assert!(
-        !serde_json::to_string(record).unwrap().contains(&filler),
+        record.get("model").is_none(),
+        "parse-dependent model extraction must be skipped"
+    );
+    assert!(
+        record.get("tool_names").is_none(),
+        "parse-dependent tool extraction must be skipped"
+    );
+    assert!(
+        !serde_json::to_string(record)
+            .unwrap()
+            .contains(payload_marker),
         "no part of the oversized payload may reach the sink"
     );
 }
@@ -7930,6 +8046,13 @@ async fn new_bound_configuration_is_range_checked() {
     assert_eq!(snapshot.ack_timeout_ms, 1_000);
     assert_eq!(snapshot.max_stream_reservation_secs, 900);
     assert_eq!(snapshot.max_redaction_scan_bytes, 1_048_576);
-    assert!(snapshot.max_entry_bytes >= snapshot.max_retained_record_bytes);
-    assert!(snapshot.buffer_max_bytes >= snapshot.max_entry_bytes);
+    assert_eq!(
+        snapshot.max_entry_bytes,
+        max_serialized_record_bytes(snapshot.max_retained_record_bytes as usize + 8_192) as u64
+    );
+    assert_eq!(
+        snapshot.max_entry_retained_bytes,
+        accounted_record_bytes(snapshot.max_entry_bytes as usize) as u64
+    );
+    assert!(snapshot.buffer_max_bytes >= snapshot.max_entry_retained_bytes);
 }
