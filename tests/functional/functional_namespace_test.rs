@@ -144,24 +144,26 @@ fn mk_id(prefix: &str) -> String {
 // ---------------------------------------------------------------------------
 
 struct NsHarness {
-    // Dropped last so the gateway releases DB connections before DROP DATABASE.
-    _isolated_db: Option<IsolatedSqlDatabase>,
     _gw: TestGateway,
     admin_base_url: String,
     proxy_base_url: String,
+    // Struct fields drop in declaration order. Keep this after the gateway so
+    // its pool releases every DB connection before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
 }
 
 /// Two independent gateway processes sharing one persistent backend. The
 /// optional tempdir owns the shared SQLite file for the lifetime of both
 /// processes; external backends use a randomized namespace instead.
 struct SharedAdminHarness {
-    // Dropped last so both gateways release connections before DROP DATABASE.
-    _isolated_db: Option<IsolatedSqlDatabase>,
     _gateway_a: TestGateway,
     _gateway_b: TestGateway,
     _sqlite_dir: Option<tempfile::TempDir>,
     admin_a: String,
     admin_b: String,
+    // Struct fields drop in declaration order. Keep this after both gateways
+    // so their pools release every DB connection before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
 }
 
 impl SharedAdminHarness {
