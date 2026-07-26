@@ -417,7 +417,10 @@ fn the_production_factory_threads_the_config_id_into_every_rate_limit_plugin() {
         "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 1}}
     });
     for (plugin_name, config) in [
-        ("rate_limiting", json!({"limits": valid_rate_limiting_rule()})),
+        (
+            "rate_limiting",
+            json!({"limits": valid_rate_limiting_rule()}),
+        ),
         (
             "graphql",
             json!({"type_rate_limits": {"query": {"max_requests": 10, "window_seconds": 1}}}),

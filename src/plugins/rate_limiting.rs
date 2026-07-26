@@ -97,7 +97,12 @@ impl RateLimiting {
             RATE_LIMITING_POLICY_CONFIG_KEYS,
             REDIS_PLUGIN_CONFIG_KEYS,
         );
-        reject_unknown_keys(object, "config", RATE_LIMITING_CONFIG_KEYS, "rate_limiting: ")?;
+        reject_unknown_keys(
+            object,
+            "config",
+            RATE_LIMITING_CONFIG_KEYS,
+            "rate_limiting: ",
+        )?;
         let limit_by = parse_limit_by(object)?;
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 

@@ -99,9 +99,9 @@ impl GrpcMethodRouter {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        let object = config
-            .as_object()
-            .ok_or_else(|| format!("grpc_method_router: config must be an object, got: {config}"))?;
+        let object = config.as_object().ok_or_else(|| {
+            format!("grpc_method_router: config must be an object, got: {config}")
+        })?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
         debug_assert_closed_root_keys(
