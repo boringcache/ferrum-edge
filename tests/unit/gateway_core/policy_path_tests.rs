@@ -7,7 +7,8 @@
 use std::borrow::Cow;
 
 use ferrum_edge::policy_path::{
-    PolicyPathRejection, canonicalize_policy_path, non_canonical_policy_path_reason,
+    PolicyPathRejection, canonicalize_policy_path, non_canonical_policy_path_pattern_reason,
+    non_canonical_policy_path_reason,
 };
 
 fn canonical(path: &str) -> String {
@@ -22,28 +23,40 @@ fn rejection(path: &str) -> PolicyPathRejection {
         .unwrap_or_else(|| panic!("{path:?} was unexpectedly accepted"))
 }
 
-// ── Fast path: no percent escape is never touched and never rejected ────────
+// ── Fast path: cleared by a scan, not by the absence of `%` ────────────────
 
 #[test]
-fn paths_without_escapes_are_borrowed_unchanged() {
+fn ordinary_paths_are_borrowed_unchanged() {
     for path in [
         "",
         "/",
         "*",
         "/admin",
         "/api/v1/users/42",
-        "/a/../b",
-        "/a/./b",
         "/api//double",
+        // A `.` inside a segment is an ordinary character; only a *complete*
+        // `.` or `..` segment is a dot segment.
+        "/a/.hidden/b",
+        "/a/..hidden/b",
+        "/a/b./c",
+        "/v1.0/users",
         "/weird!$&'()*+,;=:@chars",
     ] {
-        let result = canonicalize_policy_path(path).expect("no-escape path must be accepted");
+        let result = canonicalize_policy_path(path).expect("ordinary path must be accepted");
         assert!(
             matches!(result, Cow::Borrowed(_)),
             "{path:?} must not allocate"
         );
         assert_eq!(result, path);
     }
+}
+
+#[test]
+fn the_escape_free_scan_still_rejects_literal_structure() {
+    // The fast path is a *validating* scan. A target with no percent escape is
+    // not automatically accepted: it is accepted because the scan cleared it.
+    assert_eq!(rejection("/a/../b"), PolicyPathRejection::LiteralDotSegment);
+    assert_eq!(rejection("/a\\b"), PolicyPathRejection::LiteralBackslash);
 }
 
 // ── Ordinary single encoding: the advisory's headline bypass ───────────────
@@ -247,13 +260,80 @@ fn escape_synthesized_dot_segments_are_rejected() {
 }
 
 #[test]
-fn literal_dot_segments_are_left_exactly_as_written() {
-    // Canonicalization refuses ambiguity; it never rewrites a request's
-    // meaning. A literal `..` is equally visible to operator, gateway, and
-    // backend, so it stays put even when the path has other escapes.
-    assert_eq!(canonical("/api/../admin"), "/api/../admin");
-    assert_eq!(canonical("/api/./admin"), "/api/./admin");
-    assert_eq!(canonical("/api/../%61dmin"), "/api/../admin");
+fn literal_dot_segments_are_rejected_too() {
+    // A dot segment is not a single policy/backend coordinate: Ferrum forwards
+    // through URL parsers (the `url` crate behind reqwest on the H1/H2 and H3
+    // cross-protocol dispatch paths) and every RFC 3986 / WHATWG normalizer
+    // removes dot segments, so policy would evaluate `/api/../protected` while
+    // the forwarded request line resolves `/protected`. Canonicalization does
+    // not remove them either — removal is itself a second reading — it refuses
+    // the target.
+    for path in [
+        "/api/../admin",
+        "/api/./admin",
+        "/..",
+        "/.",
+        "/api/..",
+        "/api/.",
+        "/../api",
+        "/./api",
+        "..",
+        ".",
+        "/a/b/../../c",
+    ] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::LiteralDotSegment,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_dot_segment_is_rejected_even_alongside_accepted_escapes() {
+    // The literal rules are not confined to a "no percent escape" fast path:
+    // a target that also carries a decodable escape is held to them too.
+    assert_eq!(
+        rejection("/api/../%61dmin"),
+        PolicyPathRejection::LiteralDotSegment
+    );
+    assert_eq!(
+        rejection("/%61pi/../admin"),
+        PolicyPathRejection::LiteralDotSegment
+    );
+    assert_eq!(
+        rejection("/%61pi/.."),
+        PolicyPathRejection::LiteralDotSegment
+    );
+}
+
+// ── Backslash: literal as well as encoded ──────────────────────────────────
+
+#[test]
+fn literal_backslash_is_rejected() {
+    // The Rust `url` parser treats `\` as a path separator for special HTTP(S)
+    // URLs, as do several backend stacks, so a literal `\` is the same
+    // route-structure mismatch `%5C` is. Rejecting only the encoded form would
+    // leave the literal one on any path that reaches a permissive frontend.
+    for path in ["/api\\admin", "/\\", "/a\\..\\b", "\\admin"] {
+        assert_eq!(
+            rejection(path),
+            PolicyPathRejection::LiteralBackslash,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_backslash_is_rejected_even_alongside_accepted_escapes() {
+    assert_eq!(
+        rejection("/%61pi\\admin"),
+        PolicyPathRejection::LiteralBackslash
+    );
+    assert_eq!(
+        rejection("/api\\%61dmin"),
+        PolicyPathRejection::LiteralBackslash
+    );
 }
 
 #[test]
@@ -272,6 +352,7 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
         (PolicyPathRejection::DoubleEncoding, "double_encoding"),
         (PolicyPathRejection::EncodedSeparator, "encoded_separator"),
         (PolicyPathRejection::EncodedBackslash, "encoded_backslash"),
+        (PolicyPathRejection::LiteralBackslash, "literal_backslash"),
         (PolicyPathRejection::EncodedControl, "encoded_control"),
         (
             PolicyPathRejection::UnrepresentableEscape,
@@ -280,6 +361,10 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
         (
             PolicyPathRejection::AmbiguousDotSegment,
             "ambiguous_dot_segment",
+        ),
+        (
+            PolicyPathRejection::LiteralDotSegment,
+            "literal_dot_segment",
         ),
     ];
     for (variant, reason) in variants {
@@ -299,7 +384,18 @@ fn rejection_reasons_and_bodies_are_stable_and_echo_no_request_bytes() {
 fn non_canonical_reason_flags_config_values_that_can_never_match() {
     assert_eq!(non_canonical_policy_path_reason("/admin"), None);
     assert_eq!(non_canonical_policy_path_reason("*"), None);
-    assert_eq!(non_canonical_policy_path_reason("/api/../admin"), None);
+    assert_eq!(non_canonical_policy_path_reason("/v1.0/reports"), None);
+
+    // A configured value carrying a dot segment or a backslash can never match
+    // either: no canonical request path contains one.
+    assert_eq!(
+        non_canonical_policy_path_reason("/api/../admin"),
+        Some("literal_dot_segment")
+    );
+    assert_eq!(
+        non_canonical_policy_path_reason("/api\\admin"),
+        Some("literal_backslash")
+    );
 
     assert_eq!(
         non_canonical_policy_path_reason("/%61dmin"),
@@ -331,5 +427,43 @@ fn non_canonical_reason_flags_config_values_that_can_never_match() {
     assert_eq!(
         non_canonical_policy_path_reason("/caf%C3%A9"),
         Some("unrepresentable_escape")
+    );
+}
+
+#[test]
+fn pattern_admission_holds_regex_listen_paths_to_the_escape_rules_only() {
+    // A `~regex` listen_path is a pattern, not a literal path. `\` and `.` are
+    // regex syntax there, and the pattern is matched against a canonical
+    // request path that already cannot contain a backslash or a dot segment —
+    // so applying the literal rules would kill working routes without closing
+    // anything.
+    for pattern in [
+        r"~^/v1\.0/.*",
+        r"~^/public\.Service/Allowed$",
+        "~^/api/v[0-9]+",
+        "~(?i:/Api.*)",
+        "~.*",
+    ] {
+        assert_eq!(
+            non_canonical_policy_path_pattern_reason(pattern),
+            None,
+            "{pattern:?} must stay admissible"
+        );
+    }
+
+    // The escape half of the contract still applies: no canonical request path
+    // contains a `%`, and a regex has no metacharacter that changes that, so a
+    // pattern carrying one is dead config.
+    assert_eq!(
+        non_canonical_policy_path_pattern_reason("~/api%2F.*"),
+        Some("encoded_separator")
+    );
+    assert_eq!(
+        non_canonical_policy_path_pattern_reason("~/%61dmin"),
+        Some("percent-escapes that canonicalize to a different path")
+    );
+    assert_eq!(
+        non_canonical_policy_path_pattern_reason("~/api%2"),
+        Some("invalid_escape")
     );
 }

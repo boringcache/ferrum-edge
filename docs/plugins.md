@@ -2760,7 +2760,7 @@ Configuration must be a top-level object. Accepted keys are `status_code`, `cont
 | `body` | String | _(omit)_ | Explicit response body. Field presence — including `body: ""` — is authoritative and suppresses `message`. Omitting the field selects the default renderer. |
 | `content_type` | String | `application/json` | Response `Content-Type` header. Default-body formatting uses exact subtype `json`/`xml` or RFC 6838 `+json`/`+xml` suffixes after parameter stripping — not arbitrary substrings (`application/notjson` is plain text). |
 | `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is omitted. JSON escaping is applied automatically. For XML media types, the message must contain only XML 1.0-legal characters (tab/LF/CR and the XML Char ranges); illegal controls are rejected. |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the [canonical policy path](request_path_canonicalization.md) starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. The prefix must itself already be canonical, which (because no percent escape survives canonicalization) means it must contain no percent escape — `/%61dmin` and `/api%20name` are rejected at admission rather than silently never matching, because a request spelled the first way arrives as `/admin` and one spelled the second way is refused with `400`. Mutually exclusive with `trigger.header`. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the [canonical policy path](request_path_canonicalization.md) starts with this prefix. Must start with `/` (or be exactly `*` to match the asterisk-form target of a server-wide `OPTIONS *` request) and contain no control characters; any other value can never match a request path. The prefix must itself already be canonical: no percent escape (none survives canonicalization), no literal `\`, and no literal `.`/`..` segment (no canonical path can contain one). `/%61dmin`, `/api%20name`, `/api/../admin`, and `/api\admin` are rejected at admission rather than silently never matching — a request spelled the first way arrives as `/admin`, and the other three are refused with `400` before the plugin runs. A `.` inside a segment (`/v1.0/`) is fine. Mutually exclusive with `trigger.header`. |
 | `trigger.header` | String | _(none)_ | Only terminate when this request header is present on any raw field line (including non-UTF-8 values). Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches presence. A non-empty value matches any individual field line exactly — never a comma-folded multi-line serialization. |
 
@@ -3465,9 +3465,10 @@ The `url_path` / `full_url` targets, `conditions.paths`, and
 `global_exemptions.paths` all evaluate the **canonical policy path**, derived
 once at the frontend boundary. A client cannot dodge a path rule by
 percent-encoding an ordinary character (`/%61dmin` is matched as `/admin`), and
-encoded separators, escape-synthesized dot segments, double encodings, and
-invalid escapes never reach the WAF at all — they are rejected with `400`
-first. Write path patterns against the canonical form. See
+encoded separators, dot segments (literal `/a/../b` as well as escaped
+`/a/%2e%2e/b`), backslashes (literal `/a\b` as well as `%5C`), double
+encodings, and invalid escapes never reach the WAF at all — they are rejected
+with `400` first. Write path patterns against the canonical form. See
 [docs/request_path_canonicalization.md](request_path_canonicalization.md).
 
 Supported targets: `header_names`, `header_values` (optional non-empty

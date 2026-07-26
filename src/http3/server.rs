@@ -1298,7 +1298,7 @@ async fn handle_h3_request(
     // rebound: the H3 backend URL builders read the local value while plugins
     // read the context.
     // `None` means the target was already canonical, so nothing is rebound and
-    // nothing is allocated — the case for every path without a percent escape.
+    // nothing is allocated — the case for the overwhelming majority of traffic.
     let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
         Ok(std::borrow::Cow::Borrowed(_)) => None,
         Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),

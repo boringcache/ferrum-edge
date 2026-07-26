@@ -30,8 +30,13 @@ per-plugin decoding.
 
 `canonicalize_policy_path()` returns either a canonical path or a rejection.
 
-**Fast path.** A target with no `%` is returned unchanged, borrowed, and can
-never be rejected. Every behavior change below requires a percent escape.
+**Fast path.** The normal path is allocation-free but not unvalidated. A single
+scan proves the target carries no percent escape, no literal `\`, and no literal
+`.`/`..` segment; only then is it returned borrowed and unchanged. A target is
+accepted because the scan cleared it, not because it happened to contain no `%`.
+As soon as the scan reaches a `%` it hands off to the decoding pass, which
+re-validates from the first byte, so the two cannot disagree about what is
+accepted.
 
 **Accepted and decoded.** An escape of a character that may appear literally in
 a path — RFC 3986 `pchar`, i.e. `unreserved` / `sub-delims` / `:` / `@` — is
@@ -54,24 +59,36 @@ risking disagreement with the backend:
 | `double_encoding`        | `/a%25b`, `/a%252Fb` | An encoded `%` is the lead byte of any double encoding; a second decode could introduce structure. |
 | `encoded_separator`      | `/a%2Fb`, `/a%3Fb`, `/a%23b` | Decoding would add a segment, a query, or a fragment the raw target did not have. |
 | `encoded_backslash`      | `/a%5Cb`         | Several backend stacks treat `\` as a path separator. |
+| `literal_backslash`      | `/a\b`           | The Rust `url` parser — which parses the backend URL on the reqwest dispatch paths — treats `\` as a path separator for special HTTP(S) URLs, as do several backend stacks. A literal `\` is the same route-structure mismatch an encoded one is. |
 | `encoded_control`        | `/a%00`, `/a%0A` | A NUL truncates the path in several runtimes; other C0 controls and `DEL` are equally divergent. |
 | `unrepresentable_escape` | `/a%20b`, `/a%7Bb`, `/caf%C3%A9`, `/caf%C3%28` | The escaped byte cannot appear literally in a request target (space, `"`, `<`, `>`, `[`, `]`, `^`, `` ` ``, `{`, `\|`, `}`, and every non-ASCII byte, valid UTF-8 sequence or not). Keeping it escaped would put a different string on the wire than the one policy read; decoding it would produce an untransmittable target. Neither is a single coordinate, so the target is refused. |
 | `ambiguous_dot_segment`  | `/a/%2e%2e/b`    | A percent escape produced a `.` or `..` segment. |
+| `literal_dot_segment`    | `/a/../b`, `/a/./b`, `/a/..` | A `.` or `..` segment written literally. See below. |
 
 Rejections carry a fixed JSON body and a fixed reason token. Neither echoes any
 request bytes, and the reject is logged with the reason token only.
 
-**Literal dot segments are not rejected.** `/a/../b` passes through exactly as
-written. Canonicalization refuses ambiguity; it never rewrites a request's
-meaning, and a literal `..` is equally visible to the operator, the gateway,
-and the backend.
+**Dot segments are rejected, literal as well as escaped — and never removed.**
+A dot segment is not a single policy/backend coordinate. Ferrum's ordinary HTTP
+dispatch hands a backend URL string to reqwest (`src/proxy/mod.rs` and
+`src/http3/cross_protocol.rs`), which parses it with the Rust `url` crate; every
+RFC 3986 / WHATWG normalizer removes dot segments. Policy would therefore
+evaluate `/a/../protected` while the request line actually placed on the backend
+connection resolves `/protected`. Removing the segment inside the gateway is not
+a fix either — removal *is* a second reading, and it would change a request's
+meaning. The target is refused instead. A `.` inside a segment is an ordinary
+path character: `/v1.0/users` and `/a/.hidden/b` are unaffected; only a
+*complete* `.` or `..` segment is a dot segment.
 
 ## Invariants this buys
 
 1. **Structure preservation.** Because every escape that could decode to a
-   separator is rejected, the canonical path has exactly the segment structure
-   of the raw target. Routing, `openapi_validator` parameter segments (`[^/]+`),
-   and the backend cannot disagree about how many segments a request has.
+   separator is rejected, and because `\` and dot segments — the two literal
+   spellings a URL parser re-reads as structure — are rejected too, the
+   canonical path has exactly the segment structure of the raw target *and*
+   survives the backend URL parser unchanged. Routing, `openapi_validator`
+   parameter segments (`[^/]+`), and the backend cannot disagree about how many
+   segments a request has or which of them the request line ends up naming.
 2. **Decode idempotence.** `canonicalize(canonicalize(p)) == canonicalize(p)`,
    and a further decode of a canonical path is a no-op — there is no escape
    left to decode.
@@ -95,10 +112,10 @@ same way its other `400` rejections are shaped.
 ## Configured paths must be canonical too
 
 Operator-authored path values are compared against the canonical request path,
-so a non-canonical configured value can never match. Because no escape survives
-canonicalization, a configured path is canonical exactly when it contains no
-percent escape. Rather than silently never firing, non-canonical values are
-rejected at admission using the same canonicalizer:
+so a non-canonical configured value can never match. A configured literal path
+is canonical exactly when it contains no percent escape, no literal `\`, and no
+literal `.`/`..` segment. Rather than silently never firing, non-canonical
+values are rejected at admission using the same canonicalizer:
 
 - `Proxy.listen_path` — rejected by `Proxy::validate_fields()` and by the
   dedicated `GatewayConfig::validate_listen_path_encodings()` that runs on
@@ -107,6 +124,15 @@ rejected at admission using the same canonicalizer:
 - `request_termination` `trigger.path_prefix` — rejected by the plugin
   constructor, and therefore by Admin API validation, file-mode startup, and DB
   admission.
+
+A `~regex` `listen_path` is a *pattern*, not a literal path, so only the escape
+half of the contract applies to it. `\` and `.` are regex syntax there —
+`~^/v1\.0/.*` matches the entirely reachable canonical path `/v1.0/x` — and the
+canonical request path a pattern is matched against already cannot contain a
+backslash or a dot segment, so holding the pattern to the literal rules would
+reject working routes without closing anything. Percent escapes are still
+refused in a pattern, because no regex metacharacter makes `%2F` match a path
+that can never contain a `%`.
 
 WAF `conditions.paths`, `openapi_validator` path regexes, and other
 regex-shaped path scopes are operator-authored patterns rather than literal
@@ -122,23 +148,34 @@ verify against a rewritten spelling. Nothing else may consume it: routing and
 every policy surface run on the canonical path, so a raw spelling can never
 select a different route, operation, or rule than the backend executes.
 
+Canonicalization runs before any plugin, so a raw target that is refused never
+reaches `hmac_auth` at all. The raw path it signs is therefore always one the
+canonicalizer accepted, differing from the canonical form only in percent
+escapes of `pchar`-legal characters — a client can still sign `/%61dmin`, and
+`hmac_auth` still verifies against exactly those bytes.
+
 Transaction logs record the canonical path.
 
 ## Operational impact
 
-This is a behavior change for three shapes of traffic that previously succeeded:
+This is a behavior change for four shapes of traffic that previously succeeded:
 
 - Targets with encoded separators (`%2F`, `%252F`) were folded into `/` for
   route lookup and now receive `400`. Folding changes segment structure, so a
   folded route decision could still disagree with a backend that does not
   decode; refusing cannot. APIs that carry an encoded `/` inside a path
   parameter must move that value into the query string or a header.
-- Targets with a percent escape that decoded to a `.` or `..` segment now
-  receive `400`.
+- Targets with a `.` or `..` segment now receive `400`, whether the segment was
+  written literally (`/a/../b`, `literal_dot_segment`) or produced by a percent
+  escape (`/a/%2e%2e/b`, `ambiguous_dot_segment`). Clients that relied on the
+  gateway forwarding a relative target must send the resolved path. A `.` inside
+  a segment (`/v1.0/users`, `/a/.hidden`) is unaffected.
+- Targets with a literal backslash now receive `400` (`literal_backslash`),
+  alongside the encoded `%5C` form.
 - Targets carrying an escape of a character that cannot be written literally in
   a path — `%20` for space, `%7B`/`%5B` for brackets, and any percent-encoded
   non-ASCII text such as `/caf%C3%A9` — now receive `400`
-  (`unrepresentable_escape`). This is the broadest of the three: **percent-encoded
+  (`unrepresentable_escape`). This is the broadest of the four: **percent-encoded
   spaces and non-ASCII path segments are no longer accepted at all.** The
   gateway has no way to hold one such target that both policy and a decoding
   backend read the same way, so it refuses rather than authorize a spelling the

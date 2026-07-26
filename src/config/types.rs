@@ -2743,8 +2743,20 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
 /// previous encoded-slash admission. `~` and `=` are ordinary path characters
 /// to the canonicalizer, and a regex or exact literal carrying an escape the
 /// runtime would refuse is unreachable for the same reason.
+///
+/// A `~regex` value is a *pattern*, not a literal path, so only the escape
+/// half of the contract applies to it: `\` and `.` are regex syntax there
+/// (`~^/v1\.0/.*` matches the reachable canonical path `/v1.0/x`), while the
+/// canonical request path the pattern is evaluated against already cannot
+/// contain a backslash or a dot segment. Exact (`=/…`) and prefix values are
+/// compared byte-for-byte against that canonical path, so they are held to the
+/// full contract.
 fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
-    crate::policy_path::non_canonical_policy_path_reason(path)
+    if path.starts_with('~') {
+        crate::policy_path::non_canonical_policy_path_pattern_reason(path)
+    } else {
+        crate::policy_path::non_canonical_policy_path_reason(path)
+    }
 }
 
 /// Whether a proxy's retry policy can actually trigger for at least one request

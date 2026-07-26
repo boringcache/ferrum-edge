@@ -289,7 +289,17 @@ async fn request_termination_rejects_a_prefix_that_could_never_match() {
     // A prefix written in a non-canonical spelling is not a stricter rule, it
     // is a dead one — admission refuses it rather than letting it silently
     // never fire.
-    for prefix in ["/%61dmin", "/api%2Fadmin", "/api%2", "/api%20name"] {
+    for prefix in [
+        "/%61dmin",
+        "/api%2Fadmin",
+        "/api%2",
+        "/api%20name",
+        // Literal dot segments and backslashes cannot appear in a canonical
+        // request path either, so a prefix carrying one is equally dead.
+        "/api/../admin",
+        "/api/./admin",
+        "/api\\admin",
+    ] {
         let error = RequestTermination::new(&json!({
             "status_code": 403,
             "trigger": { "path_prefix": prefix }
@@ -301,10 +311,11 @@ async fn request_termination_rejects_a_prefix_that_could_never_match() {
         );
     }
 
-    // Canonical prefixes — which, since no escape survives canonicalization,
-    // means prefixes with no percent escape at all — stay valid, including the
-    // asterisk-form OPTIONS target.
-    for prefix in ["/admin", "*", "/api/v1/reports"] {
+    // Canonical prefixes stay valid: no percent escape (none survives
+    // canonicalization), no literal `\`, and no literal `.`/`..` segment. A `.`
+    // inside a segment is an ordinary path character. The asterisk-form OPTIONS
+    // target is canonical too.
+    for prefix in ["/admin", "*", "/api/v1/reports", "/v1.0/reports"] {
         RequestTermination::new(&json!({
             "status_code": 403,
             "trigger": { "path_prefix": prefix }
@@ -379,6 +390,72 @@ async fn encoded_separators_never_reach_routing() {
         assert!(
             canonicalize_policy_path(raw).is_err(),
             "{raw:?} must be rejected before routing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dot_segments_and_backslashes_never_reach_routing_or_backend_dispatch() {
+    // Rejection happens at the canonicalizer, which the frontends run before
+    // `find_proxy` and before any backend URL is built — so for these targets
+    // there is no route decision and no request line at all.
+    let router = admin_router(false);
+    for raw in [
+        "/admin/../public",
+        "/admin/./reports",
+        "/admin/reports/..",
+        "/admin\\reports",
+        // Also when the target carries an otherwise-decodable escape, so this
+        // is not a property of the escape-free scan alone.
+        "/%61dmin/../public",
+        "/%61dmin\\reports",
+    ] {
+        let rejection = canonicalize_policy_path(raw)
+            .err()
+            .unwrap_or_else(|| panic!("{raw:?} must be rejected before routing"));
+        assert!(
+            matches!(
+                rejection.reason(),
+                "literal_dot_segment" | "literal_backslash"
+            ),
+            "{raw:?} rejected for the wrong reason: {}",
+            rejection.reason()
+        );
+        // The router is never consulted for a rejected target; asserting the
+        // proxy exists for the *accepted* spelling shows the route was
+        // otherwise reachable, so rejection — not a routing miss — is what
+        // stopped it.
+        assert!(router.find_proxy(None, "/admin/reports").is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_dot_segment_or_backslash_would_desync_policy_from_the_forwarded_request_line() {
+    // Why these must be refused rather than passed through: the backend URL
+    // Ferrum hands to reqwest (`client.request(method, backend_url)`) is parsed
+    // by the `url` crate, which removes dot segments per RFC 3986 / WHATWG and
+    // treats `\` as a path separator for special HTTP(S) schemes. Passing the
+    // target through would leave policy evaluating one path while the request
+    // line resolves another — the exact divergence this module removes.
+    let router = admin_router(false);
+    let matched = router.find_proxy(None, "/admin/reports").expect("admin route");
+
+    for (raw_tail, resolved) in [
+        ("/admin/../public", "/public"),
+        ("/admin/reports/../../public", "/public"),
+        ("/admin\\reports", "/admin/reports"),
+    ] {
+        let assembled = build_backend_url(&matched.proxy, raw_tail, "", 0);
+        let parsed = url::Url::parse(&assembled).expect("backend URL parses");
+        assert_eq!(
+            parsed.path(),
+            resolved,
+            "{raw_tail:?} would be forwarded as {resolved:?}, not as written"
+        );
+        // Which is why the boundary never lets it get this far.
+        assert!(
+            canonicalize_policy_path(raw_tail).is_err(),
+            "{raw_tail:?} must be rejected at the boundary"
         );
     }
 }

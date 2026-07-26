@@ -45,19 +45,31 @@
 //!    the gateway would evaluate `/api%20name` while a decoding backend
 //!    resolves `/api name`, which is the same policy/backend semantic
 //!    mismatch this module exists to remove.
-//! 5. **No escape may synthesize a dot segment.** `/a/%2e%2e/b` is
-//!    [`PolicyPathRejection::AmbiguousDotSegment`]. A *literal* `/a/../b` is left exactly as it is —
-//!    it is equally visible to the operator, the gateway, and the backend, and
-//!    this function never changes a request's meaning, it only refuses the
-//!    readings that have more than one.
-//! 6. **Encoded C0 controls and `DEL` are rejected** ([`PolicyPathRejection::EncodedControl`]),
+//! 5. **No `.` or `..` path segment survives, literal or escaped.** A segment
+//!    that became `.`/`..` only through a percent escape (`/a/%2e%2e/b`) is
+//!    [`PolicyPathRejection::AmbiguousDotSegment`]; one written literally
+//!    (`/a/../b`) is [`PolicyPathRejection::LiteralDotSegment`]. Neither is
+//!    removed — removal *is* a second reading. A dot segment is not a single
+//!    policy/backend coordinate: Ferrum forwards through URL parsers (the
+//!    `url` crate behind `reqwest` on the HTTP/1.1, HTTP/2, and H3
+//!    cross-protocol paths) and every RFC 3986 / WHATWG normalizer removes dot
+//!    segments, so policy would evaluate `/a/../protected` while the request
+//!    line resolves `/protected`. That is exactly the divergence this module
+//!    exists to remove, so the target is refused.
+//! 6. **No `\` survives, literal or escaped.** An encoded `\` is
+//!    [`PolicyPathRejection::EncodedBackslash`] and a literal one is
+//!    [`PolicyPathRejection::LiteralBackslash`]. The `url` crate treats a
+//!    backslash as a path separator for special HTTP(S) URLs, as do several
+//!    backend stacks, so a literal `\` is the same route-structure mismatch an
+//!    encoded one is.
+//! 7. **Encoded C0 controls and `DEL` are rejected** ([`PolicyPathRejection::EncodedControl`]),
 //!    including `%00`: a NUL truncates the path in several backend runtimes.
-//! 7. **Escapes of characters that are legal literally in a path are decoded**
+//! 8. **Escapes of characters that are legal literally in a path are decoded**
 //!    (RFC 3986 `pchar` = `unreserved` / `sub-delims` / `:` / `@`), so
 //!    `/%61dmin` canonicalizes to `/admin` and an operator's literal rule
 //!    matches.
 //!
-//! Rules 4 and 7 together mean **no percent escape survives canonicalization**:
+//! Rules 4 and 8 together mean **no percent escape survives canonicalization**:
 //! an escape is either decoded to the literal byte it names or the request is
 //! refused. The canonical path is therefore always a valid HTTP request target
 //! *and* is byte-identical to what a decoding backend resolves. That is what
@@ -69,12 +81,18 @@
 //!
 //! # Fast path
 //!
-//! A path with no `%` is returned borrowed, unmodified, and can never be
-//! rejected. That is the overwhelming majority of production traffic, so the
-//! hot path stays allocation-free and no request without a percent escape
-//! changes behavior. The converse also holds: because no escape survives, a
-//! borrowed result means the target contained no escape at all, and an owned
-//! result always means at least one escape was decoded.
+//! The normal path is allocation-free but not unvalidated. A single scan
+//! proves the target carries no percent escape, no literal `\`, and no literal
+//! `.`/`..` segment; only then is it returned borrowed and unmodified. That
+//! covers the overwhelming majority of production traffic, so the hot path
+//! never allocates, but a target is accepted because the scan cleared it, not
+//! because it happened to contain no `%`. The scan hands off to the decoding
+//! pass as soon as it sees a `%`, and that pass re-validates from the start, so
+//! the two cannot disagree about what is accepted.
+//!
+//! The result's ownership is still a reliable signal: because no escape
+//! survives, a borrowed result means the target contained no escape at all, and
+//! an owned result always means at least one escape was decoded.
 //!
 //! # Relationship to `normalize_encoded_slashes`
 //!
@@ -104,6 +122,11 @@ pub enum PolicyPathRejection {
     EncodedSeparator,
     /// An encoded `\`, which several backend stacks treat as a separator.
     EncodedBackslash,
+    /// A literal `\`. The `url` crate — which parses the backend URL on the
+    /// reqwest dispatch paths — treats it as a path separator for special
+    /// HTTP(S) URLs, so the forwarded segment structure would not be the one
+    /// policy evaluated.
+    LiteralBackslash,
     /// An encoded C0 control character or `DEL` (includes `%00`).
     EncodedControl,
     /// An escape of a byte that cannot appear literally in a request target
@@ -112,6 +135,10 @@ pub enum PolicyPathRejection {
     UnrepresentableEscape,
     /// A percent escape produced a `.` or `..` path segment.
     AmbiguousDotSegment,
+    /// A literal `.` or `..` path segment. Every RFC 3986 / WHATWG normalizer
+    /// removes dot segments, so policy would read `/a/../protected` while the
+    /// forwarded request line resolves `/protected`.
+    LiteralDotSegment,
 }
 
 impl PolicyPathRejection {
@@ -122,9 +149,11 @@ impl PolicyPathRejection {
             Self::DoubleEncoding => "double_encoding",
             Self::EncodedSeparator => "encoded_separator",
             Self::EncodedBackslash => "encoded_backslash",
+            Self::LiteralBackslash => "literal_backslash",
             Self::EncodedControl => "encoded_control",
             Self::UnrepresentableEscape => "unrepresentable_escape",
             Self::AmbiguousDotSegment => "ambiguous_dot_segment",
+            Self::LiteralDotSegment => "literal_dot_segment",
         }
     }
 
@@ -141,6 +170,7 @@ impl PolicyPathRejection {
                 r#"{"error":"Request path contains an encoded path separator"}"#
             }
             Self::EncodedBackslash => r#"{"error":"Request path contains an encoded backslash"}"#,
+            Self::LiteralBackslash => r#"{"error":"Request path contains a backslash"}"#,
             Self::EncodedControl => {
                 r#"{"error":"Request path contains an encoded control character"}"#
             }
@@ -150,6 +180,7 @@ impl PolicyPathRejection {
             Self::AmbiguousDotSegment => {
                 r#"{"error":"Request path contains an encoded dot segment"}"#
             }
+            Self::LiteralDotSegment => r#"{"error":"Request path contains a dot segment"}"#,
         }
     }
 
@@ -160,9 +191,11 @@ impl PolicyPathRejection {
             Self::DoubleEncoding => "Double-encoded percent-escape in request path",
             Self::EncodedSeparator => "Encoded path separator in request path",
             Self::EncodedBackslash => "Encoded backslash in request path",
+            Self::LiteralBackslash => "Backslash in request path",
             Self::EncodedControl => "Encoded control character in request path",
             Self::UnrepresentableEscape => "Unrepresentable percent-escape in request path",
             Self::AmbiguousDotSegment => "Encoded dot segment in request path",
+            Self::LiteralDotSegment => "Dot segment in request path",
         }
     }
 }
@@ -207,21 +240,90 @@ const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Reject a segment that only became `.` or `..` because of a percent escape.
+/// Whether the *literal* bytes of the input are held to the request-path
+/// contract, or only its percent escapes are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralStructure {
+    /// Full contract. Used for request targets and for every operator value
+    /// that is compared literally against one.
+    Enforced,
+    /// Escape rules only: a literal `\` or `.`/`..` segment is left alone.
+    ///
+    /// Used for operator-authored *patterns* (`~regex` listen paths), where
+    /// `\` and `.` are regex syntax rather than path bytes — `~^/v1\.0/.*`
+    /// matches the perfectly reachable canonical path `/v1.0/x`. Percent
+    /// escapes are still refused, because a regex has no metacharacter that
+    /// makes `%2F` match anything: no canonical request path contains a `%`,
+    /// so such a pattern is dead config either way.
+    PatternOnly,
+}
+
+#[inline]
+fn is_dot_segment(segment: &[u8]) -> bool {
+    segment == b".".as_slice() || segment == b"..".as_slice()
+}
+
+/// Reject a completed `.` or `..` segment, naming whether an escape built it.
 #[inline]
 fn check_segment(
     canonical: &[u8],
     segment_start: usize,
     segment_has_escape: bool,
+    structure: LiteralStructure,
 ) -> Result<(), PolicyPathRejection> {
-    if !segment_has_escape {
+    if structure == LiteralStructure::PatternOnly {
         return Ok(());
     }
-    let segment: &[u8] = &canonical[segment_start..];
-    if segment == b".".as_slice() || segment == b"..".as_slice() {
-        return Err(PolicyPathRejection::AmbiguousDotSegment);
+    if is_dot_segment(&canonical[segment_start..]) {
+        return Err(if segment_has_escape {
+            PolicyPathRejection::AmbiguousDotSegment
+        } else {
+            PolicyPathRejection::LiteralDotSegment
+        });
     }
     Ok(())
+}
+
+/// What the allocation-free pre-scan concluded about a target.
+enum Prescan {
+    /// No percent escape, no literal backslash, and no literal dot segment:
+    /// the input is already canonical and can be returned borrowed.
+    AlreadyCanonical,
+    /// A `%` was reached. The decoding pass re-validates from the first byte,
+    /// so the scan stops here rather than duplicating its rules.
+    NeedsDecoding,
+}
+
+/// Prove a target needs neither decoding nor rejection, without allocating.
+///
+/// This is the hot path for essentially all production traffic. It is a
+/// validating scan, not a "no `%` means accept" shortcut: a literal `\` or a
+/// literal `.`/`..` segment is refused here exactly as the decoding pass
+/// refuses it.
+fn prescan(bytes: &[u8], structure: LiteralStructure) -> Result<Prescan, PolicyPathRejection> {
+    let enforced = structure == LiteralStructure::Enforced;
+    let mut segment_start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => return Ok(Prescan::NeedsDecoding),
+            b'\\' if enforced => return Err(PolicyPathRejection::LiteralBackslash),
+            b'/' if enforced => {
+                if is_dot_segment(&bytes[segment_start..index]) {
+                    return Err(PolicyPathRejection::LiteralDotSegment);
+                }
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if enforced && is_dot_segment(&bytes[segment_start..]) {
+        return Err(PolicyPathRejection::LiteralDotSegment);
+    }
+    Ok(Prescan::AlreadyCanonical)
 }
 
 /// Build the canonical policy path for `raw`, or reject the request target.
@@ -229,12 +331,19 @@ fn check_segment(
 /// See the module documentation for the full contract. `raw` is the path
 /// component only — the query string is never part of the policy path.
 pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRejection> {
+    canonicalize(raw, LiteralStructure::Enforced)
+}
+
+fn canonicalize(
+    raw: &str,
+    structure: LiteralStructure,
+) -> Result<Cow<'_, str>, PolicyPathRejection> {
     let bytes = raw.as_bytes();
-    // Hot path: no escape means nothing to validate, decode, or allocate. A
-    // path without `%` is always accepted verbatim.
-    if !bytes.contains(&b'%') {
-        return Ok(Cow::Borrowed(raw));
+    match prescan(bytes, structure)? {
+        Prescan::AlreadyCanonical => return Ok(Cow::Borrowed(raw)),
+        Prescan::NeedsDecoding => {}
     }
+    let enforced = structure == LiteralStructure::Enforced;
 
     // Every accepted escape is decoded to one literal byte, so this is both the
     // canonical policy path and the byte stream a decoding backend resolves —
@@ -248,12 +357,20 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
         let byte = bytes[index];
 
         if byte == b'/' {
-            check_segment(&canonical, segment_start, segment_has_escape)?;
+            check_segment(&canonical, segment_start, segment_has_escape, structure)?;
             canonical.push(b'/');
             segment_start = canonical.len();
             segment_has_escape = false;
             index += 1;
             continue;
+        }
+
+        // A literal backslash is refused for the same reason `%5C` is: the
+        // `url` crate reads it as a path separator for special HTTP(S) URLs,
+        // so the forwarded request line would not have the segment structure
+        // policy evaluated.
+        if byte == b'\\' && enforced {
+            return Err(PolicyPathRejection::LiteralBackslash);
         }
 
         if byte != b'%' {
@@ -292,9 +409,9 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
         index += 3;
     }
 
-    check_segment(&canonical, segment_start, segment_has_escape)?;
+    check_segment(&canonical, segment_start, segment_has_escape, structure)?;
 
-    // Reaching here means at least one `%` was consumed (the fast path handled
+    // Reaching here means at least one `%` was consumed (the pre-scan handled
     // the escape-free case) and every escape collapsed from three bytes to one,
     // so the canonical form always differs from `raw` and is always owned.
     //
@@ -316,7 +433,26 @@ pub fn canonicalize_policy_path(raw: &str) -> Result<Cow<'_, str>, PolicyPathRej
 /// config time rather than fail silently at request time; sharing
 /// [`canonicalize_policy_path`] keeps admission and runtime on one model.
 pub fn non_canonical_policy_path_reason(path: &str) -> Option<&'static str> {
-    match canonicalize_policy_path(path) {
+    reason_for(canonicalize(path, LiteralStructure::Enforced))
+}
+
+/// The same admission check for an operator-authored path *pattern* rather
+/// than a literal path.
+///
+/// A `~regex` `listen_path` is compiled and matched against the canonical
+/// request path, so it is subject to the escape half of the contract — no
+/// canonical path contains a `%`, so a pattern that does is dead config. It is
+/// *not* subject to the literal half: `\` and `.` are regex syntax there, and
+/// `~^/v1\.0/.*` matches the entirely reachable canonical path `/v1.0/x`.
+/// Applying the literal rules to a pattern would reject working routes without
+/// closing anything, because the canonical path a pattern is matched against
+/// already cannot contain a dot segment or a backslash.
+pub fn non_canonical_policy_path_pattern_reason(pattern: &str) -> Option<&'static str> {
+    reason_for(canonicalize(pattern, LiteralStructure::PatternOnly))
+}
+
+fn reason_for(result: Result<Cow<'_, str>, PolicyPathRejection>) -> Option<&'static str> {
+    match result {
         Ok(Cow::Borrowed(_)) => None,
         Ok(Cow::Owned(_)) => Some("percent-escapes that canonicalize to a different path"),
         Err(rejection) => Some(rejection.reason()),

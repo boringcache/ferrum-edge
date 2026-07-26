@@ -18631,7 +18631,7 @@ async fn handle_proxy_request_inner(
     // agree. Nothing between `RequestContext::new` and this point inspects the
     // path.
     // `None` means the target was already canonical, so nothing is rebound and
-    // nothing is allocated — the case for every path without a percent escape.
+    // nothing is allocated — the case for the overwhelming majority of traffic.
     let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
         Ok(std::borrow::Cow::Borrowed(_)) => None,
         Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),

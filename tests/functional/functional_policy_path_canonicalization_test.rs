@@ -281,8 +281,6 @@ enum Backend {
     Never,
     /// The backend must have executed exactly this request target.
     Exact(&'static str),
-    /// The backend was reached; the exact rendering is outside this contract.
-    Reached,
 }
 
 struct Case {
@@ -407,16 +405,44 @@ const CASES: &[Case] = &[
         backend_target: Backend::Exact("/tail"),
         why: "an encoded listen-path prefix still routes and strips identically",
     },
-    // Literal dot segments are accepted rather than rejected: canonicalization
-    // refuses ambiguity, it does not rewrite meaning, and a literal `..` is
-    // equally visible to operator, gateway, and backend. Only the status is
-    // asserted here — how the backend URL builder renders dot segments is
-    // pre-existing behavior outside this contract.
+    // Literal dot segments are rejected as well as escape-synthesized ones.
+    // The backend URL is parsed by the `url` crate, which removes dot segments,
+    // so passing `/canon/a/../b` through would leave policy evaluating it while
+    // the backend request line resolved `/canon/b`.
     Case {
         target: "/canon/a/../b",
-        status: 200,
-        backend_target: Backend::Reached,
-        why: "literal dot segments are not an encoding ambiguity",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a literal dot segment resolves away in the forwarded request line",
+    },
+    Case {
+        target: "/canon/./b",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a literal single-dot segment resolves away the same way",
+    },
+    Case {
+        target: "/canon/%61/../b",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "the literal rules apply to targets that also carry escapes",
+    },
+    // A literal backslash is rejected as well as `%5C`. All three senders can
+    // carry it verbatim: the raw H1 socket writes the request line byte for
+    // byte, and `http::Uri` — which the H2 and H3 senders parse their target
+    // with — permits `\` (0x5C) in the path component, so `:path` reaches the
+    // gateway as written.
+    Case {
+        target: "/canon/a\\b",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a literal backslash is a path separator to the URL parser",
+    },
+    Case {
+        target: "/canon\\blocked/thing",
+        status: 400,
+        backend_target: Backend::Never,
+        why: "a literal backslash is refused before the termination rule runs",
     },
 ];
 
@@ -437,13 +463,6 @@ fn assert_case(protocol: &str, case: &Case, status: u16, observed: Vec<String>) 
         Backend::Never => assert!(
             observed.is_empty(),
             "{protocol} {}: request must never reach a backend ({}), backend saw {observed:?}",
-            case.target,
-            case.why
-        ),
-        Backend::Reached => assert_eq!(
-            observed.len(),
-            1,
-            "{protocol} {}: expected exactly one backend request ({}), backend saw {observed:?}",
             case.target,
             case.why
         ),

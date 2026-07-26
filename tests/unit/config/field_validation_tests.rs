@@ -349,14 +349,46 @@ fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
         );
     }
 
-    // Negative: a literal dot segment is equally visible to operator, gateway,
-    // and backend, so canonicalization leaves it alone.
-    proxy.listen_path = Some("/api/../admin".into());
-    let result = proxy.validate_fields();
-    if let Err(errs) = &result {
+    // A literal dot segment or backslash is refused too: every RFC 3986 /
+    // WHATWG normalizer removes dot segments and the `url` parser treats `\`
+    // as a separator, so neither can appear in a canonical request path and
+    // neither is reachable as a literal listen_path.
+    for path in [
+        "/api/../admin",
+        "/api/./admin",
+        "/api/..",
+        "/api\\admin",
+        "=/api/../admin",
+    ] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected literal-structure rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Negative: a `~regex` listen_path is a pattern, not a literal path. `\`
+    // and `.` are regex syntax there, and the canonical path it is matched
+    // against already cannot contain a dot segment or a backslash, so holding
+    // the pattern to the literal rules would kill a working route without
+    // closing anything.
+    for path in [r"~^/v1\.0/.*", "~^/api/v[0-9]+", "~(?i:/Api.*)"] {
+        proxy.listen_path = Some(path.into());
+        if let Err(errs) = proxy.validate_fields() {
+            assert!(
+                !errs.iter().any(|e| e.contains(MARKER)),
+                "did not expect a canonical-path rejection for pattern {path:?}, got {errs:?}"
+            );
+        }
+    }
+
+    // A `.` inside a segment is an ordinary path character and stays valid.
+    proxy.listen_path = Some("/v1.0/reports".into());
+    if let Err(errs) = proxy.validate_fields() {
         assert!(
             !errs.iter().any(|e| e.contains(MARKER)),
-            "did not expect a canonical-path rejection for a literal dot segment, got {errs:?}"
+            "did not expect a canonical-path rejection for `/v1.0/reports`, got {errs:?}"
         );
     }
 }
