@@ -3816,3 +3816,90 @@ fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() 
     assert!(accumulator.entry_count() <= MAX_ENTRIES);
     assert!(accumulator.retained_bytes_for_tests() <= MAX_BYTES);
 }
+
+// --- Billing identity integrity (GHSA-m28c-f3v5-26qg) ---
+
+/// Two authenticated identities sharing a 512-byte prefix must produce two
+/// snapshot accumulator entries and two exported `consumer_id` values. A
+/// prefix-only bound merged their calls, bytes, and charges into one billed
+/// principal.
+#[test]
+fn snapshot_keeps_shared_prefix_identities_separate() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.25,
+        charge_total: 0.25,
+        ..ChargeComputation::default()
+    };
+
+    let prefix = "p".repeat(512);
+    let alice = format!("{prefix}alice");
+    let bob = format!("{prefix}bob");
+    let summary = grpc_summary("shared-prefix", "0");
+    accumulator.record_http_for_test(&summary, &alice, charge);
+    accumulator.record_http_for_test(&summary, &bob, charge);
+
+    assert_eq!(
+        accumulator.entry_count(),
+        2,
+        "shared-prefix identities must not share one accumulator entry"
+    );
+
+    let events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-identity")
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    let mut consumer_ids: Vec<&str> = events
+        .iter()
+        .map(|event| event.consumer_id.as_str())
+        .collect();
+    consumer_ids.sort_unstable();
+    assert_ne!(
+        consumer_ids[0], consumer_ids[1],
+        "distinct principals must export distinct consumer_id values"
+    );
+    for consumer_id in &consumer_ids {
+        assert!(consumer_id.len() <= 512, "consumer_id exceeded the bound");
+        assert!(
+            consumer_id.contains("~sha256:"),
+            "oversized identity must carry a digest of the complete value"
+        );
+    }
+    for event in &events {
+        assert_eq!(event.call_count, 1, "charges must not be merged");
+    }
+}
+
+/// A 512-byte identity is exactly at the bound and must be exported verbatim.
+#[test]
+fn snapshot_exports_at_limit_identity_verbatim() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.25,
+        charge_total: 0.25,
+        ..ChargeComputation::default()
+    };
+
+    let consumer = "u".repeat(512);
+    accumulator.record_http_for_test(&grpc_summary("at-limit", "0"), &consumer, charge);
+
+    let events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-at-limit")
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].consumer_id, consumer);
+}

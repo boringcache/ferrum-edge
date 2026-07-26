@@ -31,7 +31,15 @@ paths:
 - Multiple scoped instances of the same type may coexist.
 - Exception: `api_chargeback` admits at most one effective instance per proxy
   after merge (shared `/charges` registry is exactly-once) and requires every
-  enabled instance to agree on the process-global render/cleanup tunables.
+  enabled instance to agree on the process-global render/cleanup/budget
+  tunables (`max_entries` / `max_retained_bytes` included). The registry admits
+  at most `max_entries` billing identities; refused identities fold into the
+  fixed-cardinality `__cardinality_overflow__` row rather than being dropped.
+- Billing identities are never prefix-truncated. External identity claims above
+  512 bytes are rejected at the authentication boundary
+  (`commit_authentication_attempt`); anything still needing a bound inside
+  chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
+  digest of the complete value).
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

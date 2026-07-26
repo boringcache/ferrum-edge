@@ -20,6 +20,7 @@ mod ai_tool_governor_tests;
 mod ai_transcript_audit_tests;
 mod api_chargeback_sink_tests;
 mod api_chargeback_tests;
+mod authenticated_identity_bounds_tests;
 mod basic_auth_tests;
 mod batching_logger_tests;
 mod body_transform_tests;
