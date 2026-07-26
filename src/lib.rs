@@ -2110,7 +2110,27 @@ pub mod _test_support {
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────
-    pub use crate::config::db_loader::DbPoolConfig;
+    pub use crate::config::db_loader::{
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
+        SqlReconnectTransitionTestHooks,
+    };
+
+    /// Install (or clear) SQL reconnect transition test hooks on one store.
+    pub fn database_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        hooks: Option<SqlReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
+    }
+
+    /// Drive a failover-topology reconnect without the primary-first probe in
+    /// `try_failover_reconnect` (issue #3001 transition serialization tests).
+    pub async fn database_store_reconnect_as_failover_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        db_url: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.reconnect_as_failover(db_url).await
+    }
 
     // ── config/batch_atomicity ───────────────────────────────────────────────
     pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};

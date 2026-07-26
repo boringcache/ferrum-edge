@@ -888,21 +888,48 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         "primary failback must mark_primary only after publication:\n{reconnect}"
     );
 
-    // SQL parity: failover topology flips before pool publication.
+    // SQL parity: failover topology flips before pool publication, and the
+    // reconnect transition mutex serializes publication through deferred
+    // migrations / primary mark_primary so concurrent callers cannot leave
+    // pool and topology mismatched (issue #3001).
     let sql_source = include_str!("../../../src/config/db_loader.rs");
     let sql_reconnect = sql_source
         .split("async fn reconnect_for_topology(")
         .nth(1)
         .and_then(|rest| rest.split("\n    /// Extract the hostname").next())
         .expect("DatabaseStore::reconnect_for_topology body");
+    assert!(
+        sql_reconnect.contains("self.reconnect_transition.lock().await"),
+        "SQL reconnect_for_topology must serialize publication under reconnect_transition:\n{sql_reconnect}"
+    );
+    let sql_lock = sql_reconnect
+        .find("self.reconnect_transition.lock().await")
+        .expect("reconnect_transition lock");
     let sql_mark = sql_reconnect
         .find("mark_failover(")
         .expect("SQL failover path must call mark_failover");
     let sql_swap = sql_reconnect
         .find("self.pool.swap(")
         .expect("SQL failover path must swap the pool");
+    let sql_migrations = sql_reconnect
+        .find("maybe_apply_deferred_migrations()")
+        .expect("SQL reconnect must await deferred migrations under the transition lock");
+    let sql_mark_primary = sql_reconnect
+        .find("mark_primary(")
+        .expect("SQL primary path must call mark_primary after migrations");
     assert!(
-        sql_mark < sql_swap,
-        "SQL reconnect_for_topology must mark_failover before pool.swap:\n{sql_reconnect}"
+        sql_lock < sql_mark && sql_mark < sql_swap,
+        "lock -> mark_failover -> pool.swap is the fail-closed failover order:\n{sql_reconnect}"
+    );
+    assert!(
+        sql_swap < sql_migrations && sql_migrations < sql_mark_primary,
+        "pool.swap -> deferred migrations -> mark_primary must stay under the same lock:\n{sql_reconnect}"
+    );
+    let connect_at = sql_reconnect
+        .find("connect_any_pool_with_timeout(")
+        .expect("connect must stay outside the transition mutex");
+    assert!(
+        connect_at < sql_lock,
+        "pool connect must complete before taking reconnect_transition:\n{sql_reconnect}"
     );
 }
