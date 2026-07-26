@@ -4658,7 +4658,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `semantic_vector_max_candidates` | u64 | `16` | Number of nearest HNSW candidates to inspect (`ef_search` / `ef_construction`). Increase when semantic entries span many scopes. Hard maximum 1024; larger values are rejected at admission. |
 | `semantic_embedding_timeout_ms` | u64 | `5000` | Per-request timeout for embedding calls. Embedding failures fall back to a normal cache miss. Also derives the bounded wait for outbound-embedding admission and singleflight coalescing (twice this value, capped at 30s), so a saturated or stalled embedding lane cannot stall a proxied request far past the budget configured here. |
 | `sync_mode` | String | `"local"` | `"local"` (in-memory DashMap) or `"redis"` (centralized Redis) |
-| `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`). URL-embedded userinfo (`redis://user:pass@host`) is accepted but never disclosed: connection/health-check logs and non-admin/audit projections keep only the scheme, host, port, and database, replace the userinfo, and remove query/fragment data. Unparseable values and non-`redis`/`rediss` schemes fail closed to `[REDACTED]` |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:ai_cache"` | Redis key namespace prefix. Defaults to `ferrum:ai_cache` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
@@ -4666,7 +4666,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | -- | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | -- | Redis password |
-| `redis_integrity_key` | String (required in Redis mode) | -- | Narrowly scoped HMAC-SHA256 secret (≥ 32 bytes) that authenticates Redis envelopes. Required when `sync_mode: "redis"`; fail closed at admission if missing. Never logged. Rolling this key quarantines prior entries (no legacy unauthenticated shim). |
+| `redis_integrity_key` | String (required in Redis mode) | -- | Narrowly scoped HMAC-SHA256 secret (≥ 32 bytes) that authenticates Redis envelopes. Required when `sync_mode: "redis"`; fail closed at admission if missing. Never logged, and replaced by `[REDACTED]` in admin audit diffs and in `viewer`/`operator` plugin-config reads (full `admin` reads stay raw so rotation by read-modify-write works). Rolling this key quarantines prior entries (no legacy unauthenticated shim). |
 
 **Behavior:**
 
