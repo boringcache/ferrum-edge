@@ -152,6 +152,10 @@ impl WorkloadApiClient {
     ///
     /// Shared by the live gRPC client and unit tests that drive synthetic
     /// inbound frames without a Unix-socket transport.
+    ///
+    /// Errors are terminal: a transport failure or a decode/identity-pinning
+    /// failure is published and ends the relay, so a later good frame can never
+    /// overwrite it in the capacity-one slot before a slow consumer polls.
     pub fn relay_x509_svid_stream<S>(
         inbound: S,
         expected_spiffe_id: Option<SpiffeId>,
@@ -200,7 +204,21 @@ impl WorkloadApiClient {
                 if !out_tx.publish(bundle_res) {
                     return;
                 }
-                if was_ok && let Some(notify) = notify_tx.take() {
+                if !was_ok {
+                    // A decode failure is terminal, exactly like a transport
+                    // error above. It is security-relevant — the pinned
+                    // `expected_spiffe_id` was absent from the agent's response,
+                    // or the SVID did not parse — and every consumer treats any
+                    // `Err` as "drop the stream and reconnect". Continuing here
+                    // would let the *next* good frame overwrite the error in the
+                    // capacity-one slot before a slow consumer polled it, so the
+                    // identity-pinning violation would reach neither the log nor
+                    // `mesh_cert_rotation_failures_total`. Returning drops the
+                    // sender; the receiver still drains this final pending value,
+                    // so delivery of the error is guaranteed.
+                    return;
+                }
+                if let Some(notify) = notify_tx.take() {
                     let _ = notify.send(());
                 }
             }

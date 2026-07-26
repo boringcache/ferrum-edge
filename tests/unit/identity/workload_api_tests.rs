@@ -1378,6 +1378,90 @@ async fn client_relay_drop_cancels_silent_upstream_stream_promptly() {
 }
 
 #[tokio::test]
+async fn client_relay_decode_error_is_terminal_and_not_masked_by_a_later_good_frame() {
+    // Regression: with an unbounded FIFO relay, a decode failure was always
+    // delivered. Under capacity-one latest-wins, a decode failure that stayed
+    // non-terminal could be overwritten by the next good frame before a slow
+    // consumer polled — so a pinned-SPIFFE-ID violation reached neither the
+    // consumer's `warn!` nor `mesh_cert_rotation_failures_total`. The decode
+    // error must be terminal, exactly like a transport error.
+    use ferrum_edge::identity::workload_api::client::WorkloadApiClient;
+    use ferrum_edge::identity::workload_api::proto::{X509svid, X509svidResponse};
+    use tokio_stream::StreamExt;
+
+    fn svid_frame(spiffe_id: &str) -> X509svidResponse {
+        use ferrum_edge::identity::spiffe::spiffe_id_to_san;
+        use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        let cert = params.self_signed(&key).expect("self-signed leaf");
+        X509svidResponse {
+            svids: vec![X509svid {
+                spiffe_id: spiffe_id.to_string(),
+                x509_svid: cert.der().as_ref().to_vec(),
+                x509_svid_key: key.serialize_der(),
+                bundle: cert.der().as_ref().to_vec(),
+                hint: String::new(),
+            }],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        }
+    }
+
+    let pinned = SpiffeId::new("spiffe://td.test/ns/default/sa/edge").expect("pinned id");
+
+    // Buffer BOTH frames before the relay task can observe either one, so the
+    // ordering under test is deterministic: a wrong-identity frame immediately
+    // followed by a correct one.
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<Result<X509svidResponse, tonic::Status>>(4);
+    inbound_tx
+        .send(Ok(svid_frame("spiffe://td.test/ns/default/sa/attacker")))
+        .await
+        .expect("buffer wrong-identity frame");
+    inbound_tx
+        .send(Ok(svid_frame("spiffe://td.test/ns/default/sa/edge")))
+        .await
+        .expect("buffer good frame");
+    drop(inbound_tx);
+
+    let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+    let (mut stream, _ready) =
+        WorkloadApiClient::relay_x509_svid_stream(inbound, Some(pinned.clone()));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for the relayed decode error")
+        .expect("relay ended without surfacing the decode error");
+    // `SvidBundle` deliberately has no `Debug` (it holds private-key material),
+    // so unwrap the error arm by hand rather than via `expect_err`.
+    let err = match first {
+        Err(e) => e,
+        Ok(_) => panic!("pinned-SPIFFE-ID violation must not be masked by a later good frame"),
+    };
+    assert!(
+        err.to_string().contains(pinned.as_str()),
+        "decode error must name the configured SPIFFE ID (got: {err})"
+    );
+
+    let after = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for relay termination");
+    assert!(
+        after.is_none(),
+        "a decode error must terminate the relay like a transport error does"
+    );
+}
+
+#[tokio::test]
 async fn workload_api_sources_avoid_unbounded_rotation_queues() {
     // Guard against regressing to unbounded mpsc for secret-bearing rotation
     // streams; capacity-one latest-wins + oneshot first-ready are load-bearing.
