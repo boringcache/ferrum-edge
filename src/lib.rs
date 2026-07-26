@@ -43,6 +43,7 @@ pub mod observability_delivery;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
+pub mod policy_path;
 pub mod pool;
 pub mod proxy;
 pub mod request_epoch;

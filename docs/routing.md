@@ -19,6 +19,8 @@ When a request arrives, the gateway first validates protocol authority fields, t
 
 Host normalization strips a valid port suffix, preserves bracketed IPv6 literals, rejects unbracketed IPv6 literals, strips a DNS trailing dot, and lowercases ASCII hostnames. Invalid authority syntax is rejected instead of being routed ambiguously.
 
+The request path used for routing is the **canonical policy path**, derived once at the frontend boundary before route lookup and shared by every policy surface and by the backend request line. Percent-escapes of characters that are legal literally in a path are decoded (`/%61dmin` routes as `/admin`); encoded separators, escape-synthesized dot segments, double encodings, encoded control characters, invalid escapes, and escapes that do not decode to valid UTF-8 are rejected with `400` before routing. Because the same value is used for `strip_listen_path` offsets and for the forwarded path, a route decision can never desync from what the backend executes. Configured `listen_path` values must be written in that same canonical form and are rejected at admission otherwise. See [docs/request_path_canonicalization.md](request_path_canonicalization.md).
+
 ### Step 1: Cache Lookup (O(1))
 
 Before any route table scanning, the router checks two bounded caches keyed by `(host, path)`:

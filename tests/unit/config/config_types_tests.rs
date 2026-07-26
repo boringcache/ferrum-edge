@@ -4254,7 +4254,28 @@ fn test_listen_path_encodings_rejects_single_encoded_slash() {
     assert_eq!(errs.len(), 2);
     assert!(errs.iter().any(|e| e.contains("bad-upper")));
     assert!(errs.iter().any(|e| e.contains("bad-lower")));
-    assert!(errs.iter().all(|e| e.contains("encoded slashes")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_ordinary_single_encoding() {
+    // The advisory's headline case: `/%61dmin` is not a stricter spelling of
+    // `/admin`, it is an unreachable one, because request paths canonicalize
+    // before route lookup.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/admin"),
+        make_proxy("bad", "/%61dmin"),
+        make_proxy("bad-dot-segment", "/api/%2e%2e/admin"),
+        make_proxy("bad-backslash", "/api%5Cadmin"),
+        make_proxy("bad-truncated-escape", "/api%2"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 4);
+    assert!(errs.iter().any(|e| e.contains("bad-dot-segment")));
+    assert!(errs.iter().any(|e| e.contains("bad-backslash")));
+    assert!(errs.iter().any(|e| e.contains("bad-truncated-escape")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 
 #[test]

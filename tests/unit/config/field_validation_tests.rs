@@ -274,15 +274,17 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 }
 
 #[test]
-fn test_proxy_listen_path_rejects_encoded_slashes() {
-    // Prefix form, uppercase / lowercase single-encoded.
+fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
+    const MARKER: &str = "canonical policy path";
+
+    // Prefix form, uppercase / lowercase single-encoded separator.
     let mut proxy = make_proxy("test", "/api");
     for path in ["/api%2Fadmin", "/api%2fadmin"] {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected encoded-separator rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -291,8 +293,29 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected double-encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected double-encoding rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Escapes of characters that are legal literally in a path decode during
+    // canonicalization, so `/%61dmin` is a different (unreachable) spelling of
+    // `/admin` rather than a stricter one. Admission must refuse it.
+    proxy.listen_path = Some("/%61dmin".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains(MARKER)),
+        "expected ordinary-single-encoding rejection, got {errs:?}"
+    );
+
+    // Encoded backslash, encoded dot segment, encoded NUL, and a truncated
+    // escape are all refused for the same reason.
+    for path in ["/api%5Cadmin", "/api/%2e%2e/admin", "/api%00", "/api%2"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected non-canonical rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -300,26 +323,38 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
     proxy.listen_path = Some("=/api%2Fadmin".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected exact-form rejection, got {errs:?}"
     );
 
-    // Regex (`~…`) form is also rejected — request paths are normalized
+    // Regex (`~…`) form is also rejected — request paths are canonicalized
     // before regex evaluation, so a pattern with `%2F` could never match.
     proxy.listen_path = Some("~/api%2F.*".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected regex-form rejection, got {errs:?}"
     );
 
-    // Negative: non-slash percent escapes (e.g. `%20` for space) are allowed.
+    // Negative: an escape of a character that cannot appear literally in a
+    // path (`%20` for space) is already canonical and stays allowed.
     proxy.listen_path = Some("/api%20name".into());
     let result = proxy.validate_fields();
     if let Err(errs) = &result {
         assert!(
-            !errs.iter().any(|e| e.contains("encoded slashes")),
-            "did not expect encoded-slash rejection for `%20`, got {errs:?}"
+            !errs.iter().any(|e| e.contains(MARKER)),
+            "did not expect a canonical-path rejection for `%20`, got {errs:?}"
+        );
+    }
+
+    // Negative: a literal dot segment is equally visible to operator, gateway,
+    // and backend, so canonicalization leaves it alone.
+    proxy.listen_path = Some("/api/../admin".into());
+    let result = proxy.validate_fields();
+    if let Err(errs) = &result {
+        assert!(
+            !errs.iter().any(|e| e.contains(MARKER)),
+            "did not expect a canonical-path rejection for a literal dot segment, got {errs:?}"
         );
     }
 }

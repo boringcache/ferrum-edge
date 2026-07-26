@@ -524,7 +524,7 @@ impl HmacAuth {
                 .map(|proxy| proxy.namespace.as_str())
                 != Some(cached.namespace.as_str())
             || ctx.method != cached.method
-            || ctx.path != cached.path
+            || ctx.raw_path() != cached.path
             || ctx.raw_query_string().unwrap_or_default() != cached.query
             || ctx.headers.get("date").map_or("", String::as_str) != cached.date
             || Self::digest_header_ref(ctx) != Some(cached.digest_header.as_str())
@@ -708,10 +708,17 @@ impl AuthMechanism for HmacAuth {
             signature,
             date: ctx.headers.get("date").cloned().unwrap_or_default(),
             method: ctx.method.clone(),
-            path: ctx.path.clone(),
+            // The client signs the request target it put on the wire, so the
+            // signing string must use the raw path, not the canonical policy
+            // path: a canonicalized `/%61dmin` -> `/admin` would never verify.
+            // This is the one sanctioned consumer of `raw_path()` — the raw
+            // bytes are an input to signature verification only and never
+            // reach routing or any policy surface, both of which already ran
+            // on the canonical path (advisory GHSA-69xf-42xm-4w4f).
+            path: ctx.raw_path().to_string(),
             // Bind the raw query string (verbatim, as received) so query
-            // parameters are covered by the HMAC. `ctx.path` is the path
-            // component only, so without this an attacker could replay a
+            // parameters are covered by the HMAC. The path field above is the
+            // path component only, so without this an attacker could replay a
             // captured signed request with altered/added query parameters.
             query: ctx.raw_query_string().unwrap_or_default().to_string(),
             digest_header,

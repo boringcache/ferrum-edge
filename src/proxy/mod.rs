@@ -18618,6 +18618,47 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
+    // transport-level checks above — which bound the work by the operator's
+    // URL-length limit and settle smuggling/authority questions first — and
+    // before routing, every plugin phase, and backend dispatch, so no
+    // protected surface ever observes a non-canonical target. An ambiguous
+    // target is refused here rather than resolved to one of its readings.
+    //
+    // `path` and `ctx.path` are the only path coordinates the rest of this
+    // handler uses (backend URL building reads the local `path`; plugins read
+    // `ctx.path`), so rebinding both here is what makes policy and the wire
+    // agree. Nothing between `RequestContext::new` and this point inspects the
+    // path.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for every path without a percent escape.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            // The raw target is attacker-controlled: log only the fixed reason
+            // token, never the bytes.
+            warn!(
+                reason = rejection.reason(),
+                "Rejected request: ambiguous percent-encoded request path"
+            );
+            record_request(&state, 400);
+            return Ok(build_response(
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+            ));
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            // Move the original target into the context for `hmac_auth`; the
+            // canonical form replaces it everywhere else.
+            ctx.set_raw_path(std::mem::replace(&mut ctx.path, canonical.clone()));
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
