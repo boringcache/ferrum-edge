@@ -3678,6 +3678,26 @@ pub mod _test_support {
         }
     }
 
+    /// Public mirror of the direct-H2 upload cancellation signal.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UploadCancelSignalForTest {
+        Cancelled,
+        Idle,
+    }
+
+    /// Drive exactly one cancellation poll of a size-limited request body,
+    /// using the same helper `SizeLimitedIncoming::poll_frame` calls.
+    pub fn poll_upload_cancel_for_test(
+        cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> UploadCancelSignalForTest {
+        match crate::proxy::body::poll_upload_cancel_once(cancel) {
+            crate::proxy::body::UploadCancelSignal::Cancelled => {
+                UploadCancelSignalForTest::Cancelled
+            }
+            crate::proxy::body::UploadCancelSignal::Idle => UploadCancelSignalForTest::Idle,
+        }
+    }
+
     pub fn effective_request_body_limit_for_protocol_for_test(
         is_grpc_request: bool,
         http_limit: usize,

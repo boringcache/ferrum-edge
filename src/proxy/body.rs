@@ -1624,6 +1624,20 @@ impl SizeLimitedIncoming {
         }
     }
 
+    /// Arm the upload cancellation channel without installing a completion
+    /// signal.
+    ///
+    /// The direct-H2 dispatch path uses this when request-size limits are
+    /// disabled: there is no response-side gate to satisfy, but an early return
+    /// after `send_request` (a response-header timeout) must still be able to
+    /// tear down hyper's detached HTTP/2 upload pipe instead of leaving it
+    /// draining the client body toward a response nobody will read.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
     /// after `into_reqwest_body()` has moved ownership into reqwest.
     /// Prefer [`new_with_counter`](Self::new_with_counter) when the counter
@@ -1673,6 +1687,57 @@ impl SizeLimitedIncoming {
     }
 }
 
+/// Result of one poll of the direct-H2 upload cancellation channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadCancelSignal {
+    /// The response-side gate timed out and asked for the detached upload pipe
+    /// to be torn down.
+    Cancelled,
+    /// Nothing to do: either no channel is armed, the gate finished normally
+    /// and dropped its sender, or no signal has arrived yet.
+    Idle,
+}
+
+/// Poll the cancellation channel, disarming it once it reaches a terminal
+/// state so a completed `oneshot::Receiver` is never polled twice.
+///
+/// A dropped sender is *not* a cancellation — it means the response-side gate
+/// resolved on its own — so it only disarms the channel. A pending channel
+/// stays armed and leaves `cx`'s waker registered, which is what lets a stalled
+/// upload wake up when the gate later signals.
+#[inline]
+fn poll_upload_cancel(
+    cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cx: &mut Context<'_>,
+) -> UploadCancelSignal {
+    let Some(receiver) = cancel.as_mut() else {
+        return UploadCancelSignal::Idle;
+    };
+    match Pin::new(receiver).poll(cx) {
+        Poll::Ready(Ok(())) => {
+            *cancel = None;
+            UploadCancelSignal::Cancelled
+        }
+        Poll::Ready(Err(_)) => {
+            *cancel = None;
+            UploadCancelSignal::Idle
+        }
+        Poll::Pending => UploadCancelSignal::Idle,
+    }
+}
+
+/// Test hook: drive exactly one [`poll_upload_cancel`] with a no-op waker.
+///
+/// Reached only through `crate::_test_support`, which the binary target does
+/// not compile, so it is dead code there.
+#[allow(dead_code)]
+pub(crate) fn poll_upload_cancel_once(
+    cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+) -> UploadCancelSignal {
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    poll_upload_cancel(cancel, &mut cx)
+}
+
 impl Drop for SizeLimitedIncoming {
     fn drop(&mut self) {
         if self.completion.is_none() {
@@ -1692,21 +1757,11 @@ impl http_body::Body for SizeLimitedIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let cancel_poll = this.cancel.as_mut().map(|cancel| Pin::new(cancel).poll(cx));
-        match cancel_poll {
-            Some(Poll::Ready(Ok(()))) => {
-                this.cancel = None;
-                this.signal_completion(RequestBodyOutcome::Abandoned);
-                return Poll::Ready(Some(Err(
-                    "request body forwarding cancelled after upload timeout".into(),
-                )));
-            }
-            Some(Poll::Ready(Err(_))) => {
-                // The response-side gate completed normally and dropped its
-                // sender. Stop polling the cancellation channel.
-                this.cancel = None;
-            }
-            Some(Poll::Pending) | None => {}
+        if poll_upload_cancel(&mut this.cancel, cx) == UploadCancelSignal::Cancelled {
+            this.signal_completion(RequestBodyOutcome::Abandoned);
+            return Poll::Ready(Some(Err(
+                "request body forwarding cancelled after upload timeout".into(),
+            )));
         }
         match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
             Poll::Ready(Some(Ok(frame))) => {

@@ -4,7 +4,8 @@
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    DirectH2UploadGateForTest, direct_h2_upload_gate_for_test, request_body_drop_outcome_for_test,
+    DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
+    poll_upload_cancel_for_test, request_body_drop_outcome_for_test,
 };
 use ferrum_edge::proxy::body::{ProxyBody, RequestBodyOutcome, StreamingMetrics};
 use http_body::Body;
@@ -459,18 +460,52 @@ fn test_upload_gate_fails_closed_on_missing_signal() {
 }
 
 #[test]
-fn test_direct_h2_upload_timeout_cancels_detached_body_pipe() {
-    // Hyper moves an H2 request body into a detached pipe task once response
-    // headers arrive. The response-side timeout must actively wake that task;
-    // merely dropping the completion receiver leaves a stalled upload pinned.
-    let body_src = include_str!("../../../src/proxy/body.rs");
-    assert!(
-        body_src.contains("request body forwarding cancelled after upload timeout"),
-        "the size-limited body must terminate when the response-side gate cancels it"
+fn test_direct_h2_upload_cancel_signal_lifecycle() {
+    // Hyper moves an H2 request body into a detached pipe task once
+    // `send_request` is called. A dispatch path that returns early must be able
+    // to wake that task; merely dropping the completion receiver leaves a
+    // stalled upload pinned. This pins the three states the body adapter acts
+    // on before every inner poll.
+
+    // Armed but unsignalled: keep forwarding, and stay armed so the gate can
+    // still cancel later.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut cancel = Some(cancel_rx);
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
     );
-    let proxy_src = include_str!("../../../src/proxy/mod.rs");
-    assert!(
-        proxy_src.contains("let _ = cancel_tx.send(());"),
-        "the direct-H2 timeout path must signal the detached upload pipe"
+    assert!(cancel.is_some(), "a pending channel must stay armed");
+
+    // Signalled: the dispatch path timed out and wants the upload torn down.
+    cancel_tx.send(()).expect("receiver is still alive");
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Cancelled
+    );
+    assert!(cancel.is_none(), "a consumed channel must be disarmed");
+
+    // Disarmed: no second cancellation, and no re-poll of a completed receiver.
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
+
+    // Sender dropped without signalling: the dispatch path finished normally,
+    // so the upload keeps flowing and the channel is simply disarmed.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut cancel = Some(cancel_rx);
+    drop(cancel_tx);
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
+    assert!(cancel.is_none(), "a dropped sender must disarm the channel");
+
+    // No channel at all (the reqwest / non-direct-H2 constructors): idle.
+    let mut cancel = None;
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
     );
 }

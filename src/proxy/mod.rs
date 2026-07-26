@@ -32127,9 +32127,15 @@ async fn proxy_to_backend_http2(
     } else {
         usize::MAX
     };
-    let (body, body_completion_rx, mut body_cancel_tx) = if state.max_request_body_size_bytes > 0 {
+    // Arm the cancellation channel unconditionally. `send_request` hands the
+    // request body to hyper's detached HTTP/2 pipe task, so *any* early return
+    // below leaves that task draining the client upload toward a response
+    // nobody will read — whether or not a size limit is configured. Only the
+    // completion channel (and therefore the response gate) is limit-gated.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut body_cancel_tx = Some(cancel_tx);
+    let (body, body_completion_rx) = if state.max_request_body_size_bytes > 0 {
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         (
             body::SizeLimitedIncoming::new_with_counter_and_completion(
                 body,
@@ -32140,7 +32146,6 @@ async fn proxy_to_backend_http2(
                 cancel_rx,
             ),
             Some(completion_rx),
-            Some(cancel_tx),
         )
     } else {
         (
@@ -32149,8 +32154,8 @@ async fn proxy_to_backend_http2(
                 max_request_body_size,
                 Arc::clone(&body_size_exceeded),
                 Arc::clone(ctx_bytes_sent_observed),
-            ),
-            None,
+            )
+            .with_cancel(cancel_rx),
             None,
         )
     };
@@ -32354,6 +32359,15 @@ async fn proxy_to_backend_http2(
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
+                // The request body already moved into hyper's detached HTTP/2
+                // pipe task when `send_request` was called, so returning here
+                // does not stop the upload. Wake the adapter so it yields an
+                // error, resetting the backend stream and releasing the inbound
+                // client body instead of streaming it into a request whose
+                // response we have already abandoned.
+                if let Some(cancel_tx) = body_cancel_tx.take() {
+                    let _ = cancel_tx.send(());
+                }
                 if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                     return request_body_too_large();
                 }
