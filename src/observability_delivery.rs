@@ -7,6 +7,20 @@
 //! admitted terminal work (including internally spawned mirror work), then
 //! closes and awaits every registered queue worker under one absolute budget.
 //!
+//! # Task admission budget
+//!
+//! Terminal, mirror, and deadline-cleanup work share one aggregate pending-task
+//! budget (`FERRUM_LOG_DELIVERY_MAX_TASKS`). Admission reserves a permit with a
+//! lock-free counter *before* spawning or inserting into the task registry.
+//! When the budget is exhausted, spawn returns `false` immediately (non-blocking
+//! reject), increments the aggregate and budget-specific rejected-task
+//! counters, and may emit a warning on the caller thread that is both sampled
+//! and bounded to one line per window. Callers must treat rejection as the
+//! observable signal and must not spawn further deferred work to report the
+//! drop. Permits release when the task completes or is cancelled, so capacity
+//! recovers without waiting for shutdown. The shared shutdown-drain deadline is
+//! unchanged.
+//!
 //! # Generations
 //!
 //! A drained lifecycle is terminal: its task and worker admission stay closed
@@ -66,16 +80,18 @@ fn global() -> &'static DeliverySlot {
 /// Configure the hot task registry before serving-mode plugin activation.
 ///
 /// Called once per process from `main` before mode dispatch. First use creates
-/// the open generation with the configured sharding. If an earlier non-serving
-/// caller already touched the registry, the override is recorded for the next
-/// generation without replacing an open lifecycle that may own live workers.
+/// the open generation with the configured sharding and task budget. If an
+/// earlier non-serving caller already touched the registry, the overrides are
+/// recorded for the next generation without replacing an open lifecycle that
+/// may own live workers.
 ///
 /// Tests and non-serving callers that reach the registry first use the same
-/// auto-sized fallback as other concurrent runtime maps.
-pub fn initialize(pool_shard_override: usize) {
+/// auto-sized fallback as other concurrent runtime maps and the default task
+/// budget.
+pub fn initialize(pool_shard_override: usize, max_tasks: usize) {
     LIFECYCLE
-        .get_or_init(|| DeliverySlot::new(pool_shard_override))
-        .initialize(pool_shard_override);
+        .get_or_init(|| DeliverySlot::with_limits(pool_shard_override, max_tasks))
+        .initialize_with_limits(pool_shard_override, max_tasks);
 }
 
 /// Open the delivery generation for a serving cycle.
@@ -100,17 +116,32 @@ pub fn begin_serving_cycle() -> u64 {
 pub struct DeliverySlot {
     current: ArcSwap<DeliveryLifecycle>,
     pool_shard_override: AtomicUsize,
+    max_tasks: AtomicUsize,
     next_generation: AtomicU64,
 }
 
 impl DeliverySlot {
     pub fn new(pool_shard_override: usize) -> Self {
+        Self::with_limits(
+            pool_shard_override,
+            crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT,
+        )
+    }
+
+    /// Construct a slot with an explicit aggregate task admission budget.
+    ///
+    /// Used by deterministic capacity tests and by process startup after env
+    /// parsing. Values outside the documented clamp are brought into range.
+    pub fn with_limits(pool_shard_override: usize, max_tasks: usize) -> Self {
+        let max_tasks = clamp_max_tasks(max_tasks);
         Self {
-            current: ArcSwap::from_pointee(DeliveryLifecycle::with_pool_shard_amount(
+            current: ArcSwap::from_pointee(DeliveryLifecycle::with_limits(
                 pool_shard_override,
                 1,
+                max_tasks,
             )),
             pool_shard_override: AtomicUsize::new(pool_shard_override),
+            max_tasks: AtomicUsize::new(max_tasks),
             next_generation: AtomicU64::new(2),
         }
     }
@@ -122,9 +153,17 @@ impl DeliverySlot {
     /// registered against it. The new override applies to the next generation.
     /// A drained generation is replaced immediately, which is what lets a
     /// second in-process serve deliver again.
+    #[allow(dead_code)] // Used by external lifecycle tests; production calls `initialize_with_limits`.
     pub fn initialize(&self, pool_shard_override: usize) {
+        self.initialize_with_limits(pool_shard_override, self.max_tasks.load(Ordering::Acquire));
+    }
+
+    /// Record shard and task-budget overrides for the next open generation.
+    pub fn initialize_with_limits(&self, pool_shard_override: usize, max_tasks: usize) {
         self.pool_shard_override
             .store(pool_shard_override, Ordering::Release);
+        self.max_tasks
+            .store(clamp_max_tasks(max_tasks), Ordering::Release);
         // Reuse the same state-aware CAS loop as serving-cycle admission.
         // Re-checking after every failed CAS is essential: another caller may
         // have installed an open generation after we first observed a drained
@@ -141,9 +180,10 @@ impl DeliverySlot {
     }
 
     fn new_generation(&self) -> Arc<DeliveryLifecycle> {
-        Arc::new(DeliveryLifecycle::with_pool_shard_amount(
+        Arc::new(DeliveryLifecycle::with_limits(
             self.pool_shard_override.load(Ordering::Acquire),
             self.next_generation.fetch_add(1, Ordering::Relaxed),
+            self.max_tasks.load(Ordering::Acquire),
         ))
     }
 
@@ -166,6 +206,41 @@ impl DeliverySlot {
     #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the field directly.
     pub fn current_generation(&self) -> u64 {
         self.current.load().generation
+    }
+
+    /// Configured aggregate task admission budget for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the lifecycle field in `render_prometheus`.
+    pub fn max_tasks(&self) -> usize {
+        self.current.load().max_tasks
+    }
+
+    /// Tasks currently held in the registry for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads `tasks.len()` in `render_prometheus`.
+    pub fn active_tasks(&self) -> usize {
+        self.current.load().tasks.len()
+    }
+
+    /// Reserved admission permits for the current generation (registry plus
+    /// in-flight spawn handoff).
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
+    pub fn admitted_tasks(&self) -> u64 {
+        self.current.load().admitted_tasks.load(Ordering::Acquire)
+    }
+
+    /// Aggregate rejected-task count for the current generation.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin uses `rejected_task_count()` in `render_prometheus`.
+    pub fn rejected_tasks(&self) -> u64 {
+        self.current.load().rejected_task_count()
+    }
+
+    /// Budget-exhaustion rejects only, for the current generation.
+    ///
+    /// The aggregate `rejected_tasks` counter also covers closed-admission and
+    /// no-runtime rejects, so operators cannot use it alone to tell whether
+    /// `FERRUM_LOG_DELIVERY_MAX_TASKS` is the limiting factor.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the atomic in `render_prometheus`.
+    pub fn capacity_rejected_tasks(&self) -> u64 {
+        self.current.load().capacity_rejection_count()
     }
 
     fn snapshot(&self) -> Arc<DeliveryLifecycle> {
@@ -278,9 +353,28 @@ impl DeliveryCounters {
     }
 }
 
+fn clamp_max_tasks(max_tasks: usize) -> usize {
+    max_tasks.clamp(
+        crate::logging::LOG_DELIVERY_MAX_TASKS_MIN,
+        crate::logging::LOG_DELIVERY_MAX_TASKS_MAX,
+    )
+}
+
 struct DeliveryLifecycle {
     generation: u64,
     state: AtomicU8,
+    max_tasks: usize,
+    admitted_tasks: AtomicU64,
+    /// Capacity-only rejection count. Kept separate from the aggregate
+    /// rejected-task counters (which also cover closed-admission and
+    /// no-runtime rejects) so the caller-thread warning rate limit cannot be
+    /// starved by shutdown-time rejects.
+    capacity_rejections: AtomicU64,
+    /// Monotonic milliseconds at which the last capacity warning was emitted,
+    /// `0` before the first. Bounds the *rate* of caller-thread diagnostics;
+    /// the count gate alone only samples them, so a sustained flood could
+    /// still scale warnings with rejected traffic.
+    capacity_warn_last_ms: AtomicU64,
     accepting_external_tasks: AtomicBool,
     accepting_internal_tasks: AtomicBool,
     accepting_workers: AtomicBool,
@@ -299,17 +393,21 @@ struct DeliveryLifecycle {
 impl DeliveryLifecycle {
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_pool_shard_amount(0, 1)
+        Self::with_limits(0, 1, crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT)
     }
 
     fn state(&self) -> u8 {
         self.state.load(Ordering::Acquire)
     }
 
-    fn with_pool_shard_amount(pool_shard_override: usize, generation: u64) -> Self {
+    fn with_limits(pool_shard_override: usize, generation: u64, max_tasks: usize) -> Self {
         Self {
             generation,
             state: AtomicU8::new(GENERATION_OPEN),
+            max_tasks: clamp_max_tasks(max_tasks),
+            admitted_tasks: AtomicU64::new(0),
+            capacity_rejections: AtomicU64::new(0),
+            capacity_warn_last_ms: AtomicU64::new(0),
             accepting_external_tasks: AtomicBool::new(true),
             accepting_internal_tasks: AtomicBool::new(true),
             accepting_workers: AtomicBool::new(true),
@@ -325,6 +423,102 @@ impl DeliveryLifecycle {
             workers_changed: Arc::new(Notify::new()),
             counters: DeliveryCounters::new(),
             shutdown_report: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    fn rejected_task_count(&self) -> u64 {
+        self.counters
+            .rejected_terminal
+            .load(Ordering::Relaxed)
+            .saturating_add(self.counters.rejected_mirror.load(Ordering::Relaxed))
+            .saturating_add(
+                self.counters
+                    .rejected_deadline_cleanup
+                    .load(Ordering::Relaxed),
+            )
+    }
+
+    fn try_reserve_task_permit(&self) -> Option<TaskAdmissionPermit<'_>> {
+        let max_tasks = self.max_tasks as u64;
+        // Bounded compare-and-swap rather than add-then-undo: concurrent
+        // callers must never publish a reservation depth above the configured
+        // budget, not even transiently on the exported gauge.
+        self.admitted_tasks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < max_tasks).then_some(admitted + 1)
+            })
+            .ok()
+            .map(|_| TaskAdmissionPermit {
+                lifecycle: self,
+                live: true,
+            })
+    }
+
+    fn release_task_permit(&self) {
+        let released =
+            self.admitted_tasks
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                    admitted.checked_sub(1)
+                });
+        debug_assert!(
+            released.is_ok(),
+            "delivery task permit release requires an owned permit"
+        );
+    }
+
+    /// Budget-exhaustion rejects only. The aggregate `rejected_task_count`
+    /// also covers closed-admission and no-runtime rejects.
+    fn capacity_rejection_count(&self) -> u64 {
+        self.capacity_rejections.load(Ordering::Relaxed)
+    }
+
+    /// Claim the capacity-warning window, returning `true` for the single
+    /// caller that may emit this window's line.
+    ///
+    /// The count gate in `record_capacity_rejection` only *samples* rejections,
+    /// so under a sustained flood the warning rate would still scale with
+    /// attacker-driven traffic. This adds an absolute ceiling of one line per
+    /// window per delivery lifecycle generation, matching the mesh-authz idiom.
+    /// Only the sampled
+    /// callers read the clock, so the reject path stays allocation- and
+    /// syscall-free.
+    fn claim_capacity_warning_window(&self) -> bool {
+        const WINDOW_MS: u64 = 5_000;
+        let now = crate::socket_opts::monotonic_now_ms();
+        let last = self.capacity_warn_last_ms.load(Ordering::Relaxed);
+        // Emit on the first event (`last == 0`) or after a full window. A single
+        // CAS claims the window; losers stay silent. `saturating_sub` guards a
+        // coarse clock that does not advance between calls.
+        if last != 0 && now.saturating_sub(last) < WINDOW_MS {
+            return false;
+        }
+        self.capacity_warn_last_ms
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    fn record_capacity_rejection(&self, kind: DeliveryTaskKind) {
+        self.counters.record_rejected(kind);
+        let capacity_rejections = self
+            .capacity_rejections
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        // Rate-limit caller-thread diagnostics so a saturated sink cannot turn
+        // capacity rejects into a logging storm or recursive deferred work.
+        // Process `warn!` flows through the non-blocking log sinks, not through
+        // deferred delivery spawn, so this cannot re-enter admission.
+        if (capacity_rejections == 1 || capacity_rejections.is_multiple_of(1_024))
+            && self.claim_capacity_warning_window()
+        {
+            warn!(
+                generation = self.generation,
+                ?kind,
+                max_tasks = self.max_tasks,
+                admitted_tasks = self.admitted_tasks.load(Ordering::Acquire),
+                capacity_rejections,
+                rejected_tasks = self.rejected_task_count(),
+                "observability delivery task budget exhausted; rejecting admission"
+            );
         }
     }
 
@@ -350,7 +544,12 @@ impl DeliveryLifecycle {
             self.counters.record_rejected(kind);
             return false;
         }
+        let Some(mut permit) = self.try_reserve_task_permit() else {
+            self.record_capacity_rejection(kind);
+            return false;
+        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // `permit` drops and releases; no registry entry exists yet.
             self.counters.record_rejected(kind);
             return false;
         };
@@ -360,6 +559,8 @@ impl DeliveryLifecycle {
         let lifecycle = Arc::clone(self);
         let task = handle.spawn(async move {
             if start_rx.await.is_err() {
+                // Caller dropped `start_tx` after releasing or transferring the
+                // permit (cancel/send-failure paths). Do not release again.
                 return;
             }
             let _completion = TaskCompletion {
@@ -375,15 +576,27 @@ impl DeliveryLifecycle {
         if self.cancelling_tasks.load(Ordering::Acquire) {
             if let Some((_, task)) = self.tasks.remove(&task_id) {
                 task.abort.abort();
+                // This removal owns the permit via `permit` drop below.
                 self.counters.record_cancelled(kind);
+            } else {
+                // `cancel_remaining` already removed the entry and released.
+                permit.disarm();
             }
             return false;
         }
         if start_tx.send(()).is_err() {
-            self.finish_task(task_id);
-            self.counters.record_cancelled(kind);
+            // Task never started. Reclaim the registry entry when we still own
+            // it; if `cancel_remaining` won the race it already released.
+            if self.tasks.remove(&task_id).is_none() {
+                permit.disarm();
+            } else {
+                self.counters.record_cancelled(kind);
+            }
+            self.tasks_changed.notify_one();
             return false;
         }
+        // Successful handoff: registry/`TaskCompletion` owns release.
+        permit.disarm();
         true
     }
 
@@ -395,7 +608,9 @@ impl DeliveryLifecycle {
     }
 
     fn finish_task(&self, task_id: u64) {
-        self.tasks.remove(&task_id);
+        if self.tasks.remove(&task_id).is_some() {
+            self.release_task_permit();
+        }
         self.tasks_changed.notify_one();
     }
 
@@ -490,6 +705,7 @@ impl DeliveryLifecycle {
         for task_id in task_ids {
             if let Some((_, task)) = self.tasks.remove(&task_id) {
                 task.abort.abort();
+                self.release_task_permit();
                 self.counters.record_cancelled(task.kind);
             }
         }
@@ -562,16 +778,7 @@ impl DeliveryLifecycle {
         DeliveryDrainReport {
             tasks_drained,
             workers_drained,
-            rejected_tasks: self
-                .counters
-                .rejected_terminal
-                .load(Ordering::Relaxed)
-                .saturating_add(self.counters.rejected_mirror.load(Ordering::Relaxed))
-                .saturating_add(
-                    self.counters
-                        .rejected_deadline_cleanup
-                        .load(Ordering::Relaxed),
-                ),
+            rejected_tasks: self.rejected_task_count(),
             cancelled_tasks: self
                 .counters
                 .cancelled_terminal
@@ -594,6 +801,28 @@ struct TaskCompletion {
 
 struct TaskRegistration<'a> {
     lifecycle: &'a DeliveryLifecycle,
+}
+
+/// Lock-free admission permit held between reserve and successful registry
+/// handoff. Drop releases unless [`TaskAdmissionPermit::disarm`] transfers
+/// ownership to the registry/`TaskCompletion` path.
+struct TaskAdmissionPermit<'a> {
+    lifecycle: &'a DeliveryLifecycle,
+    live: bool,
+}
+
+impl TaskAdmissionPermit<'_> {
+    fn disarm(&mut self) {
+        self.live = false;
+    }
+}
+
+impl Drop for TaskAdmissionPermit<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            self.lifecycle.release_task_permit();
+        }
+    }
 }
 
 impl Drop for TaskRegistration<'_> {
@@ -872,6 +1101,9 @@ pub fn render_prometheus() -> String {
     let generation = lifecycle.generation;
     let report = lifecycle.report(true, true);
     let active_tasks = lifecycle.tasks.len();
+    let admitted_tasks = lifecycle.admitted_tasks.load(Ordering::Acquire);
+    let max_tasks = lifecycle.max_tasks;
+    let capacity_rejections = lifecycle.capacity_rejection_count();
     let active_workers = match lifecycle.workers.lock() {
         Ok(workers) => workers
             .values()
@@ -890,13 +1122,22 @@ pub fn render_prometheus() -> String {
          # HELP ferrum_observability_delivery_active_tasks Deferred observability tasks currently owned by the shutdown lifecycle.\n\
          # TYPE ferrum_observability_delivery_active_tasks gauge\n\
          ferrum_observability_delivery_active_tasks {active_tasks}\n\
+         # HELP ferrum_observability_delivery_admitted_tasks Deferred observability tasks holding an admission permit (registry plus in-flight spawn handoff).\n\
+         # TYPE ferrum_observability_delivery_admitted_tasks gauge\n\
+         ferrum_observability_delivery_admitted_tasks {admitted_tasks}\n\
+         # HELP ferrum_observability_delivery_max_tasks Configured aggregate admission budget for terminal, mirror, and deadline-cleanup tasks.\n\
+         # TYPE ferrum_observability_delivery_max_tasks gauge\n\
+         ferrum_observability_delivery_max_tasks {max_tasks}\n\
          # HELP ferrum_observability_delivery_active_workers Queue workers currently owned by the shutdown lifecycle.\n\
          # TYPE ferrum_observability_delivery_active_workers gauge\n\
          ferrum_observability_delivery_active_workers {active_workers}\n\
-         # HELP ferrum_observability_delivery_rejected_tasks_total Delivery tasks rejected after lifecycle admission closed or without a runtime.\n\
+         # HELP ferrum_observability_delivery_rejected_tasks_total Delivery tasks rejected after lifecycle admission closed, task-budget exhaustion, or without a runtime.\n\
          # TYPE ferrum_observability_delivery_rejected_tasks_total counter\n\
          ferrum_observability_delivery_rejected_tasks_total {}\n\
-         # HELP ferrum_observability_delivery_cancelled_tasks_total Delivery tasks cancelled when the shutdown budget expired.\n\
+         # HELP ferrum_observability_delivery_capacity_rejected_tasks_total Delivery tasks rejected specifically because the aggregate task budget was exhausted.\n\
+         # TYPE ferrum_observability_delivery_capacity_rejected_tasks_total counter\n\
+         ferrum_observability_delivery_capacity_rejected_tasks_total {capacity_rejections}\n\
+         # HELP ferrum_observability_delivery_cancelled_tasks_total Delivery tasks cancelled on shutdown-budget expiry or during spawn/cancel handoff races.\n\
          # TYPE ferrum_observability_delivery_cancelled_tasks_total counter\n\
          ferrum_observability_delivery_cancelled_tasks_total {}\n\
          # HELP ferrum_observability_delivery_lost_worker_records_total Queued records abandoned when worker drain exceeded the shutdown budget.\n\
@@ -915,6 +1156,8 @@ pub fn render_prometheus() -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::Semaphore;
 
     use super::*;
 
@@ -1124,5 +1367,170 @@ mod tests {
             lifecycle.counters.timed_out_drains.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn task_budget_rejects_overflow_without_growing_the_registry() {
+        let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 2));
+        // Counting/closable semaphores instead of `Notify`: `notify_one`
+        // permits saturate at one and `notify_waiters` only reaches waiters
+        // that already registered, so several held tasks lose wakeups.
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+
+        for _ in 0..2 {
+            let task_release = Arc::clone(&release);
+            let task_started = Arc::clone(&started);
+            assert!(lifecycle.spawn(
+                TaskAdmission::External,
+                DeliveryTaskKind::Terminal,
+                async move {
+                    task_started.add_permits(1);
+                    let _ = task_release.acquire().await;
+                },
+            ));
+        }
+        started
+            .acquire_many(2)
+            .await
+            .expect("held tasks report started")
+            .forget();
+
+        assert_eq!(lifecycle.tasks.len(), 2);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
+        assert!(
+            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },)
+        );
+        assert!(!lifecycle.spawn(TaskAdmission::Internal, DeliveryTaskKind::Mirror, async {},));
+        assert!(!lifecycle.spawn(
+            TaskAdmission::External,
+            DeliveryTaskKind::DeadlineCleanup,
+            async {},
+        ));
+        assert_eq!(lifecycle.tasks.len(), 2);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
+        assert_eq!(lifecycle.rejected_task_count(), 3);
+
+        release.close();
+        assert!(
+            lifecycle
+                .wait_for_tasks(Instant::now() + Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+        assert!(
+            lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },)
+        );
+    }
+
+    /// The count gate alone only samples rejections, so a sustained overflow
+    /// would still scale warning lines with attacker-driven traffic. The window
+    /// claim is the absolute ceiling; only one caller may hold it at a time.
+    #[test]
+    fn capacity_warning_window_admits_one_line_per_window() {
+        let lifecycle = DeliveryLifecycle::with_limits(0, 1, 1);
+        assert!(
+            lifecycle.claim_capacity_warning_window(),
+            "the first capacity warning must always be emitted"
+        );
+        for _ in 0..1_000 {
+            assert!(
+                !lifecycle.claim_capacity_warning_window(),
+                "further warnings inside the same window must be suppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn no_runtime_rejection_releases_task_permit() {
+        let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 1));
+        assert!(
+            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },),
+            "spawn without a Tokio runtime must reject"
+        );
+        assert_eq!(lifecycle.tasks.len(), 0);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(lifecycle.rejected_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_remaining_releases_task_permits() {
+        let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 2));
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        for _ in 0..2 {
+            let task_release = Arc::clone(&release);
+            let task_started = Arc::clone(&started);
+            assert!(lifecycle.spawn(
+                TaskAdmission::External,
+                DeliveryTaskKind::Terminal,
+                async move {
+                    task_started.add_permits(1);
+                    let _ = task_release.acquire().await;
+                },
+            ));
+        }
+        started
+            .acquire_many(2)
+            .await
+            .expect("held tasks report started")
+            .forget();
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
+
+        lifecycle.cancel_remaining();
+        assert_eq!(lifecycle.tasks.len(), 0);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+        release.close();
+    }
+
+    /// Regression for the send-failure/cancel race: the loser of registry removal
+    /// must disarm without a second `record_cancelled`, or cancelled counters
+    /// can exceed the number of inserted task ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_spawn_handoff_race_counts_cancelled_at_most_once_per_task() {
+        for _ in 0..64 {
+            let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 64));
+            let start_id = lifecycle.next_task_id.load(Ordering::Relaxed);
+            let spawner_lifecycle = Arc::clone(&lifecycle);
+            let cancel_lifecycle = Arc::clone(&lifecycle);
+
+            let spawner = tokio::spawn(async move {
+                for _ in 0..64 {
+                    let _ = spawner_lifecycle.spawn(
+                        TaskAdmission::External,
+                        DeliveryTaskKind::Terminal,
+                        std::future::pending::<()>(),
+                    );
+                }
+            });
+            let canceller = tokio::spawn(async move {
+                for _ in 0..8 {
+                    cancel_lifecycle.cancel_remaining();
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            spawner.await.expect("spawner must join");
+            canceller.await.expect("canceller must join");
+            lifecycle.cancel_remaining();
+
+            let ids_issued = lifecycle
+                .next_task_id
+                .load(Ordering::Relaxed)
+                .saturating_sub(start_id);
+            let cancelled = lifecycle
+                .counters
+                .cancelled_terminal
+                .load(Ordering::Relaxed);
+            assert_eq!(lifecycle.tasks.len(), 0);
+            assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+            assert!(
+                cancelled <= ids_issued,
+                "cancelled={cancelled} must not exceed inserted task ids={ids_issued}"
+            );
+        }
     }
 }

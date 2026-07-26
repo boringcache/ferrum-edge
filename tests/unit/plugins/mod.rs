@@ -27,6 +27,7 @@ mod body_validator_tests;
 mod bot_detection_tests;
 mod byte_budget_tests;
 mod chargeback_mirror_billing_tests;
+mod claim_header_ownership_tests;
 mod compression_tests;
 mod correlation_id_tests;
 mod cors_tests;

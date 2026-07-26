@@ -57,6 +57,7 @@ rules:
       - serviceentries
       - workloadentries
       - sidecars
+      - proxyconfigs
     verbs: ["get", "list", "watch"]
   - apiGroups: ["telemetry.istio.io"]
     resources:
@@ -64,7 +65,8 @@ rules:
     verbs: ["get", "list", "watch"]
   # T2-B: status sub-resource patching for the Istio CRDs where
   # Ferrum surfaces translation outcome via `kubectl describe`. The
-  # CRDs ship `subresources.status: {}` in Istio's own manifests, so a
+  # CRDs ship `subresources.status: {}` in Istio's own manifests
+  # (including ProxyConfig / proxyconfigs.networking.istio.io), so a
   # standard `istioctl install` already supports this. The writer reads
   # live status before each merge patch so non-Ferrum conditions are
   # preserved, hence `get` is required on the status subresources.
@@ -84,6 +86,7 @@ rules:
       - serviceentries/status
       - workloadentries/status
       - sidecars/status
+      - proxyconfigs/status
     verbs: ["get", "patch", "update"]
   - apiGroups: ["telemetry.istio.io"]
     resources:
