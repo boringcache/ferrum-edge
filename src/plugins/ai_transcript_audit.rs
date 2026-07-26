@@ -1832,10 +1832,10 @@ impl AiTranscriptAudit {
         // content-type downgrade is disabled).
         if scan_limited
             || parsed
-            .as_ref()
-            .and_then(|json| json.get("stream"))
-            .and_then(Value::as_bool)
-            == Some(true)
+                .as_ref()
+                .and_then(|json| json.get("stream"))
+                .and_then(Value::as_bool)
+                == Some(true)
         {
             ctx.metadata
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
@@ -2054,10 +2054,10 @@ impl AiTranscriptAudit {
         // directions.
         if scan_limited
             || parsed
-            .as_ref()
-            .and_then(|json| json.get("stream"))
-            .and_then(Value::as_bool)
-            == Some(true)
+                .as_ref()
+                .and_then(|json| json.get("stream"))
+                .and_then(Value::as_bool)
+                == Some(true)
         {
             ctx.metadata
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
@@ -2702,8 +2702,7 @@ impl Plugin for AiTranscriptAudit {
                 return stream_admission;
             }
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST)
-            && self.capture.streaming != StreamingCapture::Off
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) && self.capture.streaming != StreamingCapture::Off
         {
             // Stream admission above is selective: unsampled successful
             // streams must not consume buffered-response capacity.
@@ -3365,9 +3364,9 @@ fn build_batch_body(batch: &[QueuedAuditRecord]) -> Vec<u8> {
     } else {
         batch.len().saturating_add(1)
     };
-    let total = batch
-        .iter()
-        .fold(framing, |bytes, entry| bytes.saturating_add(entry.json.len()));
+    let total = batch.iter().fold(framing, |bytes, entry| {
+        bytes.saturating_add(entry.json.len())
+    });
     let mut body = Vec::with_capacity(total);
     body.push(b'[');
     for (index, entry) in batch.iter().enumerate() {
