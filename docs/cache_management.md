@@ -202,7 +202,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config fields:** `nonce.max_cache_size` (default 10,000), `nonce.cache_ttl_seconds` (default 300s), `nonce.max_encoded_length` (default 512), and `nonce.max_total_cache_bytes` (default 8,388,608). These are the canonical names; there is no `nonce_replay_protection` alias and that object is rejected as an unknown configuration key.
 
-**Cleanup mechanism:** TTL-based expiration. A nonce is retained only after its PasswordDigest verifies, and its encoded length is checked before Base64 decoding. When either the entry cap or the retained-byte cap is reached, expired entries are purged first; if still at capacity, a bounded oldest-first batch is evicted — the smaller of 10% of `max_cache_size` and 64 keys, so no request clones or sorts the whole key set. If neither pass frees room the request fails closed (HTTP 401) rather than accepting a nonce whose replay window cannot be recorded.
+**Cleanup mechanism:** TTL-based expiration. A nonce is retained only after its PasswordDigest verifies, and its encoded length is checked before Base64 decoding. When either the entry cap or the retained-byte cap is reached, expired entries are purged first; if still at capacity, a bounded oldest-first batch is evicted — the smaller of 10% of `max_cache_size` and 64 keys, so no request clones or sorts the whole key set. If neither pass frees room the request fails closed (HTTP 401) rather than accepting a nonce whose replay window cannot be recorded. Admission, eviction, and retained-byte accounting share one narrow mutex so concurrent claims cannot overshoot either hard cap (same-key races resolve as replay or in-place refresh without a new reservation).
 
 ### LDAP Auth Cache
 

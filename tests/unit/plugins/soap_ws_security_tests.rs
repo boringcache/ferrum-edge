@@ -6,6 +6,8 @@ use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
@@ -296,6 +298,33 @@ fn test_non_object_config_is_error() {
     let result = SoapWsSecurity::new(&json!(null));
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("config must be an object"));
+}
+
+#[test]
+fn test_non_object_config_error_is_redacted_and_bounded() {
+    // A non-object root can still carry credential-like material or be
+    // unbounded. The diagnostic must stay fixed/redacted.
+    let secret = "super-secret-password-material-do-not-echo";
+    let err = SoapWsSecurity::new(&Value::String(format!(
+        "username=alice&password={secret}"
+    )))
+    .err()
+    .expect("non-object must reject");
+    assert_eq!(err, "soap_ws_security: config must be an object");
+    assert!(!err.contains(secret));
+    assert!(!err.contains("alice"));
+
+    let huge = "X".repeat(200_000);
+    let huge_err = SoapWsSecurity::new(&Value::String(huge.clone()))
+        .err()
+        .expect("huge non-object must reject");
+    assert_eq!(huge_err, "soap_ws_security: config must be an object");
+    assert!(!huge_err.contains(&huge));
+    assert!(
+        huge_err.len() < 128,
+        "non-object diagnostic must stay bounded, got len {}",
+        huge_err.len()
+    );
 }
 
 #[test]
@@ -4336,5 +4365,239 @@ async fn test_oversized_wire_nonce_is_rejected_structurally() {
     assert!(
         !body.contains(&encoded[..32]),
         "the nonce must never be echoed back to the client"
+    );
+}
+
+// ── Explicit JSON null vs omission (GHSA-gr7f-55c2-rpvw residual) ───────────
+
+#[test]
+fn test_explicit_null_fields_are_rejected_not_defaulted() {
+    // Previously `present()` filtered null to absence, so these inputs silently
+    // applied weaker/default policy despite OpenAPI typing without nullable.
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "username_token.enabled null",
+            json!({
+                "timestamp": { "require": true },
+                "username_token": {
+                    "enabled": null,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "reject_missing_security_header": false
+            }),
+            "config.username_token.enabled",
+        ),
+        (
+            "saml.audience null",
+            json!({
+                "timestamp": { "require": true },
+                "saml": { "enabled": false, "audience": null },
+                "reject_missing_security_header": false
+            }),
+            "config.saml.audience",
+        ),
+        (
+            "nonce object null",
+            json!({
+                "timestamp": { "require": true },
+                "nonce": null,
+                "reject_missing_security_header": false
+            }),
+            "config.nonce",
+        ),
+        (
+            "timestamp.require null",
+            json!({
+                "timestamp": { "require": null },
+                "reject_missing_security_header": false
+            }),
+            "config.timestamp.require",
+        ),
+        (
+            "credentials null",
+            json!({
+                "timestamp": { "require": true },
+                "username_token": {
+                    "enabled": false,
+                    "credentials": null
+                },
+                "reject_missing_security_header": false
+            }),
+            "config.username_token.credentials",
+        ),
+        (
+            "credential.password null",
+            json!({
+                "timestamp": { "require": false },
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": null}]
+                },
+                "reject_missing_security_header": false
+            }),
+            "password",
+        ),
+    ];
+
+    for (label, config, path_fragment) in cases {
+        let err = SoapWsSecurity::new(config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: explicit null must reject"));
+        assert!(
+            err.contains(path_fragment) && err.contains("must not be null"),
+            "{label}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_omitted_optional_fields_still_admit_defaults() {
+    // Parity pin: omission (not null) still selects documented defaults.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "reject_missing_security_header": false
+    }))
+    .expect("omitted optional nested objects must remain valid");
+    assert!(plugin.check_nonce_replay("omitted-defaults-nonce").is_ok());
+}
+
+// ── Concurrent nonce-cap invariants (GHSA-3ffh-5842-8m92 residual) ──────────
+
+#[test]
+fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
+    const MAX_ENTRIES: usize = 32;
+    const MAX_BYTES: usize = 2_048;
+    const NONCE_LEN: usize = 64;
+    const THREADS: usize = 32;
+    const PER_THREAD: usize = 64;
+
+    let plugin = Arc::new(
+        SoapWsSecurity::new(&json!({
+            "timestamp": { "require": true },
+            "nonce": {
+                "max_cache_size": MAX_ENTRIES,
+                "cache_ttl_seconds": 86_400,
+                "max_encoded_length": NONCE_LEN,
+                "max_total_cache_bytes": MAX_BYTES
+            },
+            "reject_missing_security_header": false
+        }))
+        .expect("tight caps must admit"),
+    );
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let saturated = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_id in 0..THREADS {
+        let plugin = Arc::clone(&plugin);
+        let barrier = Arc::clone(&barrier);
+        let accepted = Arc::clone(&accepted);
+        let saturated = Arc::clone(&saturated);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for index in 0..PER_THREAD {
+                // Fixed-width distinct keys so byte accounting is exact.
+                let nonce = format!("t{thread_id:02}-{:060}", index);
+                debug_assert_eq!(nonce.len(), NONCE_LEN);
+                match plugin.check_nonce_replay(&nonce) {
+                    Ok(()) => {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) if err.contains("at capacity") => {
+                        saturated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => panic!("unexpected nonce outcome: {err}"),
+                }
+                // Caps must hold on every observation, not only at the end.
+                assert!(
+                    plugin.nonce_replay_entry_count() <= MAX_ENTRIES,
+                    "entry cap overshot under concurrency"
+                );
+                assert!(
+                    plugin.nonce_replay_retained_bytes() <= MAX_BYTES,
+                    "byte cap overshot under concurrency"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+
+    let entries = plugin.nonce_replay_entry_count();
+    let bytes = plugin.nonce_replay_retained_bytes();
+    assert!(entries <= MAX_ENTRIES, "final entry count {entries} > {MAX_ENTRIES}");
+    assert!(bytes <= MAX_BYTES, "final retained bytes {bytes} > {MAX_BYTES}");
+    assert_eq!(
+        bytes,
+        entries.saturating_mul(NONCE_LEN),
+        "byte accounting must match retained keys exactly"
+    );
+    assert!(
+        accepted.load(Ordering::Relaxed) >= entries,
+        "accepted claims must cover the retained set"
+    );
+    assert!(
+        saturated.load(Ordering::Relaxed) > 0,
+        "adversarial flood must observe fail-closed saturation"
+    );
+}
+
+#[test]
+fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
+    let plugin = Arc::new(
+        SoapWsSecurity::new(&json!({
+            "timestamp": { "require": true },
+            "nonce": {
+                "max_cache_size": 8,
+                "cache_ttl_seconds": 86_400,
+                "max_encoded_length": 32,
+                "max_total_cache_bytes": 4_096
+            },
+            "reject_missing_security_header": false
+        }))
+        .expect("config must admit"),
+    );
+
+    const THREADS: usize = 64;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let ok = Arc::new(AtomicUsize::new(0));
+    let replay = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let plugin = Arc::clone(&plugin);
+        let barrier = Arc::clone(&barrier);
+        let ok = Arc::clone(&ok);
+        let replay = Arc::clone(&replay);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            match plugin.check_nonce_replay("same-key-concurrent-nonce!!") {
+                Ok(()) => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) if err.contains("nonce replay detected") => {
+                    replay.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => panic!("unexpected same-key outcome: {err}"),
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+
+    assert_eq!(ok.load(Ordering::Relaxed), 1, "exactly one claim may admit");
+    assert_eq!(
+        replay.load(Ordering::Relaxed),
+        THREADS - 1,
+        "all other claims must be replays"
+    );
+    assert_eq!(plugin.nonce_replay_entry_count(), 1);
+    assert_eq!(
+        plugin.nonce_replay_retained_bytes(),
+        "same-key-concurrent-nonce!!".len()
     );
 }
