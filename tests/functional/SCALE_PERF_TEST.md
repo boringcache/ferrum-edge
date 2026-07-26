@@ -40,16 +40,21 @@ The test automatically skips if the container isn't running.
 
 ### MongoDB (`test_scale_perf_30k_proxies_mongodb`)
 
-Uses a MongoDB Docker container to measure how the document-store backend scales. The gateway stores its config collections in the `ferrum_scale` database (`FERRUM_MONGO_DATABASE`) and creates the production indexes automatically on startup. To exercise the incremental `config_changes` polling path, run the benchmark against a replica set; standalone MongoDB falls back to full reloads because change records are not transactionally coupled to resource writes.
+Uses a MongoDB Docker container to measure how the document-store backend scales. The gateway stores its config collections in the `ferrum_scale` database (`FERRUM_MONGO_DATABASE`) and creates the production indexes automatically on startup.
 
-**Prerequisite**: Start the MongoDB container:
+**A replica set is required, not standalone.** The benchmark provisions resources through `POST /batch`, which is all-or-nothing (issue #2401) and therefore needs MongoDB multi-document transactions; a standalone `mongod` refuses the import with `501` instead of applying part of a graph. A replica set also exercises the incremental `config_changes` polling path, since change records are only transactionally coupled to resource writes there.
+
+**Prerequisite**: Start MongoDB as a single-node replica set. `--network host` with a real port matters: a replica-set member advertises its own `host:port` and the driver reconnects to whatever is advertised, so a `-p` mapping would send the driver to the wrong port.
 
 ```bash
-docker run -d --name ferrum-scale-test-mongo \
-  -p 27117:27017 mongo:7
+docker run -d --name ferrum-scale-test-mongo --network host \
+  mongo:7 --replSet rs0 --port 27117 --bind_ip_all
+docker exec ferrum-scale-test-mongo mongosh --quiet --port 27117 --eval \
+  'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27117"}]})'
+export FERRUM_MONGO_REPLICA_SET=rs0
 ```
 
-The test automatically skips if the container isn't running, and drops the `ferrum_scale` database (via `docker exec ... mongosh`) at the start of each run for a clean baseline.
+The test automatically skips if the container isn't running, and drops the `ferrum_scale` database (via `docker exec ... mongosh --port 27117`) at the start of each run for a clean baseline.
 
 ## Test Structure
 
@@ -101,7 +106,7 @@ Constants at the top of the test file control the test parameters:
 
 ## Batch Admin API
 
-The test uses the `POST /batch` endpoint introduced to improve admin write throughput at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each batch is persisted in a single database transaction, eliminating per-row transaction overhead.
+The test uses the `POST /batch` endpoint introduced to improve admin write throughput at scale. Instead of 12,000 individual HTTP requests per batch (4 resources x 3,000), it sends ~120 batch requests (3,000 / 100 chunks x 4 resource types). Each request is persisted in a single database transaction covering its whole graph, eliminating per-row transaction overhead. Because the request is all-or-nothing, any non-2xx response means nothing from that request was applied.
 
 ## Example Output
 
