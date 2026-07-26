@@ -1410,12 +1410,19 @@ impl AiTranscriptAudit {
             }
             // The staged request excerpt grew after the reservation was taken
             // (a request transform refreshed it). Re-acquire the exact amount
-            // if the budget allows; otherwise honor the reservation without
-            // exceeding it by withholding the variable-size excerpts, so a
-            // fail-closed promise is never paid for with unaccounted bytes.
+            // if the budget allows; otherwise withhold variable-size excerpts
+            // and reuse the reservation only when the remaining accounted
+            // bytes still fit. If bounded metadata/envelope alone still
+            // exceeds the reserved lease, refuse rather than queue an
+            // under-accounted record.
             Some((lease, reserved)) => match self.retained_budget.try_acquire(accounted) {
                 Some(exact) => exact,
                 None => {
+                    // Exact growth reacquire failed. Withhold variable-size
+                    // excerpts so a fail-closed reservation is never paid for
+                    // with unaccounted bytes. If bounded metadata/envelope
+                    // alone still exceeds the reserved lease, refuse rather
+                    // than queue an under-accounted record.
                     record.request_body = None;
                     record.request_body_omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
                     if record.accounted_bytes() > reserved {
@@ -1423,7 +1430,16 @@ impl AiTranscriptAudit {
                         record.response_body_omitted_reason =
                             Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
                     }
-                    lease.shrink_to(record.accounted_bytes().min(reserved));
+                    let final_accounted = record.accounted_bytes();
+                    if final_accounted > reserved {
+                        drop(lease);
+                        drop(permit);
+                        self.retained_budget.record_drop(
+                            "record exceeded its reserved retained-byte lease after withholding excerpts",
+                        );
+                        return self.saturated_outcome();
+                    }
+                    lease.shrink_to(final_accounted);
                     lease
                 }
             },
@@ -1624,7 +1640,12 @@ impl AiTranscriptAudit {
         let ttl = self.staging_ttl;
         let max_reservation = self.limits.max_stream_reservation;
         let mut expired_reservations: u64 = 0;
-        self.staging.retain(|_, staging| {
+        // Collect expired stream ids while reclaiming staging; clear the
+        // companion `pending_streams` map only AFTER this retain releases its
+        // shard guards so the two DashMaps are never mutated in an unsafe
+        // lock order.
+        let mut expired_stream_ids: Vec<String> = Vec::new();
+        self.staging.retain(|record_id, staging| {
             if staging.stream_active && staging.commit_permit.is_some() {
                 // An active stream is exempt from the orphan TTL, but not from
                 // a lifetime of its own. `stream_active_since` is stamped by
@@ -1637,15 +1658,25 @@ impl AiTranscriptAudit {
                     return true;
                 }
                 expired_reservations = expired_reservations.saturating_add(1);
+                expired_stream_ids.push(record_id.clone());
                 // Dropping the entry releases the reserved queue permit, the
-                // staging semaphore permit, and both retained-byte leases. A
-                // stream that later terminates still emits a record — it just
-                // carries no request-side excerpt (see
-                // `on_response_stream_terminated`).
+                // staging semaphore permit, and both retained-byte leases.
                 return false;
             }
             now.duration_since(staging.captured_at) < ttl
         });
+        for record_id in expired_stream_ids {
+            // Boundedness takes priority over a late terminal emission: reclaim
+            // any pending-stream slot (and its captured excerpt) so a lost
+            // terminal hook cannot retain response bytes unboundedly. A late
+            // `on_response_stream_terminated` then finds no pending entry and
+            // omits rather than exporting stale body evidence.
+            if let Some((_, slot)) = self.pending_streams.remove(&record_id)
+                && let Ok(mut guard) = slot.captured.lock()
+            {
+                *guard = None;
+            }
+        }
         if expired_reservations > 0 {
             let total = self
                 .stream_reservations_expired
@@ -1901,8 +1932,9 @@ impl AiTranscriptAudit {
             // and drops the old lease afterwards — briefly double-charged,
             // which errs toward refusing rather than over-retaining. A refused
             // growth withholds the larger excerpt (with an explicit reason)
-            // instead of retaining unaccounted bytes; the request hash and
-            // bounded metadata still export.
+            // and only retains newly grown model/tool strings when they still
+            // fit the existing lease; otherwise the prior accounted values are
+            // kept so no uncharged growth is retained.
             let tool_bytes: usize = match bounded_tools.as_ref() {
                 Some(bounded) => tool_names_bytes(&bounded.names),
                 None => tool_names_bytes(&staged.tool_names),
@@ -1913,6 +1945,7 @@ impl AiTranscriptAudit {
                 model_bytes,
                 tool_bytes,
             );
+            let mut apply_refreshed_metadata = true;
             if refreshed_bytes <= staged.retained_bytes {
                 staged.retained_lease.shrink_to(refreshed_bytes);
                 staged.retained_bytes = refreshed_bytes;
@@ -1927,20 +1960,37 @@ impl AiTranscriptAudit {
                 if without_excerpt <= staged.retained_bytes {
                     staged.retained_lease.shrink_to(without_excerpt);
                     staged.retained_bytes = without_excerpt;
+                } else {
+                    // New model/tool values do not fit the retained lease and
+                    // no replacement lease exists. Keep prior accounted
+                    // metadata; shrink to the post-omission footprint of those
+                    // prior values so the lease still matches retained strings.
+                    apply_refreshed_metadata = false;
+                    let prior_model_bytes =
+                        staged.request_model.as_deref().map_or(0, str::len);
+                    let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
+                    let prior_without_excerpt =
+                        staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
+                    if prior_without_excerpt <= staged.retained_bytes {
+                        staged.retained_lease.shrink_to(prior_without_excerpt);
+                        staged.retained_bytes = prior_without_excerpt;
+                    }
                 }
             }
 
             staged.request_excerpt = request_excerpt;
             staged.request_truncated = request_truncated;
             staged.request_body_omitted_reason = request_body_omitted_reason;
-            staged.request_model = bounded_model.value;
-            staged.request_model_truncated = bounded_model.truncated;
-            staged.request_model_hash = bounded_model.hash;
-            if let Some(bounded_tools) = bounded_tools {
-                staged.tool_names = bounded_tools.names;
-                staged.tool_names_truncated = bounded_tools.truncated;
-                staged.tool_names_omitted = bounded_tools.omitted;
-                staged.tool_names_hash = bounded_tools.hash;
+            if apply_refreshed_metadata {
+                staged.request_model = bounded_model.value;
+                staged.request_model_truncated = bounded_model.truncated;
+                staged.request_model_hash = bounded_model.hash;
+                if let Some(bounded_tools) = bounded_tools {
+                    staged.tool_names = bounded_tools.names;
+                    staged.tool_names_truncated = bounded_tools.truncated;
+                    staged.tool_names_omitted = bounded_tools.omitted;
+                    staged.tool_names_hash = bounded_tools.hash;
+                }
             }
         }
         // Re-detect `stream` on the FINAL backend-visible body: a
@@ -3330,13 +3380,17 @@ fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
             Some(_) => return Err(AckFailure::ReportedFailures),
         }
     }
-    if let Some(Value::String(status)) = ack.get("status")
-        && !matches!(
-            status.to_ascii_lowercase().as_str(),
-            "ok" | "success" | "accepted" | "created" | "partial_ok"
-        )
-    {
-        return Err(AckFailure::ReportedFailures);
+    match ack.get("status") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(status))
+            if matches!(
+                status.to_ascii_lowercase().as_str(),
+                "ok" | "success" | "accepted" | "created" | "partial_ok"
+            ) => {}
+        // A present non-string or non-affirmative status is ambiguous and must
+        // not be treated as acknowledgement success. Diagnostics stay
+        // fixed-cardinality (no response bytes).
+        Some(_) => return Err(AckFailure::ReportedFailures),
     }
     Ok(())
 }

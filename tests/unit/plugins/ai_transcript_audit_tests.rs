@@ -7203,6 +7203,9 @@ async fn json_acknowledgement_policy_distinguishes_reported_failures_from_succes
         (r#"{"status":"ok","errors":0}"#, true),
         (r#"{"status":"ok","errors":3}"#, false),
         (r#"{"status":"partial_failure"}"#, false),
+        // A present non-string status is ambiguous and must not count as success.
+        (r#"{"status":true}"#, false),
+        (r#"{"status":1}"#, false),
         ("not json at all", false),
     ] {
         let server = MockServer::start().await;
@@ -7309,6 +7312,279 @@ async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
     );
 }
 
+/// Refusing refresh growth must never retain newly enlarged model/tool strings
+/// without a covering lease: the old staged entry stays small, the budget has
+/// no headroom for growth, and both the exported record and `retained_bytes`
+/// stay within the lease/budget.
+#[tokio::test]
+async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "buffer_max_bytes": 65536
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 50,
+                    "buffer_capacity": 10000,
+                    "max_retries": 0
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // Stage a deliberately small candidate (tiny model, no tools).
+    let small_body = br#"{"model":"a","messages":[{"role":"user","content":"hi"}]}"#;
+    let mut ctx = make_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8_lossy(small_body).into_owned(),
+    );
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        plugin.status_snapshot().retained_bytes > 0,
+        "staging must charge a lease"
+    );
+
+    // Saturate the aggregate budget with other staged candidates so a refresh
+    // growth reacquire (which briefly double-charges) has no headroom.
+    let mut fillers = Vec::new();
+    for _ in 0..80 {
+        let mut filler = make_ctx();
+        filler.metadata.insert(
+            "request_body".to_string(),
+            String::from_utf8_lossy(small_body).into_owned(),
+        );
+        let mut headers = filler.headers.clone();
+        plugin.before_proxy(&mut filler, &mut headers).await;
+        if filler
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str)
+            != Some("true")
+        {
+            break;
+        }
+        fillers.push(filler);
+        let snap = plugin.status_snapshot();
+        if snap.buffer_max_bytes.saturating_sub(snap.retained_bytes) < 4_096 {
+            break;
+        }
+    }
+    let before_refresh = plugin.status_snapshot();
+    assert!(
+        before_refresh
+            .buffer_max_bytes
+            .saturating_sub(before_refresh.retained_bytes)
+            < 4_096,
+        "budget must be near saturation before the growth attempt"
+    );
+
+    // Transform grows model to the full bound and adds a large tool set.
+    let grown_model = "m".repeat(MAX_MODEL_BYTES);
+    let mut tools = Vec::new();
+    let mut aggregate = 0usize;
+    let mut index = 0usize;
+    while aggregate < MAX_TOOL_NAMES_AGGREGATE_BYTES.saturating_sub(MAX_TOOL_NAME_BYTES)
+        && tools.len() < MAX_TOOL_NAMES
+    {
+        let name = format!("tool_{index:04}_{}", "t".repeat(96));
+        aggregate = aggregate.saturating_add(name.len().min(MAX_TOOL_NAME_BYTES));
+        tools.push(json!({"type":"function","function":{"name": name}}));
+        index += 1;
+    }
+    let refreshed = json!({
+        "model": grown_model.clone(),
+        "messages": [{"role":"user","content":"transformed"}],
+        "tools": tools
+    });
+    let refreshed_bytes = serde_json::to_vec(&refreshed).expect("body");
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &refreshed_bytes)
+        .await;
+
+    let after_refresh = plugin.status_snapshot();
+    assert!(
+        after_refresh.retained_bytes <= after_refresh.buffer_max_bytes,
+        "refresh must not charge beyond the budget: {} > {}",
+        after_refresh.retained_bytes,
+        after_refresh.buffer_max_bytes
+    );
+
+    // Drop fillers so the small, correctly-leased record can enqueue and flush.
+    drop(fillers);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "expected the repaired record to export");
+    let record = &records[0];
+    assert_eq!(
+        record.get("request_body_omitted_reason").and_then(Value::as_str),
+        Some("retained_byte_budget"),
+        "refused growth must withhold the enlarged excerpt"
+    );
+    let model = record.get("model").and_then(Value::as_str).unwrap_or("");
+    assert_eq!(
+        model, "a",
+        "prior accounted model must be kept when growth does not fit the lease"
+    );
+    assert_ne!(model, grown_model.as_str());
+    let tool_bytes: usize = record
+        .get("tool_names")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str().map(str::len))
+                .sum()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        tool_bytes, 0,
+        "prior empty tool set must be kept when growth does not fit the lease"
+    );
+    let final_snap = plugin.status_snapshot();
+    assert!(
+        final_snap.retained_bytes <= final_snap.buffer_max_bytes,
+        "retained_bytes {} must stay within budget {}",
+        final_snap.retained_bytes,
+        final_snap.buffer_max_bytes
+    );
+}
+
+/// After exact reacquire fails and bodies are withheld, a record whose
+/// remaining accounted bytes still exceed the fail-closed reservation must not
+/// be queued under-accounted.
+#[tokio::test]
+async fn enqueue_refuses_under_accounted_reservation_after_body_withholding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "buffer_max_bytes": 65536
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 50,
+                    "buffer_capacity": 10000,
+                    "max_retries": 0,
+                    "on_buffer_full": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    // Take the fail-closed commit reservation against the small staged footprint.
+    let admission = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert!(
+        matches!(admission, PluginResult::Continue),
+        "pre-commit admission must succeed: {admission:?}"
+    );
+
+    // Fill remaining budget so enqueue cannot reacquire an exact larger lease.
+    let filler_body = br#"{"model":"a","messages":[{"role":"user","content":"pad"}]}"#;
+    let mut fillers = Vec::new();
+    for _ in 0..80 {
+        let mut filler = make_ctx();
+        filler.metadata.insert(
+            "request_body".to_string(),
+            String::from_utf8_lossy(filler_body).into_owned(),
+        );
+        let mut proxy_headers = filler.headers.clone();
+        plugin.before_proxy(&mut filler, &mut proxy_headers).await;
+        if filler
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str)
+            != Some("true")
+        {
+            break;
+        }
+        fillers.push(filler);
+        let snap = plugin.status_snapshot();
+        if snap.buffer_max_bytes.saturating_sub(snap.retained_bytes) < 4_096 {
+            break;
+        }
+    }
+
+    // Grow harvested metadata after the reservation was taken so accounted
+    // bytes still exceed `reserved` even once request/response bodies are
+    // withheld.
+    ctx.metadata.insert(
+        "ai_prompt_shield.decision".to_string(),
+        "G".repeat(4_096),
+    );
+
+    plugin
+        .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected"),
+        "an under-accounted post-withholding record must fail closed"
+    );
+    let snap = plugin.status_snapshot();
+    assert!(
+        snap.retained_bytes <= snap.buffer_max_bytes,
+        "rejected under-accounted enqueue must not leave the budget over-retained"
+    );
+    assert!(
+        snap.retained_byte_drops > 0,
+        "refusing the under-accounted record must be observable"
+    );
+    let _ = fillers;
+}
+
 /// A record that is delivered releases its retained-byte lease.
 #[tokio::test]
 async fn delivered_record_releases_its_retained_bytes() {
@@ -7389,6 +7665,95 @@ async fn never_ending_stream_reservation_expires_and_releases_capacity() {
         "the abandoned stream reservation must be reclaimed and counted"
     );
     assert_eq!(snapshot.max_stream_reservation_secs, 1);
+}
+
+/// When `on_end` completes but the terminal hook is lost, reservation expiry
+/// must reclaim the companion `pending_streams` entry. A late terminal hook
+/// must neither leak that captured excerpt nor export stale body evidence.
+#[tokio::test]
+async fn expired_stream_reservation_reclaims_pending_stream_state() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "capture": { "streaming_response": true },
+                "limits": { "max_stream_reservation_secs": 1 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "on_buffer_full": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut stuck = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut stuck, &json_headers(), ai_request_body())
+        .await;
+    plugin.on_response_stream_selected(&stuck, 200, Some("text/event-stream"));
+
+    let stale_marker = "stale-stream-body-MUST-NOT-EXPORT";
+    let mut inspector = plugin
+        .response_stream_inspector(&stuck, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let chunk = format!("data: {{\"content\":\"{stale_marker}\"}}\n\n");
+    let _ = inspector.on_chunk(chunk.as_bytes()).await;
+    let _ = inspector.on_end().await;
+    // Drop the inspector without calling the terminal hook: this is the
+    // "terminal hook lost after on_end" failure mode.
+    drop(inspector);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+
+    // Any later admission runs the amortized sweep and must reclaim both the
+    // staging reservation and the pending-stream capture slot.
+    let mut later = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut later, &json_headers(), ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.status_snapshot().stream_reservations_expired,
+        1,
+        "the abandoned stream reservation must be reclaimed and counted"
+    );
+
+    // A late terminal hook must not resurrect the reclaimed pending capture
+    // as exported response evidence.
+    plugin
+        .on_response_stream_terminated(
+            &mut stuck,
+            200,
+            &BodyOutcome::success(chunk.len() as u64),
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    for request in requests {
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(
+            !body.contains(stale_marker),
+            "expired pending-stream state must not export stale body evidence"
+        );
+    }
+    assert_ne!(
+        stuck
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("queued"),
+        "a late terminal after pending-stream reclaim must not queue a stale record"
+    );
 }
 
 /// A body larger than `limits.max_redaction_scan_bytes` must not be parsed,
