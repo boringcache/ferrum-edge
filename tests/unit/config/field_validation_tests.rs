@@ -11,7 +11,7 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
     PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig,
     SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
-    validate_basic_auth_hmac_secret,
+    validate_basic_auth_hmac_secret, validate_pem_cert_file,
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
@@ -1708,6 +1708,43 @@ fn test_proxy_tls_key_without_cert_pairing_error() {
         "Expected cert/key pairing error, got: {:?}",
         errs
     );
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_mixed_bundle_atomically() {
+    let valid = std::fs::read_to_string("tests/certs/server.crt").unwrap();
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), format!("{valid}{malformed}")).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_client_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("a mixed valid/malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_client_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_all_malformed_bundle() {
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), malformed).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_server_ca_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("an all-malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_server_ca_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #1"), "got: {error}");
 }
 
 #[test]

@@ -677,14 +677,20 @@ fn build_peer_chain_verifier(
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<PeerChainVerifier, String> {
     let mut roots = RootCertStore::empty();
-    let added = roots.add_parsable_certificates(
-        trust_bundle
-            .x509_authorities
-            .iter()
-            .map(|d| CertificateDer::from(d.clone())),
-    );
-    if added.0 == 0 {
+    if trust_bundle.x509_authorities.is_empty() {
         return Err("trust bundle for peer's domain has no usable roots".to_string());
+    }
+    for (index, authority) in trust_bundle.x509_authorities.iter().enumerate() {
+        roots
+            .add(CertificateDer::from(authority.clone()))
+            .map_err(|error| {
+                format!(
+                    "trust bundle for peer domain '{}': certificate record #{} is not a usable trust root: {}",
+                    trust_bundle.trust_domain,
+                    index + 1,
+                    error
+                )
+            })?;
     }
 
     // SPIFFE peer verification is chain-only: the peer's identity is its

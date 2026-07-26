@@ -64,20 +64,71 @@ async fn test_tcp_logging_tls_rejects_invalid_ca_bundle_at_construction() {
     ensure_crypto_provider();
     let dir = tempfile::tempdir().expect("tempdir");
     let ca_path = dir.path().join("not-a-cert.pem");
-    std::fs::write(&ca_path, b"this is not a PEM certificate").expect("write garbage CA");
+    std::fs::write(
+        &ca_path,
+        b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write malformed CA");
 
-    let result = TcpLogging::new(
+    let error = TcpLogging::new(
         &json!({
             "host": "logstash.example.com",
             "port": 5141,
             "tls": true,
         }),
         client_with_ca(ca_path.to_str().expect("utf8 path")),
-    );
-    assert!(
-        result.is_err(),
-        "an unparseable CA bundle must be rejected when the plugin is constructed"
-    );
+    )
+    .err()
+    .expect("an all-malformed CA bundle must be rejected at construction");
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_tcp_logging_tls_rejects_mixed_ca_bundle_at_construction() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("mixed-ca.pem");
+    let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+    std::fs::write(
+        &ca_path,
+        format!(
+            "{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
+        ),
+    )
+    .expect("write mixed CA");
+
+    let error = TcpLogging::new(
+        &json!({
+            "host": "logstash.example.com",
+            "port": 5141,
+            "tls": true,
+        }),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("a malformed later CA record must reject plugin construction");
+    assert!(error.contains("TCP logging CA bundle"), "got: {error}");
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_tcp_logging_tls_rejects_empty_custom_ca_store() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("empty-ca.pem");
+    std::fs::write(&ca_path, b"").expect("write empty CA");
+
+    let error = TcpLogging::new(
+        &json!({
+            "host": "logstash.example.com",
+            "port": 5141,
+            "tls": true,
+        }),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("an empty custom CA store must reject plugin construction");
+    assert!(error.contains("no valid PEM certificates"), "got: {error}");
 }
 
 /// Counterpart to the above: TLS with no custom CA (system/webpki roots) still

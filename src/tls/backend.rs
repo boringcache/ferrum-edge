@@ -550,19 +550,18 @@ pub fn build_root_cert_store(
 
     if let Some(ca_path) = ca_path {
         let certs = load_cert_chain(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
-        let (added, ignored) = root_store.add_parsable_certificates(certs);
-        if added == 0 {
-            return Err(TlsError::Rustls(format!(
-                "No valid CA certificates found in {}",
-                ca_path.display()
-            )));
-        }
-        if ignored > 0 {
-            tracing::warn!(
-                "Ignored {} invalid CA certificate(s) while loading {}",
-                ignored,
-                ca_path.display()
-            );
+        let source_value = ca_path.to_string_lossy();
+        let display_source =
+            CertSource::parse(source_value.as_ref(), MaterialKind::CaBundle).redacted_source_id();
+        for (index, certificate) in certs.into_iter().enumerate() {
+            root_store.add(certificate).map_err(|error| {
+                TlsError::Rustls(format!(
+                    "backend CA bundle: certificate record #{} in '{}' is not a usable trust root: {}",
+                    index + 1,
+                    display_source,
+                    error
+                ))
+            })?;
         }
     }
 
@@ -849,21 +848,16 @@ fn load_cert_chain(
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let material = load_backend_material(path, material_kind, kind)?;
     let source_id = material.display_source_id.clone();
-    let certs = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::Pem {
-            kind,
-            path: PathBuf::from(&source_id),
-            details: format!("PEM certificates: {}", e),
-        })?;
-
-    if certs.is_empty() {
-        return Err(TlsError::Pem {
-            kind,
-            path: PathBuf::from(source_id),
-            details: "no PEM certificates found".to_string(),
-        });
-    }
+    let certs = crate::tls::parse_pem_certificate_bundle(
+        material.bytes.expose_secret(),
+        kind,
+        &source_id,
+    )
+    .map_err(|error| TlsError::Pem {
+        kind,
+        path: PathBuf::from(&source_id),
+        details: error.to_string(),
+    })?;
 
     Ok(certs)
 }

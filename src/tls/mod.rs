@@ -71,6 +71,66 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
+/// Parse a non-empty PEM certificate bundle without silently dropping records.
+///
+/// The display source must already be safe for operator-facing diagnostics.
+/// Certificate record indexes are one-based and refer to the original order in
+/// the configured bundle.
+pub(crate) fn parse_pem_certificate_bundle(
+    pem_data: &[u8],
+    label: &str,
+    display_source: &str,
+) -> Result<Vec<CertificateDer<'static>>, anyhow::Error> {
+    let certificates = rustls_pemfile::certs(&mut Cursor::new(pem_data))
+        .enumerate()
+        .map(|(index, result)| {
+            result.map_err(|error| {
+                anyhow::anyhow!(
+                    "{}: certificate record #{} in '{}' is malformed: {}",
+                    label,
+                    index + 1,
+                    display_source,
+                    error
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if certificates.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{}: no valid PEM certificates (no CERTIFICATE records) found in '{}'",
+            label,
+            display_source
+        ));
+    }
+
+    Ok(certificates)
+}
+
+/// Build an exclusive custom root store from a complete PEM bundle.
+///
+/// Every PEM record and every individual rustls root admission must succeed.
+pub(crate) fn root_cert_store_from_pem_bundle(
+    pem_data: &[u8],
+    label: &str,
+    display_source: &str,
+) -> Result<rustls::RootCertStore, anyhow::Error> {
+    let certificates = parse_pem_certificate_bundle(pem_data, label, display_source)?;
+    let mut roots = rustls::RootCertStore::empty();
+    for (index, certificate) in certificates.into_iter().enumerate() {
+        roots.add(certificate).map_err(|error| {
+            anyhow::anyhow!(
+                "{}: certificate record #{} in '{}' is not a usable trust root: {}",
+                label,
+                index + 1,
+                display_source,
+                error
+            )
+        })?;
+    }
+    Ok(roots)
+}
+
 /// Build a throwaway server config for listeners that must bind before real
 /// dynamic TLS material exists. Callers should disable accepting handshakes
 /// until the shared frontend TLS slot receives a real certificate.
@@ -586,33 +646,18 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
             &ca_material.display_source_id,
             cert_expiry_warning_days,
         )?;
-        let ca_certs: Vec<_> = certs(&mut Cursor::new(ca_material.bytes.expose_secret()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "client CA bundle: failed to parse PEM certificates from '{}': {}",
-                    ca_material.display_source_id,
-                    e
-                )
-            })?;
-
-        let mut client_auth_roots = rustls::RootCertStore::empty();
-        let (added, ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
-
-        if added == 0 {
-            return Err(anyhow::anyhow!(
-                "No valid client CA certificates found in {}",
-                ca_material.display_source_id
-            ));
-        }
+        let client_auth_roots = root_cert_store_from_pem_bundle(
+            ca_material.bytes.expose_secret(),
+            "client CA bundle",
+            &ca_material.display_source_id,
+        )?;
 
         info!(
-            "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (added: {}, ignored: {})",
+            "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (roots: {})",
             cert_material.display_source_id,
             key_source_id,
             ca_material.display_source_id,
-            added,
-            ignored
+            client_auth_roots.len()
         );
 
         let mut verifier_builder =
@@ -1205,18 +1250,11 @@ pub(crate) fn load_mesh_tls_config_with_identity_and_client_ca_bytes(
                     )
                 })?;
 
-                let ca_certs: Vec<_> = certs(&mut &ca_bundle.pem[..])
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                let mut client_auth_roots = rustls::RootCertStore::empty();
-                let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
-                if added == 0 {
-                    return Err(anyhow::anyhow!(
-                        "No valid client CA certificates found in {}",
-                        ca_bundle.path
-                    ));
-                }
+                let client_auth_roots = root_cert_store_from_pem_bundle(
+                    ca_bundle.pem,
+                    "mesh client CA bundle",
+                    ca_bundle.path,
+                )?;
 
                 let mut verifier_builder =
                     rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
@@ -1469,25 +1507,11 @@ pub fn build_client_cert_verifier(
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, anyhow::Error> {
     let ca_source = CertSource::parse(ca_bundle_path, MaterialKind::CaBundle);
     let ca_material = load_material_blocking(&ca_source, MaterialKind::CaBundle)?;
-    let ca_certs: Vec<_> = certs(&mut Cursor::new(ca_material.bytes.expose_secret()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "client CA bundle: failed to parse PEM certificates from '{}': {}",
-                ca_material.display_source_id,
-                e
-            )
-        })?;
-
-    let mut client_auth_roots = rustls::RootCertStore::empty();
-    let (added, _ignored) = client_auth_roots.add_parsable_certificates(ca_certs);
-
-    if added == 0 {
-        return Err(anyhow::anyhow!(
-            "No valid client CA certificates found in {}",
-            ca_material.display_source_id
-        ));
-    }
+    let client_auth_roots = root_cert_store_from_pem_bundle(
+        ca_material.bytes.expose_secret(),
+        "client CA bundle",
+        &ca_material.display_source_id,
+    )?;
 
     let mut verifier_builder =
         rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
@@ -1536,17 +1560,7 @@ pub(crate) fn check_cert_expiry_from_pem_bytes(
     display_path: &str,
     warning_days: u64,
 ) -> Result<(), anyhow::Error> {
-    let der_certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
-        .filter_map(|r| r.ok())
-        .collect();
-
-    if der_certs.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{}: no valid PEM certificates found in '{}'",
-            label,
-            display_path
-        ));
-    }
+    let der_certs = parse_pem_certificate_bundle(pem_data, label, display_path)?;
 
     for (i, der) in der_certs.iter().enumerate() {
         let (_, cert) = X509Certificate::from_der(der.as_ref()).map_err(|e| {

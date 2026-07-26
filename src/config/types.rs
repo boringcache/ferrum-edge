@@ -5102,7 +5102,8 @@ fn validate_tls_material_source_field(
     }
 }
 
-/// Validate that a PEM certificate file exists, is readable, and contains at least one valid certificate.
+/// Validate that a PEM certificate source is readable and every declared
+/// certificate record parses successfully.
 pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String> {
     let source =
         crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Cert);
@@ -5121,15 +5122,12 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
             ));
         }
     };
-    let certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
-        .filter_map(|r| r.ok())
-        .collect();
-    if certs.is_empty() {
-        return Err(format!(
-            "{}: no valid PEM certificates found in '{}'",
-            field_name, material.display_source_id
-        ));
-    }
+    crate::tls::parse_pem_certificate_bundle(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 

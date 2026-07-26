@@ -63,6 +63,72 @@ fn strict_mesh_tls_config() -> Arc<rustls::ServerConfig> {
     .expect("strict mesh TLS config")
 }
 
+#[test]
+fn mesh_operator_client_ca_rejects_mixed_bundle_atomically() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("mesh-client-ca.pem");
+    let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+    std::fs::write(
+        &ca_path,
+        format!(
+            "{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
+        ),
+    )
+    .expect("write mixed mesh CA");
+
+    let env = test_env_config();
+    let tls_policy = TlsPolicy::from_env_config(&env).expect("TLS policy");
+    let identity =
+        load_mesh_server_identity("tests/certs/server.crt", "tests/certs/server.key", 30)
+            .expect("mesh server identity");
+    let error = load_mesh_tls_config_with_identity(
+        &identity,
+        Some(ca_path.to_str().expect("utf8 path")),
+        MeshClientAuth::Required,
+        &tls_policy,
+        env.tls_cert_expiry_warning_days,
+        &[],
+        None,
+    )
+    .expect_err("a malformed later mesh CA record must reject the complete candidate")
+    .to_string();
+
+    assert!(error.contains("mesh client CA bundle"), "got: {error}");
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[test]
+fn mesh_operator_client_ca_rejects_all_malformed_bundle() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("malformed-mesh-client-ca.pem");
+    std::fs::write(
+        &ca_path,
+        b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write malformed mesh CA");
+
+    let env = test_env_config();
+    let tls_policy = TlsPolicy::from_env_config(&env).expect("TLS policy");
+    let identity =
+        load_mesh_server_identity("tests/certs/server.crt", "tests/certs/server.key", 30)
+            .expect("mesh server identity");
+    let error = load_mesh_tls_config_with_identity(
+        &identity,
+        Some(ca_path.to_str().expect("utf8 path")),
+        MeshClientAuth::Required,
+        &tls_policy,
+        env.tls_cert_expiry_warning_days,
+        &[],
+        None,
+    )
+    .expect_err("an all-malformed mesh CA bundle must reject the candidate")
+    .to_string();
+
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
 async fn send_plain_http(addr: SocketAddr) -> std::io::Result<Vec<u8>> {
     let mut stream = TcpStream::connect(addr).await?;
     stream

@@ -90,6 +90,13 @@ cat > ca-bundle.pem << EOF
 EOF
 ```
 
+Custom CA and client-certificate bundles are admitted atomically. Every
+declared `CERTIFICATE` record must parse, every custom CA record must be usable
+as a trust root, and a selected custom bundle must contain at least one
+certificate. A failure rejects the complete startup/reload candidate; Ferrum
+never installs only the surviving subset, and existing live pools/health
+clients keep their last-known-good generation.
+
 ### Per-Proxy Configuration
 
 You can also configure mTLS on a per-proxy basis in your configuration files:
