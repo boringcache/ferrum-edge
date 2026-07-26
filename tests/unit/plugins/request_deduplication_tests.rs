@@ -592,11 +592,23 @@ fn test_new_with_redis_config() {
 #[test]
 fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
     for (config, unknown, suggestion) in [
-        (json!({"enforce_requred": true}), "enforce_requred", "enforce_required"),
+        (
+            json!({"enforce_requred": true}),
+            "enforce_requred",
+            "enforce_required",
+        ),
         (json!({"sync_mod": "redis"}), "sync_mod", "sync_mode"),
-        (json!({"scope_by_consumers": false}), "scope_by_consumers", "scope_by_consumer"),
+        (
+            json!({"scope_by_consumers": false}),
+            "scope_by_consumers",
+            "scope_by_consumer",
+        ),
         (json!({"ttl_second": 30}), "ttl_second", "ttl_seconds"),
-        (json!({"redis_ur": "redis://host:6379"}), "redis_ur", "redis_url"),
+        (
+            json!({"redis_ur": "redis://host:6379"}),
+            "redis_ur",
+            "redis_url",
+        ),
     ] {
         let error = RequestDeduplication::new(&config, PluginHttpClient::default())
             .expect_err("unknown key must be rejected");

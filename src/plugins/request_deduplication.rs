@@ -138,12 +138,10 @@ const DEDUP_RECORD_STATE_INFLIGHT: &str = "inflight";
 const DEDUP_RECORD_STATE_COMPLETED: &str = "completed";
 /// Deterministic body for a fail-closed refusal when the centralized
 /// idempotency store cannot be consulted.
-const REDIS_UNAVAILABLE_BODY: &str =
-    r#"{"error":"Idempotency coordination store is unavailable"}"#;
+const REDIS_UNAVAILABLE_BODY: &str = r#"{"error":"Idempotency coordination store is unavailable"}"#;
 /// Deterministic body for a completion that must never be replayed: the
 /// protected operation already ran externally and has no safe replay value.
-const NON_REPLAYABLE_COMPLETION_BODY: &str =
-    r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
+const NON_REPLAYABLE_COMPLETION_BODY: &str = r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
 /// Transient per-request marker, set only while
 /// [`RequestDeduplication::publish_external_operation_tombstone`] drives the
 /// final-body hook, and carrying the publishing instance id so sibling
@@ -554,7 +552,9 @@ enum RedisPublication {
     /// The operation record atomically transitioned from this request's
     /// in-flight ownership to a completed record. `replayable` is false when
     /// only a non-replayable tombstone could be published.
-    Published { replayable: bool },
+    Published {
+        replayable: bool,
+    },
     /// The still-current record is not this request's ownership token: the
     /// lease expired, a successor owns the operation, or the record is already
     /// completed. Nothing was written.
@@ -1548,7 +1548,9 @@ impl RequestDeduplication {
     /// `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY` in `src/plugins/mod.rs`.
     fn owns_completed_external_operation(&self, ctx: &RequestContext) -> bool {
         let key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
-        let owns_state = ctx.request_deduplication_states.contains_key(&self.instance_id);
+        let owns_state = ctx
+            .request_deduplication_states
+            .contains_key(&self.instance_id);
         let serverless_owner = ctx
             .serverless_external_side_effect_owners
             .contains(&self.instance_id);
@@ -1566,19 +1568,24 @@ impl RequestDeduplication {
     async fn publish_external_operation_tombstone(&self, ctx: &mut RequestContext) {
         let external_key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
         let synthetic_key = crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
-        if !ctx.request_deduplication_states.contains_key(&self.instance_id) {
+        if !ctx
+            .request_deduplication_states
+            .contains_key(&self.instance_id)
+        {
             return;
         }
         // Consume only this instance's provenance; sibling instances publish
         // their own tombstones from their own hooks.
-        ctx.serverless_external_side_effect_owners.remove(&self.instance_id);
+        ctx.serverless_external_side_effect_owners
+            .remove(&self.instance_id);
         // The publication path must run instead of the retain-and-return
         // synthetic guard, so the synthetic marker is cleared around the call
         // and restored for any later hook that observes it.
         let synthetic_marker = ctx.metadata.remove(synthetic_key);
         let had_external_marker = ctx.metadata.contains_key(external_key);
         if !had_external_marker {
-            ctx.metadata.insert(external_key.to_string(), "true".to_string());
+            ctx.metadata
+                .insert(external_key.to_string(), "true".to_string());
         }
 
         let headers = HashMap::from([
@@ -3365,7 +3372,10 @@ impl Plugin for RequestDeduplication {
             // `execution_barrier_retention()` so the barrier outlives the lease
             // it replaces. A capacity or Redis rejection there still fails
             // closed on the retained in-flight markers.
-            if ctx.request_deduplication_states.contains_key(&self.instance_id) {
+            if ctx
+                .request_deduplication_states
+                .contains_key(&self.instance_id)
+            {
                 self.publish_external_operation_tombstone(ctx).await;
             }
             ctx.serverless_owned_dedup_publication = previous_publication_owner;
