@@ -2786,6 +2786,22 @@ fn backend_tls_sni_buffering_screen_ignores_disabled_plugin_configs() {
     assert!(rejections.is_empty(), "{msg}");
 }
 
+/// A disabled local plugin must not shadow an enabled global with the same
+/// name; the global's buffering requirement still rejects the SNI proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_disabled_local_does_not_shadow_enabled_global() {
+    let empty = serde_json::json!({});
+    let global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty.clone());
+    let mut local = sni_proxy_plugin("local-web", "grpc_web", empty);
+    local.enabled = false;
+    let config = sni_config_with_plugins(vec![global, local]);
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("enabled global shadowed by disabled local: {rejections:?}");
+    assert!(global_hit && inherited, "{msg}");
+}
+
 /// Unknown / custom plugin names stay admitted; the runtime 502 remains the
 /// fail-closed backstop, so admission must not invent a rejection.
 #[test]

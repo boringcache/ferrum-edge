@@ -3232,7 +3232,11 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
             .iter()
             .find(|pc| pc.id == assoc.plugin_config_id)
         {
-            local_names.insert(pc.plugin_name.as_str());
+            // Mirror PluginCache: disabled local/proxy_group configs are
+            // excluded before merge and do not shadow a same-named global.
+            if pc.enabled {
+                local_names.insert(pc.plugin_name.as_str());
+            }
             if plugin_config_forces_request_body_buffering(&proxy.id, pc, &screener) {
                 errors.push(format!(
                     "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
