@@ -1170,6 +1170,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Set the backend IP allowlist policy for SSRF protection.
     fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy);
 
+    /// Set optional age / per-namespace row retention for durable audit events.
+    fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy);
+
     // -----------------------------------------------------------------------
     // Full config loading
     // -----------------------------------------------------------------------
@@ -1774,6 +1777,10 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error>;
+
+    /// Namespace-scoped, bounded audit retention prune. No-op when retention
+    /// policy is unset. Must never delete rows belonging to another namespace.
+    async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 }
 
 /// Extract resource IDs from a full config.

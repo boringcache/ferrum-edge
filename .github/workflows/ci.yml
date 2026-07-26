@@ -581,6 +581,7 @@ jobs:
               integration::spec_expose_integration_tests
               integration::db_proxy_plugin_association_fail_closed_tests
               integration::admin_audit_rbac_tests
+              integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
               integration::admin_batch_atomicity_tests
               integration::admin_runtime_metrics_tests
@@ -1524,6 +1525,74 @@ jobs:
               exit 1
             fi
           done
+          # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
+          # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
+          # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.startup.enabled=false \
+            --set controlPlane.probes.liveness.enabled=false \
+            --set controlPlane.probes.readiness.enabled=false \
+            --set injector.enabled=true \
+            --set injector.probes.startup.enabled=false \
+            --set injector.probes.liveness.enabled=false \
+            --set injector.probes.readiness.enabled=false \
+            --set eastWest.enabled=true \
+            --set eastWest.probes.startup.enabled=false \
+            --set eastWest.probes.liveness.enabled=false \
+            --set eastWest.probes.readiness.enabled=false \
+            --set ambient.enabled=true \
+            --set ambient.probes.startup.enabled=false \
+            --set ambient.probes.liveness.enabled=false \
+            --set ambient.probes.readiness.enabled=false \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set ca.enabled=true \
+            --set ca.probes.startup.enabled=false \
+            --set ca.probes.liveness.enabled=false \
+            --set ca.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-disabled.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.liveness.override.httpGet.path=/live \
+            --set controlPlane.probes.liveness.override.httpGet.port=admin-http \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-override.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.override.httpGet.path=/health \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.err"; then
+            echo "::error title=Coupled mesh probe override accepted::controlPlane.probes.override must be rejected"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=ebpf \
+            --set nodeAgent.proxyMode=node_waypoint \
+            --set-string nodeAgent.admin.port=19090 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
+          python3 -I .github/scripts/verify_mesh_workload_probes.py \
+            --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
       - name: Core gateway chart static validation
         run: |
@@ -2678,11 +2747,17 @@ jobs:
           kubectl -n ferrum-prod create secret generic ferrum-mesh-production-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          # Kind smoke keeps the production example's secret wiring, but the
+          # example intentionally omits CP gRPC TLS. Without this escape hatch the
+          # binary refuses non-loopback plaintext at startup; readiness probes then
+          # correctly keep the Deployment non-Ready (previously a Ready-race hid
+          # the crash). Do not put ALLOW_PLAINTEXT back into the example values.
           helm install ferrum-prod ./charts/ferrum-mesh -n ferrum-prod \
             -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
-            --set image.pullPolicy=IfNotPresent
+            --set image.pullPolicy=IfNotPresent \
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           kubectl -n ferrum-prod get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/production-pods.txt"
           kubectl -n ferrum-prod describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane-deployment.txt"

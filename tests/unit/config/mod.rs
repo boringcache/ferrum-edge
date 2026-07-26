@@ -1,6 +1,7 @@
 mod admin_enhanced_tls_tests;
 mod admin_listeners_tests;
 mod admin_security_tests;
+mod audit_retention_tests;
 mod auto_bool_tests;
 mod backend_egress_policy_tests;
 mod batch_atomicity_tests;
