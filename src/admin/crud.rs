@@ -759,7 +759,7 @@ async fn persist_create_to_settlement<R: AdminResource>(
     let OwnedWriteSettlementContext {
         db,
         namespace,
-        mut guard,
+        guard,
         http_client,
         state,
         actor,
