@@ -145,7 +145,10 @@ fn no_percent_escape_survives_canonicalization() {
             "{raw:?} canonicalized to {once:?}, which still carries an escape"
         );
         let twice = canonical(&once);
-        assert_eq!(once, twice, "canonicalization must be idempotent for {raw:?}");
+        assert_eq!(
+            once, twice,
+            "canonicalization must be idempotent for {raw:?}"
+        );
         // No byte that would need escaping was emitted literally.
         assert!(
             !once.bytes().any(|byte| byte <= 0x20 || byte >= 0x7F),

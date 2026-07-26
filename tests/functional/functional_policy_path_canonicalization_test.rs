@@ -233,8 +233,7 @@ async fn send_h1_full(proxy_port: u16, target: &str) -> (u16, String) {
         .await
         .expect("connect h1");
     let _ = stream.set_nodelay(true);
-    let request =
-        format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -576,7 +575,9 @@ fn seed_pending_http01_order(store_dir: &std::path::Path) {
         error: None,
     })
     .expect("build ACME order");
-    store.upsert_order(order, false).expect("persist ACME order");
+    store
+        .upsert_order(order, false)
+        .expect("persist ACME order");
 }
 
 /// What an ACME-shaped target must produce.
