@@ -25,6 +25,7 @@ mod http3_server_dispatch_tests;
 mod http3_websocket_tests;
 mod ktls_handoff_tests;
 mod lazy_timeout_tests;
+mod load_balancer_rr_counter_sharding_tests;
 mod load_balancer_tests;
 mod load_balancer_wrr_concurrency_tests;
 mod locality_lb_tests;

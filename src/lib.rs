@@ -3647,6 +3647,37 @@ pub mod _test_support {
         }
     }
 
+    // ── load_balancer first-wave counter seams ───────────────────────────────
+    /// Snapshot parent selection-counter shard phases without widening the
+    /// production `LoadBalancer` API for external unit tests.
+    pub fn selection_counter_phases_for_test(lb: &crate::load_balancer::LoadBalancer) -> [u64; 16] {
+        lb.selection_counter_phases_for_test()
+    }
+
+    /// One RoundRobin pick driven by an explicit counter shard.
+    pub fn select_round_robin_from_shard_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        shard: usize,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        lb.select_round_robin_from_shard_for_test(shard)
+    }
+
+    /// One Random pick driven by an explicit counter shard.
+    pub fn select_random_from_shard_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        shard: usize,
+    ) -> Option<Arc<crate::config::types::UpstreamTarget>> {
+        lb.select_random_from_shard_for_test(shard)
+    }
+
+    /// First-wave locality-distribute bucket moduli across shards for `total`.
+    pub fn distribute_first_wave_bucket_mods_for_test(
+        lb: &crate::load_balancer::LoadBalancer,
+        total: u64,
+    ) -> Option<Vec<u64>> {
+        lb.distribute_first_wave_bucket_mods_for_test(total)
+    }
+
     /// Drive CP listener supervision the same way `control_plane::run` does,
     /// so external tests can assert Ok/Err without constructing a full CP.
     pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(

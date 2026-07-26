@@ -3179,6 +3179,7 @@ jobs:
           run_benchmark=true
           run_ip_restriction_benchmark=false
           run_wrr_benchmark=false
+          run_rr_benchmark=false
           run_ai_semantic_cache_benchmark=false
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
@@ -3238,6 +3239,10 @@ jobs:
             run_wrr_benchmark=true
           fi
 
+          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+            run_rr_benchmark=true
+          fi
+
           if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_ai_semantic_cache_benchmark=true
           fi
@@ -3252,12 +3257,13 @@ jobs:
             echo "run=${run_benchmark}"
             echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
             echo "run_wrr_benchmark=${run_wrr_benchmark}"
+            echo "run_rr_benchmark=${run_rr_benchmark}"
             echo "run_ai_semantic_cache_benchmark=${run_ai_semantic_cache_benchmark}"
             echo "reason=${reason}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
-        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
+        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
         with:
           shared-key: "ci-perf"
 
@@ -3276,6 +3282,15 @@ jobs:
           cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench wrr_selection
           python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_wrr_selection_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --min-parallel-speedup 1.10
+
+      - name: Run RoundRobin selection contention microbenchmark
+        if: steps.perf_changes.outputs.run_rr_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          python3 .github/scripts/verify_rr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
             --min-parallel-speedup 1.10
 
@@ -3362,7 +3377,7 @@ jobs:
           kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true')
+        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
@@ -3370,6 +3385,7 @@ jobs:
             tests/performance/ci_results/
             tests/performance/mesh/target/criterion/ip_restriction_lookup/
             tests/performance/mesh/target/criterion/wrr_selection/
+            tests/performance/mesh/target/criterion/rr_selection/
             tests/performance/mesh/target/criterion/ai_semantic_cache_cleanup_hot_path/
           retention-days: 30
 
@@ -3379,6 +3395,7 @@ jobs:
           RUN: ${{ steps.perf_changes.outputs.run }}
           RUN_IP_RESTRICTION: ${{ steps.perf_changes.outputs.run_ip_restriction_benchmark }}
           RUN_WRR: ${{ steps.perf_changes.outputs.run_wrr_benchmark }}
+          RUN_RR: ${{ steps.perf_changes.outputs.run_rr_benchmark }}
           RUN_AI_SEMANTIC_CACHE: ${{ steps.perf_changes.outputs.run_ai_semantic_cache_benchmark }}
           REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
@@ -3395,6 +3412,12 @@ jobs:
           if [ "${RUN_WRR}" = "true" ]; then
             {
               echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_RR}" = "true" ]; then
+            {
+              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
