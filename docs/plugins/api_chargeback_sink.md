@@ -513,10 +513,14 @@ first tick after storage recovers) into `spool.unbound_files` /
 `spool.unbound_namespaces` in the status JSON, exported as
 `chargeback_sink_spool_unbound_files` and
 `chargeback_sink_spool_unbound_namespaces`, and logged with a rate-limited
-warning naming the counts and directories. They are **never** replayed, deleted,
-evicted, or rerouted. Reconciling them is an explicit operator action: either
-re-point the sink at the original destination so the records become owned again,
-or export/remove them out of band. A record whose `owner_tag` names a different
+warning naming the counts and directories. The aggregate discovery pass shares
+one 100,000-entry traversal budget across the legacy tree and every sibling
+namespace; if that cap is reached, the warning sets `scan_truncated=true` and
+the exported counts are explicit lower bounds rather than performing unbounded
+work on a shared volume. They are **never** replayed, deleted, evicted, or
+rerouted. Reconciling them is an explicit operator action: either re-point the
+sink at the original destination so the records become owned again, or
+export/remove them out of band. A record whose `owner_tag` names a different
 identity but sits inside this namespace (only reachable by tampering or a
 hand-moved file) is treated the same way: counted, reported, never touched.
 Changing the node id or plugin config id moves records to a different parent
@@ -650,8 +654,8 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
-- `chargeback_sink_spool_unbound_files` (records not bound to a live destination identity; never replayed or deleted)
-- `chargeback_sink_spool_unbound_namespaces`
+- `chargeback_sink_spool_unbound_files` (records not bound to a live destination identity; never replayed or deleted; a lower bound when the rate-limited warning reports `scan_truncated=true`)
+- `chargeback_sink_spool_unbound_namespaces` (same bounded-scan lower-bound semantics)
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 

@@ -4331,6 +4331,40 @@ fn legacy_and_orphaned_namespaces_are_reported_but_never_replayed() {
 }
 
 #[test]
+fn unbound_scan_shares_one_entry_budget_across_sibling_namespaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = SpoolManager::for_tests(spool_settings(temp.path(), 1 << 20), "node-a").unwrap();
+    let root = spool.namespace_root_for_tests();
+    let plugin_dir = root.parent().unwrap();
+
+    let mut records = Vec::new();
+    for index in 1..=4 {
+        let day = plugin_dir
+            .join(format!("o{index:032x}"))
+            .join("20260101");
+        fs::create_dir_all(&day).unwrap();
+        let record = day.join(format!("{index:026}.ndjson"));
+        fs::write(&record, b"{\"event_id\":\"orphan\"}\n").unwrap();
+        records.push(record);
+    }
+
+    // The node directory consumes one entry and the plugin directory contains
+    // the live namespace plus these four siblings. Six entries therefore
+    // exhaust one aggregate budget before any sibling can receive a fresh
+    // recursive allowance.
+    let (files, namespaces, truncated) = spool.scan_unbound_records_with_entry_limit_for_tests(6);
+    assert!(truncated, "the aggregate scan must report its global cap");
+    assert!(
+        files < records.len() as u64 && namespaces < records.len() as u64,
+        "a bounded scan must not restart the entry budget for every sibling namespace"
+    );
+    assert!(
+        records.iter().all(|record| record.exists()),
+        "a truncated unbound scan is observability-only and must not mutate records"
+    );
+}
+
+#[test]
 fn destination_change_moves_to_a_fresh_namespace_without_rerouting() {
     let temp = tempfile::tempdir().unwrap();
     let mut before = test_owner_spec("node-a");

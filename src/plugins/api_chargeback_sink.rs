@@ -84,9 +84,10 @@ const SPOOL_WRITE_MARKER: &str = ".write-";
 const SPOOL_TMP_SUFFIX: &str = ".tmp";
 /// Bound recursive spool walks (day dirs + namespace depth headroom).
 const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
-/// Hard cap on all directory entries visited in one scan/reconcile/replay
-/// listing. Counting directories and symlinks as well as regular files prevents
-/// an attacker-controlled tree of empty directories from escaping the bound.
+/// Hard cap on directory entries visited by one bounded tree walk, and on the
+/// aggregate legacy/sibling-namespace portion of the unbound-record scan.
+/// Counting directories and symlinks as well as regular files prevents an
+/// attacker-controlled tree of empty directories from escaping the bound.
 const MAX_SPOOL_TRAVERSAL_ENTRIES: usize = 100_000;
 /// Production age before a foreign or unattributable temp may be reconciled.
 const STALE_TEMP_AGE_SECS: u64 = 300;
@@ -3434,13 +3435,13 @@ fn render_prometheus_for_sinks(
         "chargeback_sink_spool_prepare_failures_total {}\n",
         spool_prepare_failures
     ));
-    output.push_str("# HELP chargeback_sink_spool_unbound_files Retained spool records not bound to a live destination identity (pre-namespace layouts or namespaces orphaned by a destination/config change). Never replayed or deleted.\n");
+    output.push_str("# HELP chargeback_sink_spool_unbound_files Retained spool records not bound to a live destination identity. Never replayed or deleted; an observed lower bound when the bounded aggregate scan is truncated.\n");
     output.push_str("# TYPE chargeback_sink_spool_unbound_files gauge\n");
     output.push_str(&format!(
         "chargeback_sink_spool_unbound_files {}\n",
         spool_unbound_files
     ));
-    output.push_str("# HELP chargeback_sink_spool_unbound_namespaces Managed spool namespaces still holding records for a destination identity no live instance owns.\n");
+    output.push_str("# HELP chargeback_sink_spool_unbound_namespaces Managed spool namespaces still holding records for a destination identity no live instance owns; an observed lower bound when the bounded aggregate scan is truncated.\n");
     output.push_str("# TYPE chargeback_sink_spool_unbound_namespaces gauge\n");
     output.push_str(&format!(
         "chargeback_sink_spool_unbound_namespaces {}\n",
@@ -5150,6 +5151,18 @@ impl SpoolManager {
         )
     }
 
+    /// Re-run the aggregate unbound-record scan with a deterministic global
+    /// entry budget. External tests use this to prove sibling namespaces share
+    /// one bound rather than each receiving a fresh traversal allowance.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn scan_unbound_records_with_entry_limit_for_tests(
+        &self,
+        max_entries: usize,
+    ) -> (u64, u64, bool) {
+        self.scan_unbound_records_with_entry_limit(max_entries)
+    }
+
     pub fn write_events(&self, events: &[ChargeEvent]) -> Result<PathBuf, String> {
         if events.is_empty() {
             return Err(format!("{PLUGIN_NAME}: refusing to spool empty batch"));
@@ -5863,13 +5876,25 @@ impl SpoolManager {
     /// change moves to a different parent subtree and requires explicit operator
     /// discovery. Unbound records are never replayed, deleted, or rerouted.
     fn scan_unbound_records(&self) {
+        let _ = self.scan_unbound_records_with_entry_limit(MAX_SPOOL_TRAVERSAL_ENTRIES);
+    }
+
+    /// Scan legacy and sibling namespaces under one aggregate entry budget.
+    ///
+    /// Giving every sibling subtree a fresh [`MAX_SPOOL_TRAVERSAL_ENTRIES`]
+    /// allowance would make a shared-volume maintenance tick unbounded in the
+    /// number of owner namespaces. A truncated scan reports the observed lower
+    /// bound and an explicit warning; it never replays or mutates an unvisited
+    /// record.
+    fn scan_unbound_records_with_entry_limit(&self, max_entries: usize) -> (u64, u64, bool) {
         let components = match spool_namespace_components(&self.owner) {
             Ok(components) => components,
-            Err(_) => return,
+            Err(_) => return (0, 0, false),
         };
         let root = self.namespace_root.as_path();
         let dir = self.cfg.dir.as_path();
-        let (orphaned, namespaces) = count_unbound_spool_records(dir, &components, root);
+        let (orphaned, namespaces, truncated) =
+            count_unbound_spool_records(dir, &components, root, max_entries);
         let files = orphaned.saturating_add(self.count_foreign_tagged_records());
         self.metrics
             .spool_unbound_files
@@ -5877,12 +5902,13 @@ impl SpoolManager {
         self.metrics
             .spool_unbound_namespaces
             .store(namespaces, Ordering::Relaxed);
-        if files > 0 || namespaces > 0 {
-            self.warn_unbound_records(files, namespaces);
+        if files > 0 || namespaces > 0 || truncated {
+            self.warn_unbound_records(files, namespaces, truncated);
         }
+        (files, namespaces, truncated)
     }
 
-    fn warn_unbound_records(&self, files: u64, namespaces: u64) {
+    fn warn_unbound_records(&self, files: u64, namespaces: u64, truncated: bool) {
         let now = unix_timestamp_seconds();
         let last = self.last_unbound_warn_at.load(Ordering::Relaxed);
         if now.saturating_sub(last) < SPOOL_WARN_INTERVAL_SECS
@@ -5898,9 +5924,10 @@ impl SpoolManager {
             generation = self.generation,
             unbound_files = files,
             unbound_namespaces = namespaces,
+            scan_truncated = truncated,
             spool_dir = %self.cfg.dir.display(),
             managed_namespace = %self.namespace_root.display(),
-            "Chargeback sink found spool records that are not bound to this destination identity; they are never replayed or deleted and must be reconciled or removed by an operator (rate-limited)"
+            "Chargeback sink found spool records that are not bound to this destination identity, or reached the bounded scan limit; reported counts are lower bounds when scan_truncated=true, records are never replayed or deleted, and an operator must reconcile them (rate-limited)"
         );
     }
 }
@@ -6105,45 +6132,80 @@ fn count_unbound_spool_records(
     spool_dir: &Path,
     components: &SpoolNamespaceComponents,
     namespace_root: &Path,
-) -> (u64, u64) {
+    max_entries: usize,
+) -> (u64, u64, bool) {
     let node_dir = spool_dir.join(&components.node);
     let plugin_dir = node_dir.join(&components.plugin);
     let mut files = 0u64;
     let mut namespaces = 0u64;
+    let mut remaining = max_entries;
+    let mut truncated = false;
 
     // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/*.ndjson[.zst]`.
     // Only day-shaped directories are inspected so a sibling plugin config's own
     // managed subtree is never counted against this instance.
-    for day_dir in child_dirs(&node_dir, is_spool_day_component) {
-        files = files.saturating_add(count_records_in(&day_dir));
+    for day_dir in child_dirs_bounded(
+        &node_dir,
+        is_spool_day_component,
+        &mut remaining,
+        &mut truncated,
+    ) {
+        let (records, complete) = count_records_in_bounded(&day_dir, &mut remaining);
+        files = files.saturating_add(records);
+        if !complete {
+            truncated = true;
+            break;
+        }
     }
 
     // Sibling owner namespaces under this node/plugin: what a destination,
     // database, table, ledger, or plugin-id change leaves behind.
-    for owner_dir in child_dirs(&plugin_dir, |name| name.starts_with('o')) {
-        if owner_dir == namespace_root {
-            continue;
-        }
-        let records = count_records_in(&owner_dir);
-        if records > 0 {
-            namespaces = namespaces.saturating_add(1);
-            files = files.saturating_add(records);
+    if !truncated {
+        for owner_dir in child_dirs_bounded(
+            &plugin_dir,
+            |name| name.starts_with('o'),
+            &mut remaining,
+            &mut truncated,
+        ) {
+            if owner_dir == namespace_root {
+                continue;
+            }
+            let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
+            if records > 0 {
+                namespaces = namespaces.saturating_add(1);
+                files = files.saturating_add(records);
+            }
+            if !complete {
+                truncated = true;
+                break;
+            }
         }
     }
-    (files, namespaces)
+    (files, namespaces, truncated)
 }
 
 fn is_spool_day_component(name: &str) -> bool {
     name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Non-symlink child directories of `dir` whose name passes `accept`.
-fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+/// Non-symlink child directories of `dir` whose name passes `accept`, charged
+/// against the caller's aggregate traversal budget.
+fn child_dirs_bounded(
+    dir: &Path,
+    accept: impl Fn(&str) -> bool,
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut dirs = Vec::new();
     for entry in entries.flatten() {
+        if *remaining == 0 {
+            *truncated = true;
+            break;
+        }
+        *remaining = (*remaining).saturating_sub(1);
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -6161,16 +6223,20 @@ fn child_dirs(dir: &Path, accept: impl Fn(&str) -> bool) -> Vec<PathBuf> {
     dirs
 }
 
-fn count_records_in(dir: &Path) -> u64 {
-    let mut records = Vec::new();
-    let mut walk = match SpoolWalk::new(dir, SpoolFileClass::AnyRecord) {
-        Ok(walk) => walk,
-        Err(_) => return 0,
-    };
-    match walk.run(dir, &mut records) {
-        Ok(()) => records.len() as u64,
-        Err(_) => 0,
+/// Count records while consuming the same global budget used to discover
+/// sibling roots. `complete=false` stops the aggregate scan immediately.
+fn count_records_in_bounded(dir: &Path, remaining: &mut usize) -> (u64, bool) {
+    if *remaining == 0 {
+        return (0, false);
     }
+    let mut records = Vec::new();
+    let mut walk = match SpoolWalk::new_inner(dir, SpoolFileClass::AnyRecord, None, *remaining) {
+        Ok(walk) => walk,
+        Err(_) => return (0, false),
+    };
+    let complete = walk.run(dir, &mut records).is_ok();
+    *remaining = (*remaining).saturating_sub(walk.entry_count);
+    (records.len() as u64, complete)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6200,10 +6266,6 @@ struct SpoolWalk<'a> {
 }
 
 impl<'a> SpoolWalk<'a> {
-    fn new(root: &'a Path, class: SpoolFileClass) -> Result<Self, String> {
-        Self::new_inner(root, class, None, MAX_SPOOL_TRAVERSAL_ENTRIES)
-    }
-
     fn new_with_expected_root(
         root: &'a Path,
         class: SpoolFileClass,

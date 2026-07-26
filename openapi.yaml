@@ -21634,13 +21634,18 @@ components:
                     to a live destination identity (pre-namespace layouts,
                     namespaces orphaned by a destination or configuration change,
                     and records carrying another owner's tag). Never replayed,
-                    evicted, or deleted automatically.
+                    evicted, or deleted automatically. Aggregate discovery is
+                    capped at 100,000 entries across all sibling namespaces; if
+                    the rate-limited log reports `scan_truncated=true`, this value
+                    is an observed lower bound.
                 unbound_namespaces:
                   type: integer
                   minimum: 0
                   description: |
                     Managed spool namespaces still holding records for a destination
-                    identity no live instance owns.
+                    identity no live instance owns. This is an observed lower bound
+                    when the bounded aggregate discovery log reports
+                    `scan_truncated=true`.
                 available:
                   type: boolean
                   description: |
@@ -21766,12 +21771,17 @@ components:
                 pre-namespace layouts, namespaces orphaned by a destination or
                 configuration change, and records carrying another owner's tag.
                 They are reported for operator reconciliation and are never
-                replayed, evicted, or deleted automatically.
+                replayed, evicted, or deleted automatically. Aggregate discovery
+                is capped at 100,000 entries across all sibling namespaces; if
+                the rate-limited log reports `scan_truncated=true`, this value is
+                an observed lower bound.
             unbound_namespaces:
               type: integer
               description: |
                 Managed spool namespaces under this node/plugin that still hold
-                records for a destination identity no live instance owns.
+                records for a destination identity no live instance owns. This is
+                an observed lower bound when the bounded aggregate discovery log
+                reports `scan_truncated=true`.
             last_replay_at:
               type: [string, "null"]
               format: date-time
