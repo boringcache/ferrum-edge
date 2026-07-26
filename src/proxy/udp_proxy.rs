@@ -2498,7 +2498,9 @@ fn spawn_session_cleanup(
 ///
 /// Uses `DtlsServer` from the `dtls` module which demultiplexes incoming UDP
 /// datagrams by source address and manages per-client DTLS 1.2/1.3 sessions.
-/// Each accepted client (post-handshake) is handled in its own spawned task.
+/// Each accepted client (post-handshake) is handled in its own spawned task,
+/// including epoch lookup and the full `on_stream_connect` admission chain so
+/// a slow stream-connect plugin cannot stall the shared accept loop.
 #[allow(clippy::too_many_arguments)]
 async fn start_dtls_frontend_listener(
     port: u16,
@@ -2582,7 +2584,10 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                // Atomically reserve a session slot
+                // Atomically reserve a session slot. Epoch lookup and the full
+                // `on_stream_connect` admission chain run inside the per-client
+                // task below (TCP accept-loop isolation parity) so a slow or
+                // hung stream-connect plugin cannot stall `server.accept()`.
                 let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
                 if prev >= max_sessions as u64 {
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -2596,154 +2601,153 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                let epoch = request_epoch.load();
-                let Some(proxy) = epoch.proxy_by_id(&proxy_id).cloned() else {
-                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                    client_conn.close().await;
-                    warn!(proxy_id = %proxy_id, "DTLS listener proxy no longer exists in request epoch");
-                    continue;
-                };
-                let plugins = epoch
-                    .plugin_cache
-                    .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
-                let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
-                    .iter()
-                    .filter(|p| p.requires_udp_datagram_hooks())
-                    .cloned()
-                    .collect();
-                let consumer_index =
-                    Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
-                let proxy_name = proxy.name.clone();
-                let proxy_namespace = proxy.namespace.clone();
-                let backend_scheme = proxy.effective_scheme();
-                let client_ip = udp_session_client_ip(client_addr);
-
-                // Run on_stream_connect plugins (with DTLS client cert if available)
-                let stream_client_ip = client_ip.to_string();
-                let mut stream_ctx = StreamConnectionContext::new(
-                    stream_client_ip.clone(),
-                    // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
-                    // direct_client_ip always equals client_ip for UDP sessions.
-                    stream_client_ip,
-                    proxy.id.clone(),
-                    proxy_name.clone(),
-                    port,
-                    backend_scheme,
-                    consumer_index,
-                );
-                stream_ctx.proxy_lifecycle_generation = epoch
-                    .plugin_cache
-                    .proxy_lifecycle_generation(proxy.id.as_str());
-                stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
-                stream_ctx.tls_client_cert_chain_der =
-                    client_conn.tls_client_cert_chain_der.clone();
-                stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
-                // The constructor intentionally leaves node-waypoint per-pod
-                // policy scope absent: UDP/DTLS cannot wire it without a new
-                // capture path. Identity is keyed by the per-connection socket
-                // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
-                // the source pod via the `connect4`/`connect6` cgroup hooks;
-                // there are no UDP capture hooks, and a UDP stream proxy
-                // serves all clients from one shared frontend socket with a
-                // single cookie, so there is no per-source-pod cookie to
-                // resolve here. With `per_pod_policy_scoping` on
-                // (node-waypoint topology), `mesh_authz` stamps
-                // `mesh_authz.scope_missing` and, because the per-pod scope is
-                // always absent here, fails closed (rejects the stream, 403)
-                // when any namespace/selector-scoped policy is configured;
-                // with only mesh-wide policies it evaluates them normally.
-                // Per-pod scoped enforcement is unavailable for DTLS streams
-                // (TCP and HTTP/HBONE have it). See docs/mesh.md.
-                let mut rejected = false;
-                for plugin in plugins.iter() {
-                    if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-                        debug!(
-                            proxy_id = %proxy_id,
-                            client = %client_addr,
-                            "DTLS connection rejected by plugin"
-                        );
-                        client_conn.close().await;
-                        rejected = true;
-                        break;
-                    }
-                }
-                if rejected {
-                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
-
-                debug!(
-                    proxy_id = %proxy_id,
-                    client = %client_addr,
-                    "DTLS frontend connection accepted"
-                );
-
-                // Acquire the OverloadState connection guard for the accepted
-                // (post-handshake) DTLS session. Pre-handshake demux peers are
-                // tracked separately in `metrics.dtls_demux_sessions` and via
-                // the `allow_new_session` callback; we intentionally only
-                // contribute to `OverloadState.active_connections` after the
-                // handshake completed and plugin checks passed, so the global
-                // counter reflects committed sessions (parity with TCP/H3).
-                // The guard is moved into the per-client handler task below
-                // and decrements automatically when the task exits, regardless
-                // of which exit path (graceful, error, or shutdown) ran.
-                let handler_overload_guard =
-                    crate::overload::ConnectionGuard::new(&overload);
-
-                // Spawn per-client handler
-                let handler_proxy_id = proxy.id.clone();
-                let handler_epoch = Arc::clone(&epoch);
+                let handler_proxy_id = proxy_id.clone();
+                let handler_request_epoch = Arc::clone(&request_epoch);
                 let handler_health_checker = health_checker.clone();
                 let handler_dns = dns_cache.clone();
                 let handler_metrics = metrics.clone();
-                let handler_plugins = plugins.clone();
-                let handler_datagram_plugins = Arc::clone(&datagram_plugins);
-                let handler_proxy_name = proxy_name.clone();
-                let handler_proxy_namespace = proxy_namespace.clone();
-                let handler_has_plugins = !plugins.is_empty();
-                let handler_consumer_username = if handler_has_plugins {
-                    stream_ctx.effective_identity().map(str::to_owned)
-                } else {
-                    None
-                };
-                let handler_auth_method = stream_ctx.auth_method;
-                let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
-                // Preserve the accepted connection's SNI across the per-session
-                // task so disconnect summaries match `on_stream_connect`.
-                let handler_sni_hostname = stream_ctx.sni_hostname.clone();
-                let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
-                    stream_ctx.take_metadata_with_correlation_ids()
-                } else {
-                    Default::default()
-                };
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let handler_crls = crls.clone();
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
                 let handler_dtls_cache = backend_dtls_config_cache.clone();
+                let handler_overload = overload.clone();
                 // Monotonic session start for duration_ms; wall clock is only
-                // for human-readable connect/disconnect timestamps.
+                // for human-readable connect/disconnect timestamps. Captured
+                // at accept so admission wait is included in the summary.
                 let connected_mono = Instant::now();
                 let connected_at = chrono::Utc::now();
                 tokio::spawn(async move {
-                    // Hold the guard for the lifetime of the handler task. Drop
-                    // at task exit decrements `OverloadState.active_connections`.
-                    let _overload_guard = handler_overload_guard;
+                    let epoch = handler_request_epoch.load();
+                    let Some(proxy) = epoch.proxy_by_id(&handler_proxy_id) else {
+                        handler_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                        client_conn.close().await;
+                        warn!(
+                            proxy_id = %handler_proxy_id,
+                            "DTLS listener proxy no longer exists in request epoch"
+                        );
+                        return;
+                    };
+                    // Extract the few fields needed for admission/logging
+                    // without cloning the full Proxy (hot-path ownership).
+                    let resolved_proxy_id = proxy.id.clone();
+                    let proxy_name = proxy.name.clone();
+                    let proxy_namespace = proxy.namespace.clone();
+                    let backend_scheme = proxy.effective_scheme();
+                    let plugins = epoch
+                        .plugin_cache
+                        .get_plugins_for_protocol(&resolved_proxy_id, ProxyProtocol::Udp);
+                    let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
+                        .iter()
+                        .filter(|p| p.requires_udp_datagram_hooks())
+                        .cloned()
+                        .collect();
+                    let consumer_index =
+                        Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
+                    let client_ip = udp_session_client_ip(client_addr);
+
+                    // Run on_stream_connect plugins (with DTLS client cert if available)
+                    let stream_client_ip = client_ip.to_string();
+                    let mut stream_ctx = StreamConnectionContext::new(
+                        stream_client_ip.clone(),
+                        // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
+                        // direct_client_ip always equals client_ip for UDP sessions.
+                        stream_client_ip,
+                        resolved_proxy_id.clone(),
+                        proxy_name.clone(),
+                        port,
+                        backend_scheme,
+                        consumer_index,
+                    );
+                    stream_ctx.proxy_lifecycle_generation = epoch
+                        .plugin_cache
+                        .proxy_lifecycle_generation(resolved_proxy_id.as_str());
+                    stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
+                    stream_ctx.tls_client_cert_chain_der =
+                        client_conn.tls_client_cert_chain_der.clone();
+                    stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
+                    // The constructor intentionally leaves node-waypoint per-pod
+                    // policy scope absent: UDP/DTLS cannot wire it without a new
+                    // capture path. Identity is keyed by the per-connection socket
+                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
+                    // the source pod via the `connect4`/`connect6` cgroup hooks;
+                    // there are no UDP capture hooks, and a UDP stream proxy
+                    // serves all clients from one shared frontend socket with a
+                    // single cookie, so there is no per-source-pod cookie to
+                    // resolve here. With `per_pod_policy_scoping` on
+                    // (node-waypoint topology), `mesh_authz` stamps
+                    // `mesh_authz.scope_missing` and, because the per-pod scope is
+                    // always absent here, fails closed (rejects the stream, 403)
+                    // when any namespace/selector-scoped policy is configured;
+                    // with only mesh-wide policies it evaluates them normally.
+                    // Per-pod scoped enforcement is unavailable for DTLS streams
+                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
+                    for plugin in plugins.iter() {
+                        if let PluginResult::Reject { .. } =
+                            plugin.on_stream_connect(&mut stream_ctx).await
+                        {
+                            debug!(
+                                proxy_id = %handler_proxy_id,
+                                client = %client_addr,
+                                "DTLS connection rejected by plugin"
+                            );
+                            client_conn.close().await;
+                            handler_metrics
+                                .active_sessions
+                                .fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+
+                    handler_metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
+
+                    debug!(
+                        proxy_id = %handler_proxy_id,
+                        client = %client_addr,
+                        "DTLS frontend connection accepted"
+                    );
+
+                    // Acquire the OverloadState connection guard for the accepted
+                    // (post-handshake, post-admission) DTLS session. Pre-handshake
+                    // demux peers are tracked separately in
+                    // `metrics.dtls_demux_sessions` and via the
+                    // `allow_new_session` callback; we intentionally only
+                    // contribute to `OverloadState.active_connections` after the
+                    // handshake completed and plugin checks passed, so the global
+                    // counter reflects committed sessions (parity with TCP/H3).
+                    // Drop at task exit decrements regardless of exit path.
+                    let _overload_guard =
+                        crate::overload::ConnectionGuard::new(&handler_overload);
+
+                    let handler_has_plugins = !plugins.is_empty();
+                    let handler_consumer_username = if handler_has_plugins {
+                        stream_ctx.effective_identity().map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let handler_auth_method = stream_ctx.auth_method;
+                    let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
+                    // Preserve the accepted connection's SNI across the session
+                    // so disconnect summaries match `on_stream_connect`.
+                    let handler_sni_hostname = stream_ctx.sni_hostname.clone();
+                    let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
+                        stream_ctx.take_metadata_with_correlation_ids()
+                    } else {
+                        Default::default()
+                    };
+
                     let result = handle_dtls_client(
                         client_conn,
                         client_addr,
-                        &handler_proxy_id,
-                        &handler_epoch,
+                        &resolved_proxy_id,
+                        &epoch,
                         &handler_health_checker,
                         &handler_dns,
                         &handler_metrics,
                         tls_no_verify,
                         handler_ca_bundle.as_deref(),
                         &handler_cb_cache,
-                        &handler_datagram_plugins,
-                        handler_proxy_name.as_deref(),
+                        &datagram_plugins,
+                        proxy_name.as_deref(),
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
@@ -2759,7 +2763,7 @@ async fn start_dtls_frontend_listener(
                             ),
                             Err(e) => {
                                 debug!(
-                                    proxy_id = %handler_proxy_id,
+                                    proxy_id = %resolved_proxy_id,
                                     client = %client_addr,
                                     "DTLS client session ended: {}",
                                     e
@@ -2788,7 +2792,7 @@ async fn start_dtls_frontend_listener(
                             }
                         };
 
-                    if !handler_plugins.is_empty() || error_class.is_some() {
+                    if !plugins.is_empty() || error_class.is_some() {
                         let duration_ms = connected_mono.elapsed().as_millis() as f64;
                         let disconnected_at = chrono::Utc::now();
                         // Merge per-datagram WAF metadata recorded during
@@ -2797,9 +2801,9 @@ async fn start_dtls_frontend_listener(
                         let mut merged_metadata = handler_metadata;
                         merged_metadata.extend(result.metadata);
                         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
-                            namespace: &handler_proxy_namespace,
-                            proxy_id: &handler_proxy_id,
-                            proxy_name: handler_proxy_name.as_deref(),
+                            namespace: &proxy_namespace,
+                            proxy_id: &resolved_proxy_id,
+                            proxy_name: proxy_name.as_deref(),
                             proxy_lifecycle_generation: handler_proxy_lifecycle_generation,
                             client_addr,
                             consumer_username: handler_consumer_username.clone(),
@@ -2824,8 +2828,8 @@ async fn start_dtls_frontend_listener(
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
                         // Fire on_stream_disconnect plugins
-                        if !handler_plugins.is_empty() {
-                            for plugin in handler_plugins.iter() {
+                        if !plugins.is_empty() {
+                            for plugin in plugins.iter() {
                                 plugin.on_stream_disconnect(&summary).await;
                             }
                         }
