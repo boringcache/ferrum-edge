@@ -75,6 +75,7 @@ mod mesh_proxy_config_tests;
 mod mesh_runtime_overlay_consumers_tests;
 mod mesh_service_waypoint_tests;
 mod mesh_sidecar_e2e_tests;
+mod mesh_subscribe_validation_tests;
 mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
