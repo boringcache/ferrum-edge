@@ -28,6 +28,8 @@ The eBPF connect programs read `FERRUM_CAPTURE_CONFIG` before rewriting to loopb
 
 The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_name}` field selector) and reacts to three Kubernetes event flavors. `Event::Apply` from the watcher conflates "added" and "modified", so the same code path handles initial enrollment and mid-life updates.
 
+Watcher-loop exit is classified deliberately: an operator-requested shutdown still runs BPF/CNI cleanup and returns success (process exit 0). If the Kubernetes pod-watcher stream ends unexpectedly, the same cleanup path runs, then the mode returns an error so `main` exits nonzero and supervisors that restart only failed processes relaunch the agent. Transient watcher *errors* are logged and retried by kube-rs; they do not exit the loop.
+
 | Event | Source trigger | Node-agent action |
 |---|---|---|
 | Initial `Apply` for a previously-unseen pod | Pod creation | Resolve cgroup path, attach `connect4`/`connect6`/`getpeername4`/`getpeername6` programs, attach the host-side pod-veth tc classifier on ingress/egress, write `FERRUM_POD_IPS` / `FERRUM_POD_IPS6`, write `FERRUM_INCLUDE_PORTS` if the pod carries `includeOutboundPorts`. Counts toward `ferrum_node_agent_pods_enrolled_total`. |

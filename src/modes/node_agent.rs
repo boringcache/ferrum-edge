@@ -853,6 +853,11 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
+    // Initialize before Kubernetes client construction so post-init cleanup
+    // ownership (PR #3142 / #2371) can cover client failures without leaving
+    // bpffs pins loaded. Watcher injection still goes through
+    // `run_with_pod_stream` after this point.
+    initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
     let client = build_node_agent_kube_client().await?;
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
@@ -889,6 +894,7 @@ where
     S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
     I: IntoIterator<Item = PodAttachmentState>,
 {
+    initialize_backend(backend, config, metrics.as_ref())?;
     let startup_ready = Arc::new(AtomicBool::new(false));
     let cni_config = CniListenerConfig {
         enabled: false,
@@ -924,8 +930,9 @@ where
     S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
     I: IntoIterator<Item = PodAttachmentState>,
 {
-    initialize_backend(backend, config, metrics.as_ref())?;
-
+    // Caller must have already initialized the backend (`run_with_backend` or
+    // `run_with_pod_stream_for_test`) so production keeps init → kube-client
+    // ordering for cleanup-ownership compatibility with PR #3142.
     if cni_config.enabled && kube_client.is_none() {
         anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
     }
@@ -1145,7 +1152,9 @@ where
     // Same finally-style path for both exit reasons: stop background CNI work,
     // detach BPF / maps, then await the listener. Watcher exhaustion must not
     // skip this and must not hang waiting for a CNI task that never sees
-    // shutdown.
+    // shutdown. Drop readiness before the potentially slow CNI join so probes
+    // do not keep reporting ready while capture is tearing down.
+    startup_ready.store(false, Ordering::Release);
     let _ = shutdown_tx.send(true);
 
     info!(
