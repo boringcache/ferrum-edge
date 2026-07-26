@@ -45,11 +45,12 @@ use super::configsync_lifecycle::{
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
     check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, evaluate_snapshot_clock_skew,
-    full_snapshot_stream_disposition, gateway_trust_equivalence_state,
-    grow_backoff_after_failure_sleep, heartbeat_frame_admissible, reconcile_snapshot_version,
-    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
-    resource_delta_advances_authority, silence_watchdog_armed, snapshot_failure_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_delta_authority,
+    evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
+    reconcile_snapshot_version, record_applied_gateway_trust,
+    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
+    silence_watchdog_armed, snapshot_failure_stream_disposition,
     snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -630,10 +631,12 @@ pub async fn start_dp_client_with_stream_timings(
             }
             Ok(DpStreamEnd::InvalidDeltaFreshness) => {
                 // The CP supplied a DELTA whose envelope timestamp did not
-                // describe its body, or whose committed timestamp was
-                // implausibly far in the future. The delta was refused before
-                // apply, so fail over with accumulating backoff rather than
-                // letting that source poison the cross-CP freshness watermark.
+                // describe its body, whose committed timestamp was implausibly
+                // far in the future, or whose committed stamp predates the
+                // monotonic authority watermark (ABA / lagging-CP replay). The
+                // delta was refused before apply, so fail over with accumulating
+                // backoff rather than letting that source poison or roll back
+                // freshness authority.
                 warn!(
                     "Refused invalid DELTA freshness from CP [{}/{}] ({}); failing over \
                      without applying while keeping last-known-good config",
@@ -800,9 +803,10 @@ enum DpStreamEnd {
     /// the newer active config. The outer loop treats this as a
     /// failover-with-backoff failure — never as delivered config (issue #2970).
     StaleSnapshotFenced,
-    /// A DELTA envelope/body timestamp was inconsistent or implausibly far in
-    /// the future. The update is refused before apply and the outer loop fails
-    /// over with accumulating backoff so freshness authority cannot be poisoned.
+    /// A DELTA envelope/body timestamp was inconsistent, implausibly far in the
+    /// future, or older than the applied authority watermark. The update is
+    /// refused before apply and the outer loop fails over with accumulating
+    /// backoff so freshness authority cannot be poisoned or rolled back.
     InvalidDeltaFreshness,
     /// This subscription never committed a valid FULL_SNAPSHOT base (invalid /
     /// unparseable / rejected initial snapshot, or a pre-snapshot DELTA). Fail
@@ -1999,6 +2003,21 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 poll_timestamp = %poll_timestamp,
                                 "Refusing DELTA with an implausibly-future committed timestamp \
                                  before it can poison the freshness watermark"
+                            );
+                            if !was_empty {
+                                update_state_config_diverged(connection_state, divergence_metrics);
+                            }
+                            return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                        }
+                        if let Err(reason) =
+                            evaluate_delta_authority(snapshot_authority.as_ref(), committed_delta)
+                        {
+                            warn!(
+                                ?reason,
+                                cp_url,
+                                version = %update.version,
+                                poll_timestamp = %poll_timestamp,
+                                "Refusing DELTA older than the applied authority watermark"
                             );
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
