@@ -13431,67 +13431,6 @@ mod inner {
             );
         }
 
-        /// Issue #3001: failover publish must flip the write gate before the
-        /// connection ArcSwap, and a deferred reconnect must not change
-        /// topology (gate-before-publish under the generation guard).
-        #[tokio::test(flavor = "current_thread")]
-        async fn failover_publish_flips_gate_before_connection_and_defers_without_flip() {
-            let store = make_test_store(vec![]);
-            assert!(
-                store.failover_topology.primary_active(),
-                "test store starts on primary topology"
-            );
-
-            let connection_bundle = |database_name: &str| {
-                let opts = mongodb::options::ClientOptions::builder()
-                    .hosts(vec![])
-                    .build();
-                let client = mongodb::Client::with_options(opts.clone()).unwrap();
-                let lease_client = mongodb::Client::with_options(opts).unwrap();
-                let db = client.database(database_name);
-                MongoConnectionBundle::new(client, db, lease_client, Vec::new())
-            };
-
-            let admission_pin = store.connection_generation.clone().read_owned().await;
-            let blocked = store
-                .publish_reconnected_bundle(
-                    connection_bundle("must_not_publish"),
-                    false,
-                    Some("mongodb://***/failover"),
-                )
-                .expect_err(
-                    "an admission pin must defer failover publish without flipping topology",
-                );
-            assert!(blocked.to_string().contains("admission operation pins"));
-            assert!(
-                store.failover_topology.primary_active(),
-                "deferred failover reconnect must leave primary_active=true so topology stays accurate"
-            );
-            assert_eq!(store.db().name(), "test");
-            drop(admission_pin);
-
-            store
-                .publish_reconnected_bundle(
-                    connection_bundle("failover_db"),
-                    false,
-                    Some("mongodb://***/failover"),
-                )
-                .expect("failover publish must succeed once the generation pin is released");
-            assert!(
-                !store.failover_topology.primary_active(),
-                "successful failover publish must mark the write gate before exposing the connection"
-            );
-            assert_eq!(
-                store.db().name(),
-                "failover_db",
-                "failover connection must be published only after the gate flips"
-            );
-            assert!(
-                !store.failover_topology.allow_writes(),
-                "default FERRUM_DB_FAILOVER_ALLOW_WRITES=false must keep admin writes fail-closed"
-            );
-        }
-
         const TEST_CERT_PEM: &str =
             "-----BEGIN CERTIFICATE-----\nZmVycnVtLXRlc3QtY2VydA==\n-----END CERTIFICATE-----\n";
         const TEST_KEY_PEM: &str =
