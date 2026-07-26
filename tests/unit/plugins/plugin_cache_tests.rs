@@ -5,6 +5,7 @@ use ferrum_edge::_test_support::{
     incremental_plugin_rebuild_targets_for_test,
     initial_response_header_policy_plugins_by_bare_proxy_id_for_test,
     initial_response_header_policy_plugins_for_test, plugin_cache_with_real_ip_header_for_test,
+    plugins_for_protocol_by_bare_proxy_id_for_test, plugins_for_protocol_for_test,
     reconcile_fault_plugin_generations_for_test,
     request_deduplication_logical_keys_from_context_for_test, run_after_proxy_hooks_for_test,
     set_grpc_deadline_budget_for_test, transform_buffered_response_body_with_deadline_for_test,
@@ -9612,6 +9613,67 @@ fn test_initial_response_header_policy_resolves_by_namespaced_key() {
     assert_eq!(
         composed_headers, view_headers,
         "standalone policy lookup must match the request view for the same proxy"
+    );
+}
+
+/// Stream connect paths hold `Arc<PluginCacheInner>` (via `RequestEpoch`) and
+/// must resolve protocol plugins through the namespace-composing
+/// `plugins_for_protocol` accessor. Allocating a `namespaced_runtime_key` and
+/// calling the bare-key `get_plugins_for_protocol` regressed hot-path
+/// allocation after #3094 rekeyed the protocol snapshot; a bare ID also
+/// silently falls back to the global TCP chain.
+#[test]
+fn test_stream_plugins_for_protocol_resolves_by_namespaced_key() {
+    let mut scoped = make_plugin_config(
+        "rl-scoped",
+        "rate_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    scoped.namespace = "tenant-a".to_string();
+    let global = make_plugin_config(
+        "log-global",
+        "stdout_logging",
+        PluginScope::Global,
+        None,
+        true,
+    );
+    let config = make_config(
+        vec![namespaced_proxy(
+            "tenant-a",
+            "p1",
+            "/tcp-svc",
+            vec!["rl-scoped"],
+        )],
+        vec![scoped, global],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let composed = plugins_for_protocol_for_test(&cache, "tenant-a", "p1", ProxyProtocol::Tcp);
+    let composed_names: Vec<&str> = composed.iter().map(|p| p.name()).collect();
+    assert!(
+        composed_names.contains(&"rate_limiting"),
+        "namespace-composed stream lookup must attach the proxy-scoped TCP plugin: {composed_names:?}"
+    );
+    assert!(
+        composed_names.contains(&"stdout_logging"),
+        "namespace-composed stream lookup must still merge globals: {composed_names:?}"
+    );
+
+    let raw = plugins_for_protocol_by_bare_proxy_id_for_test(&cache, "p1", ProxyProtocol::Tcp);
+    let raw_names: Vec<&str> = raw.iter().map(|p| p.name()).collect();
+    assert_eq!(
+        raw_names,
+        ["stdout_logging"],
+        "a bare proxy id must miss the namespaced TCP entry and fall back to globals"
+    );
+
+    let outer = cache.get_plugins_for_protocol("tenant-a", "p1", ProxyProtocol::Tcp);
+    let outer_names: Vec<&str> = outer.iter().map(|p| p.name()).collect();
+    assert_eq!(
+        composed_names, outer_names,
+        "PluginCacheInner::plugins_for_protocol must match the public PluginCache wrapper"
     );
 }
 

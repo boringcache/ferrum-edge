@@ -52,11 +52,9 @@ impl CapturedMeshEgressLifecycle {
         destination_port: u16,
         asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Option<Self> {
-        let proxy_key =
-            crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id);
         let plugins: Vec<_> = epoch
             .plugin_cache
-            .get_plugins_for_protocol(&proxy_key, protocol)
+            .plugins_for_protocol(&proxy.namespace, &proxy.id, protocol)
             .iter()
             .filter(|plugin| plugin.name() == WORKLOAD_METRICS_PLUGIN)
             .cloned()

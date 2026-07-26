@@ -3579,6 +3579,27 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Namespace-aware protocol plugin lookup for stream/request paths that
+    /// hold `(namespace, id)` rather than a precomposed runtime key.
+    ///
+    /// Composes through the thread-local `PROXY_KEY_BUF` so steady-state
+    /// lookups stay allocation-free — the same contract as
+    /// [`Self::initial_response_header_policy_plugins`]. TCP/UDP/DTLS/mesh
+    /// connect paths must use this instead of allocating a
+    /// `namespaced_runtime_key` and calling [`Self::get_plugins_for_protocol`].
+    pub(crate) fn plugins_for_protocol(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.get_plugins_for_protocol(key.as_str(), protocol)
+        })
+    }
+
     /// Authenticate-phase plugins for a composed `proxy_key` + protocol.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw

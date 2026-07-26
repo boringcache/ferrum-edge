@@ -1504,13 +1504,11 @@ async fn run_tcp_accept_loop(
                     let final_proxy_namespace = stream_ctx.proxy_namespace.clone();
                     let final_proxy =
                         epoch.proxy_by_namespaced_id(&final_proxy_namespace, &final_proxy_id);
-                    let proxy_key = crate::config::db_backend::namespaced_runtime_key(
+                    let plugins = epoch.plugin_cache.plugins_for_protocol(
                         &final_proxy_namespace,
                         &final_proxy_id,
+                        ProxyProtocol::Tcp,
                     );
-                    let plugins = epoch
-                        .plugin_cache
-                        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Tcp);
                     let proxy_name = stream_ctx.proxy_name.clone();
                     let backend_scheme = final_proxy
                         .map(|p| p.effective_scheme())
@@ -2309,10 +2307,11 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let proxy_key = crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, proxy_id);
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy_key, ProxyProtocol::Tcp);
+    let plugins = epoch.plugin_cache.plugins_for_protocol(
+        &proxy.namespace,
+        proxy_id,
+        ProxyProtocol::Tcp,
+    );
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
