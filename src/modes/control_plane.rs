@@ -2374,6 +2374,7 @@ pub async fn run(
                                         next_sequences,
                                     );
                                     rejected_delta_tracker.record_accepted();
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
 
