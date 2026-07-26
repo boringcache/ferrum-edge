@@ -32127,34 +32127,33 @@ async fn proxy_to_backend_http2(
     } else {
         usize::MAX
     };
-    let (body, body_completion_rx, mut body_cancel_tx) =
-        if state.max_request_body_size_bytes > 0 {
-            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-            (
-                body::SizeLimitedIncoming::new_with_counter_and_completion(
-                    body,
-                    max_request_body_size,
-                    Arc::clone(&body_size_exceeded),
-                    Arc::clone(ctx_bytes_sent_observed),
-                    completion_tx,
-                    cancel_rx,
-                ),
-                Some(completion_rx),
-                Some(cancel_tx),
-            )
-        } else {
-            (
-                body::SizeLimitedIncoming::new_with_counter(
-                    body,
-                    max_request_body_size,
-                    Arc::clone(&body_size_exceeded),
-                    Arc::clone(ctx_bytes_sent_observed),
-                ),
-                None,
-                None,
-            )
-        };
+    let (body, body_completion_rx, mut body_cancel_tx) = if state.max_request_body_size_bytes > 0 {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        (
+            body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+                cancel_rx,
+            ),
+            Some(completion_rx),
+            Some(cancel_tx),
+        )
+    } else {
+        (
+            body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            ),
+            None,
+            None,
+        )
+    };
 
     // Set the URI
     parts.uri = uri;

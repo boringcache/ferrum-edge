@@ -1692,10 +1692,7 @@ impl http_body::Body for SizeLimitedIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let cancel_poll = this
-            .cancel
-            .as_mut()
-            .map(|cancel| Pin::new(cancel).poll(cx));
+        let cancel_poll = this.cancel.as_mut().map(|cancel| Pin::new(cancel).poll(cx));
         match cancel_poll {
             Some(Poll::Ready(Ok(()))) => {
                 this.cancel = None;
