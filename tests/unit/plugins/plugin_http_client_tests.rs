@@ -606,7 +606,7 @@ async fn plugin_http_client_ignores_ambient_proxy_even_with_non_matching_no_prox
     );
 }
 
-/// Every policy-governed plugin `reqwest` client family, as source text.
+/// Every policy-governed `reqwest` client family, as source text.
 ///
 /// A behavioural test can only reach the client families that are reachable
 /// from a plugin constructor; the fallback builders inside
@@ -616,6 +616,14 @@ async fn plugin_http_client_ignores_ambient_proxy_even_with_non_matching_no_prox
 /// builder — or a dropped `.no_proxy()` — fails CI instead of silently
 /// reopening the bypass.
 const POLICY_GOVERNED_CLIENT_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/tls/backend.rs",
+        include_str!("../../../src/tls/backend.rs"),
+    ),
+    (
+        "src/health_check.rs",
+        include_str!("../../../src/health_check.rs"),
+    ),
     (
         "src/plugins/utils/http_client.rs",
         include_str!("../../../src/plugins/utils/http_client.rs"),
@@ -635,7 +643,7 @@ const POLICY_GOVERNED_CLIENT_SOURCES: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn every_policy_governed_plugin_reqwest_builder_disables_ambient_proxies() {
+fn every_policy_governed_reqwest_builder_disables_ambient_proxies() {
     const NEEDLE: &str = "reqwest::Client::builder()";
     let mut checked = 0usize;
     for (path, source) in POLICY_GOVERNED_CLIENT_SOURCES {
@@ -665,7 +673,7 @@ fn every_policy_governed_plugin_reqwest_builder_disables_ambient_proxies() {
         }
     }
     assert!(
-        checked >= 6,
-        "expected to find every plugin client builder family, only found {checked}"
+        checked >= 11,
+        "expected to find every policy-governed client builder family, only found {checked}"
     );
 }

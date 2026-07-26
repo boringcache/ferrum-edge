@@ -1800,6 +1800,7 @@ fn build_health_check_client(
     }
 
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
         // Do not follow redirects on health probes: a 3xx from an allowed host to
@@ -1847,8 +1848,8 @@ fn build_health_check_client(
 /// plugin calls do not silently fall through to system DNS — every probe
 /// would otherwise burn an ephemeral port through a fresh OS resolver.
 ///
-/// If even this minimal builder fails, only then fall back to
-/// `reqwest::Client::new()` (an exceptional, doubly-degraded path).
+/// If even this minimal builder fails, retry a bare no-proxy/no-redirect client
+/// before aborting client construction (an exceptional, doubly-degraded path).
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     context: &'static str,
@@ -1857,7 +1858,9 @@ fn build_dns_cached_fallback_client(
     // IP literal would otherwise skip the DnsCacheResolver and the egress screen,
     // bouncing the probe to a denied address (same rationale as the primary
     // builders).
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -1869,12 +1872,14 @@ fn build_dns_cached_fallback_client(
             context,
             e
         );
-        // Last resort: still disable redirects. Fall back to `Client::new()` only
-        // if even this trivial builder fails (effectively never).
+        // Last resort: still disable redirects and ambient proxies.
         reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|e2| {
+                panic!("Failed to build fail-closed minimal health-check client: {e2}")
+            })
     })
 }
 
@@ -1894,6 +1899,7 @@ fn build_health_check_client_with_tls(
     let skip_verify = !tls_config.verify_server_cert || global_no_verify;
 
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
         // Do not follow redirects on health probes: a 3xx to an IP literal skips
@@ -2163,10 +2169,60 @@ mod tests {
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Once;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio_rustls::TlsAcceptor;
+    use wiremock::MockServer;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProxyEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ProxyEnvGuard {
+        fn point_all_at(proxy_url: &str) -> Self {
+            const PROXY_KEYS: &[&str] = &[
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ];
+            let saved = PROXY_KEYS
+                .iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect();
+            for &key in &PROXY_KEYS[..6] {
+                // SAFETY: ENV_LOCK serialises test access to the process-global env.
+                unsafe { std::env::set_var(key, proxy_url) };
+            }
+            for &key in &PROXY_KEYS[6..] {
+                // SAFETY: ENV_LOCK serialises test access to the process-global env.
+                unsafe { std::env::remove_var(key) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ProxyEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                // SAFETY: ENV_LOCK is held for the caller's lifetime.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(*key, value),
+                        None => std::env::remove_var(*key),
+                    }
+                }
+            }
+        }
+    }
 
     static INIT_CRYPTO: Once = Once::new();
 
@@ -2288,6 +2344,83 @@ mod tests {
         responder.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_health_check_client_ignores_ambient_proxy_environment() {
+        let proxy = MockServer::start().await;
+        let pool_config = PoolConfig::default();
+        let client = {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+            build_health_check_client(&pool_config, None, false)
+        };
+
+        let _ = client
+            .get("http://198.51.100.1:9/no-proxy-canary")
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await;
+
+        assert_eq!(
+            proxy.received_requests().await.unwrap_or_default().len(),
+            0,
+            "ambient proxy variables must not receive health-check traffic"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_health_check_client_with_tls_ignores_ambient_proxy_environment() {
+        let proxy = MockServer::start().await;
+        let pool_config = PoolConfig::default();
+        let tls_config = BackendTlsConfig::default_verify();
+        let client = {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+            build_health_check_client_with_tls(
+                &pool_config,
+                None,
+                &tls_config,
+                &None,
+                &None,
+                &None,
+                false,
+            )
+        };
+
+        let _ = client
+            .get("http://198.51.100.1:9/no-proxy-canary")
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await;
+
+        assert_eq!(
+            proxy.received_requests().await.unwrap_or_default().len(),
+            0,
+            "TLS-configured health-check clients must ignore ambient proxies"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_dns_cached_fallback_client_ignores_ambient_proxy_environment() {
+        let proxy = MockServer::start().await;
+        let client = {
+            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+            build_dns_cached_fallback_client(None, "test")
+        };
+
+        let _ = client
+            .get("http://198.51.100.1:9/no-proxy-canary")
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await;
+
+        assert_eq!(
+            proxy.received_requests().await.unwrap_or_default().len(),
+            0,
+            "degraded health-check fallback clients must ignore ambient proxies"
+        );
+    }
+
     #[tokio::test]
     async fn http_probe_connects_to_ipv6_literal() {
         let port = spawn_ipv6_plain_http_server().await;
@@ -2385,7 +2518,7 @@ mod tests {
         // resolver attached actually succeeds.
         let dns_cache = DnsCache::new(DnsConfig::default());
         let _client = build_dns_cached_fallback_client(Some(dns_cache), "test");
-        // No panic, no Err, no `Client::new()` last-resort path: success.
+        // No panic, no Err, no ambient-proxy last-resort path: success.
     }
 
     #[test]
@@ -2426,13 +2559,13 @@ mod tests {
 
         // After the request, the gateway DNS cache should contain an entry
         // for `localhost`. If the request had bypassed the resolver via
-        // `Client::new()`, the cache would be unchanged.
+        // ambient proxying, the cache would be unchanged.
         let after_len = dns_cache.cache_len();
         assert!(
             after_len > initial_len,
             "DNS cache should have populated via the cached resolver \
              (initial={}, after={}). If the fallback bypassed the resolver \
-             via Client::new(), the cache would stay empty.",
+             via ambient proxying, the cache would stay empty.",
             initial_len,
             after_len
         );

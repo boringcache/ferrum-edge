@@ -10,15 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Plugin egress no longer inherits ambient proxy configuration
-  (GHSA-c4pj-vq6x-53rw). The dedicated ClickHouse client built by
-  `api_chargeback_sink` for custom CA / mTLS / relaxed-verification settings, and
-  the dedicated `spec_expose` and `load_testing` clients, now call
-  `reqwest::ClientBuilder::no_proxy()` like the shared `PluginHttpClient` and its
-  fallback builders. With a proxy selected from `HTTP_PROXY` / `HTTPS_PROXY` /
-  `ALL_PROXY`, Ferrum resolved and screened the *proxy* while the proxy resolved
-  and connected to the configured hostname, so the ultimate destination never
-  passed `BackendEgressPolicy`. A CI guard now fails if any policy-governed
-  plugin `reqwest` builder drops `.no_proxy()`.
+  (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via
+  `BackendTlsConfigBuilder::build_reqwest`), active health-check clients
+  (primary, custom-TLS, and degraded DNS-cached fallbacks), the dedicated
+  ClickHouse client built by `api_chargeback_sink` for custom CA / mTLS /
+  relaxed-verification settings, and the dedicated `spec_expose` and
+  `load_testing` clients now call `reqwest::ClientBuilder::no_proxy()` like the
+  shared `PluginHttpClient` and its fallback builders. With a proxy selected
+  from `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, Ferrum resolved and screened
+  the *proxy* while the proxy resolved and connected to the configured hostname,
+  so the ultimate destination never passed `BackendEgressPolicy`. A CI guard
+  now fails if any policy-governed `reqwest` builder drops `.no_proxy()`.
 - `ws_logging` now enforces backend egress policy on the address it actually
   dials (GHSA-mp2j-gjfp-2vm8). Every connection and reconnection resolves the
   endpoint fresh (bypassing both DNS cache layers), rejects the complete A+AAAA
