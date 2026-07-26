@@ -196,10 +196,11 @@ impl Drop for IsolatedSqlDatabase {
                 IsolatedSqlKind::Mysql => std::process::Command::new("docker")
                     .args([
                         "exec",
+                        "-e",
+                        &format!("MYSQL_PWD={}", self.password),
                         &self.container,
                         "mysql",
                         &format!("-u{}", self.user),
-                        &format!("-p{}", self.password),
                         "-e",
                         &format!("DROP DATABASE IF EXISTS `{}`;", self.db_name),
                     ])
@@ -358,10 +359,11 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
         IsolatedSqlKind::Mysql => std::process::Command::new("docker")
             .args([
                 "exec",
+                "-e",
+                &format!("MYSQL_PWD={password}"),
                 container,
                 "mysql",
                 &format!("-u{user}"),
-                &format!("-p{password}"),
                 "-e",
                 &format!("CREATE DATABASE `{db_name}`;"),
             ])
@@ -376,7 +378,11 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
         let detail = create_output
             .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
             .unwrap_or_else(|error| error.to_string());
-        let detail = scrub_secret(&detail, &password);
+        // Scrub both the raw secret and any verbatim URL echo from docker/cli.
+        let detail = ferrum_edge::config::db_backend::redact_error_text(
+            scrub_secret(&detail, &password),
+            &[base_url],
+        );
         if db_backends_required() || db_tls_required() {
             panic!(
                 "failed to create isolated SQL database {db_name} in {container} \

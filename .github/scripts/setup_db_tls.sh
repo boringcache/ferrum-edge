@@ -238,8 +238,26 @@ wait_for_containers() {
     wait_for_healthy "$PG_CONTAINER" \
         pg_isready -U "$DB_USER" -d "$DB_NAME" || pg_ok=1
 
-    wait_for_healthy "$MYSQL_CONTAINER" \
-        mysqladmin ping -u root "-p$DB_PASSWORD" || mysql_ok=1
+    # Prefer MYSQL_PWD over -p on argv so `ps` / failure dumps do not echo the
+    # fixture password (connection URLs are already logged redacted below).
+    local mysql_elapsed=0
+    log "Waiting for $MYSQL_CONTAINER to become healthy (timeout: ${HEALTH_TIMEOUT}s) ..."
+    while (( mysql_elapsed < HEALTH_TIMEOUT )); do
+        if docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" \
+            mysqladmin ping -u root &>/dev/null; then
+            log "$MYSQL_CONTAINER is ready (${mysql_elapsed}s)."
+            mysql_ok=0
+            break
+        fi
+        sleep 2
+        (( mysql_elapsed += 2 ))
+        mysql_ok=1
+    done
+    if (( mysql_ok != 0 )); then
+        err "$MYSQL_CONTAINER did not become healthy within ${HEALTH_TIMEOUT}s."
+        log "Container logs:"
+        docker logs --tail 30 "$MYSQL_CONTAINER" >&2
+    fi
 
     if (( pg_ok != 0 || mysql_ok != 0 )); then
         die "One or more containers failed to start. Run '$0 --cleanup' to remove them."
@@ -247,10 +265,11 @@ wait_for_containers() {
 
     # Require a real authenticated query (not only ping) and grant CREATE so
     # functional cells can isolate schema work when needed.
-    if ! docker exec "$MYSQL_CONTAINER" mysql -u "$DB_USER" "-p$DB_PASSWORD" -D "$DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
+    if ! docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" \
+        mysql -u "$DB_USER" -D "$DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
         die "MySQL accepted ping but rejected authenticated queries against $DB_NAME."
     fi
-    docker exec "$MYSQL_CONTAINER" mysql -u root "-p$DB_PASSWORD" -e \
+    docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" mysql -u root -e \
         "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;" \
         >/dev/null
     # Match plaintext CI: functional cells CREATE/DROP per-cell databases.

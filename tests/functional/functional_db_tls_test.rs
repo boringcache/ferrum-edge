@@ -745,6 +745,7 @@ async fn test_sqlite_without_tls_settings() {
 #[ignore]
 async fn test_health_endpoint_shows_db_status() {
     println!("\n=== Health Endpoint with TLS DB ===\n");
+    ensure_shared_sql_containers_resumed();
 
     if !continue_if_tls_fixture_available(
         "postgres",
@@ -753,6 +754,11 @@ async fn test_health_endpoint_shows_db_status() {
     ) {
         return;
     }
+
+    // Provision before the harness so Drop order kills the gateway first —
+    // same isolation contract as the other TLS cells (no shared `ferrum` DB).
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
 
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
@@ -765,10 +771,8 @@ async fn test_health_endpoint_shows_db_status() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway");
 

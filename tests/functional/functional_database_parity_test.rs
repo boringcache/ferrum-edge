@@ -42,6 +42,10 @@ fn run_migrate(action: &str, db_type: &str, db_url: &str) -> std::process::Outpu
         .expect("spawn ferrum-edge migrate process")
 }
 
+fn redact_migrate_output(text: &str, db_url: &str) -> String {
+    ferrum_edge::config::db_backend::redact_error_text(text, &[db_url])
+}
+
 async fn assert_migrate_up_idempotent(db_type: &str, db_url: &str) {
     let first = tokio::task::spawn_blocking({
         let db_type = db_type.to_string();
@@ -50,7 +54,7 @@ async fn assert_migrate_up_idempotent(db_type: &str, db_url: &str) {
     })
     .await
     .expect("join first migrate");
-    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    let first_stderr = redact_migrate_output(&String::from_utf8_lossy(&first.stderr), db_url);
     assert!(
         first.status.success(),
         "{db_type} migrate up failed: {}\n{}",
@@ -65,8 +69,8 @@ async fn assert_migrate_up_idempotent(db_type: &str, db_url: &str) {
     })
     .await
     .expect("join second migrate");
-    let second_stderr = String::from_utf8_lossy(&second.stderr);
-    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    let second_stderr = redact_migrate_output(&String::from_utf8_lossy(&second.stderr), db_url);
+    let second_stdout = redact_migrate_output(&String::from_utf8_lossy(&second.stdout), db_url);
     assert!(
         second.status.success(),
         "{db_type} migrate up idempotent re-run failed: {}\n{}",
