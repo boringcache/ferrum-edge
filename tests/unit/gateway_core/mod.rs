@@ -60,6 +60,7 @@ mod stream_listener_tests;
 mod tcp_proxy_tests;
 mod tls_offload_tests;
 mod tls_tests;
+mod udp_reply_stop_tests;
 mod websocket_auth_tests;
 mod websocket_backend_tests;
 mod websocket_connection_limit_tests;

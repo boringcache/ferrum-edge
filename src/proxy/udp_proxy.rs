@@ -149,7 +149,13 @@ struct UdpSession {
     backend_scheme: BackendScheme,
     listen_port: u16,
     idle_timeout_ms: u64,
+    /// Set by idle cleanup before [`Self::stop_notify`] so the reply task can
+    /// observe stop either via this flag (register-then-check) or via the
+    /// permit stored by [`signal_udp_reply_task_stop`].
     stop_reply_task: std::sync::atomic::AtomicBool,
+    /// Per-session stop wake. Signaled with `Notify::notify_one` (permit
+    /// storing) so a store+notify cannot be lost if the reply task has not
+    /// yet registered a waiter between loop-top checks.
     stop_notify: Arc<tokio::sync::Notify>,
     /// RAII guard that increments [`crate::overload::OverloadState::active_connections`]
     /// on construction and decrements on drop. Each UDP session counts as one
@@ -169,6 +175,104 @@ impl UdpSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take();
+    }
+}
+
+/// Signal a UDP backend reply task to exit without waiting for backend traffic.
+///
+/// Stores the stop flag, then wakes with `Notify::notify_one` so a permit is
+/// retained when the reply task has not yet registered a waiter. Paired with
+/// [`udp_reply_recv_until_stop`]'s register-then-check ordering, store+notify
+/// cannot be missed in the gap that previously lost `notify_waiters` wakes.
+pub(crate) fn signal_udp_reply_task_stop(
+    stop_flag: &std::sync::atomic::AtomicBool,
+    stop_notify: &tokio::sync::Notify,
+) {
+    stop_flag.store(true, std::sync::atomic::Ordering::Release);
+    stop_notify.notify_one();
+}
+
+/// Wait until listener or global shutdown flips true.
+///
+/// Composed into [`udp_reply_recv_until_stop`]'s cancel arm so the production
+/// reply loop and the deterministic stop tests share one register-then-check
+/// implementation. Stack-allocated via `async fn` (no per-datagram heap).
+async fn udp_reply_shutdown_cancel(
+    listener_shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    global_shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    tokio::select! {
+        _ = listener_shutdown.changed() => {},
+        _ = async {
+            match global_shutdown.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {},
+    }
+}
+
+/// Race `recv` against the per-session reply-task stop signal and an optional
+/// additional cancellation future (listener/global shutdown in production;
+/// `pending()` in unit tests).
+///
+/// Registers as a `Notify` waiter (via `Notified::enable`) **before** loading
+/// `stop_flag`, then selects the already-enabled future against `recv` and
+/// `cancel`. Returns `None` when stop or cancel wins (or stop was already
+/// set); `Some` when `recv` completes first. This is the sole copy of the
+/// register-then-check ordering used by `create_session`'s reply loop.
+pub(crate) async fn udp_reply_recv_until_stop<F, C, T>(
+    stop_flag: &std::sync::atomic::AtomicBool,
+    stop_notify: &tokio::sync::Notify,
+    recv: F,
+    cancel: C,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+    C: std::future::Future<Output = ()>,
+{
+    let notified = stop_notify.notified();
+    tokio::pin!(notified);
+    // Register before the flag load so a concurrent store+notify cannot land
+    // between the check and select registration (notify_waiters lost-wakeup).
+    notified.as_mut().enable();
+
+    if stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+
+    tokio::select! {
+        result = recv => Some(result),
+        _ = notified => None,
+        _ = cancel => None,
+    }
+}
+
+/// Resolve a live `last_client` cache hit, clearing the entry when the cached
+/// session has been marked expired.
+///
+/// The idle-cleanup path removes sessions from the map but the recv loop may
+/// still hold an `Arc` in `last_client`. Clearing on the fast-path expired
+/// check prevents a quiet listener from pinning the backend socket/session
+/// until some later datagram overwrites the cache.
+#[allow(dead_code)] // also reached via `_test_support`
+pub(crate) fn take_udp_last_client_if_live<T>(
+    last_client: &mut Option<(SocketAddr, Arc<T>)>,
+    client_addr: SocketAddr,
+    is_expired: impl FnOnce(&T) -> bool,
+) -> Option<Arc<T>> {
+    match last_client {
+        Some((cached_addr, cached)) if *cached_addr == client_addr => {
+            if is_expired(cached.as_ref()) {
+                *last_client = None;
+                None
+            } else {
+                Some(Arc::clone(cached))
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1859,24 +1963,22 @@ async fn process_datagram(
     }
 
     // Fast path: check last-client cache before hitting DashMap.
-    // Skip the cache when the cached session has been flagged expired
-    // by the idle-cleanup task — that path removes the session from
-    // the map but the recv-loop's `Arc` keeps it alive, so without
-    // this check we'd keep forwarding through a session the cleanup
-    // task already declared dead and the configured
-    // `udp_idle_timeout_seconds` would be quietly ignored.
-    let existing_session = if let Some((cached_addr, ref cached_session)) = *last_client
-        && cached_addr == client_addr
-        && !cached_session
-            .expired
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        Some(cached_session.clone())
-    } else {
-        sessions
-            .get(&client_addr)
-            .map(|entry| entry.value().clone())
-    };
+    // Skip (and clear) the cache when the cached session has been flagged
+    // expired by the idle-cleanup task — that path removes the session from
+    // the map but the recv-loop's `Arc` keeps it alive, so without clearing
+    // we'd pin the backend socket/session on a quiet listener and keep
+    // forwarding through a session the cleanup task already declared dead.
+    let existing_session =
+        take_udp_last_client_if_live(last_client, client_addr, |cached_session| {
+            cached_session
+                .expired
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+        .or_else(|| {
+            sessions
+                .get(&client_addr)
+                .map(|entry| entry.value().clone())
+        });
 
     let Some(session) = existing_session else {
         // Cheap flood shield: when the active-session cap is already full, drop a
@@ -2342,10 +2444,12 @@ fn spawn_session_cleanup(
                             }
                             // Signal plain-UDP backend reply tasks to stop even
                             // when no backend datagram arrives to wake recv().
-                            session
-                                .stop_reply_task
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            session.stop_notify.notify_waiters();
+                            // notify_one stores a permit so the wakeup cannot be
+                            // lost if the reply task has not registered yet.
+                            signal_udp_reply_task_stop(
+                                &session.stop_reply_task,
+                                session.stop_notify.as_ref(),
+                            );
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
                             session.release_overload_guard();
@@ -3782,12 +3886,9 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
-            if reply_session
-                .stop_reply_task
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                break;
-            }
+            // Listener/global shutdown may already be set; borrow() also
+            // advances each watch "seen" version so the cancel future's
+            // changed() waits for a subsequent change.
             if *reply_listener_shutdown.borrow()
                 || reply_global_shutdown
                     .as_ref()
@@ -3796,21 +3897,23 @@ async fn create_session(
                 break;
             }
 
-            // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
+            // Read from backend — via DTLS (channel-based) or raw UDP
+            // (socket-based). Both paths share `udp_reply_recv_until_stop`
+            // so the register-then-check stop ordering cannot drift from the
+            // deterministic unit tests.
             let (data_slice, data_vec);
             let len;
             if let Some(ref dtls) = reply_dtls {
-                let recv_result = tokio::select! {
-                    result = dtls.recv() => Some(result),
-                    _ = reply_stop_notify.notified() => None,
-                    _ = reply_listener_shutdown.changed() => None,
-                    _ = async {
-                        match reply_global_shutdown.as_mut() {
-                            Some(rx) => { let _ = rx.changed().await; }
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => None,
-                };
+                let recv_result = udp_reply_recv_until_stop(
+                    &reply_session.stop_reply_task,
+                    reply_stop_notify.as_ref(),
+                    dtls.recv(),
+                    udp_reply_shutdown_cancel(
+                        &mut reply_listener_shutdown,
+                        &mut reply_global_shutdown,
+                    ),
+                )
+                .await;
                 match recv_result {
                     None => break,
                     Some(Ok(d)) => {
@@ -3838,17 +3941,16 @@ async fn create_session(
                     }
                 }
             } else if let Some(ref sock) = backend_socket {
-                let recv_result = tokio::select! {
-                    result = sock.recv(&mut buf) => Some(result),
-                    _ = reply_stop_notify.notified() => None,
-                    _ = reply_listener_shutdown.changed() => None,
-                    _ = async {
-                        match reply_global_shutdown.as_mut() {
-                            Some(rx) => { let _ = rx.changed().await; }
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => None,
-                };
+                let recv_result = udp_reply_recv_until_stop(
+                    &reply_session.stop_reply_task,
+                    reply_stop_notify.as_ref(),
+                    sock.recv(&mut buf),
+                    udp_reply_shutdown_cancel(
+                        &mut reply_listener_shutdown,
+                        &mut reply_global_shutdown,
+                    ),
+                )
+                .await;
                 match recv_result {
                     None => break,
                     Some(Ok(n)) => {

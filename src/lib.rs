@@ -209,6 +209,42 @@ pub mod _test_support {
         (udp_metadata, dtls_metadata)
     }
 
+    /// Signal a UDP reply task to stop using the production flag+`notify_one`
+    /// contract (permit-storing wake).
+    pub fn signal_udp_reply_task_stop_for_test(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+    ) {
+        crate::proxy::udp_proxy::signal_udp_reply_task_stop(stop_flag, stop_notify);
+    }
+
+    /// Race `recv` against the UDP reply-task stop signal with the production
+    /// register-then-check ordering. `cancel` is an additional select arm
+    /// (production passes listener/global shutdown; tests pass `pending()`).
+    pub async fn udp_reply_recv_until_stop_for_test<F, C, T>(
+        stop_flag: &std::sync::atomic::AtomicBool,
+        stop_notify: &tokio::sync::Notify,
+        recv: F,
+        cancel: C,
+    ) -> Option<T>
+    where
+        F: std::future::Future<Output = T>,
+        C: std::future::Future<Output = ()>,
+    {
+        crate::proxy::udp_proxy::udp_reply_recv_until_stop(stop_flag, stop_notify, recv, cancel)
+            .await
+    }
+
+    /// Resolve a live UDP `last_client` cache hit, clearing the entry when the
+    /// cached session is expired (same seam the recv loop uses).
+    pub fn take_udp_last_client_if_live_for_test<T>(
+        last_client: &mut Option<(std::net::SocketAddr, std::sync::Arc<T>)>,
+        client_addr: std::net::SocketAddr,
+        is_expired: impl FnOnce(&T) -> bool,
+    ) -> Option<std::sync::Arc<T>> {
+        crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
+    }
+
     pub fn plugin_cache_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,
