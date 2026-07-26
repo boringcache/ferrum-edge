@@ -620,7 +620,7 @@ tracing_sampling: 42.5  # spec.tracing.sampling — percentage 0-100
 | `spec.concurrency` | `concurrency` | Informational; rejected as `InvalidResource` if it does not fit in `u32` |
 | `spec.image.imageType` | `image` | Informational; surfaced to operator tooling |
 | `spec.environmentVariables` | `environment` | Informational; surfaced to operator tooling |
-| `spec.tracing.sampling` | `tracing_sampling` | Percentage 0-100; merged into the injected `workload_metrics` plugin's `sampling_percentage` |
+| `spec.tracing.sampling` | `tracing_sampling` | Percentage 0-100; merged into the injected `workload_metrics` plugin's `sampling_percentage`. Fails closed like `Telemetry.tracing.randomSamplingPercentage`: a non-numeric or out-of-range value is rejected as `InvalidResource` (`FerrumAccepted=False`/`Invalid`) rather than silently dropped — Istio's ProxyConfig CRD types it as a bare `double` with no range validation |
 
 **Scope resolution**: ProxyConfig honors the same Istio root-namespace + selector rules used by `Telemetry`, `RequestAuthentication`, and `PeerAuthentication`. The K8s translator routes through the shared `istio_policy_scope` helper, so [`scope`](../src/modes/mesh/config.rs) ends up as:
 

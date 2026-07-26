@@ -5047,7 +5047,9 @@ fn telemetry_provider_string_field_aliased(
 /// - `spec.image.imageType` -> `image` (informational)
 /// - `spec.environmentVariables` -> `environment`
 /// - `spec.tracing.sampling` -> `tracing_sampling` (percentage 0-100,
-///   merged into `workload_metrics.sampling_percentage` at slice-apply time)
+///   merged into `workload_metrics.sampling_percentage` at slice-apply time;
+///   non-numeric or out-of-range values are rejected as invalid rather than
+///   silently dropped, matching `Telemetry.tracing.randomSamplingPercentage`)
 fn proxy_config(
     options: &K8sTranslationOptions,
     object: &K8sObject,
@@ -5090,11 +5092,42 @@ fn proxy_config(
         .map(string_map)
         .unwrap_or_default();
 
-    let tracing_sampling = object
+    // Fail closed on a malformed or out-of-range sampling percentage the same
+    // way `Telemetry.tracing.randomSamplingPercentage` does. Istio's
+    // ProxyConfig CRD types `tracing.sampling` as a bare `double` with no
+    // range validation, so an operator value like `5000` reaches the watcher
+    // intact; silently accepting it would push an invalid
+    // `workload_metrics.sampling_percentage` onto every matching workload and
+    // contradict the documented "percentage 0-100" contract. A rejection is
+    // surfaced on the resource as `FerrumAccepted=False`/`Invalid`.
+    let tracing_sampling = match object
         .spec
         .get("tracing")
         .and_then(|tracing| tracing.get("sampling"))
-        .and_then(Value::as_f64);
+    {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let sampling = value.as_f64().ok_or_else(|| {
+                invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.tracing.sampling must be a number between 0 and 100 \
+                         (got {value})"
+                    ),
+                )
+            })?;
+            if !sampling.is_finite() || !(0.0..=100.0).contains(&sampling) {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "ProxyConfig spec.tracing.sampling must be between 0 and 100 \
+                         (got {sampling})"
+                    ),
+                ));
+            }
+            Some(sampling)
+        }
+    };
 
     Ok(MeshProxyConfig {
         name: object.metadata.name.clone(),
