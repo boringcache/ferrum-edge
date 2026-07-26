@@ -3405,7 +3405,7 @@ fn unknown_top_level_config_keys_are_rejected() {
     ];
     for config in configs {
         let result = BodyValidator::new(&config);
-        let error = result.expect_err("unknown key must be rejected");
+        let error = result.err().expect("unknown key must be rejected");
         assert!(error.contains("unknown configuration key"), "{error}");
     }
 }
@@ -3418,7 +3418,7 @@ fn unknown_top_level_config_keys_are_rejected_by_shape_only_validation() {
         "response_json_scheam": {"type": "object"}
     });
     let result = BodyValidator::validate_config(&config);
-    let error = result.expect_err("shape-only validation must reject it");
+    let error = result.err().expect("shape-only validation must reject it");
     assert!(error.contains("unknown configuration key"), "{error}");
 }
 
@@ -3434,7 +3434,7 @@ fn unknown_protobuf_method_keys_are_rejected() {
         }
     });
     let result = BodyValidator::new(&config);
-    let error = result.expect_err("misspelled direction must be rejected");
+    let error = result.err().expect("misspelled direction must be rejected");
     assert!(error.contains("unknown key 'respones'"), "{error}");
 }
 
@@ -3641,7 +3641,7 @@ fn schema_recursion_and_size_budgets_are_bounded() {
         schema = json!({"type": "object", "properties": {"next": schema}});
     }
     let deep = json!({"json_schema": schema});
-    let error = BodyValidator::new(&deep).expect_err("over-deep is rejected");
+    let error = BodyValidator::new(&deep).err().expect("over-deep is rejected");
     assert!(error.contains("schema budget"), "{error}");
 
     // A wide schema past the node budget is rejected on size, not depth.
@@ -3651,7 +3651,7 @@ fn schema_recursion_and_size_budgets_are_bounded() {
     }
     let properties = serde_json::Value::Object(properties);
     let wide = json!({"json_schema": {"properties": properties}});
-    let error = BodyValidator::new(&wide).expect_err("over-wide is rejected");
+    let error = BodyValidator::new(&wide).err().expect("over-wide is rejected");
     assert!(error.contains("schema budget"), "{error}");
 }
 
