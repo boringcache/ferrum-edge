@@ -53,6 +53,7 @@ pub use crate::config::batch_atomicity::{
     AtomicBatchCounts, AtomicBatchFault, AtomicBatchGraph, AtomicBatchPhase,
     BatchAdmissionLeaseLost,
 };
+#[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
     IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,

@@ -4,6 +4,10 @@
 //! polling are defined here. Each backend (sqlx, MongoDB) provides its own
 //! implementation. The trait is object-safe so it can be used as `Arc<dyn DatabaseBackend>`.
 
+// Re-exported for `use crate::config::db_backend::{AtomicBatchGraph, ...}` call
+// sites. The `ferrum-edge` binary target reaches these names through
+// `crate::config::batch_atomicity` directly, so the re-export is unused there.
+#[allow(unused_imports)]
 pub use crate::config::batch_atomicity::{
     ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
     BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
