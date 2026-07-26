@@ -3879,6 +3879,11 @@ pub mod _test_support {
         (config, accepted, rejected)
     }
 
+    pub use crate::modes::cp_namespace_full_load_test_backend::CpNamespaceFullLoadTestBackend;
+    pub use crate::modes::control_plane::{
+        load_full_config_multi_for_test, LoadFullConfigMultiTestOutcome,
+    };
+
     // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
     pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
 

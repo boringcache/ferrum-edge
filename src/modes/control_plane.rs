@@ -648,6 +648,29 @@ struct FullLoadMultiOutcome {
     failed_namespaces: Vec<String>,
 }
 
+/// External-test view of [`load_full_config_multi`]. Not `Debug`: carries
+/// consumer credentials inside `GatewayConfig`.
+pub struct LoadFullConfigMultiTestOutcome {
+    pub config: GatewayConfig,
+    pub rejected_namespaces: Vec<(String, String)>,
+    pub refreshed_namespaces: Vec<String>,
+    pub failed_namespaces: Vec<String>,
+}
+
+pub async fn load_full_config_multi_for_test(
+    db: &dyn DatabaseBackend,
+    namespaces: &[String],
+    previous: &GatewayConfig,
+) -> Result<LoadFullConfigMultiTestOutcome, anyhow::Error> {
+    let outcome = load_full_config_multi(db, namespaces, previous).await?;
+    Ok(LoadFullConfigMultiTestOutcome {
+        config: outcome.config,
+        rejected_namespaces: outcome.rejected_namespaces,
+        refreshed_namespaces: outcome.refreshed_namespaces,
+        failed_namespaces: outcome.failed_namespaces,
+    })
+}
+
 fn clear_namespaced_resources(config: &mut GatewayConfig) {
     config.proxies.clear();
     config.consumers.clear();
