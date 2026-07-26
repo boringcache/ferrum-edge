@@ -2655,6 +2655,175 @@ fn backend_tls_sni_with_grpc_web_buffering_fails_validate() {
     );
 }
 
+/// Build a plugin config for the SNI admission tests.
+fn sni_plugin_config(
+    id: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+    config: serde_json::Value,
+) -> PluginConfig {
+    let proxy_id = match scope {
+        PluginScope::Global => None,
+        _ => Some("p1".to_string()),
+    };
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: plugin_name.into(),
+        scope,
+        proxy_id,
+        enabled: true,
+        config,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Proxy-scoped plugin config attached to the SNI test proxy.
+fn sni_proxy_plugin(id: &str, name: &str, config: serde_json::Value) -> PluginConfig {
+    sni_plugin_config(id, name, PluginScope::Proxy, config)
+}
+
+/// A plain-HTTPS proxy with a backend TLS SNI override, with every
+/// non-global plugin config attached to it.
+fn sni_config_with_plugins(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
+    let mut upstream = make_upstream("sni-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    let mut associations = Vec::new();
+    for pc in &plugin_configs {
+        if pc.scope != PluginScope::Global {
+            associations.push(PluginAssociation {
+                plugin_config_id: pc.id.clone(),
+            });
+        }
+    }
+    proxy.plugins = associations;
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.plugin_configs = plugin_configs;
+    config.normalize_fields();
+    config
+}
+
+/// Only the request-body-buffering leg of the SNI admission errors.
+fn buffering_rejection_ids(config: &GatewayConfig) -> Vec<String> {
+    let Err(errors) = config.validate_upstream_references() else {
+        return Vec::new();
+    };
+    let mut rejections = Vec::new();
+    for msg in errors {
+        if msg.contains("request-body-buffering") {
+            rejections.push(msg);
+        }
+    }
+    rejections
+}
+
+/// The screen follows each plugin's own parsed state instead of a static name
+/// list: `compression` buffers only when request decompression is configured.
+#[test]
+fn backend_tls_sni_buffering_screen_follows_compression_plugin_state() {
+    let pc = sni_proxy_plugin("compression-1", "compression", serde_json::json!({}));
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("response-only compression rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let pc = sni_proxy_plugin("compression-1", "compression", decompress);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let hit = rejections.iter().any(|m| m.contains("compression-1"));
+    let msg = format!("decompressing compression admitted: {rejections:?}");
+    assert!(hit, "{msg}");
+}
+
+/// `hmac_auth` buffers the request body before authenticate but was absent
+/// from the old hardcoded name list; the trait-derived screen catches it.
+#[test]
+fn backend_tls_sni_buffering_screen_covers_plugins_absent_from_old_list() {
+    let pc = sni_proxy_plugin("hmac-1", "hmac_auth", serde_json::json!({}));
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let hit = rejections.iter().any(|m| m.contains("hmac-1"));
+    let msg = format!("hmac_auth buffering not screened: {rejections:?}");
+    assert!(hit, "{msg}");
+}
+
+/// Global-scope inheritance keeps working through the trait-derived screen.
+#[test]
+fn backend_tls_sni_buffering_screen_covers_inherited_global_plugins() {
+    let scope = PluginScope::Global;
+    let empty = serde_json::json!({});
+    let pc = sni_plugin_config("global-web", "grpc_web", scope, empty);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let named = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("global buffering plugin not screened: {rejections:?}");
+    assert!(named && inherited, "{msg}");
+}
+
+/// A disabled plugin config is not effective and must not reject the proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_disabled_plugin_configs() {
+    let empty = serde_json::json!({});
+    let mut pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
+    pc.enabled = false;
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("disabled plugin rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Unknown / custom plugin names stay admitted; the runtime 502 remains the
+/// fail-closed backstop, so admission must not invent a rejection.
+#[test]
+fn backend_tls_sni_buffering_screen_admits_unknown_plugin_names() {
+    let cfg = serde_json::json!({"anything": true});
+    let pc = sni_proxy_plugin("custom-1", "some_custom_plugin", cfg);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("unevaluable plugin rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// A built-in whose config does not construct is rejected by plugin-config
+/// validation, not disguised as a buffering conflict here.
+#[test]
+fn backend_tls_sni_buffering_screen_admits_unconstructable_configs() {
+    let cfg = serde_json::json!({"algorithms": ["not-a-codec"]});
+    let pc = sni_proxy_plugin("compression-1", "compression", cfg);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("unconstructable config rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// A proxy without a plain-HTTPS SNI override is never screened at all, so a
+/// buffering plugin on it must stay admitted.
+#[test]
+fn buffering_plugins_are_only_screened_for_sni_proxies() {
+    let empty = serde_json::json!({});
+    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
+    let mut config = sni_config_with_plugins(vec![pc]);
+    config.upstreams[0].backend_tls_sni = None;
+    config.proxies[0].resolved_tls.sni = None;
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("non-SNI proxy screened: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
 #[test]
 fn backend_tls_sni_per_port_overlay_with_http2_disabled_fails_validate() {
     let mut upstream = make_upstream("sni-upstream");

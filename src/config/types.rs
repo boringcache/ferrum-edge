@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -3082,72 +3083,52 @@ pub(crate) fn mesh_transport_retry_conflict_message(
     )
 }
 
-/// Whether a plugin config is known to force request-body buffering for at
-/// least some requests when enabled.
+/// Whether a plugin config forces request-body buffering for at least some
+/// requests when enabled.
 ///
 /// Used by backend-TLS SNI admission: plain HTTPS SNI overrides require the
 /// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
-/// Config-dependent plugins are screened from their JSON config; unknown /
-/// custom plugins are left to the runtime fail-closed 502 path.
-fn plugin_config_forces_request_body_buffering(pc: &PluginConfig) -> bool {
+///
+/// The answer comes from the authoritative
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
+/// on an instance built from the SAME parsed configuration the runtime
+/// `PluginCache` builds — there is no second, config-shaped re-implementation
+/// of the predicate to drift out of sync. See
+/// [`crate::plugins::RequestBodyBufferingScreener`] for the side-effect
+/// guarantees of that construction.
+///
+/// A plugin the screen cannot evaluate (custom / unknown plugin, or a
+/// configuration that does not construct) is admitted with a value-redacted
+/// warning, preserving the documented residual: those requests still fail
+/// closed at runtime with a `502` and
+/// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
+fn plugin_config_forces_request_body_buffering(
+    proxy_id: &str,
+    pc: &PluginConfig,
+    screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
+) -> bool {
     if !pc.enabled {
         return false;
     }
-    match pc.plugin_name.as_str() {
-        "grpc_web"
-        | "ai_prompt_compressor"
-        | "ai_stream_router"
-        | "ai_federation"
-        | "ai_transcript_audit"
-        | "ai_tool_governor"
-        | "ai_rate_limiter"
-        | "openapi_validator"
-        | "opa"
-        | "mcp_gateway" => true,
-        "request_transformer" => {
-            pc.config
-                .get("body")
-                .is_some_and(|body| !body.is_null() && body != &serde_json::Value::Null)
-                || pc
-                    .config
-                    .get("body_rules")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|rules| !rules.is_empty())
-                || pc
-                    .config
-                    .get("request")
-                    .and_then(|v| v.get("body"))
-                    .is_some_and(|body| !body.is_null())
+    // Built on first use: a proxy whose effective plugin configs are all
+    // disabled (or absent) never constructs the screener's HTTP client.
+    let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
+    match screener.screen(&pc.plugin_name, &pc.config) {
+        crate::plugins::RequestBodyBufferingScreen::Buffers => true,
+        crate::plugins::RequestBodyBufferingScreen::Streams => false,
+        crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
+            tracing::warn!(
+                proxy_id = %proxy_id,
+                plugin_config_id = %pc.id,
+                plugin_name = %pc.plugin_name,
+                reason = gap.as_str(),
+                "Backend TLS SNI admission could not evaluate request-body buffering for this \
+                 plugin; admitting the proxy. Direct HTTP/2 SNI dispatch still fails closed at \
+                 runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
+                 plugin buffers request bodies"
+            );
+            false
         }
-        "compression" => pc
-            .config
-            .get("decompress_request")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "waf" => pc
-            .config
-            .get("request_body_inspection")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "body_validator" => {
-            // Any non-empty request schema / validation config forces buffering.
-            pc.config.get("request").is_some()
-                || pc.config.get("json_schema").is_some()
-                || pc.config.get("xml_schema").is_some()
-                || pc
-                    .config
-                    .get("content_types")
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|m| !m.is_empty())
-        }
-        "ai_request_guard" | "ai_prompt_shield" => {
-            // These buffer when body transforms are configured; treat any
-            // non-empty config beyond enable flags as potentially buffering.
-            pc.config
-                .as_object()
-                .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
-        }
-        _ => false,
     }
 }
 
@@ -3193,6 +3174,14 @@ fn proxy_plain_https_sni_sources<'a>(
 /// on the direct-H2 pool (retry body replay, request-body buffering plugins,
 /// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
 /// per-port TLS overlays so `validate` catches guaranteed total outages.
+///
+/// The buffering leg is derived from the runtime
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
+/// plugin built from the same parsed config (see
+/// [`plugin_config_forces_request_body_buffering`]), so it tracks every
+/// conditional buffering plugin exactly and needs no per-plugin maintenance.
+/// Plugin construction happens only for proxies that actually carry a plain
+/// HTTPS SNI override, and only for that proxy's effective plugin configs.
 pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     proxy: &Proxy,
     upstream: Option<&Upstream>,
@@ -3232,6 +3221,11 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     // Effective plugins for this proxy: associations + globals (unless a
     // local instance shadows that plugin name — mirror PluginCache merging
     // for the buffering screen only).
+    //
+    // The screener owns an HTTP client, so build it lazily: proxies without an
+    // effective plugin config never pay for one, and non-SNI proxies already
+    // returned above.
+    let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
     let mut local_names: HashSet<&str> = HashSet::new();
     for assoc in &proxy.plugins {
         if let Some(pc) = plugin_configs
@@ -3239,7 +3233,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
             .find(|pc| pc.id == assoc.plugin_config_id)
         {
             local_names.insert(pc.plugin_name.as_str());
-            if plugin_config_forces_request_body_buffering(pc) {
+            if plugin_config_forces_request_body_buffering(&proxy.id, pc, &screener) {
                 errors.push(format!(
                     "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                      request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
@@ -3255,7 +3249,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         if local_names.contains(pc.plugin_name.as_str()) {
             continue;
         }
-        if plugin_config_forces_request_body_buffering(pc) {
+        if plugin_config_forces_request_body_buffering(&proxy.id, pc, &screener) {
             errors.push(format!(
                 "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                  request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
