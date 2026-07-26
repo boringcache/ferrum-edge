@@ -266,23 +266,25 @@ pub struct AdminState {
     /// (`db_available=false`) during a transient DB outage.
     pub db_available: Option<Arc<AtomicBool>>,
     /// Set by the database- or CP-mode poll loop when the latest full config
-    /// load was rejected by the shared runtime-config *validation* contract (a
-    /// reachable backend served a semantically-invalid snapshot) rather than
-    /// failing on connectivity — and by file-mode SIGHUP reload when a
-    /// candidate fails read/parse/validation/apply. Orthogonal to `db_available`:
-    /// on a DB/CP validation rejection the backend is reachable and admin writes
-    /// are the in-band repair tool, so `db_available` stays `true` while this
-    /// flag rises. File mode has no DB (`db_available` is `None`, treated as
-    /// reachable for `/health` gating) and stays read-only; operators repair by
-    /// fixing the file and reloading. Cleared only by the next accepted
-    /// authoritative full reload (Applied or Unchanged). Surfaced only in the
-    /// authenticated `/health` detail (`config_rejected`) and coarsely as a
-    /// `"degraded"` status; `None` in modes without a reload rejection signal.
+    /// load was rejected by the shared runtime-config validation contract or by
+    /// typed SQL row decoding (a reachable backend served a semantically invalid
+    /// or undecodable snapshot) rather than failing on connectivity — and by
+    /// file-mode SIGHUP reload when a candidate fails read/parse/validation/apply.
+    /// Orthogonal to `db_available`: on a DB/CP validation or row-decode rejection
+    /// the backend is reachable and admin writes are the in-band repair tool, so
+    /// `db_available` stays `true` while this flag rises. File mode has no DB
+    /// (`db_available` is `None`, treated as reachable for `/health` gating) and
+    /// stays read-only; operators repair by fixing the file and reloading. Cleared
+    /// only by the next accepted authoritative full reload (Applied or Unchanged).
+    /// Surfaced only in the authenticated `/health` detail (`config_rejected`) and
+    /// coarsely as a `"degraded"` status; `None` in modes without a reload
+    /// rejection signal.
     ///
     /// The stored flag is deliberately sticky across a later connectivity outage;
     /// the `/health` handler suppresses the detailed `config_rejected` field while
     /// `db_available=false` so it never advertises the writable repair path when
-    /// admin writes are actually blocked. See issue #2158 (DB/CP) and #2979 (file).
+    /// admin writes are actually blocked. See issues #2158 and #2997 (DB/CP) and
+    /// #2979 (file).
     pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
@@ -1397,13 +1399,14 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Config-rejection signal (issues #2158 / #2979): the latest full config
-        // load was rejected by the runtime-config validation contract (DB/CP) or
-        // a file-mode SIGHUP candidate failed read/parse/validation/apply while
-        // the previous generation kept serving. In DB/CP, admin writes remain
-        // ENABLED (they are the in-band repair path — `db_available` is left
-        // `true`), so surface the condition as a coarse `"degraded"` status plus
-        // a `config_rejected` detail flag. File mode has `db_available: None`
+        // Config-rejection signal (issues #2158 / #2997 / #2979): the latest
+        // full config load was rejected by the runtime-config validation
+        // contract or by typed SQL row decoding (DB/CP), or a file-mode SIGHUP
+        // candidate failed read/parse/validation/apply, while the previous
+        // generation kept serving. In DB/CP, admin writes remain ENABLED (they
+        // are the in-band repair path — `db_available` is left `true`), so
+        // surface the condition as a coarse `"degraded"` status plus a
+        // `config_rejected` detail flag. File mode has `db_available: None`
         // (treated as reachable below) and stays read-only; repair is a fixed
         // file + reload. The boolean detail is authenticated-only: it is added
         // to `health_status`, which the minimal unauthenticated body below does
