@@ -1136,6 +1136,25 @@ cancelled tasks and outstanding records through
 `ferrum_observability_delivery_*` metrics. A failed or unavailable sink cannot
 wedge process exit.
 
+`FERRUM_LOG_DELIVERY_MAX_TASKS` is the aggregate pending-task budget for
+terminal, mirror, and deadline-cleanup work (the pre-queue Tokio task and
+registry layer). Admission reserves a permit before spawn/registry insertion.
+When the budget is exhausted, further admissions are rejected immediately
+(non-blocking), counted on `ferrum_observability_delivery_rejected_tasks_total`
+and on the budget-specific
+`ferrum_observability_delivery_capacity_rejected_tasks_total`, and surfaced with
+a rate-limited caller-thread warning; callers must not spawn additional deferred
+work to report the drop. The warning is both sampled and bounded to at most one
+line per five seconds per delivery lifecycle generation, so a sustained
+overflow cannot scale log output with rejected traffic. Permits release when tasks complete or are
+cancelled, and the shared shutdown-drain deadline is unchanged.
+`ferrum_observability_delivery_max_tasks` and
+`ferrum_observability_delivery_admitted_tasks` expose the configured budget and
+current reservation depth. Alert on
+`ferrum_observability_delivery_capacity_rejected_tasks_total` rather than the
+aggregate reject counter when diagnosing budget exhaustion: the aggregate also
+counts closed-admission and no-runtime rejects that occur normally at shutdown.
+
 A completed drain is terminal for that delivery lifecycle *generation*: its
 task and worker admission stay closed and its drain report stays cached, so
 late producers on a shutting-down process cannot reopen delivery work behind
