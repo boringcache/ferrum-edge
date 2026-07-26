@@ -3078,8 +3078,9 @@ fn cache_telemetry_field(suffix: &str) -> Option<&'static str> {
 /// exact key grammar and return the telemetry suffix.
 ///
 /// `ai_semantic_cache` namespaces its per-request staging as
-/// `ai_semantic_cache.` + the instance's process-unique decimal `u64` id + `.`
-/// + suffix (`staging_metadata_key` in `src/plugins/ai_semantic_cache.rs`).
+/// `ai_semantic_cache.` plus the instance's process-unique decimal `u64` id,
+/// `.`, and the suffix (`staging_metadata_key` in
+/// `src/plugins/ai_semantic_cache.rs`).
 /// Matching the full grammar rather than the prefix alone keeps the exported
 /// key space equal to the authoritative producer schema: an unrelated key that
 /// merely starts with the namespace cannot smuggle arbitrary metadata into an
