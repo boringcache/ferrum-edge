@@ -2930,7 +2930,10 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         ("ai_semantic_cache.cache_status", "HIT"),
         // Non-numeric / oversized instance ids are not producer output.
         ("ai_semantic_cache.abc.cache_status", "HIT"),
-        ("ai_semantic_cache.999999999999999999999.cache_status", "HIT"),
+        (
+            "ai_semantic_cache.999999999999999999999.cache_status",
+            "HIT",
+        ),
         ("ai_semantic_cache.18446744073709551616.cache_status", "HIT"),
         ("ai_semantic_cache.007.cache_status", "HIT"),
         // Prefix-without-separator collision the old predicate accepted.
