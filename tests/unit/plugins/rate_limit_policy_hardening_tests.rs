@@ -16,10 +16,12 @@ use ferrum_edge::_test_support::{
     create_rate_limit_plugin_with_config_id, rate_limit_redis_key_prefix,
 };
 use ferrum_edge::plugins::utils::rate_limit::{
-    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS,
-    LocalLimiter, LocalWindowAlgorithm, MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
-    RateLimitWindowSpec, SLIDING_WINDOW_BUCKET_COUNT, SlidingWindow, local_window_algorithm,
-    single_window_ttl_seconds, two_window_ttl_seconds,
+    AiRateLimitOp, AiTokenRateAlgorithm, DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp,
+    LOCAL_TOKEN_BUCKET_MAX_WINDOW_SECONDS, LocalLimiter, LocalWindowAlgorithm,
+    MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS, RateLimitAlgorithm,
+    RateLimitWindowSpec, SLIDING_WINDOW_BUCKET_COUNT, SlidingWindow, TokenBucket,
+    UdpRateLimitAlgorithm, UdpRateLimitOp, local_window_algorithm, single_window_ttl_seconds,
+    two_window_ttl_seconds,
 };
 use ferrum_edge::plugins::{PluginHttpClient, create_plugin};
 use serde_json::{Value, json};
@@ -176,6 +178,29 @@ fn udp_rate_limiting_accepts_every_documented_root_key() {
         "redis_password": "pass",
     }))
     .expect("the documented root key set must remain accepted");
+}
+
+#[test]
+fn ai_and_websocket_roots_remain_intentionally_open() {
+    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
+    // limiter roots; neither AI nor WebSocket appears in its affected
+    // components, reproductions, impact, or component-progress list.
+    create_plugin(
+        "ai_rate_limiter",
+        &json!({
+            "token_limit": 100,
+            "future_policy_field": {"enabled": true}
+        }),
+    )
+    .expect("AI root remains forward-compatible");
+    create_plugin(
+        "ws_rate_limiting",
+        &json!({
+            "frames_per_second": 10,
+            "future_policy_field": {"enabled": true}
+        }),
+    )
+    .expect("WebSocket root remains forward-compatible");
 }
 
 // ── GHSA-jjjw-rqjm-fvf3: bounded numeric configuration ──────────────────────
@@ -440,6 +465,10 @@ fn the_production_factory_threads_the_config_id_into_every_rate_limit_plugin() {
     ] {
         create_rate_limit_plugin_with_config_id(plugin_name, &config, Some("  "))
             .expect_err(&format!("{plugin_name}: blank config id must fail closed"));
+        create_rate_limit_plugin_with_config_id(plugin_name, &config, Some("policy:shared"))
+            .expect_err(&format!(
+                "{plugin_name}: delimiter-bearing config id must fail closed"
+            ));
         create_rate_limit_plugin_with_config_id(plugin_name, &config, Some("policy-a"))
             .unwrap_or_else(|error| panic!("{plugin_name}: valid config id must admit: {error}"));
         create_rate_limit_plugin_with_config_id(plugin_name, &config, None)
@@ -482,6 +511,90 @@ fn sliding_window_enforces_configured_boundary() {
 }
 
 #[test]
+fn sliding_window_does_not_drop_the_oldest_bucket_at_the_window_boundary() {
+    // One 63-second window spans 63 sub-intervals. At exactly one window,
+    // requests at the inclusive cutoff are still live. The prior 64-interval
+    // indexing reused slot zero here and under-counted the window.
+    let mut window = SlidingWindow::new(1, Duration::from_secs(63));
+    let start = Instant::now();
+    assert!(window.would_allow(start));
+    window.increment(start);
+
+    let at_cutoff = start
+        .checked_add(Duration::from_secs(63))
+        .expect("test Instant supports a 63-second offset");
+    assert!(
+        !window.would_allow(at_cutoff),
+        "the inclusive oldest bucket must remain counted"
+    );
+    assert!(window.has_recent_activity(at_cutoff));
+
+    let conservative_horizon = start
+        .checked_add(Duration::from_secs(64))
+        .expect("test Instant supports a 64-second offset");
+    assert!(
+        window.would_allow(conservative_horizon),
+        "over-count must end within one sub-interval"
+    );
+    assert!(!window.has_recent_activity(conservative_horizon));
+}
+
+#[test]
+fn token_bucket_ignores_reverse_ordered_concurrent_timestamps() {
+    // `LocalLimiter::check` captures time before locking a key, so another
+    // request can update the bucket first with a later timestamp. Rewinding
+    // last_refill would credit the same interval twice.
+    let mut bucket = TokenBucket::from_rate(1.0, 1.0);
+    let base = Instant::now();
+    bucket.consume(1);
+
+    let future = base
+        .checked_add(Duration::from_secs(1))
+        .expect("test Instant supports a one-second offset");
+    assert!(bucket.would_allow(future, 1));
+    bucket.consume(1);
+    assert!(!bucket.would_allow(base, 1));
+
+    let half_second_later = future
+        .checked_add(Duration::from_millis(500))
+        .expect("test Instant supports a subsecond offset");
+    assert!(
+        !bucket.would_allow(half_second_later, 1),
+        "reverse timestamps must not create duplicate refill credit"
+    );
+}
+
+#[test]
+fn ai_maximum_window_uses_checked_instant_arithmetic() {
+    let algorithm = AiTokenRateAlgorithm::new(10, MAX_RATE_LIMIT_WINDOW_SECONDS);
+    let mut state = algorithm.new_state();
+    let now = Instant::now();
+    let outcome = algorithm.check_local(
+        &mut state,
+        &AiRateLimitOp::Reserve { tokens: 1 },
+        now,
+    );
+    assert!(outcome.allowed);
+    assert!(algorithm.is_state_active(&state, now));
+}
+
+#[test]
+fn udp_local_counters_saturate_instead_of_wrapping() {
+    let now = Instant::now();
+    let algorithm = UdpRateLimitAlgorithm::new(None, Some(u64::MAX - 1), 1, now);
+    let mut state = algorithm.new_state();
+    let op = UdpRateLimitOp {
+        datagram_size: u64::MAX,
+    };
+
+    assert!(!algorithm.check_local(&mut state, &op, now).allowed);
+    assert!(
+        !algorithm.check_local(&mut state, &op, now).allowed,
+        "overflow must stay denied rather than wrap below the byte limit"
+    );
+}
+
+#[test]
 fn http_graphql_grpc_shared_windows_select_bounded_sliding_aggregate() {
     // Ordinary HTTP / GraphQL / gRPC-method windows > 5s all route through
     // `new_http_window_states` → SlidingWindow. Prove the shared selector and
@@ -518,7 +631,7 @@ fn http_graphql_grpc_shared_windows_select_bounded_sliding_aggregate() {
         limit: 5,
         duration: Duration::from_secs(60),
     }]);
-    let limiter = LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), 1);
+    let limiter = LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), 2);
     let now = Instant::now();
     for i in 0..5 {
         let outcome = limiter.check_at("hot-key".to_string(), &op, now);

@@ -2527,25 +2527,32 @@ Each `limits[]` rule configures rate windows in one of two ways:
 1. `window_seconds` + `max_requests` — exact custom window
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
 
-**Configuration bounds (all rate-limit plugins).** Every window is capped at
-`2678400` seconds (31 days) and every request cap at `1000000`. Zero is rejected,
-and so is anything above the cap. The window bound keeps the value representable
+**Configuration bounds.** Every explicit `window_seconds` accepted by the
+rate-limit plugins is capped at `2678400` seconds (31 days). Ordinary HTTP,
+GraphQL, and gRPC method request caps are capped at `1000000`; zero and values
+above those bounds are rejected. The window bound keeps the value representable
 as a monotonic duration, as a signed Redis `EXPIRE` TTL (`2 × window + 1`), and
-as the stale-state retention horizon; unbounded values previously wrapped into a
-zero/negative TTL that deleted the counter on every increment and removed
-enforcement entirely. Local sliding-window state uses a fixed ring of aggregate
-count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so per-key memory
-stays O(1) in the request cap; the request-cap bound is an operational ceiling
-on budgets and Redis/header arithmetic, not a timestamp-log size limit. Unknown
-top-level keys are rejected.
+as the stale-state retention horizon; unbounded values previously wrapped into
+a zero/negative TTL that deleted the counter on every increment and removed
+enforcement entirely. Local HTTP/GraphQL/gRPC sliding-window state uses a fixed
+ring of aggregate count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so
+per-key memory stays O(1) in the request cap; the request-cap bound is an
+operational ceiling on budgets and Redis/header arithmetic, not a timestamp-log
+size limit. The `rate_limiting`, `graphql`, `grpc_method_router`, and
+`udp_rate_limiting` roots reject unknown keys. The `ai_rate_limiter` and
+`ws_rate_limiting` roots remain intentionally open for forward-compatible
+fields, consistently in runtime admission and OpenAPI.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
 **Algorithm selection** (automatic):
 - Windows ≤ 5 seconds → token bucket (O(1) memory, ideal for TPS limiting)
 - Windows > 5 seconds → bounded aggregate sliding window (fixed 64 count buckets
-  per key; oldest live bucket counted in full so enforcement stays fail-closed
-  relative to an exact timestamp log, without boundary-burst of a pure fixed window)
+  per key: one current bucket plus 63 sub-intervals per configured window).
+  A slot is reused only after its entire interval expires; the oldest bucket is
+  counted in full, so enforcement stays fail-closed relative to an exact
+  timestamp log and deliberate over-count is bounded by one sub-interval
+  (`ceil(window / 63)`), without the boundary burst of a pure fixed window.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

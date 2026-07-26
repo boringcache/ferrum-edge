@@ -132,11 +132,14 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   replicas of the same policy keep sharing a budget. An explicit
   `redis_key_prefix` is the shared-budget opt-in.
 - Every rate-limit window is bounded by `MAX_RATE_LIMIT_WINDOW_SECONDS`
-  (2678400) and every request cap by `MAX_RATE_LIMIT_MAX_REQUESTS` (1000000);
+  (2678400), and ordinary HTTP/GraphQL/gRPC request caps are bounded by
+  `MAX_RATE_LIMIT_MAX_REQUESTS` (1000000);
   TTL/retention math uses the saturating helpers in
   `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
   `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
-  timestamp per request. Rate-limit plugin roots are closed key sets.
+  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
+  rate-limit plugin roots are closed key sets; AI and WebSocket rate-limit
+  roots remain intentionally open and must stay in parity with OpenAPI.
 - Redis outage falls back to in-memory and reconnects in the background.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.

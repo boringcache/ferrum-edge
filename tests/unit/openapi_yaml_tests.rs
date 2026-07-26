@@ -1672,6 +1672,21 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         );
     }
 
+    // The typo advisory's affected-component list is limited to ordinary HTTP,
+    // GraphQL, and gRPC-method limiter roots. AI and WebSocket remain
+    // intentionally open in runtime admission, so OpenAPI must not close them.
+    for schema_name in ["AiRateLimiterConfig", "WsRateLimitingConfig"] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert!(
+            schema
+                .get("additionalProperties")
+                .is_none_or(|value| value == &json!(true)),
+            "{schema_name} must remain open in parity with runtime admission"
+        );
+    }
+
     let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
     let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);
     for pointer in [

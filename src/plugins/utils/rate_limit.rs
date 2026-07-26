@@ -40,14 +40,23 @@ pub const MAX_RATE_LIMIT_WINDOW_SECONDS: u64 = 31 * 24 * 60 * 60;
 /// one timestamp per admitted request.
 pub const MAX_RATE_LIMIT_MAX_REQUESTS: u64 = 1_000_000;
 
-/// Fixed number of aggregate count buckets covering one local sliding window.
+/// Fixed number of aggregate count buckets retained by one local sliding window.
 ///
 /// Independent of [`MAX_RATE_LIMIT_MAX_REQUESTS`]: each hot key retains at most
 /// this many `u64` counters (plus a handful of scalar fields), so sustained
 /// traffic under a maximally configured identity cannot grow per-key state
-/// with the admission count. The oldest live bucket is counted in full, which
-/// is slightly stricter than an exact timestamp log and therefore fail-closed.
+/// with the admission count. The ring spans the current sub-interval plus the
+/// preceding 63 sub-intervals; one configured window contains 63 sub-intervals.
+/// Consequently a slot is not reused until every request in it is outside the
+/// exact window. The oldest retained bucket is counted in full, so over-count
+/// is bounded by one sub-interval (`ceil(window / 63)`) and enforcement remains
+/// fail-closed relative to an exact timestamp log.
 pub const SLIDING_WINDOW_BUCKET_COUNT: usize = 64;
+
+/// Number of sub-intervals in one configured sliding window. One additional
+/// ring slot retains the oldest partially overlapping bucket.
+const SLIDING_WINDOW_INTERVALS_PER_WINDOW: u128 =
+    (SLIDING_WINDOW_BUCKET_COUNT - 1) as u128;
 
 /// Local windows at or below this many whole seconds use a token bucket;
 /// longer windows use the bounded aggregate [`SlidingWindow`].
@@ -455,11 +464,12 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         http_client: &PluginHttpClient,
         algorithm: A,
     ) -> Result<Option<Self>, String> {
-        if config_id.trim().is_empty() {
-            return Err(format!(
-                "{plugin_name}: plugin config id must be a non-empty stable identity"
-            ));
-        }
+        crate::config::types::validate_resource_id(plugin_name)
+            .map_err(|error| format!("{plugin_name}: invalid canonical plugin name: {error}"))?;
+        crate::config::types::validate_resource_id(config_id)
+            .map_err(|error| format!("{plugin_name}: invalid plugin config id: {error}"))?;
+        crate::config::types::validate_namespace(http_client.namespace())
+            .map_err(|error| format!("{plugin_name}: invalid Redis namespace: {error}"))?;
         let default_prefix = format!("{}:{plugin_name}:{config_id}", http_client.namespace());
         let Some(cfg) = RedisConfig::from_plugin_config(config, &default_prefix)? else {
             return Ok(None);
@@ -994,7 +1004,7 @@ impl FixedWindow {
 pub struct SlidingWindow {
     /// Ring of per-sub-interval request counts. Length is always
     /// [`SLIDING_WINDOW_BUCKET_COUNT`] and never grows with admissions.
-    buckets: [u64; SLIDING_WINDOW_BUCKET_COUNT],
+    buckets: Box<[u64; SLIDING_WINDOW_BUCKET_COUNT]>,
     /// Absolute monotonic bucket index of the newest live slot.
     current_bucket: u64,
     /// Origin for bucket-index math; set on first admission.
@@ -1010,7 +1020,9 @@ pub struct SlidingWindow {
 impl SlidingWindow {
     pub fn new(limit: u64, window_duration: Duration) -> Self {
         Self {
-            buckets: [0; SLIDING_WINDOW_BUCKET_COUNT],
+            // One allocation when a new key/window is admitted; steady
+            // request checks reuse this fixed-size ring without allocation.
+            buckets: Box::new([0; SLIDING_WINDOW_BUCKET_COUNT]),
             current_bucket: 0,
             epoch: None,
             total: 0,
@@ -1067,7 +1079,11 @@ impl SlidingWindow {
             return false;
         };
         match now.checked_duration_since(last) {
-            Some(elapsed) => elapsed < self.window_duration,
+            // The aggregate algorithm intentionally retains the oldest
+            // partially overlapping bucket. Cleanup must use the same
+            // conservative horizon or it could drop still-counted state and
+            // under-enforce on the next request.
+            Some(elapsed) => elapsed < sliding_window_retention(self.window_duration),
             // `now` before `last` should not happen on a monotonic clock; treat
             // as still active so cleanup stays fail-closed.
             None => true,
@@ -1089,7 +1105,7 @@ impl SlidingWindow {
         }
         let steps = new_bucket.saturating_sub(self.current_bucket);
         if steps >= SLIDING_WINDOW_BUCKET_COUNT as u64 {
-            self.buckets = [0; SLIDING_WINDOW_BUCKET_COUNT];
+            self.buckets.fill(0);
             self.total = 0;
         } else {
             let mut bucket = self.current_bucket;
@@ -1104,15 +1120,41 @@ impl SlidingWindow {
     }
 }
 
-/// Map elapsed time onto the absolute bucket index spanning `window`.
+/// Map elapsed time onto an absolute aggregate bucket index.
 ///
-/// Uses `u128` nanosecond math so `elapsed * BUCKET_COUNT` cannot wrap before
-/// the division by the (admission-bounded) window length.
+/// A configured window spans 63 sub-intervals while the ring retains 64 slots.
+/// The extra slot is essential: at the first nominal-window boundary, bucket
+/// zero can still contain a request exactly on the inclusive cutoff and must
+/// not be reused. It is reused only at the following bucket boundary, when the
+/// entire old bucket is outside the intended window.
+///
+/// Uses `u128` nanosecond math so `elapsed * INTERVALS` cannot wrap before the
+/// division by the (admission-bounded) window length.
 fn absolute_sliding_bucket(elapsed: Duration, window: Duration) -> u64 {
     let window_nanos = window.as_nanos().max(1);
     let elapsed_nanos = elapsed.as_nanos();
-    let indexed = elapsed_nanos.saturating_mul(SLIDING_WINDOW_BUCKET_COUNT as u128) / window_nanos;
+    let indexed =
+        elapsed_nanos.saturating_mul(SLIDING_WINDOW_INTERVALS_PER_WINDOW) / window_nanos;
     u64::try_from(indexed).unwrap_or(u64::MAX)
+}
+
+/// Longest time one aggregate bucket may remain counted after its last event.
+///
+/// This is `ceil(window * 64 / 63)`: the configured window plus at most one
+/// sub-interval of deliberate fail-closed over-count. Saturation keeps cleanup
+/// conservative even if this helper is called outside the admission-bounded
+/// production configuration path.
+fn sliding_window_retention(window: Duration) -> Duration {
+    let retention_nanos = window
+        .as_nanos()
+        .saturating_mul(SLIDING_WINDOW_BUCKET_COUNT as u128)
+        .div_ceil(SLIDING_WINDOW_INTERVALS_PER_WINDOW);
+    let seconds = retention_nanos / 1_000_000_000;
+    let nanos = (retention_nanos % 1_000_000_000) as u32;
+    match u64::try_from(seconds) {
+        Ok(seconds) => Duration::new(seconds, nanos),
+        Err(_) => Duration::MAX,
+    }
 }
 
 #[derive(Debug)]
@@ -1175,13 +1217,21 @@ impl TokenBucket {
             return false;
         }
         let window_secs = self.capacity / self.refill_rate;
-        now.duration_since(self.last_refill).as_secs_f64() < window_secs * 2.0
+        now.checked_duration_since(self.last_refill)
+            .is_none_or(|elapsed| elapsed.as_secs_f64() < window_secs * 2.0)
     }
 
     fn refill(&mut self, now: Instant) {
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        // Requests capture `now` before taking the per-key DashMap write guard.
+        // Concurrent requests can therefore reach this state in reverse
+        // timestamp order. Moving `last_refill` backwards would count the same
+        // elapsed interval twice and over-admit; leave state untouched instead.
+        let Some(elapsed) = now.checked_duration_since(self.last_refill) else {
+            return;
+        };
         self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.capacity);
     }
 }
 
@@ -1523,7 +1573,12 @@ impl TokenUsageWindow {
     }
 
     fn current_usage(&mut self, now: Instant) -> u64 {
-        let cutoff = now - self.window_duration;
+        // A maximum admitted window can be longer than the monotonic clock's
+        // representable history. Retain all entries when subtraction is not
+        // representable so cleanup remains fail-closed instead of panicking.
+        let Some(cutoff) = now.checked_sub(self.window_duration) else {
+            return self.total;
+        };
         while let Some(entry) = self.entries.front() {
             if entry.at < cutoff {
                 let expired = entry.tokens;
@@ -1689,7 +1744,10 @@ impl TokenUsageWindow {
     fn has_recent_activity(&self, now: Instant) -> bool {
         self.entries
             .back()
-            .is_some_and(|entry| now.duration_since(entry.at) < self.window_duration)
+            .is_some_and(|entry| {
+                now.checked_duration_since(entry.at)
+                    .is_none_or(|elapsed| elapsed < self.window_duration)
+            })
     }
 }
 
@@ -2210,7 +2268,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        let now_secs = now.duration_since(self.epoch_base).as_secs();
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         let current_epoch = now_secs / self.window_seconds;
         let stored_epoch = state.window_epoch.load(Ordering::Acquire);
 
@@ -2231,9 +2289,8 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
 
         state.last_check_secs.store(now_secs, Ordering::Relaxed);
 
-        let new_count = state.count.fetch_add(1, Ordering::AcqRel) + 1;
-        let new_bytes =
-            state.bytes.fetch_add(op.datagram_size, Ordering::AcqRel) + op.datagram_size;
+        let new_count = saturating_atomic_add(&state.count, 1);
+        let new_bytes = saturating_atomic_add(&state.bytes, op.datagram_size);
 
         if let Some(max_datagrams) = self.datagrams_per_window
             && new_count > max_datagrams
@@ -2275,7 +2332,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                     .incr_and_incrby_with_expire(
                         &datagram_key,
                         &bytes_key,
-                        op.datagram_size as i64,
+                        u64_to_i64_saturating(op.datagram_size),
                         ttl,
                     )
                     .await?;
@@ -2311,7 +2368,11 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                 if let Some(max_bytes) = self.bytes_per_window {
                     let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
                     let bytes = redis
-                        .incrby_with_expire(&bytes_key, op.datagram_size as i64, ttl)
+                        .incrby_with_expire(
+                            &bytes_key,
+                            u64_to_i64_saturating(op.datagram_size),
+                            ttl,
+                        )
                         .await?;
                     if bytes as u64 > max_bytes {
                         return Ok(RateLimitOutcome::deny()
@@ -2328,9 +2389,21 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
-        let now_secs = now.duration_since(self.epoch_base).as_secs();
+        let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
         let max_idle = self.window_seconds.saturating_mul(2).max(10);
         !state.is_stale(now_secs, max_idle)
+    }
+}
+
+/// Atomically add without allowing a wrapped counter to reset enforcement.
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) -> u64 {
+    match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(value))
+    }) {
+        Ok(previous) => previous.saturating_add(value),
+        // The closure always returns `Some`; keep the observed value as a
+        // fail-closed fallback if that invariant ever changes.
+        Err(current) => current,
     }
 }
 
