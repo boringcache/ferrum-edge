@@ -4752,11 +4752,9 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
     let mut newer = create_test_config(3);
     newer.loaded_at = Utc::now();
     newer.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let mut equivalent_older = newer.clone();
+    equivalent_older.loaded_at = newer.loaded_at - chrono::Duration::hours(6);
     let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
-
-    let mut equivalent_older = create_test_config(3);
-    equivalent_older.loaded_at = Utc::now() - chrono::Duration::hours(6);
-    equivalent_older.trust_bundles = Some(Box::new(create_test_trust_bundles()));
     let (older_addr, older_tx, _older_handle) = start_test_cp_server(equivalent_older).await;
 
     let proxy_state = create_test_proxy_state();

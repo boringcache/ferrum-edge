@@ -441,7 +441,8 @@ fn delta_authority_fence_admits_equal_newer_and_unestablished_watermarks() {
         gateway_trust: GatewayTrustEquivalenceState::Unknown,
     };
     assert!(
-        evaluate_delta_authority(Some(&unestablished), applied - chrono::Duration::hours(9)).is_ok()
+        evaluate_delta_authority(Some(&unestablished), applied - chrono::Duration::hours(9))
+            .is_ok()
     );
 }
 
