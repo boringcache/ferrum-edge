@@ -73,6 +73,10 @@ async fn shutdown_requested_cleans_up_and_returns_ok() {
         "explicit shutdown must return Ok, got {result:?}"
     );
     assert!(
+        *shutdown_tx.borrow(),
+        "shutdown path must leave the watch signalled for CNI/admin teardown"
+    );
+    assert!(
         backend.cleaned_up,
         "shutdown path must run backend.cleanup_all"
     );
@@ -100,6 +104,7 @@ async fn shutdown_requested_wins_over_an_already_exhausted_stream() {
         result.is_ok(),
         "requested shutdown must win over stream exhaustion, got {result:?}"
     );
+    assert!(*shutdown_tx.borrow());
     assert!(backend.cleaned_up);
     assert_eq!(backend.detached_pods, vec!["pod-shutdown-race".to_string()]);
 }
@@ -126,6 +131,10 @@ async fn watcher_exhaustion_cleans_up_and_returns_err() {
     assert!(
         err.to_string().contains("Pod watcher ended unexpectedly"),
         "unexpected error text: {err}"
+    );
+    assert!(
+        *shutdown_tx.borrow(),
+        "exhaustion must signal shutdown so the CNI listener join cannot hang"
     );
     assert!(
         backend.cleaned_up,

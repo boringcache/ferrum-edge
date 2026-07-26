@@ -857,6 +857,13 @@ async fn run_with_backend(
     // ownership (PR #3142 / #2371) can cover client failures without leaving
     // bpffs pins loaded. Watcher injection still goes through
     // `run_with_pod_stream` after this point.
+    //
+    // Semantic union when #3142 lands (do not merge main solely for that
+    // conflict): wrap the initialized backend in `InitializedBackendOwner`,
+    // map kube-client failure through `owner.fail_with(err)` (never bare `?`),
+    // pass `&mut owner` (or `owner.backend_mut()` only for attach/detach work)
+    // into `run_with_pod_stream`, and tear down via `owner.shutdown_pods`
+    // — never a free `cleanup_all_pods`/`cleanup_all` that bypasses the latch.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
     let client = build_node_agent_kube_client().await?;
     let pods: Api<Pod> = Api::all(client.clone());
@@ -1154,6 +1161,10 @@ where
     // skip this and must not hang waiting for a CNI task that never sees
     // shutdown. Drop readiness before the potentially slow CNI join so probes
     // do not keep reporting ready while capture is tearing down.
+    //
+    // With PR #3142's `InitializedBackendOwner`, replace `cleanup_all_pods`
+    // below with `owner.shutdown_pods(...)` so Drop cannot double-clean. Keep
+    // the readiness clear + `shutdown_tx.send(true)` ahead of that teardown.
     startup_ready.store(false, Ordering::Release);
     let _ = shutdown_tx.send(true);
 
