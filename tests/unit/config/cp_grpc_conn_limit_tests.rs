@@ -200,7 +200,9 @@ fn ipv4_and_ipv6_sources_are_accounted_separately() {
         .try_acquire(IpAddr::V6(Ipv6Addr::LOCALHOST))
         .expect("v6 is a distinct source");
     assert!(
-        limiter.try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST)).is_err(),
+        limiter
+            .try_acquire(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .is_err(),
         "v4 source is at its per-IP cap"
     );
     assert_eq!(limiter.tracked_source_ips(), 2);
