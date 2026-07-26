@@ -242,3 +242,39 @@ async fn functional_forwarded_via_can_disable_via_without_disabling_forwarded_he
         "for=127.0.0.1;proto=http;host=example.com"
     );
 }
+
+/// Issue #2952: with `FERRUM_ADD_FORWARDED_HEADER=true`, the reqwest primary
+/// builder must strip a spoofed client `Forwarded` before writing the
+/// gateway-owned element. `pool_enable_http2: false` keeps this on the
+/// reqwest arm (the historical append-after-client-value failure mode).
+#[ignore]
+#[tokio::test]
+async fn functional_forwarded_via_reqwest_path_strips_spoofed_client_forwarded() {
+    let harness = HeaderHarness::new(false, "ferrum-edge", true).await;
+    let client = http1_client();
+
+    let response = client
+        .get(harness.proxy_url())
+        .header("host", "example.com")
+        .header("forwarded", "for=10.0.0.1;proto=https")
+        .send()
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.expect("body"), "ok");
+
+    let request = harness.assert_backend_ok().await;
+    let forwarded = header_values(&request, "forwarded");
+    assert_eq!(
+        forwarded,
+        vec!["for=127.0.0.1;proto=http;host=example.com"],
+        "reqwest path must emit exactly one gateway-owned Forwarded derived from \
+         the real client/scheme/Host; got {forwarded:?} (headers={:?})",
+        request.headers
+    );
+    assert!(
+        forwarded.iter().all(|v| !v.contains("10.0.0.1")),
+        "spoofed client Forwarded must not reach the reqwest-path backend: {forwarded:?}"
+    );
+}

@@ -592,8 +592,16 @@ impl ServerlessFunction {
         if !self.forward_headers.is_empty() {
             let mut headers_map = serde_json::Map::new();
             for key in &self.forward_headers {
-                // Check both proxy headers and original request headers
-                if let Some(val) = proxy_headers.get(key).or_else(|| ctx.headers.get(key)) {
+                // Read only the effective `before_proxy` header map. Falling
+                // back to `ctx.headers` would resurrect field lines an earlier
+                // `before_proxy` plugin deliberately removed — `authorization`
+                // under `strip_authorization_on_success`, or a gateway-owned
+                // `claim_headers` destination whose claim was absent — and hand
+                // that client-supplied value to the function as if the gateway
+                // had asserted it. `ctx.headers` is the pristine ingress map and
+                // is never the outbound view; on the no-clone path the handler
+                // has already moved it into `proxy_headers`.
+                if let Some(val) = proxy_headers.get(key) {
                     headers_map.insert(key.clone(), Value::String(val.clone()));
                 }
             }

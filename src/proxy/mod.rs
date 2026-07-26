@@ -2604,6 +2604,49 @@ pub(crate) fn compose_early_upload_bound(
     }
 }
 
+/// Decision for a direct-H2 request whose backend response headers arrived
+/// before the client upload reached a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectH2UploadGate {
+    /// The upload finished cleanly, so the backend response may be forwarded.
+    Forward,
+    /// The configured request body limit was exceeded — deterministic 413,
+    /// never the backend's early response.
+    RequestBodyTooLarge,
+    /// No terminal outcome was reported at all, so the size decision is
+    /// genuinely unknown. Fail closed: an unvetted early backend response must
+    /// not reach the client.
+    FailClosed,
+}
+
+/// Map a terminal request-body outcome onto the direct-H2 response gate.
+///
+/// `Errored` / `Abandoned` forward the backend response. Both provably imply
+/// the limit was *not* exceeded: overflow stores `exceeded` and reports
+/// `RequestBodyOutcome::Exceeded` from the same `poll_frame`, taking the
+/// completion sender so neither a later poll nor `Drop` can relabel it. Failing
+/// closed on them instead would turn two ordinary flows into 502s — a backend
+/// that answers early (401/403/413) and `RST_STREAM`s the unread upload, which
+/// is what Go's and Envoy's HTTP/2 servers do by default, and a client that
+/// disconnects mid-upload — while buying no additional enforcement.
+///
+/// `None` models a completion sender dropped without reporting. The adapter's
+/// `Drop` impl makes that unreachable in practice, but it must still fail
+/// closed rather than default to forwarding.
+pub(crate) fn classify_direct_h2_upload_outcome(
+    outcome: Option<body::RequestBodyOutcome>,
+) -> DirectH2UploadGate {
+    let Some(outcome) = outcome else {
+        return DirectH2UploadGate::FailClosed;
+    };
+    match outcome {
+        body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
+        body::RequestBodyOutcome::Completed
+        | body::RequestBodyOutcome::Errored
+        | body::RequestBodyOutcome::Abandoned => DirectH2UploadGate::Forward,
+    }
+}
+
 /// Later early-phase consumers must reuse one already-drained prebuffer rather
 /// than starting (and deducting) a second fresh whole-upload timeout.
 #[inline]
@@ -5425,12 +5468,16 @@ impl ProxyState {
     /// by [`HealthChecker::take_active_check_handles`] — they wrap the
     /// spawned active-check / passive-recovery tasks. Modes must `await`
     /// them in the per-mode background-drain phase (alongside DNS / metrics
-    /// / overload). Without that, cleanup falls back to
-    /// `Drop for HealthChecker`, which only aborts tasks once the last
-    /// `Arc<HealthChecker>` clone is dropped — at process exit, AFTER the
-    /// drain window has already closed. That late abort lets a probe
-    /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
-    /// a misleading "unhealthy" log line right before tear-down.
+    /// / overload). Taking handles drains JoinHandles for await only;
+    /// `HealthChecker` retains AbortHandles so config reload can still
+    /// cancel the drained startup generation. Without that retained cancel
+    /// path, reload would orphan startup probes. Without the mode-side
+    /// await, cleanup falls back to `Drop for HealthChecker`, which only
+    /// aborts tasks once the last `Arc<HealthChecker>` clone is dropped —
+    /// at process exit, AFTER the drain window has already closed. That
+    /// late abort lets a probe mid-`http_probe` finish its TCP / TLS /
+    /// HTTP round-trip and emit a misleading "unhealthy" log line right
+    /// before tear-down.
     pub fn new(
         config: GatewayConfig,
         dns_cache: DnsCache,
@@ -5733,9 +5780,9 @@ impl ProxyState {
         // immediately before the process tears down.
         let health_check_restart_rx = health_check_shutdown_rx.clone();
         health_checker.start_with_shutdown(&config, health_check_shutdown_rx);
-        // Drain the spawned task handles BEFORE wrapping in Arc so the
-        // caller can await them in the background-drain phase. Drop is
-        // a no-op safety net once the Vec is empty.
+        // Drain JoinHandles for mode-side graceful await. AbortHandles stay
+        // with HealthChecker so config reload can still cancel this
+        // generation; Drop remains a safety net for any undrained tasks.
         let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
@@ -15632,11 +15679,15 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 mandatory_replay_transform_failed = Some(plugin.name());
                 break;
             } else {
-                crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                     ctx,
+                    response_status,
                     response_headers,
-                    response_body.len(),
-                );
+                    response_body,
+                ) {
+                    terminal_body_response_selected = true;
+                    break;
+                }
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -16960,11 +17011,14 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             );
             body_transformed = true;
         } else {
-            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                 ctx,
+                response_status,
                 response_headers,
-                response_body.len(),
-            );
+                response_body,
+            ) {
+                return (true, true);
+            }
         }
         ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }
@@ -19447,6 +19501,12 @@ async fn handle_proxy_request_inner(
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    // Bind this request to the same cache generation's static response-side
+    // presentation policy that the plugin list above will execute, so a plugin
+    // persisting a finalized representation can prove which rules produced it.
+    ctx.set_response_presentation_policy_digest(
+        plugin_cache_view.response_presentation_policy_digest(),
+    );
     // Establish the effective RPC budget before any request-plugin or body
     // await. The absolute instant is anchored to `timestamp_received` and is
     // carried independently of the relative header forwarded upstream.
@@ -26981,7 +27041,9 @@ pub(crate) async fn proxy_to_backend_retry(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
-            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -28361,7 +28423,9 @@ async fn proxy_to_backend(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
-            n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
@@ -30669,6 +30733,9 @@ async fn proxy_to_backend_hbone(
                 }
             }
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 insert_outbound_header_or_warn(
@@ -31597,6 +31664,9 @@ async fn proxy_to_backend_mesh_mtls(
             // consistency check.
             "host" => continue,
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
             _ => {
                 insert_outbound_header_or_warn(
@@ -32150,12 +32220,38 @@ async fn proxy_to_backend_http2(
     } else {
         usize::MAX
     };
-    let body = body::SizeLimitedIncoming::new_with_counter(
-        body,
-        max_request_body_size,
-        Arc::clone(&body_size_exceeded),
-        Arc::clone(ctx_bytes_sent_observed),
-    );
+    // Arm the cancellation channel unconditionally. `send_request` hands the
+    // request body to hyper's detached HTTP/2 pipe task, so *any* early return
+    // below leaves that task draining the client upload toward a response
+    // nobody will read — whether or not a size limit is configured. Only the
+    // completion channel (and therefore the response gate) is limit-gated.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let mut body_cancel_tx = Some(cancel_tx);
+    let (body, body_completion_rx) = if state.max_request_body_size_bytes > 0 {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        (
+            body::SizeLimitedIncoming::new_with_counter_and_completion(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+                completion_tx,
+                cancel_rx,
+            ),
+            Some(completion_rx),
+        )
+    } else {
+        (
+            body::SizeLimitedIncoming::new_with_counter(
+                body,
+                max_request_body_size,
+                Arc::clone(&body_size_exceeded),
+                Arc::clone(ctx_bytes_sent_observed),
+            )
+            .with_cancel(cancel_rx),
+            None,
+        )
+    };
 
     // Set the URI
     parts.uri = uri;
@@ -32215,6 +32311,13 @@ async fn proxy_to_backend_http2(
             // value risked an authoritative-size mismatch with the framed
             // body when a request_transformer plugin mutated the body.
             n if headers_mod::is_backend_request_strip_header(n) => continue,
+            // Strip gateway-owned forwarding identity before regenerating it
+            // below. `HeaderMap::insert` would replace, but keep the same
+            // fail-closed ownership predicate as reqwest/H3 so a capability
+            // flip cannot change which Forwarded element backends observe.
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             // RFC 9110 §7.6.1: also strip every header NAMED in the
             // request's `Connection` field — see `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -32356,6 +32459,18 @@ async fn proxy_to_backend_http2(
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
+                // The request body already moved into hyper's detached HTTP/2
+                // pipe task when `send_request` was called, so returning here
+                // does not stop the upload. Wake the adapter so it yields an
+                // error, resetting the backend stream and releasing the inbound
+                // client body instead of streaming it into a request whose
+                // response we have already abandoned. Best-effort: the signal
+                // only lands the next time hyper polls the body, so a pipe
+                // parked on backend send capacity tears down later (see the
+                // `cancel` field docs on `SizeLimitedIncoming`).
+                if let Some(cancel_tx) = body_cancel_tx.take() {
+                    let _ = cancel_tx.send(());
+                }
                 if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                     return request_body_too_large();
                 }
@@ -32401,6 +32516,109 @@ async fn proxy_to_backend_http2(
             Err(e) => return map_h2_err(e),
         }
     };
+
+    // HTTP/2 is full duplex: a backend may return response headers before it
+    // has consumed the upload. Do not expose that response until the request
+    // body adapter has made the configured size-limit decision authoritative.
+    //
+    // The channel is installed only when `max_request_body_size_bytes > 0`, and
+    // limits-on requests reach direct-H2 only through a backend TLS SNI override
+    // (`can_dispatch_direct_http2_pool` requires a zero limit otherwise). So the
+    // gate — and the interleaving it gives up, a genuinely full-duplex non-gRPC
+    // H2 app now sees response headers withheld until its upload terminates —
+    // is scoped to SNI-override routes that have a request-size limit set.
+    if let Some(body_completion_rx) = body_completion_rx {
+        // The header phase has already spent its own deadline, so the upload
+        // phase reuses the operator whole-upload stall guard composed with any
+        // client RPC deadline. Without it a backend that answers early and then
+        // stops reading the upload — or a client that stalls mid-body — would
+        // pin this request open indefinitely.
+        let upload_bound =
+            compose_early_upload_bound(grpc_deadline_at, proxy.backend_read_timeout_ms);
+        let outcome = match upload_bound {
+            Some((upload_deadline, bound_kind)) => {
+                match tokio::time::timeout_at(upload_deadline, body_completion_rx).await {
+                    Ok(received) => received.ok(),
+                    Err(_) => {
+                        // `send_request` has already yielded response headers,
+                        // so hyper moved the request body into a detached H2
+                        // pipe task. Dropping this handler or the response does
+                        // not cancel that upload: the pipe task holds its own
+                        // `h2` stream reference, so the stream is not reset
+                        // while it lives. Wake the adapter explicitly; its
+                        // terminal error resets the backend stream and releases
+                        // the inbound client body. Best-effort — a pipe parked
+                        // on backend send capacity is not polling the body and
+                        // tears down only once credit, a reset, or connection
+                        // close arrives (see `SizeLimitedIncoming::cancel`).
+                        if let Some(cancel_tx) = body_cancel_tx.take() {
+                            let _ = cancel_tx.send(());
+                        }
+                        if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                            return request_body_too_large();
+                        }
+                        return match bound_kind {
+                            EarlyUploadBoundKind::RpcDeadline => (
+                                client_grpc_deadline_exceeded_response_for_optional_request(
+                                    ctx,
+                                    headers,
+                                    resolved_ip,
+                                ),
+                                None,
+                            ),
+                            EarlyUploadBoundKind::OperatorTimeout => {
+                                warn!(
+                                    proxy_id = %proxy.id,
+                                    "HTTP/2: client upload did not finish within the whole-upload bound ({}ms) after backend response headers",
+                                    proxy.backend_read_timeout_ms
+                                );
+                                (request_body_timeout_backend_response(resolved_ip), None)
+                            }
+                        };
+                    }
+                }
+            }
+            // Both bounds are disabled by configuration; preserve the existing
+            // "0 = no timeout" contract shared with the buffered upload paths
+            // and with the response-header wait just above. An operator who
+            // sets `backend_read_timeout_ms = 0` and sends no RPC deadline
+            // accepts that a backend which answers early and then stops reading
+            // the upload holds this request until the client body terminates or
+            // the connection drops. Do not add a hidden floor here — that would
+            // silently break the documented contract.
+            None => body_completion_rx.await.ok(),
+        };
+        // Normal completion: dropping the sender makes the adapter stop
+        // polling the cancellation channel without changing its outcome.
+        drop(body_cancel_tx.take());
+        match classify_direct_h2_upload_outcome(outcome) {
+            DirectH2UploadGate::Forward => {}
+            DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
+            DirectH2UploadGate::FailClosed => {
+                error!(
+                    proxy_id = %proxy.id,
+                    outcome = ?outcome,
+                    "HTTP/2 request upload reported no terminal size decision; refusing to forward early backend response"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                    },
+                    None,
+                );
+            }
+        }
+    }
+    if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+        return request_body_too_large();
+    }
 
     // Extract response status and headers
     let status = response.status().as_u16();
@@ -32581,9 +32799,10 @@ fn build_http3_backend_headers(
             // Do not let client-supplied values appear first on native H3
             // backend requests, where duplicate header ordering can make a
             // backend consume the spoofed value instead of Ferrum's canonical
-            // value.
-            "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" => continue,
-            "forwarded" if state.add_forwarded_header => continue,
+            // value. Same fail-closed ownership as reqwest / direct-H2.
+            n if headers_mod::is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => {
+                continue;
+            }
             "host" => {
                 // Apply per-route `preserve_host_header` override on the
                 // first-attempt H3-native backend path. Mirrors
@@ -37825,6 +38044,94 @@ mod tests {
         assert_eq!(
             header_value(&out, "forwarded"),
             Some("for=203.0.113.9;proto=https;host=api.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_backend_headers_drop_client_forwarded_when_regenerating() {
+        // Issue #2952: spoofed Forwarded must not precede the gateway-owned
+        // element on the H1/H2 → native-H3 header builder.
+        let env_config = crate::config::env_config::EnvConfig {
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([
+            ("host".to_string(), "api.example".to_string()),
+            (
+                "forwarded".to_string(),
+                "for=10.0.0.1;proto=https".to_string(),
+            ),
+        ]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                xff_append_ip: "10.0.0.7",
+                effective_host: "h3-backend.example",
+                request_is_secure: true,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "forwarded")
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.9;proto=https;host=api.example"],
+            "only the gateway-owned Forwarded element may reach the H3 backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_backend_headers_drop_mixed_case_forwarded_when_regenerating() {
+        let env_config = crate::config::env_config::EnvConfig {
+            add_forwarded_header: true,
+            ..Default::default()
+        };
+        let state = make_test_proxy_state_with_env(GatewayConfig::default(), env_config);
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Https);
+
+        let headers = HashMap::from([
+            ("host".to_string(), "api.example".to_string()),
+            (
+                "FORWARDED".to_string(),
+                "for=10.0.0.1;proto=https, for=\"[::1]\"".to_string(),
+            ),
+        ]);
+        let out = build_http3_backend_headers(
+            &state,
+            &proxy,
+            &headers,
+            Http3BackendHeaderContext {
+                client_ip: "203.0.113.9",
+                xff_append_ip: "10.0.0.7",
+                effective_host: "h3-backend.example",
+                request_is_secure: true,
+                inbound_version: hyper::Version::HTTP_11,
+                content_length: None,
+            },
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case("forwarded"))
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.9;proto=https;host=api.example"],
+            "mixed-case / malformed-folded client Forwarded must not survive"
         );
     }
 

@@ -146,15 +146,23 @@ jobs:
         run: |
           # The Rust test checks for "ferrum-scale-test-mongo" by name via `docker inspect`
           # and cleans the database via `docker exec ... mongosh`.
-          docker run -d --name ferrum-scale-test-mongo \
-            -p 27117:27017 \
-            mongo:7
+          #
+          # Single-node replica set, not standalone: the benchmark provisions via
+          # POST /batch, which is all-or-nothing (issue #2401) and therefore needs
+          # MongoDB multi-document transactions. A standalone mongod refuses the
+          # batch with 501 rather than applying part of a graph.
+          # `--network host` with a real port: a replica-set member advertises
+          # its own host:port and the driver reconnects to whatever is
+          # advertised, so a `-p` mapping would point the driver at the wrong
+          # port.
+          docker run -d --name ferrum-scale-test-mongo --network host \
+            mongo:7 --replSet rs0 --port 27117 --bind_ip_all
 
           # Wait for the container to be ready
           echo "Waiting for MongoDB to be ready..."
           for i in $(seq 1 30); do
             if docker exec ferrum-scale-test-mongo \
-              mongosh --quiet --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
+              mongosh --quiet --port 27117 --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
               echo "MongoDB container ready"
               break
             fi
@@ -164,6 +172,24 @@ jobs:
             fi
             sleep 1
           done
+
+          docker exec ferrum-scale-test-mongo mongosh --quiet --port 27117 --eval \
+            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27117"}]}) }'
+          echo "Waiting for the replica set primary..."
+          for i in $(seq 1 60); do
+            if docker exec ferrum-scale-test-mongo mongosh --quiet --port 27117 --eval \
+              'db.hello().isWritablePrimary' 2>/dev/null | grep -q true; then
+              echo "Replica set primary ready"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::MongoDB replica set did not elect a primary"
+              docker logs ferrum-scale-test-mongo
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "FERRUM_MONGO_REPLICA_SET=rs0" >> "$GITHUB_ENV"
 
       - name: Run scale benchmark (MongoDB)
         if: inputs.db_type == 'mongodb'
