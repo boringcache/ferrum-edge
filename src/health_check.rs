@@ -567,9 +567,10 @@ impl HealthChecker {
         // in the config so the shared maps don't accumulate stale entries.
         // The replacement generation only ever writes keys that are in
         // `active_keys`, so running this after the spawn cannot drop live
-        // state. Active probes also defer `target_states` entry until after
-        // the post-dial generation fence, so a retired mid-flight probe
-        // cannot re-insert a just-pruned key.
+        // state. Active probes defer `target_states` / `unhealthy` entry until
+        // after the post-dial generation fence and re-check generation while
+        // holding the DashMap entry lock, so a retired mid-flight probe cannot
+        // resurrect a just-pruned key in the TOCTOU between fence and insert.
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
@@ -1154,16 +1155,30 @@ impl HealthChecker {
 
                 // Refuse stale map inserts / mutations after reload advances
                 // the generation, even if abort has not yet torn the task down
-                // mid-probe. Deferring `target_states` entry until here keeps a
-                // retired probe from re-inserting a just-pruned key.
+                // mid-probe. Defer entry until here, and re-check generation
+                // while holding the DashMap entry lock, so prune cannot race a
+                // pre-insert fence and leave a resurrected removed-target key.
+                let state = {
+                    use dashmap::mapref::entry::Entry;
+                    match target_states.entry(key.clone()) {
+                        Entry::Occupied(entry) => {
+                            if task_generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            entry.get().clone()
+                        }
+                        Entry::Vacant(entry) => {
+                            if task_generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            entry.insert(Arc::new(TargetHealth::new())).clone()
+                        }
+                    }
+                };
+
                 if task_generation.load(Ordering::Acquire) != generation {
                     return;
                 }
-
-                let state = target_states
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(TargetHealth::new()))
-                    .clone();
 
                 if probe_outcome.success {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1174,13 +1189,24 @@ impl HealthChecker {
                         cache.record_latency(&upstream_id_owned, &probe_target, latency_us);
                     }
 
-                    if successes >= healthy_threshold && unhealthy_targets.remove(&key).is_some() {
-                        info!(
-                            "Active health check: target {} is healthy ({:?} probe)",
-                            key, probe_type
-                        );
-                        if let Some(ref cache) = lb_cache {
-                            cache.reset_recovered_target_latency(&upstream_id_owned, &probe_target);
+                    if successes >= healthy_threshold {
+                        // Only clear unhealthy under the still-current
+                        // generation so a retired success cannot drop a mark
+                        // the replacement probe just wrote.
+                        let removed = unhealthy_targets.remove_if(&key, |_, _| {
+                            task_generation.load(Ordering::Acquire) == generation
+                        });
+                        if removed.is_some() {
+                            info!(
+                                "Active health check: target {} is healthy ({:?} probe)",
+                                key, probe_type
+                            );
+                            if let Some(ref cache) = lb_cache {
+                                cache.reset_recovered_target_latency(
+                                    &upstream_id_owned,
+                                    &probe_target,
+                                );
+                            }
                         }
                     }
                 } else {
@@ -1192,18 +1218,25 @@ impl HealthChecker {
                         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
                         let last_failure =
                             probe_outcome.failure.as_deref().unwrap_or("probe failed");
-                        unhealthy_targets.entry(key.clone()).or_insert_with(|| {
-                            warn!(
-                                target = %key_ref,
-                                probe_type = ?probe_type,
-                                failures = failures,
-                                unhealthy_threshold = unhealthy_threshold,
-                                elapsed_ms = elapsed_ms,
-                                last_failure = %last_failure,
-                                "Active health check: target is unhealthy"
-                            );
-                            now_epoch_ms()
-                        });
+                        use dashmap::mapref::entry::Entry;
+                        match unhealthy_targets.entry(key.clone()) {
+                            Entry::Occupied(_) => {}
+                            Entry::Vacant(entry) => {
+                                if task_generation.load(Ordering::Acquire) != generation {
+                                    return;
+                                }
+                                warn!(
+                                    target = %key_ref,
+                                    probe_type = ?probe_type,
+                                    failures = failures,
+                                    unhealthy_threshold = unhealthy_threshold,
+                                    elapsed_ms = elapsed_ms,
+                                    last_failure = %last_failure,
+                                    "Active health check: target is unhealthy"
+                                );
+                                entry.insert(now_epoch_ms());
+                            }
+                        }
                     }
                 }
             }
