@@ -1,4 +1,9 @@
 {{- if .Values.injector.enabled }}
+{{- $tcpHandler := dict "tcpSocket" (dict "port" "webhook") -}}
+{{- $liveHandler := .Values.injector.probes.liveness.override | default dict -}}
+{{- if not $liveHandler }}{{- $liveHandler = $tcpHandler -}}{{- end -}}
+{{- $readyHandler := .Values.injector.probes.readiness.override | default dict -}}
+{{- if not $readyHandler }}{{- $readyHandler = $tcpHandler -}}{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,6 +56,7 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.injector.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
           volumeMounts:
             - name: injector-tls
               mountPath: /etc/ferrum/injector/tls
