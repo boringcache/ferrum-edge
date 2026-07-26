@@ -359,8 +359,7 @@ pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
 
 /// Stable admin-facing message for an API-spec-owned proxy delete that the
 /// configured backend deployment cannot commit atomically.
-pub const PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE: &str =
-    "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment";
+pub const PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE: &str = "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment";
 
 /// The configured backend cannot atomically delete a proxy ownership graph.
 ///

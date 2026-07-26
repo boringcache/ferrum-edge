@@ -1263,9 +1263,7 @@ async fn owned_proxy_delete_snapshot(
             .expect("count fixture proxies"),
         plugin_configs: db
             .collection::<Document>("plugin_configs")
-            .count_documents(
-                doc! { "_id": fixture.plugin_id.as_str(), "namespace": "ferrum" },
-            )
+            .count_documents(doc! { "_id": fixture.plugin_id.as_str(), "namespace": "ferrum" })
             .await
             .expect("count fixture plugin configs"),
         api_specs: db
@@ -1275,9 +1273,7 @@ async fn owned_proxy_delete_snapshot(
             .expect("count fixture API specs"),
         upstreams: db
             .collection::<Document>("upstreams")
-            .count_documents(
-                doc! { "_id": fixture.upstream_id.as_str(), "namespace": "ferrum" },
-            )
+            .count_documents(doc! { "_id": fixture.upstream_id.as_str(), "namespace": "ferrum" })
             .await
             .expect("count fixture upstreams"),
         config_changes: db
@@ -1377,8 +1373,7 @@ async fn test_mongodb_standalone_owned_proxy_delete_refuses_before_mutation() {
     let client = reqwest::Client::new();
     let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
     let fixture = OwnedProxyDeleteFixture::new("standalone-owned-delete");
-    let spec_id =
-        submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
     let db = mongo_database(&mongo_url).await;
     let before = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
     assert_eq!(
@@ -1588,8 +1583,7 @@ async fn assert_replica_set_delete_failure_rolls_back(collection: &str) {
     let client = reqwest::Client::new();
     let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
     let fixture = OwnedProxyDeleteFixture::new(collection);
-    let spec_id =
-        submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
     let db = mongo_database(&mongo_url).await;
     let before = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
     assert_eq!(
@@ -1673,8 +1667,7 @@ async fn test_mongodb_replica_set_owned_proxy_delete_commits_complete_graph() {
     let client = reqwest::Client::new();
     let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
     let fixture = OwnedProxyDeleteFixture::new("transactional-owned-delete");
-    let spec_id =
-        submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
     let db = mongo_database(&mongo_url).await;
 
     let response = client
