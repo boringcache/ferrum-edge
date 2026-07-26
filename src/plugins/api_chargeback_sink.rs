@@ -112,6 +112,16 @@ const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
 /// Deployment-safe ceiling for each configured inter-attempt delay field
 /// (`retry.initial_delay_ms` and `retry.max_delay_ms`).
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Bound on how far one compressed spool record may expand during replay.
+///
+/// JSONEachRow charge batches compress at roughly 5-20x, so a 200x allowance
+/// never rejects a record this plugin wrote, while a planted high-ratio archive
+/// inside the managed tree can no longer expand without limit inside the billing
+/// process. An over-limit record is quarantined, never silently dropped.
+const SPOOL_MAX_DECOMPRESSION_RATIO: u64 = 200;
+/// Floor for the expansion allowance so a very small legitimate record is never
+/// bounded below its own framing overhead.
+const SPOOL_MIN_DECOMPRESSED_BYTES: u64 = 1024 * 1024;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -5380,10 +5390,11 @@ impl SpoolManager {
     /// Owned bytes include active data files, crash-left temps, corrupt
     /// quarantine, metadata-only dead-letter (`.rejected.meta`) files, in-flight
     /// replay claims, and any unattributable record still occupying the tree.
-    /// Eviction never selects an in-flight claim or a record whose owner tag is
-    /// not ours: deleting either would destroy another owner's or another
-    /// delivery's billing data. When only such files remain the write fails
-    /// closed instead of over-admitting or stealing them.
+    /// Eviction never selects an in-flight claim, a temp under an active write,
+    /// or a record whose owner tag is not ours: deleting any of them would
+    /// destroy another owner's or another delivery's billing data. When only
+    /// such files remain the write fails closed instead of over-admitting or
+    /// stealing them.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
@@ -5397,14 +5408,15 @@ impl SpoolManager {
                 return Ok(());
             }
             let owned = self.list_owned_spool_files()?;
+            let wall_clock = SystemTime::now();
             let Some(oldest) = owned
                 .iter()
-                .find(|path| self.is_evictable_owned_file(path.as_path()))
+                .find(|path| self.is_evictable_owned_file(path.as_path(), wall_clock))
                 .cloned()
             else {
                 let protected = owned.len();
                 return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight or owned by another identity and are never evicted",
+                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
                     self.cfg.max_bytes
                 ));
             };
@@ -5441,8 +5453,19 @@ impl SpoolManager {
     }
 
     /// Whether one owned file may be dropped to make room for a new batch.
-    fn is_evictable_owned_file(&self, path: &Path) -> bool {
-        if is_spool_inflight_file(path) {
+    ///
+    /// Eviction runs per [`SpoolManager`], so two accepted generations in one
+    /// process (or two processes sharing the volume) hold different writer
+    /// locks. A temp that a peer is actively publishing is therefore protected
+    /// by exactly the reconciliation predicate: unlinking it would leave the
+    /// peer's already-fsynced payload with no directory entry to rename onto,
+    /// failing that publish and silently losing a billing batch. Crash-left
+    /// temps stay reclaimable, so quota pressure still makes progress.
+    fn is_evictable_owned_file(&self, path: &Path, now: SystemTime) -> bool {
+        if is_spool_inflight_file(path) || is_live_spool_path(path) {
+            return false;
+        }
+        if is_spool_temp_file(path) && !self.temp_is_reclaimable(path, now) {
             return false;
         }
         match spool_file_owner_tag(path) {
@@ -5451,6 +5474,22 @@ impl SpoolManager {
             None => true,
             Some(tag) => tag == self.owner.tag.as_ref(),
         }
+    }
+
+    /// Same ownership/age test [`Self::reconcile_stale_temp_files`] applies,
+    /// minus the live-path check the caller has already made. An unreadable
+    /// temp is treated as protected so a transient stat failure can never
+    /// escalate into deleting a peer's in-progress write.
+    fn temp_is_reclaimable(&self, path: &Path, now: SystemTime) -> bool {
+        let owned_by_this_process = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_spool_write_temp)
+            .is_some_and(|temp| temp.process_tag == spool_process_tag());
+        if owned_by_this_process {
+            return true;
+        }
+        spool_temp_is_stale(path, now, self.stale_temp_age_secs).unwrap_or(false)
     }
 
     fn collect(&self, files: &mut Vec<PathBuf>, class: SpoolFileClass) -> Result<(), String> {
@@ -6538,12 +6577,10 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains(".ndjson.zst"))
     {
-        zstd::stream::decode_all(bytes.as_slice()).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to decompress spool file '{}': {error}",
-                path.display()
-            )
-        })?
+        let limit = (bytes.len() as u64)
+            .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
+            .max(SPOOL_MIN_DECOMPRESSED_BYTES);
+        decode_zstd_bounded(&bytes, limit, path)?
     } else {
         bytes
     };
@@ -6553,6 +6590,38 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
             path.display()
         )
     })
+}
+
+/// Decompress one spool record, failing closed past `limit` decoded bytes.
+///
+/// The caller quarantines an undecodable record to `<data-name>.corrupt` rather
+/// than deleting it, so a rejected archive stays on disk for operator review.
+fn decode_zstd_bounded(bytes: &[u8], limit: u64, path: &Path) -> Result<Vec<u8>, String> {
+    let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
+            path.display()
+        )
+    })?;
+    let mut decoded = Vec::new();
+    // Read one byte past the allowance so an over-limit record is detected
+    // without ever materializing the rest of its expansion.
+    decoder
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut decoded)
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to decompress spool file '{}': {error}",
+                path.display()
+            )
+        })?;
+    if decoded.len() as u64 > limit {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool file '{}' expands past its {limit}-byte decompression bound",
+            path.display()
+        ));
+    }
+    Ok(decoded)
 }
 
 #[allow(dead_code)]

@@ -3550,6 +3550,132 @@ fn reload_generation_does_not_delete_a_live_peer_temp() {
 }
 
 #[test]
+fn admission_eviction_never_unlinks_a_live_peer_generation_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let event = sample_event("evt-live-temp");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    // Room for exactly one encoded record, so the planted temp blocks admission.
+    let settings = spool_settings(temp.path(), encoded_len);
+
+    let gen1 = SpoolManager::for_tests_with_owner(settings.clone(), &spec, 21).unwrap();
+    let day = gen1.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let final_path = day.join(owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB1"));
+    let active_tmp = gen1.write_temp_path_for_tests(&final_path).unwrap();
+    fs::write(&active_tmp, vec![0u8; encoded_len as usize]).unwrap();
+    // Generation 21 is mid-publish: payload written and fsynced, rename pending.
+    let lease = SpoolManager::hold_live_spool_path_for_tests(&active_tmp);
+
+    // A replacement generation holds its own writer lock, so only the shared
+    // live-path set can stop its quota eviction from unlinking that temp.
+    let gen2 = SpoolManager::for_tests_with_owner(settings.clone(), &spec, 22).unwrap();
+    let err = gen2
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("admission must fail closed rather than evict a live peer temp");
+    assert!(
+        err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        active_tmp.exists(),
+        "eviction must never unlink a peer generation's in-progress temp"
+    );
+
+    // Once the writer releases the lease the same quota pressure reclaims it.
+    drop(lease);
+    let written = gen2.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !active_tmp.exists(),
+        "an abandoned same-process temp stays reclaimable under quota pressure"
+    );
+}
+
+#[test]
+fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let event = sample_event("evt-peer-temp");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = spool_settings(temp.path(), encoded_len);
+
+    // Production stale-temp horizon: another process's fresh temp is protected.
+    let spool = SpoolManager::for_tests_with_owner_faults_and_ages(
+        settings.clone(),
+        &spec,
+        31,
+        SpoolFsFault::None,
+        300,
+        300,
+    )
+    .unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let peer_tmp = day.join(format!(
+        "{}.write-deadbeefdeadbeefdeadbeefdeadbeef-7.tmp",
+        owned_data_name("01ARZ3NDEKTSV4RRFFQ69G5FB2")
+    ));
+    fs::write(&peer_tmp, vec![0u8; encoded_len as usize]).unwrap();
+
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("a peer process's fresh temp must not be evicted to admit a write");
+    assert!(
+        err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        peer_tmp.exists(),
+        "eviction must respect the stale-temp horizon for peer-process temps"
+    );
+
+    // With the horizon elapsed the same temp is reconciled and the write fits.
+    let reclaiming = SpoolManager::for_tests_with_owner_faults_and_ages(
+        settings,
+        &spec,
+        32,
+        SpoolFsFault::None,
+        0,
+        300,
+    )
+    .unwrap();
+    assert!(
+        !peer_tmp.exists(),
+        "an expired peer-process temp is reconciled at first prepare"
+    );
+    let written = reclaiming.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+}
+
+#[test]
+fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
+    let bomb = encode_spool_bytes_for_tests(&bomb_plain, SpoolCompression::Zstd).unwrap();
+    assert!(
+        bomb.len() < 4096,
+        "the fixture must exercise a high compression ratio"
+    );
+    let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB3.ndjson.zst");
+    fs::write(&bomb_path, &bomb).unwrap();
+    let err = decode_spool_file_for_tests(&bomb_path)
+        .expect_err("a high-ratio archive must not expand without bound");
+    assert!(
+        err.contains("decompression bound"),
+        "unexpected error: {err}"
+    );
+
+    // A record within the expansion allowance still decodes normally.
+    let ok_plain = vec![b'\n'; 512 * 1024];
+    let ok = encode_spool_bytes_for_tests(&ok_plain, SpoolCompression::Zstd).unwrap();
+    let ok_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB4.ndjson.zst");
+    fs::write(&ok_path, &ok).unwrap();
+    let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
+    assert_eq!(decoded.len(), ok_plain.len());
+}
+
+#[test]
 fn peer_process_temp_is_quota_owned_and_never_a_replay_candidate() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);

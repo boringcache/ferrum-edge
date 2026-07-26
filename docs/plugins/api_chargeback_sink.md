@@ -449,6 +449,11 @@ fields are never logged.
 
 - Unreadable local spool files are renamed with a `.corrupt` suffix so newer
   files can continue to replay.
+- A `zstd` spool record may expand to at most 200x its encoded size (floor
+  1 MiB) during replay. Charge batches compress far below that, so the bound
+  never rejects a record Ferrum wrote; a planted high-ratio archive inside the
+  managed tree is quarantined as `.corrupt` instead of expanding without limit
+  inside the billing process.
 - Permanently rejected rows (and single-row 413 failures) are discarded only
   after one deterministic sibling `.rejected.meta` JSON document has been
   durably written for the source file. The document contains the aggregate
@@ -467,8 +472,11 @@ fields are never logged.
 
 Dead-letter metadata, corrupt files, temps, and in-flight claims remain under
 the managed namespace and count toward `spool.max_bytes` until eviction drops the
-oldest **evictable** owned file. In-flight claims and records carrying another
-owner's tag are never evictable.
+oldest **evictable** owned file. In-flight claims, temps still under an active
+write, and records carrying another owner's tag are never evictable: eviction
+applies the same ownership and stale-age test reconciliation does, so it can
+reclaim a crash-left temp but never unlink a peer generation's in-progress
+publish.
 
 ### Migration and destination changes
 
@@ -521,10 +529,11 @@ over-admit. Existing owned bytes plus the incoming encoded file must stay within
 `max_bytes`; when space is short, the oldest **evictable** owned file is dropped
 and `chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
 still cannot fit after eviction (including on an empty spool, or when every
-retained file is an in-flight claim or owned by another identity), the write is
-**rejected** and the batch/event follows the existing spool-failure path
-(warned and not durably retained). The sink never silently exceeds the ceiling
-and never reclaims bytes by destroying an in-flight or foreign-owned record.
+retained file is an in-flight claim, a temp under an active write, or owned by
+another identity), the write is **rejected** and the batch/event follows the
+existing spool-failure path (warned and not durably retained). The sink never
+silently exceeds the ceiling and never reclaims bytes by destroying an in-flight,
+actively written, or foreign-owned record.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb, using **encoded** average event size (and headroom for retained

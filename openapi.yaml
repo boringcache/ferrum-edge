@@ -21312,10 +21312,10 @@ components:
                 (*.inflight), and quarantined (*.corrupt) / dead-letter metadata
                 files. A pending write is sized before admission under the spool write
                 lock; the oldest evictable owned file is dropped until the incoming
-                encoded file fits. In-flight claims and records carrying another
-                owner's tag are never evictable, so a write that cannot fit is
-                rejected rather than exceeding the ceiling or destroying another
-                owner's or another delivery's records.
+                encoded file fits. In-flight claims, temps under an active write,
+                and records carrying another owner's tag are never evictable, so a
+                write that cannot fit is rejected rather than exceeding the ceiling
+                or destroying another owner's or another delivery's records.
             replay_interval_secs:
               type: integer
               minimum: 1
