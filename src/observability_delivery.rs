@@ -420,7 +420,7 @@ impl DeliveryLifecycle {
             )
     }
 
-    fn try_reserve_task_permit(&self) -> bool {
+    fn try_reserve_task_permit(&self) -> Option<TaskAdmissionPermit<'_>> {
         let max_tasks = self.max_tasks as u64;
         // Bounded compare-and-swap rather than add-then-undo: concurrent
         // callers must never publish a reservation depth above the configured
@@ -429,7 +429,11 @@ impl DeliveryLifecycle {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 (admitted < max_tasks).then_some(admitted + 1)
             })
-            .is_ok()
+            .ok()
+            .map(|_| TaskAdmissionPermit {
+                lifecycle: self,
+                live: true,
+            })
     }
 
     fn release_task_permit(&self) {
@@ -452,6 +456,8 @@ impl DeliveryLifecycle {
             .saturating_add(1);
         // Rate-limit caller-thread diagnostics so a saturated sink cannot turn
         // capacity rejects into a logging storm or recursive deferred work.
+        // Process `warn!` flows through the non-blocking log sinks, not through
+        // deferred delivery spawn, so this cannot re-enter admission.
         if capacity_rejections == 1 || capacity_rejections.is_multiple_of(1_024) {
             warn!(
                 generation = self.generation,
@@ -487,12 +493,12 @@ impl DeliveryLifecycle {
             self.counters.record_rejected(kind);
             return false;
         }
-        if !self.try_reserve_task_permit() {
+        let Some(mut permit) = self.try_reserve_task_permit() else {
             self.record_capacity_rejection(kind);
             return false;
-        }
+        };
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.release_task_permit();
+            // `permit` drops and releases; no registry entry exists yet.
             self.counters.record_rejected(kind);
             return false;
         };
@@ -502,6 +508,8 @@ impl DeliveryLifecycle {
         let lifecycle = Arc::clone(self);
         let task = handle.spawn(async move {
             if start_rx.await.is_err() {
+                // Caller dropped `start_tx` after releasing or transferring the
+                // permit (cancel/send-failure paths). Do not release again.
                 return;
             }
             let _completion = TaskCompletion {
@@ -517,18 +525,26 @@ impl DeliveryLifecycle {
         if self.cancelling_tasks.load(Ordering::Acquire) {
             if let Some((_, task)) = self.tasks.remove(&task_id) {
                 task.abort.abort();
-                // This removal owns the permit. If the entry is already gone,
-                // cancel_remaining removed it and released the permit.
-                self.release_task_permit();
+                // This removal owns the permit via `permit` drop below.
                 self.counters.record_cancelled(kind);
+            } else {
+                // `cancel_remaining` already removed the entry and released.
+                permit.disarm();
             }
             return false;
         }
         if start_tx.send(()).is_err() {
-            self.finish_task(task_id);
+            // Task never started. Reclaim the registry entry when we still own
+            // it; if `cancel_remaining` won the race it already released.
+            if self.tasks.remove(&task_id).is_none() {
+                permit.disarm();
+            }
+            self.tasks_changed.notify_one();
             self.counters.record_cancelled(kind);
             return false;
         }
+        // Successful handoff: registry/`TaskCompletion` owns release.
+        permit.disarm();
         true
     }
 
@@ -733,6 +749,28 @@ struct TaskCompletion {
 
 struct TaskRegistration<'a> {
     lifecycle: &'a DeliveryLifecycle,
+}
+
+/// Lock-free admission permit held between reserve and successful registry
+/// handoff. Drop releases unless [`TaskAdmissionPermit::disarm`] transfers
+/// ownership to the registry/`TaskCompletion` path.
+struct TaskAdmissionPermit<'a> {
+    lifecycle: &'a DeliveryLifecycle,
+    live: bool,
+}
+
+impl TaskAdmissionPermit<'_> {
+    fn disarm(&mut self) {
+        self.live = false;
+    }
+}
+
+impl Drop for TaskAdmissionPermit<'_> {
+    fn drop(&mut self) {
+        if self.live {
+            self.lifecycle.release_task_permit();
+        }
+    }
 }
 
 impl Drop for TaskRegistration<'_> {
@@ -1329,5 +1367,48 @@ mod tests {
             lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
             },)
         );
+    }
+
+    #[test]
+    fn no_runtime_rejection_releases_task_permit() {
+        let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 1));
+        assert!(
+            !lifecycle.spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, async {
+            },),
+            "spawn without a Tokio runtime must reject"
+        );
+        assert_eq!(lifecycle.tasks.len(), 0);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(lifecycle.rejected_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_remaining_releases_task_permits() {
+        let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 2));
+        let release = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Semaphore::new(0));
+        for _ in 0..2 {
+            let task_release = Arc::clone(&release);
+            let task_started = Arc::clone(&started);
+            assert!(lifecycle.spawn(
+                TaskAdmission::External,
+                DeliveryTaskKind::Terminal,
+                async move {
+                    task_started.add_permits(1);
+                    let _ = task_release.acquire().await;
+                },
+            ));
+        }
+        started
+            .acquire_many(2)
+            .await
+            .expect("held tasks report started")
+            .forget();
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 2);
+
+        lifecycle.cancel_remaining();
+        assert_eq!(lifecycle.tasks.len(), 0);
+        assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+        release.close();
     }
 }
