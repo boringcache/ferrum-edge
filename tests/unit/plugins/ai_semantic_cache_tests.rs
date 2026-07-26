@@ -5427,7 +5427,9 @@ fn redis_quarantine_successful_del_clears_suppressor() {
     let key = "semantic-key-del-ok";
     let fp = quarantine_fp("poison");
     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
-    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key));
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
 
     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, true);
     assert!(
@@ -5465,7 +5467,9 @@ fn redis_quarantine_ttl_recovery_reconsiders_key() {
     let key = "semantic-key-ttl";
     let fp = quarantine_fp("poison");
     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
-    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key));
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
 
     ai_semantic_cache_expire_redis_quarantine_for_test(&plugin, key);
     assert!(
@@ -5550,7 +5554,8 @@ fn redis_quarantine_concurrent_record_and_probe_stay_bounded() {
                     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
                         &plugin, &key, fp, false,
                     );
-                    let _ = ai_semantic_cache_redis_quarantine_is_suppressed_for_test(&plugin, &key);
+                    let _ =
+                        ai_semantic_cache_redis_quarantine_is_suppressed_for_test(&plugin, &key);
                 }
             });
         }
@@ -5570,13 +5575,17 @@ fn redis_quarantine_reload_instances_are_isolated() {
     let fp = quarantine_fp("poison");
     ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&first, key, fp, false);
 
-    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(&first, key));
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &first, key
+    ));
     assert!(
         !ai_semantic_cache_redis_quarantine_suppressed_for_test(&second, key),
         "reload/sibling instances must not share quarantine suppressors"
     );
     ai_semantic_cache_clear_redis_quarantine_for_test(&first, key);
-    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(&first, key));
+    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &first, key
+    ));
 }
 
 #[tokio::test]
@@ -5615,7 +5624,9 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
         .to_string();
 
     let fp = quarantine_fp("remote-poison");
-    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, &cache_key, fp, false);
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+        &plugin, &cache_key, fp, false,
+    );
     let before = ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin);
 
     let mut ctx2 = RequestContext::new(
@@ -5691,8 +5702,7 @@ fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
         "insert must not allocate a vector of cloned keys for a map-wide scan"
     );
     assert!(
-        insert.contains("entries.iter().next()")
-            || insert.contains("self.entries.iter().next()"),
+        insert.contains("entries.iter().next()") || insert.contains("self.entries.iter().next()"),
         "over-cap insert must use constant-work arbitrary/sample victim selection"
     );
     assert!(

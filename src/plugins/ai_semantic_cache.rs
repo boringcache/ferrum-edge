@@ -4630,7 +4630,10 @@ impl Plugin for AiSemanticCache {
                                         "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"
                                     );
                                     self.quarantine_invalid_redis_entry(
-                                        redis, &redis_key, &cache_key, fingerprint,
+                                        redis,
+                                        &redis_key,
+                                        &cache_key,
+                                        fingerprint,
                                     )
                                     .await;
                                 }
@@ -4653,7 +4656,10 @@ impl Plugin for AiSemanticCache {
                                 "ai_semantic_cache: quarantining oversized Redis entry"
                             );
                             self.quarantine_invalid_redis_entry(
-                                redis, &redis_key, &cache_key, fingerprint,
+                                redis,
+                                &redis_key,
+                                &cache_key,
+                                fingerprint,
                             )
                             .await;
                         }
@@ -4672,7 +4678,10 @@ impl Plugin for AiSemanticCache {
                                 "ai_semantic_cache: quarantining empty Redis entry"
                             );
                             self.quarantine_invalid_redis_entry(
-                                redis, &redis_key, &cache_key, fingerprint,
+                                redis,
+                                &redis_key,
+                                &cache_key,
+                                fingerprint,
                             )
                             .await;
                         }
