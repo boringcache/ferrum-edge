@@ -6,13 +6,13 @@ use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
-    ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolFsFault, SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
-    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
-    clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
-    replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
+    SnapshotAccumulator, SpoolCompression, SpoolFsFault, SpoolManager, SpoolOwnerSpec,
+    SpoolSettings, SpoolWriteHookPoint, classify_clickhouse_acknowledgement_for_tests,
+    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
+    decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
+    render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
+    serialize_json_each_row, set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
@@ -3860,6 +3860,104 @@ fn atomic_spool_write_fault_injection_surfaces_before_success() {
     // The unfaulted path still publishes durably.
     write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n").unwrap();
     assert!(final_path.exists());
+}
+
+#[test]
+fn rollback_before_rename_preserves_a_peer_published_final_path() {
+    // `spool.meta.json` is one shared name for every writer of a namespace, so a
+    // writer that fails before its own rename must never unlink the manifest a
+    // peer already published.
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("spool.meta.json");
+    let peer_bytes: &[u8] = b"{\"published_by\":\"peer\"}\n";
+    fs::write(&final_path, peer_bytes).unwrap();
+
+    for fault in [SpoolFsFault::FileSync, SpoolFsFault::Rename] {
+        let tmp_path = temp
+            .path()
+            .join(format!("spool.meta.json.write-{fault:?}.tmp"));
+        let err = write_private_file_atomically_with_fault_for_tests(
+            &tmp_path,
+            &final_path,
+            b"{\"published_by\":\"me\"}\n",
+            fault,
+        )
+        .expect_err("an injected pre-rename fault must fail the write");
+        assert!(
+            err.contains("injected fault"),
+            "unexpected error for {fault:?}: {err}"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "rollback must still remove this attempt's own temp for {fault:?}"
+        );
+        assert_eq!(
+            fs::read(&final_path).unwrap(),
+            peer_bytes,
+            "rollback must not unlink a final path this attempt never published ({fault:?})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_after_rename_keeps_a_peer_replacement_of_the_final_path() {
+    // The injected interleaving: this attempt renames, a peer republishes the
+    // same shared name, and only then does this attempt's directory fsync fail.
+    // The peer now owns the entry, so rollback must leave it alone.
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("spool.meta.json");
+    let tmp_path = temp.path().join("spool.meta.json.write-peer-race.tmp");
+
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &tmp_path,
+        &final_path,
+        b"{\"published_by\":\"me\"}\n",
+        SpoolFsFault::PeerRepublishThenDirSync,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !tmp_path.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
+    assert_eq!(
+        fs::read(&final_path).unwrap(),
+        PEER_REPUBLISH_MARKER,
+        "rollback must not unlink a peer publication that replaced this attempt's rename"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_after_rename_still_removes_this_attempts_own_publication() {
+    // Same failing step as the peer-race test above; the only difference is that
+    // nothing replaced this attempt's inode, so ownership is proven and the
+    // unsynced publication is rolled back as before. The pair keeps the
+    // ownership check from degenerating into "never delete".
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("spool.meta.json");
+    let tmp_path = temp.path().join("spool.meta.json.write-own.tmp");
+    // A peer publication that this attempt's own rename replaces: rolling that
+    // rename back removes the entry rather than resurrecting the peer inode.
+    fs::write(&final_path, b"{\"published_by\":\"peer\"}\n").unwrap();
+
+    let err = write_private_file_atomically_with_fault_for_tests(
+        &tmp_path,
+        &final_path,
+        b"{\"published_by\":\"me\"}\n",
+        SpoolFsFault::DirSync,
+    )
+    .expect_err("an injected directory-sync fault must fail the write");
+    assert!(err.contains("injected fault"), "unexpected error: {err}");
+    assert!(
+        !final_path.exists(),
+        "a publication this attempt still owns must be rolled back"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "rollback must still remove this attempt's own temp"
+    );
 }
 
 #[test]

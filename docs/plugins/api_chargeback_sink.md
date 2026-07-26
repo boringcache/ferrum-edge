@@ -372,11 +372,17 @@ created with private permissions, written as process/generation-attributed
 directory-fsynced on Unix. The `spool.meta.json` ownership manifest uses the same
 attributed temp name, so two generations or two processes sharing the volume can
 never collide on one manifest temp and unlink each other's in-progress write. A
-Unix parent-directory open or fsync failure is a **write failure**: Ferrum
-removes the temp/final path, performs a second real parent-directory fsync, and
-returns the error before any snapshot baseline commit. If rollback removal or its
-second fsync also fails, that failure is included in the returned diagnostic
-rather than claiming a guaranteed rollback. On platforms that cannot fsync
+Unix parent-directory open or fsync failure is a **write failure**: Ferrum rolls
+the attempt back, performs a second real parent-directory fsync, and returns the
+error before any snapshot baseline commit. Rollback is ownership-scoped. It
+always removes this attempt's own attributed temp, but it removes the final path
+only when that attempt's rename actually took effect and the path still names the
+exact file that rename published (device plus inode, compared without following
+symlinks). A failure before the rename therefore leaves a peer's already-published
+manifest untouched, and a peer that republishes the shared name after the rename
+keeps its newer file. If rollback removal or its second fsync also fails, that
+failure is included in the returned diagnostic rather than claiming a guaranteed
+rollback. On platforms that cannot fsync
 directories (notably Windows) a successful file sync plus rename is the
 durability boundary this plugin can offer, and that limit is stated rather than
 claimed away — there is no silent "best-effort" success after a failed directory
