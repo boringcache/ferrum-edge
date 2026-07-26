@@ -6483,6 +6483,26 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
             }),
             false,
         ),
+        (
+            json!({
+                "limits": { "max_request_bytes": 1048576 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            true,
+        ),
+        (
+            json!({
+                "limits": { "max_request_bytes": 1048577 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            false,
+        ),
     ];
     for (config, expected_valid) in parity_cases {
         assert_component_validity(&spec, "AiTranscriptAuditConfig", &config, expected_valid);
