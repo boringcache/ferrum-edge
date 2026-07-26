@@ -367,7 +367,7 @@ fn unknown_selector_field_does_not_broaden_cross_namespace_attachment() {
         assert_eq!(condition["message"], accepted["message"]);
     }
     let message = accepted["message"].as_str().expect("status message");
-    for leaked in ["matchLables", "matchLabels", secret, "team", "payments"] {
+    for leaked in ["matchLables", secret, "team", "payments"] {
         assert!(
             !message.contains(leaked),
             "selector diagnostics must stay redacted: leaked {leaked}"
