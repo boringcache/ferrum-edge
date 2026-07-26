@@ -58,9 +58,8 @@ fn mappings(config: &Value) -> Vec<ClaimHeaderMapping> {
 /// Authenticate an external principal and install claim headers over `headers`.
 fn authenticate_and_apply(claims: &Value, config: &Value, headers: &mut HashMap<String, String>) {
     let mapped = mappings(config);
-    let destinations = ClaimHeaderDestinations::from_mapping_groups(std::iter::once(
-        mapped.as_slice(),
-    ));
+    let destinations =
+        ClaimHeaderDestinations::from_mapping_groups(std::iter::once(mapped.as_slice()));
 
     let mut ctx = ctx();
     let mut attempt = AuthenticationAttempt::new();
@@ -178,14 +177,19 @@ fn an_instance_never_strips_a_destination_it_does_not_own() {
     let config = json!({"claim_headers": {"email": "X-Owned"}});
     let mut headers = HashMap::from([
         ("X-Owned".to_string(), "attacker".to_string()),
-        ("X-Other-Plugin-Destination".to_string(), "other".to_string()),
+        (
+            "X-Other-Plugin-Destination".to_string(),
+            "other".to_string(),
+        ),
     ]);
 
     authenticate_and_apply(&json!({"sub": "alice"}), &config, &mut headers);
 
     assert!(!headers.contains_key("X-Owned"));
     assert_eq!(
-        headers.get("X-Other-Plugin-Destination").map(String::as_str),
+        headers
+            .get("X-Other-Plugin-Destination")
+            .map(String::as_str),
         Some("other"),
         "another instance's destination must be untouched"
     );
@@ -197,9 +201,10 @@ fn provider_override_destinations_are_owned_and_sanitized() {
     // destination: both belong to the owned set.
     let plugin_level = mappings(&json!({"claim_headers": {"email": "X-Plugin-Email"}}));
     let provider_level = mappings(&json!({"claim_headers": {"email": "X-Provider-Email"}}));
-    let destinations = ClaimHeaderDestinations::from_mapping_groups(
-        [plugin_level.as_slice(), provider_level.as_slice()],
-    );
+    let destinations = ClaimHeaderDestinations::from_mapping_groups([
+        plugin_level.as_slice(),
+        provider_level.as_slice(),
+    ]);
     let owned: Vec<&str> = destinations.names().collect();
     assert_eq!(
         owned,
@@ -226,7 +231,10 @@ fn provider_override_destinations_are_owned_and_sanitized() {
     .expect("attempt commits");
 
     let mut headers = HashMap::from([
-        ("X-Plugin-Email".to_string(), "attacker@example.test".to_string()),
+        (
+            "X-Plugin-Email".to_string(),
+            "attacker@example.test".to_string(),
+        ),
         (
             "X-Provider-Email".to_string(),
             "attacker@example.test".to_string(),
@@ -350,7 +358,11 @@ fn an_instance_never_installs_a_destination_owned_by_another_instance() {
         !headers.contains_key("X-Instance-B-Email"),
         "the client's copy of the owned destination must not survive, got {headers:?}"
     );
-    assert_eq!(headers.len(), 1, "no other header may be added: {headers:?}");
+    assert_eq!(
+        headers.len(),
+        1,
+        "no other header may be added: {headers:?}"
+    );
 }
 
 #[tokio::test]
