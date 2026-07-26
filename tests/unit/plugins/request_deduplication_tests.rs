@@ -732,6 +732,7 @@ fn redaction_transformer(value: &str) -> serde_json::Value {
 /// An RTDS gate flip with no config reload must retire a stored replay: the
 /// finalized replay path skips the transform the new gate just enabled.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn replay_is_rejected_after_response_policy_changes() {
     use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
     use ferrum_edge::plugins::response_transformer::runtime_overlay;
@@ -777,6 +778,7 @@ async fn replay_is_rejected_after_response_policy_changes() {
 /// byte-identical, but the operator edited the static redaction rule. A replay
 /// stored under the old rule must not skip the new one.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn replay_is_rejected_when_static_redaction_rules_change_under_an_unchanged_gate() {
     use ferrum_edge::plugins::response_transformer::runtime_overlay;
 
@@ -823,6 +825,7 @@ async fn replay_is_rejected_when_static_redaction_rules_change_under_an_unchange
 /// Equivalent policy must stay replayable: an unrelated reload that rebuilds the
 /// same configuration derives the same digest, so retained responses survive.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn replay_survives_a_rebuild_of_equivalent_response_policy() {
     use ferrum_edge::plugins::response_transformer::runtime_overlay;
 
@@ -972,6 +975,7 @@ fn mcp_gateway_config(upstream_url: &str) -> serde_json::Value {
 /// the response `text/event-stream`, so a replay stored before the change would
 /// be delivered unwrapped under an event-stream label.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn replay_is_rejected_when_a_non_response_transformer_presentation_policy_changes() {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
@@ -1076,6 +1080,7 @@ fn every_dynamic_presentation_plugin_name_reports_dynamic_when_constructed() {
 /// replay. Without this, a `Dynamic` plugin's `None` digest would compare equal
 /// to the next request's `None` and replay under a catalog nobody witnessed.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn unprovable_presentation_policy_retains_no_replayable_representation() {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
@@ -1111,6 +1116,7 @@ async fn unprovable_presentation_policy_retains_no_replayable_representation() {
 /// matters after a reload adds an `mcp_gateway` to a proxy that already has
 /// retained responses.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn provable_stored_policy_does_not_replay_under_an_unprovable_live_policy() {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
@@ -1147,6 +1153,7 @@ async fn provable_stored_policy_does_not_replay_under_an_unprovable_live_policy(
 /// equivalent multi-plugin presentation policy must keep replays serviceable,
 /// so provenance retires only representations that are genuinely superseded.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
 async fn replay_survives_an_equivalent_rebuild_of_a_multi_plugin_presentation_policy() {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
@@ -1220,7 +1227,7 @@ fn presentation_policy_digest_covers_presence_multiplicity_and_order_across_plug
     let sse = ("sse", sse_wrapping_config(true, 3000));
     let transformer = ("response_transformer", redaction_transformer("[redacted]"));
 
-    let transformer_only = presentation_digest_for_plugin_specs(&[transformer.clone()]);
+    let transformer_only = presentation_digest_for_plugin_specs(std::slice::from_ref(&transformer));
     let with_sse = presentation_digest_for_plugin_specs(&[sse.clone(), transformer.clone()]);
     assert_ne!(
         transformer_only, with_sse,
