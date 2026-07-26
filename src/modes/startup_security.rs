@@ -186,8 +186,7 @@ pub fn load_startup_security_with_scope(
         } else {
             "Invalid admin TLS configuration"
         };
-        materials.admin_tls =
-            try_load_admin_tls(env_config, policy, &materials.crls, label)?;
+        materials.admin_tls = try_load_admin_tls(env_config, policy, &materials.crls, label)?;
     }
 
     if scope.dtls {

@@ -487,9 +487,8 @@ pub fn execute_validate() -> Result<(), String> {
     // free (no binds, no servers, no store mutation, no random JWT mint).
     let security_scope = StartupSecurityScope::for_mode(&env_config.mode);
     if !security_scope.is_empty() {
-        load_startup_security(&env_config).map_err(|e| {
-            format!("Startup security validation failed: {}", e)
-        })?;
+        load_startup_security(&env_config)
+            .map_err(|e| format!("Startup security validation failed: {}", e))?;
         println!("Startup security (env TLS/CIDRs/metrics): OK");
     }
 

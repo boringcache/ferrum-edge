@@ -935,12 +935,8 @@ pub async fn serve(
         Ok(None) => None,
         Err(e) => {
             error!("TLS configuration validation failed: {:#}", e);
-            shutdown_file_background_startup_tasks(
-                &shutdown_tx,
-                &proxy_state,
-                background_handles,
-            )
-            .await;
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
+                .await;
             return Err(e);
         }
     };
