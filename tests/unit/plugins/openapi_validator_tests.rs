@@ -1,6 +1,7 @@
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
     priority,
+    utils::content_encoding::{DecodeLimits, decode_content_encoding},
 };
 use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
@@ -8,6 +9,11 @@ use std::collections::HashMap;
 use std::io::Write as _;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+
+/// Stable client/log message for response-side decode/conversion failures.
+/// Backend-controlled encoding details must not cross this boundary.
+const SAFE_RESPONSE_DECODE_ERROR: &str =
+    "Response body could not be safely decoded or converted for schema validation";
 
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -3177,7 +3183,28 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     );
     assert_eq!(
         response_error(&ctx),
-        Some("unsupported content-encoding 'zstd'")
+        Some(SAFE_RESPONSE_DECODE_ERROR),
+        "response-side encoding failures must stay redacted at the public boundary"
+    );
+    // Internal classification still names the unsupported coding; that detail
+    // must not appear in response_error metadata.
+    let internal = decode_content_encoding(
+        Some("zstd"),
+        br#"{"ok":true}"#,
+        DecodeLimits {
+            max_decoded_bytes: 1024,
+            max_cumulative_bytes: 1024,
+            max_codings: 4,
+            max_amplification_ratio: 0,
+        },
+    )
+    .expect_err("unsupported response coding must fail closed internally");
+    assert_eq!(internal, "unsupported content-encoding 'zstd'");
+    assert!(
+        !response_error(&ctx)
+            .unwrap_or_default()
+            .contains("zstd"),
+        "unsupported coding name must not leak into response_error metadata"
     );
 
     // Corrupt outer layer of a gzip,br chain.
@@ -3358,12 +3385,33 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
             .await,
         Some(502),
     );
+    assert_eq!(
+        response_error(&ctx),
+        Some(SAFE_RESPONSE_DECODE_ERROR),
+        "response expansion over max_body_bytes must stay redacted at the public boundary"
+    );
+    // Prove the decoder itself enforces the per-layer ceiling with a precise
+    // classification that response_error deliberately withholds.
+    let internal = decode_content_encoding(
+        Some("gzip"),
+        &response_gzip,
+        DecodeLimits {
+            max_decoded_bytes: 64,
+            max_cumulative_bytes: 64,
+            max_codings: 4,
+            max_amplification_ratio: 0,
+        },
+    )
+    .expect_err("oversized decoded response layer must fail closed internally");
     assert!(
-        response_error(&ctx)
+        internal.contains("exceeds 64 bytes") || internal.contains("max_decoded_bytes"),
+        "internal decode must name the size ceiling, got {internal:?}"
+    );
+    assert!(
+        !response_error(&ctx)
             .unwrap_or_default()
             .contains("exceeds 64 bytes"),
-        "response expansion must honor max_body_bytes, got {:?}",
-        response_error(&ctx)
+        "size-ceiling detail must not leak into response_error metadata"
     );
 }
 

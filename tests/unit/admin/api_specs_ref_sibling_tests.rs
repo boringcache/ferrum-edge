@@ -355,12 +355,46 @@ fn unknown_x_ferrum_validate_bypass_key_is_rejected() {
 
 #[test]
 fn exponential_ref_fanout_hits_the_expansion_limit() {
-    let branches = vec![json!({"$ref": "#/components/schemas/Target"}); 8];
-    let component = json!({"anyOf": branches});
-    let spec = spec_with_request_schema(
-        "3.1.0",
-        &component.to_string(),
-        r##"{"$ref": "#/components/schemas/Target"}"##,
+    // A self-recursive Target is expanded depth-first, so one spine burns
+    // MAX_SCHEMA_REF_DEPTH before the node budget can fire. Use a finite
+    // layered DAG (no cycles) so width is materialised and the expansion
+    // budget is what fails closed before memory exhaustion.
+    let mut components = serde_json::Map::new();
+    components.insert(
+        "Leaf".to_string(),
+        json!({"type": "string", "minLength": 1}),
+    );
+    let mut child = "Leaf".to_string();
+    for layer in (0..7).rev() {
+        let name = format!("L{layer}");
+        let branches = vec![json!({ "$ref": format!("#/components/schemas/{child}") }); 8];
+        components.insert(name.clone(), json!({ "anyOf": branches }));
+        child = name;
+    }
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Ref Fanout API", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "components": {{"schemas": {schemas}}},
+  "paths": {{
+    "/items": {{
+      "post": {{
+        "requestBody": {{
+          "content": {{
+            "application/json": {{
+              "schema": {{"$ref": "#/components/schemas/L0"}}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block(),
+        schemas = Value::Object(components)
     );
     let error = extract_err(&spec);
     assert!(
