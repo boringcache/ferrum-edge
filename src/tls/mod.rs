@@ -71,6 +71,20 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
+/// Fixed operator-facing PEM parse failure classes. Never interpolate
+/// rustls-pemfile diagnostics: they can echo malformed PEM lines or bytes.
+fn pem_certificate_parse_failure_class(error: rustls_pemfile::Error) -> &'static str {
+    match error {
+        rustls_pemfile::Error::IllegalSectionStart { .. } => "illegal PEM section start",
+        rustls_pemfile::Error::MissingSectionEnd { .. } => "missing PEM section end marker",
+        rustls_pemfile::Error::Base64Decode(_) => "invalid PEM base64 encoding",
+    }
+}
+
+/// Fixed operator-facing trust-anchor admission failure class. Never interpolate
+/// the rejected certificate DER or rustls admission diagnostics.
+const PEM_TRUST_ROOT_ADMISSION_FAILURE_CLASS: &str = "certificate failed trust-anchor admission";
+
 /// Parse a non-empty PEM certificate bundle without silently dropping records.
 ///
 /// The display source must already be safe for operator-facing diagnostics.
@@ -90,7 +104,7 @@ pub(crate) fn parse_pem_certificate_bundle(
                     label,
                     index + 1,
                     display_source,
-                    error
+                    pem_certificate_parse_failure_class(error)
                 )
             })
         })
@@ -118,13 +132,13 @@ pub(crate) fn root_cert_store_from_pem_bundle(
     let certificates = parse_pem_certificate_bundle(pem_data, label, display_source)?;
     let mut roots = rustls::RootCertStore::empty();
     for (index, certificate) in certificates.into_iter().enumerate() {
-        roots.add(certificate).map_err(|error| {
+        roots.add(certificate).map_err(|_rejected_certificate| {
             anyhow::anyhow!(
                 "{}: certificate record #{} in '{}' is not a usable trust root: {}",
                 label,
                 index + 1,
                 display_source,
-                error
+                PEM_TRUST_ROOT_ADMISSION_FAILURE_CLASS
             )
         })?;
     }

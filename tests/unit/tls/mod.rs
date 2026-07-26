@@ -1,3 +1,4 @@
 mod inventory_public_metadata_tests;
+mod pem_bundle_redaction_tests;
 mod san_allow_list_verifier_tests;
 mod source_redaction_tests;
