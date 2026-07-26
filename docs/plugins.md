@@ -1162,6 +1162,25 @@ cancelled tasks and outstanding records through
 `ferrum_observability_delivery_*` metrics. A failed or unavailable sink cannot
 wedge process exit.
 
+`FERRUM_LOG_DELIVERY_MAX_TASKS` is the aggregate pending-task budget for
+terminal, mirror, and deadline-cleanup work (the pre-queue Tokio task and
+registry layer). Admission reserves a permit before spawn/registry insertion.
+When the budget is exhausted, further admissions are rejected immediately
+(non-blocking), counted on `ferrum_observability_delivery_rejected_tasks_total`
+and on the budget-specific
+`ferrum_observability_delivery_capacity_rejected_tasks_total`, and surfaced with
+a rate-limited caller-thread warning; callers must not spawn additional deferred
+work to report the drop. The warning is both sampled and bounded to at most one
+line per five seconds per delivery lifecycle generation, so a sustained
+overflow cannot scale log output with rejected traffic. Permits release when tasks complete or are
+cancelled, and the shared shutdown-drain deadline is unchanged.
+`ferrum_observability_delivery_max_tasks` and
+`ferrum_observability_delivery_admitted_tasks` expose the configured budget and
+current reservation depth. Alert on
+`ferrum_observability_delivery_capacity_rejected_tasks_total` rather than the
+aggregate reject counter when diagnosing budget exhaustion: the aggregate also
+counts closed-admission and no-runtime rejects that occur normally at shutdown.
+
 A completed drain is terminal for that delivery lifecycle *generation*: its
 task and worker admission stay closed and its drain report stays cached, so
 late producers on a shutting-down process cannot reopen delivery work behind
@@ -1624,9 +1643,13 @@ ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generati
 status with aggregate totals), and process-wide aggregate Prometheus metrics
 under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
-configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
-reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
-persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
+configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
+ownership/claim protocol, and reconciliation guidance. Each spool is partitioned
+by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,
+ClickHouse endpoint/database/table, node id), so sibling instances can never
+replay, delete, or dead-letter each other's billing records. Set
+`FERRUM_NODE_ID` for stable spool ownership on persistent storage. Ordinary HTTP
+is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
 `http_status_code`, and normalized final `grpc_status` as separate fields.
@@ -1685,6 +1708,8 @@ Unknown configuration keys, explicit `null` properties, empty configured strings
 ---
 
 ## Authentication Plugins
+
+Every `claim_headers` destination configured on `jwks_auth`, `oauth2_introspection`, or `oidc_relying_party` is **gateway-owned and always sanitized**. After a successful authentication the gateway removes each configured destination header from the request — case-insensitively, so duplicate and case-variant client copies go too — before it installs any verified claim value. A claim that is missing, null, empty or blank, of an unusable type, or absent from the principal that actually authenticated therefore leaves the destination **absent**; a client-supplied value is never forwarded in its place. Backends may treat these headers as gateway assertions. Each plugin instance owns exactly the destinations it configures (including every provider override): it sanitizes only those destinations and installs verified values only for those destinations. One instance therefore never strips another instance's destinations and never consumes a value staged for a destination another instance owns. A destination is sanitized once per request, so an instance sharing a destination cannot erase a value another instance already installed.
 
 ### `mtls_auth`
 
@@ -2915,7 +2940,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
 | `forward_body` | bool | `false` | Include the lossless buffered request body for every method. UTF-8 bytes are an exact string with `body_encoding: "utf8"`; other bytes are base64 with `body_encoding: "base64"`. The active media type is carried separately as `body_content_type` |
-| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
+| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load). Read from the effective `before_proxy` header view, so a field line an earlier plugin removed — `authorization` under `strip_authorization_on_success`, or a gateway-owned `claim_headers` destination with no verified claim — is absent from the payload rather than re-read from the client's original request |
 | `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |

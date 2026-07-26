@@ -322,8 +322,11 @@ must name a `FERRUM_*` variable.
 
 A failed ClickHouse export uses `retry.max_attempts` total attempts (including
 the initial try; valid range **1–32**). `0` is rejected rather than silently
-rewritten. Batch `size` is capped at **10000** and `flush_interval_ms` at
-**600000** to match the shared `BatchingLogger` admission limits. Each of
+rewritten. `clickhouse.timeout_ms` is bounded to **1–600000** ms per attempt so
+the cross-process spool claim lease is finite and remains longer than the
+accepted request/retry budget. Batch `size` is capped at **10000** and
+`flush_interval_ms` at **600000** to match the shared `BatchingLogger` admission
+limits. Each of
 `retry.initial_delay_ms` and
 `retry.max_delay_ms` is capped at **60000** ms. The inter-attempt delay uses
 **bounded exponential backoff**: it starts at `retry.initial_delay_ms` and
@@ -339,11 +342,39 @@ handed to the spool (when enabled) instead of being dropped.
 
 ## Spool And Replay
 
-Spool files are written under:
+Spool files are written under a **managed namespace** owned by exactly one sink
+identity:
 
 ```text
-<spool.dir>/<node_id>/<YYYYMMDD>/<ULID>.ndjson.zst
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/spool.meta.json
+<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/<YYYYMMDD>/<ULID>.<owner_tag>.ndjson.zst
 ```
+
+### Spool ownership identity
+
+The owner identity is the tuple
+
+`(plugin config id, Ferrum namespace/ledger, sanitized ClickHouse endpoint,
+database, table, node id)`.
+
+`owner_digest` is a domain-separated, length-prefixed SHA-256 over that tuple
+(first 32 hex characters in the path); `owner_tag` is its first 32 hex
+characters and is embedded in **every** managed filename. The endpoint is the
+credential-free configured base URL, including its configured path when present,
+and the ClickHouse password is deliberately excluded, so neither the path, the
+manifest, nor the digest is credential derived. `safe_node` and `safe_plugin`
+stay human-readable when the source value is already a safe component; absolute
+paths, parent segments, separators, NUL, drive letters, UNC, and Windows device
+prefixes are hashed into one safe component instead of being joined, and NUL is
+rejected outright.
+
+Versioned `spool.meta.json` records the whole tuple plus `owner_digest`,
+`owner_tag`, and the format version. It is written at prepare time and validated
+before every replay listing. On mismatch the sink **fails closed**: nothing is
+read, delivered, deleted, dead-lettered, or evicted, `spool.available` goes to
+`false`, and `chargeback_sink_spool_prepare_failures_total` increments. The
+per-file `owner_tag` binds each record individually, so a record moved between
+directories is still attributable and is never replayed by a different owner.
 
 The sink writes failed batches and queue high-water overflow to an async spool
 delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
@@ -351,9 +382,97 @@ terminal hooks only enqueue to that worker; compression, directory scans, writes
 and fsync never run inline on those hooks. Saturation of the delivery queue is
 counted (`chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
-created with private permissions, written as `*.tmp`, fsynced, and renamed into
-place. The background replayer scans durable data files (`*.ndjson` /
-`*.ndjson.zst`) in lexicographic order.
+created with private permissions, written as process/generation-attributed
+`*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
+directory-fsynced on Unix. The `spool.meta.json` ownership manifest uses the same
+attributed temp name, so two generations or two processes sharing the volume can
+never collide on one manifest temp and unlink each other's in-progress write. A
+Unix parent-directory open or fsync failure is a **write failure**: Ferrum rolls
+the attempt back, performs a second real parent-directory fsync, and returns the
+error before any snapshot baseline commit.
+
+Rollback is ownership-scoped, and ownership is decided by the name being
+published rather than by inspecting the file on disk. It always removes this
+attempt's own attributed temp. It also removes the **final** path when that name
+belongs exclusively to the attempt — the ULID-derived `<ulid>.<owner_tag>.<ext>`
+batch and its `<name>.rejected.meta` dead-letter record, which no other writer
+can publish. It never removes `spool.meta.json`, the one final name every writer
+of a namespace shares: an unlink acts on a path, and a peer's `rename` can
+replace that path between any ownership check and the removal, so no
+stat-then-unlink, content comparison, or timestamp comparison could keep such a
+removal from deleting a peer's newer manifest.
+
+A failed manifest publish therefore leaves the manifest entry in place, and
+Ferrum does **not** treat that as success. The durability error is still
+returned, live storage is not marked prepared, the batch is not accepted, and
+`chargeback_sink_spool_prepare_failures_total` increments. What can survive is a
+manifest whose directory entry was never fsynced (or whose bytes replaced a
+peer's); the next prepare revalidates it against this sink's identity and
+regenerates it or fails closed, so it is recoverable, whereas deleting another
+writer's live manifest would not be. If rollback removal or its second fsync also
+fails, that failure is included in the returned diagnostic rather than claiming a
+guaranteed rollback.
+
+On platforms that cannot fsync directories (notably Windows) a successful file
+sync plus rename is the durability boundary this plugin can offer, and that limit
+is stated rather than claimed away — there is no silent "best-effort" success
+after a failed directory sync on Unix.
+
+Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
+and stale-temp cleanup use non-following metadata), proves the managed root
+resolves under the canonical `spool.dir`, enforces containment for every path it
+creates, renames, or unlinks, verifies that the namespace path still names its
+original canonical directory before every walk/mutation, bounds traversal depth
+and total directory-entry count, and skips directory cycles by device/inode
+identity.
+
+### Claim and lease protocol
+
+The background replayer scans durable data files (`*.ndjson` / `*.ndjson.zst`)
+carrying **its own** `owner_tag`, in lexicographic order, then **atomically
+claims** each candidate by renaming it to
+
+```text
+<ULID>.<owner_tag>.ndjson.claim-<process_tag>-<generation>-<lease_deadline>.inflight
+```
+
+before any ClickHouse delivery. The rename is the mutual-exclusion primitive: on
+a shared volume exactly one accepted generation or process can win it, and the
+loser simply moves on to the next file. `process_tag` is a per-process nonce
+drawn with 128 bits at startup, so a restart never mistakes a crashed run's claim
+for live work. The lease deadline is derived from the configured worst-case
+delivery budget (`clickhouse.timeout_ms` × `retry.max_attempts` plus the retry
+backoff schedule, ×4, with a 300-second floor and no shorter ceiling).
+Multi-chunk replay renews the claim before each chunk, so the aggregate delivery
+of one file cannot outlive a lease sized for one bounded request/retry budget.
+
+Claim disposition:
+
+- **Delivered** — the claim is removed.
+- **Retryable** — the claim is released back to its durable replayable name and
+  the tick stops so ordering is preserved.
+- **Permanent / 413 single row** — the claim is replaced by safe dead-letter
+  metadata named after the durable data file.
+- **Unreadable** — the claim is quarantined as `<data-name>.corrupt`.
+
+In-flight claims count toward `spool.max_bytes` but are **never** eviction
+candidates; when only claimed or foreign-owned files remain, an admission that
+cannot fit fails closed instead of destroying them. Recovery at prepare time
+returns a claim to its durable name only when this process demonstrably abandoned
+it (same `process_tag`, no live lease) or when a peer's lease deadline has
+passed.
+
+Within one process the exclusion is absolute: a live claim holds an in-memory
+lease, so no other accepted generation can recover it. Across processes sharing a
+volume the exclusion is the atomic rename plus a *time* bound, not a proof that
+the peer stopped: a peer stalled past its lease (host pause, `SIGSTOP`, or clock
+skew between replicas) can still be delivering a claim another process has
+recovered. The lease is sized at four times the accepted worst-case delivery
+budget and renewed before every chunk so that window is not reachable by ordinary
+slow delivery, and the residual case is a duplicate insert — not a lost or
+misrouted record — which the stable `event_id` / `ReplacingMergeTree` idempotency
+contract deduplicates. A claim is never delivered to a destination other than the
+one its `owner_tag` names.
 
 Queued export and spool-delivery events retain the same byte leases under
 `batch.buffer_max_bytes`; transferring an event to the spool worker does not
@@ -381,6 +500,18 @@ fields are never logged.
 
 - Unreadable local spool files are renamed with a `.corrupt` suffix so newer
   files can continue to replay.
+- Every encoded and decoded spool artifact is hard-capped at 256 MiB, matching
+  the sink's maximum accepted retained-byte budget. The writer refuses a larger
+  artifact, so it cannot publish a record this build will not replay. Within
+  that ceiling, a `zstd` record may expand to at most 200x its encoded size
+  (floor 1 MiB). A planted large raw file or high-ratio archive inside the
+  managed tree is quarantined as `.corrupt` without first being read or expanded
+  without limit inside the billing process.
+- `spool.meta.json` is bounded separately at 64 KiB. It is the one managed file
+  read *before* ownership is established — on every prepare and every replay
+  listing — so it is reachable without first deriving this owner's tag. An
+  oversized manifest fails the ownership check closed (`spool.available=false`,
+  `chargeback_sink_spool_prepare_failures_total`) and mutates nothing.
 - Permanently rejected rows (and single-row 413 failures) are discarded only
   after one deterministic sibling `.rejected.meta` JSON document has been
   durably written for the source file. The document contains the aggregate
@@ -389,11 +520,51 @@ fields are never logged.
   payload, response bodies, credentials, or charge-record PII. If the metadata
   write fails, the original file remains replayable; successfully inserted
   rows may be retried with their unchanged `event_id` idempotency identity.
-- Stale `*.tmp` files left by an interrupted atomic write are deleted at spool
-  startup and after a failed write/rename so they cannot accumulate indefinitely.
+- Temps left by an interrupted atomic write are reconciled only when this process
+  demonstrably owns them (matching `process_tag`) and no live writer holds the
+  path, or when they are foreign/unattributable **and** older than the stale-temp
+  age (300 s). A reloaded generation therefore cannot unlink the active temp of
+  an older accepted generation or of a peer process sharing the volume.
+- In-flight replay claims are recovered to durable replayable names during live
+  prepare, subject to the lease rules above.
 
-Dead-letter metadata and corrupt files remain under the node spool tree and
-count toward `spool.max_bytes` until eviction drops the oldest owned file.
+Dead-letter metadata, corrupt files, temps, and in-flight claims remain under
+the managed namespace and count toward `spool.max_bytes` until eviction drops the
+oldest **evictable** owned file. In-flight claims, temps still under an active
+write, and records carrying another owner's tag are never evictable: eviction
+applies the same ownership and stale-age test reconciliation does, so it can
+reclaim a crash-left temp but never unlink a peer generation's in-progress
+publish.
+
+### Migration and destination changes
+
+Ferrum never silently replays records it does not own to a newly configured
+destination. Two shapes are recognized and reported instead:
+
+- **Pre-namespace (legacy) records** written directly under
+  `<spool.dir>/<node>/<YYYYMMDD>/`, which carry no ownership binding.
+- **Orphaned namespaces**: a sibling `o<owner_digest>` directory left behind when
+  the Ferrum namespace/ledger, ClickHouse endpoint, database, or table changed
+  while the node id and plugin config id stayed the same.
+
+Both are counted when the managed namespace is prepared (process start, or the
+first tick after storage recovers) into `spool.unbound_files` /
+`spool.unbound_namespaces` in the status JSON, exported as
+`chargeback_sink_spool_unbound_files` and
+`chargeback_sink_spool_unbound_namespaces`, and logged with a rate-limited
+warning naming the counts and directories. The aggregate discovery pass shares
+one 100,000-entry traversal budget across the legacy tree and every sibling
+namespace; if that cap is reached, the warning sets `scan_truncated=true` and
+the exported counts are explicit lower bounds rather than performing unbounded
+work on a shared volume. They are **never** replayed, deleted, evicted, or
+rerouted. Reconciling them is an explicit operator action: either re-point the
+sink at the original destination so the records become owned again, or
+export/remove them out of band. A record whose `owner_tag` names a different
+identity but sits inside this namespace (only reachable by tampering or a
+hand-moved file) is treated the same way: counted, reported, never touched.
+Changing the node id or plugin config id moves records to a different parent
+subtree, so the replacement instance cannot safely attribute or count them;
+operators must inspect those previous subtrees explicitly.
 
 Offline validation and candidate-generation staging do not create, chmod, or
 probe `spool.dir`. After cache publication, the committed replayer prepares and
@@ -403,12 +574,13 @@ probe is persistent operational evidence: status reports `spool.available=false`
 `chargeback_sink_spool_prepare_failures_total` increments until storage recovers.
 
 `spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
-sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
+sink under its managed namespace (after compression when `compression` is
 `zstd`). The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
-- in-progress atomic-write temps (`*.ndjson.tmp`, `*.ndjson.zst.tmp`, and
+- in-progress atomic-write temps (`*.write-<process_tag>-<generation>.tmp` and
   dead-letter metadata `*.rejected.meta.tmp` files)
+- in-flight replay claims (`*.inflight`)
 - corrupt quarantine (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
 - metadata-only dead letters (`*.ndjson.rejected.meta` /
   `*.ndjson.zst.rejected.meta`)
@@ -416,11 +588,14 @@ sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
 Pending writes are serialized/compressed and sized **before** quota admission.
 Admission holds the spool write lock with eviction so concurrent writers cannot
 over-admit. Existing owned bytes plus the incoming encoded file must stay within
-`max_bytes`; when space is short, the oldest owned file is dropped and
-`chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
-still cannot fit after eviction (including on an empty spool), the write is
-**rejected** and the batch/event follows the existing spool-failure path
-(warned and not durably retained). The sink never silently exceeds the ceiling.
+`max_bytes`; when space is short, the oldest **evictable** owned file is dropped
+and `chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
+still cannot fit after eviction (including on an empty spool, or when every
+retained file is an in-flight claim, a temp under an active write, or owned by
+another identity), the write is **rejected** and the batch/event follows the
+existing spool-failure path (warned and not durably retained). The sink never
+silently exceeds the ceiling and never reclaims bytes by destroying an in-flight,
+actively written, or foreign-owned record.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
 absorb, using **encoded** average event size (and headroom for retained
@@ -432,12 +607,17 @@ max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_secon
 
 When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
 stable identity such as a StatefulSet ordinal (see
-[configuration.md](../configuration.md) and `ferrum.conf`). Accepted values
-are any non-empty trimmed string; whitespace-only is ignored and values longer
-than 512 characters are truncated. Resolution order is `FERRUM_NODE_ID`, then
-`HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node ID changes
-across restarts, the sink logs a warning when it finds sibling spool
-directories that may contain events from an older identity.
+[configuration.md](../configuration.md) and `ferrum.conf`). The value is
+length-bounded for charge-event provenance and encoded into a single safe path
+component for the managed namespace (hostile absolute/parent/separator/NUL/drive
+forms are hashed rather than joined raw). It is also part of the spool ownership
+digest, so a node-identity change produces a fresh managed namespace. Resolution
+order is `FERRUM_NODE_ID`, then `HOSTNAME`, then `/etc/hostname`, then
+`unknown`. If the node identity changes across restarts, records under the
+previous identity remain in the previous `<safe_node>` subtree and are never
+replayed or deleted automatically. Because the replacement instance scans only
+its own node/plugin subtree, node-id changes are not added to its unbound metric;
+operators must inspect and reconcile the previous node subtree explicitly.
 
 ## Reconciliation Queries
 
@@ -508,11 +688,13 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
 - `chargeback_sink_snapshot_finalizations_pending`
-- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
+- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, in-flight claim, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
+- `chargeback_sink_spool_unbound_files` (records not bound to a live destination identity; never replayed or deleted; a lower bound when the rate-limited warning reports `scan_truncated=true`)
+- `chargeback_sink_spool_unbound_namespaces` (same bounded-scan lower-bound semantics)
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 

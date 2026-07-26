@@ -13588,7 +13588,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Per-provider claim path to upstream header mappings
+                description: >-
+                  Per-provider claim path to upstream header mappings. Destination
+                  headers are gateway-owned and always sanitized: every configured
+                  destination is removed from the client request (case-insensitively)
+                  before verified claim values are installed, so an absent, null,
+                  empty, or wrong-type claim leaves the header absent instead of
+                  forwarding client-supplied input.
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
@@ -13634,7 +13640,13 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Global claim path to upstream header mappings
+          description: >-
+            Global claim path to upstream header mappings. Destination headers are
+            gateway-owned and always sanitized: every configured destination is
+            removed from the client request (case-insensitively) before verified
+            claim values are installed, so an absent, null, empty, or wrong-type
+            claim leaves the header absent instead of forwarding client-supplied
+            input.
         claim_headers_separator:
           type: string
           default: ","
@@ -13777,7 +13789,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Claim path to upstream header mappings
+                description: >-
+                  Claim path to upstream header mappings. Destination headers are
+                  gateway-owned and always sanitized: every configured destination is
+                  removed from the client request (case-insensitively) before verified
+                  claim values are installed, so an absent, null, empty, or wrong-type
+                  claim leaves the header absent instead of forwarding client-supplied
+                  input.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -13896,6 +13914,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
+                description: >-
+                  Session claim path to upstream header mappings. Destination headers
+                  are gateway-owned and always sanitized: every configured destination
+                  is removed from the client request (case-insensitively) before
+                  verified claim values are installed, so an absent, null, empty, or
+                  wrong-type claim leaves the header absent instead of forwarding
+                  client-supplied input.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -15071,7 +15096,16 @@ components:
           format: double
           minimum: 0
           maximum: 100
-          description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
+          description: |
+            Tracing sampling percentage 0.0–100.0. Populated from Istio
+            `Telemetry.tracing.randomSamplingPercentage` and, as a baseline,
+            from `MeshProxyConfig.tracing_sampling` (Telemetry wins when both
+            are present). `ProxyConfig.spec.tracing.sampling` has no
+            counterpart in Istio's `networking.istio.io/v1beta1` ProxyConfig
+            CRD schema, so the Kubernetes API server prunes it and the
+            baseline arrives over native/file/xDS mesh config rather than the
+            CRD watcher. Non-numeric or out-of-range ProxyConfig / Telemetry
+            sampling values fail closed at Kubernetes translation.
         custom_tags:
           type: object
           maxProperties: 32
@@ -18321,7 +18355,7 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load)."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
@@ -21449,7 +21483,12 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 600000
               default: 5000
+              description: >-
+                Per-attempt ClickHouse connect/request timeout. Bounded at ten
+                minutes so the cross-process spool claim lease remains finite
+                and strictly longer than the accepted request/retry budget.
         batch:
           type: object
           additionalProperties: false
@@ -21527,13 +21566,24 @@ components:
               default: 10737418240
               description: |
                 Hard ceiling on total encoded on-disk bytes owned by this sink under
-                spool.dir for the local node_id (after compression). Counts active
-                spool files (*.ndjson / *.ndjson.zst), in-progress atomic-write temps
-                (*.tmp), and quarantined (*.corrupt) files. A pending write is sized
-                before admission under the spool write lock; oldest owned files are
-                dropped until the incoming encoded file fits. If one encoded batch
-                still cannot fit, the write is rejected rather than exceeding the
-                ceiling.
+                its managed namespace
+                (<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/) after
+                compression. The owner digest binds the plugin config id, Ferrum
+                namespace/ledger, sanitized ClickHouse endpoint, database, table, and
+                node id; it contains no credentials. Counts active spool files
+                (*.ndjson / *.ndjson.zst), atomic-write temps
+                (*.write-<process_tag>-<generation>.tmp), in-flight replay claims
+                (*.inflight), and quarantined (*.corrupt) / dead-letter metadata
+                files. A pending write is sized before admission under the spool write
+                lock; the oldest evictable owned file is dropped until the incoming
+                encoded file fits. In-flight claims, temps under an active write,
+                and records carrying another owner's tag are never evictable, so a
+                write that cannot fit is rejected rather than exceeding the ceiling
+                or destroying another owner's or another delivery's records. Each
+                encoded and decoded artifact is also capped at 268435456 bytes;
+                zstd replay additionally applies a 200x expansion limit with a
+                1 MiB floor, and oversized artifacts are quarantined without first
+                being read or expanded without bound.
             replay_interval_secs:
               type: integer
               minimum: 1
@@ -21874,6 +21924,26 @@ components:
                 prepare_failures_total:
                   type: integer
                   minimum: 0
+                unbound_files:
+                  type: integer
+                  minimum: 0
+                  description: |
+                    Retained spool records across live instances that are not bound
+                    to a live destination identity (pre-namespace layouts,
+                    namespaces orphaned by a destination or configuration change,
+                    and records carrying another owner's tag). Never replayed,
+                    evicted, or deleted automatically. Aggregate discovery is
+                    capped at 100,000 entries across all sibling namespaces; if
+                    the rate-limited log reports `scan_truncated=true`, this value
+                    is an observed lower bound.
+                unbound_namespaces:
+                  type: integer
+                  minimum: 0
+                  description: |
+                    Managed spool namespaces still holding records for a destination
+                    identity no live instance owns. This is an observed lower bound
+                    when the bounded aggregate discovery log reports
+                    `scan_truncated=true`.
                 available:
                   type: boolean
                   description: |
@@ -21986,12 +22056,30 @@ components:
               type: integer
             files:
               type: integer
-              description: Count of owned spool files (active data, temps, and quarantined).
+              description: Count of owned spool files (active data, temps, in-flight claims, and quarantined).
             bytes:
               type: integer
-              description: Total encoded on-disk bytes for owned spool files (active data, temps, and quarantined).
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, and quarantined).
             drops_total:
               type: integer
+            unbound_files:
+              type: integer
+              description: |
+                Retained spool records not bound to a live destination identity:
+                pre-namespace layouts, namespaces orphaned by a destination or
+                configuration change, and records carrying another owner's tag.
+                They are reported for operator reconciliation and are never
+                replayed, evicted, or deleted automatically. Aggregate discovery
+                is capped at 100,000 entries across all sibling namespaces; if
+                the rate-limited log reports `scan_truncated=true`, this value is
+                an observed lower bound.
+            unbound_namespaces:
+              type: integer
+              description: |
+                Managed spool namespaces under this node/plugin that still hold
+                records for a destination identity no live instance owns. This is
+                an observed lower bound when the bounded aggregate discovery log
+                reports `scan_truncated=true`.
             last_replay_at:
               type: [string, "null"]
               format: date-time
