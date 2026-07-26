@@ -20,7 +20,9 @@
 
 use std::sync::Arc;
 
-use ferrum_edge::http3::peer_identity::{H3ConnectionIdentity, H3PeerIdentity, zero_rtt_admitted};
+use ferrum_edge::http3::peer_identity::{
+    H3ConnectionIdentity, H3PeerIdentity, quic_max_early_data_size, zero_rtt_admitted,
+};
 
 fn leaf() -> Vec<u8> {
     vec![0x30, 0x82, 0x01, 0xAA]
@@ -34,6 +36,10 @@ fn root() -> Vec<u8> {
     vec![0x30, 0x82, 0x03, 0xCC]
 }
 
+fn compact_whitespace(input: &str) -> String {
+    input.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 // ---------------------------------------------------------------------------
 // 1. 0-RTT admission
 // ---------------------------------------------------------------------------
@@ -42,8 +48,8 @@ fn root() -> Vec<u8> {
 fn zero_rtt_is_refused_when_client_auth_is_configured() {
     // The core availability fix: an H3 listener with a frontend client-cert
     // verifier must never take the 0.5-RTT accept path, so peer identity is
-    // only ever read after handshake completion. TLS 1.3 refuses early data
-    // under client authentication anyway, so nothing is lost.
+    // only ever read after handshake completion. The matching TLS configuration
+    // also disables client early data for the same listener posture.
     assert!(
         !zero_rtt_admitted(true, true),
         "FERRUM_TLS_EARLY_DATA_METHODS must not enable the 0.5-RTT accept path \
@@ -62,6 +68,48 @@ fn zero_rtt_stays_disabled_without_early_data_methods() {
     // 0-RTT remains opt-in. Neither posture turns it on by itself.
     assert!(!zero_rtt_admitted(false, false));
     assert!(!zero_rtt_admitted(false, true));
+}
+
+#[test]
+fn quic_early_data_advertisement_matches_application_admission() {
+    assert_eq!(quic_max_early_data_size(false, false), 0);
+    assert_eq!(quic_max_early_data_size(false, true), 0);
+    assert_eq!(
+        quic_max_early_data_size(true, false),
+        u32::MAX,
+        "enabled non-mTLS QUIC early data must use quinn's only valid enabled size"
+    );
+    assert_eq!(
+        quic_max_early_data_size(true, true),
+        0,
+        "an mTLS listener must disable early data at TLS as well as refusing into_0rtt"
+    );
+}
+
+#[test]
+fn h3_early_data_uses_the_bounded_stateful_resumption_cache() {
+    let source = compact_whitespace(include_str!("../../../src/http3/server.rs"));
+    let conditional = source
+        .find("ifserver_tls_config.max_early_data_size==0{")
+        .expect(
+            "stateless QUIC ticketer must be conditional on early data being disabled",
+        );
+    let cache = source[conditional..]
+        .find("server_tls_config.session_storage=")
+        .map(|offset| conditional + offset)
+        .expect("H3 TLS builder must install the bounded stateful session cache");
+    let ticketer_block = &source[conditional..cache];
+
+    assert!(
+        ticketer_block.contains("rustls::crypto::ring::Ticketer::new()"),
+        "stateless tickets must be used only when server early data is disabled"
+    );
+    assert!(
+        source[cache..].contains(
+            "rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size)"
+        ),
+        "HTTP/3 server 0-RTT state must be bounded by FERRUM_TLS_SESSION_CACHE_SIZE"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,11 +280,11 @@ fn slots_are_per_connection_and_do_not_share_identity() {
 }
 
 #[test]
-fn republishing_replaces_the_connection_caches_so_no_stale_evaluation_survives() {
-    // Defence in depth: the slot is only published once in production, but if a
-    // second publication ever happened the caches must be rebuilt alongside the
-    // certificate rather than carried over — a cached `mtls_auth` verdict for
-    // an old certificate must never be reused for a new one.
+fn a_second_publish_cannot_replace_the_established_identity_or_caches() {
+    // Defence in depth: production has one publisher per connection, and the
+    // holder enforces that lifecycle too. If a future refactor accidentally
+    // invokes a second publisher, it must not replace the certificate beneath
+    // request contexts already sharing the first identity's auth caches.
     let slot = H3ConnectionIdentity::pre_handshake();
     slot.publish_established(Some(vec![leaf()]));
     let first = slot.snapshot();
@@ -244,8 +292,8 @@ fn republishing_replaces_the_connection_caches_so_no_stale_evaluation_survives()
     slot.publish_established(Some(vec![intermediate()]));
     let second = slot.snapshot();
 
-    assert_eq!(second.client_cert_der.as_deref(), Some(&intermediate()));
+    assert_eq!(second.client_cert_der.as_deref(), Some(&leaf()));
     let first_cache = first.mtls_auth_connection_cache.as_ref().expect("first");
     let second_cache = second.mtls_auth_connection_cache.as_ref().expect("second");
-    assert!(!Arc::ptr_eq(first_cache, second_cache));
+    assert!(Arc::ptr_eq(first_cache, second_cache));
 }

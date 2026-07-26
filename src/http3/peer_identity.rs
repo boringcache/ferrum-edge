@@ -12,9 +12,9 @@
 //!
 //! 1. [`zero_rtt_admitted`] — the admission decision. A listener configured
 //!    with a frontend client-certificate verifier never takes quinn's
-//!    `into_0rtt()` path at all. rustls refuses early data under client
-//!    authentication anyway, so 0.5-RTT materialization buys nothing there and
-//!    only creates the pre-handshake identity window.
+//!    `into_0rtt()` path at all and sets the QUIC TLS early-data size to zero.
+//!    Incoming 0.5-RTT precedes client authentication, so materializing the
+//!    connection there would create a pre-handshake identity window.
 //! 2. [`H3ConnectionIdentity`] — a lock-free, per-connection `ArcSwap` slot
 //!    holding one coherent [`H3PeerIdentity`] snapshot. Requests read the whole
 //!    snapshot with a single `load_full()`, so `is_early_data` and the peer
@@ -45,15 +45,35 @@ use crate::plugins::mtls_auth::MtlsAuthConnectionCache;
 ///
 /// 0-RTT requires the operator to have opted in via
 /// `FERRUM_TLS_EARLY_DATA_METHODS`, **and** requires the listener not to be
-/// doing frontend client-certificate authentication. Under client auth the
-/// TLS stack will not accept early data, so taking the 0.5-RTT path would only
-/// materialize the connection before the peer's certificate is known.
+/// doing frontend client-certificate authentication. Taking the 0.5-RTT path
+/// under client auth would materialize the connection before the peer's
+/// certificate is known.
 #[inline]
 pub fn zero_rtt_admitted(
     early_data_methods_configured: bool,
     client_auth_configured: bool,
 ) -> bool {
     early_data_methods_configured && !client_auth_configured
+}
+
+/// QUIC rustls `max_early_data_size` for the listener posture.
+///
+/// Quinn accepts only `0` or `u32::MAX`. Keep the TLS advertisement coupled to
+/// [`zero_rtt_admitted`]: an mTLS listener must disable early data in the TLS
+/// configuration as well as refusing the 0.5-RTT application accept path.
+/// Otherwise a stateful-resumption fallback could accept replayable client
+/// early data and deliver it only after the full handshake, where the request
+/// loop would no longer be able to distinguish it from ordinary 1-RTT data.
+#[inline]
+pub fn quic_max_early_data_size(
+    early_data_methods_configured: bool,
+    client_auth_configured: bool,
+) -> u32 {
+    if zero_rtt_admitted(early_data_methods_configured, client_auth_configured) {
+        u32::MAX
+    } else {
+        0
+    }
 }
 
 /// One coherent view of an HTTP/3 connection's peer identity, published as a
@@ -154,7 +174,16 @@ impl H3ConnectionIdentity {
     /// handshake has actually completed.
     pub fn publish_established(&self, peer_certs: Option<Vec<Vec<u8>>>) {
         let established = Arc::new(H3PeerIdentity::established(peer_certs));
-        self.slot.store(established);
+        let current = self.slot.load_full();
+        if !current.is_early_data {
+            return;
+        }
+        // Enforce the documented one-publication lifecycle in the holder
+        // itself. If a future refactor accidentally creates two publishers,
+        // only the first transition from the unique pre-handshake snapshot can
+        // win; a later certificate can never replace the identity and caches
+        // already shared with multiplexed request contexts.
+        let _previous = self.slot.compare_and_swap(&current, established);
     }
 
     /// Read the current snapshot. One lock-free load; every field a request

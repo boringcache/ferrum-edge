@@ -9,11 +9,12 @@
 //! `FERRUM_TLS_EARLY_DATA_METHODS` — when configured, quinn's `into_0rtt()` is
 //! used to detect early data connections and enforce per-method filtering.
 //! The 0.5-RTT accept path is refused when the listener is configured for
-//! frontend client-certificate authentication, because TLS 1.3 does not accept
-//! early data under client auth and materializing the connection before the
-//! peer's `Certificate` flight would leave `peer_identity()` unknowable (see
-//! [`crate::http3::peer_identity`]). Stateless session ticket resumption is
-//! always enabled (saves 1 RTT on reconnects).
+//! frontend client-certificate authentication, because materializing the
+//! connection before the peer's `Certificate` flight would leave
+//! `peer_identity()` unknowable (see [`crate::http3::peer_identity`]).
+//! Session resumption is always enabled (saves 1 RTT on reconnects). Ordinary
+//! listeners use stateless rotating tickets; non-mTLS listeners with early data
+//! enabled use the bounded stateful cache rustls requires for server 0-RTT.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,7 +29,9 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use super::peer_identity::{H3ConnectionIdentity, zero_rtt_admitted};
+use super::peer_identity::{
+    H3ConnectionIdentity, quic_max_early_data_size, zero_rtt_admitted,
+};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
@@ -404,30 +407,36 @@ fn build_h3_quinn_server_config(
     // When the policy reports 0 (default), 0-RTT is disabled — early data is
     // replayable, which is dangerous for non-idempotent operations proxied
     // through an API gateway. When the policy reports any non-zero value
-    // (methods configured), QUIC/rustls requires max_early_data_size to be
-    // exactly u32::MAX (2^32-1). A finite TLS early-data byte cap is not
-    // expressible on QUIC; Ferrum's method allowlist in handle_h3_connection()
-    // remains the application-layer admission control. Mapping here keeps
-    // startup and live reload fail-closed: quinn rejects any other size, so we
-    // never pass the policy's finite aspirational value through.
-    server_tls_config.max_early_data_size = match tls_policy.early_data_max_size {
-        0 => 0,
-        _ => u32::MAX,
-    };
+    // (methods configured) on a non-mTLS listener, QUIC/rustls requires
+    // max_early_data_size to be exactly u32::MAX (2^32-1). A finite TLS
+    // early-data byte cap is not expressible on QUIC; Ferrum's method allowlist
+    // in handle_h3_connection() remains the application-layer admission
+    // control. Client-authenticated listeners use 0 so the TLS advertisement
+    // and the 0.5-RTT application accept path are both disabled. Mapping here
+    // keeps startup and live reload fail-closed: quinn rejects any other size,
+    // so we never pass the policy's finite aspirational value through.
+    server_tls_config.max_early_data_size = quic_max_early_data_size(
+        tls_policy.early_data_max_size > 0,
+        client_ca_bundle_path.is_some(),
+    );
 
-    // Enable TLS 1.3 session resumption for QUIC connections.
-    // Stateless tickets allow clients to resume sessions without a full handshake,
-    // saving 1 RTT on reconnections. This is safe (no replay risk — 0-RTT is still
-    // disabled separately via max_early_data_size=0).
-    match rustls::crypto::ring::Ticketer::new() {
-        Ok(ticketer) => {
-            server_tls_config.ticketer = ticketer;
-        }
-        Err(e) => {
-            warn!(
-                "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
-                e
-            );
+    // Rustls accepts server early data only with stateful resumption, because
+    // the stored session record carries the freshness/anti-replay inputs. Keep
+    // that cache bounded by FERRUM_TLS_SESSION_CACHE_SIZE. When early data is
+    // disabled (including every mTLS listener), prefer the ordinary stateless
+    // rotating ticketer; if construction fails, the same bounded stateful cache
+    // remains as the fail-safe resumption fallback.
+    if server_tls_config.max_early_data_size == 0 {
+        match rustls::crypto::ring::Ticketer::new() {
+            Ok(ticketer) => {
+                server_tls_config.ticketer = ticketer;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
+                    e
+                );
+            }
         }
     }
     server_tls_config.session_storage =
@@ -620,9 +629,10 @@ pub async fn start_http3_listener_with_signal(
     if client_auth_configured && !state.early_data_methods.is_empty() {
         warn!(
             "HTTP/3 0-RTT is disabled on this listener because frontend mTLS \
-             (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH) is configured. TLS 1.3 does not accept \
-             early data under client authentication, so FERRUM_TLS_EARLY_DATA_METHODS has no \
-             effect for HTTP/3 here; ordinary 1-RTT mTLS requests are unaffected."
+             (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH) is configured. QUIC TLS early data and \
+             the pre-authentication 0.5-RTT accept path are both disabled, so \
+             FERRUM_TLS_EARLY_DATA_METHODS has no effect for HTTP/3 here; ordinary 1-RTT mTLS \
+             requests are unaffected."
         );
     }
     let drain_seconds = state.env_config.shutdown_drain_seconds;
@@ -838,9 +848,9 @@ async fn handle_h3_connection(
 ) -> Result<(), anyhow::Error> {
     // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
     // outright when this listener does frontend client-certificate
-    // authentication: rustls will not accept early data under client auth, so
-    // the 0.5-RTT accept path buys nothing there and would only materialize the
-    // connection before the peer's certificate is known (issue #2938).
+    // authentication: the 0.5-RTT accept path would materialize the connection
+    // before the peer's certificate is known (issue #2938), and the TLS builder
+    // disables client early data for the same listener posture.
     let early_data_enabled =
         zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
 

@@ -211,9 +211,10 @@ pub struct TlsPolicy {
     /// `0` = 0-RTT disabled (default). Any non-zero value means the operator
     /// opted in via `FERRUM_TLS_EARLY_DATA_METHODS`. Protocol-specific notes:
     /// - HTTP/3 (QUIC): rustls/quinn only accept `0` or `u32::MAX` for
-    ///   `ServerConfig::max_early_data_size`. The H3 builder maps any non-zero
-    ///   policy value to `u32::MAX`; a finite QUIC TLS byte cap is not
-    ///   expressible. Method-level admission remains Ferrum's gate.
+    ///   `ServerConfig::max_early_data_size`. On a non-mTLS listener the H3
+    ///   builder maps any non-zero policy value to `u32::MAX`; an mTLS listener
+    ///   maps it to `0`. A finite QUIC TLS byte cap is not expressible.
+    ///   Method-level admission remains Ferrum's gate.
     /// - HTTPS/H1/H2: `enable_early_data` currently keeps rustls 0-RTT
     ///   disabled until per-request early-data state is available, so this
     ///   finite aspirational size is not applied on the TCP TLS frontend.
@@ -297,8 +298,9 @@ impl TlsPolicy {
 
         // 0-RTT early data: when methods are configured, record a non-zero
         // aspirational TLS size (16 KiB, typical GET/HEAD). 0 = disabled (the
-        // secure default). HTTP/3 maps any non-zero value to u32::MAX because
-        // QUIC/rustls reject every other size; HTTPS currently ignores this
+        // secure default). HTTP/3 maps any non-zero value to u32::MAX on a
+        // non-mTLS listener because QUIC/rustls reject every other enabled
+        // size; an mTLS listener maps it to 0. HTTPS currently ignores this
         // until per-request early-data state is available (see enable_early_data).
         let early_data_max_size = if env_config.tls_early_data_methods.is_empty() {
             0
@@ -1322,9 +1324,9 @@ pub fn enable_secret_extraction_for_ktls(config: &mut Arc<ServerConfig>) {
 /// keep rustls 0-RTT disabled on the TCP/TLS frontend so method allowlists
 /// cannot be bypassed by direct clients — the policy's finite
 /// `early_data_max_size` is therefore not applied here either. Native HTTP/3
-/// 0-RTT remains supported through quinn's `into_0rtt()` path, where any
-/// non-zero policy value is mapped to `u32::MAX` (the only enabled size
-/// QUIC/rustls accept).
+/// 0-RTT remains supported through quinn's `into_0rtt()` path, where a non-zero
+/// policy value is mapped to `u32::MAX` on non-mTLS listeners (the only enabled
+/// size QUIC/rustls accept) and to `0` on mTLS listeners.
 pub fn enable_early_data(_config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy) {
     if tls_policy.early_data_max_size > 0 {
         tracing::warn!(

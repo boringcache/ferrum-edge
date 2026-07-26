@@ -64,7 +64,9 @@ fn h3_connection_shares_spiffe_cache_with_request_contexts() {
     let connection_handler = compact_whitespace(connection_handler);
 
     assert!(
-        connection_handler.contains("letpeer_spiffe_extraction_cache=identity.peer_spiffe_extraction_cache.clone();"),
+        connection_handler.contains(
+            "letpeer_spiffe_extraction_cache=identity.peer_spiffe_extraction_cache.clone();"
+        ),
         "every H3 request task must clone the SPIFFE cache from the identity snapshot"
     );
     let request_call = connection_handler

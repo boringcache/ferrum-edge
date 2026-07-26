@@ -1740,9 +1740,10 @@ fn build_h3_mtls_fixture() -> H3MtlsFixture {
 
 /// Build a quinn server endpoint that requires a client certificate, mirroring
 /// `build_h3_quinn_server_config`: TLS 1.3 only, `h3` ALPN, a WebPKI client-cert
-/// verifier, and the same QUIC early-data size the gateway installs when
-/// `FERRUM_TLS_EARLY_DATA_METHODS` is configured (`u32::MAX` — quinn/rustls
-/// reject every other non-zero value).
+/// verifier, and the same disabled QUIC early-data posture the gateway installs
+/// when client authentication is configured. The test still calls
+/// `into_0rtt()` directly to pin quinn's server-side 0.5-RTT behavior, which is
+/// independent of whether the client actually offered 0-RTT data.
 fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(fixture.ca_der.clone()).expect("trust CA");
@@ -1762,10 +1763,9 @@ fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
         .with_single_cert(certs, key)
         .expect("server TLS config");
     server_tls.alpn_protocols = vec![b"h3".to_vec()];
-    // QUIC/rustls contract: enabled early data must be exactly u32::MAX.
-    // Production `build_h3_quinn_server_config` maps any non-zero
-    // `TlsPolicy::early_data_max_size` to this value.
-    server_tls.max_early_data_size = u32::MAX;
+    // Production disables the TLS early-data advertisement on every mTLS
+    // listener, in addition to refusing the application-level 0.5-RTT path.
+    server_tls.max_early_data_size = 0;
 
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quic cfg");
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
