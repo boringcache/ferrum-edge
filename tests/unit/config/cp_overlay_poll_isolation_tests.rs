@@ -168,6 +168,52 @@ fn full_db_reload_reapplies_k8s_overlay_and_mesh() {
 }
 
 #[test]
+fn overlay_slot_preserves_mesh_when_later_translate_omits_it() {
+    // #2982: merge_k8s_translation keeps an existing mesh when a successful
+    // translate omits mesh. The overlay slot must do the same — it is the only
+    // mesh source on CP full-reload re-merge (DB snapshots clear mesh).
+    let overlay_slot = empty_k8s_overlay_slot();
+    let managed = BTreeSet::from(["ferrum".to_string()]);
+
+    let mut with_mesh = GatewayConfig::default();
+    with_mesh
+        .proxies
+        .push(make_proxy("gwapi-route-httpbin", "ferrum"));
+    with_mesh.mesh = Some(mesh_with_service("overlay-svc"));
+    store_accepted_k8s_overlay(&overlay_slot, with_mesh, managed.clone());
+
+    let mut without_mesh = GatewayConfig::default();
+    without_mesh
+        .proxies
+        .push(make_proxy("gwapi-route-httpbin", "ferrum"));
+    store_accepted_k8s_overlay(&overlay_slot, without_mesh, managed);
+
+    let mut db_reload = GatewayConfig::default();
+    db_reload.proxies.push(make_proxy("db-proxy", "ferrum"));
+    db_reload.mesh = None;
+
+    let published = cas_publish_db_snapshot_with_k8s_overlay_for_test(
+        &ArcSwap::from_pointee(GatewayConfig::default()),
+        &overlay_slot,
+        db_reload,
+    );
+
+    assert!(
+        published.mesh.is_some(),
+        "mesh accepted by an earlier translate must survive a later mesh-less \
+         translate and the following DB full-reload re-merge"
+    );
+    assert_eq!(
+        published
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()),
+        Some(vec!["overlay-svc"]),
+        "preserved mesh must remain the previously accepted overlay mesh"
+    );
+}
+
+#[test]
 fn full_reload_with_no_refreshed_namespaces_leaves_subscribers_untouched() {
     // A full load whose every namespace was demoted (e.g. cursor reads failed)
     // must not CAS/broadcast: DPs and mesh keep last-known-good.

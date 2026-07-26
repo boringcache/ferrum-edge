@@ -97,11 +97,23 @@ impl CpPublicationGate {
 ///
 /// Only ever called after a translation SUCCEEDS, so a failed translate never
 /// overwrites the last accepted overlay with an empty one.
+///
+/// Mesh retention matches [`merge_k8s_translation`]: a successful translate that
+/// omits `mesh` must not erase a previously accepted mesh block. The overlay
+/// slot is the sole mesh source on CP full-reload re-merge (DB snapshots clear
+/// `mesh`), so dropping it here would let the next DB poll wipe mesh from
+/// `config_arc` even though merging the same translate into the live snapshot
+/// would have kept it (#2982).
 pub fn store_accepted_k8s_overlay(
     slot: &K8sOverlaySlot,
-    translation: GatewayConfig,
+    mut translation: GatewayConfig,
     managed_namespaces: BTreeSet<String>,
 ) {
+    if translation.mesh.is_none()
+        && let Some(previous) = slot.load_full().as_ref()
+    {
+        translation.mesh = previous.translation.mesh.clone();
+    }
     slot.store(Arc::new(Some(AcceptedK8sOverlay {
         translation,
         managed_namespaces,
