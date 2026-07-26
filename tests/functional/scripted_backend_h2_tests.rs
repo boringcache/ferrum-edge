@@ -2650,6 +2650,15 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 /// The registry flip is the production-observable signal that pool insertion
 /// completed. `handshakes_completed()` alone precedes `get_sender` returning
 /// and is not sufficient — a fixed sleep after handshake is nondeterministic.
+///
+/// Both signals are required, and both are loop conditions rather than a
+/// post-flip assertion: hyper's client-side h2c handshake resolves once the
+/// connection preface is flushed, without waiting for the peer's SETTINGS, so
+/// the registry can commit `supported` a hair before the backend's own
+/// server-side handshake bookkeeping lands. Asserting on that ordering would
+/// convert a scheduling hiccup into a failure; waiting on it cannot. A probe
+/// that never dials this backend still fails closed on `timeout` below, with
+/// the same diagnostics.
 async fn wait_for_grpc_h2c_probe_pool_ready(
     harness: &GatewayHarness,
     backend: &ScriptedGrpcBackend,
@@ -2661,16 +2670,8 @@ async fn wait_for_grpc_h2c_probe_pool_ready(
             && let Some(entries) = body["entries"].as_array()
             && let Some(entry) = entries.first()
             && entry["grpc_transport"]["h2c"].as_str() == Some("supported")
+            && backend.handshakes_completed() >= 1
         {
-            assert!(
-                backend.handshakes_completed() >= 1,
-                "h2c probe must occupy connection 0 for scripted accept ordering; \
-                 handshakes_completed={}, accepted_connections={}, \
-                 backend_step_errors={:?}",
-                backend.handshakes_completed(),
-                backend.accepted_connections(),
-                backend.step_errors().await
-            );
             return;
         }
         if Instant::now() >= deadline {
@@ -2679,7 +2680,7 @@ async fn wait_for_grpc_h2c_probe_pool_ready(
                 .await
                 .unwrap_or_else(|e| json!({ "fetch_error": e.to_string() }));
             panic!(
-                "startup h2c capability probe did not publish supported within {timeout:?}; \
+                "startup h2c capability probe did not become pool-ready within {timeout:?}; \
                  registry={registry:?}; handshakes_completed={}, \
                  accepted_connections={}, backend_step_errors={:?}",
                 backend.handshakes_completed(),
