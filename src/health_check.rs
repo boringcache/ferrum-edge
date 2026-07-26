@@ -465,7 +465,7 @@ impl HealthChecker {
         let recovery_generation = self
             .passive_recovery_generation
             .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
+            + 1;
 
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut new_aborts: Vec<AbortHandle> = Vec::new();
@@ -1184,6 +1184,14 @@ impl HealthChecker {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
                     let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
+                    // Shared TargetHealth / LB cache intentionally survive reload.
+                    // Bail before side effects if this probe retired mid-mutation so
+                    // a drained generation cannot publish latency or clear marks
+                    // under replacement policy.
+                    if task_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+
                     if let Some(ref cache) = lb_cache {
                         let latency_us = probe_start.elapsed().as_micros() as u64;
                         cache.record_latency(&upstream_id_owned, &probe_target, latency_us);
@@ -1213,29 +1221,41 @@ impl HealthChecker {
                     state.consecutive_successes.store(0, Ordering::Relaxed);
                     let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
+                    if task_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+
                     if failures >= unhealthy_threshold {
-                        let key_ref = key.clone();
                         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
                         let last_failure =
                             probe_outcome.failure.as_deref().unwrap_or("probe failed");
-                        use dashmap::mapref::entry::Entry;
-                        match unhealthy_targets.entry(key.clone()) {
-                            Entry::Occupied(_) => {}
-                            Entry::Vacant(entry) => {
-                                if task_generation.load(Ordering::Acquire) != generation {
-                                    return;
+                        // Insert under the entry lock with only a generation
+                        // re-check in between — never log while holding the
+                        // DashMap shard (logging can stall concurrent prune /
+                        // probe ownership on the same shard).
+                        let inserted = {
+                            use dashmap::mapref::entry::Entry;
+                            match unhealthy_targets.entry(key.clone()) {
+                                Entry::Occupied(_) => false,
+                                Entry::Vacant(entry) => {
+                                    if task_generation.load(Ordering::Acquire) != generation {
+                                        return;
+                                    }
+                                    entry.insert(now_epoch_ms());
+                                    true
                                 }
-                                warn!(
-                                    target = %key_ref,
-                                    probe_type = ?probe_type,
-                                    failures = failures,
-                                    unhealthy_threshold = unhealthy_threshold,
-                                    elapsed_ms = elapsed_ms,
-                                    last_failure = %last_failure,
-                                    "Active health check: target is unhealthy"
-                                );
-                                entry.insert(now_epoch_ms());
                             }
+                        };
+                        if inserted {
+                            warn!(
+                                target = %key,
+                                probe_type = ?probe_type,
+                                failures = failures,
+                                unhealthy_threshold = unhealthy_threshold,
+                                elapsed_ms = elapsed_ms,
+                                last_failure = %last_failure,
+                                "Active health check: target is unhealthy"
+                            );
                         }
                     }
                 }
