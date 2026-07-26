@@ -607,13 +607,10 @@ async fn start_node_agent_admin_listeners(
         return Ok(handles);
     }
 
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(env_config).map_err(|e| anyhow::anyhow!(e))?,
-    );
+    let admin_allowed_cidrs = Arc::new(crate::modes::startup_security::load_admin_allowed_cidrs(
+        env_config,
+    )?);
+    let metrics_auth = Arc::new(crate::modes::startup_security::load_metrics_auth(env_config)?);
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {

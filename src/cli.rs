@@ -436,6 +436,7 @@ fn report_field(env_key: &str, rendered: &str) -> String {
 /// Validate configuration without starting the gateway.
 pub fn execute_validate() -> Result<(), String> {
     use crate::config::{EnvConfig, OperatingMode, file_loader};
+    use crate::modes::startup_security::{StartupSecurityScope, load_startup_security};
 
     let env_config =
         EnvConfig::from_env().map_err(|e| format!("Settings validation failed: {}", e))?;
@@ -479,6 +480,17 @@ pub fn execute_validate() -> Result<(), String> {
         println!("  Consumers: {}", config.consumers.len());
         println!("  Upstreams: {}", config.upstreams.len());
         println!("  Plugin configs: {}", config.plugin_configs.len());
+    }
+
+    // Env-level TLS/security surfaces that `run` hard-fails on must also fail
+    // `validate`. Shared loaders in `modes::startup_security` are side-effect
+    // free (no binds, no servers, no store mutation, no random JWT mint).
+    let security_scope = StartupSecurityScope::for_mode(env_config.mode);
+    if !security_scope.is_empty() {
+        load_startup_security(&env_config).map_err(|e| {
+            format!("Startup security validation failed: {}", e)
+        })?;
+        println!("Startup security (env TLS/CIDRs/metrics): OK");
     }
 
     println!("\nValidation passed.");

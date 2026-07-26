@@ -59,6 +59,7 @@ use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
@@ -9399,8 +9400,10 @@ async fn serve_mesh_runtime(
         node_waypoint_dns_slice_for_prepared_config(&runtime, slice.as_ref(), &config)
     });
 
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
+    // drift between the two commands (issue #2976).
+    let tls_policy = startup_security::load_tls_policy(&env_config)?;
+    let crls = startup_security::load_crls_from_env(&env_config)?;
     // GAP-3D: on node-waypoint topology, create the SOCK_OPS metrics
     // state up front so plugin construction inside `ProxyState::new`
     // picks it up via PluginHttpClient and the spawned ringbuf consumer
@@ -10439,14 +10442,8 @@ fn start_mesh_admin_listeners(
         serving_degraded,
         listener_failures: serving_listener_failures,
     } = serving_signals;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(env_config)
-            .map_err(|err| anyhow::anyhow!(err))?,
-    );
+    let admin_allowed_cidrs = Arc::new(startup_security::load_admin_allowed_cidrs(env_config)?);
+    let metrics_auth = Arc::new(startup_security::load_metrics_auth(env_config)?);
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
@@ -10557,23 +10554,14 @@ fn start_mesh_admin_listeners(
             "{} — mesh admin HTTPS listener disabled",
             crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
-    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
+    } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
+        let admin_tls_config = startup_security::load_admin_tls_material(
+            env_config,
             tls_policy,
-            env_config.tls_cert_expiry_warning_days,
             crls,
-        )
-        .map_err(|err| anyhow::anyhow!("Invalid mesh admin TLS configuration: {err}"))?;
+            "Invalid mesh admin TLS configuration",
+        )?;
         let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
             env_config,

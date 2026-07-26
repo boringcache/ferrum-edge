@@ -44,8 +44,8 @@ use crate::grpc::mesh_registry::{
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
 use crate::modes::file::ListenerJoinHandle;
+use crate::modes::startup_security;
 use crate::startup::wait_for_start_signals;
-use crate::tls::{self, TlsPolicy};
 use crate::util::conn_limit::{ConnLimiter, ConnPermit};
 use crate::xds::XdsAdsServer;
 
@@ -1020,15 +1020,12 @@ pub async fn run(
     };
 
     // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
-    );
+    // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
+    // drift between the two commands (issue #2976).
+    let tls_policy = startup_security::load_tls_policy(&env_config)?;
+    let crls = startup_security::load_crls_from_env(&env_config)?;
+    let admin_allowed_cidrs = Arc::new(startup_security::load_admin_allowed_cidrs(&env_config)?);
+    let metrics_auth = Arc::new(startup_security::load_metrics_auth(&env_config)?);
 
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
@@ -1152,28 +1149,20 @@ pub async fn run(
             crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
         None
-    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
+    } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr: SocketAddr =
             env_config.admin_socket_addr(env_config.admin_https_port);
         let admin_https_shutdown = shutdown_tx.subscribe();
 
-        // Load admin TLS configuration
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
+        // Load admin TLS configuration (shared with validate, issue #2976).
+        let admin_tls_config = match startup_security::load_admin_tls_material(
+            &env_config,
             &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
             &crls,
+            "Invalid admin TLS configuration",
         ) {
             Ok(config) => {
-                if admin_client_ca_bundle.is_some() {
+                if env_config.admin_tls_client_ca_bundle_path.is_some() {
                     info!(
                         "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
                     );
@@ -1189,8 +1178,8 @@ pub async fn run(
                 config
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {}", e);
-                return Err(anyhow::anyhow!("Invalid admin TLS configuration: {}", e));
+                error!("Failed to load admin TLS configuration: {:#}", e);
+                return Err(e);
             }
         };
 

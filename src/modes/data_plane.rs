@@ -20,9 +20,10 @@ use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
+use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
-use crate::tls::{self, TlsPolicy};
+use crate::tls;
 
 pub async fn run(
     env_config: EnvConfig,
@@ -67,15 +68,12 @@ pub async fn run(
 
     // Build TLS hardening policy from environment (needed for both frontend
     // and backend TLS — cipher suites, protocol versions, key exchange groups).
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
-    );
+    // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
+    // drift between the two commands (issue #2976).
+    let tls_policy = startup_security::load_tls_policy(&env_config)?;
+    let crls = startup_security::load_crls_from_env(&env_config)?;
+    let admin_allowed_cidrs = Arc::new(startup_security::load_admin_allowed_cidrs(&env_config)?);
+    let metrics_auth = Arc::new(startup_security::load_metrics_auth(&env_config)?);
 
     // Start with empty config; CP will push the real one via gRPC.
     // The empty initial config means `start_with_shutdown` spawns no
@@ -209,51 +207,38 @@ pub async fn run(
             (None, None)
         };
 
-    // Load TLS configuration if provided
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.frontend_tls_cert_path,
-        &env_config.frontend_tls_key_path,
-    ) {
-        info!("Loading TLS configuration...");
-        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth_and_ocsp(
-            cert_path,
-            key_path,
-            client_ca_bundle_path,
-            env_config.frontend_tls_ocsp_response_source.as_deref(),
-            false,
-            &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            &crls,
-        ) {
-            Ok(mut config) => {
-                // Enable 0-RTT on the proxy frontend only (not admin).
-                tls::enable_early_data(&mut config, &tls_policy);
-                // Enable kTLS session-secret extraction on the proxy frontend
-                // only (not admin) when kTLS could be used. Rustls gates
-                // `dangerous_extract_secrets()` behind this flag.
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                if client_ca_bundle_path.is_some() {
-                    info!(
-                        "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
-                    );
-                } else {
-                    info!(
-                        "TLS configuration loaded without client certificate verification (HTTPS available)"
-                    );
-                }
-                Some(config)
+    // Load TLS configuration if provided (shared with validate, issue #2976).
+    let tls_config = match startup_security::try_load_frontend_tls(&env_config, &tls_policy, &crls)
+    {
+        Ok(Some(mut config)) => {
+            info!("Loading TLS configuration...");
+            // Enable 0-RTT on the proxy frontend only (not admin).
+            tls::enable_early_data(&mut config, &tls_policy);
+            // Enable kTLS session-secret extraction on the proxy frontend
+            // only (not admin) when kTLS could be used. Rustls gates
+            // `dangerous_extract_secrets()` behind this flag.
+            if env_config.ktls_enabled.could_be_enabled() {
+                tls::enable_secret_extraction_for_ktls(&mut config);
             }
-            Err(e) => {
-                error!("TLS configuration validation failed: {}", e);
-                return Err(anyhow::anyhow!("Invalid TLS configuration: {}", e));
+            if env_config.frontend_tls_client_ca_bundle_path.is_some() {
+                info!(
+                    "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                );
+            } else {
+                info!(
+                    "TLS configuration loaded without client certificate verification (HTTPS available)"
+                );
             }
+            Some(config)
         }
-    } else {
-        info!("No TLS configuration provided (HTTP only)");
-        None
+        Ok(None) => {
+            info!("No TLS configuration provided (HTTP only)");
+            None
+        }
+        Err(e) => {
+            error!("TLS configuration validation failed: {:#}", e);
+            return Err(e);
+        }
     };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
@@ -312,21 +297,11 @@ pub async fn run(
     }
 
     // Set DTLS cert/key for UDP proxies with frontend_tls (DTLS termination).
+    // Shared expiry gate with `ferrum-edge validate` (issue #2976).
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
-        tls::check_cert_expiry(
-            cert_path,
-            "DTLS frontend cert",
-            env_config.tls_cert_expiry_warning_days,
-        )?;
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path {
-            tls::check_cert_expiry(
-                ca_path,
-                "DTLS client CA cert",
-                env_config.tls_cert_expiry_warning_days,
-            )?;
-        }
+        startup_security::validate_dtls_material(&env_config)?;
         proxy_state
             .stream_listener_manager
             .set_frontend_dtls_cert_key(
@@ -676,28 +651,20 @@ pub async fn run(
             "{} — admin HTTPS listener disabled",
             crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
-    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
+    } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr: SocketAddr =
             env_config.admin_socket_addr(env_config.admin_https_port);
         let admin_https_shutdown = shutdown_tx.subscribe();
 
-        // Load admin TLS configuration
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
+        // Load admin TLS configuration (shared with validate, issue #2976).
+        let admin_tls_config = match startup_security::load_admin_tls_material(
+            &env_config,
             &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
             &crls,
+            "Invalid admin TLS configuration",
         ) {
             Ok(config) => {
-                if admin_client_ca_bundle.is_some() {
+                if env_config.admin_tls_client_ca_bundle_path.is_some() {
                     info!(
                         "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
                     );
@@ -713,8 +680,8 @@ pub async fn run(
                 config
             }
             Err(e) => {
-                error!("Failed to load admin TLS configuration: {}", e);
-                return Err(anyhow::anyhow!("Invalid admin TLS configuration: {}", e));
+                error!("Failed to load admin TLS configuration: {:#}", e);
+                return Err(e);
             }
         };
 
