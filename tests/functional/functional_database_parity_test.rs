@@ -11,7 +11,8 @@
 
 use crate::common::{
     DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
-    host_port_from_db_url, mysql_test_url, postgres_test_url, tcp_endpoint_reachable,
+    host_port_from_db_url, mysql_test_url, postgres_test_url, provision_isolated_sql_database,
+    tcp_endpoint_reachable,
 };
 use serde_json::json;
 use std::process::Command;
@@ -93,9 +94,9 @@ async fn test_postgres_migrate_up_is_idempotent() {
     ) {
         return;
     }
-    // Isolate schema work onto a dedicated database name when the URL path is
-    // the shared CI database — migrate is safe to re-run, but keep the probe
-    // pointed at the provisioned URL verbatim.
+    // Isolate migrate onto a dedicated database so schema work cannot collide
+    // with CRUD/namespace cells that share the CI container.
+    let (url, _isolated_db) = provision_isolated_sql_database(&url);
     assert_migrate_up_idempotent("postgres", &url).await;
 }
 
@@ -114,6 +115,7 @@ async fn test_mysql_migrate_up_is_idempotent() {
     ) {
         return;
     }
+    let (url, _isolated_db) = provision_isolated_sql_database(&url);
     assert_migrate_up_idempotent("mysql", &url).await;
 }
 
@@ -254,6 +256,7 @@ async fn test_postgres_connectivity_recovery_after_container_pause() {
     let Some(url) = postgres_test_url() else {
         return;
     };
+    let (url, _isolated_db) = provision_isolated_sql_database(&url);
     run_connectivity_recovery(DbType::Postgres(url), "ferrum-ci-postgres", "postgres").await;
 }
 
@@ -263,5 +266,6 @@ async fn test_mysql_connectivity_recovery_after_container_pause() {
     let Some(url) = mysql_test_url() else {
         return;
     };
+    let (url, _isolated_db) = provision_isolated_sql_database(&url);
     run_connectivity_recovery(DbType::MySql(url), "ferrum-ci-mysql", "mysql").await;
 }

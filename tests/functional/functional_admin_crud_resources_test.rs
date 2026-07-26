@@ -18,8 +18,8 @@
 //! when those URLs/servers are absent.
 use crate::common::{
     DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
-    host_port_from_db_url, mysql_test_url, postgres_test_url, spawn_http_identifying,
-    tcp_endpoint_reachable,
+    host_port_from_db_url, mysql_test_url, postgres_test_url, provision_isolated_sql_database,
+    spawn_http_identifying, tcp_endpoint_reachable,
 };
 use ferrum_edge::plugins::available_plugins;
 use reqwest::{Client, StatusCode};
@@ -214,6 +214,8 @@ async fn test_admin_postgres_runtime_resource_crud_matrix() {
         return;
     }
 
+    let (postgres_url, _isolated_db) = provision_isolated_sql_database(&postgres_url);
+
     let backend_a = spawn_http_identifying("pg-crud-a")
         .await
         .expect("spawn postgres backend a");
@@ -269,6 +271,8 @@ async fn test_admin_mysql_runtime_resource_crud_matrix() {
     ) {
         return;
     }
+
+    let (mysql_url, _isolated_db) = provision_isolated_sql_database(&mysql_url);
 
     let backend_a = spawn_http_identifying("mysql-crud-a")
         .await

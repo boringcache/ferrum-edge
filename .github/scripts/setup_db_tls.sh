@@ -256,9 +256,9 @@ wait_for_containers() {
 
     log "All containers are healthy and ready for testing."
     log ""
-    log "Connection details:"
-    log "  PostgreSQL: postgres://$DB_USER:$DB_PASSWORD@localhost:$PG_PORT/$DB_NAME?sslmode=verify-full"
-    log "  MySQL:      mysql://$DB_USER:$DB_PASSWORD@localhost:$MYSQL_PORT/$DB_NAME"
+    log "Connection details (password redacted):"
+    log "  PostgreSQL: postgres://$DB_USER:***@localhost:$PG_PORT/$DB_NAME?sslmode=verify-full"
+    log "  MySQL:      mysql://$DB_USER:***@localhost:$MYSQL_PORT/$DB_NAME"
 }
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@
 
 use crate::common::{
     DbType, TestGateway, continue_if_tls_fixture_available, ensure_shared_sql_containers_resumed,
+    provision_isolated_sql_database,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -499,6 +500,10 @@ async fn test_postgresql_tls_verify_full() {
         certs
     );
 
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
+
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
         .expect("Failed to create harness");
@@ -511,10 +516,8 @@ async fn test_postgresql_tls_verify_full() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &certs, "verify-full")
+        .start_gateway(&db_url, &certs, "verify-full")
         .await
         .expect("Failed to start gateway with PostgreSQL TLS (verify-full)");
 
@@ -547,6 +550,10 @@ async fn test_postgresql_tls_require() {
         return;
     }
 
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
+
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
         .expect("Failed to create harness");
@@ -558,10 +565,8 @@ async fn test_postgresql_tls_require() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway with PostgreSQL TLS (require)");
 
@@ -604,6 +609,10 @@ async fn test_mysql_tls_verify_identity() {
         "CA cert not found"
     );
 
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("mysql://ferrum:test-password@localhost:13306/ferrum");
+
     let mut harness = DbTlsTestHarness::new("mysql")
         .await
         .expect("Failed to create harness");
@@ -615,11 +624,8 @@ async fn test_mysql_tls_verify_identity() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    // sqlx MySQL URL format
-    let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
-
     harness
-        .start_gateway(db_url, &certs, "verify-full")
+        .start_gateway(&db_url, &certs, "verify-full")
         .await
         .expect("Failed to start gateway with MySQL TLS (verify-full)");
 
@@ -652,6 +658,10 @@ async fn test_mysql_tls_required() {
         return;
     }
 
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("mysql://ferrum:test-password@localhost:13306/ferrum");
+
     let mut harness = DbTlsTestHarness::new("mysql")
         .await
         .expect("Failed to create harness");
@@ -663,10 +673,8 @@ async fn test_mysql_tls_required() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway with MySQL TLS (require)");
 

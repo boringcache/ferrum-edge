@@ -148,3 +148,192 @@ pub fn host_port_from_db_url(url: &str) -> String {
         format!("{host_port}:5432")
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IsolatedSqlKind {
+    Postgres,
+    Mysql,
+}
+
+/// Owns a per-cell PostgreSQL/MySQL database created against a known CI
+/// container. Dropped after the gateway process so later cells cannot load
+/// poison rows left by a prior shared-database failure.
+pub struct IsolatedSqlDatabase {
+    container: String,
+    db_name: String,
+    kind: IsolatedSqlKind,
+    user: String,
+    password: String,
+}
+
+impl Drop for IsolatedSqlDatabase {
+    fn drop(&mut self) {
+        let output = match self.kind {
+            IsolatedSqlKind::Postgres => std::process::Command::new("docker")
+                .args([
+                    "exec",
+                    &self.container,
+                    "psql",
+                    "-U",
+                    &self.user,
+                    "-d",
+                    "postgres",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-c",
+                    &format!(
+                        "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE);",
+                        self.db_name
+                    ),
+                ])
+                .output(),
+            IsolatedSqlKind::Mysql => std::process::Command::new("docker")
+                .args([
+                    "exec",
+                    &self.container,
+                    "mysql",
+                    &format!("-u{}", self.user),
+                    &format!("-p{}", self.password),
+                    "-e",
+                    &format!("DROP DATABASE IF EXISTS `{}`;", self.db_name),
+                ])
+                .output(),
+        };
+        if let Ok(output) = output {
+            if !output.status.success() {
+                eprintln!(
+                    "WARN: failed to drop isolated {} database {} in {}: {}",
+                    match self.kind {
+                        IsolatedSqlKind::Postgres => "postgres",
+                        IsolatedSqlKind::Mysql => "mysql",
+                    },
+                    self.db_name,
+                    self.container,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+fn ci_sql_container(host_port: &str) -> Option<(&'static str, IsolatedSqlKind)> {
+    let normalized = host_port
+        .strip_prefix("127.0.0.1:")
+        .or_else(|| host_port.strip_prefix("localhost:"))
+        .unwrap_or(host_port);
+    match normalized {
+        "5432" => Some(("ferrum-ci-postgres", IsolatedSqlKind::Postgres)),
+        "3306" => Some(("ferrum-ci-mysql", IsolatedSqlKind::Mysql)),
+        "15432" => Some(("ferrum-test-pg-tls", IsolatedSqlKind::Postgres)),
+        "13306" => Some(("ferrum-test-mysql-tls", IsolatedSqlKind::Mysql)),
+        _ => None,
+    }
+}
+
+fn sql_url_credentials(url: &str) -> Option<(String, String)> {
+    let stripped = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .or_else(|| url.strip_prefix("mysql://"))?;
+    let authority = stripped.split(['/', '?']).next()?;
+    let userinfo = authority.split('@').next()?;
+    if !userinfo.contains(':') || !authority.contains('@') {
+        return None;
+    }
+    let (user, password) = userinfo.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
+}
+
+fn rewrite_sql_url_database(url: &str, db_name: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (authority, after_authority) = rest.split_once('/')?;
+    let query = after_authority.find('?').map(|idx| &after_authority[idx..]);
+    Some(match query {
+        Some(query) => format!("{scheme}://{authority}/{db_name}{query}"),
+        None => format!("{scheme}://{authority}/{db_name}"),
+    })
+}
+
+/// Create a unique database on a known CI SQL container and return a URL that
+/// points at it. Non-CI URLs keep the shared database (no-op isolation).
+///
+/// When backends/TLS fixtures are required and the URL maps to a CI container,
+/// failure to create the database panics instead of silently sharing state.
+pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<IsolatedSqlDatabase>) {
+    let host_port = host_port_from_db_url(base_url);
+    let Some((container, kind)) = ci_sql_container(&host_port) else {
+        return (base_url.to_string(), None);
+    };
+    let Some((user, password)) = sql_url_credentials(base_url) else {
+        if db_backends_required() || db_tls_required() {
+            panic!(
+                "cannot isolate SQL database for required CI backend: credentials missing in {base_url}"
+            );
+        }
+        return (base_url.to_string(), None);
+    };
+
+    let db_name = format!("ferrum_cell_{}", uuid::Uuid::new_v4().simple());
+    let create_output = match kind {
+        IsolatedSqlKind::Postgres => std::process::Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "psql",
+                "-U",
+                &user,
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                &format!("CREATE DATABASE \"{db_name}\";"),
+            ])
+            .output(),
+        IsolatedSqlKind::Mysql => std::process::Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "mysql",
+                &format!("-u{user}"),
+                &format!("-p{password}"),
+                "-e",
+                &format!("CREATE DATABASE `{db_name}`;"),
+            ])
+            .output(),
+    };
+
+    let created = create_output
+        .as_ref()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !created {
+        let detail = create_output
+            .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+            .unwrap_or_else(|error| error.to_string());
+        if db_backends_required() || db_tls_required() {
+            panic!(
+                "failed to create isolated SQL database {db_name} in {container} \
+                 (required for CI cell isolation): {detail}"
+            );
+        }
+        eprintln!(
+            "WARN: could not isolate SQL database on {container}; reusing shared URL ({detail})"
+        );
+        return (base_url.to_string(), None);
+    }
+
+    let Some(url) = rewrite_sql_url_database(base_url, &db_name) else {
+        panic!("failed to rewrite isolated database URL for {base_url}");
+    };
+    (
+        url,
+        Some(IsolatedSqlDatabase {
+            container: container.to_string(),
+            db_name,
+            kind,
+            user,
+            password,
+        }),
+    )
+}

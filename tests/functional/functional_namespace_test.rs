@@ -34,8 +34,9 @@
 //! -- --ignored namespace`.
 
 use crate::common::{
-    DbType, TestGateway, continue_if_backend_available, ensure_shared_sql_containers_resumed,
-    host_port_from_db_url, mysql_test_url, postgres_test_url, tcp_endpoint_reachable,
+    DbType, IsolatedSqlDatabase, TestGateway, continue_if_backend_available,
+    ensure_shared_sql_containers_resumed, host_port_from_db_url, mysql_test_url,
+    postgres_test_url, provision_isolated_sql_database, tcp_endpoint_reachable,
 };
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -72,9 +73,12 @@ impl Backend {
 /// external backend is unavailable and backends are not required — the
 /// calling test should skip in that case. When `FERRUM_DB_BACKENDS_REQUIRED`
 /// is set, missing/unreachable backends panic instead of returning `None`.
-async fn resolve_db(backend: Backend) -> Option<DbType> {
+///
+/// SQL backends also return an optional isolation guard so each cell uses a
+/// dedicated database on the shared CI container.
+async fn resolve_db(backend: Backend) -> Option<(DbType, Option<IsolatedSqlDatabase>)> {
     match backend {
-        Backend::Sqlite => Some(DbType::Sqlite),
+        Backend::Sqlite => Some((DbType::Sqlite, None)),
         Backend::Postgres => {
             ensure_shared_sql_containers_resumed();
             let url = postgres_test_url()?;
@@ -86,7 +90,8 @@ async fn resolve_db(backend: Backend) -> Option<DbType> {
             ) {
                 return None;
             }
-            Some(DbType::Postgres(url))
+            let (url, isolated) = provision_isolated_sql_database(&url);
+            Some((DbType::Postgres(url), isolated))
         }
         Backend::Mysql => {
             ensure_shared_sql_containers_resumed();
@@ -99,7 +104,8 @@ async fn resolve_db(backend: Backend) -> Option<DbType> {
             ) {
                 return None;
             }
-            Some(DbType::MySql(url))
+            let (url, isolated) = provision_isolated_sql_database(&url);
+            Some((DbType::MySql(url), isolated))
         }
         Backend::Mongodb => {
             let url = std::env::var("FERRUM_TEST_MONGO_URL")
@@ -112,7 +118,7 @@ async fn resolve_db(backend: Backend) -> Option<DbType> {
             ) {
                 return None;
             }
-            Some(DbType::Mongo(url))
+            Some((DbType::Mongo(url), None))
         }
     }
 }
@@ -138,6 +144,8 @@ fn mk_id(prefix: &str) -> String {
 // ---------------------------------------------------------------------------
 
 struct NsHarness {
+    // Dropped last so the gateway releases DB connections before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
     _gw: TestGateway,
     admin_base_url: String,
     proxy_base_url: String,
@@ -147,6 +155,8 @@ struct NsHarness {
 /// optional tempdir owns the shared SQLite file for the lifetime of both
 /// processes; external backends use a randomized namespace instead.
 struct SharedAdminHarness {
+    // Dropped last so both gateways release connections before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
     _gateway_a: TestGateway,
     _gateway_b: TestGateway,
     _sqlite_dir: Option<tempfile::TempDir>,
@@ -156,7 +166,7 @@ struct SharedAdminHarness {
 
 impl SharedAdminHarness {
     async fn start(backend: Backend) -> Option<Self> {
-        let (db, sqlite_dir) = match backend {
+        let (db, sqlite_dir, isolated_db) = match backend {
             Backend::Sqlite => {
                 let temp_dir = tempfile::TempDir::new().expect("shared SQLite tempdir");
                 let db_path = temp_dir.path().join("shared-admin.db");
@@ -167,9 +177,13 @@ impl SharedAdminHarness {
                         db_url,
                     },
                     Some(temp_dir),
+                    None,
                 )
             }
-            _ => (resolve_db(backend).await?, None),
+            _ => {
+                let (db, isolated) = resolve_db(backend).await?;
+                (db, None, isolated)
+            }
         };
 
         let builder = || {
@@ -200,6 +214,7 @@ impl SharedAdminHarness {
             _gateway_a: gateway_a,
             _gateway_b: gateway_b,
             _sqlite_dir: sqlite_dir,
+            _isolated_db: isolated_db,
         })
     }
 }
@@ -219,7 +234,7 @@ impl NsHarness {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            let db = match resolve_db(backend).await {
+            let (db, isolated_db) = match resolve_db(backend).await {
                 Some(db) => db,
                 None => return None,
             };
@@ -263,6 +278,7 @@ impl NsHarness {
                 admin_base_url: gw.admin_base_url.clone(),
                 proxy_base_url: gw.proxy_base_url.clone(),
                 _gw: gw,
+                _isolated_db: isolated_db,
             });
         }
         panic!("namespace harness failed to start: {last_err}");

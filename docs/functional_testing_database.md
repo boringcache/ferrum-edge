@@ -17,10 +17,11 @@ and omit backend URLs / containers; suites print `SKIPPED` and return success.
 
 Shared CI PostgreSQL/MySQL containers are resumed defensively at the start of
 SQL-backed cells (`ensure_shared_sql_containers_resumed`) so a prior
-connectivity-recovery `docker pause` cannot leave later cells frozen. MySQL
-row mappers decode TEXT/MEDIUMTEXT through UTF-8 helpers so sqlx-Any BLOB
-mapping cannot turn a successful write into a false admin 404 or poison later
-gateway full-loads on the shared database.
+connectivity-recovery `docker pause` cannot leave later cells frozen. Each
+SQL-backed cell also provisions a dedicated `ferrum_cell_*` database on those
+containers (`provision_isolated_sql_database`) so one cell cannot poison later
+full-loads. MySQL row mappers decode TEXT/MEDIUMTEXT through UTF-8 helpers so
+sqlx-Any BLOB mapping cannot turn a successful write into a false admin 404.
 
 | Behavior | SQLite | PostgreSQL | MySQL | MongoDB |
 |---|---|---|---|---|
