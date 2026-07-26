@@ -63,6 +63,7 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use super::utils::policy_digest;
 use super::utils::sse::is_text_event_stream_media_type;
 use super::{PluginResult, RequestContext};
 use crate::util::http_headers::headers_have_cache_control_directive;
@@ -125,7 +126,21 @@ pub struct SsePlugin {
     /// Only applies to buffered responses. Implies client-visible
     /// `text/event-stream` for wrapped responses. Default: false.
     wrap_non_sse_responses: bool,
+
+    /// Content-derived digest of this instance's whole accepted static config,
+    /// used as replay provenance (see `response_presentation_policy_digest`).
+    ///
+    /// Computed once at construction from the canonical form of the validated
+    /// configuration, so it covers every present and future static knob without
+    /// an enumeration that could silently fall behind a new field. Only the
+    /// digest is ever exposed; the source config is not retained.
+    static_policy_digest: [u8; 32],
 }
+
+/// Domain separator and schema version for [`SsePlugin`] replay provenance.
+/// Bumping the version invalidates every previously persisted representation
+/// rather than letting an old digest match new semantics.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.sse.static.v1";
 
 impl SsePlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
@@ -154,6 +169,12 @@ impl SsePlugin {
             field
         });
 
+        // Digest the accepted configuration as a whole. Every knob that shapes
+        // the wrapped client representation (`wrap_non_sse_responses`,
+        // `retry_ms`, `force_sse_content_type`) is in here by construction.
+        let static_policy_digest =
+            policy_digest::static_config_digest(STATIC_POLICY_DIGEST_DOMAIN, config);
+
         Ok(Self {
             require_accept_header,
             require_get_method,
@@ -164,6 +185,7 @@ impl SsePlugin {
             retry_field,
             force_sse_content_type,
             wrap_non_sse_responses,
+            static_policy_digest,
         })
     }
 
@@ -313,6 +335,23 @@ impl super::Plugin for SsePlugin {
 
     fn requires_response_body_buffering(&self) -> bool {
         self.wrap_non_sse_responses
+    }
+
+    /// SSE wrapping is a presentation policy a finalized replay skips, so this
+    /// instance enrolls in replay provenance.
+    ///
+    /// `after_proxy` still runs on a replay and can relabel the response
+    /// `Content-Type` to `text/event-stream`, but the wrapping body transform
+    /// below is suppressed. A representation retained before
+    /// `wrap_non_sse_responses` (or `retry_ms`) was configured would therefore
+    /// be delivered unwrapped — or wrapped under superseded framing — while
+    /// labelled as an event stream. Enrollment is unconditional, including for
+    /// an instance that is not currently wrapping: whether wrapping is on is
+    /// itself the policy a stored representation must be bound to, and a
+    /// conditional contribution would make the per-proxy digest depend on live
+    /// request state rather than static configuration.
+    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
+        Some(self.static_policy_digest)
     }
 
     fn should_buffer_response_body_for_content_type(

@@ -31,7 +31,11 @@
 //! an incremental rebuild. Every retained response therefore carries a complete
 //! `ResponsePolicyProvenance` — the content digest of the published RTDS
 //! response-side gate map *and* the content digest of the effective static
-//! `response_transformer` rules — and replays only while both still match:
+//! rules of **every** plugin whose response-body transform the replay skips
+//! (`response_transformer`, `sse`, and `mcp_gateway` today; see
+//! `Plugin::response_presentation_policy_digest` for the audited set and why
+//! `compression`, `grpc_web`, `ai_response_guard`, and `ai_tool_governor` are
+//! excluded) — and replays only while both still match:
 //!
 //! - **Lookup**: a stored response whose provenance differs from the live one
 //!   is refused with 409 rather than replayed. It is not re-executed: the
@@ -46,8 +50,9 @@
 //!   assumed policy.
 //!
 //! Both halves are required. The gate map alone covers only enable/disable
-//! flips of an RTDS-scoped instance; a redaction/header/body *rule* edit that
-//! leaves the gate map identical would otherwise let an old Redis
+//! flips of an RTDS-scoped instance; a redaction/header/body *rule* edit — or
+//! the addition, removal, or reordering of any other enrolled presentation
+//! plugin — that leaves the gate map identical would otherwise let an old Redis
 //! representation match the current digest and skip the new transform. Only
 //! fixed-size digests are stored — never rule text, header values, or any other
 //! configuration content.

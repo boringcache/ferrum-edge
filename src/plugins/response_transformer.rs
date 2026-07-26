@@ -60,10 +60,12 @@
 //! - `request_deduplication` persists to Redis, where an entry outlives the
 //!   instance, the cache generation, and the process. A gate identity is
 //!   meaningless there, so it stores content digests instead: the gate map's
-//!   content *and* this plugin's `response_presentation_policy_digest()`, the
-//!   digest of the whole accepted static config. A rule edit that leaves
-//!   the gate map untouched therefore still retires every replay captured
-//!   before it.
+//!   content *and* the per-proxy fold of every enrolled plugin's
+//!   `response_presentation_policy_digest()` — this plugin's being the digest
+//!   of its whole accepted static config. A rule edit that leaves the gate map
+//!   untouched therefore still retires every replay captured before it, as does
+//!   a change to any other presentation plugin the replay path skips (`sse`,
+//!   `mcp_gateway`) or to their configured order.
 //!
 //! ## Representation metadata after a body rewrite
 //!

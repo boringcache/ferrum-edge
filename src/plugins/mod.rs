@@ -1644,9 +1644,11 @@ impl HeldCodecPermit {
 ///   so nothing else can witness them. Being content-derived rather than a
 ///   pointer identity, it means the same thing in every process, which is what
 ///   a representation retained in a shared store has to be compared against.
-/// - `presentation` — content digest of the effective *static* rules
-///   (`response_transformer` configuration, folded in configured execution
-///   order). Static rules cannot change under one live plugin instance, but a
+/// - `presentation` — content digest of the effective *static* rules of every
+///   plugin whose response-body transform the replay skips, folded in
+///   configured execution order (see
+///   `Plugin::response_presentation_policy_digest` for the enrolled set and the
+///   audited exclusions). Static rules cannot change under one live instance, but a
 ///   representation persisted to Redis outlives the instance, the generation,
 ///   and the process, so an unchanged gate map says nothing about whether the
 ///   redaction/header/body rules still match. `None` means the effective static
@@ -1964,9 +1966,9 @@ pub struct RequestContext {
     /// rather than a guess. Kept private so request metadata cannot forge one.
     pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
     /// Content digest of the effective *static* response-side presentation
-    /// policy (today: every `response_transformer` instance's accepted config,
-    /// folded in configured execution order) for this request's proxy and
-    /// protocol.
+    /// policy for this request's proxy and protocol: every enrolled instance's
+    /// accepted config (`Plugin::response_presentation_policy_digest`), folded
+    /// in configured execution order.
     ///
     /// Copied once from the request's plugin-cache view, so it describes
     /// exactly the instances that will run on this request's response path.
@@ -6416,6 +6418,35 @@ pub trait Plugin: Send + Sync {
     /// `utils::policy_digest::static_config_digest` with a plugin-specific
     /// domain separator. Return only the digest: the value is persisted outside
     /// this process, so raw configuration must never be exposed here.
+    ///
+    /// Only response *body* transforms need enrollment. `after_proxy` header
+    /// hooks — including the rejection-path hooks a synthetic replay runs
+    /// through — still execute on a finalized replay, so header policy is
+    /// enforced live and is never skipped.
+    ///
+    /// Every current implementor of `transform_response_body` /
+    /// `transform_response_body_with_context` has been audited against that
+    /// rule. Enrolled: `response_transformer`, `sse`, `mcp_gateway`.
+    /// Deliberately not enrolled, and why the skip drops no live decision:
+    ///
+    /// - `compression` — content coding, not presentation. A replay is
+    ///   delivered through the rejection path, where `after_proxy` declines to
+    ///   commit a `Content-Encoding` at all, so the skipped transform cannot
+    ///   leave a mislabeled body. The retained bytes are self-describing (the
+    ///   stored `Content-Encoding` travels with them) and `request_deduplication`
+    ///   binds `Accept-Encoding` into the request fingerprint, so a replay only
+    ///   ever reaches a client that advertised the stored coding.
+    /// - `grpc_web` — protocol framing with no static presentation
+    ///   configuration. The translation mode comes entirely from the request
+    ///   `Content-Type` (fingerprint-bound) and the response's own trailers,
+    ///   which are part of the retained bytes. Its one static knob,
+    ///   `expose_headers`, is CORS *header* policy applied in `after_proxy`.
+    /// - `ai_response_guard`, `ai_tool_governor` — their current-policy
+    ///   inspection re-runs over the replayed bytes and opts a mandatory
+    ///   transform back in through `requires_replay_response_body_transform`,
+    ///   failing closed when it cannot rewrite. Newly configured redaction is
+    ///   therefore applied to a replay under the *live* policy, which is
+    ///   strictly stronger than proving a stored digest still matches.
     fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
         None
     }

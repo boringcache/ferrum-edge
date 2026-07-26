@@ -910,6 +910,279 @@ fn presentation_policy_digest_is_order_sensitive_across_transformer_instances() 
     );
 }
 
+/// Digest of the effective static response-presentation policy for an ordered
+/// list of `(plugin_name, config)` pairs, exactly as the plugin cache folds it
+/// over one proxy's configured execution order. Unlike `presentation_digest_for`
+/// this spans plugin *types*, which is what the completeness claim rests on.
+fn presentation_digest_for_plugin_specs(specs: &[(&str, serde_json::Value)]) -> [u8; 32] {
+    let plugins: Vec<Arc<dyn Plugin>> = specs
+        .iter()
+        .map(|(name, config)| {
+            create_plugin_with_http_client(name, config, PluginHttpClient::default())
+                .unwrap_or_else(|err| panic!("{name} config must be valid: {err}"))
+                .unwrap_or_else(|| panic!("{name} must be a built-in plugin"))
+        })
+        .collect();
+    let contributions: Vec<(&str, [u8; 32])> = plugins
+        .iter()
+        .filter_map(|plugin| {
+            plugin
+                .response_presentation_policy_digest()
+                .map(|digest| (plugin.name(), digest))
+        })
+        .collect();
+    presentation_policy_digest(contributions)
+}
+
+/// `sse` with the given wrapping policy. `wrap_non_sse_responses` rewrites the
+/// client-visible body into `data: ...` event framing, and `require_get_method`
+/// is off so the policy is reachable on the non-safe methods dedup covers.
+fn sse_wrapping_config(wrap: bool, retry_ms: u64) -> serde_json::Value {
+    json!({
+        "require_get_method": false,
+        "require_accept_header": false,
+        "wrap_non_sse_responses": wrap,
+        "retry_ms": retry_ms,
+    })
+}
+
+fn mcp_gateway_config(upstream_url: &str) -> serde_json::Value {
+    json!({
+        "enabled": true,
+        "mode": "aggregate_router",
+        "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+        "servers": {
+            "github": {
+                "upstream_url": upstream_url,
+                "namespace": "github",
+                "enabled": true,
+            }
+        },
+    })
+}
+
+/// The completeness residual this repair closes: the RTDS gate map and every
+/// `response_transformer` rule are unchanged, but an `sse` wrap was enabled.
+/// The finalized-replay path skips that wrap while `after_proxy` still relabels
+/// the response `text/event-stream`, so a replay stored before the change would
+/// be delivered unwrapped under an event-stream label.
+#[tokio::test]
+async fn replay_is_rejected_when_a_non_response_transformer_presentation_policy_changes() {
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
+    let plugin = make_plugin(json!({}));
+    let unchanged_transformer = redaction_transformer("[redacted]");
+
+    let before = presentation_digest_for_plugin_specs(&[
+        ("sse", sse_wrapping_config(false, 3000)),
+        ("response_transformer", unchanged_transformer.clone()),
+    ]);
+    let after = presentation_digest_for_plugin_specs(&[
+        ("sse", sse_wrapping_config(true, 3000)),
+        ("response_transformer", unchanged_transformer),
+    ]);
+    assert_ne!(
+        before, after,
+        "enabling an sse body wrap must change the presentation policy digest"
+    );
+
+    let mut first_ctx = policy_bound_ctx(Some(before));
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "sse-wrap".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut replay_ctx = policy_bound_ctx(Some(after));
+    let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "a replay stored before the sse wrap was enabled must be refused, got {result:?}"
+    );
+    assert!(!finalized_response_replay_for_test(&replay_ctx));
+}
+
+/// The `mcp_gateway` public-URI mapping is the other non-`response_transformer`
+/// enrollment: rewriting an upstream resource URI onto a different gateway URI
+/// changes the client representation a replay would otherwise keep serving.
+#[tokio::test]
+async fn replay_is_rejected_when_the_mcp_public_uri_mapping_changes() {
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
+    let plugin = make_plugin(json!({}));
+
+    let alpha = mcp_gateway_config("http://mcp-alpha:8080");
+    let beta = mcp_gateway_config("http://mcp-beta:8080");
+    let before = presentation_digest_for_plugin_specs(&[("mcp_gateway", alpha)]);
+    let after = presentation_digest_for_plugin_specs(&[("mcp_gateway", beta)]);
+    assert_ne!(
+        before, after,
+        "an mcp_gateway server-catalog edit must change the presentation policy digest"
+    );
+
+    let mut first_ctx = policy_bound_ctx(Some(before));
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "mcp-catalog".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut replay_ctx = policy_bound_ctx(Some(after));
+    let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "a replay stored under a superseded mcp catalog must be refused, got {result:?}"
+    );
+    assert!(!finalized_response_replay_for_test(&replay_ctx));
+}
+
+/// The complement of the rejection above: an unrelated reload that rebuilds an
+/// equivalent multi-plugin presentation policy must keep replays serviceable,
+/// so provenance retires only representations that are genuinely superseded.
+#[tokio::test]
+async fn replay_survives_an_equivalent_rebuild_of_a_multi_plugin_presentation_policy() {
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
+    let plugin = make_plugin(json!({}));
+
+    let stored_under = presentation_digest_for_plugin_specs(&[
+        ("sse", sse_wrapping_config(true, 3000)),
+        ("response_transformer", redaction_transformer("[redacted]")),
+    ]);
+    // Same accepted policy, written with the object members in another order.
+    let rebuilt = presentation_digest_for_plugin_specs(&[
+        (
+            "sse",
+            json!({
+                "retry_ms": 3000,
+                "wrap_non_sse_responses": true,
+                "require_accept_header": false,
+                "require_get_method": false,
+            }),
+        ),
+        (
+            "response_transformer",
+            json!({
+                "rules": [{
+                    "key": "x-account",
+                    "value": "[redacted]",
+                    "target": "headers",
+                    "operation": "update",
+                }],
+                "runtime_overlay_scope": "redaction",
+            }),
+        ),
+    ]);
+    assert_eq!(
+        stored_under, rebuilt,
+        "equivalent multi-plugin policy must derive an identical digest across rebuilds"
+    );
+
+    let mut first_ctx = policy_bound_ctx(Some(stored_under));
+    let mut headers =
+        HashMap::from([("idempotency-key".to_string(), "equivalent-multi".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut replay_ctx = policy_bound_ctx(Some(rebuilt));
+    let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::RejectBinary {
+                status_code: 201,
+                ..
+            }
+        ),
+        "an equivalent policy must still replay, got {result:?}"
+    );
+    assert!(finalized_response_replay_for_test(&replay_ctx));
+}
+
+/// Presence, multiplicity, and configured order across plugin *types* all move
+/// the digest. Order matters in production because `priority_override` and
+/// multiple instances can put an `sse` wrap on either side of a
+/// `response_transformer` body rule, and the two orders are different bytes.
+#[test]
+fn presentation_policy_digest_covers_presence_multiplicity_and_order_across_plugin_types() {
+    let sse = ("sse", sse_wrapping_config(true, 3000));
+    let transformer = ("response_transformer", redaction_transformer("[redacted]"));
+
+    let transformer_only = presentation_digest_for_plugin_specs(&[transformer.clone()]);
+    let with_sse = presentation_digest_for_plugin_specs(&[sse.clone(), transformer.clone()]);
+    assert_ne!(
+        transformer_only, with_sse,
+        "adding an enrolled plugin of another type must change the digest"
+    );
+
+    let reversed = presentation_digest_for_plugin_specs(&[transformer.clone(), sse.clone()]);
+    assert_ne!(
+        with_sse, reversed,
+        "an sse wrap before vs. after a body rule is a different representation"
+    );
+
+    let duplicated =
+        presentation_digest_for_plugin_specs(&[sse.clone(), sse.clone(), transformer.clone()]);
+    assert_ne!(
+        with_sse, duplicated,
+        "a second instance of the same plugin must change the digest"
+    );
+
+    let mcp = ("mcp_gateway", mcp_gateway_config("http://mcp-alpha:8080"));
+    let with_mcp = presentation_digest_for_plugin_specs(&[sse, transformer, mcp]);
+    assert_ne!(
+        with_sse, with_mcp,
+        "mcp_gateway must contribute to the presentation policy digest"
+    );
+}
+
+/// Pins the audited exclusion set. These plugins transform response bodies but
+/// deliberately contribute no provenance: `compression` and `grpc_web` are
+/// coding/framing mechanics bound by the request fingerprint rather than static
+/// presentation policy, and the AI guards re-run their current-policy decision
+/// over the replayed bytes through `requires_replay_response_body_transform`.
+/// Enrolling one of them later must be a deliberate change, not a drift.
+#[test]
+fn audited_non_presentation_body_transforms_do_not_contribute_provenance() {
+    let guard = json!({"pii_patterns": ["email"], "action": "redact"});
+    let governor = json!({
+        "default_action": "allow",
+        "tools": { "filesystem.write": { "action": "deny" } }
+    });
+    for (name, config) in [
+        ("compression", json!({})),
+        ("grpc_web", json!({})),
+        ("ai_response_guard", guard),
+        ("ai_tool_governor", governor),
+    ] {
+        let plugin = create_plugin_with_http_client(name, &config, PluginHttpClient::default())
+            .unwrap_or_else(|err| panic!("{name} config must be valid: {err}"))
+            .unwrap_or_else(|| panic!("{name} must be a built-in plugin"));
+        assert!(
+            plugin.response_presentation_policy_digest().is_none(),
+            "{name} is an audited exclusion from replay provenance; enrolling it must be \
+             a deliberate change with its own reasoning"
+        );
+    }
+}
+
 /// A request that never observed the effective static policy has unprovable
 /// provenance and must not leave a replayable representation in Redis.
 #[test]

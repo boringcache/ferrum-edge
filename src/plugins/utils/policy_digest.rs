@@ -56,11 +56,13 @@ pub fn static_config_digest(domain: &str, config: &Value) -> [u8; 32] {
 /// Fold every enrolled plugin instance's static digest, **in configured
 /// execution order**, into one per-proxy presentation-policy digest.
 ///
-/// Order is part of the identity: response header/body rules are not
-/// commutative, so the same instances reordered produce a different
-/// client-visible representation and must not share provenance. The plugin
-/// name is hashed alongside each digest so two different plugin types can
-/// never swap contributions unnoticed. An empty iterator yields the
+/// Order is part of the identity: response body/header rules are not
+/// commutative — an `sse` wrap of a `response_transformer` output is not the
+/// same representation as the reverse — so the same instances reordered produce
+/// a different client-visible representation and must not share provenance. The
+/// plugin name is hashed alongside each digest so two different plugin types can
+/// never swap contributions unnoticed, and the trailing count means adding or
+/// removing an instance always moves the result. An empty iterator yields the
 /// well-defined "no presentation policy" digest rather than a sentinel, so the
 /// absence of transformers is itself a policy that a stored representation is
 /// bound to.
