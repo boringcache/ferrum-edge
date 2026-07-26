@@ -916,6 +916,8 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
 
 #[tokio::test]
 async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behavior() {
+    let saturated_server = mock_sink().await;
+    let saturated_endpoint = format!("{}/ingest", saturated_server.uri());
     let plugin = AiTranscriptAudit::new(
         &json!({
             "mode": "metadata_only",
@@ -931,13 +933,15 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             },
             "sink": {
                 "type": "http",
-                "endpoint_url": "https://audit.example.com/x",
+                "endpoint_url": saturated_endpoint,
                 "on_buffer_full": "reject"
             }
         }),
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let headers = json_headers();
     for index in 0..4096 {
         let mut ctx = make_ctx();
@@ -988,14 +992,18 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "internal candidate state must still be removed"
     );
 
+    let peer_server = mock_sink().await;
+    let peer_endpoint = format!("{}/ingest", peer_server.uri());
     let peer = AiTranscriptAudit::new(
         &config_with_sink(
-            "https://audit.example.com/x",
+            &peer_endpoint,
             json!({ "capture": { "streaming_response": true } }),
         ),
         loopback_http_client(),
     )
     .unwrap();
+    peer.start_background_tasks().expect("live start");
+    peer.commit_background_tasks();
     let mut peer_overflow = make_ctx();
     assert!(matches!(
         peer.on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body(),)
@@ -1027,6 +1035,28 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         !plugin.should_buffer_response_body(&peer_overflow),
         "a saturated instance must not buffer a response for a peer's candidate"
     );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&peer_overflow),
+        "a saturated instance must not force reqwest dispatch for a peer's stream candidate"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_none(),
+        "a saturated instance must not tee a peer's stream"
+    );
+    // Borrowed peer `sample_hit` must not reopen stream selection on the
+    // saturated instance (the residual `MD_SAMPLE_HIT` fallback hazard).
+    peer_overflow.metadata.insert(
+        "ai_transcript_audit.sample_hit".to_string(),
+        "true".to_string(),
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_none(),
+        "shared sample_hit must not authorize a saturated instance to tee"
+    );
     plugin
         .capture_final_response_body(
             &mut peer_overflow,
@@ -1035,13 +1065,46 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             br#"{"choices":[{"message":{"content":"ok"}}]}"#,
         )
         .await;
-    assert_eq!(
-        peer_overflow
-            .metadata
-            .get("ai_transcript_audit.sink_status")
-            .map(String::as_str),
-        Some("rejected"),
-        "a saturated instance must not commit a response record for a peer's candidate"
+    plugin
+        .on_response_stream_terminated(&mut peer_overflow, 200, &BodyOutcome::success(0))
+        .await;
+    // `request_rejected_for_sink` can preserve a prior "rejected" stamp even
+    // across a successful enqueue, so prove non-emission via the sink and prove
+    // the peer still holds the commit capability.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        saturated_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a saturated instance must not emit a response record for a peer's candidate"
+    );
+    assert!(
+        peer.forces_reqwest_dispatch(&peer_overflow),
+        "peer must retain its staging commit capability after saturated response hooks"
+    );
+    assert!(
+        peer.response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_some(),
+        "peer must still be able to tee its own staged stream"
+    );
+    let mut still_saturated = make_ctx();
+    assert!(
+        matches!(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut still_saturated,
+                    &headers,
+                    ai_request_body()
+                )
+                .await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "saturated instance must remain at the 4096-entry bound"
     );
 }
 

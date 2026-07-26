@@ -1051,12 +1051,14 @@ impl AiTranscriptAudit {
     ) -> bool {
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !self.has_staged_candidate(&ctx.metadata)
         {
             return false;
         }
-
-        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        // Ownership is proven by a local staging entry only — never by the
+        // shared peer-writable `MD_SAMPLE_HIT` key (see `owned_sample_hit`).
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return false;
+        };
         sample_hit
             // A response-side streaming inspector can fire the guardrail only
             // after headers commit. Reserve now for that possible terminal
@@ -1358,25 +1360,12 @@ impl AiTranscriptAudit {
             .is_some_and(|record_id| self.staging.contains_key(record_id))
     }
 
-    /// THIS instance's staged sampling roll, not the shared
-    /// `ai_transcript_audit.sample_hit` metadata key: a second instance of the
-    /// plugin can overwrite that key with its own roll, and each instance keys
-    /// its own `staging` map by the shared record id.
-    fn staged_sample_hit(&self, metadata: &HashMap<String, String>) -> bool {
-        let staged = metadata
-            .get(MD_RECORD_ID)
-            .and_then(|record_id| self.staging.get(record_id))
-            .map(|staging| staging.sample_hit);
-        staged.unwrap_or_else(|| flag(metadata, MD_SAMPLE_HIT))
-    }
-
     /// THIS instance's staged sampling roll, or `None` when this instance holds
     /// no staging entry for the record — i.e. the shared `MD_CANDIDATE` marker on
-    /// the context belongs to a co-located peer instance. Unlike
-    /// [`Self::staged_sample_hit`] there is deliberately no `MD_SAMPLE_HIT`
-    /// fallback: that key is shared and peer-writable, so falling back to it
-    /// would let a peer's roll drive this instance's commit admission and its
-    /// client-visible fail-closed 503.
+    /// the context belongs to a co-located peer instance. There is deliberately
+    /// no `MD_SAMPLE_HIT` fallback: that key is shared and peer-writable, so
+    /// falling back to it would let a peer's roll drive this instance's stream
+    /// selection, commit admission, and client-visible fail-closed 503.
     fn owned_sample_hit(&self, metadata: &HashMap<String, String>) -> Option<bool> {
         metadata
             .get(MD_RECORD_ID)
@@ -1385,23 +1374,27 @@ impl AiTranscriptAudit {
     }
 
     /// Whether a marked AI candidate's stream should actually be teed. `On`
-    /// tees every marked candidate; `Sampled` tees only sampling-roll winners
-    /// plus requests a request-side guardrail flagged (evaluated here — at
-    /// dispatch/response time — because the guardrail plugins at 2925–2978 run
-    /// AFTER staging at 2740 but BEFORE the proxy's dispatch decision, so
-    /// `always_capture_on_guardrail` can still capture response evidence on an
-    /// un-sampled stream). Error statuses and response-side guardrail hits are
-    /// only known later still: on un-sampled streams those overrides emit via
-    /// the `log` fallback without a response body/hash (teeing every stream
-    /// "just in case" would defeat sampled capture entirely).
+    /// tees every candidate THIS instance staged; `Sampled` tees only
+    /// sampling-roll winners plus requests a request-side guardrail flagged
+    /// (evaluated here — at dispatch/response time — because the guardrail
+    /// plugins at 2925–2978 run AFTER staging at 2740 but BEFORE the proxy's
+    /// dispatch decision, so `always_capture_on_guardrail` can still capture
+    /// response evidence on an un-sampled stream). A peer-only marker yields
+    /// no tee. Error statuses and response-side guardrail hits are only known
+    /// later still: on un-sampled streams those overrides emit via the `log`
+    /// fallback without a response body/hash (teeing every stream "just in
+    /// case" would defeat sampled capture entirely).
     fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
         match self.capture.streaming {
             StreamingCapture::Off => false,
-            StreamingCapture::On => true,
-            StreamingCapture::Sampled => {
-                self.staged_sample_hit(metadata)
-                    || (self.sampling.always_on_guardrail && guardrail_fired(metadata))
-            }
+            StreamingCapture::On => self.has_staged_candidate(metadata),
+            StreamingCapture::Sampled => match self.owned_sample_hit(metadata) {
+                Some(true) => true,
+                Some(false) => self.sampling.always_on_guardrail && guardrail_fired(metadata),
+                // Shared peer marker / no local staging: never tee from a
+                // borrowed `MD_SAMPLE_HIT` roll.
+                None => false,
+            },
         }
     }
 
@@ -2216,18 +2209,19 @@ impl Plugin for AiTranscriptAudit {
             return None;
         }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
-        if self.capture.streaming == StreamingCapture::Off
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
+        if self.capture.streaming == StreamingCapture::Off {
             return None;
         }
         // In `sampled` mode the marker alone is not enough: only tee streams
         // that won the sampling roll or that a request-side guardrail flagged
-        // (see `stream_tee_wanted`).
+        // (see `stream_tee_wanted`). Ownership is required either way —
+        // `stream_tee_wanted` reads only the local staging entry.
         if !self.stream_tee_wanted(&ctx.metadata) {
             return None;
         }
-        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return None;
+        };
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
         // this request won the sampling roll (`emit_decision` emits on `sampled`
