@@ -661,11 +661,10 @@ fn resolve_udp_session_epoch_view(
         .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
         .clone();
-    let plugins = epoch.plugin_cache.plugins_for_protocol(
-        &proxy.namespace,
-        &proxy.id,
-        ProxyProtocol::Udp,
-    );
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Udp);
     let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
         .iter()
         .filter(|p| p.requires_udp_datagram_hooks())

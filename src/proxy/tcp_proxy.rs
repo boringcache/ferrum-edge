@@ -2307,11 +2307,10 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let plugins = epoch.plugin_cache.plugins_for_protocol(
-        &proxy.namespace,
-        proxy_id,
-        ProxyProtocol::Tcp,
-    );
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
