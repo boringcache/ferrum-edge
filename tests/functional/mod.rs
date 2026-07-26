@@ -41,6 +41,7 @@ mod functional_h3_authority_validation_test;
 mod functional_h3_grpc_streaming_test;
 mod functional_h3_grpc_web_test;
 mod functional_h3_local_policy_test;
+mod functional_h3_mtls_early_data_test;
 mod functional_h3_soap_utf16_test;
 mod functional_header_limits_test;
 mod functional_header_read_timeout_test;

@@ -89,6 +89,15 @@ The deliberate exception is operator-enabled HTTP/3 0-RTT early data
 Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
 so backends can apply their own replay policy.
 
+0-RTT and frontend mTLS are mutually exclusive on the HTTP/3 listener. When
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set, the H3 listener never takes
+quinn's 0.5-RTT accept path — TLS 1.3 does not accept early data under client
+authentication, and accepting the connection before the peer's `Certificate`
+flight would leave `peer_identity()` unknowable for the connection's lifetime.
+`FERRUM_TLS_EARLY_DATA_METHODS` is therefore inert for HTTP/3 on such a
+listener (a startup warning says so); ordinary 1-RTT H3 mTLS keeps working and
+`mtls_auth` / `spiffe_identity` receive the presented client certificate.
+
 ## Configuration Scenarios
 
 ### 1. HTTP Only (Default)
