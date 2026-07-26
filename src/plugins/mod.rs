@@ -8088,9 +8088,9 @@ impl RequestBodyBufferingScreener {
             }
             // A registered built-in that yields `None` is a retired/fail-closed
             // alias; treat it like any other unanswerable name.
-            Ok(None) => RequestBodyBufferingScreen::Indeterminate(
-                RequestBodyBufferingScreenGap::NotBuiltin,
-            ),
+            Ok(None) => {
+                RequestBodyBufferingScreen::Indeterminate(RequestBodyBufferingScreenGap::NotBuiltin)
+            }
             // The constructor message can echo configured values, so it is
             // deliberately dropped here — plugin-config validation surfaces the
             // detailed error on its own path.
