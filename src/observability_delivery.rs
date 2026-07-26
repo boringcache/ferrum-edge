@@ -478,7 +478,8 @@ impl DeliveryLifecycle {
     /// The count gate in `record_capacity_rejection` only *samples* rejections,
     /// so under a sustained flood the warning rate would still scale with
     /// attacker-driven traffic. This adds an absolute ceiling of one line per
-    /// window per process, matching the mesh-authz idiom. Only the sampled
+    /// window per delivery lifecycle generation, matching the mesh-authz idiom.
+    /// Only the sampled
     /// callers read the clock, so the reject path stays allocation- and
     /// syscall-free.
     fn claim_capacity_warning_window(&self) -> bool {

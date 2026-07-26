@@ -1145,8 +1145,8 @@ and on the budget-specific
 `ferrum_observability_delivery_capacity_rejected_tasks_total`, and surfaced with
 a rate-limited caller-thread warning; callers must not spawn additional deferred
 work to report the drop. The warning is both sampled and bounded to at most one
-line per five seconds per process, so a sustained overflow cannot scale log
-output with rejected traffic. Permits release when tasks complete or are
+line per five seconds per delivery lifecycle generation, so a sustained
+overflow cannot scale log output with rejected traffic. Permits release when tasks complete or are
 cancelled, and the shared shutdown-drain deadline is unchanged.
 `ferrum_observability_delivery_max_tasks` and
 `ferrum_observability_delivery_admitted_tasks` expose the configured budget and
