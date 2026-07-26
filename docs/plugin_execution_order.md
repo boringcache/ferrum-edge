@@ -327,7 +327,11 @@ execution barrier with that same retention. If later capacity pressure evicts a
 protected completion, its barrier inherits the completion's original insertion
 time and retention rather than starting a fresh `inflight_ttl_seconds` lease.
 Redis publication remains compare-and-set fenced, and a stale hook cannot clear
-either the barrier or a successor owner.
+either the barrier or a successor owner. Per-key barriers are hard-capped at
+`max_entries`; overflow is collapsed into one fixed process-global deadline
+that returns 503 for applicable idempotency-key requests until the longest
+displaced completion deadline, rather than allocating unbounded key state or
+failing open.
 
 These markers are internal (`ferrum:`-prefixed) and cannot be set from public
 request metadata or from a backend response header. A new plugin that spends

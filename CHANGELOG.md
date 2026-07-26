@@ -52,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use an explicit fixed-size execution barrier carrying the completion's own
   authoritative retention clock; neither path can silently restart a shorter
   `inflight_ttl_seconds` lease. Stale owner hooks cannot clear the barrier or a
-  successor because every transition remains fingerprint/token fenced.
+  successor because every transition remains fingerprint/token fenced. Per-key
+  execution barriers are hard-capped at `max_entries`; overflow extends one
+  fixed process-global deadline that returns 503 for applicable idempotency-key
+  requests, preserving fail-closed retention without unbounded key storage.
   Serverless responses with stable, complete policy provenance are still stored
   as ordinary replays. The provenance contract is documented in
   `docs/plugin_execution_order.md`.

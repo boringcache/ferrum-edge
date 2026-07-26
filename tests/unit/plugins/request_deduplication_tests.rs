@@ -2324,6 +2324,73 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
     }
 }
 
+/// Per-key execution barriers are hard-capped. Additional completed operations
+/// collapse into one fixed process-global refusal deadline rather than growing
+/// attacker-influenced key storage or failing open.
+#[tokio::test]
+async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
+    let plugin = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1,
+        "max_entry_size_bytes": 1
+    }));
+
+    for key in ["barrier-cap-a", "barrier-cap-b"] {
+        let mut ctx = new_ctx("POST", "/api");
+        let mut headers =
+            HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        plugin
+            .on_response_committed(&mut ctx, 200, &HashMap::new(), b"done")
+            .await;
+    }
+
+    // Only the first per-key barrier persists. The second remains a raw lease
+    // only until its ordinary in-flight expiry; the fixed global deadline is
+    // the durable fail-closed protection.
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut blocked_ctx = new_ctx("POST", "/api");
+    let mut blocked_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "barrier-cap-c".to_string(),
+    )]);
+    match plugin
+        .before_proxy(&mut blocked_ctx, &mut blocked_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.contains("execution-barrier capacity"));
+        }
+        _ => panic!("execution-barrier overflow must fail closed"),
+    }
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "overflow must not retain an additional long-lived per-key barrier"
+    );
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut expired_ctx = new_ctx("POST", "/api");
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut expired_ctx, &mut blocked_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
 /// A stale terminal hook must not publish over or clear the successor that
 /// acquired after the execution barrier's authoritative deadline.
 #[tokio::test]

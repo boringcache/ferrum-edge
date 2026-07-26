@@ -139,6 +139,11 @@ const DEDUP_RECORD_STATE_COMPLETED: &str = "completed";
 /// Deterministic body for a fail-closed refusal when the centralized
 /// idempotency store cannot be consulted.
 const REDIS_UNAVAILABLE_BODY: &str = r#"{"error":"Idempotency coordination store is unavailable"}"#;
+/// Deterministic refusal while the bounded per-key execution-barrier budget is
+/// saturated. One process-global deadline covers any additional completed
+/// operations fail-closed without allocating attacker-amplified per-key state.
+const EXECUTION_BARRIER_CAPACITY_BODY: &str =
+    r#"{"error":"Idempotency execution-barrier capacity is saturated"}"#;
 /// Deterministic body for a completion that must never be replayed: the
 /// protected operation already ran externally and has no safe replay value.
 const NON_REPLAYABLE_COMPLETION_BODY: &str = r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
@@ -246,6 +251,10 @@ const REDIS_ONLY_CONFIG_KEYS: &[&str] = &[
 /// the `Instant`-based entry expiry.
 fn monotonic_secs() -> u64 {
     PROCESS_START.elapsed().as_secs()
+}
+
+fn monotonic_millis() -> u64 {
+    u64::try_from(PROCESS_START.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether a full cleanup scan is due, given the last scan's recorded monotonic
@@ -771,6 +780,13 @@ pub struct RequestDeduplication {
     completed_count: AtomicUsize,
     completed_size_bytes: AtomicUsize,
     inflight_count: AtomicUsize,
+    /// Number of explicit per-key execution barriers. Unlike active in-flight
+    /// work, this durable security state is hard-capped at `max_entries`.
+    execution_barrier_count: AtomicUsize,
+    /// Process-relative monotonic deadline for a single bounded fail-closed
+    /// overflow barrier. When the per-key barrier budget is full, this one
+    /// scalar protects every displaced key without retaining their identities.
+    execution_barrier_overflow_until_ms: AtomicU64,
     local_inflight_sequence: AtomicU64,
     completed_sequence: AtomicU64,
     next_completed_evict_sequence: AtomicU64,
@@ -916,6 +932,8 @@ impl RequestDeduplication {
             completed_count: AtomicUsize::new(0),
             completed_size_bytes: AtomicUsize::new(0),
             inflight_count: AtomicUsize::new(0),
+            execution_barrier_count: AtomicUsize::new(0),
+            execution_barrier_overflow_until_ms: AtomicU64::new(0),
             local_inflight_sequence: AtomicU64::new(0),
             completed_sequence: AtomicU64::new(0),
             next_completed_evict_sequence: AtomicU64::new(0),
@@ -945,6 +963,42 @@ impl RequestDeduplication {
     /// documented meaning of `ttl_seconds`.
     fn execution_barrier_retention(&self) -> Duration {
         self.ttl.max(self.inflight_ttl)
+    }
+
+    fn try_reserve_execution_barrier(&self) -> bool {
+        self.execution_barrier_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.max_entries).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_execution_barrier(&self) {
+        decrement_atomic(&self.execution_barrier_count);
+    }
+
+    /// Extend the one bounded overflow barrier to cover this completion's
+    /// authoritative deadline.
+    ///
+    /// The deadline is derived from the original insertion instant, not from
+    /// overflow detection time, so eviction cannot restart or shorten the
+    /// completion clock. `fetch_max` composes concurrent displaced barriers
+    /// without storing their keys.
+    fn extend_execution_barrier_overflow(&self, inserted_at: Instant, retention: Duration) {
+        let inserted_ms = inserted_at
+            .checked_duration_since(*PROCESS_START)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        self.execution_barrier_overflow_until_ms
+            .fetch_max(inserted_ms.saturating_add(retention_ms), Ordering::SeqCst);
+    }
+
+    fn execution_barrier_overflow_active(&self) -> bool {
+        monotonic_millis()
+            < self
+                .execution_barrier_overflow_until_ms
+                .load(Ordering::SeqCst)
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -1053,6 +1107,8 @@ impl RequestDeduplication {
                     .unwrap_or(now);
             }
         }
+        self.execution_barrier_overflow_until_ms
+            .store(0, Ordering::SeqCst);
         self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
@@ -1354,6 +1410,7 @@ impl RequestDeduplication {
                     } else {
                         // A barrier is accounted with the in-flight/fixed-state
                         // counter. Replacing it in place preserves cardinality.
+                        self.release_execution_barrier();
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
                             fingerprint: fingerprint.to_string(),
@@ -1856,7 +1913,10 @@ impl RequestDeduplication {
                     } if current == fingerprint && current_owner_token == owner_token
                 )
             })
-            .map(|_| decrement_atomic(&self.inflight_count))
+            .map(|_| {
+                self.release_execution_barrier();
+                decrement_atomic(&self.inflight_count)
+            })
     }
 
     /// Build the Redis payload a completed response would produce.
@@ -1927,12 +1987,17 @@ impl RequestDeduplication {
 
         if entry_size > self.max_entry_size_bytes {
             let inflight_count = if publish_execution_barrier_on_skip {
-                entry.insert(DeduplicationEntry::ExecutionBarrier {
-                    inserted_at: Instant::now(),
-                    retention,
-                    fingerprint: fingerprint.to_string(),
-                    owner_token: owner_token.to_string(),
-                });
+                let inserted_at = Instant::now();
+                if self.try_reserve_execution_barrier() {
+                    entry.insert(DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention,
+                        fingerprint: fingerprint.to_string(),
+                        owner_token: owner_token.to_string(),
+                    });
+                } else {
+                    self.extend_execution_barrier_overflow(inserted_at, retention);
+                }
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 entry.remove();
@@ -1948,12 +2013,17 @@ impl RequestDeduplication {
         let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
             if publish_execution_barrier_on_skip {
-                entry.insert(DeduplicationEntry::ExecutionBarrier {
-                    inserted_at: Instant::now(),
-                    retention,
-                    fingerprint: fingerprint.to_string(),
-                    owner_token: owner_token.to_string(),
-                });
+                let inserted_at = Instant::now();
+                if self.try_reserve_execution_barrier() {
+                    entry.insert(DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention,
+                        fingerprint: fingerprint.to_string(),
+                        owner_token: owner_token.to_string(),
+                    });
+                } else {
+                    self.extend_execution_barrier_overflow(inserted_at, retention);
+                }
             }
             let redis_candidate = if self.redis_client.is_some() {
                 Some(CachedResponse {
@@ -2102,6 +2172,7 @@ impl RequestDeduplication {
             } => {
                 let keep = now.duration_since(*inserted_at) < *retention;
                 if !keep {
+                    self.release_execution_barrier();
                     decrement_atomic(&self.inflight_count);
                 }
                 keep
@@ -2288,14 +2359,27 @@ impl RequestDeduplication {
             // an externally executed response. If the replay cannot remain in
             // the bounded local cache, retain a small local tombstone so Redis
             // loss cannot turn an identical retry into another side effect.
-            entry.insert(DeduplicationEntry::ExecutionBarrier {
-                inserted_at: barrier_inserted_at,
-                retention: barrier_retention,
-                fingerprint,
-                owner_token: publisher_owner_token,
-            });
-            self.inflight_count.fetch_add(1, Ordering::Relaxed);
-            CompletedSequenceRemoval::Tombstoned
+            if self.try_reserve_execution_barrier() {
+                entry.insert(DeduplicationEntry::ExecutionBarrier {
+                    inserted_at: barrier_inserted_at,
+                    retention: barrier_retention,
+                    fingerprint,
+                    owner_token: publisher_owner_token,
+                });
+                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                CompletedSequenceRemoval::Tombstoned
+            } else {
+                // The per-key security-state budget is full. Collapse this
+                // completion into the one bounded process-global refusal
+                // deadline rather than allocating another attacker-influenced
+                // map entry or reopening the operation.
+                self.extend_execution_barrier_overflow(
+                    barrier_inserted_at,
+                    barrier_retention,
+                );
+                entry.remove();
+                CompletedSequenceRemoval::Removed
+            }
         } else {
             entry.remove();
             CompletedSequenceRemoval::Removed
@@ -2955,6 +3039,21 @@ impl Plugin for RequestDeduplication {
 
         // Periodic cleanup
         self.cleanup_local_cache();
+
+        // Per-key execution barriers are hard-capped at `max_entries`. If
+        // completed external operations overflowed that budget, one bounded
+        // process-global deadline fails every applicable idempotency-key request
+        // closed until the longest displaced completion deadline. Completed
+        // replays are intentionally not consulted here: their key might not be
+        // one of the displaced operations, and selecting by attacker-controlled
+        // request order would make the overflow state unsafe.
+        if self.execution_barrier_overflow_active() {
+            return PluginResult::Reject {
+                status_code: 503,
+                body: EXECUTION_BARRIER_CAPACITY_BODY.to_string(),
+                headers: HashMap::new(),
+            };
+        }
 
         // Check Redis first (centralized dedup across instances), then acquire
         // a Redis in-flight lock before any gateway instance can dispatch the
