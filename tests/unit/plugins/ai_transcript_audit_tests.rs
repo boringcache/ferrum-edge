@@ -4249,8 +4249,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
     );
     let saturated_after_peer_stream = saturated.status_snapshot();
     assert_eq!(
-        saturated_after_peer_stream.retained_bytes,
-        saturated_before_peer_stream.retained_bytes,
+        saturated_after_peer_stream.retained_bytes, saturated_before_peer_stream.retained_bytes,
         "peer stream markers must not acquire a retained-byte owner"
     );
     assert_eq!(
@@ -7606,7 +7605,9 @@ async fn spawn_incomplete_ack_server(
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind acknowledgement server");
-    let addr = listener.local_addr().expect("acknowledgement server address");
+    let addr = listener
+        .local_addr()
+        .expect("acknowledgement server address");
     let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
     let release = Arc::new(tokio::sync::Notify::new());
     let release_server = Arc::clone(&release);
@@ -7619,9 +7620,7 @@ async fn spawn_incomplete_ack_server(
                 return;
             }
             if socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n",
-                )
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n")
                 .await
                 .is_err()
             {
@@ -7632,9 +7631,7 @@ async fn spawn_incomplete_ack_server(
             // Dropping with fewer than Content-Length bytes makes the
             // response-body stream fail without placing collector bytes in any
             // diagnostic.
-            if reset_on_release
-                && let Ok(std_socket) = socket.into_std()
-            {
+            if reset_on_release && let Ok(std_socket) = socket.into_std() {
                 let reset_socket = socket2::Socket::from(std_socket);
                 let _ = reset_socket.set_linger(Some(std::time::Duration::ZERO));
             }
