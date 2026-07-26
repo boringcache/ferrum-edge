@@ -1155,7 +1155,7 @@ pub async fn run(
                     e, path
                 );
                 match load_config_backup(path) {
-                    Some(cfg) => {
+                    Ok(Some(cfg)) => {
                         startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);
                         if startup_config_rejected {
                             error!(
@@ -1174,10 +1174,24 @@ pub async fn run(
                         );
                         (cfg, None)
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(anyhow::anyhow!(
                             "Database load failed and no usable backup at {}: {}",
                             path,
+                            e
+                        ));
+                    }
+                    Err(backup_err) => {
+                        // Surface the backup rejection itself — collapsing parse /
+                        // version / runtime-validation failures to a generic
+                        // "no usable backup" hides the actionable diagnostics
+                        // operators need when FERRUM_DB_CONFIG_BACKUP_PATH points
+                        // at a syntactically valid but runtime-fatal snapshot.
+                        return Err(anyhow::anyhow!(
+                            "Database load failed and config backup at {} was rejected: {}. \
+                             Original database error: {}",
+                            path,
+                            backup_err,
                             e
                         ));
                     }
