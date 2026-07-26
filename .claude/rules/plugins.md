@@ -40,6 +40,12 @@ paths:
   (`commit_authentication_attempt`); anything still needing a bound inside
   chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
   digest of the complete value).
+- Exception: `request_deduplication` and `mcp_gateway` may not be effective on
+  the same proxy. A dedup replay is a finalized representation served before
+  `mcp_gateway` runs, and MCP's public-URI rewrite comes from live upstream
+  discovery state that no persisted digest can witness
+  (`request_deduplication::validate_composition`, mirrored at runtime by
+  `ResponsePresentationPolicy::Dynamic`).
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
