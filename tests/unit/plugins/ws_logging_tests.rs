@@ -1492,7 +1492,7 @@ async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv4() {
         &json!({
             "endpoint_url": format!("ws://rebind.ferrum.test:{}/logs", addr.port()),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "reconnect_delay_ms": 50,
             "buffer_capacity": 16
@@ -1537,7 +1537,7 @@ async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv6() {
         &json!({
             "endpoint_url": format!("ws://v6rebind.ferrum.test:{}/logs", addr.port()),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
             "reconnect_delay_ms": 50,
             "buffer_capacity": 16
