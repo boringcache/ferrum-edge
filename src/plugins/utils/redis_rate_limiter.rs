@@ -392,7 +392,7 @@ impl RedisConfig {
 /// a caller can still hold a string this function has never validated.
 pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
     let Ok(mut parsed) = Url::parse(raw_url) else {
-        return "[REDACTED]".to_string();
+        return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     };
     if parsed.username().is_empty() && parsed.password().is_none() {
         // Return the original bytes rather than the parser's normalization, so
@@ -401,7 +401,7 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
         return raw_url.to_string();
     }
     if parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err() {
-        return "[REDACTED]".to_string();
+        return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     }
     parsed.to_string()
 }
