@@ -80,6 +80,15 @@ fn rejects_an_implausibly_large_modulus() {
 }
 
 #[test]
+fn rejects_oversized_leading_zero_padding_before_encoding() {
+    let mut modulus = vec![0x00; 1024];
+    modulus.push(0x01);
+    let error =
+        rsa_public_key_der(&modulus, &[0x01, 0x00, 0x01]).expect_err("oversized padded modulus");
+    assert!(error.to_string().contains("RSA modulus is larger"));
+}
+
+#[test]
 fn rejects_an_implausibly_large_public_exponent() {
     let exponent = vec![0x01; 17];
     let error = rsa_public_key_der(&[0x01, 0x02], &exponent).expect_err("oversized exponent");

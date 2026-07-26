@@ -19,7 +19,9 @@ use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CryptokiError, RvError};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
-use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
+use cryptoki::object::{
+    Attribute, AttributeInfo, AttributeType, KeyType, ObjectClass, ObjectHandle,
+};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::{AuthPin, Ulong};
@@ -47,6 +49,12 @@ const MAX_RSA_MODULUS_BYTES: usize = 1024;
 /// Largest RSA public exponent accepted when reconstructing the token public
 /// key. Real exponents are 3 bytes (65537); 16 leaves generous headroom.
 const MAX_RSA_EXPONENT_BYTES: usize = 16;
+
+/// Maximum DER size of the PKCS#1 `RSAPublicKey` carried in an accepted leaf
+/// certificate. This covers the bounded modulus and exponent above plus their
+/// INTEGER and SEQUENCE headers.
+const MAX_RSA_PUBLIC_KEY_DER_BYTES: usize =
+    MAX_RSA_MODULUS_BYTES + MAX_RSA_EXPONENT_BYTES + 32;
 
 /// Size of the random challenge signed by the token when the SPKI comparison
 /// is unavailable. Fresh per attempt so a captured signature from an earlier
@@ -278,8 +286,8 @@ pub struct Pkcs11SigningKey {
     pkcs11: Pkcs11,
     /// RFC 5280 SubjectPublicKeyInfo reconstructed from the token's public RSA
     /// attributes, when the token exposes them. `None` means the token withheld
-    /// `CKA_MODULUS`/`CKA_PUBLIC_EXPONENT`, and the pairing has to be proved by
-    /// signature challenge instead.
+    /// `CKA_MODULUS`/`CKA_PUBLIC_EXPONENT` on the selected private-key object,
+    /// and the pairing has to be proved by signature challenge instead.
     public_key_spki: Option<Arc<Vec<u8>>>,
 }
 
@@ -308,26 +316,24 @@ impl Pkcs11SigningKey {
     }
 
     /// Resolve the token key and, when the token permits it, reconstruct its
-    /// SubjectPublicKeyInfo.
+    /// SubjectPublicKeyInfo from the selected private-key object.
     ///
     /// Resolving the private key keeps the pre-existing availability and
     /// ambiguity checks: an absent or multiply-matched selector is still an
     /// error before anything is published. Only the public-attribute read is
     /// best effort — `Ok(None)` means "prove the pairing another way", never
     /// "skip the proof".
+    ///
+    /// A separately selected `CKO_PUBLIC_KEY` is deliberately not trusted
+    /// here. Matching label/id attributes are metadata, not cryptographic proof
+    /// that a public object pairs with the selected private key. If the private
+    /// object withholds its public attributes, the fresh sign-and-verify
+    /// challenge against the leaf certificate is the proof.
     fn load_public_key_spki(&self) -> anyhow::Result<Option<Vec<u8>>> {
         let session = self.open_session()?;
         self.login_if_configured(&session)?;
         let private_key = self.find_private_key(&session)?;
-        if let Some(spki) = self.rsa_spki_from_object(&session, private_key) {
-            return Ok(Some(spki));
-        }
-        // Some tokens withhold the public attributes on the private key object
-        // but publish a paired CKO_PUBLIC_KEY under the same selector.
-        let Some(public_key) = self.find_public_key(&session)? else {
-            return Ok(None);
-        };
-        Ok(self.rsa_spki_from_object(&session, public_key))
+        Ok(self.rsa_spki_from_object(&session, private_key))
     }
 
     /// Reconstruct the SPKI of `object` from its RSA public attributes.
@@ -338,6 +344,36 @@ impl Pkcs11SigningKey {
     /// sound proof, so a quirky token degrades in capability and never in
     /// enforcement. Diagnostics carry only the configured selector.
     fn rsa_spki_from_object(&self, session: &Session, object: ObjectHandle) -> Option<Vec<u8>> {
+        let attribute_info = match session.get_attribute_info(
+            object,
+            &[AttributeType::Modulus, AttributeType::PublicExponent],
+        ) {
+            Ok(attribute_info) => attribute_info,
+            Err(error) => {
+                debug!(
+                    selector = %self.config.selector(),
+                    error = %error,
+                    "PKCS#11 token did not describe its RSA public attributes; proving the certificate pairing by signature challenge instead"
+                );
+                return None;
+            }
+        };
+        let lengths_are_bounded = matches!(
+            attribute_info.as_slice(),
+            [
+                AttributeInfo::Available(modulus_len),
+                AttributeInfo::Available(public_exponent_len)
+            ] if *modulus_len <= MAX_RSA_MODULUS_BYTES
+                && *public_exponent_len <= MAX_RSA_EXPONENT_BYTES
+        );
+        if !lengths_are_bounded {
+            debug!(
+                selector = %self.config.selector(),
+                "PKCS#11 token withheld or reported out-of-bounds RSA public attributes; proving the certificate pairing by signature challenge instead"
+            );
+            return None;
+        }
+
         let attributes = match session.get_attributes(
             object,
             &[AttributeType::Modulus, AttributeType::PublicExponent],
@@ -444,38 +480,6 @@ impl Pkcs11SigningKey {
         }
     }
 
-    /// Locate the paired public key object, if the token publishes exactly one
-    /// under the same selector.
-    ///
-    /// Zero or several matches yield `None` rather than an error: the private
-    /// key selection above is already unambiguous, and an ambiguous *public*
-    /// object simply means this shortcut cannot be trusted, so the pairing is
-    /// proved by signature challenge instead. Guessing which public object to
-    /// believe would weaken the proof.
-    fn find_public_key(&self, session: &Session) -> anyhow::Result<Option<ObjectHandle>> {
-        let mut template = vec![
-            Attribute::Class(ObjectClass::PUBLIC_KEY),
-            Attribute::KeyType(KeyType::RSA),
-        ];
-        if let Some(id) = self.config.id.as_ref() {
-            template.push(Attribute::Id(id.clone()));
-        }
-        if let Some(label) = self.config.label.as_ref() {
-            template.push(Attribute::Label(label.as_bytes().to_vec()));
-        }
-
-        let mut matches = session.find_objects(&template).with_context(|| {
-            format!(
-                "failed to search PKCS#11 public keys for {}",
-                self.config.selector()
-            )
-        })?;
-        match matches.len() {
-            1 => Ok(Some(matches.remove(0))),
-            _ => Ok(None),
-        }
-    }
-
     fn find_private_key(&self, session: &Session) -> anyhow::Result<ObjectHandle> {
         let mut template = vec![
             Attribute::Class(ObjectClass::PRIVATE_KEY),
@@ -488,21 +492,31 @@ impl Pkcs11SigningKey {
             template.push(Attribute::Label(label.as_bytes().to_vec()));
         }
 
-        let mut matches = session.find_objects(&template).with_context(|| {
+        let objects = session.iter_objects(&template).with_context(|| {
             format!(
-                "failed to search PKCS#11 private keys for {}",
+                "failed to start PKCS#11 private-key search for {}",
                 self.config.selector()
             )
         })?;
+        // Only zero, one, or multiple matters. Stop after two so a broken
+        // token cannot make ambiguity detection allocate one handle per match.
+        let mut matches = objects
+            .take(2)
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| {
+                format!(
+                    "failed to search PKCS#11 private keys for {}",
+                    self.config.selector()
+                )
+            })?;
         match matches.len() {
             0 => bail!(
                 "no PKCS#11 RSA private key matched {}",
                 self.config.selector()
             ),
             1 => Ok(matches.remove(0)),
-            count => bail!(
-                "{} PKCS#11 RSA private keys matched {}; refine the selector with ?label= or ?id_hex=",
-                count,
+            _ => bail!(
+                "multiple PKCS#11 RSA private keys matched {}; refine the selector with ?label= or ?id_hex=",
                 self.config.selector()
             ),
         }
@@ -726,7 +740,11 @@ pub fn leaf_rsa_public_key_der(leaf: &CertificateDer<'_>) -> anyhow::Result<Vec<
     if spki.subject_public_key.unused_bits != 0 {
         bail!("the leaf certificate public key bit string is malformed");
     }
-    Ok(spki.subject_public_key.data.to_vec())
+    let public_key = spki.subject_public_key.data.as_ref();
+    if public_key.len() > MAX_RSA_PUBLIC_KEY_DER_BYTES {
+        bail!("the leaf certificate RSA public key is larger than the supported maximum");
+    }
+    Ok(public_key.to_vec())
 }
 
 /// Encode an RFC 5280 SubjectPublicKeyInfo for the RSA public key described by
@@ -742,13 +760,13 @@ pub fn rsa_spki_der(modulus: &[u8], public_exponent: &[u8]) -> anyhow::Result<Ve
 /// Encode the PKCS#1 `RSAPublicKey ::= SEQUENCE { modulus INTEGER,
 /// publicExponent INTEGER }` structure.
 pub fn rsa_public_key_der(modulus: &[u8], public_exponent: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if strip_leading_zeros(modulus).len() > MAX_RSA_MODULUS_BYTES {
+    if modulus.len() > MAX_RSA_MODULUS_BYTES {
         bail!(
             "RSA modulus is larger than the supported maximum of {} bytes",
             MAX_RSA_MODULUS_BYTES
         );
     }
-    if strip_leading_zeros(public_exponent).len() > MAX_RSA_EXPONENT_BYTES {
+    if public_exponent.len() > MAX_RSA_EXPONENT_BYTES {
         bail!(
             "RSA public exponent is larger than the supported maximum of {} bytes",
             MAX_RSA_EXPONENT_BYTES

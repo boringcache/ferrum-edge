@@ -477,10 +477,9 @@ jobs:
           FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
           RUST_BACKTRACE: 1
 
-      # Token-key / leaf-certificate pairing coverage. Run single threaded: a
-      # `cryptoki::Pkcs11` context calls `C_Finalize` on drop, which would tear
-      # the module down underneath a concurrently running test in the same
-      # process.
+      # Token-key / leaf-certificate pairing coverage. Run single threaded:
+      # PKCS#11 module initialization and token login state are process-global
+      # on common providers, so independent test contexts must not race.
       - name: Run PKCS#11 certificate-pairing tests
         run: cargo test --features pkcs11 --test unit_tests tls::pkcs11 -- --include-ignored --test-threads=1
         env:

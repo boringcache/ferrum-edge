@@ -48,8 +48,8 @@ Finding the key is not enough. Before a certified key is published to a frontend
 
 Two proof paths, in order of preference:
 
-1. **SubjectPublicKeyInfo comparison.** Ferrum reads `CKA_MODULUS` and `CKA_PUBLIC_EXPONENT` from the selected private key — or, if the token withholds them there, from a single paired `CKO_PUBLIC_KEY` under the same selector — reconstructs the RFC 5280 SubjectPublicKeyInfo, and hands it to rustls so `CertifiedKey::keys_match()` compares it byte for byte against the leaf certificate. This reads only public attributes; no private material is requested.
-2. **Bounded sign-and-verify challenge.** If the token discloses no usable public attributes, Ferrum has the token sign one 32-byte fresh random challenge with RSA PKCS#1 v1.5 SHA-256 and verifies the signature under the leaf certificate's public key. This is a single signing operation performed once at config load, never on the request path. It requires an RSA key of 2048–8192 bits.
+1. **SubjectPublicKeyInfo comparison.** Ferrum reads `CKA_MODULUS` and `CKA_PUBLIC_EXPONENT` from the selected private-key object, reconstructs the RFC 5280 SubjectPublicKeyInfo, and hands it to rustls so `CertifiedKey::keys_match()` compares it byte for byte against the leaf certificate. Attribute sizes and DER reconstruction are bounded. This reads only public attributes; no private material is requested.
+2. **Bounded sign-and-verify challenge.** If the selected private-key object discloses no usable public attributes, Ferrum has the token sign one 32-byte fresh random challenge with RSA PKCS#1 v1.5 SHA-256 and verifies the signature under the leaf certificate's public key. A separately selected `CKO_PUBLIC_KEY` is not treated as proof because a shared label or id is metadata, not cryptographic evidence that two token objects form a pair. This is a single signing operation performed once at config load, never on the request path. It requires an RSA key of 2048–8192 bits.
 
 A mismatch, a non-RSA leaf certificate, an unparseable leaf, or a missing leaf is a hard error: the resolver or the backend client identity is never published. Errors name only the configured `pkcs11://` source and the label/`id_hex` selector already present in the configuration — never the PIN, token attribute bytes, the challenge, or the signature.
 
@@ -106,4 +106,4 @@ cargo test --features pkcs11 --test unit_tests tls::pkcs11 -- --include-ignored 
 
 Passing the first test proves Ferrum can load the configured token key and produce an RSA signature through PKCS#11. The second run proves that server TLS and backend client mTLS accept the matching token key and reject the mismatched one before publishing any identity.
 
-Run the pairing tests single threaded. A `cryptoki` context calls `C_Finalize` when it is dropped, which would tear the module down underneath another test running concurrently in the same process.
+Run the pairing tests single threaded. PKCS#11 module initialization and token login state are process-global on common providers, so independent test contexts must not race each other.
