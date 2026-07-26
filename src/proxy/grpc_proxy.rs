@@ -3440,19 +3440,25 @@ pub(crate) fn apply_remaining_grpc_timeout_header(
     headers: &mut hyper::HeaderMap,
     deadline: tokio::time::Instant,
 ) {
+    let value = remaining_grpc_timeout_header_value(deadline);
+    headers.insert("grpc-timeout", value);
+}
+
+/// Build the wire value for the remaining portion of a receipt-anchored gRPC
+/// deadline. Shared by native gRPC (`HeaderMap`) and pass-through gRPC-Web
+/// (`reqwest::RequestBuilder`) so neither transport can re-arm the original
+/// relative header on a later attempt.
+pub(crate) fn remaining_grpc_timeout_header_value(
+    deadline: tokio::time::Instant,
+) -> hyper::header::HeaderValue {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let ms = crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1);
     let timeout_val = crate::plugins::grpc_deadline::format_grpc_timeout_ms(ms.max(1));
-    match hyper::header::HeaderValue::from_str(&timeout_val) {
-        Ok(value) => {
-            headers.insert("grpc-timeout", value);
-        }
-        Err(_) => {
-            // Unreachable: the shared formatter only emits ASCII digits plus
-            // one unit letter. Keep the prior header rather than panicking on
-            // the request path.
-        }
-    }
+    // The shared formatter only emits ASCII digits plus one unit letter, all
+    // accepted by HeaderValue. Avoid unwrap/expect on the request path anyway;
+    // the minimum legal gRPC timeout is a safe fail-closed fallback.
+    hyper::header::HeaderValue::from_str(&timeout_val)
+        .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("1m"))
 }
 
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into

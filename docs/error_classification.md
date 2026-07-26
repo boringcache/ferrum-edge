@@ -41,7 +41,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | Protocol | Classifier | Input | Technique |
 |---|---|---|---|
 | HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS → bounded substring fallback inside the `is_connect()` branch |
-| HTTP/2 (direct pool) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/2 (pooled request send) | [`classify_pooled_h2_send_request_error`](../src/proxy/http2_pool.rs) | `&hyper::Error` | Hyper typed predicates → post-wire io source-chain walk → conservative `ProtocolError` fallback |
 | HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
 | gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
 | WebSocket / generic boxed | [`classify_boxed_error`](../src/retry.rs) | `&dyn Error` | Typed walk: `StreamSetupError` (TCP/UDP setup) → `tokio_tungstenite::tungstenite::Error` (RFC 6455 ConnectionClosed/AlreadyClosed/Protocol) → `io::Error` → `hyper::Error` → bounded Display/Debug fallback |
@@ -49,6 +50,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/hyper, returns `(ErrorClass, client_disconnected: bool)` |
 
 The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `request_on_wire()` flag is the **authoritative** body-on-wire signal — `connection_error` is derived directly from `!e.request_on_wire()` at H3 dispatch sites, NOT from the class. See [docs/http3.md](http3.md) for that contract.
+
+Direct-H2 pool acquisition and pooled request dispatch have different phase boundaries. Acquisition errors are pre-wire. Once a pooled sender is acquired, `hyper::Error::is_canceled()` is the only typed proof that dispatch never occurred; every other known or unknown send failure is post-wire. In particular, a connect-only class inferred from an inner I/O source is normalized to `ProtocolError`, because an inner `ConnectionRefused` or port-exhaustion errno cannot prove that an already-pooled request was never sent.
 
 ## Stream-family typed errors (`StreamSetupError`)
 

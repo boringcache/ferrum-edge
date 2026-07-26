@@ -1399,6 +1399,10 @@ fn test_pooled_h2_send_request_classifier_is_public_for_dispatch_sites() {
         src.contains("if hyper_err.is_canceled()"),
         "pooled send_request classifier must treat hyper is_canceled as pre-wire"
     );
+    assert!(
+        src.contains("return normalize_pooled_h2_send_post_wire_class(cls);"),
+        "typed source-chain errors must pass through the conservative post-wire boundary"
+    );
     let mod_src = include_str!("../../../src/proxy/mod.rs");
     assert!(
         mod_src.contains("classify_pooled_h2_send_request_error"),
@@ -1410,6 +1414,35 @@ fn test_pooled_h2_send_request_classifier_is_public_for_dispatch_sites() {
         ),
         "must not hard-code connection_error=true with ProtocolError"
     );
+}
+
+#[test]
+fn test_pooled_h2_send_source_classes_fail_closed_as_post_wire() {
+    use ferrum_edge::_test_support::normalize_pooled_h2_send_post_wire_class_for_test as normalize;
+    use ferrum_edge::retry::request_reached_wire;
+
+    for class in [
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::PortExhaustion,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let mapped = normalize(class);
+        assert_eq!(mapped, ErrorClass::ProtocolError, "{class:?}");
+        assert!(request_reached_wire(mapped), "{class:?} -> {mapped:?}");
+    }
+
+    for class in [
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::RequestError,
+    ] {
+        assert_eq!(normalize(class), class, "{class:?}");
+    }
 }
 
 #[tokio::test]
@@ -1451,6 +1484,29 @@ async fn test_remaining_grpc_timeout_header_decrements_across_attempts() {
         second_ms < first_ms,
         "second attempt must forward a strictly smaller remaining timeout \
          (first={first_ms}m second={second_ms}m) — never re-arm the original"
+    );
+}
+
+#[test]
+fn test_reqwest_grpc_timeout_forwarding_uses_remaining_deadline_on_every_attempt() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        src.matches(".map(grpc_proxy::remaining_grpc_timeout_header_value)")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must derive the outbound header from the absolute deadline"
+    );
+    assert_eq!(
+        src.matches("\"grpc-timeout\" if remaining_grpc_timeout_header.is_some() => continue")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must suppress the stale relative header"
+    );
+    assert_eq!(
+        src.matches("req_builder = req_builder.header(\"grpc-timeout\", value);")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must install one remaining-budget header"
     );
 }
 

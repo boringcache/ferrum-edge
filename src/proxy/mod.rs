@@ -26966,6 +26966,14 @@ pub(crate) async fn proxy_to_backend_retry(
     // `parse_connection_listed_from_str_map` for the spec rationale and
     // smuggling defence.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let remaining_grpc_timeout_header = request_ctx
+        .grpc_deadline_at()
+        .filter(|_| {
+            !connection_listed_strip
+                .iter()
+                .any(|name| name == "grpc-timeout")
+        })
+        .map(grpc_proxy::remaining_grpc_timeout_header_value);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -26980,10 +26988,14 @@ pub(crate) async fn proxy_to_backend_retry(
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
         }
+    }
+    if let Some(value) = remaining_grpc_timeout_header {
+        req_builder = req_builder.header("grpc-timeout", value);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -28395,6 +28407,14 @@ async fn proxy_to_backend(
     // (canonical predicate in `proxy::headers`). Also strip every header
     // NAMED in the request's `Connection` field.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let remaining_grpc_timeout_header = request_ctx
+        .grpc_deadline_at()
+        .filter(|_| {
+            !connection_listed_strip
+                .iter()
+                .any(|name| name == "grpc-timeout")
+        })
+        .map(grpc_proxy::remaining_grpc_timeout_header_value);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -28409,10 +28429,14 @@ async fn proxy_to_backend(
             n if headers_mod::is_backend_request_strip_header(n) => continue,
             n if headers_mod::is_proxy_generated_forwarding_header(n) => continue,
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
         }
+    }
+    if let Some(value) = remaining_grpc_timeout_header {
+        req_builder = req_builder.header("grpc-timeout", value);
     }
 
     // Add proxy-managed forwarding metadata.

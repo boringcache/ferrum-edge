@@ -329,6 +329,12 @@ pub mod _test_support {
         crate::proxy::direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
     }
 
+    pub fn normalize_pooled_h2_send_post_wire_class_for_test(
+        error_class: crate::retry::ErrorClass,
+    ) -> crate::retry::ErrorClass {
+        crate::proxy::http2_pool::normalize_pooled_h2_send_post_wire_class(error_class)
+    }
+
     pub fn eager_buffer_body_read_status_and_class_for_test(
         class: crate::retry::ErrorClass,
     ) -> (u16, crate::retry::ErrorClass) {
