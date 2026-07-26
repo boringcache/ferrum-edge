@@ -2112,8 +2112,11 @@ pub(crate) fn can_use_direct_http2_pool(
 ///
 /// `get_sender()` may dial or probe the backend, so callers must use this
 /// stricter predicate before opening an H2 sender. When body-size limits are
-/// enabled, the request must stay on the reqwest path so local request-size
-/// checks and deferred backend admission run before any backend interaction.
+/// enabled, ordinary (non-SNI) requests stay on the reqwest path so local
+/// request-size checks and deferred backend admission run before any backend
+/// interaction. Backend TLS SNI overrides cannot use reqwest, so callers that
+/// require direct-H2 for SNI should consult [`can_use_direct_http2_pool`]
+/// instead and enforce limits in-path (413 / 502) on the H2 sender.
 pub(crate) fn can_dispatch_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
@@ -7989,6 +7992,12 @@ impl ProxyState {
             self.env_config.http3_idle_timeout,
         );
         self.config.store(Arc::clone(&published.config));
+        // Config publications can add, remove, or repoint certificate-family
+        // sources without producing a TLS source-watcher event. Invalidate the
+        // metrics-safe snapshot only after the validated epoch is published so
+        // the next scrape refreshes against the accepted config, while rejected
+        // and unchanged candidates leave the current snapshot undisturbed.
+        crate::tls::inventory_cache::mark_stale();
     }
 
     /// Record whether the serving mode actually started an H3 listener.
@@ -8527,16 +8536,17 @@ impl ProxyState {
         let old_config = self.config.load_full();
         let mut new_config = (*old_config).clone();
 
-        // Remove deleted resources
+        // Remove deleted resources by (namespace, id) so a misrouted removal
+        // cannot delete a same-id object belonging to another namespace.
         if !result.removed_proxy_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_proxy_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .proxies
-                .retain(|p| !removed.contains(p.id.as_str()));
+                .retain(|p| !removed.contains(&(p.namespace.as_str(), p.id.as_str())));
         }
         if !result.removed_consumer_ids.is_empty() {
             let removed: std::collections::HashSet<(&str, &str)> = result
@@ -8549,46 +8559,47 @@ impl ProxyState {
             });
         }
         if !result.removed_plugin_config_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_plugin_config_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .plugin_configs
-                .retain(|pc| !removed.contains(pc.id.as_str()));
+                .retain(|pc| !removed.contains(&(pc.namespace.as_str(), pc.id.as_str())));
             for proxy in &mut new_config.proxies {
-                proxy
-                    .plugins
-                    .retain(|assoc| !removed.contains(assoc.plugin_config_id.as_str()));
+                proxy.plugins.retain(|assoc| {
+                    !removed.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                });
             }
         }
         if !result.removed_upstream_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_upstream_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .upstreams
-                .retain(|u| !removed.contains(u.id.as_str()));
+                .retain(|u| !removed.contains(&(u.namespace.as_str(), u.id.as_str())));
         }
 
         // Upsert added/modified resources using HashMap index for O(1) lookups
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
         if !result.added_or_modified_proxies.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (p.id.clone(), i))
+                .map(|(i, p)| ((p.namespace.clone(), p.id.clone()), i))
                 .collect();
             for proxy in result.added_or_modified_proxies {
-                if let Some(&pos) = idx.get(&proxy.id) {
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.proxies[pos] = proxy;
                 } else {
-                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
             }
@@ -8613,34 +8624,36 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_plugin_configs.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .plugin_configs
                 .iter()
                 .enumerate()
-                .map(|(i, pc)| (pc.id.clone(), i))
+                .map(|(i, pc)| ((pc.namespace.clone(), pc.id.clone()), i))
                 .collect();
             for pc in result.added_or_modified_plugin_configs {
-                if let Some(&pos) = idx.get(&pc.id) {
+                let key = (pc.namespace.clone(), pc.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.plugin_configs[pos] = pc;
                 } else {
-                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    idx.insert(key, new_config.plugin_configs.len());
                     new_config.plugin_configs.push(pc);
                 }
             }
         }
 
         if !result.added_or_modified_upstreams.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .upstreams
                 .iter()
                 .enumerate()
-                .map(|(i, u)| (u.id.clone(), i))
+                .map(|(i, u)| ((u.namespace.clone(), u.id.clone()), i))
                 .collect();
             for upstream in result.added_or_modified_upstreams {
-                if let Some(&pos) = idx.get(&upstream.id) {
+                let key = (upstream.namespace.clone(), upstream.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.upstreams[pos] = upstream;
                 } else {
-                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    idx.insert(key, new_config.upstreams.len());
                     new_config.upstreams.push(upstream);
                 }
             }
@@ -8954,6 +8967,40 @@ impl ProxyState {
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+
+    /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
+    /// does before it swaps, so the result is content-comparable against
+    /// [`Self::current_config`].
+    ///
+    /// `update_config` normalizes fields, resolves upstream TLS, quarantines
+    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// **before** storing the snapshot. A raw CP-delivered candidate has not
+    /// been through those node-local steps, so comparing it directly against
+    /// the applied config reports a spurious mismatch on any node whose
+    /// identity or credential state triggers one of them — most visibly a DP
+    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// plugin config exists only on the applied side.
+    ///
+    /// The ConfigSync older-cross-source identical-payload exception
+    /// (`configsync_lifecycle::authoritative_snapshot_payload_matches`) depends
+    /// on that comparison, so it must canonicalize first or the exception is
+    /// silently inert and every equivalent failover snapshot is fenced.
+    ///
+    /// Quarantine diagnostics are intentionally discarded: this is a read-only
+    /// comparison helper on a clone, and `update_config` logs them on the real
+    /// apply path.
+    pub fn canonicalize_snapshot_for_comparison(&self, config: &GatewayConfig) -> GatewayConfig {
+        let mut candidate = config.clone();
+        candidate.normalize_fields();
+        candidate.resolve_upstream_tls();
+        let _ = candidate.quarantine_invalid_hmac_credentials();
+        inject_gateway_workload_metrics_if_svid(
+            &mut candidate,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
+        candidate
     }
 }
 
@@ -11871,6 +11918,44 @@ impl EffectiveWsSizeLimits {
             max_size,
         ))
     }
+
+    /// Global frame/message capacity overflow Close when no plugin rule supplied
+    /// the binding ceiling. Bounded, non-secret empty reason (RFC 6455 1009).
+    pub(crate) fn global_capacity_close_for_error(
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                (*size, *max_size, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                (*size, *max_size, "message")
+            }
+            _ => return None,
+        };
+        Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
+pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Size,
+        // Empty reason stays within the 123-byte control-frame budget and never
+        // echoes peer-controlled or secret material.
+        reason: "".into(),
+    }
+}
+
+/// Defined idle-timeout policy Close published once for both relay halves.
+pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "idle timeout".into(),
+    }
 }
 
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
@@ -12627,6 +12712,15 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Publish one defined policy Close before cancel so
+                            // both halves attempt the same meaningful teardown
+                            // (1001) instead of asymmetric 1005/1006.
+                            let close = publish_ws_policy_close(
+                                &policy_close_ctb,
+                                &cancel_ctb,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut backend_sink, close).await;
                             break;
                         }
                     };
@@ -12794,6 +12888,25 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -12863,6 +12976,14 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Mirror of c2b: publish once, then bounded polite
+                            // write so the client observes the same 1001 Close.
+                            let close = publish_ws_policy_close(
+                                &policy_close_btc,
+                                &cancel_btc,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut ws_sink, close).await;
                             break;
                         }
                     };
@@ -13003,6 +13124,25 @@ where
                                     size,
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
@@ -27777,13 +27917,21 @@ async fn proxy_to_backend(
             retain_request_body,
             requires_request_body_buffering,
         );
-        let direct_h2_can_dispatch = can_dispatch_direct_http2_pool(
-            pool_config.enable_http2,
-            retain_request_body,
-            requires_request_body_buffering,
-            state.max_request_body_size_bytes,
-            state.max_response_body_size_bytes,
-        );
+        // Backend TLS SNI cannot fall back to reqwest. Body-size limits are
+        // enforced in-path on the direct-H2 sender / response collectors
+        // (413 / 502), so nonzero FERRUM_MAX_*_BODY_SIZE_BYTES must not
+        // disqualify SNI routes the way they do for ordinary H2 preference.
+        let direct_h2_can_dispatch = if requires_direct_h2_for_sni {
+            direct_h2_compatible
+        } else {
+            can_dispatch_direct_http2_pool(
+                pool_config.enable_http2,
+                retain_request_body,
+                requires_request_body_buffering,
+                state.max_request_body_size_bytes,
+                state.max_response_body_size_bytes,
+            )
+        };
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
@@ -27809,13 +27957,19 @@ async fn proxy_to_backend(
             );
         }
         if direct_h2_dispatch {
+            // 413 on an oversized declared Content-Length BEFORE dial/admission,
+            // matching HBONE/mesh-mTLS ordering so a capacity 503 cannot mask a
+            // size violation — especially important for SNI routes that must
+            // stay on direct-H2 under nonzero body limits.
+            if let Some(reject) =
+                oversized_request_body_dispatch_reject(state, method, headers, resolved_ip.clone())
+            {
+                return reject;
+            }
             // Gate adaptive-concurrency admission BEFORE opening the H2 sender.
             // `get_sender()` can dial the backend, so admitting afterward would
             // let a capacity-rejected request still create a connection and
-            // would hide get_sender connect failures from the limiter. Body-size
-            // limited requests intentionally do not enter this block: they must
-            // stay on the reqwest path so local 413 checks and deferred backend
-            // admission happen before any backend interaction.
+            // would hide get_sender connect failures from the limiter.
             let mut h2_admission_permits = match preacquired_backend_admission.take_or_run(
                 backend_admission_plugins,
                 request_ctx,
@@ -27942,29 +28096,32 @@ async fn proxy_to_backend(
                         );
                     }
                 };
-                return backend_dispatch_response(
-                    proxy_to_backend_http2(
-                        state,
-                        direct_h2_proxy,
-                        sender,
-                        backend_url,
-                        method,
-                        headers,
-                        request,
-                        plugins,
-                        response_decision_ctx,
-                        request_ctx.grpc_deadline_at(),
-                        stream_response,
-                        client_ip,
-                        xff_append_ip,
-                        request_is_secure,
-                        resolved_ip,
-                        ctx_bytes_sent_observed,
-                    )
-                    .await,
-                    None,
-                    h2_admission_permits.take(),
-                );
+                let (backend_resp, request_body_exceeded) = proxy_to_backend_http2(
+                    state,
+                    direct_h2_proxy,
+                    sender,
+                    backend_url,
+                    method,
+                    headers,
+                    request,
+                    plugins,
+                    response_decision_ctx,
+                    request_ctx.grpc_deadline_at(),
+                    stream_response,
+                    client_ip,
+                    xff_append_ip,
+                    request_is_secure,
+                    resolved_ip,
+                    ctx_bytes_sent_observed,
+                )
+                .await;
+                return BackendDispatchResult::Response {
+                    response: Box::new(backend_resp),
+                    retained_body: None,
+                    backend_admission_permits: h2_admission_permits.take(),
+                    request_body_exceeded,
+                    streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
+                };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
             // releasing the in-flight slot so the reqwest path below re-admits
@@ -31875,7 +32032,7 @@ pub(crate) fn response_header_deadline(
 async fn proxy_to_backend_http2(
     state: &ProxyState,
     proxy: &Proxy,
-    mut sender: hyper::client::conn::http2::SendRequest<Incoming>,
+    mut sender: crate::proxy::http2_pool::Http2Sender,
     backend_url: &str,
     method: &str,
     headers: &HashMap<String, String>,
@@ -31888,13 +32045,14 @@ async fn proxy_to_backend_http2(
     xff_append_ip: &str,
     request_is_secure: bool,
     resolved_ip: Option<String>,
-    // Shared counter for request body bytes. The H2 direct pool forwards
-    // the body via hyper without the reqwest adapter layer, so we wrap
-    // the body in `CountingIncoming` (backed by this shared counter) before
-    // building the hyper request. Summary builders read from the same
-    // `ctx.bytes_sent_observed` once the response completes.
+    // Shared counter for request body bytes. SizeLimitedIncoming increments
+    // this as frames are polled so summary builders observe streamed uploads
+    // (not just Content-Length) once the response completes.
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
-) -> retry::BackendResponse {
+) -> (
+    retry::BackendResponse,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     debug!(proxy_id = %proxy.id, backend_url = %strip_query_params(backend_url), "Proxying request via HTTP/2 pool");
 
     // Parse the backend URL
@@ -31902,35 +32060,36 @@ async fn proxy_to_backend_http2(
         Ok(u) => u,
         Err(e) => {
             error!(proxy_id = %proxy.id, error = %e, "Invalid backend URL");
-            return retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: None,
-            };
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
         }
     };
 
     // Build hyper request
     let (mut parts, body) = original_req.into_parts();
-
-    // If the client sent `Content-Length`, seed the shared request-bytes
-    // counter so the summary reflects the declared request size. The H2 direct
-    // pool forwards the body via hyper's `SendRequest`, which expects
-    // `Request<Incoming>`, so we cannot wrap with `CountingIncoming` here
-    // without changing the pool signature. For chunked/unknown-length H2
-    // requests, `bytes_sent` remains 0 on this path (accepted scope
-    // limitation documented on the field rustdoc).
-    if let Some(cl) = headers
-        .get("content-length")
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        ctx_bytes_sent_observed.fetch_max(cl, std::sync::atomic::Ordering::Release);
-    }
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
+        state.max_request_body_size_bytes
+    } else {
+        usize::MAX
+    };
+    let body = body::SizeLimitedIncoming::new_with_counter(
+        body,
+        max_request_body_size,
+        Arc::clone(&body_size_exceeded),
+        Arc::clone(ctx_bytes_sent_observed),
+    );
 
     // Set the URI
     parts.uri = uri;
@@ -31940,16 +32099,19 @@ async fn proxy_to_backend_http2(
         Ok(m) => m,
         Err(()) => {
             warn_invalid_backend_method(&proxy.id, "direct_h2", method);
-            return retry::BackendResponse {
-                status_code: 405,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: None,
-            };
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                None,
+            );
         }
     };
 
@@ -32067,20 +32229,54 @@ async fn proxy_to_backend_http2(
 
     // Send to backend with read timeout (0 = no timeout)
     let h2_send_fut = sender.send_request(backend_req);
-    let map_h2_err = {
-        let resolved_ip = resolved_ip.clone();
-        move |e: hyper::Error| {
-            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+    let request_body_too_large = || {
+        (
             retry::BackendResponse {
-                status_code: 502,
+                status_code: 413,
                 body: ResponseBody::Buffered(
-                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
-                connection_error: true,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ProtocolError),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+            },
+            None,
+        )
+    };
+    let map_h2_err = {
+        let resolved_ip = resolved_ip.clone();
+        let body_size_exceeded = Arc::clone(&body_size_exceeded);
+        move |e: hyper::Error| {
+            if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                return (
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    None,
+                );
             }
+            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+            (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ProtocolError),
+                },
+                None,
+            )
         }
     };
     let read_started_at = tokio::time::Instant::now();
@@ -32094,12 +32290,18 @@ async fn proxy_to_backend_http2(
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return map_h2_err(e),
             Err(_) => {
+                if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                    return request_body_too_large();
+                }
                 match deadline_source {
                     ResponseHeaderDeadlineSource::Client => {
-                        return client_grpc_deadline_exceeded_response_for_optional_request(
-                            ctx,
-                            headers,
-                            resolved_ip,
+                        return (
+                            client_grpc_deadline_exceeded_response_for_optional_request(
+                                ctx,
+                                headers,
+                                resolved_ip,
+                            ),
+                            None,
                         );
                     }
                     ResponseHeaderDeadlineSource::Operator => {
@@ -32108,18 +32310,21 @@ async fn proxy_to_backend_http2(
                             "HTTP/2: read timeout ({}ms) waiting for backend response",
                             proxy.backend_read_timeout_ms
                         );
-                        return retry::BackendResponse {
-                            status_code: 504,
-                            body: ResponseBody::Buffered(
-                                r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                            ),
-                            headers: HashMap::new(),
-                            // The request reached the H2 sender; this is a
-                            // response-read failure, not a connect failure.
-                            connection_error: false,
-                            backend_resolved_ip: resolved_ip,
-                            error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                        };
+                        return (
+                            retry::BackendResponse {
+                                status_code: 504,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                // The request reached the H2 sender; this is a
+                                // response-read failure, not a connect failure.
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip,
+                                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                            },
+                            None,
+                        );
                     }
                 }
             }
@@ -32136,6 +32341,32 @@ async fn proxy_to_backend_http2(
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
+    if let Some(len) =
+        declared_response_length_exceeds_limit(&resp_headers, state.max_response_body_size_bytes)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = len,
+            max_response_body_size_bytes = state.max_response_body_size_bytes,
+            "HTTP/2 backend response body exceeds configured size limit"
+        );
+        return (
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+            },
+            None,
+        );
+    }
+
     // Content-type-aware buffer -> stream downgrade (see `proxy_to_backend`).
     let stream_response = refine_stream_response_for_content_type(
         stream_response,
@@ -32147,62 +32378,77 @@ async fn proxy_to_backend_http2(
     );
 
     if stream_response {
-        retry::BackendResponse {
-            status_code: status,
-            body: ResponseBody::StreamingH2(response),
-            headers: resp_headers,
-            connection_error: false,
-            backend_resolved_ip: resolved_ip,
-            error_class: None,
-        }
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::StreamingH2(response),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            Some(body_size_exceeded),
+        )
     } else {
-        // Buffer the full response body
-        let collect =
-            collect_hyper_body_with_limit(response.into_body(), 0, proxy.backend_read_timeout_ms);
+        // Buffer the full response body, enforcing the operator size cap.
+        let collect = collect_hyper_body_with_limit(
+            response.into_body(),
+            state.max_response_body_size_bytes,
+            proxy.backend_read_timeout_ms,
+        );
         let collect_result =
             match crate::plugins::await_grpc_deadline(grpc_deadline_at, collect).await {
                 Ok(result) => result,
                 Err(()) => {
-                    return client_grpc_deadline_exceeded_response_for_optional_request(
-                        ctx,
-                        headers,
-                        resolved_ip,
+                    return (
+                        client_grpc_deadline_exceeded_response_for_optional_request(
+                            ctx,
+                            headers,
+                            resolved_ip,
+                        ),
+                        None,
                     );
                 }
             };
         let body_bytes = match collect_result {
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
-                // Defensive: cannot occur with max_size=0 (the size guard is
-                // disabled), but the proxy path must never panic — surface a
-                // 502 instead of `unreachable!` if the invariant ever breaks.
-                error!(
+                warn!(
                     proxy_id = %proxy.id,
-                    "HTTP/2 buffered body collection reported TooLarge despite max_size=0"
+                    max_response_body_size_bytes = state.max_response_body_size_bytes,
+                    "HTTP/2 buffered body collection exceeded configured size limit"
                 );
-                return retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
-                };
+                return (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend response body exceeds maximum size"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                    },
+                    None,
+                );
             }
             Err(HyperBodyCollectError::Read(e)) => {
                 error!(proxy_id = %proxy.id, error = %e, "Failed to read HTTP/2 response body");
-                return retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ProtocolError),
-                };
+                return (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                    },
+                    None,
+                );
             }
             Err(HyperBodyCollectError::ReadTimeout { timeout_ms }) => {
                 warn!(
@@ -32210,26 +32456,32 @@ async fn proxy_to_backend_http2(
                     timeout_ms = timeout_ms,
                     "HTTP/2 backend response body read timed out"
                 );
-                return retry::BackendResponse {
-                    status_code: 504,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                };
+                return (
+                    retry::BackendResponse {
+                        status_code: 504,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                    },
+                    None,
+                );
             }
         };
-        retry::BackendResponse {
-            status_code: status,
-            body: ResponseBody::Buffered(body_bytes),
-            headers: resp_headers,
-            connection_error: false,
-            backend_resolved_ip: resolved_ip,
-            error_class: None,
-        }
+        (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body_bytes),
+                headers: resp_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        )
     }
 }
 
@@ -33900,6 +34152,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;
     use crate::plugins::ai_federation::AiFederation;
@@ -42771,7 +43024,7 @@ mod tests {
                 added_or_modified_consumers: Vec::new(),
                 removed_consumer_ids: Vec::new(),
                 added_or_modified_plugin_configs: Vec::new(),
-                removed_plugin_config_ids: vec!["pc1".to_string()],
+                removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: 0,
