@@ -27,8 +27,8 @@ use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
-    chain_response_stream_inspectors, create_response_stream_inspector,
-    plugin_failure_policy, priority, validate_plugin_config,
+    chain_response_stream_inspectors, create_response_stream_inspector, plugin_failure_policy,
+    priority, validate_plugin_config,
 };
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use serde_json::{Value, json};
@@ -99,6 +99,12 @@ fn make_ctx() -> RequestContext {
 
 fn ai_request_body() -> &'static [u8] {
     br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#
+}
+
+/// An AI request that asks for an SSE response (`stream: true`), so staging
+/// publishes the shared `ai_transcript_audit.stream_request` marker.
+fn stream_request_body() -> &'static [u8] {
+    br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#
 }
 
 /// Config with an HTTP sink pointed at `endpoint`, plus caller overrides merged
@@ -937,13 +943,19 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
 
 #[tokio::test]
 async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behavior() {
+    let saturated_server = mock_sink().await;
+    let saturated_endpoint = format!("{}/ingest", saturated_server.uri());
+    // `batch_size: 1` on the shortest admitted flush interval: any record this
+    // instance leaks reaches `saturated_server` within one flush cycle, so the
+    // emptiness assertion at the end of this test cannot be satisfied merely by
+    // a slow default flush (batch 50 / 1000 ms).
     let plugin = AiTranscriptAudit::new(
         &json!({
             "mode": "metadata_only",
             "capture": {
                 "request": true,
-                "response": false,
-                "streaming_response": false
+                "response": true,
+                "streaming_response": true
             },
             "sampling": {
                 "rate": 0.0,
@@ -952,13 +964,18 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             },
             "sink": {
                 "type": "http",
-                "endpoint_url": "https://audit.example.com/x",
+                "endpoint_url": saturated_endpoint,
+                "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
                 "on_buffer_full": "reject"
             }
         }),
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let headers = json_headers();
     for index in 0..4096 {
         let mut ctx = make_ctx();
@@ -1009,14 +1026,18 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "internal candidate state must still be removed"
     );
 
+    let peer_server = mock_sink().await;
+    let peer_endpoint = format!("{}/ingest", peer_server.uri());
     let peer = AiTranscriptAudit::new(
         &config_with_sink(
-            "https://audit.example.com/x",
+            &peer_endpoint,
             json!({ "capture": { "streaming_response": true } }),
         ),
         loopback_http_client(),
     )
     .unwrap();
+    peer.start_background_tasks().expect("live start");
+    peer.commit_background_tasks();
     let mut peer_overflow = make_ctx();
     assert!(matches!(
         peer.on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body(),)
@@ -1044,6 +1065,242 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
         "a saturated instance must not erase a peer instance's staged candidate"
     );
     assert!(peer.forces_reqwest_dispatch(&peer_overflow));
+    assert!(
+        !plugin.should_buffer_response_body(&peer_overflow),
+        "a saturated instance must not buffer a response for a peer's candidate"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&peer_overflow),
+        "a saturated instance must not force reqwest dispatch for a peer's stream candidate"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_none(),
+        "a saturated instance must not tee a peer's stream"
+    );
+    // Borrowed peer `sample_hit` must not reopen stream selection on the
+    // saturated instance (the residual `MD_SAMPLE_HIT` fallback hazard).
+    peer_overflow.metadata.insert(
+        "ai_transcript_audit.sample_hit".to_string(),
+        "true".to_string(),
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_none(),
+        "shared sample_hit must not authorize a saturated instance to tee"
+    );
+    plugin
+        .capture_final_response_body(
+            &mut peer_overflow,
+            200,
+            &headers,
+            br#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )
+        .await;
+    plugin
+        .on_response_stream_terminated(&mut peer_overflow, 200, &BodyOutcome::success(0))
+        .await;
+    assert!(
+        peer.forces_reqwest_dispatch(&peer_overflow),
+        "peer must retain its staging commit capability after saturated response hooks"
+    );
+    assert!(
+        peer.response_stream_inspector(&peer_overflow, 200, Some("text/event-stream"))
+            .is_some(),
+        "peer must still be able to tee its own staged stream"
+    );
+    let mut still_saturated = make_ctx();
+    assert!(
+        matches!(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut still_saturated,
+                    &headers,
+                    ai_request_body()
+                )
+                .await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "saturated instance must remain at the 4096-entry bound"
+    );
+
+    // `request_rejected_for_sink` can preserve a prior "rejected" stamp even
+    // across a successful enqueue, so non-emission has to be proven at the sink.
+    // The peer's OWN commit is the positive control: waiting for its record to
+    // land proves the export pipeline is live and that at least one flush cycle
+    // elapsed on both identically configured (`batch_size: 1`,
+    // `flush_interval_ms: 100`) background workers. Only then does an empty
+    // `saturated_server` mean the saturated instance emitted nothing, rather
+    // than that nothing had flushed yet.
+    peer.capture_final_response_body(
+        &mut peer_overflow,
+        200,
+        &headers,
+        br#"{"choices":[{"message":{"content":"ok"}}]}"#,
+    )
+    .await;
+    assert_eq!(
+        wait_for_records(&peer_server).await.len(),
+        1,
+        "the peer that owns the staging entry must export exactly one record"
+    );
+    assert!(
+        saturated_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a saturated instance must not emit a response record for a peer's candidate"
+    );
+}
+
+/// A saturated instance owns no staging entry, but the shared
+/// `ai_transcript_audit.candidate`/`record_id` markers a peer instance published
+/// are still on the context. The reject-path refresh in `after_proxy` rewrites
+/// SHARED metadata (`stream_request`, `request_hash`) that drives the peer's
+/// buffer-vs-stream decision and its exported record, so it must stay gated on
+/// the local staging entry rather than on the borrowed marker.
+#[tokio::test]
+async fn saturated_instance_must_not_refresh_a_peer_instances_staged_request() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    for _ in 0..4096 {
+        let mut filler = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut filler, &headers, ai_request_body())
+            .await;
+    }
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut proxy_headers = json_headers();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(stream_request_body().to_vec()).unwrap(),
+    );
+    peer.before_proxy(&mut ctx, &mut proxy_headers).await;
+    let peer_request_hash = ctx
+        .metadata
+        .get("ai_transcript_audit.request_hash")
+        .cloned()
+        .expect("the peer stages the candidate and publishes its request hash");
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // The saturated instance sees the peer's shared marker but wins no permit.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut proxy_headers).await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not erase a peer instance's staged candidate"
+    );
+
+    // A request-phase terminator rewrites the body and drops `stream`. Only an
+    // instance that actually staged this request may republish that decision.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(ai_request_body().to_vec()).unwrap(),
+    );
+    let mut response_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not rewrite a peer's staged stream decision"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.request_hash"),
+        Some(&peer_request_hash),
+        "a saturated instance must not overwrite a peer's staged request hash"
+    );
+}
+
+/// The staging entry IS the instance's commit capability: `on_response_committed`
+/// consumes it with a single atomic `remove`, so a duplicated or retried commit
+/// hook — and the deferred `log` fallback behind it — can never emit a second,
+/// staging-less record for the same transaction.
+#[tokio::test]
+async fn committed_response_consumes_the_staging_permit_exactly_once() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "the first commit emits one record");
+
+    // A replayed commit hook over the same context, then the log fallback.
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let total: usize = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body.as_array().map(Vec::len))
+        .sum();
+    assert_eq!(
+        total, 1,
+        "a replayed commit hook must not emit a second record from a consumed staging entry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3898,6 +4155,173 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
         instance_b
             .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
             .is_none()
+    );
+}
+
+/// Stream reserve/tee gates require THIS instance's staging entry. A peer's
+/// shared `MD_CANDIDATE` / `MD_SAMPLE_HIT` metadata must not reserve stream
+/// capacity, force reqwest dispatch, or install a stream inspector on a
+/// saturated instance or change its retained-byte/reservation lifecycle;
+/// `StreamingCapture::Off` never tees; a locally staged sampled winner may tee
+/// and its own reservation must revoke and release normally.
+#[tokio::test]
+async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
+    let saturated = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "request": true, "response": false, "streaming_response": "sampled" },
+            "sampling": { "rate": 0.0, "always_capture_on_guardrail": false },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    for _ in 0..4096 {
+        let mut filler = make_ctx();
+        saturated
+            .on_final_request_body_with_context(&mut filler, &headers, ai_request_body())
+            .await;
+    }
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": "sampled" },
+                "sampling": { "rate": 1.0, "always_capture_on_guardrail": false },
+                "limits": { "max_stream_reservation_secs": 1 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        peer.on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sample_hit")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    assert!(matches!(
+        saturated
+            .on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    ctx.metadata.insert(
+        "ai_transcript_audit.sample_hit".to_string(),
+        "true".to_string(),
+    );
+
+    // `on_response_stream_selected` -> `stream_commit_selected`: shared marker
+    // without local staging must not reserve stream capacity or mutate retained
+    // byte / expiry accounting.
+    let saturated_before_peer_stream = saturated.status_snapshot();
+    saturated.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
+    assert!(
+        !saturated.forces_reqwest_dispatch(&ctx),
+        "peer sample_hit must not authorize stream dispatch without local staging"
+    );
+    assert!(
+        saturated
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "peer marker must not tee on a saturated instance"
+    );
+    let saturated_after_peer_stream = saturated.status_snapshot();
+    assert_eq!(
+        saturated_after_peer_stream.retained_bytes,
+        saturated_before_peer_stream.retained_bytes,
+        "peer stream markers must not acquire a retained-byte owner"
+    );
+    assert_eq!(
+        saturated_after_peer_stream.stream_reservations_expired,
+        saturated_before_peer_stream.stream_reservations_expired,
+        "peer stream markers must not create a revocable reservation"
+    );
+
+    // `StreamingCapture::Off` never tees, even when this instance staged.
+    let off = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": false, "response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut off_ctx = make_ctx();
+    off.on_final_request_body_with_context(&mut off_ctx, &headers, ai_request_body())
+        .await;
+    assert!(
+        !off.forces_reqwest_dispatch(&off_ctx),
+        "streaming off must not force reqwest dispatch"
+    );
+    assert!(
+        off.response_stream_inspector(&off_ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "streaming off must not tee SSE"
+    );
+
+    // Sampled mode with an owned winning roll may tee. Its reservation owns
+    // only this instance's accounting and expiry must synchronously revoke the
+    // capture before releasing those bytes.
+    assert!(
+        peer.forces_reqwest_dispatch(&ctx),
+        "locally staged sampled winner must tee"
+    );
+    let peer_before_reservation = peer.status_snapshot();
+    peer.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
+    let mut peer_inspector = peer
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("locally staged sampled winner must install a stream inspector");
+    let peer_probe = peer
+        .stream_capture_probe(&ctx)
+        .expect("owned stream must publish a local lifecycle slot");
+    let peer_chunk = vec![b'p'; 4096];
+    let _ = peer_inspector.on_chunk(&peer_chunk).await;
+    let peer_during_reservation = peer.status_snapshot();
+    assert!(
+        peer_during_reservation
+            .retained_bytes
+            .saturating_sub(peer_before_reservation.retained_bytes)
+            >= peer_during_reservation.max_entry_retained_bytes,
+        "fail-open stream capture must reserve the complete retained-record charge before copying"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+    let revoked = peer_probe
+        .snapshot()
+        .expect("the live inspector retains only its revoked slot");
+    assert!(revoked.revoked);
+    assert_eq!(revoked.retained_capture_bytes, 0);
+    let peer_after_expiry = peer.status_snapshot();
+    assert_eq!(peer_after_expiry.retained_bytes, 0);
+    assert_eq!(peer_after_expiry.stream_reservations_expired, 1);
+
+    drop(peer_inspector);
+    peer.on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(4096))
+        .await;
+    assert!(
+        peer_probe.snapshot().is_none(),
+        "terminal claim must release the revoked slot after accounting is gone"
     );
 }
 
@@ -7285,7 +7709,7 @@ async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
                     "endpoint_url": endpoint.clone(),
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
-                    "flush_interval_ms": 50,
+                    "flush_interval_ms": 100,
                     // Count capacity stays far above what the byte budget admits.
                     "buffer_capacity": 10000,
                     "max_retries": 0
@@ -7355,7 +7779,7 @@ async fn serialized_record_bytes_are_exactly_charged_during_delivery() {
                     "endpoint_url": endpoint.clone(),
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
-                    "flush_interval_ms": 50,
+                    "flush_interval_ms": 100,
                     "max_retries": 0
                 }
             }),
@@ -7432,7 +7856,7 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
                     "endpoint_url": endpoint.clone(),
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
-                    "flush_interval_ms": 50,
+                    "flush_interval_ms": 100,
                     "buffer_capacity": 10000,
                     "max_retries": 0
                 }
@@ -7601,7 +8025,7 @@ async fn fail_closed_reservation_covers_the_full_serialized_entry_charge() {
                     "endpoint_url": endpoint.clone(),
                     "allow_insecure_loopback": true,
                     "batch_size": 1,
-                    "flush_interval_ms": 50,
+                    "flush_interval_ms": 100,
                     "buffer_capacity": 10000,
                     "max_retries": 0,
                     "on_buffer_full": "reject"
@@ -7783,13 +8207,9 @@ async fn expired_stream_revokes_capture_and_hash_work_while_forwarding() {
     plugin
         .on_final_request_body_with_context(&mut stuck, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = create_response_stream_inspector(
-        &plugins,
-        &mut stuck,
-        200,
-        Some("text/event-stream"),
-    )
-    .expect("inspector");
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut stuck, 200, Some("text/event-stream"))
+            .expect("inspector");
     let probe = plugin
         .stream_capture_probe(&stuck)
         .expect("registered capture probe");
@@ -7877,13 +8297,9 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
         plugin
             .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
             .await;
-        let mut inspector = create_response_stream_inspector(
-            &plugins,
-            &mut ctx,
-            200,
-            Some("text/event-stream"),
-        )
-        .expect("cohort inspector");
+        let mut inspector =
+            create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+                .expect("cohort inspector");
         let cohort_chunk = vec![b'c'; 8192];
         let _ = inspector.on_chunk(&cohort_chunk).await;
         probes.push(
@@ -7906,18 +8322,14 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
     let mut second_cohort = make_ctx();
     plugin
-        .on_final_request_body_with_context(
-            &mut second_cohort,
-            &json_headers(),
-            ai_request_body(),
-        )
+        .on_final_request_body_with_context(&mut second_cohort, &json_headers(), ai_request_body())
         .await;
     assert_eq!(plugin.status_snapshot().stream_reservations_expired, 3);
     assert!(
         probes.iter().all(|probe| {
-            probe.snapshot().is_some_and(|snapshot| {
-                snapshot.revoked && snapshot.retained_capture_bytes == 0
-            })
+            probe
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.revoked && snapshot.retained_capture_bytes == 0)
         }),
         "every expired inspector must release its capture window"
     );
@@ -7947,9 +8359,9 @@ async fn repeated_expired_stream_cohorts_cannot_bypass_retained_capacity() {
     }
     assert!(
         probes.iter().all(|probe| {
-            probe.snapshot().is_some_and(|snapshot| {
-                snapshot.revoked && snapshot.retained_capture_bytes == 0
-            })
+            probe
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.revoked && snapshot.retained_capture_bytes == 0)
         }),
         "old cohorts must not recapture after their accounting was released"
     );
@@ -7999,25 +8411,15 @@ async fn late_normal_termination_emits_exactly_one_safe_expiry_fallback() {
 
     let request_marker = "expired-request-MUST-NOT-EXPORT";
     let response_marker = "expired-response-MUST-NOT-EXPORT";
-    let request = format!(
-        r#"{{"model":"gpt","messages":[{{"content":"{request_marker}"}}]}}"#
-    );
+    let request = format!(r#"{{"model":"gpt","messages":[{{"content":"{request_marker}"}}]}}"#);
     let response = format!("data: {{\"content\":\"{response_marker}\"}}\n\n");
     let mut ctx = make_ctx();
     plugin
-        .on_final_request_body_with_context(
-            &mut ctx,
-            &json_headers(),
-            request.as_bytes(),
-        )
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), request.as_bytes())
         .await;
-    let mut inspector = create_response_stream_inspector(
-        &plugins,
-        &mut ctx,
-        200,
-        Some("text/event-stream"),
-    )
-    .expect("inspector");
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
     let _ = inspector.on_chunk(response.as_bytes()).await;
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
@@ -8081,17 +8483,11 @@ async fn abnormal_post_expiry_drop_cannot_leak_or_double_emit() {
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
         .await;
-    let mut inspector = create_response_stream_inspector(
-        &plugins,
-        &mut ctx,
-        200,
-        Some("text/event-stream"),
-    )
-    .expect("inspector");
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
     let _ = inspector.on_chunk(b"abnormal-secret").await;
-    let probe = plugin
-        .stream_capture_probe(&ctx)
-        .expect("capture probe");
+    let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
 
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
     drop(inspector);
@@ -8261,9 +8657,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let probe = plugin
-        .stream_capture_probe(&ctx)
-        .expect("capture probe");
+    let probe = plugin.stream_capture_probe(&ctx).expect("capture probe");
     let chunk = vec![b'r'; 6000];
     match inspector.on_chunk(&chunk).await {
         ResponseStreamAction::Forward(forwarded) => {
@@ -8284,11 +8678,7 @@ async fn redacted_stream_accumulation_stops_at_scan_bound() {
     let _ = inspector.on_end().await;
     drop(inspector);
     plugin
-        .on_response_stream_terminated(
-            &mut ctx,
-            200,
-            &BodyOutcome::success(chunk.len() as u64),
-        )
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
