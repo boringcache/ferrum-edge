@@ -89,7 +89,10 @@ fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
             .as_ref()
             .map(|revision| revision.authority.clone())
             .unwrap_or_default(),
-        config_sequence: slice.revision.as_ref().map_or(0, |revision| revision.sequence),
+        config_sequence: slice
+            .revision
+            .as_ref()
+            .map_or(0, |revision| revision.sequence),
     }
 }
 

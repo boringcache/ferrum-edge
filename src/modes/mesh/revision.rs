@@ -552,7 +552,8 @@ impl MeshRevisionGate {
         };
         let consecutive = match state.quarantined.as_ref() {
             Some(previous)
-                if previous.authority == authority && previous.reason == reason.as_metric_label() =>
+                if previous.authority == authority
+                    && previous.reason == reason.as_metric_label() =>
             {
                 previous.consecutive.saturating_add(1)
             }

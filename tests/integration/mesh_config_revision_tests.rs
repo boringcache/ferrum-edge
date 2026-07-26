@@ -118,7 +118,10 @@ fn client_config() -> NativeMeshClientConfig {
 /// which is precisely the multi-CP failover shape.
 fn consumer_for(state: MeshRuntimeState) -> NativeMeshConfigConsumer {
     let request = client_config().subscribe_request(ferrum_edge::FERRUM_VERSION);
-    NativeMeshConfigConsumer::new(state, MeshUpdateExpectation::from_subscribe_request(&request))
+    NativeMeshConfigConsumer::new(
+        state,
+        MeshUpdateExpectation::from_subscribe_request(&request),
+    )
 }
 
 fn installed_version(state: &MeshRuntimeState) -> Option<String> {
@@ -211,7 +214,9 @@ fn malformed_authorities_are_treated_as_absent() {
 #[test]
 fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
     let gate = MeshRevisionGate::new();
-    let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).expect("fixture time");
+    let now = Utc
+        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), now)
         .expect("bootstrap installs");
@@ -219,10 +224,7 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
     let rejection = gate
         .admit(Some(&revision("db", 99)), now)
         .expect_err("an older revision is quarantined");
-    assert_eq!(
-        rejection.reason(),
-        MeshRevisionRejectReason::StaleRevision
-    );
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
     assert!(
         rejection.terminates_stream(),
         "a lagging CP's whole view is behind; the stream must fail over"
@@ -265,7 +267,9 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 300,
     });
-    let t0 = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).expect("fixture time");
+    let t0 = Utc
+        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), t0)
         .expect("bootstrap installs");
@@ -320,7 +324,9 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     gate.set_policy(MeshRevisionPolicy {
         foreign_authority_adopt_secs: 0,
     });
-    let t0 = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).expect("fixture time");
+    let t0 = Utc
+        .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), t0)
         .expect("bootstrap installs");
@@ -365,10 +371,7 @@ fn install_slice_quarantines_a_stale_slice_without_touching_live_state() {
     let rejection = outcome
         .rejection()
         .expect("an older revision must be quarantined");
-    assert_eq!(
-        rejection.reason(),
-        MeshRevisionRejectReason::StaleRevision
-    );
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
 
     assert_eq!(installed_version(&state).as_deref(), Some("v-100"));
     assert_eq!(
@@ -561,12 +564,9 @@ fn envelope_revision_must_match_the_slice_revision() {
         config_sequence: 1_000,
         ..update_for(&slice)
     };
-    let rejection = validate_mesh_config_update(
-        &forged_sequence,
-        &expected,
-        MeshUpdateConsumer::Native,
-    )
-    .expect_err("an envelope claiming a different sequence is refused");
+    let rejection =
+        validate_mesh_config_update(&forged_sequence, &expected, MeshUpdateConsumer::Native)
+            .expect_err("an envelope claiming a different sequence is refused");
     assert_eq!(
         rejection.reason(),
         MeshUpdateRejectReason::EnvelopeRevisionMismatch
@@ -578,13 +578,9 @@ fn envelope_revision_must_match_the_slice_revision() {
         ..update_for(&slice)
     };
     assert_eq!(
-        validate_mesh_config_update(
-            &dropped_authority,
-            &expected,
-            MeshUpdateConsumer::Native
-        )
-        .expect_err("dropping the envelope revision is a mismatch, not an exemption")
-        .reason(),
+        validate_mesh_config_update(&dropped_authority, &expected, MeshUpdateConsumer::Native)
+            .expect_err("dropping the envelope revision is a mismatch, not an exemption")
+            .reason(),
         MeshUpdateRejectReason::EnvelopeRevisionMismatch
     );
 

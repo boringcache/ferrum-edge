@@ -1016,14 +1016,13 @@ pub async fn run(
     // startup so every snapshot this CP publishes — startup load, poll delta,
     // full reload — advertises the same authority.
     let mesh_config_authority = resolve_mesh_config_authority(&env_config);
-    let (config, initial_change_sequences) =
-        load_full_config_multi_with_sequence(
-            db.as_ref(),
-            &polled_namespaces,
-            mesh_config_authority.as_deref(),
-            0,
-        )
-        .await?;
+    let (config, initial_change_sequences) = load_full_config_multi_with_sequence(
+        db.as_ref(),
+        &polled_namespaces,
+        mesh_config_authority.as_deref(),
+        0,
+    )
+    .await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers, {} plugins, {} upstreams across {} namespace(s)",
         config.proxies.len(),

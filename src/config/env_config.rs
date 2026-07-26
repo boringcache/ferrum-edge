@@ -2499,8 +2499,8 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
-            mesh_config_authority_id:
-                crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string(),
+            mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
+                .to_string(),
             mesh_config_revision_adopt_secs:
                 crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
