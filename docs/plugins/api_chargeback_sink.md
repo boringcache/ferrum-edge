@@ -369,15 +369,18 @@ counted (`chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
 created with private permissions, written as process/generation-attributed
 `*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
-directory-fsynced on Unix. A Unix parent-directory open or fsync failure is a
-**write failure**: Ferrum removes the temp/final path, performs a second real
-parent-directory fsync, and returns the error before any snapshot baseline
-commit. If rollback removal or its second fsync also fails, that failure is
-included in the returned diagnostic rather than claiming a guaranteed rollback.
-On platforms that cannot fsync directories (notably Windows) a successful file
-sync plus rename is the durability boundary this plugin can offer, and that limit
-is stated rather than claimed away — there is no silent "best-effort" success
-after a failed directory sync on Unix.
+directory-fsynced on Unix. The `spool.meta.json` ownership manifest uses the same
+attributed temp name, so two generations or two processes sharing the volume can
+never collide on one manifest temp and unlink each other's in-progress write. A
+Unix parent-directory open or fsync failure is a **write failure**: Ferrum
+removes the temp/final path, performs a second real parent-directory fsync, and
+returns the error before any snapshot baseline commit. If rollback removal or its
+second fsync also fails, that failure is included in the returned diagnostic
+rather than claiming a guaranteed rollback. On platforms that cannot fsync
+directories (notably Windows) a successful file sync plus rename is the
+durability boundary this plugin can offer, and that limit is stated rather than
+claimed away — there is no silent "best-effort" success after a failed directory
+sync on Unix.
 
 Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
 and stale-temp cleanup use non-following metadata), proves the managed root

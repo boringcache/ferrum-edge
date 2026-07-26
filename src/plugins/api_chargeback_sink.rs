@@ -5366,7 +5366,15 @@ impl SpoolManager {
         let bytes = serde_json::to_vec_pretty(&meta).map_err(|error| {
             format!("{PLUGIN_NAME}: failed to serialize spool namespace metadata: {error}")
         })?;
-        let tmp = path.with_extension("json.tmp");
+        // Attribute the manifest temp to this process and generation like every
+        // other managed temp. A fixed `spool.meta.json.tmp` is the same name for
+        // every peer, so a concurrent first prepare by another generation or
+        // another process sharing the volume would collide on `create_new` and
+        // then unlink the live writer's temp during rollback — exactly the
+        // cross-writer clobber the rest of this protocol forbids. The attributed
+        // name is also recognized by `reconcile_stale_temp_files`, so a crash
+        // leftover is reclaimed and quota-accounted instead of leaking.
+        let tmp = spool_write_temp_path(&path, self.generation)?;
         self.assert_managed_path(&tmp)?;
         let _live = LiveSpoolPathGuard::new(tmp.clone());
         write_private_file_atomically_with_ops(&tmp, &path, &bytes, self.fs_ops)

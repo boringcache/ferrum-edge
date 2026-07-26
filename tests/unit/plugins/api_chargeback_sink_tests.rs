@@ -3604,6 +3604,39 @@ fn reload_generation_does_not_delete_a_live_peer_temp() {
 }
 
 #[test]
+fn manifest_write_does_not_collide_with_a_peer_manifest_temp() {
+    let temp = tempfile::tempdir().unwrap();
+    let spec = test_owner_spec("node-a");
+    let root = SpoolManager::namespace_root_path_for_tests(temp.path(), &spec).unwrap();
+    fs::create_dir_all(&root).unwrap();
+
+    // A peer generation or peer process sharing this volume is mid-publish on
+    // its own ownership manifest. A fixed `spool.meta.json.tmp` would make this
+    // path the same name for every writer: `create_new` would fail and the
+    // rollback would then unlink the peer's live temp and the manifest itself.
+    let peer_tmp = root.join("spool.meta.json.tmp");
+    fs::write(&peer_tmp, b"peer in-progress manifest").unwrap();
+
+    let spool = SpoolManager::for_tests_with_owner(spool_settings(temp.path(), 1 << 20), &spec, 41)
+        .unwrap();
+    let manifest = spool.namespace_root_for_tests().join("spool.meta.json");
+
+    assert!(
+        peer_tmp.exists(),
+        "publishing the ownership manifest must not unlink a peer writer's temp"
+    );
+    assert_eq!(
+        fs::read(&peer_tmp).unwrap(),
+        b"peer in-progress manifest".to_vec(),
+        "a peer writer's manifest temp must not be truncated or overwritten"
+    );
+    assert!(
+        manifest.is_file(),
+        "the ownership manifest must still be published"
+    );
+}
+
+#[test]
 fn admission_eviction_never_unlinks_a_live_peer_generation_temp() {
     let temp = tempfile::tempdir().unwrap();
     let spec = test_owner_spec("node-a");
@@ -4339,9 +4372,7 @@ fn unbound_scan_shares_one_entry_budget_across_sibling_namespaces() {
 
     let mut records = Vec::new();
     for index in 1..=4 {
-        let day = plugin_dir
-            .join(format!("o{index:032x}"))
-            .join("20260101");
+        let day = plugin_dir.join(format!("o{index:032x}")).join("20260101");
         fs::create_dir_all(&day).unwrap();
         let record = day.join(format!("{index:026}.ndjson"));
         fs::write(&record, b"{\"event_id\":\"orphan\"}\n").unwrap();
