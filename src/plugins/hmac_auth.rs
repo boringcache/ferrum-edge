@@ -51,7 +51,6 @@ use std::fmt;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
-use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
     self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
 };
@@ -780,23 +779,20 @@ async fn run_hmac_auth(
             body,
             headers: std::collections::HashMap::new(),
         },
-        // Route the prebuffered-body success through the shared commit boundary
-        // instead of assigning identity directly, so this path gets the same
-        // blank-principal filtering and the same same-principal binding check as
-        // every other mechanism.
-        Some(Ok(consumer)) => match auth_flow::commit_authentication_attempt(
-            ctx,
-            AuthenticationAttempt::new(),
-            VerifyOutcome::consumer(consumer),
-            mechanism.mechanism_name(),
-            false,
-        ) {
-            Ok(_) => super::PluginResult::Continue,
-            Err(rejection) => auth_flow::reject_for_verify_outcome(
-                rejection,
-                <HmacAuth as auth_flow::AuthMechanism>::authentication_challenge(mechanism),
-            ),
-        },
+        Some(Ok(consumer)) => {
+            if ctx.identified_consumer.is_none() {
+                debug!(
+                    "{}: identified consumer '{}'",
+                    mechanism.mechanism_name(),
+                    consumer.username
+                );
+                ctx.identified_consumer = Some(consumer);
+            }
+            if ctx.auth_method.is_none() {
+                ctx.auth_method = Some(mechanism.mechanism_name());
+            }
+            super::PluginResult::Continue
+        }
     }
 }
 

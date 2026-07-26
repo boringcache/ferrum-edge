@@ -1076,12 +1076,7 @@ impl super::Plugin for JwksAuth {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_context(
-            ctx,
-            headers,
-            CLAIM_HEADER_METADATA_PREFIX,
-            &self.claim_header_destinations,
-        );
+        apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue
     }
 

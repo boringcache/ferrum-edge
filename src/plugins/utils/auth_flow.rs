@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::types::Consumer;
 use crate::consumer_index::ConsumerIndex;
@@ -83,107 +83,6 @@ pub enum VerifyOutcome {
     VerificationFailed(String),
     Forbidden(String),
     Internal(String),
-}
-
-/// Canonical identifier for the principal one accepted authentication factor
-/// proved.
-///
-/// Display names are deliberately never used for comparison: two unrelated
-/// people can share a `username` or a `name` claim, so equating principals on a
-/// display value would let one factor stand in for another. A gateway Consumer
-/// is identified by its namespace-qualified stable Consumer ID, and an external
-/// principal by the canonical identity string its mechanism verified (issuer +
-/// subject, SPIFFE ID, or equivalent) — the same value that reaches
-/// `authenticated_identity`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CanonicalPrincipal {
-    /// A gateway Consumer record, keyed on namespace + stable Consumer ID.
-    Consumer { namespace: String, id: String },
-    /// An external principal, keyed on the mechanism-canonical identity string.
-    External(String),
-}
-
-/// The canonical principal set a request has committed, or that one attempt
-/// asserts.
-///
-/// A single attempt may legitimately assert both sides at once when the
-/// mechanism itself maps an external credential onto a Consumer record. That is
-/// the only "already-supported mapping" that binds a Consumer to an external
-/// identity, because one credential proved both.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PrincipalBinding {
-    pub consumer: Option<CanonicalPrincipal>,
-    pub external: Option<CanonicalPrincipal>,
-}
-
-impl PrincipalBinding {
-    fn is_empty(&self) -> bool {
-        self.consumer.is_none() && self.external.is_none()
-    }
-}
-
-/// Canonical principal set already committed for this request.
-fn committed_principal_binding(ctx: &RequestContext) -> PrincipalBinding {
-    PrincipalBinding {
-        consumer: ctx
-            .identified_consumer
-            .as_ref()
-            .filter(|consumer| !consumer.username.trim().is_empty())
-            .map(|consumer| CanonicalPrincipal::Consumer {
-                namespace: consumer.namespace.clone(),
-                id: consumer.id.clone(),
-            }),
-        external: ctx
-            .authenticated_identity
-            .as_deref()
-            .map(str::trim)
-            .filter(|identity| !identity.is_empty())
-            .map(|identity| CanonicalPrincipal::External(identity.to_string())),
-    }
-}
-
-/// Deterministic same-principal rule for composed authentication factors.
-///
-/// A second accepted factor may only ride on an already-committed principal when
-/// it asserts *exactly* the same canonical principal set. Concretely:
-///
-/// * Consumer/Consumer — same namespace + stable Consumer ID.
-/// * external/external — byte-identical canonical identity string.
-/// * mixed Consumer/external — only when the committed attempt already bound
-///   both sides itself; a Consumer factor and a separate external factor are
-///   never assumed to describe one person.
-///
-/// Anything else is unprovable, so it fails closed rather than letting one
-/// factor's principal be retained while another factor's identity is dropped.
-fn principal_binding_matches(committed: &PrincipalBinding, incoming: &PrincipalBinding) -> bool {
-    committed == incoming
-}
-
-/// Same-principal guard for stream-lifecycle authentication.
-///
-/// `on_stream_connect` mechanisms authenticate against `StreamConnectionContext`
-/// rather than `RequestContext`, but carry the same Consumer/external identity
-/// pair, so they need the same binding rule as [`commit_authentication_attempt`].
-/// Returns `true` when committing `incoming_consumer` would compose a principal
-/// different from one already asserted for this connection.
-///
-/// Takes the already-committed identities as plain fields so this stays a pure
-/// rule with no dependency on the stream context type.
-pub fn stream_principal_binding_conflicts(
-    committed_consumer: Option<&Consumer>,
-    committed_external_identity: Option<&str>,
-    incoming_consumer: &Consumer,
-) -> bool {
-    if let Some(committed) = committed_consumer.filter(|c| !c.username.trim().is_empty()) {
-        // Compare stable Consumer identity, never the display username.
-        return committed.namespace != incoming_consumer.namespace
-            || committed.id != incoming_consumer.id;
-    }
-    // A separately asserted external principal cannot vouch for a Consumer
-    // record, so pairing the two is unprovable and fails closed.
-    committed_external_identity
-        .map(str::trim)
-        .is_some_and(|identity| !identity.is_empty())
 }
 
 impl VerifyOutcome {
@@ -312,29 +211,18 @@ async fn run_auth_impl<M: AuthMechanism>(
             allow_external_identity,
         ) {
             Ok(_) => PluginResult::Continue,
-            Err(rejection) => {
-                reject_for_verify_outcome(rejection, mechanism.authentication_challenge())
+            Err(VerifyOutcome::InvalidFormat(body))
+            | Err(VerifyOutcome::Invalid(body))
+            | Err(VerifyOutcome::ConsumerNotFound(body))
+            | Err(VerifyOutcome::VerificationFailed(body)) => {
+                reject(401, body, mechanism.authentication_challenge())
+            }
+            Err(VerifyOutcome::Forbidden(body)) => reject(403, body, None),
+            Err(VerifyOutcome::Internal(body)) => reject(500, body, None),
+            Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
+                PluginResult::Continue
             }
         },
-    }
-}
-
-/// Map a rejecting [`VerifyOutcome`] onto the shared HTTP-family status code and
-/// challenge policy. Every authentication path must use this so a
-/// principal-binding conflict, a bad credential, and a dependency failure keep
-/// one consistent client-visible contract.
-pub fn reject_for_verify_outcome(
-    outcome: VerifyOutcome,
-    challenge: Option<&'static str>,
-) -> PluginResult {
-    match outcome {
-        VerifyOutcome::InvalidFormat(body)
-        | VerifyOutcome::Invalid(body)
-        | VerifyOutcome::ConsumerNotFound(body)
-        | VerifyOutcome::VerificationFailed(body) => reject(401, body, challenge),
-        VerifyOutcome::Forbidden(body) => reject(403, body, None),
-        VerifyOutcome::Internal(body) => reject(500, body, None),
-        VerifyOutcome::Success { .. } | VerifyOutcome::NotApplicable => PluginResult::Continue,
     }
 }
 
@@ -345,16 +233,6 @@ pub fn reject_for_verify_outcome(
 /// produced no usable principal, so every staged mutation was discarded.
 /// Verification errors are returned unchanged for the caller's protocol-
 /// specific rejection mapping.
-///
-/// This is the single principal-binding boundary for every authentication path
-/// that reaches a [`RequestContext`] (HTTP/1.1, HTTP/2, HTTP/3, native gRPC,
-/// gRPC-Web, and the WebSocket upgrade all authenticate through
-/// `run_authentication_phase`). When an earlier factor already committed a
-/// principal, a later accepted factor asserting a *different* canonical
-/// principal returns `Err(VerifyOutcome::Forbidden)` instead of being silently
-/// discarded, so credentials belonging to different people can never be composed
-/// into an apparent multi-factor chain. See `principal_binding_matches` for the
-/// exact same-principal rule.
 pub fn commit_authentication_attempt(
     ctx: &mut RequestContext,
     attempt: AuthenticationAttempt,
@@ -392,44 +270,6 @@ pub fn commit_authentication_attempt(
     }
 
     let principal_already_committed = request_principal_is_committed(ctx);
-
-    // Bind composed factors to one principal. When an earlier factor already
-    // committed a principal, this factor may only proceed if it proves the very
-    // same canonical principal set. Otherwise credentials belonging to different
-    // people could be composed into an apparent AND/multi-factor chain and
-    // authorized as whichever principal happened to populate the context first.
-    //
-    // This is checked before any staged mutation is committed so a rejected
-    // composition leaves no credential cleanup or claim state behind.
-    if principal_already_committed {
-        let committed = committed_principal_binding(ctx);
-        let incoming = PrincipalBinding {
-            consumer: consumer
-                .as_ref()
-                .map(|consumer| CanonicalPrincipal::Consumer {
-                    namespace: consumer.namespace.clone(),
-                    id: consumer.id.clone(),
-                }),
-            external: external_identity
-                .as_deref()
-                .map(str::trim)
-                .filter(|identity| !identity.is_empty())
-                .map(|identity| CanonicalPrincipal::External(identity.to_string())),
-        };
-        if !incoming.is_empty() && !principal_binding_matches(&committed, &incoming) {
-            // Mechanism names only. Canonical principals are identity material
-            // (subject claims, SPIFFE IDs, Consumer IDs) and must not be logged.
-            warn!(
-                plugin = auth_method,
-                reason = "principal_binding_conflict",
-                "Rejected authentication chain composing credentials from different principals"
-            );
-            return Err(VerifyOutcome::Forbidden(
-                r#"{"error":"Authentication factors do not belong to the same principal"}"#
-                    .to_string(),
-            ));
-        }
-    }
 
     // Cleanup is additive for every accepted credential that reaches this
     // boundary. The dispatcher normally stops after its first success; direct

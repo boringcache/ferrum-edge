@@ -27,8 +27,11 @@ pub struct ClaimHeaderMapping {
 /// configuration walk and no per-request name normalization.
 #[derive(Clone, Debug, Default)]
 pub struct ClaimHeaderDestinations {
-    /// Deduplicated, sorted, lowercase destination header names.
-    names: Vec<String>,
+    /// Deduplicated, sorted owned destinations as
+    /// `(pending-claim metadata key, lowercase destination header name)`. The
+    /// metadata key is precomputed so the request path can look a destination's
+    /// staged value up directly, with no per-request formatting.
+    entries: Vec<(String, String)>,
 }
 
 impl ClaimHeaderDestinations {
@@ -40,22 +43,35 @@ impl ClaimHeaderDestinations {
     where
         I: IntoIterator<Item = &'a [ClaimHeaderMapping]>,
     {
-        let mut names: Vec<String> = mapping_groups
+        let mut entries: Vec<(String, String)> = mapping_groups
             .into_iter()
             .flatten()
-            .map(|mapping| mapping.destination_header.clone())
+            .map(|mapping| {
+                (
+                    mapping.metadata_key.clone(),
+                    mapping.destination_header.clone(),
+                )
+            })
             .collect();
-        names.sort_unstable();
-        names.dedup();
-        Self { names }
+        entries.sort_unstable();
+        entries.dedup();
+        Self { entries }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.entries.is_empty()
     }
 
-    pub fn names(&self) -> &[String] {
-        &self.names
+    /// Lowercase destination header names this instance owns.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(_, name)| name.as_str())
+    }
+
+    /// Owned destinations as `(metadata key, destination header name)` pairs.
+    fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(key, name)| (key.as_str(), name.as_str()))
     }
 }
 
@@ -122,24 +138,24 @@ pub fn emit_claim_headers_to_attempt(
 /// that owns a destination strips the client value; a later instance that shares
 /// the same destination will not erase a value an earlier instance already
 /// installed, and no instance ever touches a destination it does not own.
+///
+/// Both sanitization *and* installation are scoped to the owned destination set.
+/// Instances of the same plugin type share a `claim_headers` metadata prefix, so
+/// consuming every pending key under that prefix would let an instance that runs
+/// earlier install — and thereby drain — a value staged by the instance that
+/// actually owns and authenticated that destination; the true owner would then
+/// sanitize the value away with nothing left to reinstall.
 pub fn apply_claim_headers_from_context(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
-    metadata_prefix: &str,
     destinations: &ClaimHeaderDestinations,
 ) {
+    if destinations.is_empty() {
+        return;
+    }
     sanitize_owned_claim_header_destinations(ctx, headers, destinations);
-    let keys: Vec<String> = ctx
-        .pending_claim_headers
-        .keys()
-        .filter(|key| key.starts_with(metadata_prefix))
-        .cloned()
-        .collect();
-    for key in keys {
-        let Some(header_name) = key.strip_prefix(metadata_prefix) else {
-            continue;
-        };
-        if let Some(value) = ctx.pending_claim_headers.remove(&key) {
+    for (metadata_key, header_name) in destinations.entries() {
+        if let Some(value) = ctx.pending_claim_headers.remove(metadata_key) {
             headers.insert(header_name.to_string(), value);
         }
     }
@@ -162,8 +178,6 @@ fn sanitize_owned_claim_header_destinations(
     }
     let unclaimed: Vec<&str> = destinations
         .names()
-        .iter()
-        .map(String::as_str)
         .filter(|name| !ctx.sanitized_claim_header_destinations.contains(*name))
         .collect();
     if unclaimed.is_empty() {

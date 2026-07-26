@@ -1,12 +1,10 @@
-//! Coverage for the shared authentication-composition boundary:
-//!
-//! * `claim_headers` destinations are gateway-owned and always sanitized, so a
-//!   client-supplied value can never survive an authenticated request.
-//! * Composed authentication factors must prove the same canonical principal
-//!   before authorization runs.
+//! Coverage for gateway-owned `claim_headers` destinations
+//! (GHSA-99wm-qwwv-33v9): a plugin instance sanitizes and installs exactly the
+//! destinations it configures, so a client-supplied value can never survive an
+//! authenticated request and one instance can never consume or erase another
+//! instance's verified value.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -14,9 +12,7 @@ use serde_json::{Value, json};
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::{Consumer, default_namespace};
 use ferrum_edge::plugins::utils::auth_attempt::AuthenticationAttempt;
-use ferrum_edge::plugins::utils::auth_flow::{
-    VerifyOutcome, commit_authentication_attempt, stream_principal_binding_conflicts,
-};
+use ferrum_edge::plugins::utils::auth_flow::{VerifyOutcome, commit_authentication_attempt};
 use ferrum_edge::plugins::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
     emit_claim_headers_to_attempt, parse_claim_headers,
@@ -78,12 +74,8 @@ fn authenticate_and_apply(claims: &Value, config: &Value, headers: &mut HashMap<
     )
     .expect("attempt commits");
 
-    apply_claim_headers_from_context(&mut ctx, headers, PREFIX, &destinations);
+    apply_claim_headers_from_context(&mut ctx, headers, &destinations);
 }
-
-// ---------------------------------------------------------------------------
-// GHSA-99wm-qwwv-33v9 — gateway-owned claim-header destinations
-// ---------------------------------------------------------------------------
 
 #[test]
 fn present_claim_replaces_client_supplied_destination() {
@@ -208,7 +200,7 @@ fn provider_override_destinations_are_owned_and_sanitized() {
     let destinations = ClaimHeaderDestinations::from_mapping_groups(
         [plugin_level.as_slice(), provider_level.as_slice()],
     );
-    let owned: Vec<&str> = destinations.names().iter().map(String::as_str).collect();
+    let owned: Vec<&str> = destinations.names().collect();
     assert_eq!(
         owned,
         vec!["x-plugin-email", "x-provider-email"],
@@ -240,7 +232,7 @@ fn provider_override_destinations_are_owned_and_sanitized() {
             "attacker@example.test".to_string(),
         ),
     ]);
-    apply_claim_headers_from_context(&mut ctx, &mut headers, PREFIX, &destinations);
+    apply_claim_headers_from_context(&mut ctx, &mut headers, &destinations);
 
     assert_eq!(
         headers.get("x-provider-email").map(String::as_str),
@@ -279,7 +271,7 @@ fn a_later_instance_does_not_erase_a_shared_destination_already_installed() {
         HashMap::from([("X-Shared".to_string(), "attacker@example.test".to_string())]);
 
     // First instance sanitizes and installs the verified value.
-    apply_claim_headers_from_context(&mut ctx, &mut headers, PREFIX, &destinations);
+    apply_claim_headers_from_context(&mut ctx, &mut headers, &destinations);
     assert_eq!(
         headers.get("x-shared").map(String::as_str),
         Some("verified@example.test")
@@ -287,12 +279,78 @@ fn a_later_instance_does_not_erase_a_shared_destination_already_installed() {
 
     // A second instance sharing the destination has nothing staged; it must not
     // erase the value the first instance already installed.
-    apply_claim_headers_from_context(&mut ctx, &mut headers, PREFIX, &destinations);
+    apply_claim_headers_from_context(&mut ctx, &mut headers, &destinations);
     assert_eq!(
         headers.get("x-shared").map(String::as_str),
         Some("verified@example.test"),
         "a shared destination is claimed once per request"
     );
+}
+
+#[test]
+fn an_instance_never_installs_a_destination_owned_by_another_instance() {
+    // Two instances of the same plugin type: they share the `claim_headers`
+    // metadata prefix but own disjoint destinations. Only the second instance
+    // authenticated, so only its destination has a staged value.
+    let first_mappings = mappings(&json!({"claim_headers": {"email": "X-Instance-A-Email"}}));
+    let second_mappings = mappings(&json!({"claim_headers": {"email": "X-Instance-B-Email"}}));
+    let first =
+        ClaimHeaderDestinations::from_mapping_groups(std::iter::once(first_mappings.as_slice()));
+    let second =
+        ClaimHeaderDestinations::from_mapping_groups(std::iter::once(second_mappings.as_slice()));
+
+    let mut ctx = ctx();
+    let mut attempt = AuthenticationAttempt::new();
+    emit_claim_headers_to_attempt(
+        &mut attempt,
+        &json!({"email": "verified@example.test"}),
+        &second_mappings,
+        ",",
+    );
+    commit_authentication_attempt(
+        &mut ctx,
+        attempt,
+        VerifyOutcome::success(None, Some("alice@example.test".to_string()), None),
+        "test_auth",
+        true,
+    )
+    .expect("attempt commits");
+
+    let mut headers = HashMap::from([
+        (
+            "X-Instance-A-Email".to_string(),
+            "attacker@example.test".to_string(),
+        ),
+        (
+            "X-Instance-B-Email".to_string(),
+            "attacker@example.test".to_string(),
+        ),
+    ]);
+
+    // The non-authenticating instance runs first. It owns only its own
+    // destination, so it strips that one and must neither install nor consume
+    // the value staged for the other instance's destination.
+    apply_claim_headers_from_context(&mut ctx, &mut headers, &first);
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-instance-a-email")),
+        "the earlier instance must strip its own unfilled destination, got {headers:?}"
+    );
+
+    // The true owner still has its staged value and installs it: the earlier
+    // instance neither installed nor drained it.
+    apply_claim_headers_from_context(&mut ctx, &mut headers, &second);
+    assert_eq!(
+        headers.get("x-instance-b-email").map(String::as_str),
+        Some("verified@example.test"),
+        "the authenticated instance's verified value must survive, got {headers:?}"
+    );
+    assert!(
+        !headers.contains_key("X-Instance-B-Email"),
+        "the client's copy of the owned destination must not survive, got {headers:?}"
+    );
+    assert_eq!(headers.len(), 1, "no other header may be added: {headers:?}");
 }
 
 #[tokio::test]
@@ -336,263 +394,4 @@ async fn jwks_auth_strips_client_claim_header_when_the_token_omits_the_claim() {
         "an authenticated request without the mapped claim must not forward client input, \
          got {headers:?}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// GHSA-2xjg-2v8q-cr33 — same-principal binding for composed factors
-// ---------------------------------------------------------------------------
-
-/// Commit a second factor onto a context that already committed a principal.
-fn commit_second_factor(ctx: &mut RequestContext, outcome: VerifyOutcome) -> Result<bool, u16> {
-    commit_authentication_attempt(
-        ctx,
-        AuthenticationAttempt::new(),
-        outcome,
-        "second_factor",
-        true,
-    )
-    .map_err(|rejection| match rejection {
-        VerifyOutcome::Forbidden(_) => 403,
-        VerifyOutcome::Internal(_) => 500,
-        _ => 401,
-    })
-}
-
-fn commit_first_factor(ctx: &mut RequestContext, outcome: VerifyOutcome) {
-    commit_authentication_attempt(
-        ctx,
-        AuthenticationAttempt::new(),
-        outcome,
-        "first_factor",
-        true,
-    )
-    .expect("first factor commits");
-}
-
-#[test]
-fn mixed_consumer_and_external_factors_are_rejected() {
-    // Bob proves an external identity; Alice's Consumer credential is then
-    // composed on top. No single principal proved both factors.
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("bob@example.test".to_string()), None),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    assert_eq!(result, Err(403));
-    assert!(
-        ctx.identified_consumer.is_none(),
-        "a rejected composition must not install the second principal"
-    );
-    assert_eq!(ctx.authenticated_identity.as_deref(), Some("bob@example.test"));
-    assert_eq!(ctx.auth_method, Some("first_factor"));
-}
-
-#[test]
-fn two_different_consumers_are_rejected() {
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("bob-id", "bob"))),
-    );
-
-    assert_eq!(result, Err(403));
-    assert_eq!(
-        ctx.identified_consumer
-            .as_ref()
-            .map(|c| c.username.as_str()),
-        Some("alice")
-    );
-}
-
-#[test]
-fn two_different_external_identities_are_rejected() {
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("alice@example.test".to_string()), None),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("bob@example.test".to_string()), None),
-    );
-
-    assert_eq!(result, Err(403));
-}
-
-#[test]
-fn distinct_consumers_sharing_a_display_name_are_rejected() {
-    // Two separate Consumer records that merely happen to share a username must
-    // not be treated as one principal.
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("tenant-a-alice", "alice"))),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("tenant-b-alice", "alice"))),
-    );
-
-    assert_eq!(
-        result,
-        Err(403),
-        "principals must be compared by stable Consumer ID, not display name"
-    );
-}
-
-#[test]
-fn the_same_consumer_presented_twice_is_accepted() {
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    assert_eq!(result, Ok(true));
-    assert_eq!(
-        ctx.identified_consumer
-            .as_ref()
-            .map(|c| c.username.as_str()),
-        Some("alice")
-    );
-    assert_eq!(ctx.auth_method, Some("first_factor"));
-}
-
-#[test]
-fn the_same_external_identity_presented_twice_is_accepted() {
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("alice@example.test".to_string()), None),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("alice@example.test".to_string()), None),
-    );
-
-    assert_eq!(result, Ok(true));
-    assert_eq!(
-        ctx.authenticated_identity.as_deref(),
-        Some("alice@example.test")
-    );
-}
-
-#[test]
-fn a_single_credential_may_bind_a_consumer_and_an_external_identity() {
-    // One mechanism proved both sides, which is the only supported mapping
-    // between a Consumer and an external identity. Replaying it is accepted.
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::success(
-            Some(Arc::new(consumer("alice-id", "alice"))),
-            Some("alice@example.test".to_string()),
-            None,
-        ),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::success(
-            Some(Arc::new(consumer("alice-id", "alice"))),
-            Some("alice@example.test".to_string()),
-            None,
-        ),
-    );
-
-    assert_eq!(result, Ok(true));
-}
-
-#[test]
-fn a_factor_adding_an_unproven_external_identity_is_rejected() {
-    // The committed factor proved only a Consumer. A later factor asserting the
-    // same Consumer plus an extra external identity introduces an identity no
-    // credential in the chain vouched for.
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::success(
-            Some(Arc::new(consumer("alice-id", "alice"))),
-            Some("bob@example.test".to_string()),
-            None,
-        ),
-    );
-
-    assert_eq!(result, Err(403));
-}
-
-#[test]
-fn a_principal_less_second_factor_is_not_a_conflict() {
-    let mut ctx = ctx();
-    commit_first_factor(
-        &mut ctx,
-        VerifyOutcome::consumer(Arc::new(consumer("alice-id", "alice"))),
-    );
-
-    // Blank principals are filtered before the binding check, so this is simply
-    // "established nothing" rather than a conflicting principal.
-    let result = commit_second_factor(
-        &mut ctx,
-        VerifyOutcome::success(None, Some("   ".to_string()), None),
-    );
-
-    assert_eq!(result, Ok(false));
-    assert_eq!(
-        ctx.identified_consumer
-            .as_ref()
-            .map(|c| c.username.as_str()),
-        Some("alice")
-    );
-}
-
-#[test]
-fn stream_binding_rule_matches_the_request_rule() {
-    let alice = consumer("alice-id", "alice");
-    let bob = consumer("bob-id", "bob");
-    let alice_other_tenant = consumer("tenant-b-alice", "alice");
-
-    // Nothing committed yet.
-    assert!(!stream_principal_binding_conflicts(None, None, &alice));
-    // Same stable Consumer.
-    assert!(!stream_principal_binding_conflicts(Some(&alice), None, &alice));
-    // Different Consumer.
-    assert!(stream_principal_binding_conflicts(Some(&alice), None, &bob));
-    // Same display name, different stable ID.
-    assert!(stream_principal_binding_conflicts(
-        Some(&alice),
-        None,
-        &alice_other_tenant
-    ));
-    // A separately asserted external principal cannot vouch for a Consumer.
-    assert!(stream_principal_binding_conflicts(
-        None,
-        Some("spiffe://example.test/ns/default/sa/bob"),
-        &alice
-    ));
-    // A blank external identity is not a committed principal.
-    assert!(!stream_principal_binding_conflicts(None, Some("  "), &alice));
 }

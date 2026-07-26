@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, warn};
+use tracing::debug;
 use x509_parser::prelude::*;
 
 use crate::consumer_index::ConsumerIndex;
@@ -915,32 +915,6 @@ auth_flow::impl_auth_plugin!(
                 consumer: Some(consumer),
                 ..
             } => {
-                // Apply the shared same-principal binding rule before committing.
-                // A connection that already asserted a different Consumer or an
-                // external principal must not have this certificate's Consumer
-                // composed on top of it; stream lifecycle plugins and
-                // `effective_identity()` would then authorize one side of a
-                // conflicting identity set.
-                if auth_flow::stream_principal_binding_conflicts(
-                    ctx.identified_consumer.as_deref(),
-                    ctx.authenticated_identity.as_deref(),
-                    &consumer,
-                ) {
-                    // Mechanism only; principal identifiers are identity material.
-                    warn!(
-                        plugin = "mtls_auth",
-                        reason = "principal_binding_conflict",
-                        "Rejected stream authentication composing credentials from different \
-                         principals"
-                    );
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body:
-                            r#"{"error":"Authentication factors do not belong to the same principal"}"#
-                                .into(),
-                        headers: HashMap::new(),
-                    };
-                }
                 if ctx.identified_consumer.is_none() {
                     debug!(
                         "mtls_auth: identified stream consumer '{}'",

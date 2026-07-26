@@ -1806,12 +1806,7 @@ impl super::Plugin for OidcRelyingParty {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        apply_claim_headers_from_context(
-            ctx,
-            headers,
-            CLAIM_HEADER_METADATA_PREFIX,
-            &self.provider.claim_header_destinations,
-        );
+        apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
         PluginResult::Continue
     }
     async fn after_proxy(
@@ -3930,14 +3925,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_session_for_a_different_principal_is_rejected_without_a_rolling_cookie() {
+    async fn later_accepted_session_does_not_commit_rolling_cookie() {
         let plugin = build_plugin("https://idp.example.com/token");
         let now = chrono::Utc::now().timestamp();
         let payload = session_payload(now - 1000, now - 1000, None, now + 100_000);
         let mut ctx = ctx_with_session(&plugin, &payload);
-        // An earlier mechanism committed a different external principal, so this
-        // session composes two principals and must fail closed rather than being
-        // silently discarded (GHSA-2xjg-2v8q-cr33).
         ctx.authenticated_identity = Some("first@example.com".to_string());
         ctx.auth_method = Some("jwks_auth");
 
@@ -3945,10 +3937,7 @@ mod tests {
             plugin
                 .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
                 .await,
-            PluginResult::Reject {
-                status_code: 403,
-                ..
-            }
+            PluginResult::Continue
         ));
         assert_eq!(
             ctx.authenticated_identity.as_deref(),
