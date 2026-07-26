@@ -4467,9 +4467,10 @@ fn test_omitted_optional_fields_still_admit_defaults() {
 
 #[test]
 fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
-    const MAX_ENTRIES: usize = 32;
-    const MAX_BYTES: usize = 2_048;
+    const MAX_ENTRIES: usize = 128;
+    const MAX_BYTES: usize = 4_096; // MIN_NONCE_MAX_TOTAL_CACHE_BYTES
     const NONCE_LEN: usize = 64;
+    const BYTE_CAP_ENTRIES: usize = MAX_BYTES / NONCE_LEN;
     const THREADS: usize = 32;
     const PER_THREAD: usize = 64;
 
@@ -4489,13 +4490,11 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
 
     let barrier = Arc::new(Barrier::new(THREADS));
     let accepted = Arc::new(AtomicUsize::new(0));
-    let saturated = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::with_capacity(THREADS);
     for thread_id in 0..THREADS {
         let plugin = Arc::clone(&plugin);
         let barrier = Arc::clone(&barrier);
         let accepted = Arc::clone(&accepted);
-        let saturated = Arc::clone(&saturated);
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             for index in 0..PER_THREAD {
@@ -4506,15 +4505,16 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
                     Ok(()) => {
                         accepted.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(err) if err.contains("at capacity") => {
-                        saturated.fetch_add(1, Ordering::Relaxed);
-                    }
                     Err(err) => panic!("unexpected nonce outcome: {err}"),
                 }
                 // Caps must hold on every observation, not only at the end.
                 assert!(
                     plugin.nonce_replay_entry_count() <= MAX_ENTRIES,
                     "entry cap overshot under concurrency"
+                );
+                assert!(
+                    plugin.nonce_replay_entry_count() <= BYTE_CAP_ENTRIES,
+                    "byte-derived entry cap overshot under concurrency"
                 );
                 assert!(
                     plugin.nonce_replay_retained_bytes() <= MAX_BYTES,
@@ -4530,19 +4530,24 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
     let entries = plugin.nonce_replay_entry_count();
     let bytes = plugin.nonce_replay_retained_bytes();
     assert!(entries <= MAX_ENTRIES, "final entry count {entries} > {MAX_ENTRIES}");
+    assert!(
+        entries <= BYTE_CAP_ENTRIES,
+        "final entry count {entries} > byte cap {BYTE_CAP_ENTRIES}"
+    );
     assert!(bytes <= MAX_BYTES, "final retained bytes {bytes} > {MAX_BYTES}");
     assert_eq!(
         bytes,
         entries.saturating_mul(NONCE_LEN),
         "byte accounting must match retained keys exactly"
     );
-    assert!(
-        accepted.load(Ordering::Relaxed) >= entries,
-        "accepted claims must cover the retained set"
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        THREADS * PER_THREAD,
+        "bounded eviction must admit every distinct fresh nonce"
     );
-    assert!(
-        saturated.load(Ordering::Relaxed) > 0,
-        "adversarial flood must observe fail-closed saturation"
+    assert_eq!(
+        entries, BYTE_CAP_ENTRIES,
+        "byte cap must pin the retained set after the flood"
     );
 }
 
