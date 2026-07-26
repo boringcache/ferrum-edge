@@ -5468,12 +5468,16 @@ impl ProxyState {
     /// by [`HealthChecker::take_active_check_handles`] — they wrap the
     /// spawned active-check / passive-recovery tasks. Modes must `await`
     /// them in the per-mode background-drain phase (alongside DNS / metrics
-    /// / overload). Without that, cleanup falls back to
-    /// `Drop for HealthChecker`, which only aborts tasks once the last
-    /// `Arc<HealthChecker>` clone is dropped — at process exit, AFTER the
-    /// drain window has already closed. That late abort lets a probe
-    /// mid-`http_probe` finish its TCP / TLS / HTTP round-trip and emit
-    /// a misleading "unhealthy" log line right before tear-down.
+    /// / overload). Taking handles drains JoinHandles for await only;
+    /// `HealthChecker` retains AbortHandles so config reload can still
+    /// cancel the drained startup generation. Without that retained cancel
+    /// path, reload would orphan startup probes. Without the mode-side
+    /// await, cleanup falls back to `Drop for HealthChecker`, which only
+    /// aborts tasks once the last `Arc<HealthChecker>` clone is dropped —
+    /// at process exit, AFTER the drain window has already closed. That
+    /// late abort lets a probe mid-`http_probe` finish its TCP / TLS /
+    /// HTTP round-trip and emit a misleading "unhealthy" log line right
+    /// before tear-down.
     pub fn new(
         config: GatewayConfig,
         dns_cache: DnsCache,
@@ -5776,9 +5780,9 @@ impl ProxyState {
         // immediately before the process tears down.
         let health_check_restart_rx = health_check_shutdown_rx.clone();
         health_checker.start_with_shutdown(&config, health_check_shutdown_rx);
-        // Drain the spawned task handles BEFORE wrapping in Arc so the
-        // caller can await them in the background-drain phase. Drop is
-        // a no-op safety net once the Vec is empty.
+        // Drain JoinHandles for mode-side graceful await. AbortHandles stay
+        // with HealthChecker so config reload can still cancel this
+        // generation; Drop remains a safety net for any undrained tasks.
         let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
