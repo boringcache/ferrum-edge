@@ -2574,10 +2574,10 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // a clone of this proxy whose only delta is a clamped connect timeout —
         // a field deliberately excluded from the pool key — so it lands on the
         // SAME single-shard gRPC pool entry the request path uses, and it is
-        // spawned rather than awaited before readiness. `wait_for_probe_dial`
-        // below closes that race; without it, whether the warmup RPC reuses the
-        // probe's connection or dials its own is a coin flip, and the scripted
-        // `connection_scripts` ring is assigned by accept order.
+        // spawned rather than awaited before readiness. `wait_for_grpc_h2c_probe_pool_ready`
+        // below closes that race by waiting for the registry to record
+        // `grpc_transport.h2c = supported` (probe `get_sender` finished and
+        // inserted the sender); handshake completion alone is insufficient.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .capture_output()
         .spawn()
@@ -2591,13 +2591,11 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
 
     // Settle the startup capability probe before any traffic. It is the only
-    // thing that can dial the backend before the first RPC, so once its h2c
-    // handshake has completed the accept ring is deterministic: connection 0 is
-    // the probe (script 0), and the pooled sender for the single shard is the
-    // probe's. The bounded wait fails diagnostically if that current startup
-    // contract changes; falling through would restore the accept-order race this
-    // synchronization exists to eliminate.
-    wait_for_probe_dial(&backend, Duration::from_secs(2)).await;
+    // thing that can dial the backend before the first RPC. Wait for the
+    // registry to record h2c=supported so the probe's `get_sender` has
+    // finished and cached its sender on the single shard; only then is the
+    // accept ring deterministic (connection 0 = probe / script 0).
+    wait_for_grpc_h2c_probe_pool_ready(&harness, &backend, Duration::from_secs(5)).await;
 
     let first = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
@@ -2639,8 +2637,8 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     );
 }
 
-/// Wait until the gateway's startup backend-capability probe has completed its
-/// h2c handshake against `backend`, or `timeout` elapses.
+/// Wait until the gateway's startup h2c capability probe has finished
+/// `grpc_pool.get_sender()` and committed `grpc_transport.h2c = supported`.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
 /// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
@@ -2649,25 +2647,48 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
 /// `ScriptedGrpcBackend::connection_scripts` (assigned by accept order) or off
 /// which pooled sender the first request reuses must drain that probe first.
 ///
-async fn wait_for_probe_dial(backend: &ScriptedGrpcBackend, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if backend.handshakes_completed() >= 1 {
-            // The handshake is observable slightly before `get_sender` inserts
-            // the sender into the pool; give that insert a moment to land so
-            // the first RPC deterministically reuses the probe's connection.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+/// The registry flip is the production-observable signal that pool insertion
+/// completed. `handshakes_completed()` alone precedes `get_sender` returning
+/// and is not sufficient — a fixed sleep after handshake is nondeterministic.
+async fn wait_for_grpc_h2c_probe_pool_ready(
+    harness: &GatewayHarness,
+    backend: &ScriptedGrpcBackend,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await
+            && let Some(entries) = body["entries"].as_array()
+            && let Some(entry) = entries.first()
+            && entry["grpc_transport"]["h2c"].as_str() == Some("supported")
+        {
+            assert!(
+                backend.handshakes_completed() >= 1,
+                "h2c probe must occupy connection 0 for scripted accept ordering; \
+                 handshakes_completed={}, accepted_connections={}, \
+                 backend_step_errors={:?}",
+                backend.handshakes_completed(),
+                backend.accepted_connections(),
+                backend.step_errors().await
+            );
             return;
+        }
+        if Instant::now() >= deadline {
+            let registry = harness
+                .get_admin_json("/backend-capabilities")
+                .await
+                .unwrap_or_else(|e| json!({ "fetch_error": e.to_string() }));
+            panic!(
+                "startup h2c capability probe did not publish supported within {timeout:?}; \
+                 registry={registry:?}; handshakes_completed={}, \
+                 accepted_connections={}, backend_step_errors={:?}",
+                backend.handshakes_completed(),
+                backend.accepted_connections(),
+                backend.step_errors().await
+            );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!(
-        "startup capability probe did not complete within {timeout:?}; \
-         handshakes_completed={}, accepted_connections={}, backend_step_errors={:?}",
-        backend.handshakes_completed(),
-        backend.accepted_connections(),
-        backend.step_errors().await
-    );
 }
 
 /// #2934: retry attempts must preserve duplicate metadata field lines from

@@ -2986,9 +2986,11 @@ pub(crate) async fn proxy_grpc_request_core(
         headers.insert(hyper::header::HOST, val);
     }
 
-    // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
-    // that add/replace/remove grpc-timeout are reflected in the effective timeout.
-    // Two distinct timeout regimes:
+    // Carry forward the receipt-anchored absolute deadline from
+    // `prepare_request_deadline` (parsed before before_proxy plugins and
+    // body awaits). Post-merge header mutations do not re-arm this budget;
+    // before_proxy plugins cannot extend or re-anchor RPC time limits via
+    // grpc-timeout. Two distinct timeout regimes:
     //  * client_grpc_deadline_at — a client-supplied absolute end-to-end
     //    deadline established once at request receipt (via
     //    `prepare_request_deadline`, independent of the `grpc_deadline`
