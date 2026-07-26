@@ -16,12 +16,11 @@ use super::{
     GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
-    RouteProxySpec, SourceKind,
-    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    mesh_route_dispatch_plugin_from_rules, optional_port_field, optional_target_weight_field,
-    port_from_u64, proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route,
+    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field,
+    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
+    service_dns_name, string_array, string_field, upstream_for_route,
 };
 use crate::config::types::{PluginConfig, Proxy};
 
@@ -692,8 +691,7 @@ fn namespace_selector_expression(
         }
     };
     match operator {
-        GatewayApiNamespaceSelectorOperator::In
-        | GatewayApiNamespaceSelectorOperator::NotIn
+        GatewayApiNamespaceSelectorOperator::In | GatewayApiNamespaceSelectorOperator::NotIn
             if values.is_empty() =>
         {
             return Err(listener_validation_error(
@@ -760,9 +758,9 @@ fn valid_kubernetes_dns_subdomain(value: &str) -> bool {
 fn valid_kubernetes_label_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         && value
             .as_bytes()
             .first()

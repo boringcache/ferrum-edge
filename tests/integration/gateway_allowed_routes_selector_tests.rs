@@ -239,7 +239,10 @@ fn parser_rejects_every_malformed_selector_shape_and_operator_cardinality_atomic
             .expect_err("malformed selector must reject the whole listener");
         let message = error.to_string();
         assert!(message.starts_with("spec.listeners[].allowedRoutes.namespaces.selector"));
-        assert!(!message.contains(secret), "selector values must stay redacted");
+        assert!(
+            !message.contains(secret),
+            "selector values must stay redacted"
+        );
     }
 
     for malformed_listener in [
@@ -412,10 +415,7 @@ fn invalid_listener_does_not_block_valid_sibling_listener() {
         status["listeners"][1]["conditions"][0]["status"],
         Value::String("True".to_string())
     );
-    assert_eq!(
-        status["listeners"][1]["attachedRoutes"],
-        Value::from(1_u64)
-    );
+    assert_eq!(status["listeners"][1]["attachedRoutes"], Value::from(1_u64));
 }
 
 #[test]

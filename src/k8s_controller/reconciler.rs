@@ -1751,8 +1751,7 @@ mod tests {
             gateway_selector_reconcile_objects(json!({"matchLabels": {"team": "payments"}}));
         let valid = gateway_selector_translation(&valid_objects);
         let managed = BTreeSet::new();
-        let active =
-            merge_k8s_translation(&GatewayConfig::default(), &valid.config, &managed);
+        let active = merge_k8s_translation(&GatewayConfig::default(), &valid.config, &managed);
         assert_eq!(active.proxies.len(), 1);
 
         let invalid_objects = gateway_selector_reconcile_objects(json!({
@@ -1773,8 +1772,7 @@ mod tests {
         assert_eq!(restored.proxies.len(), 1);
 
         let route_deleted = gateway_selector_translation(&valid_objects[..2]);
-        let after_route_delete =
-            merge_k8s_translation(&restored, &route_deleted.config, &managed);
+        let after_route_delete = merge_k8s_translation(&restored, &route_deleted.config, &managed);
         assert!(after_route_delete.proxies.is_empty());
 
         let gateway_deleted = gateway_selector_translation(&valid_objects[..1]);
