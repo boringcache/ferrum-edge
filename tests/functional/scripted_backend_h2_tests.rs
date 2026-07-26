@@ -2515,23 +2515,23 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
 /// With `FERRUM_ADD_FORWARDED_HEADER=true`, the direct-H2 builder must strip a
 /// spoofed client `Forwarded` and emit exactly one gateway-owned element.
 ///
-/// Fixture notes (hosted job 89647762460 returned a 502 here): the gateway
-/// opens an unspecified number of connections to this backend before the
-/// request under test — the startup capability probe dials one through
-/// `http2_pool::get_sender()` and parks it, and `HEAD /` pool warmup dials
-/// another through the reqwest client. A *one-shot* script (the default)
-/// makes the fixture close each connection ~100ms after its final step, so
-/// whether a connection the gateway still has pooled is alive when the
-/// ownership GET dispatches becomes a wall-clock race; losing it surfaces as
-/// `502 {"error":"Backend unavailable"}` from `sender.send_request` on a
-/// pooled-but-dead connection.
+/// Fixture notes (hosted jobs 89647762460 / 89765485950 returned a 502 here):
 ///
-/// `repeat_script(true)` removes that race by construction rather than by
-/// sleeping past it: the fixture serves the happy path on a loop, so every
-/// connection accepts unbounded streams and the fixture never closes a
-/// connection the gateway may have pooled. Warmup is disabled so no `HEAD /`
-/// traffic is interleaved either — same contract as the H3 ownership sibling,
-/// which sets `FERRUM_POOL_WARMUP_ENABLED=false` and gates on the registry.
+/// 1. **Body-size gate (deterministic)**: ordinary (non-SNI) direct-H2 dispatch
+///    requires `FERRUM_MAX_{REQUEST,RESPONSE}_BODY_SIZE_BYTES=0` via
+///    `can_dispatch_direct_http2_pool`. Defaults leave those nonzero, so the
+///    request falls through to reqwest against this ALPN-`h2`-only fixture and
+///    surfaces as `502 {"error":"Backend unavailable"}` with
+///    `error sending request for url (...)` — even when the registry already
+///    shows `h2_tls=supported`. Mirror `bodyless_direct_h2_sse_response_is_governed`.
+///
+/// 2. **Pooled probe / warmup connections**: capability probing and pool
+///    warmup dial this backend before the ownership GET. A one-shot script
+///    closes those connections after its final step, so a later request that
+///    reuses a pooled sender can 502. `repeat_script(true)` keeps every
+///    accepted connection serving unbounded streams. Warmup is enabled so the
+///    registry populates; the test still gates on `h2_tls=supported` before
+///    firing the ownership GET.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
@@ -2569,12 +2569,14 @@ async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
         .file_config(yaml)
         .log_level("info")
         .capture_output()
-        // Initial capability refresh only — no pool-warmup `HEAD /` traffic
-        // against the scripted H2 fixture. With warmup disabled the startup
-        // path still runs one capability refresh pass, which is what
-        // classifies `h2_tls=supported` for the gate below (same contract as
-        // the H3 ownership regression).
-        .pool_warmup_enabled(false)
+        // Opt into capability probing (registry gate below) and zero body
+        // limits so ordinary (non-SNI) dispatch stays on the direct-H2 pool —
+        // same contract as `bodyless_direct_h2_sse_response_is_governed`.
+        // `repeat_script(true)` absorbs any warmup `HEAD /` on the same
+        // connection without tearing it down.
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
         .env("FERRUM_ADD_FORWARDED_HEADER", "true")
         .spawn()
         .await
