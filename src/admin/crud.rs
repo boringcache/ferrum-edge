@@ -759,7 +759,7 @@ async fn persist_create_to_settlement<R: AdminResource>(
     let OwnedWriteSettlementContext {
         db,
         namespace,
-        guard,
+        mut guard,
         http_client,
         state,
         actor,
@@ -902,7 +902,7 @@ async fn persist_undecodable_delete_repair<R: AdminResource>(
     let OwnedWriteSettlementContext {
         db,
         namespace,
-        mut guard,
+        guard,
         http_client: _,
         state,
         actor,
