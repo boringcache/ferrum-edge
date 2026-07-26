@@ -151,12 +151,12 @@ versions only applied partially. Three behaviors change:
   `Authorization` header is treated as authorized even when Ferrum itself
   performs no authentication (the common "forward the bearer token to a backend
   that validates it" topology). Such responses are stored only when the origin
-  sends `Cache-Control: public`, `must-revalidate`, or `s-maxage`, or when the
-  plugin sets `cache_key_include_consumer: true`. Deployments that relied on
-  caching backend-authenticated responses under a plain `max-age` will see those
-  routes go to the origin every time. Restore caching by adding the origin
-  directive (preferred, since it also keeps backend revocation effective) or by
-  setting `cache_key_include_consumer: true` on the plugin instance.
+  sends `Cache-Control: public`, `must-revalidate`, or `s-maxage`.
+  `cache_key_include_consumer` no longer overrides this origin policy; it only
+  changes cache-key partitioning. Deployments that relied on caching
+  backend-authenticated responses under a plain `max-age` will see those routes
+  go to the origin every time. Restore caching by adding an appropriate origin
+  directive so backend revocation and scope changes remain authoritative.
 - **Qualified `private` / `no-cache` field lists are enforced.** Fields named by
   `private="x-account"` / `no-cache="x-secret"` are dropped from the stored
   entry, and a malformed qualified argument (unquoted, unterminated, empty, or

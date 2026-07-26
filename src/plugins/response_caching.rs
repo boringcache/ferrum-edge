@@ -461,7 +461,8 @@ enum CacheControlArgument<'a> {
     Token(&'a str),
     /// Quoted-string argument with quoted-pairs resolved.
     Quoted(Cow<'a, str>),
-    /// Unterminated quoted string — unusable, handled conservatively.
+    /// Unterminated quoted string or non-OWS trailing junk — unusable and
+    /// handled conservatively.
     Malformed,
 }
 
@@ -544,7 +545,20 @@ fn parse_cache_control(header_value: &str) -> CacheControlDirectives {
             }
             if bytes.get(index) == Some(&b'"') {
                 match parse_quoted_string(header_value, &mut index) {
-                    Some(parsed) => argument = Some(CacheControlArgument::Quoted(parsed)),
+                    Some(parsed) => {
+                        // Only optional whitespace may follow a quoted-string
+                        // before the member delimiter. Treat trailing junk as
+                        // malformed instead of accepting a valid prefix such
+                        // as `private="x-account"junk`.
+                        while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                            index += 1;
+                        }
+                        if matches!(bytes.get(index), None | Some(b',')) {
+                            argument = Some(CacheControlArgument::Quoted(parsed));
+                        } else {
+                            argument = Some(CacheControlArgument::Malformed);
+                        }
+                    }
                     None => {
                         // Unterminated quote: the remainder of the header is
                         // uninterpretable, so stop after handling this member
@@ -1749,7 +1763,6 @@ impl ResponseCaching {
     /// [`NEVER_CACHED_RESPONSE_HEADERS`] and
     /// [`Self::stash_request_headers_snapshot`], which stores it only hashed.
     fn shared_cache_allows_authorized_response(
-        &self,
         ctx: &RequestContext,
         request_headers: &HashMap<String, String>,
         directives: &CacheControlDirectives,
@@ -1760,13 +1773,7 @@ impl ResponseCaching {
             return true;
         }
 
-        if directives.public || directives.must_revalidate || directives.s_maxage.is_some() {
-            return true;
-        }
-
-        // Documented operator opt-in: retain authenticated responses under
-        // their isolated per-credential key even without an origin opt-in.
-        self.config.cache_key_include_consumer
+        directives.public || directives.must_revalidate || directives.s_maxage.is_some()
     }
 
     /// Stash the transformed-header values `before_proxy` saw for every
@@ -2365,7 +2372,7 @@ impl Plugin for ResponseCaching {
         }
 
         let request_view = &lookup_headers.headers;
-        if !self.shared_cache_allows_authorized_response(ctx, request_view, &directives) {
+        if !Self::shared_cache_allows_authorized_response(ctx, request_view, &directives) {
             debug!(
                 "response_caching: refusing to store a response to an authorized request without \
                  an explicit shared-cache opt-in"

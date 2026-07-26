@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live request credential rather than only to a gateway-minted identity, so a
   gateway that forwards `Authorization` to a backend that validates it no longer
   retains the protected response without an explicit `public` /
-  `must-revalidate` / `s-maxage` opt-in (or `cache_key_include_consumer: true`).
+  `must-revalidate` / `s-maxage` opt-in. `cache_key_include_consumer` remains a
+  key-partition option but no longer overrides the origin's storage policy.
   Backend-side revocation, expiry, and scope changes are no longer masked for
   the entry's lifetime (GHSA-7f28-wh4x-5375).
 - `Cache-Control` is parsed with quoted-string awareness, so the qualified

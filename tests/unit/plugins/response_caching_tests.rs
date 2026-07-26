@@ -4294,17 +4294,18 @@ async fn test_backend_authenticated_bearer_stored_with_explicit_optin() {
     }
 }
 
-/// The documented operator opt-in still applies to a request whose credential
-/// only the backend understands.
+/// A local key-partition option cannot replace the origin's explicit
+/// shared-cache permission. Otherwise backend-side revocation remains masked
+/// for the entry lifetime even though credentials do not cross cache keys.
 #[tokio::test]
-async fn test_backend_authenticated_bearer_stored_under_consumer_opt_in() {
+async fn test_consumer_key_partition_does_not_override_shared_cache_admission() {
     let plugin = plugin_with_config(json!({ "cache_key_include_consumer": true }));
     let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
     let response = advisory_headers(&[("cache-control", "max-age=300")]);
 
     advisory_miss_cycle(
         &plugin,
-        "/api/consumer-optin",
+        "/api/consumer-key-partition",
         &request,
         200,
         &response,
@@ -4312,14 +4313,12 @@ async fn test_backend_authenticated_bearer_stored_under_consumer_opt_in() {
     )
     .await;
 
-    let hit = advisory_lookup(&plugin, "/api/consumer-optin", &request).await;
-    let (_, body, _) = expect_reject(hit);
-    assert_eq!(body, b"isolated");
-
-    // Still isolated per credential.
-    let other = advisory_headers(&[("authorization", "Bearer other-token")]);
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "cache_key_include_consumer only changes key partitioning and must not authorize storage"
+    );
     assert!(matches!(
-        advisory_lookup(&plugin, "/api/consumer-optin", &other).await,
+        advisory_lookup(&plugin, "/api/consumer-key-partition", &request).await,
         PluginResult::Continue
     ));
 }
@@ -4449,6 +4448,8 @@ async fn test_malformed_qualified_directives_refuse_the_whole_response() {
         "public, max-age=300, private=\"\"",
         // Member that is not a valid field name.
         "public, max-age=300, no-cache=\"bad header\"",
+        // A valid quoted prefix followed by non-OWS junk is malformed.
+        "public, max-age=300, private=\"x-account\"junk",
         // Bare spelling alongside a qualified one, either order.
         "public, max-age=300, private=\"x-account\", private",
         "public, max-age=300, private, private=\"x-account\"",
