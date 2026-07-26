@@ -12,6 +12,67 @@ use super::claim_resolver::{parse_claim_path_value, resolve_claim_path};
 pub struct ClaimHeaderMapping {
     pub claim_path: String,
     pub metadata_key: String,
+    /// Normalized (lowercase) request-header name this mapping owns. Retained
+    /// alongside `metadata_key` so the request path never has to strip the
+    /// metadata prefix to learn which destination is gateway-owned.
+    pub destination_header: String,
+}
+
+/// The complete set of request-header destinations one plugin instance owns
+/// through `claim_headers`, including every provider override.
+///
+/// `claim_headers` destinations are **gateway-owned**: after a successful
+/// authentication the gateway is the only party allowed to assert them. The set
+/// is precomputed at plugin construction so the request path performs no
+/// configuration walk and no per-request name normalization.
+#[derive(Clone, Debug, Default)]
+pub struct ClaimHeaderDestinations {
+    /// Deduplicated, sorted owned destinations as
+    /// `(pending-claim metadata key, lowercase destination header name)`. The
+    /// metadata key is precomputed so the request path can look a destination's
+    /// staged value up directly, with no per-request formatting.
+    entries: Vec<(String, String)>,
+}
+
+impl ClaimHeaderDestinations {
+    /// Union every destination reachable from one plugin instance. Callers pass
+    /// the plugin-level mappings plus each provider's override mappings, so a
+    /// provider that only overrides some destinations still contributes to the
+    /// owned set and cannot leave a stale client value behind.
+    pub fn from_mapping_groups<'a, I>(mapping_groups: I) -> Self
+    where
+        I: IntoIterator<Item = &'a [ClaimHeaderMapping]>,
+    {
+        let mut entries: Vec<(String, String)> = mapping_groups
+            .into_iter()
+            .flatten()
+            .map(|mapping| {
+                (
+                    mapping.metadata_key.clone(),
+                    mapping.destination_header.clone(),
+                )
+            })
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        Self { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Lowercase destination header names this instance owns.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(_, name)| name.as_str())
+    }
+
+    /// Owned destinations as `(metadata key, destination header name)` pairs.
+    fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(key, name)| (key.as_str(), name.as_str()))
+    }
 }
 
 pub fn parse_claim_headers(
@@ -43,6 +104,7 @@ pub fn parse_claim_headers(
         mappings.push(ClaimHeaderMapping {
             claim_path: parsed_claim_path,
             metadata_key,
+            destination_header: header_name,
         });
     }
     Ok(mappings)
@@ -62,23 +124,73 @@ pub fn emit_claim_headers_to_attempt(
     }
 }
 
+/// Install verified claim values into the backend request headers.
+///
+/// `claim_headers` destinations are gateway-owned and always sanitized: every
+/// destination this plugin instance owns is removed case-insensitively (covering
+/// duplicate and case-variant client headers) *before* any verified value is
+/// installed. A claim that is missing, null, empty, of an unusable type, or that
+/// belongs to a principal this instance did not authenticate therefore leaves the
+/// destination **absent** rather than preserving attacker-controlled client
+/// input.
+///
+/// Sanitization is claimed once per destination per request. The first instance
+/// that owns a destination strips the client value; a later instance that shares
+/// the same destination will not erase a value an earlier instance already
+/// installed, and no instance ever touches a destination it does not own.
+///
+/// Both sanitization *and* installation are scoped to the owned destination set.
+/// Instances of the same plugin type share a `claim_headers` metadata prefix, so
+/// consuming every pending key under that prefix would let an instance that runs
+/// earlier install — and thereby drain — a value staged by the instance that
+/// actually owns and authenticated that destination; the true owner would then
+/// sanitize the value away with nothing left to reinstall.
 pub fn apply_claim_headers_from_context(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
-    metadata_prefix: &str,
+    destinations: &ClaimHeaderDestinations,
 ) {
-    let keys: Vec<String> = ctx
-        .pending_claim_headers
-        .keys()
-        .filter(|key| key.starts_with(metadata_prefix))
-        .cloned()
-        .collect();
-    for key in keys {
-        let Some(header_name) = key.strip_prefix(metadata_prefix) else {
-            continue;
-        };
-        if let Some(value) = ctx.pending_claim_headers.remove(&key) {
+    if destinations.is_empty() {
+        return;
+    }
+    sanitize_owned_claim_header_destinations(ctx, headers, destinations);
+    for (metadata_key, header_name) in destinations.entries() {
+        if let Some(value) = ctx.pending_claim_headers.remove(metadata_key) {
             headers.insert(header_name.to_string(), value);
+        }
+    }
+}
+
+/// Remove every gateway-owned destination this instance still has to claim.
+///
+/// Runs before installation so an absent, wrong-type, or unusable claim can
+/// never leave a client-supplied value in place. Removal is case-insensitive
+/// because the effective `before_proxy` map is not guaranteed to be all
+/// lowercase: hyper normalizes wire field names, but plugins and transformers
+/// insert operator-cased names, so a lowercase insert alone could leave an
+/// `X-Authenticated-Email` variant beside the gateway's value.
+fn sanitize_owned_claim_header_destinations(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    destinations: &ClaimHeaderDestinations,
+) {
+    if destinations.is_empty() {
+        return;
+    }
+    headers.retain(|name, _| {
+        !destinations.names().any(|destination| {
+            !ctx.sanitized_claim_header_destinations
+                .contains(destination)
+                && name.eq_ignore_ascii_case(destination)
+        })
+    });
+    for destination in destinations.names() {
+        if !ctx
+            .sanitized_claim_header_destinations
+            .contains(destination)
+        {
+            ctx.sanitized_claim_header_destinations
+                .insert(destination.to_string());
         }
     }
 }
@@ -101,15 +213,29 @@ pub fn parse_separator(
     Ok(raw.to_string())
 }
 
+/// Resolve one mapped claim into a header value, or `None` when the claim is
+/// absent, null, of an unusable type, or carries no non-whitespace content.
+///
+/// Returning `None` is what makes the destination absent after sanitization, so
+/// an empty or blank claim must never yield `Some("")` — a backend that trusts
+/// the destination would otherwise see a gateway-asserted empty identity.
 fn claim_value_for_header(claims: &Value, claim_path: &str, separator: &str) -> Option<String> {
-    match resolve_claim_path(claims, claim_path)? {
-        Value::String(value) => Some(value.clone()),
+    let value = match resolve_claim_path(claims, claim_path)? {
+        Value::String(value) => value.clone(),
         Value::Array(values) => {
-            let parts: Vec<&str> = values.iter().filter_map(Value::as_str).collect();
-            (!parts.is_empty()).then(|| parts.join(separator))
+            let parts: Vec<&str> = values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|part| !part.trim().is_empty())
+                .collect();
+            if parts.is_empty() {
+                return None;
+            }
+            parts.join(separator)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn normalize_allowed_header(raw_header: &str, plugin: &str, field: &str) -> Result<String, String> {
@@ -169,10 +295,12 @@ mod tests {
             ClaimHeaderMapping {
                 claim_path: "email".to_string(),
                 metadata_key: "p.x-user-email".to_string(),
+                destination_header: "x-user-email".to_string(),
             },
             ClaimHeaderMapping {
                 claim_path: "roles".to_string(),
                 metadata_key: "p.x-user-roles".to_string(),
+                destination_header: "x-user-roles".to_string(),
             },
         ];
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());

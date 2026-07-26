@@ -436,3 +436,180 @@ fn mesh_wide_proxy_config_applies_to_workload_in_other_namespace() {
         .expect("mesh-wide ProxyConfig must contribute sampling");
     assert_eq!(sampling, 7.5);
 }
+
+/// CFG-05 / XDS-02: a Kubernetes `networking.istio.io/v1beta1` ProxyConfig
+/// object in a translation batch must land on the native mesh slice and
+/// round-trip identically through the Ferrum `ProxyConfigsCarrier` ECDS path.
+/// This is the deterministic proof that the watcher/translator ingestion path
+/// affects both native and xDS-equivalent mesh slices (issue #2396).
+#[test]
+fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
+    use std::collections::BTreeMap;
+
+    use ferrum_edge::config_sources::k8s::{
+        K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    };
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+    use ferrum_edge::xds::{MeshSliceCarrier, apply_carrier, build_slice_carriers};
+
+    let proxy_config = K8sObject {
+        api_version: "networking.istio.io/v1beta1".to_string(),
+        kind: "ProxyConfig".to_string(),
+        metadata: K8sMetadata {
+            name: "api-defaults".to_string(),
+            uid: String::new(),
+            namespace: "default".to_string(),
+            generation: Some(1),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: serde_json::json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "concurrency": 4,
+            "image": {"imageType": "distroless"},
+            "environmentVariables": {"GOMAXPROCS": "4"},
+            "tracing": {"sampling": 42.0}
+        }),
+        status: serde_json::Value::Object(serde_json::Map::new()),
+    };
+
+    let options = K8sTranslationOptions::new(
+        "default".to_string(),
+        TrustDomain::new("cluster.local").expect("test trust domain"),
+    );
+    let translation =
+        translate_k8s_objects(&[proxy_config], options).expect("ProxyConfig translation succeeds");
+    let gateway_config = translation.config;
+    assert_eq!(
+        gateway_config
+            .mesh
+            .as_ref()
+            .expect("mesh present")
+            .proxy_configs
+            .len(),
+        1,
+        "K8s ProxyConfig must populate mesh.proxy_configs"
+    );
+
+    let request = MeshSliceRequest {
+        node_id: "node-a".to_string(),
+        namespace: "default".to_string(),
+        workload_spiffe_id: None,
+        labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+        cluster_domain: "cluster.local".to_string(),
+        enforce_sidecar_egress: false,
+        sidecar_egress_dry_run: false,
+        enforce_sidecar_identity_narrowing: false,
+        waypoint_name: None,
+        ambient_udp_source_scoping: false,
+    };
+    let native = MeshSlice::from_gateway_config(&gateway_config, request);
+    assert_eq!(native.proxy_configs.len(), 1);
+    let resolved = native
+        .resolved_proxy_config()
+        .expect("selector-matching ProxyConfig must resolve");
+    assert_eq!(resolved.tracing_sampling, Some(42.0));
+    assert_eq!(resolved.concurrency, Some(4));
+    assert_eq!(resolved.image.as_deref(), Some("distroless"));
+
+    let carriers = build_slice_carriers(&native);
+    let proxy_carrier = carriers
+        .iter()
+        .find(|c| matches!(c, MeshSliceCarrier::ProxyConfigs(_)))
+        .expect("native slice must emit ProxyConfigsCarrier");
+    let encoded = proxy_carrier
+        .encode_value()
+        .expect("ProxyConfigsCarrier encodes");
+    let decoded = MeshSliceCarrier::decode(proxy_carrier.type_url(), &encoded)
+        .expect("decode succeeds")
+        .expect("recognized ProxyConfigs carrier");
+
+    let mut xds_equivalent = MeshSlice {
+        node_id: native.node_id.clone(),
+        namespace: native.namespace.clone(),
+        ..Default::default()
+    };
+    apply_carrier(&mut xds_equivalent, decoded);
+    assert_eq!(
+        xds_equivalent.proxy_configs, native.proxy_configs,
+        "xDS ProxyConfigsCarrier must recover the same proxy_configs as native"
+    );
+    assert_eq!(
+        xds_equivalent
+            .resolved_proxy_config()
+            .and_then(|pc| pc.tracing_sampling),
+        Some(42.0)
+    );
+}
+
+/// Now that the Kubernetes watcher can carry an operator-authored ProxyConfig
+/// all the way to the injected `workload_metrics` plugin, an unusable
+/// `spec.tracing.sampling` must fail closed at translation instead of being
+/// silently dropped (non-numeric) or pushed through unvalidated
+/// (out-of-range). This mirrors `Telemetry.tracing.randomSamplingPercentage`
+/// and matches the documented "percentage 0-100" contract; the rejection is
+/// what the Istio status writer surfaces as `FerrumAccepted=False`/`Invalid`.
+#[test]
+fn k8s_proxy_config_rejects_unusable_tracing_sampling() {
+    use ferrum_edge::config_sources::k8s::{
+        K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    };
+    use ferrum_edge::identity::spiffe::TrustDomain;
+
+    fn proxy_config_with_sampling(sampling: serde_json::Value) -> K8sObject {
+        K8sObject {
+            api_version: "networking.istio.io/v1beta1".to_string(),
+            kind: "ProxyConfig".to_string(),
+            metadata: K8sMetadata {
+                name: "api-defaults".to_string(),
+                uid: String::new(),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: serde_json::json!({ "tracing": { "sampling": sampling } }),
+            status: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    fn options() -> K8sTranslationOptions {
+        K8sTranslationOptions::new(
+            "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        )
+    }
+
+    for rejected in [
+        serde_json::json!(5000.0),
+        serde_json::json!(-1.0),
+        serde_json::json!("50"),
+    ] {
+        let object = proxy_config_with_sampling(rejected.clone());
+        let result = translate_k8s_objects(&[object], options());
+        let message = match result {
+            Ok(_) => panic!("sampling {rejected} must be rejected, not translated"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("spec.tracing.sampling"),
+            "rejection must name the offending field, got: {message}"
+        );
+    }
+
+    // The inclusive bounds stay accepted.
+    for accepted in [0.0_f64, 100.0_f64] {
+        let object = proxy_config_with_sampling(serde_json::json!(accepted));
+        let translation = match translate_k8s_objects(&[object], options()) {
+            Ok(translation) => translation,
+            Err(error) => panic!("sampling {accepted} must be accepted: {error}"),
+        };
+        let mesh = translation.config.mesh.expect("mesh present");
+        assert_eq!(mesh.proxy_configs[0].tracing_sampling, Some(accepted));
+    }
+}

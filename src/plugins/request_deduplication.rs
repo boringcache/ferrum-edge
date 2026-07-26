@@ -14,6 +14,74 @@
 //!   Redis is unreachable.
 //!
 //! Only applies to non-safe HTTP methods (POST, PUT, PATCH by default).
+//!
+//! ## Replay provenance
+//!
+//! An idempotent replay is a *finalized* client representation: the synthetic
+//! replay path deliberately skips ordinary presentation transforms
+//! (`RequestContext::finalized_response_replay`) so non-idempotent
+//! `response_transformer` header/body `add` sequences cannot run a second time
+//! over an already-transformed body. That skip is only sound while the stored
+//! bytes are still the product of the *live* presentation policy.
+//!
+//! Unlike `response_caching`, this plugin cannot lean on "a config reload
+//! builds a new instance with an empty cache": a Redis entry outlives the
+//! plugin instance, the cache generation, and the process, and a
+//! `proxy_group`-scoped instance with unchanged config is even retained across
+//! an incremental rebuild. Every retained response therefore carries a complete
+//! `ResponsePolicyProvenance` — the content digest of the published RTDS
+//! response-side gate map *and* the content digest of the effective static
+//! rules of **every** plugin whose response-body transform the replay skips
+//! (`response_transformer` and `sse` today; see
+//! `Plugin::response_presentation_policy` for the audited set and why
+//! `compression`, `grpc_web`, `ai_response_guard`, and `ai_tool_governor` are
+//! excluded) — and replays only while both still match:
+//!
+//! - **Lookup**: a stored response whose provenance differs from the live one
+//!   is refused with 409 rather than replayed. It is not re-executed: the
+//!   backend side effect may already have happened, so serving a superseded
+//!   representation and repeating the operation are both unacceptable, and the
+//!   client must retry after the bounded TTL.
+//! - **Store**: a response whose request straddled a gate publication, or whose
+//!   effective presentation policy could not be established, is retained
+//!   nowhere — not in Redis and not in the local map. Its bytes belong to no
+//!   provable policy. In-flight ownership is untouched, so concurrent-duplicate
+//!   protection still holds; only the finalized replay is given up.
+//! - **Legacy/malformed payloads**: a Redis record without complete, decodable
+//!   provenance is rejected. It can never be replayed on the strength of an
+//!   assumed policy.
+//!
+//! Both halves are required. The gate map alone covers only enable/disable
+//! flips of an RTDS-scoped instance; a redaction/header/body *rule* edit — or
+//! the addition, removal, or reordering of any other enrolled presentation
+//! plugin — that leaves the gate map identical would otherwise let an old Redis
+//! representation match the current digest and skip the new transform. An
+//! *incomplete* provenance matches nothing, including another incomplete one:
+//! two requests that both failed to establish the policy have not proven they
+//! share it. Only fixed-size digests are stored — never rule text, header
+//! values, catalog entries, upstream URLs, session identifiers, or any other
+//! configuration or runtime content.
+//!
+//! ## Plugins that cannot be composed with deduplication
+//!
+//! Some response-body rewrites are not a function of configuration at all.
+//! `mcp_gateway` resolves public resource/tool/prompt URIs against a
+//! per-downstream-session catalog it re-lists from upstream whenever its
+//! discovery TTL expires; entries appear, disappear, get remapped, or become
+//! ambiguous with no config edit and no plugin-cache rebuild. Worse, this
+//! plugin's `before_proxy` short-circuits at priority
+//! `priorities::REQUEST_DEDUPLICATION`, ahead of `priorities::MCP_GATEWAY`, so
+//! a replay is served without MCP validating or routing the request against the
+//! current catalog at all. No digest available before the lookup can witness
+//! that state, and deriving one would mean an upstream round trip under a
+//! per-session lock on the hot path.
+//!
+//! Rather than replay under an unprovable policy, the composition is refused:
+//! [`validate_composition`] rejects the pair at config admission and at
+//! plugin-cache construction. For the admission paths that only warn on
+//! pre-existing data, `ResponsePresentationPolicy::Dynamic` collapses the
+//! proxy's presentation digest to `None` at runtime, which fails both storage
+//! and replay closed through the rules above.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -111,7 +179,153 @@ fn decrement_atomic(value: &AtomicUsize) -> usize {
 use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::{is_per_request_trace_header, sanitize_cached_headers};
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
-use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePolicyProvenance};
+
+/// Plugins whose response-body rewrite is derived from live runtime state that
+/// no construction-time digest can describe, and which therefore cannot be
+/// composed with `request_deduplication` on the same proxy.
+///
+/// This is the config-admission mirror of the plugins that report
+/// [`super::ResponsePresentationPolicy::Dynamic`]. Admission works on
+/// `PluginConfig` names before any plugin is constructed, so the two surfaces
+/// are joined by name; `tests/unit/plugins/request_deduplication_tests.rs`
+/// asserts a constructed instance of each name actually reports `Dynamic`, so
+/// the list cannot drift away from the runtime behavior it stands in for.
+pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
+
+fn dynamic_response_presentation_is_active(plugin: &crate::config::types::PluginConfig) -> bool {
+    if !plugin.enabled {
+        return false;
+    }
+    match plugin.plugin_name.as_str() {
+        // `mcp_gateway` retains an explicit, validated inner enable switch.
+        // When false, none of its request or response hooks apply, so there is
+        // no dynamic presentation policy to make deduplication unprovable.
+        "mcp_gateway" => {
+            plugin
+                .config
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        }
+        _ => true,
+    }
+}
+
+/// Reject composing `request_deduplication` with a plugin whose response-body
+/// presentation policy cannot be proven stable for a retained representation.
+///
+/// A dedup replay is a *finalized* representation: the synthetic replay path
+/// skips ordinary presentation transforms, and `request_deduplication`'s
+/// `before_proxy` short-circuits ahead of every plugin with a higher priority
+/// value — including `mcp_gateway`. So a hit is served without the MCP catalog
+/// ever being consulted, under a public-URI mapping that this gateway refreshes
+/// from upstream on its own schedule. There is no digest that can witness that
+/// state, so the composition is refused here rather than silently replaying
+/// bytes whose producing policy cannot be established.
+///
+/// Runtime plugin-cache construction repeats this check as a fail-closed
+/// backstop, and `ResponsePresentationPolicy::Dynamic` degrades the request
+/// path to never retaining or replaying, for the admission paths that only warn
+/// on pre-existing bad data.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    use crate::config::types::{PluginConfig, PluginScope};
+
+    // Keyed by `(namespace, id)` exactly like the runtime merge's scoped-plugin
+    // map: a proxy only ever resolves associations against plugin configs in
+    // its own namespace, so an id reused across namespaces cannot cross over.
+    let plugin_by_scoped_id: HashMap<(&str, &str), &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+        .collect();
+
+    // Resolve each name the way the runtime merge does before deciding whether
+    // the pair is actually effective together. Two properties of that merge are
+    // load-bearing here:
+    //
+    // - Globals are namespace-partitioned: a global instance is merged only
+    //   into proxies in its own namespace.
+    // - Shadowing is decided by the outer `enabled` flag alone. An instance
+    //   whose *inner* switch is off is still constructed and still replaces the
+    //   same-named global for that proxy, so the effective set has to be
+    //   resolved first and only then asked which members actually apply a
+    //   dynamic rewrite. Filtering by activity before shadow resolution would
+    //   fall back to a global that the runtime never merges, and reject a
+    //   composition that cannot occur.
+    let effective_ids = |proxy: &crate::config::types::Proxy, name: &str| -> Vec<String> {
+        let local: Vec<&PluginConfig> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                let plugin = *plugin_by_scoped_id.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                let scope_applies = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                    // Proxy-group instances are required to omit `proxy_id`;
+                    // the explicit association is what makes them applicable.
+                    PluginScope::ProxyGroup => true,
+                    PluginScope::Global => false,
+                };
+                (plugin.enabled && plugin.plugin_name == name && scope_applies).then_some(plugin)
+            })
+            .collect();
+        let effective: Vec<&PluginConfig> = if local.is_empty() {
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.enabled
+                        && plugin.namespace == proxy.namespace
+                        && plugin.scope == PluginScope::Global
+                        && plugin.plugin_name == name
+                })
+                .collect()
+        } else {
+            local
+        };
+        effective
+            .into_iter()
+            .filter(|plugin| dynamic_response_presentation_is_active(plugin))
+            .map(|plugin| plugin.id.clone())
+            .collect()
+    };
+
+    let mut errors = Vec::new();
+    for proxy in &config.proxies {
+        let dedup_ids = effective_ids(proxy, "request_deduplication");
+        if dedup_ids.is_empty() {
+            continue;
+        }
+        for dynamic_name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+            let dynamic_ids = effective_ids(proxy, dynamic_name);
+            if dynamic_ids.is_empty() {
+                continue;
+            }
+            errors.push(format!(
+                "request_deduplication cannot be composed with {dynamic_name} on proxy '{}': \
+                 an idempotent replay is served without re-running {dynamic_name}'s response \
+                 rewrite, which is derived from live upstream discovery state rather than \
+                 configuration, so a replay cannot be proven to match the current policy. \
+                 request_deduplication: {}; {dynamic_name}: {}. \
+                 Disable one of them on this proxy",
+                proxy.id,
+                dedup_ids.join(", "),
+                dynamic_ids.join(", ")
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// A cached response stored for deduplication replay.
 #[derive(Debug, Clone)]
@@ -120,6 +334,9 @@ struct CachedResponse {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    /// Response-side presentation policy this representation was produced
+    /// under. Replay is admitted only while it still equals the live policy.
+    response_policy: ResponsePolicyProvenance,
 }
 
 impl CachedResponse {
@@ -184,6 +401,12 @@ enum RedisDeduplicationAction {
     Miss,
     Replay(CachedResponse),
     Conflict,
+    /// A record exists for this key but carries no usable replay provenance
+    /// (legacy payload, corrupted value, or malformed digests). It can neither
+    /// be replayed — that would skip the live presentation policy — nor be
+    /// treated as a miss, which would re-execute a non-safe request whose
+    /// original side effect may already have completed.
+    UnprovableRecord,
 }
 
 enum RedisInFlightAction {
@@ -200,7 +423,11 @@ enum RedisStoreAction {
 
 enum RedisPayloadAdmission {
     Admitted(Vec<u8>),
-    RejectedBySize,
+    /// The response cannot be persisted: it does not fit the configured entry
+    /// size, could not be serialized, or has incomplete replay provenance.
+    /// Every case is handled identically by the caller — nothing is written and
+    /// in-flight ownership is resolved by the existing storage-skip rules.
+    Rejected,
 }
 
 enum LocalCompletionAction {
@@ -222,6 +449,9 @@ struct LocalCompletionCandidate<'a> {
     status_code: u16,
     headers: HashMap<String, String>,
     body: &'a [u8],
+    retain_inflight_on_skip: bool,
+    retain_inflight_on_eviction: bool,
+    response_policy: ResponsePolicyProvenance,
 }
 
 enum CompletionSkipReason {
@@ -566,6 +796,36 @@ impl RequestDeduplication {
     }
 
     fn replay_response(&self, ctx: &mut RequestContext, cached: &CachedResponse) -> PluginResult {
+        // The replay below suppresses ordinary presentation transforms, so it
+        // is sound only while the stored bytes are provably the product of the
+        // live response-side policy — both the RTDS gate content and the
+        // effective static rules. Any difference retires the representation,
+        // and so does an unprovable policy on either side: `admits_replay_of`
+        // refuses two incomplete values rather than letting "unknown" match
+        // "unknown". That is what fails a proxy carrying a
+        // `ResponsePresentationPolicy::Dynamic` plugin closed on the local
+        // path, where nothing else would have caught it.
+        // 409 rather than a re-execution: the original backend side effect may
+        // already have run under this idempotency key.
+        let live_policy = ctx.response_policy_provenance();
+        if !live_policy.admits_replay_of(&cached.response_policy) {
+            // Distinguish the two refusals for operators: a policy that moved
+            // is a transient, self-healing state, while an unestablished policy
+            // means this proxy composes deduplication with a presentation
+            // plugin whose rewrite cannot be witnessed and will never replay.
+            let body = if live_policy.complete().is_none()
+                || cached.response_policy.complete().is_none()
+            {
+                r#"{"error":"The response policy for this request could not be established, so a stored idempotent response cannot be replayed"}"#
+            } else {
+                r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
+            };
+            return PluginResult::Reject {
+                status_code: 409,
+                body: body.to_string(),
+                headers: HashMap::new(),
+            };
+        }
         // Stored bytes have already passed the final response-body lifecycle.
         // Suppress ordinary presentation transforms on this synthetic replay;
         // current inspection/final validation still runs, and a new redaction
@@ -796,18 +1056,40 @@ impl RequestDeduplication {
             Err(()) => return RedisDeduplicationAction::Miss,
         };
 
-        match serde_json::from_slice::<SerializableCachedResponse>(&data) {
-            Ok(s) if s.fingerprint == fingerprint => {
-                RedisDeduplicationAction::Replay(CachedResponse {
-                    status_code: s.status_code,
-                    headers: s.headers,
-                    body: Bytes::from(s.body),
-                    inserted_at: Instant::now(), // Not meaningful for Redis entries
-                })
+        let stored = match serde_json::from_slice::<SerializableCachedResponse>(&data) {
+            Ok(stored) => stored,
+            // A record we cannot parse is a record whose provenance we cannot
+            // establish. Legacy payloads written before replay provenance
+            // existed land here (the provenance field is required, not
+            // defaulted), as does any corrupted or foreign value. Fail closed
+            // with a conflict: replaying it would skip the live presentation
+            // policy, and treating it as a miss would re-execute a non-safe
+            // request whose original side effect may already have happened.
+            Err(_) => {
+                debug!(
+                    "request_deduplication: Redis idempotency record is unreadable or carries no \
+                     replay provenance; refusing replay"
+                );
+                return RedisDeduplicationAction::UnprovableRecord;
             }
-            Ok(_) => RedisDeduplicationAction::Conflict,
-            Err(_) => RedisDeduplicationAction::Miss,
+        };
+        if stored.fingerprint != fingerprint {
+            return RedisDeduplicationAction::Conflict;
         }
+        let Some(response_policy) = stored.response_policy.decode() else {
+            debug!(
+                "request_deduplication: Redis idempotency record carries malformed replay \
+                 provenance; refusing replay"
+            );
+            return RedisDeduplicationAction::UnprovableRecord;
+        };
+        RedisDeduplicationAction::Replay(CachedResponse {
+            status_code: stored.status_code,
+            headers: stored.headers,
+            body: Bytes::from(stored.body),
+            inserted_at: Instant::now(), // Not meaningful for Redis entries
+            response_policy,
+        })
     }
 
     async fn redis_mark_inflight(&self, key: &str, fingerprint: &str) -> RedisInFlightAction {
@@ -899,7 +1181,7 @@ impl RequestDeduplication {
 
         let data = match self.redis_payload_for_response(fingerprint, response) {
             RedisPayloadAdmission::Admitted(data) => data,
-            RedisPayloadAdmission::RejectedBySize => return RedisStoreAction::SkippedSize,
+            RedisPayloadAdmission::Rejected => return RedisStoreAction::SkippedSize,
         };
 
         let redis_key = redis.make_key(&[key]);
@@ -919,6 +1201,19 @@ impl RequestDeduplication {
         fingerprint: &str,
         response: &CachedResponse,
     ) -> RedisPayloadAdmission {
+        // A representation persisted to Redis outlives this instance, this
+        // cache generation, and this process, so it may only be written with
+        // complete provenance. An incomplete value means the request never
+        // observed the effective static presentation policy; recording it would
+        // assert a compatibility claim that no later reader could check.
+        let Some((gate, presentation)) = response.response_policy.complete() else {
+            debug!(
+                "request_deduplication: response-side presentation policy could not be \
+                 established for this request; refusing to persist a replayable representation"
+            );
+            return RedisPayloadAdmission::Rejected;
+        };
+
         let entry_size = response.retained_size();
         if entry_size > self.max_entry_size_bytes {
             debug!(
@@ -926,11 +1221,12 @@ impl RequestDeduplication {
                 max_entry_size_bytes = self.max_entry_size_bytes,
                 "request_deduplication: completed response exceeds Redis entry size limit, skipping store"
             );
-            return RedisPayloadAdmission::RejectedBySize;
+            return RedisPayloadAdmission::Rejected;
         }
 
         let serializable = SerializableCachedResponse {
             fingerprint: fingerprint.to_string(),
+            response_policy: SerializableResponsePolicyProvenance::encode(gate, presentation),
             status_code: response.status_code,
             headers: response.headers.clone(),
             body: response.body.to_vec(),
@@ -938,7 +1234,7 @@ impl RequestDeduplication {
 
         let data = match serde_json::to_vec(&serializable) {
             Ok(data) => data,
-            Err(_) => return RedisPayloadAdmission::RejectedBySize,
+            Err(_) => return RedisPayloadAdmission::Rejected,
         };
         if data.len() > self.max_entry_size_bytes {
             debug!(
@@ -946,7 +1242,7 @@ impl RequestDeduplication {
                 max_entry_size_bytes = self.max_entry_size_bytes,
                 "request_deduplication: serialized Redis response exceeds entry size limit, skipping store"
             );
-            return RedisPayloadAdmission::RejectedBySize;
+            return RedisPayloadAdmission::Rejected;
         }
         RedisPayloadAdmission::Admitted(data)
     }
@@ -971,22 +1267,36 @@ impl RequestDeduplication {
             .map(|_| decrement_atomic(&self.inflight_count))
     }
 
+    /// Build the Redis payload a completed response would produce.
+    ///
+    /// `presentation_digest` is the effective static response-presentation
+    /// policy digest a real request would have copied from its plugin-cache
+    /// view; `None` reproduces a request that never observed one, which must
+    /// refuse to persist.
     #[allow(dead_code)]
     pub(crate) fn redis_payload_for_tests(
         &self,
         status_code: u16,
         headers: HashMap<String, String>,
         body: &[u8],
+        presentation_digest: Option<[u8; 32]>,
     ) -> Option<Vec<u8>> {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test".to_string(),
+        );
+        ctx.set_response_presentation_policy_digest(presentation_digest);
         let response = CachedResponse {
             status_code,
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            response_policy: ctx.response_policy_provenance(),
         };
         match self.redis_payload_for_response("test-fingerprint", &response) {
             RedisPayloadAdmission::Admitted(payload) => Some(payload),
-            RedisPayloadAdmission::RejectedBySize => None,
+            RedisPayloadAdmission::Rejected => None,
         }
     }
 
@@ -996,13 +1306,14 @@ impl RequestDeduplication {
         fingerprint: &str,
         owner_token: &str,
         candidate: LocalCompletionCandidate<'_>,
-        retain_inflight_on_skip: bool,
-        retain_inflight_on_eviction: bool,
     ) -> LocalCompletionAction {
         let LocalCompletionCandidate {
             status_code,
             headers,
             body,
+            retain_inflight_on_skip,
+            retain_inflight_on_eviction,
+            response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
@@ -1042,6 +1353,7 @@ impl RequestDeduplication {
                     headers,
                     body: Bytes::copy_from_slice(body),
                     inserted_at: Instant::now(),
+                    response_policy,
                 })
             } else {
                 if !retain_inflight_on_skip {
@@ -1072,6 +1384,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            response_policy,
         };
         let redis_copy = cached.clone();
         entry.insert(DeduplicationEntry::Completed {
@@ -1428,6 +1741,10 @@ enum CompletedSequenceRemoval {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SerializableCachedResponse {
     fingerprint: String,
+    /// Replay provenance. Deliberately **required** with no serde default: a
+    /// legacy record written before provenance existed fails to deserialize and
+    /// is refused, instead of silently defaulting into a match.
+    response_policy: SerializableResponsePolicyProvenance,
     status_code: u16,
     headers: HashMap<String, String>,
     #[serde(
@@ -1435,6 +1752,44 @@ struct SerializableCachedResponse {
         deserialize_with = "deserialize_cached_response_body"
     )]
     body: Vec<u8>,
+}
+
+/// Wire form of `ResponsePolicyProvenance`.
+///
+/// Both halves are fixed-length lowercase hex SHA-256 digests. Storing hex
+/// rather than a byte array keeps the record compact and stable across
+/// serializer versions, and a digest is all that is ever written: no rule text,
+/// header value, scope name, or other configuration content reaches Redis.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializableResponsePolicyProvenance {
+    /// Content digest of the published RTDS response-side gate map.
+    gate: String,
+    /// Content digest of the effective static response-presentation rules.
+    presentation: String,
+}
+
+impl SerializableResponsePolicyProvenance {
+    fn encode(gate: [u8; 32], presentation: [u8; 32]) -> Self {
+        Self {
+            gate: hex::encode(gate),
+            presentation: hex::encode(presentation),
+        }
+    }
+
+    /// Decode both halves, or `None` when either is not exactly 32 hex-encoded
+    /// bytes. A malformed record can never be replayed on an assumed policy.
+    fn decode(&self) -> Option<ResponsePolicyProvenance> {
+        Some(ResponsePolicyProvenance::from_persisted(
+            decode_digest_hex(&self.gate)?,
+            decode_digest_hex(&self.presentation)?,
+        ))
+    }
+}
+
+fn decode_digest_hex(value: &str) -> Option<[u8; 32]> {
+    let mut digest = [0u8; 32];
+    hex::decode_to_slice(value, &mut digest).ok()?;
+    Some(digest)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1646,7 +2001,12 @@ fn request_body_digest(
 // still sees the crate-private helper itself as unused.
 #[allow(dead_code)]
 pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bool {
-    serde_json::from_slice::<SerializableCachedResponse>(data).is_ok()
+    // Mirrors the admission `redis_get` performs: a payload counts as valid
+    // only when it both deserializes and carries decodable replay provenance.
+    serde_json::from_slice::<SerializableCachedResponse>(data)
+        .ok()
+        .and_then(|stored| stored.response_policy.decode())
+        .is_some()
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -1831,6 +2191,11 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
 
+        // Idempotent responses are finalized representations. Pin the policy
+        // before any response-side gate can be read so replay provenance can
+        // be validated without reapplying non-idempotent transforms.
+        let _ = ctx.pin_response_policy_stamp();
+
         let (key, fingerprint) = {
             // Get idempotency key from headers. Keep the borrow scoped so no
             // header-map borrow survives across Redis/cache awaits below.
@@ -1881,6 +2246,15 @@ impl Plugin for RequestDeduplication {
                         headers: HashMap::new(),
                     };
                 }
+                RedisDeduplicationAction::UnprovableRecord => {
+                    return PluginResult::Reject {
+                        status_code: 409,
+                        body:
+                            r#"{"error":"The stored idempotent response cannot be proven compatible with the current response policy"}"#
+                                .to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
                 RedisDeduplicationAction::Miss => {}
             }
 
@@ -1899,6 +2273,17 @@ impl Plugin for RequestDeduplication {
                                 status_code: 409,
                                 body:
                                     r#"{"error":"Idempotency key was reused for a different request"}"#
+                                        .to_string(),
+                                headers: HashMap::new(),
+                            };
+                        }
+                        RedisDeduplicationAction::UnprovableRecord => {
+                            self.redis_release_inflight(&key, &fingerprint, &token)
+                                .await;
+                            return PluginResult::Reject {
+                                status_code: 409,
+                                body:
+                                    r#"{"error":"The stored idempotent response cannot be proven compatible with the current response policy"}"#
                                         .to_string(),
                                 headers: HashMap::new(),
                             };
@@ -2153,6 +2538,49 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
 
+        // Replay provenance is checked only once a representation is actually
+        // going to be retained. It must stay BELOW the synthetic guard above:
+        // a synthetic short-circuit stores nothing either way, so failing it
+        // closed here would hold both in-flight markers until `inflight_ttl`
+        // for a request that never reached the backend — turning, e.g., a
+        // probabilistic `fault_injection` abort into a hard 409 lockout for the
+        // whole TTL — while buying no safety, because there are no bytes whose
+        // producing policy could be misrepresented.
+        //
+        // `response_policy_stamp_stable()` compares the pinned publication
+        // *identity*, not its content, so an A→B→A cycle observed during this
+        // request is still treated as a straddle. The gate content read by the
+        // transforms that shaped these bytes is then unknown, and the
+        // representation belongs to no provable policy.
+        if !ctx.response_policy_stamp_stable() {
+            // The final representation may have straddled a policy
+            // publication, so it is unsafe to persist. Keep the in-flight
+            // ownership until its bounded TTL rather than allowing a retry to
+            // repeat a possibly completed external side effect.
+            return PluginResult::Continue;
+        }
+        let response_policy = ctx.response_policy_provenance();
+        if response_policy.complete().is_none() {
+            // The effective response-side presentation policy could not be
+            // established — no plugin-cache view, or this proxy carries a
+            // plugin whose response rewrite comes from live runtime state
+            // (`ResponsePresentationPolicy::Dynamic`). These bytes belong to no
+            // provable policy, so they are retained nowhere: not in Redis,
+            // which `redis_payload_for_response` would refuse anyway, and not
+            // in the local map, where a later request under an equally
+            // unprovable policy would otherwise be served them.
+            //
+            // Concurrent-duplicate protection is unaffected — the in-flight
+            // marking already happened and is kept until its bounded TTL, so a
+            // retry cannot repeat a possibly completed external side effect.
+            // Only the finalized *replay* is given up.
+            debug!(
+                "request_deduplication: response-side presentation policy could not be \
+                 established for this request; retaining no replayable representation"
+            );
+            return PluginResult::Continue;
+        }
+
         // Strip session-bearing headers (Set-Cookie, Authorization, trace
         // IDs, rate-limit counters, etc.) before persisting. Replaying a
         // verbatim `Set-Cookie: session=...` to a second client sharing the
@@ -2171,9 +2599,11 @@ impl Plugin for RequestDeduplication {
                 status_code: response_status,
                 headers: safe_headers,
                 body,
+                retain_inflight_on_skip: retain_inflight_on_storage_skip,
+                retain_inflight_on_eviction: retain_inflight_on_storage_skip
+                    || redis_lock_token.is_some(),
+                response_policy,
             },
-            retain_inflight_on_storage_skip,
-            retain_inflight_on_storage_skip || redis_lock_token.is_some(),
         ) {
             LocalCompletionAction::Published {
                 cached,

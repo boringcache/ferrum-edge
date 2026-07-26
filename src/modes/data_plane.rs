@@ -588,6 +588,7 @@ pub async fn run(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(&env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
