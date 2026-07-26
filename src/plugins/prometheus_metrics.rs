@@ -1711,7 +1711,7 @@ impl MetricsRegistry {
             + self.tls_source_fetch_failure_counter.len() * 220
             + self.tls_cert_rotation_counter.len() * 220
             + if self.database_delta_poll_metrics.load().is_some() {
-                1400
+                1700
             } else {
                 0
             }
@@ -2486,6 +2486,18 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_database_delta_recoveries_total",
                 snapshot.recoveries_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_poll_last_completed_timestamp_seconds Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).\n",
+            );
+            output.push_str("# TYPE ferrum_database_poll_last_completed_timestamp_seconds gauge\n");
+            let last_poll_secs = snapshot.last_poll_completed_at_unix_ms / 1000;
+            render_process_counter(
+                &mut output,
+                "ferrum_database_poll_last_completed_timestamp_seconds",
+                last_poll_secs,
                 &ns_label,
             );
         }
