@@ -5178,7 +5178,12 @@ impl ProxyState {
                 .proxy_id
                 .as_deref()
                 .and_then(|proxy_id| proxy_map.get(&(plugin.namespace.as_str(), proxy_id)).copied())
-                .or_else(|| config.proxies.first());
+                .or_else(|| {
+                    config
+                        .proxies
+                        .iter()
+                        .find(|proxy| proxy.namespace == plugin.namespace)
+                });
             let Some(base_proxy) = base_proxy else {
                 continue;
             };

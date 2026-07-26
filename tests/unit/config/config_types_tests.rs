@@ -1106,6 +1106,29 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
 }
 
 #[test]
+fn global_mtls_auth_applies_only_within_its_namespace() {
+    let mut tenant_a_proxy = stream_proxy("plain", BackendScheme::Tcp, false);
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    let mut tenant_b_global = mtls_plugin(
+        "mtls-global",
+        PluginScope::Global,
+        None,
+        serde_json::json!({}),
+    );
+    tenant_b_global.namespace = "tenant-b".to_string();
+    let config = GatewayConfig {
+        proxies: vec![tenant_a_proxy],
+        plugin_configs: vec![tenant_b_global],
+        ..empty_config()
+    };
+
+    assert!(
+        config.validate_mtls_auth_compatibility().is_ok(),
+        "a tenant-b global plugin must not apply to a tenant-a proxy"
+    );
+}
+
+#[test]
 fn frontend_tls_mtls_example_is_a_valid_gateway_config() {
     let docs = include_str!("../../../docs/frontend_tls.md");
     let section = docs
@@ -3263,6 +3286,98 @@ fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
             && msg.contains("mesh-upstream")
             && msg.contains("mesh.hbone")),
         "expected unshadowed global dispatch conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn retry_proxy_ignores_foreign_namespace_global_dispatch() {
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let foreign_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: "tenant-b".into(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![foreign_dispatch];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "a tenant-b global dispatch rule must not affect a tenant-a proxy"
+    );
+}
+
+#[test]
+fn route_dispatch_association_resolves_same_namespace_plugin_id() {
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let foreign_dispatch = PluginConfig {
+        id: "shared-dispatch".into(),
+        namespace: "tenant-b".into(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut local_dispatch = foreign_dispatch.clone();
+    local_dispatch.namespace = ferrum_edge::config::types::default_namespace();
+    local_dispatch.config = serde_json::json!({
+        "rules": [
+            { "match": {}, "destination": { "upstream_id": "plain-upstream" } }
+        ]
+    });
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "shared-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![foreign_dispatch, local_dispatch];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "the association must resolve the local same-id plugin, not tenant-b's"
     );
 }
 

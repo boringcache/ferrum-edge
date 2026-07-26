@@ -3236,7 +3236,9 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     for assoc in &proxy.plugins {
         if let Some(pc) = plugin_configs
             .iter()
-            .find(|pc| pc.id == assoc.plugin_config_id)
+            .find(|pc| {
+                pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
+            })
         {
             local_names.insert(pc.plugin_name.as_str());
             if plugin_config_forces_request_body_buffering(pc) {
@@ -3249,7 +3251,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         }
     }
     for pc in plugin_configs {
-        if pc.scope != PluginScope::Global {
+        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
             continue;
         }
         if local_names.contains(pc.plugin_name.as_str()) {
@@ -3472,7 +3474,11 @@ impl GatewayConfig {
                     })
                     .collect();
                 let effective = if local_mtls.is_empty() {
-                    global_mtls.clone()
+                    global_mtls
+                        .iter()
+                        .copied()
+                        .filter(|plugin| plugin.namespace == proxy.namespace)
+                        .collect()
                 } else {
                     local_mtls
                 };
@@ -4505,7 +4511,9 @@ impl GatewayConfig {
             if let Some(plugin) = self
                 .plugin_configs
                 .iter()
-                .find(|pc| pc.id == assoc.plugin_config_id)
+                .find(|pc| {
+                    pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
+                })
             {
                 if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
                     shadows_global_dispatch = true;
@@ -4515,7 +4523,9 @@ impl GatewayConfig {
         }
         if !shadows_global_dispatch {
             for plugin in &self.plugin_configs {
-                if plugin.scope == PluginScope::Global {
+                if plugin.scope == PluginScope::Global
+                    && plugin.namespace == proxy.namespace
+                {
                     collect(plugin);
                 }
             }
