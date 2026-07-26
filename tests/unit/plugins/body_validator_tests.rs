@@ -3418,7 +3418,7 @@ fn unknown_top_level_config_keys_are_rejected_by_shape_only_validation() {
         "response_json_scheam": {"type": "object"}
     });
     let result = BodyValidator::validate_config(&config);
-    let error = result.err().expect("shape-only validation must reject it");
+    let error = result.expect_err("shape-only validation must reject it");
     assert!(error.contains("unknown configuration key"), "{error}");
 }
 
