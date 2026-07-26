@@ -1370,6 +1370,20 @@ impl AiTranscriptAudit {
         staged.unwrap_or_else(|| flag(metadata, MD_SAMPLE_HIT))
     }
 
+    /// THIS instance's staged sampling roll, or `None` when this instance holds
+    /// no staging entry for the record — i.e. the shared `MD_CANDIDATE` marker on
+    /// the context belongs to a co-located peer instance. Unlike
+    /// [`Self::staged_sample_hit`] there is deliberately no `MD_SAMPLE_HIT`
+    /// fallback: that key is shared and peer-writable, so falling back to it
+    /// would let a peer's roll drive this instance's commit admission and its
+    /// client-visible fail-closed 503.
+    fn owned_sample_hit(&self, metadata: &HashMap<String, String>) -> Option<bool> {
+        metadata
+            .get(MD_RECORD_ID)
+            .and_then(|record_id| self.staging.get(record_id))
+            .map(|staging| staging.sample_hit)
+    }
+
     /// Whether a marked AI candidate's stream should actually be teed. `On`
     /// tees every marked candidate; `Sampled` tees only sampling-roll winners
     /// plus requests a request-side guardrail flagged (evaluated here — at
@@ -2024,11 +2038,11 @@ impl Plugin for AiTranscriptAudit {
 
         // Peek (do not consume) the staging entry for the fail-closed gate. The
         // observe-only committed hook consumes it after every validator has run.
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // The roll is read from THIS instance's staging entry only, never from
+        // the shared peer-writable `MD_SAMPLE_HIT` key (see `owned_sample_hit`).
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return PluginResult::Continue;
+        };
         // The transaction-log `sampled` flag carries the sampling ROLL (matching
         // the exported record's `sampled` field), not the emit decision —
         // `sink_status` already conveys whether a record was emitted.
@@ -2068,7 +2082,7 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
+        if !flag(&ctx.metadata, MD_CANDIDATE) {
             self.staging.remove(&record_id);
             return;
         }
@@ -2077,6 +2091,13 @@ impl Plugin for AiTranscriptAudit {
             .get(MD_SINK_STATUS)
             .is_some_and(|status| status == "rejected");
 
+        // The single atomic `remove` IS the instance-scoped commit capability: it
+        // both proves this instance staged the request (a peer instance's shared
+        // `MD_CANDIDATE` marker yields nothing here) and consumes the staging
+        // permit exactly once, so a duplicated or retried commit hook cannot emit
+        // a second, staging-less record. Do not reintroduce a
+        // `has_staged_candidate` pre-check: that would only re-open a
+        // check-then-act window without changing the outcome.
         let Some((_, mut staging)) = self.staging.remove(&record_id) else {
             return;
         };

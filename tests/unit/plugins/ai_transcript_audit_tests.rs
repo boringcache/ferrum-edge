@@ -94,6 +94,12 @@ fn ai_request_body() -> &'static [u8] {
     br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is 123-45-6789"}]}"#
 }
 
+/// An AI request that asks for an SSE response (`stream: true`), so staging
+/// publishes the shared `ai_transcript_audit.stream_request` marker.
+fn stream_request_body() -> &'static [u8] {
+    br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#
+}
+
 /// Config with an HTTP sink pointed at `endpoint`, plus caller overrides merged
 /// over the top-level object.
 fn config_with_sink(endpoint: &str, overrides: Value) -> Value {
@@ -1036,6 +1042,151 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             .map(String::as_str),
         Some("rejected"),
         "a saturated instance must not commit a response record for a peer's candidate"
+    );
+}
+
+/// A saturated instance owns no staging entry, but the shared
+/// `ai_transcript_audit.candidate`/`record_id` markers a peer instance published
+/// are still on the context. The reject-path refresh in `after_proxy` rewrites
+/// SHARED metadata (`stream_request`, `request_hash`) that drives the peer's
+/// buffer-vs-stream decision and its exported record, so it must stay gated on
+/// the local staging entry rather than on the borrowed marker.
+#[tokio::test]
+async fn saturated_instance_must_not_refresh_a_peer_instances_staged_request() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "request": true, "response": true },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    for _ in 0..4096 {
+        let mut filler = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut filler, &headers, ai_request_body())
+            .await;
+    }
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut proxy_headers = json_headers();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(stream_request_body().to_vec()).unwrap(),
+    );
+    peer.before_proxy(&mut ctx, &mut proxy_headers).await;
+    let peer_request_hash = ctx
+        .metadata
+        .get("ai_transcript_audit.request_hash")
+        .cloned()
+        .expect("the peer stages the candidate and publishes its request hash");
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // The saturated instance sees the peer's shared marker but wins no permit.
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut proxy_headers).await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not erase a peer instance's staged candidate"
+    );
+
+    // A request-phase terminator rewrites the body and drops `stream`. Only an
+    // instance that actually staged this request may republish that decision.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(ai_request_body().to_vec()).unwrap(),
+    );
+    let mut response_headers = HashMap::new();
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not rewrite a peer's staged stream decision"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.request_hash"),
+        Some(&peer_request_hash),
+        "a saturated instance must not overwrite a peer's staged request hash"
+    );
+}
+
+/// The staging entry IS the instance's commit capability: `on_response_committed`
+/// consumes it with a single atomic `remove`, so a duplicated or retried commit
+/// hook — and the deferred `log` fallback behind it — can never emit a second,
+/// staging-less record for the same transaction.
+#[tokio::test]
+async fn committed_response_consumes_the_staging_permit_exactly_once() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "the first commit emits one record");
+
+    // A replayed commit hook over the same context, then the log fallback.
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let total: usize = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body.as_array().map(Vec::len))
+        .sum();
+    assert_eq!(
+        total,
+        1,
+        "a replayed commit hook must not emit a second record from a consumed staging entry"
     );
 }
 
