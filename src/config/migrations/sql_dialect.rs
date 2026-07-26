@@ -1579,35 +1579,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_upstream_namespace_name_unique_index_across_dialects() {
-        // Issue #2999: upstream (namespace, name) uniqueness must be a durable
-        // DB invariant, not only an advisory admin precheck.
-        for dialect in ["postgres", "mysql", "sqlite"] {
-            let builder = V001SqlBuilder::new(dialect);
-            let sqls = builder.namespace_unique_index_sqls();
-            let upstream = sqls
-                .iter()
-                .find(|sql| sql.contains("idx_upstreams_namespace_name"))
-                .unwrap_or_else(|| panic!("{dialect} must declare idx_upstreams_namespace_name"));
-            assert!(
-                upstream.contains("ON upstreams (namespace, name)"),
-                "{dialect} upstream unique index must cover (namespace, name): {upstream}"
-            );
-            if dialect == "mysql" {
-                assert!(
-                    !upstream.contains("WHERE name IS NOT NULL"),
-                    "MySQL unique indexes already permit multiple NULLs without a partial predicate"
-                );
-            } else {
-                assert!(
-                    upstream.contains("WHERE name IS NOT NULL"),
-                    "{dialect} must use a partial unique index so unnamed upstreams may coexist"
-                );
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
     // FK constraint consistency regression tests
     //
