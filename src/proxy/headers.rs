@@ -159,10 +159,16 @@ pub enum SecondaryRequestHostPolicy {
 /// Returns `true` when a materialised request header must not be copied onto a
 /// Ferrum-generated secondary request (mirror, load-test synthetic/fan-out).
 ///
-/// Applies the primary backend-request strip set, proxy-owned forwarding
-/// identity headers, RFC 9110 `Connection`-listed names (snapshot must be
-/// taken via [`parse_connection_listed_from_str_map`] before filtering), and
-/// the caller-selected [`SecondaryRequestHostPolicy`].
+/// Applies the primary backend-request strip set, every proxy forwarding
+/// identity header (the `X-Forwarded-*` family and RFC 7239 `Forwarded`),
+/// RFC 9110 `Connection`-listed names (snapshot must be taken via
+/// [`parse_connection_listed_from_str_map`] before filtering), and the
+/// caller-selected [`SecondaryRequestHostPolicy`].
+///
+/// Secondary requests do not regenerate Ferrum's forwarding identity. Strip
+/// `Forwarded` unconditionally, just as the secondary boundary already strips
+/// `X-Forwarded-*`, so a client-supplied identity cannot reach a mirror or
+/// synthetic/fan-out target even when primary RFC 7239 generation is disabled.
 ///
 /// Comparison is ASCII case-insensitive so plugin-synthesised mixed-case keys
 /// cannot bypass the boundary.
@@ -181,6 +187,7 @@ pub fn is_secondary_request_strip_header(
     }
     is_backend_request_strip_header(&name_lower)
         || is_proxy_generated_forwarding_header(&name_lower)
+        || name_lower == "forwarded"
 }
 
 /// Filter a materialised request header map for a Ferrum-generated secondary
