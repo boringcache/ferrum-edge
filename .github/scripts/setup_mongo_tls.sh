@@ -106,12 +106,18 @@ EXTEOF
     # Combined client PEM for in-container mongosh readiness probes.
     cat "$cert_dir/client.crt" "$cert_dir/client.key" > "$cert_dir/client.pem"
 
+    # Literal mongosh probe used by the container HEALTHCHECK (no --eval / no
+    # nested docker-exec dispatch from this script's wait loop).
+    printf '%s\n' 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' \
+        > "$cert_dir/ping.js"
+
     # Restrict private keys; leave public certs readable for Docker copies.
     # mongodb.pem / client.pem are re-permissioned to 0600 inside the container
     # after copy (bind mounts may not preserve host mode bits).
     chmod 600 "$cert_dir/ca.key" "$cert_dir/server.key" "$cert_dir/client.key" \
         "$cert_dir/mongodb.pem" "$cert_dir/client.pem"
-    chmod 644 "$cert_dir/ca.crt" "$cert_dir/server.crt" "$cert_dir/client.crt"
+    chmod 644 "$cert_dir/ca.crt" "$cert_dir/server.crt" "$cert_dir/client.crt" \
+        "$cert_dir/ping.js"
 
     log "Certificates generated successfully."
 }
@@ -134,12 +140,18 @@ start_mongo_tls_container() {
         docker rm -f "$name" >/dev/null
     fi
 
+    # HEALTHCHECK is established as a literal docker-run surface and observed
+    # later via `docker inspect` only — never via `docker exec` + mongosh --eval.
     if [[ "$require_client_cert" == "0" ]]; then
         log "Starting MongoDB TLS container ($name) on port $host_port (client certs optional) ..."
         docker run -d \
             --name "$name" \
             -p "${host_port}:27017" \
             -v "$cert_dir:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
             --entrypoint bash \
             mongo:7 \
             -c '
@@ -148,9 +160,10 @@ start_mongo_tls_container() {
                 cp /certs-src/mongodb.pem /certs/mongodb.pem
                 cp /certs-src/ca.crt /certs/ca.crt
                 cp /certs-src/client.pem /certs/client.pem
-                chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem
+                cp /certs-src/ping.js /certs/ping.js
+                chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
                 chmod 600 /certs/mongodb.pem /certs/client.pem
-                chmod 644 /certs/ca.crt
+                chmod 644 /certs/ca.crt /certs/ping.js
                 exec docker-entrypoint.sh mongod \
                     --bind_ip_all \
                     --tlsMode requireTLS \
@@ -164,6 +177,10 @@ start_mongo_tls_container() {
             --name "$name" \
             -p "${host_port}:27017" \
             -v "$cert_dir:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt --tlsCertificateKeyFile /certs/client.pem /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
             --entrypoint bash \
             mongo:7 \
             -c '
@@ -172,9 +189,10 @@ start_mongo_tls_container() {
                 cp /certs-src/mongodb.pem /certs/mongodb.pem
                 cp /certs-src/ca.crt /certs/ca.crt
                 cp /certs-src/client.pem /certs/client.pem
-                chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem
+                cp /certs-src/ping.js /certs/ping.js
+                chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
                 chmod 600 /certs/mongodb.pem /certs/client.pem
-                chmod 644 /certs/ca.crt
+                chmod 644 /certs/ca.crt /certs/ping.js
                 exec docker-entrypoint.sh mongod \
                     --bind_ip_all \
                     --tlsMode requireTLS \
@@ -192,36 +210,53 @@ start_mongo_tls_container() {
 
 wait_for_mongo_tls() {
     local name="$1"
-    local require_client_cert="$2"
     local elapsed=0
-    local ping_eval='quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)'
+    local status
+    local running
 
-    log "Waiting for $name to accept TLS connections (timeout: ${HEALTH_TIMEOUT}s) ..."
+    log "Waiting for $name HEALTHCHECK (timeout: ${HEALTH_TIMEOUT}s) ..."
 
     while (( elapsed < HEALTH_TIMEOUT )); do
-        if [[ "$require_client_cert" == "1" ]]; then
-            if docker exec "$name" mongosh --quiet --tls --host 127.0.0.1 --port 27017 \
-                    --tlsCAFile /certs/ca.crt \
-                    --tlsCertificateKeyFile /certs/client.pem \
-                    --eval "$ping_eval" &>/dev/null; then
-                log "$name is ready (${elapsed}s)."
-                return 0
-            fi
-        else
-            if docker exec "$name" mongosh --quiet --tls --host 127.0.0.1 --port 27017 \
-                    --tlsCAFile /certs/ca.crt \
-                    --eval "$ping_eval" &>/dev/null; then
-                log "$name is ready (${elapsed}s)."
-                return 0
-            fi
+        if ! docker inspect "$name" &>/dev/null; then
+            err "$name is missing."
+            return 1
         fi
+
+        running="$(docker inspect --format='{{.State.Running}}' "$name" 2>/dev/null || echo false)"
+        if [[ "$running" != "true" ]]; then
+            err "$name is not running."
+            log "Container logs:"
+            docker logs --tail 40 "$name" >&2 || true
+            return 1
+        fi
+
+        status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || echo missing)"
+        case "$status" in
+            healthy)
+                log "$name is ready (${elapsed}s)."
+                return 0
+                ;;
+            unhealthy)
+                err "$name HEALTHCHECK reported unhealthy."
+                log "Container logs:"
+                docker logs --tail 40 "$name" >&2 || true
+                return 1
+                ;;
+            starting|none|missing)
+                # `none`/`missing` can race the first inspect after create; keep
+                # waiting and fail closed on timeout instead.
+                ;;
+            *)
+                ;;
+        esac
+
         sleep 2
         (( elapsed += 2 ))
     done
 
     err "$name did not become healthy within ${HEALTH_TIMEOUT}s."
     log "Container logs:"
-    docker logs --tail 40 "$name" >&2
+    docker logs --tail 40 "$name" >&2 || true
     return 1
 }
 
@@ -229,8 +264,8 @@ wait_for_containers() {
     local tls_ok=0
     local mtls_ok=0
 
-    wait_for_mongo_tls "$TLS_CONTAINER" 0 || tls_ok=1
-    wait_for_mongo_tls "$MTLS_CONTAINER" 1 || mtls_ok=1
+    wait_for_mongo_tls "$TLS_CONTAINER" || tls_ok=1
+    wait_for_mongo_tls "$MTLS_CONTAINER" || mtls_ok=1
 
     if (( tls_ok != 0 || mtls_ok != 0 )); then
         die "One or more MongoDB TLS containers failed to start. Run '$0 --cleanup' to remove them."
