@@ -102,6 +102,7 @@ fn admin_state_with_audit(db: DatabaseStore, admin_audit_enabled: bool) -> Admin
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -314,6 +315,37 @@ async fn viewer_restore_is_rejected_before_large_body_buffering() {
             .contains("required role is 'admin'"),
         "unexpected RBAC error body: {body:?}"
     );
+}
+
+/// `/batch` and `/restore` are the two bulk-write routes whose handlers carry no
+/// role check of their own, so their `admin` requirement has to hold from the
+/// route arm as well as from the pre-body admission gate. An `operator` may
+/// create a proxy or an upstream one at a time; neither of these is a permitted
+/// escalation of that.
+#[tokio::test]
+async fn operator_cannot_bulk_write_through_batch_or_restore() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+
+    let operator = token("op-user", Some("operator"));
+    for path in ["/batch", "/restore?confirm=true"] {
+        let (status, body) = post_raw(
+            &base,
+            path,
+            &operator,
+            br#"{"version":"1","proxies":[]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 403, "operator {path} body: {body:?}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("required role is 'admin'"),
+            "unexpected RBAC error body for {path}: {body:?}"
+        );
+    }
 }
 
 #[tokio::test]
