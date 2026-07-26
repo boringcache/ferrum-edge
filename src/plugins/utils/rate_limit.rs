@@ -429,6 +429,7 @@ pub struct RedisLimiter<A: RateLimitAlgorithm> {
 }
 
 impl<A: RateLimitAlgorithm> RedisLimiter<A> {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(
         plugin_name: &str,
         config: &Value,
@@ -711,6 +712,7 @@ where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     A: RateLimitAlgorithm + Clone,
 {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn from_plugin_config(
         plugin_name: &'static str,
         config: &Value,
@@ -1033,18 +1035,21 @@ impl SlidingWindow {
 
     /// Fixed upper bound on retained aggregate buckets for any key/window.
     #[inline]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub const fn bucket_capacity() -> usize {
         SLIDING_WINDOW_BUCKET_COUNT
     }
 
     /// Number of aggregate bucket slots retained (always [`bucket_capacity`]).
     #[inline]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn retained_buckets(&self) -> usize {
         self.buckets.len()
     }
 
     /// Admissions currently counted inside the live window.
     #[inline]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn counted_requests(&self) -> u64 {
         self.total
     }

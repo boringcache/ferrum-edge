@@ -56,6 +56,7 @@ pub struct UdpRateLimiting {
 }
 
 impl UdpRateLimiting {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new_with_http_client(
         config: &Value,
         http_client: PluginHttpClient,
