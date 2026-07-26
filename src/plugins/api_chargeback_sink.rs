@@ -4429,11 +4429,33 @@ pub enum SpoolFsFault {
     Rename,
     DirOpen,
     DirSync,
-    /// A peer republishes the shared final path between this attempt's rename
-    /// and its parent-directory fsync, and that fsync then fails. Models the
-    /// only interleaving in which rollback could otherwise unlink an entry this
+    /// A peer republishes the final path between this attempt's rename and its
+    /// parent-directory fsync, and that fsync then fails. Models the
+    /// interleaving in which a path-based rollback would unlink an entry this
     /// attempt no longer owns.
     PeerRepublishThenDirSync,
+}
+
+/// Whether this write attempt exclusively owns the name it publishes to.
+///
+/// Rollback after a failed publish may only unlink a final path when no other
+/// writer can be publishing to that same name, because a path unlink cannot be
+/// made atomic with any proof about which file the name currently resolves to.
+/// Stat-then-unlink, content comparison, and timestamp comparison all lose the
+/// race against an atomic `rename` by a peer between the check and the unlink,
+/// and an in-process lock says nothing about a peer process sharing the volume.
+/// So the distinction is drawn statically, at each call site, instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolFinalOwnership {
+    /// A name no other writer can publish to: the ULID-derived data batch
+    /// `<ulid>.<owner_tag>.<ext>`, and the `<that name>.rejected.meta`
+    /// dead-letter record derived from one. Rollback unlinks such a final,
+    /// because the only entry it can ever destroy is this attempt's own
+    /// unsynced publication.
+    Unique,
+    /// A well-known name every writer of the namespace publishes to — currently
+    /// only `spool.meta.json`. Rollback never unlinks such a final.
+    Shared,
 }
 
 /// Injectable durable-write steps for the atomic spool publish sequence.
@@ -4445,9 +4467,9 @@ pub enum SpoolFsFault {
 struct SpoolFsOps {
     sync_file: fn(&File, &Path) -> Result<(), String>,
     rename: fn(&Path, &Path) -> Result<(), String>,
-    /// Runs after a successful rename and after this attempt's published
-    /// identity has been recorded. Production wires it to a no-op; tests use it
-    /// to interleave a peer republication of the shared final path.
+    /// Runs immediately after a successful rename. Production wires it to a
+    /// no-op; tests use it to interleave a peer republication of the final path
+    /// between this attempt's rename and its parent-directory fsync.
     after_rename: fn(&Path),
     open_dir: fn(&Path) -> Result<File, String>,
     sync_dir: fn(&File, &Path) -> Result<(), String>,
@@ -4476,46 +4498,6 @@ impl SpoolFsOps {
             }
         }
         ops
-    }
-}
-
-/// Identity of the exact file a path names, used to prove that a rollback is
-/// about to unlink this attempt's own publication and not a peer's.
-///
-/// Device plus inode distinguishes two publications of byte-identical content,
-/// which a content or timestamp comparison cannot. Platforms without stable
-/// inode identity yield `None`, which callers treat as "ownership not proven"
-/// and therefore never unlink. That costs nothing there: the only failure that
-/// can happen after a successful rename is the Unix parent-directory sync.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(unix), allow(dead_code))]
-struct PublishedFileIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-impl PublishedFileIdentity {
-    /// True when both identities name the same file on the same device.
-    fn matches(self, other: Self) -> bool {
-        self.dev == other.dev && self.ino == other.ino
-    }
-
-    /// Identify the file currently named by `path` without following symlinks.
-    fn of(path: &Path) -> Option<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::symlink_metadata(path).ok()?;
-            Some(Self {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            None
-        }
     }
 }
 
@@ -5293,7 +5275,15 @@ impl SpoolManager {
         // generation in this process can reconcile the temp mid-write.
         let write_result = {
             let _live = LiveSpoolPathGuard::new(tmp_path.clone());
-            write_private_file_atomically_with_ops(&tmp_path, &final_path, &bytes, self.fs_ops)
+            // The final name carries a freshly minted ULID, so no peer can be
+            // publishing to it and a failed publish rolls its own file back.
+            write_private_file_atomically_with_ops(
+                &tmp_path,
+                &final_path,
+                &bytes,
+                self.fs_ops,
+                SpoolFinalOwnership::Unique,
+            )
         };
         write_result?;
         invalidate_status_cache();
@@ -5452,7 +5442,19 @@ impl SpoolManager {
         let tmp = spool_write_temp_path(&path, self.generation)?;
         self.assert_managed_path(&tmp)?;
         let _live = LiveSpoolPathGuard::new(tmp.clone());
-        write_private_file_atomically_with_ops(&tmp, &path, &bytes, self.fs_ops)
+        // `spool.meta.json` is the one shared final name in this protocol: every
+        // writer of the namespace publishes to it. A failed publish therefore
+        // cleans only the attributed temp above and leaves the manifest entry
+        // alone — see the rollback in `write_private_file_atomically_with_ops`.
+        // The error still propagates, so `live_storage_prepared` stays unset and
+        // the next prepare revalidates or regenerates the manifest.
+        write_private_file_atomically_with_ops(
+            &tmp,
+            &path,
+            &bytes,
+            self.fs_ops,
+            SpoolFinalOwnership::Shared,
+        )
     }
 
     /// Fail closed when the on-disk ownership record does not name this exact
@@ -6591,7 +6593,16 @@ fn write_dead_letter_meta(
         }
     }
     let _live = LiveSpoolPathGuard::new(tmp_path.clone());
-    write_private_file_atomically_with_ops(&tmp_path, &meta_path, &bytes, spool.fs_ops)?;
+    // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
+    // ULID-named source artifact it describes, so this final is exclusively this
+    // attempt's and a failed publish rolls it back.
+    write_private_file_atomically_with_ops(
+        &tmp_path,
+        &meta_path,
+        &bytes,
+        spool.fs_ops,
+        SpoolFinalOwnership::Unique,
+    )?;
     if let Err(error) = fs::remove_file(source_path) {
         let cleanup_error = fs::remove_file(&meta_path).err();
         return Err(format!(
@@ -6949,8 +6960,10 @@ pub fn write_private_file_atomically_for_tests(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, SpoolFsOps::REAL)
+    let ops = SpoolFsOps::REAL;
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
 /// Exercise the durable-write contract with one step forced to fail.
@@ -6961,13 +6974,10 @@ pub fn write_private_file_atomically_with_fault_for_tests(
     final_path: &Path,
     bytes: &[u8],
     fault: SpoolFsFault,
+    ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    write_private_file_atomically_with_ops(
-        tmp_path,
-        final_path,
-        bytes,
-        SpoolFsOps::with_fault(fault),
-    )
+    let ops = SpoolFsOps::with_fault(fault);
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
 fn write_private_file_atomically_with_ops(
@@ -6975,14 +6985,9 @@ fn write_private_file_atomically_with_ops(
     final_path: &Path,
     bytes: &[u8],
     ops: SpoolFsOps,
+    ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    // Identity of the file this attempt published, recorded by the inner
-    // sequence the instant its rename takes effect. It stays `None` when the
-    // attempt failed before the rename — exactly the case where `final_path` is
-    // either absent or a peer's publication that this attempt never owned.
-    let mut published: Option<PublishedFileIdentity> = None;
-    let result =
-        write_private_file_atomically_inner(tmp_path, final_path, bytes, ops, &mut published);
+    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
     let Err(primary_error) = result else {
         return Ok(());
     };
@@ -6994,10 +6999,11 @@ fn write_private_file_atomically_with_ops(
     // completed, preserve that evidence in the returned error rather than
     // claiming a guaranteed rollback.
     let mut cleanup_errors = Vec::new();
-    // The temp name is unique to this attempt — a fresh ULID for data files, and
-    // the `*.write-<process_tag>-<generation>.tmp` attribution for every managed
-    // temp including the manifest — so unlinking it can only ever discard this
-    // attempt's own bytes.
+    // Every temp this helper is given is derived from a name only this attempt
+    // can be writing: a fresh ULID for data batches, the
+    // `*.write-<process_tag>-<generation>.tmp` attribution for the shared
+    // manifest, and the claimed source artifact's ULID for dead-letter metadata.
+    // Unlinking it can therefore only discard this attempt's own bytes.
     match fs::remove_file(tmp_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -7006,23 +7012,30 @@ fn write_private_file_atomically_with_ops(
             tmp_path.display()
         )),
     }
-    // `final_path`, unlike the temp, can be shared: `spool.meta.json` is one
-    // well-known name for every writer of the namespace. Unlink it only against
-    // proof of ownership — this attempt's rename took effect, and the path still
-    // names that exact file. A pre-rename failure never owned the entry, so a
-    // peer's already-published manifest survives; a peer that republished after
-    // our rename owns a different inode, so its newer publication survives too.
+    // `final_path`, unlike the temp, is not always this attempt's to delete.
     //
-    // The stat and the unlink are still two path-based calls, so this narrows
-    // rather than closes the race. The residual direction is the safe one: a
-    // final left in place is recoverable (the manifest is rewritten on the next
-    // prepare, and a data file is replayed or reconciled), whereas a deleted
-    // peer publication is not. Rolling back a rename that replaced a peer's
-    // manifest likewise removes the entry rather than restoring the peer inode,
-    // which the same regeneration path covers.
-    if let Some(published) = published
-        && PublishedFileIdentity::of(final_path).is_some_and(|current| current.matches(published))
-    {
+    // For a [`SpoolFinalOwnership::Unique`] name — a ULID-derived data batch or
+    // its dead-letter metadata — no other writer can publish to that path, so
+    // the only entry an unlink can destroy is this attempt's own unsynced
+    // publication. Roll it back, and report a cleanup failure rather than
+    // claiming a guaranteed rollback.
+    //
+    // For a [`SpoolFinalOwnership::Shared`] name — `spool.meta.json`, one
+    // well-known path for every writer of the namespace — the unlink is skipped
+    // entirely. There is no way to make "this entry is still the file I renamed"
+    // atomic with the unlink that acts on it: a peer's `rename` can replace the
+    // name between any check and the removal, so stat-then-unlink (by inode or
+    // otherwise), content comparison, and timestamp comparison would all still
+    // permit deleting a peer's newer publication. An in-process lock does not
+    // help either, since peers are separate processes on a shared volume.
+    //
+    // Skipping it can leave a manifest whose directory entry was never fsynced,
+    // or whose bytes replaced a peer's. That is recoverable: the durability
+    // error is still returned, live storage is never marked prepared, and the
+    // next prepare validates the manifest against this sink's identity and
+    // regenerates or fails closed on it. Deleting a peer's publication is not
+    // recoverable, so the residual is deliberately pushed to the safe side.
+    if ownership == SpoolFinalOwnership::Unique {
         match fs::remove_file(final_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -7059,18 +7072,13 @@ fn write_private_file_atomically_with_ops(
     }
 }
 
-/// Publish `bytes` at `final_path` durably, recording in `published` the
-/// identity of the file this attempt put there the moment its rename succeeds.
-///
-/// `published` is the rollback caller's ownership evidence: it is left `None` on
-/// every failure that happens before the rename, so such a failure can never be
-/// mistaken for ownership of a path some other writer published.
+/// Publish `bytes` at `final_path` durably: private temp, write, fsync, rename,
+/// parent-directory fsync. Rollback of a partial sequence is the caller's job.
 fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
     ops: SpoolFsOps,
-    published: &mut Option<PublishedFileIdentity>,
 ) -> Result<(), String> {
     if let Some(parent) = tmp_path.parent() {
         ensure_private_dir(parent)?;
@@ -7107,10 +7115,9 @@ fn write_private_file_atomically_inner(
     (ops.sync_file)(&file, tmp_path)?;
     drop(file);
     (ops.rename)(tmp_path, final_path)?;
-    // Record what this attempt just published before any later step can fail, so
-    // rollback can prove that the entry it is about to unlink is still this
-    // attempt's own file rather than a peer's replacement.
-    *published = PublishedFileIdentity::of(final_path);
+    // Test-only interleaving point: production wires this to a no-op, and the
+    // fault-injection suite uses it to republish `final_path` as a peer would
+    // before the directory fsync below fails.
     (ops.after_rename)(final_path);
     // Durably persist the rename itself. The file contents were fsynced above,
     // but the directory entry pointing at them is only guaranteed after an fsync

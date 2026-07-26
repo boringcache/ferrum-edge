@@ -374,19 +374,34 @@ attributed temp name, so two generations or two processes sharing the volume can
 never collide on one manifest temp and unlink each other's in-progress write. A
 Unix parent-directory open or fsync failure is a **write failure**: Ferrum rolls
 the attempt back, performs a second real parent-directory fsync, and returns the
-error before any snapshot baseline commit. Rollback is ownership-scoped. It
-always removes this attempt's own attributed temp, but it removes the final path
-only when that attempt's rename actually took effect and the path still names the
-exact file that rename published (device plus inode, compared without following
-symlinks). A failure before the rename therefore leaves a peer's already-published
-manifest untouched, and a peer that republishes the shared name after the rename
-keeps its newer file. If rollback removal or its second fsync also fails, that
-failure is included in the returned diagnostic rather than claiming a guaranteed
-rollback. On platforms that cannot fsync
-directories (notably Windows) a successful file sync plus rename is the
-durability boundary this plugin can offer, and that limit is stated rather than
-claimed away — there is no silent "best-effort" success after a failed directory
-sync on Unix.
+error before any snapshot baseline commit.
+
+Rollback is ownership-scoped, and ownership is decided by the name being
+published rather than by inspecting the file on disk. It always removes this
+attempt's own attributed temp. It also removes the **final** path when that name
+belongs exclusively to the attempt — the ULID-derived `<ulid>.<owner_tag>.<ext>`
+batch and its `<name>.rejected.meta` dead-letter record, which no other writer
+can publish. It never removes `spool.meta.json`, the one final name every writer
+of a namespace shares: an unlink acts on a path, and a peer's `rename` can
+replace that path between any ownership check and the removal, so no
+stat-then-unlink, content comparison, or timestamp comparison could keep such a
+removal from deleting a peer's newer manifest.
+
+A failed manifest publish therefore leaves the manifest entry in place, and
+Ferrum does **not** treat that as success. The durability error is still
+returned, live storage is not marked prepared, the batch is not accepted, and
+`chargeback_sink_spool_prepare_failures_total` increments. What can survive is a
+manifest whose directory entry was never fsynced (or whose bytes replaced a
+peer's); the next prepare revalidates it against this sink's identity and
+regenerates it or fails closed, so it is recoverable, whereas deleting another
+writer's live manifest would not be. If rollback removal or its second fsync also
+fails, that failure is included in the returned diagnostic rather than claiming a
+guaranteed rollback.
+
+On platforms that cannot fsync directories (notably Windows) a successful file
+sync plus rename is the durability boundary this plugin can offer, and that limit
+is stated rather than claimed away — there is no silent "best-effort" success
+after a failed directory sync on Unix.
 
 Spool enumeration never follows symlinks (scan, replay, eviction, quarantine,
 and stale-temp cleanup use non-following metadata), proves the managed root
