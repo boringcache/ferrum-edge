@@ -1049,9 +1049,7 @@ impl AiTranscriptAudit {
         _response_status: u16,
         _content_type: Option<&str>,
     ) -> bool {
-        if self.capture.streaming == StreamingCapture::Off
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-        {
+        if self.capture.streaming == StreamingCapture::Off || !flag(&ctx.metadata, MD_CANDIDATE) {
             return false;
         }
         // Ownership is proven by a local staging entry only — never by the
