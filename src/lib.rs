@@ -928,6 +928,10 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
     }
 
+    pub fn request_deduplication_redis_record_payload_is_valid(data: &[u8]) -> bool {
+        crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
+    }
+
     pub fn request_deduplication_completed_size_snapshot_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {

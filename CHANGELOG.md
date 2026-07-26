@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neither overwrite a successor's completed response nor publish while a
   successor owns the operation; such a completion is discarded locally too
   instead of being replayed as a non-authoritative result. Redis-mode logical
-  keys move to `v4` and the record format is versioned, so a rolling upgrade
-  reads and writes disjoint keys instead of mixing formats. A new
+  keys move to `v4`, unconditionally include the matched proxy namespace even
+  under an explicitly shared Redis prefix, and the record format is versioned,
+  so a rolling upgrade reads and writes disjoint keys instead of mixing
+  formats. Current-version records with missing ownership fences, impossible
+  state fields, or mismatched inner/outer fingerprints fail closed. A new
   `on_redis_unavailable` field decides outage behavior and **defaults to
   `fail_closed` (HTTP 503)**; deployments that prefer the previous
   process-local fallback must set `on_redis_unavailable: "local_only"`.

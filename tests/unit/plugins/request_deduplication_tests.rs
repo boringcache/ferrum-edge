@@ -7,12 +7,14 @@ use ferrum_edge::_test_support::{
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
-    request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
+    request_deduplication_redis_payload_for_test,
+    request_deduplication_redis_record_payload_is_valid,
+    request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
     request_deduplication_with_instance_id_for_test,
     set_response_presentation_policy_digest_for_test,
 };
-use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, Proxy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::{
@@ -487,6 +489,48 @@ async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
     assert_ne!(
         first_key, whitespace_distinct_key,
         "distinct nonblank plugin_config_id bytes must not collapse after validation"
+    );
+}
+
+/// A custom Redis prefix is allowed to be shared by multiple namespaces, so
+/// namespace must remain part of the hashed operation identity even when all
+/// resource IDs and request bytes are equal.
+#[tokio::test]
+async fn explicit_shared_redis_prefix_still_partitions_proxy_namespaces() {
+    let plugin = make_redis_sibling(
+        "idempotency-key",
+        "shared-dedup-config",
+        "ferrum:dedup:shared",
+    );
+
+    async fn logical_key(plugin: &RequestDeduplication, namespace: &str) -> String {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": "orders",
+            "namespace": namespace,
+            "hosts": ["api.example"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080
+        }))
+        .expect("proxy fixture");
+        let mut ctx = body_ctx("POST", "/api/orders", b"{}");
+        ctx.matched_proxy = Some(Arc::new(proxy));
+        let mut headers = keyed_headers("shared-key", "api.example", 2);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
+        assert_eq!(keys.len(), 1, "expected one acquired logical key");
+        keys.into_iter().next().expect("logical key")
+    }
+
+    let blue = logical_key(&plugin, "blue").await;
+    let green = logical_key(&plugin, "green").await;
+    assert_ne!(
+        blue, green,
+        "equal proxy/config IDs under an explicit shared Redis prefix must remain namespace-scoped"
     );
 }
 
@@ -5073,6 +5117,99 @@ fn test_redis_cached_response_byte_array_body_with_provenance_is_accepted() {
     let byte_array_body = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","presentation":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"},"status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
 
     assert!(request_deduplication_redis_cached_response_payload_is_valid(byte_array_body));
+}
+
+/// Current-version operation records have a strict state-dependent shape.
+/// Missing fences, impossible field combinations, and a replay whose inner
+/// fingerprint disagrees with its owning record are unknown writer state and
+/// must fail closed rather than being interpreted optimistically.
+#[test]
+fn redis_operation_record_rejects_malformed_current_version_shapes() {
+    let fingerprint = "sha256-request-a";
+    let valid_replay = json!({
+        "fingerprint": fingerprint,
+        "response_policy": {
+            "gate": "00".repeat(32),
+            "presentation": "11".repeat(32)
+        },
+        "status_code": 201,
+        "headers": {},
+        "body": "e30="
+    });
+
+    for valid in [
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": "owner-a"
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "replay": valid_replay.clone()
+        }),
+    ] {
+        let bytes = serde_json::to_vec(&valid).expect("record JSON");
+        assert!(
+            request_deduplication_redis_record_payload_is_valid(&bytes),
+            "valid current record rejected: {valid}"
+        );
+    }
+
+    for malformed in [
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint
+        }),
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": ""
+        }),
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": "owner-a",
+            "replay": valid_replay.clone()
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "owner_token": "stale-owner"
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "replay": {
+                "fingerprint": "sha256-request-b",
+                "response_policy": {
+                    "gate": "00".repeat(32),
+                    "presentation": "11".repeat(32)
+                },
+                "status_code": 201,
+                "headers": {},
+                "body": "e30="
+            }
+        }),
+    ] {
+        let bytes = serde_json::to_vec(&malformed).expect("record JSON");
+        assert!(
+            !request_deduplication_redis_record_payload_is_valid(&bytes),
+            "malformed current record accepted: {malformed}"
+        );
+    }
 }
 
 #[test]

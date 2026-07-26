@@ -1017,16 +1017,27 @@ impl RequestDeduplication {
     /// Redis keys and request metadata never expose idempotency values or
     /// authenticated identities.
     fn build_key(&self, ctx: &RequestContext, idempotency_value: &str) -> String {
-        let proxy_id = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|p| p.id.as_str())
-            .unwrap_or("_");
-
         let mut hasher = Sha256::new();
         hash_framed(&mut hasher, "version", DEDUP_LOGICAL_KEY_VERSION.as_bytes());
         hash_framed(&mut hasher, "plugin_config_id", self.config_id.as_bytes());
-        hash_framed(&mut hasher, "proxy_id", proxy_id.as_bytes());
+        // The Redis prefix is operator-configurable and may deliberately be
+        // shared across namespaces. Namespace therefore belongs in the
+        // authenticated logical identity itself, not only in the default
+        // prefix, so equal resource IDs in separate namespaces cannot claim or
+        // replay one another's operation.
+        if let Some(proxy) = ctx.matched_proxy.as_ref() {
+            hash_framed(&mut hasher, "matched_proxy", b"1");
+            hash_framed(
+                &mut hasher,
+                "proxy_namespace",
+                proxy.namespace.as_bytes(),
+            );
+            hash_framed(&mut hasher, "proxy_id", proxy.id.as_bytes());
+        } else {
+            // Frame presence explicitly rather than reserving a sentinel that
+            // could collide with a valid namespace/resource identifier.
+            hash_framed(&mut hasher, "matched_proxy", b"0");
+        }
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
@@ -1313,7 +1324,7 @@ impl RequestDeduplication {
         let Ok(record) = serde_json::from_slice::<SerializableDedupRecord>(&data) else {
             return RedisRecordState::Unreadable;
         };
-        if record.record_version != DEDUP_REDIS_RECORD_VERSION {
+        if !record.has_valid_current_shape() {
             return RedisRecordState::Unreadable;
         }
         match record.state.as_str() {
@@ -2293,6 +2304,37 @@ struct SerializableDedupRecord {
 }
 
 impl SerializableDedupRecord {
+    /// Validate the state-dependent wire shape before any field is trusted.
+    ///
+    /// Serde defaults make forward-compatible parsing convenient, but they
+    /// must not turn a partially written or attacker-controlled record into a
+    /// valid ownership/completion state. In particular, an in-flight record
+    /// always carries a nonempty fencing token and no replay, while a completed
+    /// record carries no owner and any replay must bind to the outer request
+    /// fingerprint.
+    fn has_valid_current_shape(&self) -> bool {
+        if self.record_version != DEDUP_REDIS_RECORD_VERSION || self.fingerprint.is_empty() {
+            return false;
+        }
+
+        match self.state.as_str() {
+            DEDUP_RECORD_STATE_INFLIGHT => {
+                self.owner_token
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty())
+                    && self.replay.is_none()
+            }
+            DEDUP_RECORD_STATE_COMPLETED => {
+                self.owner_token.is_none()
+                    && self
+                        .replay
+                        .as_ref()
+                        .is_none_or(|replay| replay.fingerprint == self.fingerprint)
+            }
+            _ => false,
+        }
+    }
+
     fn inflight(fingerprint: &str, token: &str) -> Self {
         Self {
             record_version: DEDUP_REDIS_RECORD_VERSION,
@@ -2523,6 +2565,22 @@ pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bo
         .ok()
         .and_then(|stored| stored.response_policy.decode())
         .is_some()
+}
+
+// External tests reach this through `crate::_test_support`; the binary target
+// still sees the crate-private helper itself as unused.
+#[allow(dead_code)]
+pub(crate) fn redis_record_payload_is_valid_for_test(data: &[u8]) -> bool {
+    let Ok(record) = serde_json::from_slice::<SerializableDedupRecord>(data) else {
+        return false;
+    };
+    if !record.has_valid_current_shape() {
+        return false;
+    }
+    record
+        .replay
+        .as_ref()
+        .is_none_or(|replay| replay.response_policy.decode().is_some())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
