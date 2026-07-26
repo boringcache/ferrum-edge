@@ -119,6 +119,7 @@ fn admin_state(db: DatabaseStore) -> AdminState {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }

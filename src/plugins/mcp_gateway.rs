@@ -687,6 +687,10 @@ impl McpGateway {
         // (honors FERRUM_POOL_SHARD_AMOUNT via the shared http client).
         let session_shard_amount = http_client.pool_shard_amount();
 
+        // No static replay-provenance digest is computed here on purpose. The
+        // public-URI mapping this plugin writes into response bodies comes from
+        // the live per-session `McpCatalog`, not from `config`; see
+        // `response_presentation_policy`.
         Ok(Self {
             enabled,
             mode,
@@ -3181,6 +3185,42 @@ impl Plugin for McpGateway {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         HTTP_ONLY_PROTOCOLS
+    }
+
+    /// The public-URI/name rewrite this plugin applies to `resources/read`,
+    /// `tools/call`, and `prompts/get` results is **not** a function of static
+    /// configuration, so it cannot be reduced to a construction-time digest.
+    ///
+    /// `transform_response_body_with_context` resolves the rewrite against
+    /// [`McpCatalog`] — the per-downstream-session resources, resource
+    /// templates, tools, and prompts this gateway discovers from upstream and
+    /// re-lists whenever `discovery.cache_ttl` expires. Which public URI maps
+    /// to which upstream URI, which entries are hidden, and which are ambiguous
+    /// all change with no config edit, no plugin-cache rebuild, and no new
+    /// plugin instance. The catalog is also per session and per process: its
+    /// `version` counter is a local monotonic value, so it is meaningless to a
+    /// representation replayed in another session or by another gateway.
+    /// Digesting the static config would therefore assert a compatibility claim
+    /// the catalog can invalidate at any moment while the digest still matches.
+    ///
+    /// The ordering makes this unrecoverable rather than merely awkward:
+    /// `request_deduplication` (priority
+    /// `priorities::REQUEST_DEDUPLICATION`) short-circuits in `before_proxy`
+    /// ahead of this plugin (`priorities::MCP_GATEWAY`), so a replay never runs
+    /// the MCP validation/routing that would observe the current catalog or
+    /// stamp `mcp.response_rewrite.*` metadata. There is no request-scoped
+    /// dynamic provenance to pin before the dedup lookup, and establishing one
+    /// would require an upstream discovery refresh — a network round trip under
+    /// a per-session lock — on the dedup hot path.
+    ///
+    /// Reporting `Dynamic` collapses the proxy's presentation digest to `None`,
+    /// which makes every replay consumer fail closed. Config admission rejects
+    /// the composition outright
+    /// (`request_deduplication::validate_composition`); this is the runtime
+    /// backstop for admission paths that only warn.
+    fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
+        self.enabled
+            .then_some(super::ResponsePresentationPolicy::Dynamic)
     }
 
     fn modifies_request_headers(&self) -> bool {
