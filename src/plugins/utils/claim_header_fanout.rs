@@ -176,21 +176,21 @@ fn sanitize_owned_claim_header_destinations(
     if destinations.is_empty() {
         return;
     }
-    let unclaimed: Vec<&str> = destinations
-        .names()
-        .filter(|name| !ctx.sanitized_claim_header_destinations.contains(*name))
-        .collect();
-    if unclaimed.is_empty() {
-        return;
-    }
     headers.retain(|name, _| {
-        !unclaimed
-            .iter()
-            .any(|destination| name.eq_ignore_ascii_case(destination))
+        !destinations.names().any(|destination| {
+            !ctx.sanitized_claim_header_destinations
+                .contains(destination)
+                && name.eq_ignore_ascii_case(destination)
+        })
     });
-    for destination in unclaimed {
-        ctx.sanitized_claim_header_destinations
-            .insert(destination.to_string());
+    for destination in destinations.names() {
+        if !ctx
+            .sanitized_claim_header_destinations
+            .contains(destination)
+        {
+            ctx.sanitized_claim_header_destinations
+                .insert(destination.to_string());
+        }
     }
 }
 
