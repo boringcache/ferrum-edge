@@ -81,7 +81,10 @@ fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
 
     // IPv6 authorities keep diagnostics while stripping userinfo.
     let ipv6 = make_config("redis://user:pass@[2001:db8::10]:6379/2", false);
-    assert_eq!(ipv6.redacted_url(), "redis://redacted@[2001:db8::10]:6379/2");
+    assert_eq!(
+        ipv6.redacted_url(),
+        "redis://redacted@[2001:db8::10]:6379/2"
+    );
 
     // Opaque schemes can embed secrets outside userinfo/query/fragment; they
     // must not be echoed just because the URL crate can parse them.
