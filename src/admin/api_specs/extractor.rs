@@ -2654,7 +2654,11 @@ impl LocalSchemaResolver {
                 root
             } else {
                 root.pointer(resource_root_pointer).ok_or_else(|| {
-                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
+                    schema_reference_error(unresolved_internal_ref_message(
+                        reference,
+                        &resource_key,
+                        resource_root_pointer,
+                    ))
                 })?
             };
             // Empty fragment = schema resource root. The OpenAPI document root
@@ -2669,7 +2673,11 @@ impl LocalSchemaResolver {
                 resource_root
             } else {
                 resource_root.pointer(&decoded_fragment).ok_or_else(|| {
-                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
+                    schema_reference_error(unresolved_internal_ref_message(
+                        reference,
+                        &resource_key,
+                        resource_root_pointer,
+                    ))
                 })?
             };
             let absolute_pointer = if decoded_fragment.is_empty() {
@@ -2741,6 +2749,26 @@ impl LocalSchemaResolver {
         resource.set_fragment(None);
         Ok(resource)
     }
+}
+
+/// A JSON-pointer fragment resolves *inside* the schema resource in force at the
+/// reference, not against the OpenAPI document root. When an enclosing or
+/// adjacent `$id` rebased that resource, a pointer such as
+/// `#/components/schemas/Order` silently stops addressing the document, so name
+/// the resource that was searched instead of reporting a bare "unresolved".
+/// Both interpolated values come from the submitted spec and are already the
+/// same trust class as `reference`; no resolver-internal state is disclosed.
+fn unresolved_internal_ref_message(
+    reference: &str,
+    resource_key: &str,
+    resource_root_pointer: &str,
+) -> String {
+    if resource_root_pointer.is_empty() {
+        return format!("unresolved internal $ref '{reference}'");
+    }
+    format!(
+        "unresolved internal $ref '{reference}': the fragment is resolved inside the schema resource '{resource_key}' (rooted at '{resource_root_pointer}' by its $id), not against the OpenAPI document root; use an absolute $ref or move the $id"
+    )
 }
 
 fn resource_uri_key(url: &Url) -> String {
@@ -2921,6 +2949,19 @@ const SCHEMA_NON_ASSERTION_KEYWORDS: &[&str] = &[
 const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] =
     &["$dynamicRef", "unevaluatedItems", "unevaluatedProperties"];
 
+/// Resolution context for one Schema Object `$ref`-with-siblings composition:
+/// the document root, the reporting location, the reference being composed, the
+/// remaining recursion budget, the base URI in force inside the referring object
+/// (after its own `$id`), and the shared resolver.
+struct RefComposition<'a> {
+    root: &'a Value,
+    location: &'a str,
+    reference: &'a str,
+    depth: usize,
+    child_base: &'a Url,
+    resolver: &'a LocalSchemaResolver,
+}
+
 /// Compose a Schema Object `$ref` with its adjacent keywords without letting an
 /// adjacent keyword overwrite a referenced assertion (GHSA-rf4j-rhmf-8whm).
 ///
@@ -2936,15 +2977,18 @@ const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] =
 ///   did not opt into it, the import fails closed and asks for an explicit
 ///   `allOf`.
 fn compose_schema_ref_siblings(
-    root: &Value,
+    ctx: RefComposition<'_>,
     object: &Map<String, Value>,
     resolved_target: Value,
-    location: &str,
-    reference: &str,
-    depth: usize,
-    child_base: &Url,
-    resolver: &LocalSchemaResolver,
 ) -> Result<Value, ExtractError> {
+    let RefComposition {
+        root,
+        location,
+        reference,
+        depth,
+        child_base,
+        resolver,
+    } = ctx;
     let mut wrapper_fields = Map::new();
     let mut assertions = Map::new();
     for (key, child) in object {
@@ -3051,14 +3095,16 @@ fn resolve_refs(
                     if context == ResolveContext::Schema {
                         // Schema Object: never merge keywords by replacement.
                         return compose_schema_ref_siblings(
-                            root,
+                            RefComposition {
+                                root,
+                                location,
+                                reference,
+                                depth,
+                                child_base: &child_base,
+                                resolver,
+                            },
                             object,
                             resolved,
-                            location,
-                            reference,
-                            depth,
-                            &child_base,
-                            resolver,
                         );
                     }
                     // Reference Object (Path Item / requestBody / response /

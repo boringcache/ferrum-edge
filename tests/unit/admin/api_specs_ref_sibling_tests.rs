@@ -113,15 +113,47 @@ fn annotation_only_ref_siblings_stay_flat() {
 
 #[test]
 fn identifier_ref_siblings_stay_on_the_wrapper() {
+    // The referring object declares its own `$id`, so the sibling `$ref` is
+    // resolved against that base (2020-12 §8.2.1) — here an absolute reference
+    // to a second in-document schema resource. The `$id` must stay on the
+    // wrapper: relocating it into an `allOf` branch would move the base-URI
+    // scope of every URI-reference keyword composed beside it.
     let spec = spec_with_request_schema(
         "3.1.0",
-        r#"{"type": "string", "minLength": 3}"#,
-        r##"{"$id": "https://example.com/wrapper.json", "$ref": "#/components/schemas/Target", "maxLength": 5}"##,
+        r#"{"$id": "https://example.com/target.json", "type": "string", "minLength": 3}"#,
+        r#"{"$id": "https://example.com/wrapper.json", "$ref": "https://example.com/target.json", "maxLength": 5}"#,
     );
     let schema = first_request_schema(&spec);
     assert_eq!(schema["$id"], "https://example.com/wrapper.json");
     assert_eq!(schema["allOf"][0]["minLength"], 3);
     assert_eq!(schema["allOf"][1]["maxLength"], 5);
+    assert!(
+        schema.get("maxLength").is_none(),
+        "the assertion sibling must not be merged onto the wrapper: {schema}"
+    );
+}
+
+#[test]
+fn identifier_ref_sibling_rebases_a_document_root_pointer() {
+    // `$id` beside `$ref` starts a new schema resource, so `#/components/...`
+    // no longer addresses the OpenAPI document — it addresses the wrapper.
+    // That is the standard rule, and it must fail closed (with actionable
+    // wording) rather than silently falling back to the document root.
+    let spec = spec_with_request_schema(
+        "3.1.0",
+        r#"{"type": "string", "minLength": 3}"#,
+        r##"{"$id": "https://example.com/wrapper.json", "$ref": "#/components/schemas/Target", "maxLength": 5}"##,
+    );
+    let error = extract_err(&spec);
+    assert!(
+        matches!(error, ExtractError::SchemaReference(_)),
+        "unexpected error: {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("https://example.com/wrapper.json") && message.contains("$id"),
+        "error must explain the $id rebase: {message}"
+    );
 }
 
 #[test]
