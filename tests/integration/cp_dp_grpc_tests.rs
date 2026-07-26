@@ -4822,13 +4822,27 @@ fn add_proxy_delta_at(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> In
 }
 
 /// Broadcast `delta` as a DELTA envelope whose version matches its body stamp.
+///
+/// Returns the number of live ConfigSync subscriptions the frame was queued to.
+/// A `0` means the DP was between attempts and the frame was dropped, so a
+/// "the delta never applied" assertion would hold for the wrong reason.
 fn send_delta(
     tx: &tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
     delta: &IncrementalResult,
-) {
+) -> usize {
     let version = delta.poll_timestamp.to_rfc3339();
     let body = serde_json::to_string(delta).unwrap();
-    let _ = tx.send(delta_update(body, &version));
+    tx.send(delta_update(body, &version)).unwrap_or(0)
+}
+
+/// True once the DP has recorded a rejected non-empty DELTA.
+///
+/// Sticky divergence is cleared by the FULL_SNAPSHOT recovery that follows the
+/// terminated stream, so the recovery counter must be checked too — otherwise a
+/// fast reconnect can erase the only evidence that the fence fired.
+fn delta_rejection_recorded(connection_state: &Arc<ArcSwap<DpCpConnectionState>>) -> bool {
+    let state = connection_state.load();
+    state.config_diverged || state.config_divergence_recoveries_total > 0
 }
 
 /// Wait until the DP reports an established ConfigSync stream.
@@ -5020,13 +5034,40 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
         "ABA candidate must postdate the older equivalent body stamp so only \
          evaluate_delta_authority (not GatewayConfig.loaded_at) can refuse it"
     );
-    // Re-broadcast a few times: a delta sent while the DP is momentarily between
-    // attempts is simply dropped, which would pass this test for the wrong
-    // reason. Every delivery must be fenced.
-    for _ in 0..3 {
-        send_delta(&older_tx, &stale);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    // Re-broadcast until the DP demonstrably processed and rejected the frame: a
+    // delta sent while the DP is momentarily between attempts is dropped by the
+    // broadcast channel, which would pass the negative assertions below for the
+    // wrong reason. `delta_rejection_recorded` is the DP-side proof that the
+    // fence actually ran — only a rejected non-empty DELTA raises divergence on
+    // this path.
+    assert!(
+        !delta_rejection_recorded(&connection_state),
+        "no DELTA has been rejected yet — the rejection signal below must come \
+         from the ABA candidate, not from earlier failover activity"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut queued_to_live_subscription = false;
+    let mut fenced = false;
+    while std::time::Instant::now() < deadline {
+        if send_delta(&older_tx, &stale) > 0 {
+            queued_to_live_subscription = true;
+        }
+        if delta_rejection_recorded(&connection_state) {
+            fenced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    assert!(
+        queued_to_live_subscription,
+        "the stale DELTA must reach a live ConfigSync subscription — a dropped \
+         broadcast would satisfy the assertions below vacuously"
+    );
+    assert!(
+        fenced,
+        "the DP must record a rejected DELTA — without that the assertions below \
+         would also hold if the frame was never evaluated"
+    );
 
     assert!(
         !wait_for_proxy_id(&proxy_state, "aba-rollback", Duration::from_secs(5)).await,
@@ -5085,10 +5126,21 @@ async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
 
     let rolled_back = create_test_proxy("stale-delta", "/stale-delta");
     let stale = add_proxy_delta_at(rolled_back, watermark - chrono::Duration::hours(1));
-    send_delta(&update_tx, &stale);
+    // The accepted snapshot above proves a subscription is live, so this frame
+    // must be queued to it; a dropped broadcast would make the negative
+    // assertion below vacuous.
+    assert!(
+        send_delta(&update_tx, &stale) > 0,
+        "the stale DELTA must reach the DP's established ConfigSync subscription"
+    );
     assert!(
         !wait_for_proxy_id(&proxy_state, "stale-delta", Duration::from_secs(5)).await,
         "a DELTA stamped before the applied watermark must be refused before apply"
+    );
+    assert!(
+        delta_rejection_recorded(&connection_state),
+        "the fence must record a rejected DELTA (sticky divergence or its \
+         FULL_SNAPSHOT recovery), proving the frame was evaluated and refused"
     );
     assert!(
         proxy_state.config.load().loaded_at >= watermark,
@@ -5104,7 +5156,7 @@ async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
     while std::time::Instant::now() < deadline {
         let forward = create_test_proxy("fresh-delta", "/fresh-delta");
         let fresh = add_proxy_delta_at(forward, Utc::now());
-        send_delta(&update_tx, &fresh);
+        let _ = send_delta(&update_tx, &fresh);
         if wait_for_proxy_id(&proxy_state, "fresh-delta", Duration::from_millis(500)).await {
             applied = true;
             break;
