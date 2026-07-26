@@ -938,6 +938,12 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            let retention_policy = crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            };
+            retention_policy.log_if_enabled();
+            store.set_audit_retention_policy(retention_policy);
             store.run_migrations().await?;
             Box::new(store)
         }
@@ -1003,6 +1009,12 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            let retention_policy = crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            };
+            retention_policy.log_if_enabled();
+            store.set_audit_retention_policy(retention_policy);
 
             // Connect read replica for admin-only read offload. Runtime
             // config polling remains primary-consistent.
@@ -1155,7 +1167,7 @@ pub async fn run(
                     e, path
                 );
                 match load_config_backup(path) {
-                    Some(cfg) => {
+                    Ok(Some(cfg)) => {
                         startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);
                         if startup_config_rejected {
                             error!(
@@ -1174,10 +1186,24 @@ pub async fn run(
                         );
                         (cfg, None)
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(anyhow::anyhow!(
                             "Database load failed and no usable backup at {}: {}",
                             path,
+                            e
+                        ));
+                    }
+                    Err(backup_err) => {
+                        // Surface the backup rejection itself — collapsing parse /
+                        // version / runtime-validation failures to a generic
+                        // "no usable backup" hides the actionable diagnostics
+                        // operators need when FERRUM_DB_CONFIG_BACKUP_PATH points
+                        // at a syntactically valid but runtime-fatal snapshot.
+                        return Err(anyhow::anyhow!(
+                            "Database load failed and config backup at {} was rejected: {}. \
+                             Original database error: {}",
+                            path,
+                            backup_err,
                             e
                         ));
                     }

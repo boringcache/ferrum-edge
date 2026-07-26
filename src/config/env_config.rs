@@ -1701,6 +1701,15 @@ pub struct EnvConfig {
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
     pub admin_audit_enabled: bool,
+    /// Optional age-based audit retention in days (`FERRUM_AUDIT_RETENTION_DAYS`).
+    /// Unset disables age prune. When set, must be in `1..=36_500`. Distinct from
+    /// audit delivery-loss hardening (#2421): this only bounds retained rows.
+    pub audit_retention_days: Option<u64>,
+    /// Per-namespace audit row cap (`FERRUM_AUDIT_RETENTION_MAX_ROWS`).
+    /// Defaults to 100,000. Set to `0` to disable the row cap (retain audit rows
+    /// indefinitely by count). Non-zero values must be in `1..=10_000_000`.
+    /// Newest events win under deterministic `(ts, id)` ordering.
+    pub audit_retention_max_rows: Option<u64>,
     /// Require admin JWTs to carry an `ns` claim authorizing the
     /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
     /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
@@ -2530,6 +2539,8 @@ impl Default for EnvConfig {
             tls_no_verify: false,
             admin_read_only: false,
             admin_audit_enabled: false,
+            audit_retention_days: None,
+            audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
@@ -2729,8 +2740,17 @@ impl EnvConfig {
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
             admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
+            audit_retention_days: Option<u64> = "FERRUM_AUDIT_RETENTION_DAYS";
+            audit_retention_max_rows: u64 = "FERRUM_AUDIT_RETENTION_MAX_ROWS"
+                => crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
+        let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
+            audit_retention_days,
+            Some(audit_retention_max_rows),
+        )?;
+        let audit_retention_days = audit_retention_policy.retention_days;
+        let audit_retention_max_rows = audit_retention_policy.max_rows_per_namespace;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -3594,6 +3614,8 @@ impl EnvConfig {
             tls_no_verify,
             admin_read_only,
             admin_audit_enabled,
+            audit_retention_days,
+            audit_retention_max_rows,
             admin_require_namespace_claim,
             admin_tls_no_verify,
             enable_http3,
