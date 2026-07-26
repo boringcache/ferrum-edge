@@ -198,11 +198,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Used nonces for replay protection in WS-Security authentication.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries and 8 MiB total retained nonce-key bytes, with each encoded nonce capped at 512 characters.
 
-**Config field:** `nonce_replay_protection.max_cache_size` (default 10,000) and `nonce_replay_protection.cache_ttl_seconds` (default 300s).
+**Config fields:** `nonce.max_cache_size` (default 10,000), `nonce.cache_ttl_seconds` (default 300s), `nonce.max_encoded_length` (default 512), and `nonce.max_total_cache_bytes` (default 8,388,608). These are the canonical names; there is no `nonce_replay_protection` alias and that object is rejected as an unknown configuration key.
 
-**Cleanup mechanism:** TTL-based expiration. When the cache reaches `max_cache_size`, expired entries are purged first. If still at capacity after purging, the oldest 10% of entries are forcibly evicted to make room.
+**Cleanup mechanism:** TTL-based expiration. A nonce is retained only after its PasswordDigest verifies, and its encoded length is checked before Base64 decoding. When either the entry cap or the retained-byte cap is reached, expired entries are purged first; if still at capacity, a bounded oldest-first batch is evicted — the smaller of 10% of `max_cache_size` and 64 keys, so no request clones or sorts the whole key set. If neither pass frees room the request fails closed (HTTP 401) rather than accepting a nonce whose replay window cannot be recorded.
 
 ### LDAP Auth Cache
 
@@ -282,8 +282,10 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
-| `soap_ws_security` | `nonce_replay_protection.max_cache_size` | `10000` | Maximum tracked nonces |
-| `soap_ws_security` | `nonce_replay_protection.cache_ttl_seconds` | `300` | Nonce expiry TTL |
+| `soap_ws_security` | `nonce.max_cache_size` | `10000` | Maximum tracked nonces |
+| `soap_ws_security` | `nonce.cache_ttl_seconds` | `300` | Nonce expiry TTL |
+| `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
+| `soap_ws_security` | `nonce.max_total_cache_bytes` | `8388608` | Maximum retained nonce-key bytes |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |

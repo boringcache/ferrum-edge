@@ -15091,7 +15091,8 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. There is no nonce_replay_protection alias — nonce.* is the only canonical shape."
+      additionalProperties: false
       properties:
         reject_missing_security_header:
           type: boolean
@@ -15100,6 +15101,7 @@ components:
         timestamp:
           type: object
           description: WS-Security Timestamp validation
+          additionalProperties: false
           properties:
             require:
               type: boolean
@@ -15109,7 +15111,9 @@ components:
               type: integer
               format: uint64
               default: 300
-              description: Maximum age (seconds) of the Created timestamp before rejection
+              minimum: 1
+              maximum: 86400
+              description: Maximum age (seconds) of the Created timestamp before rejection. Zero is rejected because it would accept no timestamp at all.
             require_expires:
               type: boolean
               default: false
@@ -15118,7 +15122,9 @@ components:
               type: integer
               format: uint64
               default: 300
-              description: Clock skew tolerance (seconds) for timestamp validation
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for timestamp validation. Zero is permitted (strictest). The maximum keeps every admitted value inside representable duration arithmetic.
         username_token:
           type: object
           description: |
@@ -15129,6 +15135,7 @@ components:
             still perform PasswordText/PasswordDigest verification against
             process-local dummy material. Structural token or policy failures
             remain distinct.
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15144,15 +15151,19 @@ components:
               items:
                 type: object
                 required: [username, password]
+                additionalProperties: false
                 properties:
                   username:
                     type: string
+                    minLength: 1
                   password:
                     type: string
-              description: Allowed username/password pairs for UsernameToken authentication
+                    minLength: 1
+              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with non-empty username and password; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins.
         x509_signature:
           type: object
           description: X.509 certificate signature verification
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15162,16 +15173,19 @@ components:
               type: array
               items:
                 type: string
-              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint)
+                minLength: 1
+              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint). Non-string or empty entries are rejected rather than dropped.
             allowed_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [rsa-sha256, rsa-sha1]
               default: [rsa-sha256]
-              description: Allowed XMLDSig signature algorithms
+              description: Allowed XMLDSig signature algorithms. Unsupported values are rejected rather than dropped.
             allowed_digest_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [sha256, sha1]
@@ -15217,6 +15231,7 @@ components:
             On any failure the request is rejected with HTTP 401. Unsupported
             canonicalization or transform algorithms fail closed; inclusive c14n,
             comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15226,6 +15241,7 @@ components:
               type: array
               items:
                 type: string
+                minLength: 1
               description: |
                 SAML Issuer URIs that are accepted as the source of an assertion.
                 Required when `enabled` is true. The Issuer string inside the
@@ -15234,6 +15250,7 @@ components:
               type: array
               items:
                 type: string
+                minLength: 1
               description: |
                 PEM file paths of IdP X.509 signing certificates. The cert
                 presented inside the assertion's `KeyInfo` must match one of
@@ -15242,6 +15259,7 @@ components:
                 updating this list and restarting (no live reload).
             allowed_signature_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [rsa-sha256, rsa-sha1]
@@ -15253,6 +15271,7 @@ components:
                 of `allowed_digest_algorithms`.
             allowed_digest_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [sha256, sha1]
@@ -15265,30 +15284,62 @@ components:
                 can choose any combination.
             audience:
               type: string
+              minLength: 1
               description: |
                 Optional. When set, the assertion's
                 `Conditions/AudienceRestriction/Audience` must match this
                 string exactly. Use this to bind assertions to the specific
-                service this proxy fronts.
+                service this proxy fronts. Must be a non-empty string when
+                present — a wrong-typed value is rejected rather than silently
+                removing audience binding.
             clock_skew_seconds:
               type: integer
               format: uint64
               default: 300
-              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter.
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter. Zero is permitted (strictest); the maximum keeps every admitted value inside representable duration arithmetic.
         nonce:
           type: object
-          description: Nonce replay protection cache (PasswordDigest only)
+          description: |
+            Nonce replay protection cache (PasswordDigest only). A nonce is
+            retained only after its PasswordDigest verifies, and the cache is
+            bounded on three independent axes: per-nonce encoded length,
+            retained entries, and total retained bytes. When neither expiry nor
+            a bounded oldest-first eviction batch can free room the request
+            fails closed (HTTP 401) rather than accepting a nonce whose replay
+            window cannot be recorded. This is the only canonical shape; there
+            is no `nonce_replay_protection` alias.
+          additionalProperties: false
           properties:
             cache_ttl_seconds:
               type: integer
               format: uint64
               default: 300
-              description: How long to remember nonces for replay detection (seconds)
+              minimum: 1
+              maximum: 86400
+              description: How long to remember nonces for replay detection (seconds). Zero is rejected because it would make replay detection inert.
             max_cache_size:
               type: integer
               format: uint64
               default: 10000
-              description: Maximum nonce cache entries before eviction sweep
+              minimum: 1
+              maximum: 1000000
+              description: Maximum nonce cache entries before eviction sweep. Zero is rejected because it would make replay detection inert.
+            max_encoded_length:
+              type: integer
+              format: uint64
+              default: 512
+              minimum: 16
+              maximum: 4096
+              description: Maximum length of the encoded wsse:Nonce value, enforced before Base64 decoding and before any cache insertion so an oversized nonce is never decoded or retained.
+            max_total_cache_bytes:
+              type: integer
+              format: uint64
+              default: 8388608
+              minimum: 4096
+              maximum: 1073741824
+              description: Maximum total retained nonce-key bytes. Must be at least max_encoded_length. Bounds the cache in bytes as well as entries so max_cache_size cannot be multiplied by the per-nonce length.
 
     CorsExactOrigin:
       oneOf:

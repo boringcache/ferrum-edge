@@ -14,6 +14,37 @@
 //! in the shared pre-`before_proxy` normalization phase so this plugin
 //! validates the same size-bounded plaintext the backend receives.
 //!
+//! ## Configuration admission (strict, fail-closed)
+//!
+//! The root object and every nested fixed-shape object (`timestamp`,
+//! `username_token`, each `credentials` entry, `x509_signature`, `saml`,
+//! `nonce`) reject unknown keys and wrong-typed values before any default
+//! applies. Silently defaulting a malformed value used to be able to disable
+//! UsernameToken/SAML/X.509 policy, drop SAML audience binding, or reset a
+//! freshness/replay window while startup, Admin validation, CP/DP propagation,
+//! and reload all reported success — the `FailClosed` registration in
+//! `src/plugins/mod.rs` never saw an error, so no last-known-good generation
+//! was retained. There is no `nonce_replay_protection` alias: `nonce.*` is the
+//! only canonical shape and the alias is rejected as an unknown key.
+//!
+//! Every duration and cache control has an enforced inclusive range. Upper
+//! bounds sit far below `chrono::TimeDelta`'s representable range and parsed
+//! WS-Security / SAML instants are clamped to a four-digit year, so no admitted
+//! configuration and no hostile `Created` / `Expires` / `NotBefore` /
+//! `NotOnOrAfter` value can overflow duration or `DateTime` arithmetic and panic
+//! a request task. Durations are converted once at admission.
+//!
+//! ## Nonce replay cache bounds
+//!
+//! Replay state is bounded on three independent axes — per-nonce encoded
+//! length, retained entries, and total retained bytes — and a nonce is only
+//! retained *after* its PasswordDigest verifies. The encoded-length ceiling is
+//! checked before Base64 decoding, forced eviction clones at most
+//! `NONCE_EVICTION_BATCH` keys (never the whole key set), and a cache that
+//! cannot make room fails the request closed rather than admitting a nonce
+//! whose replay window cannot be recorded. Diagnostics use fixed-cardinality
+//! failure classes and never include the nonce.
+//!
 //! ## Request body character encoding
 //!
 //! Matching SOAP media types are buffered as raw bytes
@@ -55,7 +86,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use dashmap::{DashMap, mapref::entry::Entry};
 use ring::digest;
 use ring::signature as ring_sig;
@@ -64,11 +95,13 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginResult, RequestContext};
@@ -99,6 +132,99 @@ const MAX_XML_NODES: u32 = 65_536;
 const MAX_CANONICALIZATION_DEPTH: usize = 256;
 const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
 const MAX_INCLUSIVE_PREFIX_LIST_BYTES: usize = 4_096;
+
+// ── Configuration admission bounds ──────────────────────────────────────────
+
+/// Inclusive bounds for every operator-supplied duration and cache control.
+///
+/// Upper bounds sit far below `chrono::TimeDelta`'s `i64::MAX / 1000` second
+/// ceiling, so no admitted configuration can make duration construction or
+/// `DateTime` arithmetic overflow on the request path. Lower bounds reject the
+/// degenerate values that silently disable a defense (a zero freshness window
+/// or a zero-entry replay cache).
+const MIN_TIMESTAMP_MAX_AGE_SECONDS: u64 = 1;
+const MAX_TIMESTAMP_MAX_AGE_SECONDS: u64 = 86_400;
+/// Zero skew is allowed: it is strictly *stricter* than the default, unlike a
+/// zero freshness window which would accept nothing or a zero cache which
+/// would accept every replay.
+const MIN_CLOCK_SKEW_SECONDS: u64 = 0;
+const MAX_CLOCK_SKEW_SECONDS: u64 = 3_600;
+const MIN_NONCE_CACHE_TTL_SECONDS: u64 = 1;
+const MAX_NONCE_CACHE_TTL_SECONDS: u64 = 86_400;
+const MIN_NONCE_MAX_CACHE_SIZE: u64 = 1;
+const MAX_NONCE_MAX_CACHE_SIZE: u64 = 1_000_000;
+
+/// WS-Security UsernameToken Profile nonces are short random values (16–32 raw
+/// bytes is typical). The ceiling is enforced on the *encoded* value before
+/// Base64 decoding, so an oversized nonce is never decoded or retained.
+const DEFAULT_NONCE_MAX_ENCODED_LENGTH: u64 = 512;
+const MIN_NONCE_MAX_ENCODED_LENGTH: u64 = 16;
+const MAX_NONCE_MAX_ENCODED_LENGTH: u64 = 4_096;
+
+/// Total retained nonce-key bytes. The cache is bounded in bytes as well as in
+/// entries so `max_cache_size` cannot be multiplied by the per-nonce length to
+/// reach an arbitrary retained footprint.
+const DEFAULT_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+const MIN_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 4_096;
+const MAX_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Hard ceiling on keys cloned during one forced-eviction pass, independent of
+/// `max_cache_size`. Forced eviction previously cloned and sorted *every*
+/// retained key, which gave any caller that could fill the cache an unbounded
+/// per-request clone + sort.
+const NONCE_EVICTION_BATCH: usize = 64;
+
+/// Representable-year window for parsed WS-Security / SAML instants.
+///
+/// `chrono`'s `%Y` accepts years far outside the four-digit range, and its
+/// `DateTime` `Add`/`Sub` impls panic on overflow. Clamping attacker-supplied
+/// instants at parse time keeps every later `instant ± skew` and instant
+/// difference inside range without scattering checked arithmetic through the
+/// validation paths. `xsd:dateTime` values outside this window have no
+/// legitimate WS-Security use.
+const MIN_PARSED_YEAR: i32 = 1970;
+const MAX_PARSED_YEAR: i32 = 9999;
+
+// ── Allowed configuration keys (exhaustive, per fixed-shape object) ─────────
+
+const ROOT_CONFIG_KEYS: &[&str] = &[
+    "reject_missing_security_header",
+    "timestamp",
+    "username_token",
+    "x509_signature",
+    "saml",
+    "nonce",
+];
+const TIMESTAMP_CONFIG_KEYS: &[&str] = &[
+    "require",
+    "max_age_seconds",
+    "require_expires",
+    "clock_skew_seconds",
+];
+const USERNAME_TOKEN_CONFIG_KEYS: &[&str] = &["enabled", "password_type", "credentials"];
+const CREDENTIAL_CONFIG_KEYS: &[&str] = &["username", "password"];
+const X509_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "trusted_certs",
+    "allowed_algorithms",
+    "allowed_digest_algorithms",
+    "require_signed_timestamp",
+];
+const SAML_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "trusted_issuers",
+    "trusted_signing_certs",
+    "allowed_signature_algorithms",
+    "allowed_digest_algorithms",
+    "audience",
+    "clock_skew_seconds",
+];
+const NONCE_CONFIG_KEYS: &[&str] = &[
+    "cache_ttl_seconds",
+    "max_cache_size",
+    "max_encoded_length",
+    "max_total_cache_bytes",
+];
 
 /// UTF-16→UTF-8 size is bounded by construction for well-formed input: each
 /// BMP code point uses 2 wire bytes and at most 3 UTF-8 bytes (≤ 3/2×), and
@@ -132,6 +258,217 @@ enum SignatureAlgorithm {
 enum DigestAlgorithm {
     Sha256,
     Sha1,
+}
+
+// ── Strict cold-path configuration accessors ───────────────────────────────
+//
+// Every fixed-shape SOAP security object is checked for unknown keys and exact
+// value types *before* defaults apply. A misspelled key or a wrong-typed value
+// must fail admission — silently falling back to a default is how a
+// string-valued `username_token.enabled` used to disable credential
+// authentication while startup, Admin validation, CP/DP propagation, and reload
+// all reported success. An explicit JSON `null` is treated as absent (config
+// stores round-trip omitted optional fields that way); any other wrong type is
+// an error.
+
+type ConfigObject = serde_json::Map<String, Value>;
+
+/// Non-null value for `key`, or `None` when absent / explicitly null.
+fn present<'a>(object: Option<&'a ConfigObject>, key: &str) -> Option<&'a Value> {
+    object
+        .and_then(|map| map.get(key))
+        .filter(|value| !value.is_null())
+}
+
+/// Uniform type-mismatch diagnostic for a fixed-shape configuration field.
+fn type_error(path: &str, key: &str, expected: &str) -> String {
+    format!("soap_ws_security: '{path}.{key}' must be {expected}")
+}
+
+fn range_error(path: &str, key: &str, min: u64, max: u64) -> String {
+    format!("soap_ws_security: '{path}.{key}' must be an integer {min}..={max}")
+}
+
+fn required_error(path: &str, key: &str) -> String {
+    format!("soap_ws_security: '{path}.{key}' is required")
+}
+
+fn duplicate_error(path: &str) -> String {
+    format!("soap_ws_security: '{path}.username' duplicates an earlier entry")
+}
+
+fn enum_error(path: &str, key: &str, value: &str, allowed: &str) -> String {
+    format!("soap_ws_security: '{path}.{key}' value '{value}' is not one of: {allowed}")
+}
+
+fn allowed_values<T>(variants: &[(&str, T)]) -> String {
+    let names: Vec<&str> = variants.iter().map(|(name, _)| *name).collect();
+    names.join(", ")
+}
+
+/// Nested object at `key`, rejecting any non-object present value.
+fn soap_object<'a>(
+    object: Option<&'a ConfigObject>,
+    path: &str,
+    key: &str,
+) -> Result<Option<&'a ConfigObject>, String> {
+    match present(object, key) {
+        None => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map)),
+        Some(_) => Err(type_error(path, key, "an object")),
+    }
+}
+
+fn soap_bool(
+    object: Option<&ConfigObject>,
+    path: &str,
+    key: &str,
+    default: bool,
+) -> Result<bool, String> {
+    match present(object, key) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(type_error(path, key, "a boolean, not a string or number")),
+    }
+}
+
+/// Unsigned integer within an inclusive range. Rejects non-integers, negatives,
+/// fractional numbers, and out-of-range values so no admitted value can
+/// overflow duration arithmetic or disable a bound.
+fn soap_u64_bounded(
+    object: Option<&ConfigObject>,
+    path: &str,
+    key: &str,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    let value = match present(object, key) {
+        None => return Ok(default),
+        Some(value) => value,
+    };
+    let Some(parsed) = value.as_u64() else {
+        return Err(range_error(path, key, min, max));
+    };
+    if parsed < min || parsed > max {
+        return Err(range_error(path, key, min, max));
+    }
+    Ok(parsed)
+}
+
+/// Non-empty string, rejecting any non-string present value.
+fn soap_string(
+    object: Option<&ConfigObject>,
+    path: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match present(object, key) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(type_error(path, key, "a non-empty string")),
+        Some(_) => Err(type_error(path, key, "a string")),
+    }
+}
+
+/// Array of non-empty strings. Malformed entries are rejected instead of
+/// silently dropped, so a partially-bad cert / issuer list cannot narrow the
+/// trust set while reporting success.
+fn soap_string_array(
+    object: Option<&ConfigObject>,
+    path: &str,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let value = match present(object, key) {
+        None => return Ok(None),
+        Some(value) => value,
+    };
+    let Some(array) = value.as_array() else {
+        return Err(type_error(path, key, "an array of strings"));
+    };
+    let mut parsed = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        match entry.as_str() {
+            Some(text) if !text.trim().is_empty() => parsed.push(text.to_string()),
+            _ => {
+                let indexed = format!("{key}[{index}]");
+                return Err(type_error(path, &indexed, "a non-empty string"));
+            }
+        }
+    }
+    Ok(Some(parsed))
+}
+
+/// Enum-valued array with an explicit default. Unknown members are rejected —
+/// dropping them used to be able to empty an allow-list or narrow it in ways
+/// the operator never asked for.
+fn soap_enum_array<T: Copy>(
+    object: Option<&ConfigObject>,
+    path: &str,
+    key: &str,
+    variants: &[(&str, T)],
+    default: &[T],
+) -> Result<Vec<T>, String> {
+    let Some(entries) = soap_string_array(object, path, key)? else {
+        return Ok(default.to_vec());
+    };
+    if entries.is_empty() {
+        let allowed = allowed_values(variants);
+        let expected = format!("a non-empty subset of: {allowed}");
+        return Err(type_error(path, key, &expected));
+    }
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let matched = variants
+            .iter()
+            .find(|(name, _)| *name == entry.as_str())
+            .map(|(_, variant)| *variant);
+        let Some(matched) = matched else {
+            let allowed = allowed_values(variants);
+            return Err(enum_error(path, key, entry, &allowed));
+        };
+        parsed.push(matched);
+    }
+    Ok(parsed)
+}
+
+/// Saturating `u64` → `usize`. Every ceiling in this module fits `u32`, so this
+/// cannot narrow on any supported target; saturating keeps the conversion
+/// panic-free without an `unwrap`.
+fn usize_or_max(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+const SIGNATURE_ALGORITHM_VARIANTS: &[(&str, SignatureAlgorithm)] = &[
+    ("rsa-sha256", SignatureAlgorithm::RsaSha256),
+    ("rsa-sha1", SignatureAlgorithm::RsaSha1),
+];
+const DIGEST_ALGORITHM_VARIANTS: &[(&str, DigestAlgorithm)] = &[
+    ("sha256", DigestAlgorithm::Sha256),
+    ("sha1", DigestAlgorithm::Sha1),
+];
+
+/// Reject unknown keys on a fixed-shape object with the shared path-qualified
+/// diagnostics (including spelling suggestions).
+fn reject_unknown(
+    object: Option<&ConfigObject>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let Some(map) = object else {
+        return Ok(());
+    };
+    reject_unknown_keys(map, path, allowed, "soap_ws_security: ")
+}
+
+/// Configured duration, converted once at admission so the request path never
+/// performs a fallible or panicking duration construction. The bounds above
+/// already guarantee success; the fallible conversion stays so a future bound
+/// change cannot reintroduce a panicking `Duration::seconds` on the hot path.
+fn admitted_duration(path: &str, key: &str, seconds: u64) -> Result<chrono::Duration, String> {
+    let signed = i64::try_from(seconds).ok();
+    let duration = signed.and_then(chrono::Duration::try_seconds);
+    let message = || type_error(path, key, "a representable duration");
+    duration.ok_or_else(message)
 }
 
 fn sha256_array(value: &[u8]) -> [u8; 32] {
@@ -193,7 +530,10 @@ pub struct SoapWsSecurity {
     require_timestamp: bool,
     timestamp_max_age_seconds: u64,
     timestamp_require_expires: bool,
-    clock_skew_seconds: u64,
+    /// Pre-converted at admission; the request path performs no fallible or
+    /// panicking duration construction.
+    timestamp_max_age: chrono::Duration,
+    clock_skew: chrono::Duration,
 
     // UsernameToken
     username_token_enabled: bool,
@@ -216,15 +556,22 @@ pub struct SoapWsSecurity {
     saml_enabled: bool,
     saml_trusted_issuers: Vec<String>,
     saml_audience: Option<String>,
-    saml_clock_skew_seconds: u64,
+    saml_clock_skew: chrono::Duration,
     saml_trusted_signing_certs: Vec<TrustedCert>,
     saml_allowed_signature_algorithms: Vec<SignatureAlgorithm>,
     saml_allowed_digest_algorithms: Vec<DigestAlgorithm>,
 
     // Nonce replay protection
     nonce_cache: Arc<DashMap<String, NonceEntry>>,
+    /// Retained nonce-key bytes, kept in step with `nonce_cache` on every
+    /// insert and eviction so the cache is bounded in bytes as well as entries.
+    nonce_cache_bytes: Arc<AtomicUsize>,
     nonce_cache_ttl_seconds: u64,
     max_nonce_cache_size: usize,
+    /// Encoded-nonce ceiling, enforced before Base64 decoding and before any
+    /// cache insertion.
+    max_nonce_encoded_length: usize,
+    max_nonce_cache_bytes: usize,
 
     // General
     reject_missing_security_header: bool,
@@ -236,17 +583,48 @@ impl SoapWsSecurity {
             .as_object()
             .ok_or_else(|| format!("soap_ws_security: config must be an object, got: {config}"))?;
 
+        // Strict admission: unknown root keys fail closed. This is what makes
+        // the documented-but-never-read `nonce_replay_protection` object and
+        // every misspelling an error instead of a silently weaker policy.
+        let root = Some(config_obj);
+        reject_unknown(root, "config", ROOT_CONFIG_KEYS)?;
+
         // ── Timestamp config ────────────────────────────────────────────
-        let ts_cfg = config_obj.get("timestamp").unwrap_or(&Value::Null);
-        let require_timestamp = ts_cfg["require"].as_bool().unwrap_or(true);
-        let timestamp_max_age_seconds = ts_cfg["max_age_seconds"].as_u64().unwrap_or(300);
-        let timestamp_require_expires = ts_cfg["require_expires"].as_bool().unwrap_or(false);
-        let clock_skew_seconds = ts_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
+        let ts_cfg = soap_object(root, "config", "timestamp")?;
+        reject_unknown(ts_cfg, "config.timestamp", TIMESTAMP_CONFIG_KEYS)?;
+        let require_timestamp = soap_bool(ts_cfg, "config.timestamp", "require", true)?;
+        let timestamp_max_age_seconds = soap_u64_bounded(
+            ts_cfg,
+            "config.timestamp",
+            "max_age_seconds",
+            300,
+            MIN_TIMESTAMP_MAX_AGE_SECONDS,
+            MAX_TIMESTAMP_MAX_AGE_SECONDS,
+        )?;
+        let timestamp_require_expires =
+            soap_bool(ts_cfg, "config.timestamp", "require_expires", false)?;
+        let clock_skew_seconds = soap_u64_bounded(
+            ts_cfg,
+            "config.timestamp",
+            "clock_skew_seconds",
+            300,
+            MIN_CLOCK_SKEW_SECONDS,
+            MAX_CLOCK_SKEW_SECONDS,
+        )?;
+        let timestamp_max_age = admitted_duration(
+            "config.timestamp",
+            "max_age_seconds",
+            timestamp_max_age_seconds,
+        )?;
+        let clock_skew =
+            admitted_duration("config.timestamp", "clock_skew_seconds", clock_skew_seconds)?;
 
         // ── UsernameToken config ────────────────────────────────────────
-        let ut_cfg = config_obj.get("username_token").unwrap_or(&Value::Null);
-        let username_token_enabled = ut_cfg["enabled"].as_bool().unwrap_or(false);
-        let password_type = match ut_cfg["password_type"].as_str().unwrap_or("PasswordDigest") {
+        let ut_cfg = soap_object(root, "config", "username_token")?;
+        reject_unknown(ut_cfg, "config.username_token", USERNAME_TOKEN_CONFIG_KEYS)?;
+        let username_token_enabled = soap_bool(ut_cfg, "config.username_token", "enabled", false)?;
+        let configured_type = soap_string(ut_cfg, "config.username_token", "password_type")?;
+        let password_type = match configured_type.as_deref().unwrap_or("PasswordDigest") {
             "PasswordText" => PasswordType::PasswordText,
             "PasswordDigest" => PasswordType::PasswordDigest,
             other => {
@@ -257,23 +635,42 @@ impl SoapWsSecurity {
             }
         };
 
-        let credentials: Vec<Credential> = ut_cfg["credentials"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        let username = v["username"].as_str()?.to_string();
-                        let password = v["password"].as_str()?.to_string();
-                        let password_text_hash = sha256_array(password.as_bytes());
-                        Some(Credential {
-                            username,
-                            password,
-                            password_text_hash,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Credentials are validated entry by entry. A malformed entry is an
+        // error rather than a dropped entry: silently shrinking the credential
+        // set changes who can authenticate without any operator signal.
+        let mut credentials: Vec<Credential> = Vec::new();
+        if let Some(entries) = present(ut_cfg, "credentials") {
+            let ut_path = "config.username_token";
+            let Some(array) = entries.as_array() else {
+                return Err(type_error(ut_path, "credentials", "an array"));
+            };
+            credentials.reserve(array.len());
+            for (index, entry) in array.iter().enumerate() {
+                let path = format!("{ut_path}.credentials[{index}]");
+                let Some(entry_obj) = entry.as_object() else {
+                    return Err(type_error(ut_path, "credentials", "an array of objects"));
+                };
+                let entry_ref = Some(entry_obj);
+                reject_unknown(entry_ref, &path, CREDENTIAL_CONFIG_KEYS)?;
+                let Some(username) = soap_string(entry_ref, &path, "username")? else {
+                    return Err(required_error(&path, "username"));
+                };
+                let Some(password) = soap_string(entry_ref, &path, "password")? else {
+                    return Err(required_error(&path, "password"));
+                };
+                // Duplicate usernames would make credential selection
+                // first-wins, so a later rotation entry would be inert.
+                if credentials.iter().any(|c| c.username == username) {
+                    return Err(duplicate_error(&path));
+                }
+                let password_text_hash = sha256_array(password.as_bytes());
+                credentials.push(Credential {
+                    username,
+                    password,
+                    password_text_hash,
+                });
+            }
+        }
 
         if username_token_enabled && credentials.is_empty() {
             return Err(
@@ -289,17 +686,12 @@ impl SoapWsSecurity {
         let dummy_password_text_hash = sha256_array(dummy_password.as_bytes());
 
         // ── X.509 signature config ──────────────────────────────────────
-        let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
-        let x509_enabled = x509_cfg["enabled"].as_bool().unwrap_or(false);
+        let x509_cfg = soap_object(root, "config", "x509_signature")?;
+        reject_unknown(x509_cfg, "config.x509_signature", X509_CONFIG_KEYS)?;
+        let x509_enabled = soap_bool(x509_cfg, "config.x509_signature", "enabled", false)?;
 
-        let trusted_cert_paths: Vec<String> = x509_cfg["trusted_certs"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cert_paths = soap_string_array(x509_cfg, "config.x509_signature", "trusted_certs")?;
+        let trusted_cert_paths: Vec<String> = cert_paths.unwrap_or_default();
 
         if x509_enabled && trusted_cert_paths.is_empty() {
             return Err(
@@ -361,18 +753,13 @@ impl SoapWsSecurity {
             });
         }
 
-        let allowed_signature_algorithms: Vec<SignatureAlgorithm> = x509_cfg["allowed_algorithms"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| match v.as_str()? {
-                        "rsa-sha256" => Some(SignatureAlgorithm::RsaSha256),
-                        "rsa-sha1" => Some(SignatureAlgorithm::RsaSha1),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![SignatureAlgorithm::RsaSha256]);
+        let allowed_signature_algorithms: Vec<SignatureAlgorithm> = soap_enum_array(
+            x509_cfg,
+            "config.x509_signature",
+            "allowed_algorithms",
+            SIGNATURE_ALGORITHM_VARIANTS,
+            &[SignatureAlgorithm::RsaSha256],
+        )?;
 
         if x509_enabled && allowed_signature_algorithms.is_empty() {
             return Err(
@@ -382,18 +769,13 @@ impl SoapWsSecurity {
             );
         }
 
-        let allowed_digest_algorithms: Vec<DigestAlgorithm> = x509_cfg["allowed_digest_algorithms"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| match v.as_str()? {
-                        "sha256" => Some(DigestAlgorithm::Sha256),
-                        "sha1" => Some(DigestAlgorithm::Sha1),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![DigestAlgorithm::Sha256]);
+        let allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
+            x509_cfg,
+            "config.x509_signature",
+            "allowed_digest_algorithms",
+            DIGEST_ALGORITHM_VARIANTS,
+            &[DigestAlgorithm::Sha256],
+        )?;
 
         if x509_enabled && allowed_digest_algorithms.is_empty() {
             return Err(
@@ -403,22 +785,20 @@ impl SoapWsSecurity {
             );
         }
 
-        let require_signed_timestamp = x509_cfg["require_signed_timestamp"]
-            .as_bool()
-            .unwrap_or(true);
+        let require_signed_timestamp = soap_bool(
+            x509_cfg,
+            "config.x509_signature",
+            "require_signed_timestamp",
+            true,
+        )?;
 
         // ── SAML config ─────────────────────────────────────────────────
-        let saml_cfg = config_obj.get("saml").unwrap_or(&Value::Null);
-        let saml_enabled = saml_cfg["enabled"].as_bool().unwrap_or(false);
+        let saml_cfg = soap_object(root, "config", "saml")?;
+        reject_unknown(saml_cfg, "config.saml", SAML_CONFIG_KEYS)?;
+        let saml_enabled = soap_bool(saml_cfg, "config.saml", "enabled", false)?;
 
-        let saml_trusted_issuers: Vec<String> = saml_cfg["trusted_issuers"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let issuers = soap_string_array(saml_cfg, "config.saml", "trusted_issuers")?;
+        let saml_trusted_issuers: Vec<String> = issuers.unwrap_or_default();
 
         if saml_enabled && saml_trusted_issuers.is_empty() {
             return Err(
@@ -427,22 +807,27 @@ impl SoapWsSecurity {
             );
         }
 
-        let saml_audience = saml_cfg["audience"].as_str().map(String::from);
-        let saml_clock_skew_seconds = saml_cfg["clock_skew_seconds"].as_u64().unwrap_or(300);
+        // A wrong-typed audience used to become `None`, silently removing
+        // service binding while SAML stayed enabled.
+        let saml_audience = soap_string(saml_cfg, "config.saml", "audience")?;
+        let saml_clock_skew_seconds = soap_u64_bounded(
+            saml_cfg,
+            "config.saml",
+            "clock_skew_seconds",
+            300,
+            MIN_CLOCK_SKEW_SECONDS,
+            MAX_CLOCK_SKEW_SECONDS,
+        )?;
+        let saml_clock_skew =
+            admitted_duration("config.saml", "clock_skew_seconds", saml_clock_skew_seconds)?;
 
         // SAML trusted signing certs — IdP X.509 certs used to verify the
         // assertion's `<Signature>`. Matched by SHA-256 fingerprint of the
         // full DER, so operators must trust each leaf cert directly (no CA
         // chain validation). This is the standard practice for SAML where
         // IdPs publish their signing certs in metadata.
-        let saml_trusted_signing_cert_paths: Vec<String> = saml_cfg["trusted_signing_certs"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let signing_certs = soap_string_array(saml_cfg, "config.saml", "trusted_signing_certs")?;
+        let saml_trusted_signing_cert_paths: Vec<String> = signing_certs.unwrap_or_default();
 
         if saml_enabled && saml_trusted_signing_cert_paths.is_empty() {
             return Err(
@@ -501,19 +886,13 @@ impl SoapWsSecurity {
             });
         }
 
-        let saml_allowed_signature_algorithms: Vec<SignatureAlgorithm> =
-            saml_cfg["allowed_signature_algorithms"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| match v.as_str()? {
-                            "rsa-sha256" => Some(SignatureAlgorithm::RsaSha256),
-                            "rsa-sha1" => Some(SignatureAlgorithm::RsaSha1),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![SignatureAlgorithm::RsaSha256]);
+        let saml_allowed_signature_algorithms: Vec<SignatureAlgorithm> = soap_enum_array(
+            saml_cfg,
+            "config.saml",
+            "allowed_signature_algorithms",
+            SIGNATURE_ALGORITHM_VARIANTS,
+            &[SignatureAlgorithm::RsaSha256],
+        )?;
 
         if saml_enabled && saml_allowed_signature_algorithms.is_empty() {
             return Err(
@@ -523,19 +902,13 @@ impl SoapWsSecurity {
             );
         }
 
-        let saml_allowed_digest_algorithms: Vec<DigestAlgorithm> =
-            saml_cfg["allowed_digest_algorithms"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| match v.as_str()? {
-                            "sha256" => Some(DigestAlgorithm::Sha256),
-                            "sha1" => Some(DigestAlgorithm::Sha1),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![DigestAlgorithm::Sha256]);
+        let saml_allowed_digest_algorithms: Vec<DigestAlgorithm> = soap_enum_array(
+            saml_cfg,
+            "config.saml",
+            "allowed_digest_algorithms",
+            DIGEST_ALGORITHM_VARIANTS,
+            &[DigestAlgorithm::Sha256],
+        )?;
 
         if saml_enabled && saml_allowed_digest_algorithms.is_empty() {
             return Err(
@@ -546,15 +919,58 @@ impl SoapWsSecurity {
         }
 
         // ── Nonce / replay config ───────────────────────────────────────
-        let nonce_cfg = config_obj.get("nonce").unwrap_or(&Value::Null);
-        let nonce_cache_ttl_seconds = nonce_cfg["cache_ttl_seconds"].as_u64().unwrap_or(300);
-        let max_nonce_cache_size = nonce_cfg["max_cache_size"].as_u64().unwrap_or(10_000) as usize;
+        // Zero TTL or zero capacity used to be accepted and made replay
+        // detection inert while the plugin still advertised it, so both now
+        // have enforced lower bounds.
+        let nonce_cfg = soap_object(root, "config", "nonce")?;
+        reject_unknown(nonce_cfg, "config.nonce", NONCE_CONFIG_KEYS)?;
+        let nonce_cache_ttl_seconds = soap_u64_bounded(
+            nonce_cfg,
+            "config.nonce",
+            "cache_ttl_seconds",
+            300,
+            MIN_NONCE_CACHE_TTL_SECONDS,
+            MAX_NONCE_CACHE_TTL_SECONDS,
+        )?;
+        let max_nonce_cache_size = soap_u64_bounded(
+            nonce_cfg,
+            "config.nonce",
+            "max_cache_size",
+            10_000,
+            MIN_NONCE_MAX_CACHE_SIZE,
+            MAX_NONCE_MAX_CACHE_SIZE,
+        )?;
+        let max_nonce_encoded_length = soap_u64_bounded(
+            nonce_cfg,
+            "config.nonce",
+            "max_encoded_length",
+            DEFAULT_NONCE_MAX_ENCODED_LENGTH,
+            MIN_NONCE_MAX_ENCODED_LENGTH,
+            MAX_NONCE_MAX_ENCODED_LENGTH,
+        )?;
+        let max_nonce_cache_bytes = soap_u64_bounded(
+            nonce_cfg,
+            "config.nonce",
+            "max_total_cache_bytes",
+            DEFAULT_NONCE_MAX_TOTAL_CACHE_BYTES,
+            MIN_NONCE_MAX_TOTAL_CACHE_BYTES,
+            MAX_NONCE_MAX_TOTAL_CACHE_BYTES,
+        )?;
+        // A byte cap below one maximum-length nonce would reject every
+        // PasswordDigest request; refuse the contradiction at admission rather
+        // than failing closed on live traffic.
+        if max_nonce_cache_bytes < max_nonce_encoded_length {
+            let expected = format!("at least max_encoded_length ({max_nonce_encoded_length})");
+            let path = "config.nonce";
+            return Err(type_error(path, "max_total_cache_bytes", &expected));
+        }
+        let max_nonce_cache_size = usize_or_max(max_nonce_cache_size);
+        let max_nonce_encoded_length = usize_or_max(max_nonce_encoded_length);
+        let max_nonce_cache_bytes = usize_or_max(max_nonce_cache_bytes);
 
         // ── General ─────────────────────────────────────────────────────
-        let reject_missing_security_header = config_obj
-            .get("reject_missing_security_header")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let reject_missing_security_header =
+            soap_bool(root, "config", "reject_missing_security_header", true)?;
 
         // Must have at least one security feature enabled
         if !username_token_enabled && !x509_enabled && !saml_enabled && !require_timestamp {
@@ -568,7 +984,8 @@ impl SoapWsSecurity {
             require_timestamp,
             timestamp_max_age_seconds,
             timestamp_require_expires,
-            clock_skew_seconds,
+            timestamp_max_age,
+            clock_skew,
             username_token_enabled,
             password_type,
             credentials,
@@ -582,13 +999,16 @@ impl SoapWsSecurity {
             saml_enabled,
             saml_trusted_issuers,
             saml_audience,
-            saml_clock_skew_seconds,
+            saml_clock_skew,
             saml_trusted_signing_certs,
             saml_allowed_signature_algorithms,
             saml_allowed_digest_algorithms,
             nonce_cache: Arc::new(DashMap::new()),
+            nonce_cache_bytes: Arc::new(AtomicUsize::new(0)),
             nonce_cache_ttl_seconds,
             max_nonce_cache_size,
+            max_nonce_encoded_length,
+            max_nonce_cache_bytes,
             reject_missing_security_header,
         })
     }
@@ -613,8 +1033,12 @@ impl SoapWsSecurity {
         let created = parse_ws_datetime(&created_str)
             .ok_or_else(|| format!("WS-Security: invalid Created timestamp '{}'", created_str))?;
 
-        let skew = chrono::Duration::seconds(self.clock_skew_seconds as i64);
-        let max_age = chrono::Duration::seconds(self.timestamp_max_age_seconds as i64);
+        // Durations are pre-converted at config admission and `parse_ws_datetime`
+        // clamps parsed instants to `MIN_PARSED_YEAR..=MAX_PARSED_YEAR`, so
+        // neither the duration construction nor the instant arithmetic below can
+        // overflow and panic this request task.
+        let skew = self.clock_skew;
+        let max_age = self.timestamp_max_age;
 
         // Created must not be in the future (with clock skew tolerance)
         if created > now + skew {
@@ -734,13 +1158,26 @@ impl SoapWsSecurity {
                 // known/unknown credential branch so missing digest inputs cannot
                 // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
-                let nonce_b64 = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
+                let nonce_b64_raw = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
                     UsernameTokenError::Structural(
                         "WS-Security: PasswordDigest requires Nonce element".to_string(),
                     )
                 })?;
 
-                let nonce_bytes = BASE64.decode(nonce_b64.trim()).map_err(|e| {
+                // One canonical form for both the digest input and the replay
+                // cache key (`find_element_text` already trims; being explicit
+                // keeps the two derivations from drifting apart). The length
+                // ceiling is enforced on the *encoded* value before Base64
+                // decoding, so an oversized nonce never allocates a decode
+                // buffer and is never retained.
+                let nonce_b64 = nonce_b64_raw.trim();
+                if nonce_b64.len() > self.max_nonce_encoded_length {
+                    return Err(UsernameTokenError::Structural(
+                        "WS-Security: Nonce exceeds the maximum permitted length".to_string(),
+                    ));
+                }
+
+                let nonce_bytes = BASE64.decode(nonce_b64).map_err(|e| {
                     UsernameTokenError::Structural(format!(
                         "WS-Security: invalid Nonce base64 encoding: {}",
                         e
@@ -774,7 +1211,7 @@ impl SoapWsSecurity {
                     // poison a victim's nonce before the legitimate request
                     // arrives. The atomic entry check also prevents two
                     // concurrent valid requests from both accepting it.
-                    self.check_nonce_replay(&nonce_b64)
+                    self.check_nonce_replay(nonce_b64)
                         .map_err(UsernameTokenError::Structural)?;
                     Ok(username)
                 } else {
@@ -786,19 +1223,50 @@ impl SoapWsSecurity {
 
     // ── Nonce replay protection ─────────────────────────────────────────
 
-    /// Check if a nonce has been seen before within the TTL window.
-    /// Inserts the nonce into the cache if not a replay.
+    /// Stable, fixed-cardinality failure classes for replay-state outcomes.
+    /// The attacker-supplied nonce is never interpolated into a log line or a
+    /// client-visible body.
+    const NONCE_TOO_LONG_CLASS: &'static str = "nonce_too_long";
+    const NONCE_STATE_SATURATED_CLASS: &'static str = "nonce_state_saturated";
+
+    /// Check if a nonce has been seen before within the TTL window, inserting
+    /// it when it is not a replay.
+    ///
+    /// The cache is bounded on three independent axes so a caller cannot turn
+    /// replay state into a memory or CPU sink: per-nonce encoded length, total
+    /// retained entries, and total retained bytes. Reclamation prefers expired
+    /// entries, then a *bounded* oldest-first batch; if neither frees room the
+    /// request fails closed rather than admitting a nonce whose replay window
+    /// cannot be recorded.
     pub fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
-        // Evict expired entries if cache is at capacity
-        if self.nonce_cache.len() >= self.max_nonce_cache_size {
+        if nonce.len() > self.max_nonce_encoded_length {
+            warn!(
+                failure_class = Self::NONCE_TOO_LONG_CLASS,
+                "soap_ws_security: Nonce exceeds the maximum permitted length"
+            );
+            return Err("WS-Security: Nonce exceeds the maximum permitted length".to_string());
+        }
+
+        // Evict expired entries when either bound is reached.
+        if self.nonce_capacity_reached(nonce.len()) {
             self.evict_expired_nonces();
         }
 
-        // Hard cap: if still at capacity after evicting expired entries,
-        // evict oldest entries to prevent unbounded memory growth under
-        // floods of unique fresh nonces.
-        if self.nonce_cache.len() >= self.max_nonce_cache_size {
+        // Still full: evict a bounded oldest-first batch. Unlike the previous
+        // clone-and-sort-every-key pass, this clones at most
+        // `NONCE_EVICTION_BATCH` keys regardless of `max_cache_size`.
+        if self.nonce_capacity_reached(nonce.len()) {
             self.evict_oldest_nonces();
+        }
+
+        // Fail closed. Treating an unrecordable nonce as fresh would silently
+        // convert an exhausted cache into a replay bypass.
+        if self.nonce_capacity_reached(nonce.len()) {
+            warn!(
+                failure_class = Self::NONCE_STATE_SATURATED_CLASS,
+                "soap_ws_security: replay protection state is at capacity"
+            );
+            return Err("WS-Security: replay protection state is at capacity".to_string());
         }
 
         let now = Instant::now();
@@ -809,36 +1277,98 @@ impl SoapWsSecurity {
                 if age.as_secs() < self.nonce_cache_ttl_seconds {
                     return Err("WS-Security: nonce replay detected".to_string());
                 }
+                // Same key replaced in place — retained bytes are unchanged.
                 entry.insert(NonceEntry { inserted_at: now });
             }
             Entry::Vacant(entry) => {
+                let key_bytes = entry.key().len();
                 entry.insert(NonceEntry { inserted_at: now });
+                self.add_nonce_bytes(key_bytes);
             }
         }
 
         Ok(())
     }
 
+    /// True when admitting `incoming_bytes` more would breach the entry cap or
+    /// the retained-byte cap.
+    fn nonce_capacity_reached(&self, incoming_bytes: usize) -> bool {
+        if self.nonce_cache.len() >= self.max_nonce_cache_size {
+            return true;
+        }
+        let retained = self.nonce_cache_bytes.load(Ordering::Relaxed);
+        retained.saturating_add(incoming_bytes) > self.max_nonce_cache_bytes
+    }
+
+    /// Release `bytes` from the retained-byte counter.
+    ///
+    /// Saturating rather than a plain `fetch_sub`: accounting is exact today
+    /// (DashMap removals are atomic, so no key's bytes are released twice), but
+    /// an underflow would wrap the counter to a huge value and permanently
+    /// reject every fresh nonce.
+    fn release_nonce_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let sub = |current: usize| Some(current.saturating_sub(bytes));
+        let relaxed = Ordering::Relaxed;
+        let _ = self.nonce_cache_bytes.fetch_update(relaxed, relaxed, sub);
+    }
+
+    fn add_nonce_bytes(&self, bytes: usize) {
+        self.nonce_cache_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn evict_expired_nonces(&self) {
         let now = Instant::now();
         let ttl_secs = self.nonce_cache_ttl_seconds;
-        self.nonce_cache
-            .retain(|_, entry| now.duration_since(entry.inserted_at).as_secs() < ttl_secs);
+        let mut reclaimed = 0usize;
+        self.nonce_cache.retain(|key, entry| {
+            let keep = now.duration_since(entry.inserted_at).as_secs() < ttl_secs;
+            if !keep {
+                reclaimed = reclaimed.saturating_add(key.len());
+            }
+            keep
+        });
+        self.release_nonce_bytes(reclaimed);
     }
 
-    /// Evict oldest entries when the cache is full and no expired entries remain.
-    /// Removes 10% of entries (by insertion time) to amortize the eviction cost.
+    /// Evict the oldest retained nonces when the cache is full and no expired
+    /// entries remain.
+    ///
+    /// The batch is the smaller of the 10% amortization target and
+    /// `NONCE_EVICTION_BATCH`, and the candidate buffer is kept sorted
+    /// oldest-first at that bounded size, so peak eviction memory is O(batch)
+    /// rather than O(cache) and no per-request cost scales with
+    /// `max_cache_size`.
     fn evict_oldest_nonces(&self) {
-        let to_remove = (self.max_nonce_cache_size / 10).max(1);
-        let mut entries: Vec<(String, Instant)> = self
-            .nonce_cache
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().inserted_at))
-            .collect();
-        entries.sort_by_key(|(_, inserted_at)| *inserted_at);
-        for (key, _) in entries.into_iter().take(to_remove) {
-            self.nonce_cache.remove(&key);
+        let target = self.max_nonce_cache_size / 10;
+        let batch = target.clamp(1, NONCE_EVICTION_BATCH);
+        let mut oldest: Vec<(Instant, String)> = Vec::with_capacity(batch);
+        for entry in self.nonce_cache.iter() {
+            let inserted_at = entry.value().inserted_at;
+            if oldest.len() >= batch {
+                // Buffer is ascending by insertion time, so the last element is
+                // the newest candidate. Skip entries that are newer than it.
+                match oldest.last() {
+                    Some((newest, _)) if *newest <= inserted_at => continue,
+                    _ => {
+                        oldest.pop();
+                    }
+                }
+            }
+            let is_older = |c: &(Instant, String)| c.0 <= inserted_at;
+            let position = oldest.partition_point(is_older);
+            oldest.insert(position, (inserted_at, entry.key().clone()));
         }
+
+        let mut reclaimed = 0usize;
+        for (_, key) in oldest {
+            if self.nonce_cache.remove(&key).is_some() {
+                reclaimed = reclaimed.saturating_add(key.len());
+            }
+        }
+        self.release_nonce_bytes(reclaimed);
     }
 
     // ── X.509 signature verification ────────────────────────────────────
@@ -1230,7 +1760,9 @@ impl SoapWsSecurity {
         if let Some(conditions) =
             unique_child_element(assertion_node, "Conditions", "WS-Security: SAML")?
         {
-            let skew = chrono::Duration::seconds(self.saml_clock_skew_seconds as i64);
+            // Pre-converted at admission; parsed condition instants are
+            // year-clamped, so no arithmetic below can overflow.
+            let skew = self.saml_clock_skew;
 
             if let Some(not_before_str) = conditions.attribute("NotBefore") {
                 let not_before = parse_ws_datetime(not_before_str).ok_or_else(|| {
@@ -3439,6 +3971,20 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 
 /// Parse WS-Security datetime formats (ISO 8601 variants).
 fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
+    // Reject instants outside the representable WS-Security window. `chrono`'s
+    // `%Y` accepts years far beyond four digits and its `DateTime` `Add`/`Sub`
+    // impls panic on overflow, so an unclamped `Expires` / `NotOnOrAfter` could
+    // turn `instant + skew` into a panicked request task. No legitimate
+    // WS-Security or SAML instant falls outside this range.
+    let parsed = parse_ws_datetime_unbounded(s)?;
+    let year = parsed.year();
+    if !(MIN_PARSED_YEAR..=MAX_PARSED_YEAR).contains(&year) {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn parse_ws_datetime_unbounded(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
 
     // Try standard RFC 3339 first
