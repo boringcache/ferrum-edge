@@ -390,8 +390,10 @@ fn test_into_tracked_returns_metrics_independent_of_body_kind() {
 //      the body is already end-of-stream, then drops the adapter without ever
 //      polling it. That drop must report a normal completion — issue #3176's
 //      regression turned every empty direct-H2 request into a 502.
-//   2. The gate that consumes the outcome forwards only on a clean completion,
-//      returns a deterministic 413 on overflow, and fails closed otherwise.
+//   2. The gate that consumes the outcome returns a deterministic 413 on
+//      overflow, forwards on every other terminal outcome (all of which imply
+//      the limit was never exceeded), and fails closed only when no terminal
+//      outcome was reported at all.
 
 #[test]
 fn test_drop_without_poll_on_end_stream_body_reports_completion() {
@@ -414,11 +416,27 @@ fn test_drop_with_outstanding_frames_reports_abandoned() {
 }
 
 #[test]
-fn test_upload_gate_forwards_only_on_clean_completion() {
+fn test_upload_gate_forwards_on_clean_completion() {
     assert_eq!(
         direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed)),
         DirectH2UploadGateForTest::Forward
     );
+}
+
+#[test]
+fn test_upload_gate_forwards_on_error_and_abandon() {
+    // Neither outcome can coexist with an overflow: `poll_frame` takes the
+    // completion sender when it stores `exceeded`, so an exceeded upload always
+    // reports `Exceeded`. Failing closed here would turn a backend that answers
+    // early and resets the unread upload — or a client that disconnects
+    // mid-body — into a 502 without enforcing anything extra.
+    for outcome in [RequestBodyOutcome::Errored, RequestBodyOutcome::Abandoned] {
+        assert_eq!(
+            direct_h2_upload_gate_for_test(Some(outcome)),
+            DirectH2UploadGateForTest::Forward,
+            "outcome {outcome:?} must forward the backend response"
+        );
+    }
 }
 
 #[test]
@@ -431,18 +449,11 @@ fn test_upload_gate_maps_overflow_to_deterministic_413() {
 }
 
 #[test]
-fn test_upload_gate_fails_closed_on_error_abandon_and_missing_signal() {
-    for outcome in [
-        Some(RequestBodyOutcome::Errored),
-        Some(RequestBodyOutcome::Abandoned),
-        // Sender dropped without reporting: unreachable through the adapter's
-        // Drop impl, but the gate must still refuse to forward.
-        None,
-    ] {
-        assert_eq!(
-            direct_h2_upload_gate_for_test(outcome),
-            DirectH2UploadGateForTest::FailClosed,
-            "outcome {outcome:?} must fail closed"
-        );
-    }
+fn test_upload_gate_fails_closed_on_missing_signal() {
+    // Sender dropped without reporting: unreachable through the adapter's Drop
+    // impl, but with no terminal size decision the gate must refuse to forward.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(None),
+        DirectH2UploadGateForTest::FailClosed
+    );
 }

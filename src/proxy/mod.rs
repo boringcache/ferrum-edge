@@ -2613,12 +2613,22 @@ pub(crate) enum DirectH2UploadGate {
     /// The configured request body limit was exceeded — deterministic 413,
     /// never the backend's early response.
     RequestBodyTooLarge,
-    /// The upload errored, was abandoned, or never reported an outcome. Fail
-    /// closed: an untrusted early backend response must not reach the client.
+    /// No terminal outcome was reported at all, so the size decision is
+    /// genuinely unknown. Fail closed: an unvetted early backend response must
+    /// not reach the client.
     FailClosed,
 }
 
 /// Map a terminal request-body outcome onto the direct-H2 response gate.
+///
+/// `Errored` / `Abandoned` forward the backend response. Both provably imply
+/// the limit was *not* exceeded: overflow stores `exceeded` and reports
+/// `RequestBodyOutcome::Exceeded` from the same `poll_frame`, taking the
+/// completion sender so neither a later poll nor `Drop` can relabel it. Failing
+/// closed on them instead would turn two ordinary flows into 502s — a backend
+/// that answers early (401/403/413) and `RST_STREAM`s the unread upload, which
+/// is what Go's and Envoy's HTTP/2 servers do by default, and a client that
+/// disconnects mid-upload — while buying no additional enforcement.
 ///
 /// `None` models a completion sender dropped without reporting. The adapter's
 /// `Drop` impl makes that unreachable in practice, but it must still fail
@@ -2626,12 +2636,14 @@ pub(crate) enum DirectH2UploadGate {
 pub(crate) fn classify_direct_h2_upload_outcome(
     outcome: Option<body::RequestBodyOutcome>,
 ) -> DirectH2UploadGate {
+    let Some(outcome) = outcome else {
+        return DirectH2UploadGate::FailClosed;
+    };
     match outcome {
-        Some(body::RequestBodyOutcome::Completed) => DirectH2UploadGate::Forward,
-        Some(body::RequestBodyOutcome::Exceeded) => DirectH2UploadGate::RequestBodyTooLarge,
-        Some(body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned) | None => {
-            DirectH2UploadGate::FailClosed
-        }
+        body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
+        body::RequestBodyOutcome::Completed
+        | body::RequestBodyOutcome::Errored
+        | body::RequestBodyOutcome::Abandoned => DirectH2UploadGate::Forward,
     }
 }
 
@@ -32435,7 +32447,7 @@ async fn proxy_to_backend_http2(
                 error!(
                     proxy_id = %proxy.id,
                     outcome = ?outcome,
-                    "HTTP/2 request upload did not complete; refusing to forward early backend response"
+                    "HTTP/2 request upload reported no terminal size decision; refusing to forward early backend response"
                 );
                 return (
                     retry::BackendResponse {
