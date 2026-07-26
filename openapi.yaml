@@ -3184,7 +3184,8 @@ paths:
         authorization, and all custom-header values are never persisted in
         the diff, Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
-        userinfo is stripped while its scheme/host/port/database are kept.
+        userinfo/query/fragment data is stripped while its
+        scheme/host/port/database are kept.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
@@ -6288,8 +6289,8 @@ components:
             endpoint paths/queries, authorization, and custom-header values
             are never persisted, `redis_integrity_key` (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
-            `redis_url` userinfo is stripped while scheme/host/port/database
-            are kept.
+            `redis_url` userinfo/query/fragment data is stripped while
+            scheme/host/port/database are kept.
 
     AuditEventListResponse:
       type: object

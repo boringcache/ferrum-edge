@@ -486,7 +486,11 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
 
     let integrity_key = "redis-integrity-secret-0123456789abcdef";
     let redis_password = "redis-acl-password-0123456789";
-    let redis_url = format!("redis://cacheuser:{redis_password}@cache.internal:6379/3");
+    let redis_query_secret = "query-secret-0123456789";
+    let redis_fragment_secret = "fragment-secret-0123456789";
+    let redis_url = format!(
+        "redis://cacheuser:{redis_password}@cache.internal:6379/3?token={redis_query_secret}#{redis_fragment_secret}"
+    );
     let plugin = json!({
         "id": "redis-cache-secret",
         "plugin_name": "ai_semantic_cache",
@@ -521,7 +525,10 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
         assert_eq!(projected["config"]["sync_mode"], "redis");
         let serialized = projected.to_string();
         assert!(
-            !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+            !serialized.contains(integrity_key)
+                && !serialized.contains(redis_password)
+                && !serialized.contains(redis_query_secret)
+                && !serialized.contains(redis_fragment_secret),
             "{role} response leaked Redis secret material: {projected:?}"
         );
     }
@@ -530,7 +537,10 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     let serialized = list_body.to_string();
     assert!(
-        !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+        !serialized.contains(integrity_key)
+            && !serialized.contains(redis_password)
+            && !serialized.contains(redis_query_secret)
+            && !serialized.contains(redis_fragment_secret),
         "viewer list leaked Redis secret material: {list_body:?}"
     );
     assert_eq!(list_body["data"][0]["config"]["redis_url"], expected_url);
@@ -560,7 +570,10 @@ async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
     assert_eq!(event["diff"]["after"]["config"]["redis_url"], expected_url);
     let serialized = event["diff"].to_string();
     assert!(
-        !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+        !serialized.contains(integrity_key)
+            && !serialized.contains(redis_password)
+            && !serialized.contains(redis_query_secret)
+            && !serialized.contains(redis_fragment_secret),
         "audit diff leaked Redis secret material: {event:?}"
     );
 }

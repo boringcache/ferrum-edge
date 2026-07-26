@@ -53,6 +53,15 @@ fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
         "redis://redacted@redis.internal:6379/1"
     );
 
+    let suffix_secrets = make_config(
+        "redis://redis.internal:6379/4?password=query-secret#fragment-secret",
+        false,
+    );
+    assert_eq!(
+        suffix_secrets.redacted_url(),
+        "redis://redis.internal:6379/4"
+    );
+
     // No userinfo: the original bytes are returned, not the parser's
     // normalization, so a credential-free URL is never silently rewritten.
     let bare = make_config("redis://Redis.Internal:6379/0", false);

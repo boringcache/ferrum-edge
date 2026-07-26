@@ -384,7 +384,8 @@ impl RedisConfig {
     }
 }
 
-/// Strip userinfo from a connection URL, keeping scheme/host/port/path.
+/// Strip userinfo, query, and fragment from a connection URL, keeping
+/// scheme/host/port/path.
 ///
 /// Fails closed to a bare marker when the value cannot be parsed: an
 /// unparseable string cannot be proven credential-free, and `redis_url` is
@@ -394,15 +395,24 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
     let Ok(mut parsed) = Url::parse(raw_url) else {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     };
-    if parsed.username().is_empty() && parsed.password().is_none() {
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    let has_suffix = parsed.query().is_some() || parsed.fragment().is_some();
+    if !has_userinfo && !has_suffix {
         // Return the original bytes rather than the parser's normalization, so
         // a credential-free value is never silently rewritten in an admin
         // projection or a log line.
         return raw_url.to_string();
     }
-    if parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err() {
+    if has_userinfo
+        && (parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err())
+    {
         return super::metadata_redaction::REDACTED_PLACEHOLDER.to_string();
     }
+    // Redis URLs may carry non-secret transport options in the query, but
+    // arbitrary disabled/unvalidated plugin configs can also put credentials
+    // there or in a fragment. Neither is needed to identify the destination.
+    parsed.set_query(None);
+    parsed.set_fragment(None);
     parsed.to_string()
 }
 
