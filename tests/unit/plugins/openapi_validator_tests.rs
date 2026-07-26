@@ -412,6 +412,23 @@ async fn request_validation_blocks_or_logs_by_mode() {
 }
 
 #[tokio::test]
+async fn required_request_body_is_checked_without_a_content_type() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let mut ctx = post_ctx("/items");
+    ctx.headers.clear();
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "required-body presence must be checked independently of media selection"
+    );
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &HashMap::new(), b"")
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn delete_request_with_schema_buffers_and_validates_body() {
     let plugin = OpenapiValidator::new(&json!({
         "enforcement_mode": "block",
@@ -5793,6 +5810,124 @@ fn request_body_requires_one_of_the_two_documented_forms() {
         error.contains("unknown configuration key"),
         "unexpected error: {error}"
     );
+
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {}}
+        }]
+    }));
+    assert!(error.contains("must not be empty"), "unexpected error: {error}");
+}
+
+#[test]
+fn response_status_keys_are_canonical_and_unambiguous() {
+    for status in ["099", "600", "0200", "20", "2X0"] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {(status): {"application/json": {"type": "object"}}}
+            }]
+        }));
+        assert!(
+            error.contains("invalid status"),
+            "unexpected error for {status}: {error}"
+        );
+    }
+
+    for responses in [
+        json!({
+            "2XX": {"application/json": {"type": "object"}},
+            "2xx": {"text/plain": {"type": "string"}}
+        }),
+        json!({
+            "default": {"application/json": {"type": "object"}},
+            "DEFAULT": {"text/plain": {"type": "string"}}
+        }),
+    ] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": responses
+            }]
+        }));
+        assert!(
+            error.contains("duplicate"),
+            "ambiguous status keys must fail: {error}"
+        );
+    }
+}
+
+#[test]
+fn normalized_duplicate_media_types_are_rejected() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "Application/Json": {"type": "object"},
+                    "application/json": {"type": "object"}
+                }
+            }
+        }]
+    }));
+    assert!(error.contains("duplicate media type"), "unexpected error: {error}");
+
+    let error = config_error(json!({
+        "error_response": {
+            "content_type": "application/problem+json;\r\nx-injected: true"
+        },
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("valid HTTP header value"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn multipart_header_object_rejects_unknown_fields() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {
+                                        "schema": {"type": "string"},
+                                        "requred": true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(error.contains("requred"), "unexpected error: {error}");
 }
 
 #[test]
@@ -5910,7 +6045,7 @@ async fn statuses_without_body_semantics_are_skipped() {
         }]
     }))
     .unwrap();
-    for status in [204u16, 304] {
+    for status in [204u16, 205, 304] {
         let mut ctx = post_ctx("/items");
         assert_continue(
             plugin
@@ -5924,6 +6059,29 @@ async fn statuses_without_body_semantics_are_skipped() {
             Some("no_body_expected")
         );
     }
+}
+
+#[tokio::test]
+async fn strict_empty_response_contract_still_schedules_validation() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {}}
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/items");
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"unexpected")
+            .await,
+        Some(502),
+    );
 }
 
 #[tokio::test]
@@ -5961,6 +6119,38 @@ async fn strict_mode_covers_missing_and_out_of_scope_content_types() {
             .on_final_response_body(&mut ctx, 200, &content_type_headers("text/plain"), b"hi")
             .await,
         Some(502),
+    );
+}
+
+#[tokio::test]
+async fn structured_media_suffix_matching_is_ascii_case_insensitive() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["ok"]
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("Application/Vnd.Example+JSON"),
+                br#"{"ok":true}"#,
+            )
+            .await,
     );
 }
 
@@ -6081,4 +6271,51 @@ async fn response_validation_errors_do_not_echo_backend_values() {
         "backend response content must not land in transaction logs: {detail}"
     );
     assert!(detail.contains("/ok"), "unexpected detail: {detail}");
+}
+
+#[tokio::test]
+async fn response_conversion_and_media_errors_do_not_echo_backend_values() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"text/plain": {"type": "boolean"}}}
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &content_type_headers("text/plain"),
+            b"backend-secret",
+        )
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(!body.contains("backend-secret"));
+    assert!(!detail.contains("backend-secret"));
+
+    let mut ctx = post_ctx("/items");
+    let secret_content_type = "application/backend-secret";
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &content_type_headers(secret_content_type),
+            b"value",
+        )
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(!body.contains(secret_content_type));
+    assert!(!detail.contains(secret_content_type));
 }

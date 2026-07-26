@@ -93,22 +93,32 @@ fn ref_sibling_cannot_relax_referenced_required_and_additional_properties() {
 }
 
 #[test]
-fn annotation_only_ref_siblings_stay_flat() {
-    // No assertion is displaced, so the historical flat overlay is preserved
-    // and no `allOf` wrapper is introduced.
+fn annotation_only_ref_siblings_preserve_both_schema_objects() {
+    // An annotation stays on the referring Schema Object. Flattening it into
+    // the target would change identifier scope, overwrite target annotations,
+    // and drop it entirely when the target is a boolean schema.
     let spec = spec_with_request_schema(
         "3.1.0",
         r#"{"type": "string", "description": "target"}"#,
         r##"{"$ref": "#/components/schemas/Target", "description": "override", "x-owner": "team"}"##,
     );
     let schema = first_request_schema(&spec);
-    assert_eq!(schema["type"], "string");
+    assert_eq!(schema["allOf"][0]["type"], "string");
+    assert_eq!(schema["allOf"][0]["description"], "target");
     assert_eq!(schema["description"], "override");
     assert_eq!(schema["x-owner"], "team");
-    assert!(
-        schema.get("allOf").is_none(),
-        "unexpected wrapper: {schema}"
+}
+
+#[test]
+fn annotation_next_to_boolean_ref_target_is_not_dropped() {
+    let spec = spec_with_request_schema(
+        "3.1.0",
+        "true",
+        r##"{"$ref": "#/components/schemas/Target", "description": "kept"}"##,
     );
+    let schema = first_request_schema(&spec);
+    assert_eq!(schema["description"], "kept");
+    assert_eq!(schema["allOf"], json!([true]));
 }
 
 #[test]
@@ -175,6 +185,30 @@ fn unevaluated_properties_next_to_ref_is_rejected() {
 }
 
 #[test]
+fn dynamic_scope_keywords_next_to_ref_are_rejected() {
+    for keyword in ["$dynamicRef", "$recursiveRef"] {
+        let request_schema = json!({
+            "$ref": "#/components/schemas/Target",
+            (keyword): "#node"
+        });
+        let spec = spec_with_request_schema(
+            "3.1.0",
+            r#"{"type": "object"}"#,
+            &request_schema.to_string(),
+        );
+        let error = extract_err(&spec);
+        assert!(
+            matches!(error, ExtractError::SchemaReference(_)),
+            "unexpected error for {keyword}: {error}"
+        );
+        assert!(
+            error.to_string().contains(keyword),
+            "unexpected error for {keyword}: {error}"
+        );
+    }
+}
+
+#[test]
 fn openapi_30_assertion_ref_sibling_is_rejected() {
     // OpenAPI 3.0 Schema Object `$ref` is a JSON Reference: adjacent keywords
     // have no defined meaning, so neither merging nor 2020-12 composition is
@@ -203,8 +237,8 @@ fn openapi_30_annotation_ref_sibling_still_imports() {
         r##"{"$ref": "#/components/schemas/Target", "description": "override"}"##,
     );
     let schema = first_request_schema(&spec);
-    assert_eq!(schema["type"], "string");
     assert_eq!(schema["description"], "override");
+    assert_eq!(schema["allOf"][0]["type"], "string");
 }
 
 #[test]
@@ -293,6 +327,45 @@ fn unknown_x_ferrum_validate_side_key_is_rejected() {
     assert!(
         error.to_string().contains("content_typs"),
         "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn unknown_x_ferrum_validate_bypass_key_is_rejected() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Typo Bypass API", "version": "1.0.0"}},
+  "x-ferrum-validate": {{"bypass": {{"methdos": ["GET"]}}}},
+  "x-ferrum-proxy": {proxy},
+  "paths": {{
+    "/items": {{
+      "get": {{"responses": {{"204": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+    let error = extract_err(&spec);
+    assert!(
+        error.to_string().contains("methdos"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn exponential_ref_fanout_hits_the_expansion_limit() {
+    let branches = vec![json!({"$ref": "#/components/schemas/Target"}); 8];
+    let component = json!({"anyOf": branches});
+    let spec = spec_with_request_schema(
+        "3.1.0",
+        &component.to_string(),
+        r##"{"$ref": "#/components/schemas/Target"}"##,
+    );
+    let error = extract_err(&spec);
+    assert!(
+        matches!(error, ExtractError::SchemaTooLarge { .. }),
+        "fan-out must hit the expansion limit before exhausting memory: {error}"
     );
 }
 

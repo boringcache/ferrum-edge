@@ -126,6 +126,8 @@ pub enum ExtractError {
     SchemaReference(String),
     #[error("schema reference depth exceeded while resolving '{location}'")]
     SchemaTooDeep { location: String },
+    #[error("resolved schema exceeds the expansion limit while resolving '{location}'")]
+    SchemaTooLarge { location: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +658,8 @@ const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
     "error_truncate_chars",
 ];
 const X_FERRUM_VALIDATE_SIDE_KEYS: &[&str] = &["enabled", "content_types"];
+const OPENAPI_VALIDATOR_BYPASS_KEYS: &[&str] =
+    &["paths", "methods", "consumers", "header_present"];
 
 fn reject_unknown_validate_keys(
     object: &Map<String, Value>,
@@ -748,6 +752,13 @@ fn validate_openapi_validator_bypass(
             which,
             error: "openapi_validator bypass config must be an object".to_string(),
         })?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        &format!("{which}.bypass"),
+        OPENAPI_VALIDATOR_BYPASS_KEYS,
+        "",
+    )
+    .map_err(|error| ExtractError::MalformedExtension { which, error })?;
     for key in ["paths", "methods", "consumers"] {
         if let Some(value) = object.get(key)
             && !value.is_array()
@@ -892,6 +903,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         }
     };
     let mut operations = Vec::new();
+    let mut generated_operation_bytes = 0usize;
     // Draft selection is emitted once on the top-level openapi_validator config
     // (`schema_draft`). Runtime compiles every operation with that selector;
     // per-operation copies are not part of the published Admin schema.
@@ -981,7 +993,26 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 if !responses.is_empty() {
                     entry.insert("responses".to_string(), Value::Object(responses.clone()));
                 }
-                operations.push(Value::Object(entry));
+                let entry = Value::Object(entry);
+                let entry_bytes = serde_json::to_vec(&entry)
+                    .map_err(|error| ExtractError::MalformedExtension {
+                        which: "x-ferrum-validate",
+                        error: format!(
+                            "generated openapi_validator operation could not be serialized: {error}"
+                        ),
+                    })?
+                    .len();
+                generated_operation_bytes = generated_operation_bytes
+                    .checked_add(entry_bytes)
+                    .ok_or_else(|| ExtractError::SchemaTooLarge {
+                        location: effective_template.clone(),
+                    })?;
+                if generated_operation_bytes > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
+                    return Err(ExtractError::SchemaTooLarge {
+                        location: effective_template,
+                    });
+                }
+                operations.push(entry);
             }
         }
     }
@@ -1438,6 +1469,19 @@ fn normalize_request_body_encoding(
     version: &str,
     resolver: &LocalSchemaResolver,
 ) -> Result<Value, ExtractError> {
+    const HEADER_OBJECT_KEYS: &[&str] = &[
+        "description",
+        "required",
+        "deprecated",
+        "allowEmptyValue",
+        "style",
+        "explode",
+        "allowReserved",
+        "schema",
+        "content",
+        "example",
+        "examples",
+    ];
     let base = media_type
         .split(';')
         .next()
@@ -1653,6 +1697,49 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 };
+                for key in header_object.keys() {
+                    if !HEADER_OBJECT_KEYS.contains(&key.as_str()) {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'] contains unsupported field '{key}'"
+                            ),
+                        });
+                    }
+                }
+                if let Some(description) = header_object.get("description")
+                    && !description.is_null()
+                    && !description.is_string()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].description must be a string"
+                        ),
+                    });
+                }
+                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
+                    if let Some(value) = header_object.get(key)
+                        && !value.is_boolean()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
+                            ),
+                        });
+                    }
+                }
+                if let Some(examples) = header_object.get("examples")
+                    && !examples.is_object()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                        ),
+                    });
+                }
                 if header_object.contains_key("content") {
                     return Err(ExtractError::MalformedExtension {
                         which: "requestBody.content.encoding",
@@ -1980,6 +2067,11 @@ fn swagger_media_types(
 }
 
 const MAX_SCHEMA_REF_DEPTH: usize = 32;
+/// Maximum number of values materialized by one schema/reference expansion.
+///
+/// A shallow schema can otherwise use repeated local `$ref` branches to grow
+/// exponentially before the generated-config byte limit is checked.
+const MAX_RESOLVED_SCHEMA_NODES: usize = 500_000;
 const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// Path Item recursion grows several YAML/JSON container levels per callback.
 /// Keep its explicit resolver budget below the parsers' own recursion ceiling
@@ -2931,13 +3023,21 @@ const SCHEMA_NON_ASSERTION_KEYWORDS: &[&str] = &[
     "definitions",
     "deprecated",
     "description",
+    "discriminator",
     "example",
     "examples",
     "externalDocs",
+    "format",
     "id",
+    "readOnly",
     "summary",
     "title",
+    "writeOnly",
     "xml",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "$recursiveAnchor",
 ];
 
 /// Schema Object keywords Ferrum cannot faithfully relocate into a composition
@@ -2946,20 +3046,25 @@ const SCHEMA_NON_ASSERTION_KEYWORDS: &[&str] = &[
 /// the adjacent `$ref` — which a separate `allOf` branch does not see, and
 /// `$dynamicRef` resolution depends on the dynamic scope. Importing either next
 /// to `$ref` would change meaning, so they fail closed instead.
-const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] =
-    &["$dynamicRef", "unevaluatedItems", "unevaluatedProperties"];
+const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] = &[
+    "$dynamicRef",
+    "$recursiveRef",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
 
 /// Resolution context for one Schema Object `$ref`-with-siblings composition:
 /// the document root, the reporting location, the reference being composed, the
 /// remaining recursion budget, the base URI in force inside the referring object
 /// (after its own `$id`), and the shared resolver.
-struct RefComposition<'a> {
+struct RefComposition<'a, 'b> {
     root: &'a Value,
     location: &'a str,
     reference: &'a str,
     depth: usize,
     child_base: &'a Url,
     resolver: &'a LocalSchemaResolver,
+    budget: &'b mut ResolutionBudget,
 }
 
 /// Compose a Schema Object `$ref` with its adjacent keywords without letting an
@@ -2977,7 +3082,7 @@ struct RefComposition<'a> {
 ///   did not opt into it, the import fails closed and asks for an explicit
 ///   `allOf`.
 fn compose_schema_ref_siblings(
-    ctx: RefComposition<'_>,
+    ctx: RefComposition<'_, '_>,
     object: &Map<String, Value>,
     resolved_target: Value,
 ) -> Result<Value, ExtractError> {
@@ -2988,6 +3093,7 @@ fn compose_schema_ref_siblings(
         depth,
         child_base,
         resolver,
+        budget,
     } = ctx;
     let mut wrapper_fields = Map::new();
     let mut assertions = Map::new();
@@ -3000,7 +3106,7 @@ fn compose_schema_ref_siblings(
                 "$ref '{reference}' at {location} has an adjacent '{key}' keyword, whose evaluation scope cannot be preserved; move the reference into an explicit allOf branch"
             )));
         }
-        let resolved_child = resolve_refs(
+        let resolved_child = resolve_refs_bounded(
             root,
             child,
             location,
@@ -3008,27 +3114,19 @@ fn compose_schema_ref_siblings(
             child_base,
             resolver,
             schema_child_context(key, child),
+            budget,
         )?;
-        if SCHEMA_NON_ASSERTION_KEYWORDS.contains(&key.as_str()) || key.starts_with("x-") {
+        if SCHEMA_NON_ASSERTION_KEYWORDS.contains(&key.as_str())
+            || key.starts_with("x-")
+            || (resolver.schema_object_ref_siblings && key == "nullable")
+        {
             wrapper_fields.insert(key.clone(), resolved_child);
         } else {
             assertions.insert(key.clone(), resolved_child);
         }
     }
 
-    if assertions.is_empty() {
-        // No assertion is displaced, so the historical overlay is already
-        // standards-equivalent and stays byte-compatible.
-        let mut merged = resolved_target;
-        if let Some(merged_object) = merged.as_object_mut() {
-            for (key, value) in wrapper_fields {
-                merged_object.insert(key, value);
-            }
-        }
-        return Ok(merged);
-    }
-
-    if !resolver.schema_object_ref_siblings {
+    if !assertions.is_empty() && !resolver.schema_object_ref_siblings {
         let mut keywords: Vec<&str> = assertions.keys().map(String::as_str).collect();
         keywords.sort_unstable();
         return Err(schema_reference_error(format!(
@@ -3037,11 +3135,18 @@ fn compose_schema_ref_siblings(
         )));
     }
 
+    if wrapper_fields.is_empty() && assertions.is_empty() {
+        return Ok(resolved_target);
+    }
+
+    consume_resolution_budget(budget, location, 1, 2)?;
     let mut wrapper = wrapper_fields;
-    wrapper.insert(
-        "allOf".to_string(),
-        Value::Array(vec![resolved_target, Value::Object(assertions)]),
-    );
+    let mut branches = vec![resolved_target];
+    if !assertions.is_empty() {
+        consume_resolution_budget(budget, location, 1, 2)?;
+        branches.push(Value::Object(assertions));
+    }
+    wrapper.insert("allOf".to_string(), Value::Array(branches));
     Ok(Value::Object(wrapper))
 }
 
@@ -3054,7 +3159,112 @@ fn resolve_refs(
     resolver: &LocalSchemaResolver,
     context: ResolveContext,
 ) -> Result<Value, ExtractError> {
+    let mut budget = ResolutionBudget {
+        remaining_nodes: MAX_RESOLVED_SCHEMA_NODES,
+        remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+    };
+    resolve_refs_bounded(
+        root,
+        value,
+        location,
+        depth,
+        current_base,
+        resolver,
+        context,
+        &mut budget,
+    )
+}
+
+struct ResolutionBudget {
+    remaining_nodes: usize,
+    remaining_bytes: usize,
+}
+
+fn consume_resolution_budget(
+    budget: &mut ResolutionBudget,
+    location: &str,
+    nodes: usize,
+    bytes: usize,
+) -> Result<(), ExtractError> {
+    let Some(remaining_nodes) = budget.remaining_nodes.checked_sub(nodes) else {
+        return Err(ExtractError::SchemaTooLarge {
+            location: location.to_string(),
+        });
+    };
+    let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(bytes) else {
+        return Err(ExtractError::SchemaTooLarge {
+            location: location.to_string(),
+        });
+    };
+    budget.remaining_nodes = remaining_nodes;
+    budget.remaining_bytes = remaining_bytes;
+    Ok(())
+}
+
+fn opaque_value_weight(value: &Value) -> (usize, usize) {
+    match value {
+        Value::Null => (1, 4),
+        Value::Bool(true) => (1, 4),
+        Value::Bool(false) => (1, 5),
+        Value::Number(number) => (1, number.to_string().len()),
+        Value::String(value) => (1, value.len().saturating_add(2)),
+        Value::Array(values) => {
+            values
+                .iter()
+                .fold((1usize, 2usize), |weight, child| {
+                    let child = opaque_value_weight(child);
+                    (
+                        weight.0.saturating_add(child.0),
+                        weight.1.saturating_add(child.1).saturating_add(1),
+                    )
+                })
+        }
+        Value::Object(object) => {
+            object
+                .iter()
+                .fold((1usize, 2usize), |weight, (key, child)| {
+                    let child = opaque_value_weight(child);
+                    (
+                        weight.0.saturating_add(child.0),
+                        weight
+                            .1
+                            .saturating_add(key.len())
+                            .saturating_add(child.1)
+                            .saturating_add(4),
+                    )
+                })
+        }
+    }
+}
+
+fn shallow_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(value) => value.len().saturating_add(2),
+        Value::Array(values) => values.len().saturating_add(2),
+        Value::Object(object) => object.keys().fold(2usize, |bytes, key| {
+            bytes.saturating_add(key.len()).saturating_add(4)
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_refs_bounded(
+    root: &Value,
+    value: &Value,
+    location: &str,
+    depth: usize,
+    current_base: &Url,
+    resolver: &LocalSchemaResolver,
+    context: ResolveContext,
+    budget: &mut ResolutionBudget,
+) -> Result<Value, ExtractError> {
     if context == ResolveContext::Opaque {
+        let (nodes, bytes) = opaque_value_weight(value);
+        consume_resolution_budget(budget, location, nodes, bytes)?;
         return Ok(value.clone());
     }
     if depth == 0 {
@@ -3062,6 +3272,7 @@ fn resolve_refs(
             location: location.to_string(),
         });
     }
+    consume_resolution_budget(budget, location, 1, shallow_value_bytes(value))?;
     match value {
         Value::Object(object) => {
             let child_base = if context == ResolveContext::Schema {
@@ -3082,7 +3293,7 @@ fn resolve_refs(
                 // are rejected inside `resolve_reference` as UnsupportedExternalRef.
                 let (target, target_base) =
                     resolver.resolve_reference(root, reference, &child_base)?;
-                let mut resolved = resolve_refs(
+                let mut resolved = resolve_refs_bounded(
                     root,
                     target,
                     reference,
@@ -3090,6 +3301,7 @@ fn resolve_refs(
                     &target_base,
                     resolver,
                     context,
+                    budget,
                 )?;
                 if object.len() > 1 {
                     if context == ResolveContext::Schema {
@@ -3102,6 +3314,7 @@ fn resolve_refs(
                                 depth,
                                 child_base: &child_base,
                                 resolver,
+                                budget,
                             },
                             object,
                             resolved,
@@ -3118,7 +3331,7 @@ fn resolve_refs(
                             if key != "$ref" {
                                 resolved_object.insert(
                                     key.clone(),
-                                    resolve_refs(
+                                    resolve_refs_bounded(
                                         root,
                                         child,
                                         location,
@@ -3126,6 +3339,7 @@ fn resolve_refs(
                                         &child_base,
                                         resolver,
                                         ResolveContext::Opaque,
+                                        budget,
                                     )?,
                                 );
                             }
@@ -3146,7 +3360,7 @@ fn resolve_refs(
                 };
                 resolved.insert(
                     key.clone(),
-                    resolve_refs(
+                    resolve_refs_bounded(
                         root,
                         child,
                         location,
@@ -3154,6 +3368,7 @@ fn resolve_refs(
                         &child_base,
                         resolver,
                         child_context,
+                        budget,
                     )?,
                 );
             }
@@ -3162,7 +3377,7 @@ fn resolve_refs(
         Value::Array(values) if context == ResolveContext::SchemaArray => values
             .iter()
             .map(|child| {
-                resolve_refs(
+                resolve_refs_bounded(
                     root,
                     child,
                     location,
@@ -3170,6 +3385,7 @@ fn resolve_refs(
                     current_base,
                     resolver,
                     ResolveContext::Schema,
+                    budget,
                 )
             })
             .collect::<Result<Vec<_>, _>>()

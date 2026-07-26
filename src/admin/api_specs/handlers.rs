@@ -638,6 +638,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::UnsupportedExternalRef { .. } => "UnsupportedExternalRef",
         ExtractError::SchemaReference(_) => "SchemaReference",
         ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
+        ExtractError::SchemaTooLarge { .. } => "SchemaTooLarge",
     }
 }
 
@@ -666,7 +667,8 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::InvalidTagName { .. }
         | ExtractError::UnsupportedExternalRef { .. }
         | ExtractError::SchemaReference(_)
-        | ExtractError::SchemaTooDeep { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        | ExtractError::SchemaTooDeep { .. }
+        | ExtractError::SchemaTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
