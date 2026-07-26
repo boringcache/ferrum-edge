@@ -5837,31 +5837,18 @@ impl InitializedBackendOwner {
         self.backend.as_mut()
     }
 
-    /// Detach enrolled pods and invoke `cleanup_all` exactly once (normal
-    /// shutdown path).
-    ///
-    /// Deliberately does NOT write the `.udp-not-ready` ack. By this point
-    /// `cleanup_all()` has detached the tc classifier and torn down the pod-IP
-    /// registry, so the host-veth gate that normally drops pod-originated UDP is
-    /// *gone*, not closed. If a mesh proxy keeps running across a node-agent
-    /// DaemonSet restart, publishing the ack would tell its still-live per-netns
-    /// producer that the host gate is closed (`retain_guard = false`) and let it
-    /// tear its in-netns DROP guard down into plaintext — enrolled pods would
-    /// then egress UDP uncaptured/unauthorized until the new node-agent
-    /// re-enrolls and reopens the producer. Fail closed instead: withholding the
-    /// ack makes `await_udp_not_ready_ack` time out on the producer side, so it
-    /// retains the in-netns guard (self-healing — reaped on the producer's next
-    /// open). A fresh ack is only ever published by
-    /// `reconcile_udp_capture_readiness` once the BPF gate is verifiably
-    /// re-closed, which a restarted node-agent re-derives from live state rather
-    /// than trusting a persisted marker.
+    /// Run the ordered shutdown teardown ([`shutdown_backend_state`]) exactly
+    /// once. A later `Drop` observes the latch and does nothing.
     fn shutdown_pods(
         &mut self,
         pod_states: &DashMap<String, PodAttachmentState>,
         config: &NodeAgentConfig,
     ) {
-        detach_enrolled_pods(self.backend_mut(), pod_states, config);
-        self.cleanup_once("shutdown");
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        shutdown_backend_state(self.backend.as_mut(), pod_states, config);
     }
 
     /// Cleanup after a late startup/runtime error (e.g. Kubernetes client
@@ -5932,24 +5919,43 @@ fn detach_enrolled_pods(
     }
 }
 
-/// Inline-test harness for the shutdown sequence over a *borrowed* backend, so
-/// the existing tests can keep asserting on their own `MockEbpfBackend` after
-/// teardown (the production owner takes the backend by value).
+/// Ordered node-agent teardown: per-pod detach first (dropping each enrolled
+/// pod's registry entry and readiness markers), then the node-global
+/// `cleanup_all`.
 ///
-/// This mirrors [`InitializedBackendOwner::shutdown_pods`] step for step and
-/// calls the same production helpers; the exactly-once ownership and ordering of
-/// the real path are covered separately by
-/// [`startup_cleanup_test_seams::probe_normal_shutdown_cleanup_once_for_test`],
-/// which drives `shutdown_pods` itself.
-#[cfg(test)]
-fn cleanup_all_pods(
+/// This is the whole body of the normal shutdown path;
+/// [`InitializedBackendOwner::shutdown_pods`] adds only the exactly-once latch.
+/// Keeping it a free function over a *borrowed* backend is what lets the
+/// inline tests assert the ordering and the fail-closed UDP behaviour below
+/// against the real production code rather than a test-local copy (the owner
+/// takes the backend by value, so a consumed mock is no longer observable).
+///
+/// Deliberately does NOT write the `.udp-not-ready` ack. By this point
+/// `cleanup_all()` has detached the tc classifier and torn down the pod-IP
+/// registry, so the host-veth gate that normally drops pod-originated UDP is
+/// *gone*, not closed. If a mesh proxy keeps running across a node-agent
+/// DaemonSet restart, publishing the ack would tell its still-live per-netns
+/// producer that the host gate is closed (`retain_guard = false`) and let it
+/// tear its in-netns DROP guard down into plaintext — enrolled pods would then
+/// egress UDP uncaptured/unauthorized until the new node-agent re-enrolls and
+/// reopens the producer. Fail closed instead: withholding the ack makes
+/// `await_udp_not_ready_ack` time out on the producer side, so it retains the
+/// in-netns guard (self-healing — reaped on the producer's next open). A fresh
+/// ack is only ever published by `reconcile_udp_capture_readiness` once the BPF
+/// gate is verifiably re-closed, which a restarted node-agent re-derives from
+/// live state rather than trusting a persisted marker.
+fn shutdown_backend_state(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
 ) {
     detach_enrolled_pods(backend, pod_states, config);
-    if let Err(e) = backend.cleanup_all() {
-        warn!(error = %e, "Failed to cleanup BPF state during shutdown");
+    if let Err(cleanup_err) = backend.cleanup_all() {
+        warn!(
+            error = %cleanup_err,
+            context = "shutdown",
+            "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
+        );
     }
 }
 
@@ -6924,7 +6930,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_detaches_attached() {
+    fn shutdown_backend_state_detaches_attached() {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert(
@@ -6973,7 +6979,7 @@ mod tests {
             trust_domain: "cluster.local".to_string(),
             node_waypoint_pod_registry_dir: None,
         };
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert_eq!(backend.detached_pods.len(), 1);
         assert_eq!(backend.detached_pods[0], "pod-1");
@@ -6981,7 +6987,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_removes_registry_and_ready_files() {
+    fn shutdown_backend_state_removes_registry_and_ready_files() {
         // Shutdown must drop each enrolled pod's registry entry + readiness
         // markers so a mesh proxy that keeps running doesn't leak dead
         // in-netns listeners.
@@ -7027,7 +7033,7 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
 
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert!(
             !registry.path().join("pod-x").exists(),
@@ -7060,7 +7066,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_withholds_udp_not_ready_ack_for_fail_closed_restart() {
+    fn shutdown_backend_state_withholds_udp_not_ready_ack_for_fail_closed_restart() {
         // Regression for the node-agent DaemonSet restart path: even with a stale
         // `.udp-ready` marker present (producer still live), shutdown teardown must
         // never write the `.udp-not-ready` ack, so the surviving producer times out
@@ -7107,7 +7113,7 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
 
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert!(
             !registry
