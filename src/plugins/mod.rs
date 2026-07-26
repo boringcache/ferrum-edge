@@ -1890,6 +1890,13 @@ pub struct RequestContext {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// Lowercase `claim_headers` destinations already sanitized for this
+    /// request. Gateway-owned destinations are stripped exactly once, by the
+    /// first plugin instance that owns them, so a later instance sharing a
+    /// destination can never erase a verified value an earlier instance already
+    /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
+    /// configured.
+    pub(crate) sanitized_claim_header_destinations: HashSet<String>,
     /// Credential header names precomputed by the plugin cache for safe
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
@@ -2469,6 +2476,7 @@ impl RequestContext {
             ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
@@ -3250,6 +3258,7 @@ impl RequestContext {
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,

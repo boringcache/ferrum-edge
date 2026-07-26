@@ -7,7 +7,7 @@
 //! signal that Ferrum accepted/rejected the policy or what it actually
 //! programmed. This module fills that gap.
 //!
-//! All nine translated Istio CRDs are covered:
+//! All ten translated Istio CRDs are covered:
 //!
 //! - `AuthorizationPolicy` — status confirms `ALLOW` with no rules
 //!   compiles to a synthetic never-match rule (Istio allow-nothing
@@ -33,6 +33,14 @@
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
 //!   and service binding.
+//! - `ProxyConfig` — status reports resolved scope plus concurrency / image /
+//!   environment / tracing.sampling translation outcome. Istio's
+//!   `proxyconfigs.networking.istio.io` CRD declares `subresources.status`
+//!   (authoritative Istio API manifests), so FerrumAccepted is writable.
+//!   Only `selector`, `concurrency`, `image`, and `environmentVariables`
+//!   exist in that CRD's structural spec schema, so cluster-sourced objects
+//!   always report `tracing.sampling: <unset>` — the API server prunes
+//!   `spec.tracing`, which arrives over native/file/xDS mesh config instead.
 //!
 //! For each kind a rejection (`K8sTranslateError`) flips `FerrumAccepted`
 //! to `False`/`Invalid` with the translator's reason, so a hard rejection
@@ -194,6 +202,7 @@ fn istio_api_resource(update: &IstioStatusUpdate) -> Option<ApiResource> {
         ("WorkloadEntry", "networking.istio.io", _) => "workloadentries",
         ("Sidecar", "networking.istio.io", _) => "sidecars",
         ("Telemetry", "telemetry.istio.io", _) => "telemetries",
+        ("ProxyConfig", "networking.istio.io", "v1beta1") => "proxyconfigs",
         _ => return None,
     };
     Some(ApiResource {
@@ -248,6 +257,9 @@ pub fn plan_istio_status_updates(
                     options.mesh_sidecar_ingress_enforced,
                 ),
                 "Telemetry" => telemetry_status(object, result.as_ref()),
+                "ProxyConfig" => {
+                    proxy_config_status(object, result.as_ref(), &options.istio_root_namespace)
+                }
                 _ => return None,
             };
             if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
@@ -283,6 +295,7 @@ fn is_supported_istio_kind(kind: &str) -> bool {
             | "WorkloadEntry"
             | "Sidecar"
             | "Telemetry"
+            | "ProxyConfig"
     )
 }
 
@@ -1387,6 +1400,90 @@ fn telemetry_status(
     }
 }
 
+/// Status for `ProxyConfig`. Surfaces resolved policy scope plus the
+/// translated concurrency / image / environment / tracing.sampling fields.
+///
+/// Authoritative evidence: Istio's `proxyconfigs.networking.istio.io` CRD
+/// (istio/api `customresourcedefinitions.gen.yaml`) declares
+/// `subresources: { status: {} }` on the served `v1beta1` version with a
+/// conditions-shaped status schema, so `FerrumAccepted` is writable the same
+/// way as the other watched Istio kinds.
+///
+/// That CRD's structural spec schema admits only `selector`, `concurrency`,
+/// `image`, and `environmentVariables`; `spec.tracing` is pruned by the API
+/// server, so `tracing_sampling` reads `<unset>` for every cluster-sourced
+/// object. It is reported anyway to stay in lock-step with the translator's
+/// field set for non-pruned object feeds.
+fn proxy_config_status(
+    object: &K8sObject,
+    result: Result<&K8sTranslation, &K8sTranslateError>,
+    istio_root_namespace: &str,
+) -> (Value, Option<Value>) {
+    let scope = istio_policy_scope_label(object, istio_root_namespace);
+    let concurrency = object
+        .spec
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok());
+    let image = object
+        .spec
+        .get("image")
+        .and_then(|img| img.get("imageType"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let environment_count = object
+        .spec
+        .get("environmentVariables")
+        .and_then(Value::as_object)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let tracing_sampling = object
+        .spec
+        .get("tracing")
+        .and_then(|tracing| tracing.get("sampling"))
+        .and_then(Value::as_f64);
+
+    match result {
+        Ok(_translation) => {
+            let message = format!(
+                "Ferrum accepted this ProxyConfig (scope: {scope}; concurrency: {}; image: {}; \
+                 environment vars: {environment_count}; tracing.sampling: {})",
+                concurrency
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "<unset>".to_string()),
+                image.as_deref().unwrap_or("<unset>"),
+                tracing_sampling
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "<unset>".to_string()),
+            );
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "concurrency": concurrency,
+                    "image": image,
+                    "environment_vars": environment_count,
+                    "tracing_sampling": tracing_sampling,
+                }
+            });
+            accepted_status(object, true, "Accepted", &message, Some(detail))
+        }
+        Err(error) => {
+            let message = format!("Ferrum rejected this ProxyConfig: {error}");
+            let detail = json!({
+                "translation": {
+                    "scope": scope,
+                    "concurrency": concurrency,
+                    "image": image,
+                    "environment_vars": environment_count,
+                    "tracing_sampling": tracing_sampling,
+                    "error": format!("{error}"),
+                }
+            });
+            accepted_status(object, false, "Invalid", &message, Some(detail))
+        }
+    }
+}
+
 /// Resolve the Istio policy scope label for selector-driven CRDs
 /// (`RequestAuthentication`, etc.) the same way the translator's
 /// `istio_policy_scope` does: a non-empty selector means `WorkloadSelector`,
@@ -2256,25 +2353,37 @@ mod tests {
     }
 
     #[test]
-    fn supported_kind_filter_skips_unknown_kinds() {
-        // `ProxyConfig` is translated by the Istio translator but the
-        // controller does not watch it (`ISTIO_CRDS`) and the status writer
-        // does not surface it, so the planner must skip it.
+    fn supported_kind_filter_accepts_proxy_config() {
+        // ProxyConfig is watched (`ISTIO_CRDS`) and the status writer surfaces
+        // FerrumAccepted — Istio's CRD declares subresources.status.
         let obj = object(
             "networking.istio.io/v1beta1",
             "ProxyConfig",
             "default-pc",
-            json!({}),
+            json!({
+                "concurrency": 4,
+                "tracing": { "sampling": 12.5 }
+            }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
-        assert!(
-            updates.is_empty(),
-            "ProxyConfig is not a status-writer kind; planner should skip it"
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].kind, "ProxyConfig");
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(detail["translation"]["scope"].as_str(), Some("Namespace"));
+        assert_eq!(detail["translation"]["concurrency"].as_u64(), Some(4));
+        assert_eq!(
+            detail["translation"]["tracing_sampling"].as_f64(),
+            Some(12.5)
         );
     }
 
     #[test]
-    fn api_resource_returns_none_for_unsupported_kind() {
+    fn api_resource_returns_proxy_config_v1beta1() {
         let update = IstioStatusUpdate {
             api_version: "networking.istio.io/v1beta1".to_string(),
             kind: "ProxyConfig".to_string(),
@@ -2283,9 +2392,81 @@ mod tests {
             status: Value::Null,
             ferrum_detail: None,
         };
+        let ar = istio_api_resource(&update).expect("ProxyConfig is a status-writer kind");
+        assert_eq!(ar.group, "networking.istio.io");
+        assert_eq!(ar.version, "v1beta1");
+        assert_eq!(ar.plural, "proxyconfigs");
+    }
+
+    #[test]
+    fn api_resource_returns_none_for_unsupported_kind() {
+        let update = IstioStatusUpdate {
+            api_version: "networking.istio.io/v1beta1".to_string(),
+            kind: "EnvoyFilter".to_string(),
+            namespace: "default".to_string(),
+            name: "ef".to_string(),
+            status: Value::Null,
+            ferrum_detail: None,
+        };
         assert!(
             istio_api_resource(&update).is_none(),
-            "ProxyConfig is not a status-writer kind; planner already filters it"
+            "EnvoyFilter is not a status-writer kind"
+        );
+    }
+
+    #[test]
+    fn proxy_config_rejection_surfaces_invalid_condition() {
+        let obj = object(
+            "networking.istio.io/v1beta1",
+            "ProxyConfig",
+            "bad-pc",
+            json!({ "concurrency": -1 }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+    }
+
+    #[test]
+    fn proxy_config_unusable_tracing_sampling_surfaces_invalid_condition() {
+        // An out-of-range sampling value must land as
+        // FerrumAccepted=False/Invalid rather than Accepted with a silently
+        // dropped or unvalidated percentage. Note that Istio's v1beta1
+        // ProxyConfig CRD has no `tracing` property in its structural spec
+        // schema, so the API server prunes this field on a real cluster; this
+        // pins the planner contract for non-pruned object feeds.
+        let obj = object(
+            "networking.istio.io/v1beta1",
+            "ProxyConfig",
+            "bad-sampling",
+            json!({ "tracing": { "sampling": 5000.0 } }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        assert_eq!(updates.len(), 1);
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tracing.sampling"),
+            "status message must name the offending field: {:?}",
+            c["message"]
+        );
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["tracing_sampling"].as_f64(),
+            Some(5000.0),
+            "detail should retain the rejected numeric sampling for operators"
         );
     }
 
