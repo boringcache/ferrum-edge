@@ -3080,14 +3080,6 @@ impl AdminResource for Upstream {
         }
     }
 
-    fn allow_cached_read_fallback(_error: &anyhow::Error) -> bool {
-        // Upstream rows are authoritative in database mode. Falling back to an
-        // empty/stale cache turns MySQL MEDIUMTEXT decode failures (and other
-        // persistence errors) into false 404s and leaves undecodable rows that
-        // poison later gateway full-loads on the shared CI database.
-        false
-    }
-
     fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
         if self.targets.is_empty() && self.service_discovery.is_none() {
             return Err(ValidationError::Message(
