@@ -290,9 +290,8 @@ pub fn validate_composition(
         };
         effective
             .into_iter()
-            .filter_map(|plugin| {
-                dynamic_response_presentation_is_active(plugin).then(|| plugin.id.clone())
-            })
+            .filter(|plugin| dynamic_response_presentation_is_active(plugin))
+            .map(|plugin| plugin.id.clone())
             .collect()
     };
 
@@ -450,6 +449,9 @@ struct LocalCompletionCandidate<'a> {
     status_code: u16,
     headers: HashMap<String, String>,
     body: &'a [u8],
+    retain_inflight_on_skip: bool,
+    retain_inflight_on_eviction: bool,
+    response_policy: ResponsePolicyProvenance,
 }
 
 enum CompletionSkipReason {
@@ -1304,14 +1306,14 @@ impl RequestDeduplication {
         fingerprint: &str,
         owner_token: &str,
         candidate: LocalCompletionCandidate<'_>,
-        retain_inflight_on_skip: bool,
-        retain_inflight_on_eviction: bool,
-        response_policy: ResponsePolicyProvenance,
     ) -> LocalCompletionAction {
         let LocalCompletionCandidate {
             status_code,
             headers,
             body,
+            retain_inflight_on_skip,
+            retain_inflight_on_eviction,
+            response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
         let _guard = self.accounting_guard();
@@ -2597,10 +2599,11 @@ impl Plugin for RequestDeduplication {
                 status_code: response_status,
                 headers: safe_headers,
                 body,
+                retain_inflight_on_skip: retain_inflight_on_storage_skip,
+                retain_inflight_on_eviction: retain_inflight_on_storage_skip
+                    || redis_lock_token.is_some(),
+                response_policy,
             },
-            retain_inflight_on_storage_skip,
-            retain_inflight_on_storage_skip || redis_lock_token.is_some(),
-            response_policy,
         ) {
             LocalCompletionAction::Published {
                 cached,
