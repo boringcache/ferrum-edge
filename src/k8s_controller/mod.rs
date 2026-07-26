@@ -27,9 +27,7 @@ use istio_status::IstioStatusWriter;
 use metrics::ControllerMetrics;
 pub use reconciler::ReconcileBroadcasters;
 pub use reconciler::{
-    AcceptedK8sOverlay, CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay,
-    empty_k8s_overlay_slot, merge_k8s_translation, publish_k8s_reconcile,
-    store_accepted_k8s_overlay, swap_merged_k8s_translation,
+    CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
 };
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
