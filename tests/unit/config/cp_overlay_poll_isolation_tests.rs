@@ -21,7 +21,7 @@ use ferrum_edge::_test_support::{
     publish_cp_full_reload_for_test, publish_cp_incremental_for_test, publish_k8s_reconcile,
     store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
-use ferrum_edge::config::db_backend::IncrementalResult;
+use ferrum_edge::config::db_backend::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy, ResponseBodyMode,
 };
@@ -176,13 +176,13 @@ fn per_namespace_incremental_rejection_keeps_sibling_lkg() {
 
     let mut ok_delta = empty_incremental();
     ok_delta.added_or_modified_proxies = vec![make_proxy("a-new", "ns-a")];
-    ok_delta.removed_proxy_ids = vec!["a-old".to_string()];
+    ok_delta.removed_proxy_ids = vec![NamespacedResourceId::new("ns-a", "a-old")];
 
     let mut bad_delta = empty_incremental();
     let mut dangling = make_proxy("b-bad", "ns-b");
     dangling.upstream_id = Some("missing-upstream".to_string());
     bad_delta.added_or_modified_proxies = vec![dangling];
-    bad_delta.removed_proxy_ids = vec!["b-old".to_string()];
+    bad_delta.removed_proxy_ids = vec![NamespacedResourceId::new("ns-b", "b-old")];
 
     let partitions = HashMap::from([
         ("ns-a".to_string(), ok_delta),
@@ -453,8 +453,8 @@ fn apply_mesh_event(state: &mut BTreeSet<String>, event: &MeshConfigBroadcast) {
             for proxy in &result.added_or_modified_proxies {
                 state.insert(proxy.id.clone());
             }
-            for id in &result.removed_proxy_ids {
-                state.remove(id);
+            for key in &result.removed_proxy_ids {
+                state.remove(&key.id);
             }
         }
     }
