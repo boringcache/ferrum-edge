@@ -164,10 +164,11 @@ pub fn apply_claim_headers_from_context(
 /// Remove every gateway-owned destination this instance still has to claim.
 ///
 /// Runs before installation so an absent, wrong-type, or unusable claim can
-/// never leave a client-supplied value in place. Case-insensitive removal is
-/// required because `RequestContext::headers` preserves the client's original
-/// header casing, so a lowercase insert alone would leave a `X-Authenticated-Email`
-/// variant beside the gateway's value.
+/// never leave a client-supplied value in place. Removal is case-insensitive
+/// because the effective `before_proxy` map is not guaranteed to be all
+/// lowercase: hyper normalizes wire field names, but plugins and transformers
+/// insert operator-cased names, so a lowercase insert alone could leave an
+/// `X-Authenticated-Email` variant beside the gateway's value.
 fn sanitize_owned_claim_header_destinations(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,

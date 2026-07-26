@@ -18155,7 +18155,7 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load)."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false

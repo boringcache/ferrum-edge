@@ -2836,7 +2836,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 |---|---|---|---|
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
 | `forward_body` | bool | `false` | Include the lossless buffered request body for every method. UTF-8 bytes are an exact string with `body_encoding: "utf8"`; other bytes are base64 with `body_encoding: "base64"`. The active media type is carried separately as `body_content_type` |
-| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
+| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load). Read from the effective `before_proxy` header view, so a field line an earlier plugin removed — `authorization` under `strip_authorization_on_success`, or a gateway-owned `claim_headers` destination with no verified claim — is absent from the payload rather than re-read from the client's original request |
 | `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
