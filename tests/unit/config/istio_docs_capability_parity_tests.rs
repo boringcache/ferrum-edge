@@ -195,6 +195,21 @@ fn configuration_md_hosts_capability_contract_v1() {
             || CONFIGURATION_MD.contains("fails closed on non-numeric or out-of-range"),
         "capability contract must document ProxyConfig tracing.sampling fail-closed bounds"
     );
+    // Istio's authoritative `proxyconfigs.networking.istio.io` v1beta1 CRD has
+    // a structural spec schema with exactly four properties (`selector`,
+    // `concurrency`, `image`, `environmentVariables`) and no
+    // `x-kubernetes-preserve-unknown-fields` on `spec`, so `spec.tracing` is
+    // pruned by the API server. The capability contract must not imply the
+    // watcher can observe `tracing.sampling`, or operators will apply a
+    // ProxyConfig that is silently pruned and get no sampling change.
+    assert!(
+        CONFIGURATION_MD.contains("pruned by the Kubernetes API server"),
+        "capability contract must disclose that ProxyConfig spec.tracing is pruned by K8s"
+    );
+    assert!(
+        !CONFIGURATION_MD.contains("from watched `ProxyConfig.spec.tracing.sampling`"),
+        "capability contract must not claim tracing.sampling arrives over the CRD watcher"
+    );
 }
 
 #[test]
@@ -300,4 +315,41 @@ fn openapi_workload_metrics_sampling_documents_proxy_config_source() {
         !OPENAPI_YAML.contains("Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD)."),
         "openapi.yaml must not claim sampling_percentage is Telemetry-only"
     );
+    // ...but it must not claim the value arrives over the CRD watcher either:
+    // Istio's ProxyConfig CRD schema has no `tracing` property, so the API
+    // server prunes it and the baseline comes from native/file/xDS mesh config.
+    assert!(
+        OPENAPI_YAML.contains("MeshProxyConfig.tracing_sampling"),
+        "openapi.yaml must name the mesh-model field that actually supplies the baseline"
+    );
+    assert!(
+        !OPENAPI_YAML.contains("from watched `ProxyConfig.spec.tracing.sampling`"),
+        "openapi.yaml must not claim tracing.sampling is watched from the ProxyConfig CRD"
+    );
+}
+
+/// Istio's `proxyconfigs.networking.istio.io` v1beta1 CRD admits only
+/// `selector`, `concurrency`, `image`, and `environmentVariables` in its
+/// structural spec schema. `docs/mesh.md` must say so next to the
+/// `spec.tracing.sampling` row rather than presenting it as an Istio field an
+/// operator can `kubectl apply`.
+#[test]
+fn mesh_md_discloses_proxy_config_tracing_is_not_a_crd_field() {
+    assert!(
+        MESH_MD.contains("Ferrum mesh-model extension, not an Istio CRD field"),
+        "docs/mesh.md ProxyConfig field table must flag tracing.sampling as a non-CRD field"
+    );
+    assert!(
+        MESH_MD.contains("pruned by the Kubernetes API server"),
+        "docs/mesh.md must state that spec.tracing.sampling is pruned by the API server"
+    );
+    for stale in [
+        "Istio's ProxyConfig CRD types it as a bare `double` with no range validation",
+        "reaches the watcher intact",
+    ] {
+        assert!(
+            !MESH_MD.contains(stale),
+            "docs/mesh.md must not retain the stale CRD-reachability claim: {stale}"
+        );
+    }
 }

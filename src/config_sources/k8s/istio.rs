@@ -5049,7 +5049,10 @@ fn telemetry_provider_string_field_aliased(
 /// - `spec.tracing.sampling` -> `tracing_sampling` (percentage 0-100,
 ///   merged into `workload_metrics.sampling_percentage` at slice-apply time;
 ///   non-numeric or out-of-range values are rejected as invalid rather than
-///   silently dropped, matching `Telemetry.tracing.randomSamplingPercentage`)
+///   silently dropped, matching `Telemetry.tracing.randomSamplingPercentage`).
+///   This is a Ferrum mesh-model field with **no counterpart in Istio's
+///   `networking.istio.io/v1beta1` ProxyConfig CRD** — see the note on the
+///   parse below.
 fn proxy_config(
     options: &K8sTranslationOptions,
     object: &K8sObject,
@@ -5093,13 +5096,22 @@ fn proxy_config(
         .unwrap_or_default();
 
     // Fail closed on a malformed or out-of-range sampling percentage the same
-    // way `Telemetry.tracing.randomSamplingPercentage` does. Istio's
-    // ProxyConfig CRD types `tracing.sampling` as a bare `double` with no
-    // range validation, so an operator value like `5000` reaches the watcher
-    // intact; silently accepting it would push an invalid
+    // way `Telemetry.tracing.randomSamplingPercentage` does: silently
+    // accepting one would push an invalid
     // `workload_metrics.sampling_percentage` onto every matching workload and
     // contradict the documented "percentage 0-100" contract. A rejection is
     // surfaced on the resource as `FerrumAccepted=False`/`Invalid`.
+    //
+    // Reachability: Istio's `proxyconfigs.networking.istio.io` v1beta1 CRD has
+    // a *structural* spec schema whose only properties are `selector`,
+    // `concurrency`, `image`, and `environmentVariables` — there is no
+    // `tracing` property and no `x-kubernetes-preserve-unknown-fields` on
+    // `spec`. A `spec.tracing.sampling` applied to a real cluster is therefore
+    // pruned by the Kubernetes API server and never reaches the CRD watcher;
+    // the field is populated over native `MeshSubscribe` / file / xDS mesh
+    // config instead. This branch is deliberate defense-in-depth for any
+    // object feed that is not API-server-pruned (and for a future CRD schema
+    // that adds the field), not a live K8s admission gate.
     let tracing_sampling = match object
         .spec
         .get("tracing")
@@ -14105,6 +14117,12 @@ extensionProviders:
         // value must surface as InvalidResource so FerrumAccepted=False
         // rather than silently dropping (string) or pushing an out-of-range
         // percentage into every matching workload's workload_metrics.
+        //
+        // Istio's v1beta1 ProxyConfig CRD has no `tracing` property in its
+        // structural spec schema, so on a real cluster the API server prunes
+        // `spec.tracing` before the watcher sees it. These cases pin the
+        // translator contract for non-pruned object feeds; they are not a
+        // claim that an operator can set this field via `kubectl apply`.
         let bad_values = [
             ("out_of_range_high", serde_json::json!(5000.0)),
             ("out_of_range_low", serde_json::json!(-1.0)),

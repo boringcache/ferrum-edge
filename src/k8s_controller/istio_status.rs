@@ -37,6 +37,10 @@
 //!   environment / tracing.sampling translation outcome. Istio's
 //!   `proxyconfigs.networking.istio.io` CRD declares `subresources.status`
 //!   (authoritative Istio API manifests), so FerrumAccepted is writable.
+//!   Only `selector`, `concurrency`, `image`, and `environmentVariables`
+//!   exist in that CRD's structural spec schema, so cluster-sourced objects
+//!   always report `tracing.sampling: <unset>` — the API server prunes
+//!   `spec.tracing`, which arrives over native/file/xDS mesh config instead.
 //!
 //! For each kind a rejection (`K8sTranslateError`) flips `FerrumAccepted`
 //! to `False`/`Invalid` with the translator's reason, so a hard rejection
@@ -1404,6 +1408,12 @@ fn telemetry_status(
 /// `subresources: { status: {} }` on the served `v1beta1` version with a
 /// conditions-shaped status schema, so `FerrumAccepted` is writable the same
 /// way as the other watched Istio kinds.
+///
+/// That CRD's structural spec schema admits only `selector`, `concurrency`,
+/// `image`, and `environmentVariables`; `spec.tracing` is pruned by the API
+/// server, so `tracing_sampling` reads `<unset>` for every cluster-sourced
+/// object. It is reported anyway to stay in lock-step with the translator's
+/// field set for non-pruned object feeds.
 fn proxy_config_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -2424,10 +2434,12 @@ mod tests {
 
     #[test]
     fn proxy_config_unusable_tracing_sampling_surfaces_invalid_condition() {
-        // Watching ProxyConfig makes tracing.sampling operator-reachable; an
-        // out-of-range bare double (Istio CRD has no range validation) must
-        // land as FerrumAccepted=False/Invalid rather than Accepted with a
-        // silently dropped or unvalidated percentage.
+        // An out-of-range sampling value must land as
+        // FerrumAccepted=False/Invalid rather than Accepted with a silently
+        // dropped or unvalidated percentage. Note that Istio's v1beta1
+        // ProxyConfig CRD has no `tracing` property in its structural spec
+        // schema, so the API server prunes this field on a real cluster; this
+        // pins the planner contract for non-pruned object feeds.
         let obj = object(
             "networking.istio.io/v1beta1",
             "ProxyConfig",

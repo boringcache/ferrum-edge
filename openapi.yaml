@@ -14883,9 +14883,13 @@ components:
           description: |
             Tracing sampling percentage 0.0–100.0. Populated from Istio
             `Telemetry.tracing.randomSamplingPercentage` and, as a baseline,
-            from watched `ProxyConfig.spec.tracing.sampling` (Telemetry wins
-            when both are present). Non-numeric or out-of-range ProxyConfig /
-            Telemetry sampling values fail closed at Kubernetes translation.
+            from `MeshProxyConfig.tracing_sampling` (Telemetry wins when both
+            are present). `ProxyConfig.spec.tracing.sampling` has no
+            counterpart in Istio's `networking.istio.io/v1beta1` ProxyConfig
+            CRD schema, so the Kubernetes API server prunes it and the
+            baseline arrives over native/file/xDS mesh config rather than the
+            CRD watcher. Non-numeric or out-of-range ProxyConfig / Telemetry
+            sampling values fail closed at Kubernetes translation.
         custom_tags:
           type: object
           maxProperties: 32
