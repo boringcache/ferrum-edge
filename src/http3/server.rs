@@ -1696,6 +1696,11 @@ async fn handle_h3_request(
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    // Same cache generation as `plugins` above: replay provenance must describe
+    // exactly the response-side rules this request will run.
+    ctx.set_response_presentation_policy_digest(
+        plugin_cache_view.response_presentation_policy_digest(),
+    );
     // Resolve the effective gRPC policy before any plugin/body await. Native
     // H3 and the H3→H2 bridge both consume this same monotonic absolute instant
     // instead of reconstructing a fresh timer from a rewritten header.

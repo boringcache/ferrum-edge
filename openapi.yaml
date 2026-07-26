@@ -61,13 +61,44 @@ info:
     available, including mesh egress-scope dry-runs, backend capability
     refreshes, and forced TLS source reloads.
 
-    ## Request body size limits
+    ## Request body size and time limits
 
     Most write endpoints accept request bodies up to 1 MiB; bodies that exceed
     the limit are rejected with `413 Payload Too Large`. The `/restore`
     endpoint has a higher configurable limit (default 100 MiB, controlled by
     `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`) to accommodate large-scale
     backups (30K+ proxies / 90K+ plugins can reach ~80 MB).
+
+    Every body-collecting endpoint — including `POST`/`PUT /api-specs` — is
+    additionally bounded in *time* by `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS`
+    (default 30, `0` disables). A body that has not finished arriving when the
+    deadline expires is rejected with `408 Request Timeout` and its HTTP/1.1
+    connection or HTTP/2 stream is released.
+
+    That value is the budget for a 1 MiB body. Endpoints with a larger size cap
+    scale the deadline by that cap, so the bound is one shared minimum
+    throughput rather than a flat wall clock that would demand 25x/100x the
+    upload rate from exactly the endpoints that legitimately carry the most
+    bytes. At the defaults: 30s for a 1 MiB body, 750s for a 25 MiB
+    `/api-specs` body, and 3000s for a 100 MiB `/restore` body.
+
+    The body is read only for routes that consume it, and only after that
+    route's role gate. An unknown path, a method the path does not route, a
+    read/delete route, and a caller whose role the route would reject with
+    `403` are all answered without the request body being buffered.
+
+    ## Admin HTTP/2
+
+    The admin listeners serve HTTP/1.1 and HTTP/2 (HTTPS negotiates via ALPN,
+    plaintext accepts h2c prior knowledge). HTTP/2 connections advertise
+    bounded `SETTINGS_MAX_CONCURRENT_STREAMS`
+    (`FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS`, default 64) and
+    `SETTINGS_MAX_HEADER_LIST_SIZE`
+    (`FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES`, default 65536), so one
+    connection can neither multiplex unbounded streams nor accumulate an
+    unbounded header block per stream. A connection that neither delivers a new
+    request nor holds one in flight for a whole
+    `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` window is closed.
   version: 0.2.0
   license:
     name: PolyForm Noncommercial 1.0.0
@@ -173,12 +204,14 @@ paths:
         incremental polling repeatedly rejecting the same delta while serving
         last known-good config; or, in database, control-plane, or file mode, a
         full config load/reload rejected while the previous generation keeps
-        serving — `config_rejected: true`. In database/CP the admin API stays
-        writable as the in-band repair path, gated on any deferred schema
-        migration applying first; in file mode the admin API stays read-only and
-        operators repair by fixing the file and reloading). `config_rejected` is
-        a sticky flag cleared only by an accepted authoritative full reload
-        (Applied or Unchanged); while the backend is unreachable
+        serving — `config_rejected: true`. In database/CP, rejection is by the
+        runtime-config validation contract or by typed SQL row decoding while the
+        backend is reachable, and the admin API stays writable as the in-band
+        repair path, gated on any deferred schema migration applying first; in
+        file mode the admin API stays read-only and operators repair by fixing
+        the file and reloading). `config_rejected` is a sticky flag cleared only
+        by an accepted authoritative full reload (Applied or Unchanged); while
+        the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
         outage. In CP/DP/mesh modes, if a supervised serving
@@ -366,6 +399,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -416,6 +451,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
@@ -491,6 +528,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "501":
@@ -556,6 +595,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "501":
@@ -631,6 +672,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "502":
@@ -687,6 +730,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -745,6 +790,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
     delete:
@@ -815,6 +862,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -871,6 +920,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
     delete:
@@ -941,6 +992,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -995,6 +1048,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
     delete:
@@ -1065,6 +1120,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -1119,6 +1176,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
     delete:
@@ -1189,6 +1248,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
 
@@ -1243,6 +1304,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
     delete:
@@ -1367,6 +1430,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
 
   # ── Overload ────────────────────────────────────────────────────────
   /overload:
@@ -2290,6 +2355,8 @@ paths:
                 properties:
                   error:
                     type: string
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "503":
           description: Proxy state unavailable in this mode
           content:
@@ -3353,6 +3420,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: |
             A resource in the graph conflicts with an existing resource
@@ -3600,6 +3669,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
@@ -3703,6 +3774,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: Conflict — `listen_path` already exists, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
@@ -3769,6 +3842,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: Conflict — `listen_path` already exists on another proxy, stream proxy `listen_port` conflicts with another proxy or reserved/unavailable port, or the proxy's plugin associations would make mTLS DNS identities ambiguous
           content:
@@ -3890,6 +3965,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "500":
@@ -3960,6 +4037,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "500":
@@ -4045,6 +4124,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "500":
@@ -4094,6 +4175,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "500":
@@ -4366,6 +4449,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -4424,6 +4509,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -4515,6 +4602,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -4571,6 +4660,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
@@ -4911,6 +5002,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: A spec already exists for this proxy ID, a resource name / listen_path conflicts, or the embedded plugin associations would make mTLS DNS identities ambiguous
           content:
@@ -5137,6 +5230,8 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "409":
           description: A resource name / listen_path in the new spec conflicts with an existing resource outside this bundle, or the replacement would make mTLS DNS identities ambiguous
           content:
@@ -5494,6 +5589,15 @@ components:
             error: Admin API is in read-only mode
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: >-
+        The request body did not finish arriving within
+        FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS (default 30). The HTTP/1.1
+        connection or HTTP/2 stream is released; retry the request.
       content:
         application/json:
           schema:
@@ -10118,24 +10222,26 @@ components:
             Database, control-plane, and file modes, authenticated detail only.
             Present and `true` when the latest **full** config load/reload was
             rejected: in database/CP, by the runtime-config validation contract
-            (a reachable backend served a semantically-invalid snapshot); in file
-            mode, when a SIGHUP candidate fails read, parse, validation, or apply.
-            The gateway keeps serving the last known-good config. In database/CP,
-            because the backend is reachable, the admin API stays writable
-            (`admin_writes_enabled` stays `true`) so the offending resource can be
-            repaired in-band; `status` is forced to `degraded`. Re-enabling writes
-            is gated on any deferred schema migration applying first, so a
-            reachable backend with a still-pending schema keeps writes blocked
-            while this flag stays set. In file mode the admin API remains
-            read-only; operators repair by fixing the config file and reloading.
-            The flag is sticky and clears only when an accepted authoritative
-            **full** reload proves the candidate is valid again (Applied or
-            Unchanged; an accepted incremental poll in database/CP does not clear
-            it). While the backend is unreachable (`admin_writes_enabled` false)
-            this detail is suppressed so it never advertises the writable repair
-            path during an outage, even though the underlying flag remains set. A
-            genuine connectivity failure is reported via
-            `admin_writes_enabled`/`status` instead and does not set this flag.
+            (a reachable backend served a semantically-invalid snapshot) or by
+            typed SQL row decoding (a reachable backend served an undecodable
+            row); in file mode, when a SIGHUP candidate fails read, parse,
+            validation, or apply. The gateway keeps serving the last known-good
+            config. In database/CP, because the backend is reachable, the admin
+            API stays writable (`admin_writes_enabled` stays `true`) so the
+            offending resource can be repaired in-band; `status` is forced to
+            `degraded`. Re-enabling writes is gated on any deferred schema
+            migration applying first, so a reachable backend with a still-pending
+            schema keeps writes blocked while this flag stays set. In file mode
+            the admin API remains read-only; operators repair by fixing the
+            config file and reloading. The flag is sticky and clears only when
+            an accepted authoritative **full** reload proves the candidate is
+            valid again (Applied or Unchanged; an accepted incremental poll in
+            database/CP does not clear it). While the backend is unreachable
+            (`admin_writes_enabled` false) this detail is suppressed so it never
+            advertises the writable repair path during an outage, even though the
+            underlying flag remains set. A genuine connectivity failure is
+            reported via `admin_writes_enabled`/`status` instead and does not set
+            this flag.
         mesh:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
@@ -13482,7 +13588,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Per-provider claim path to upstream header mappings
+                description: >-
+                  Per-provider claim path to upstream header mappings. Destination
+                  headers are gateway-owned and always sanitized: every configured
+                  destination is removed from the client request (case-insensitively)
+                  before verified claim values are installed, so an absent, null,
+                  empty, or wrong-type claim leaves the header absent instead of
+                  forwarding client-supplied input.
               claim_headers_separator:
                 type: string
                 description: Separator for array claim header values
@@ -13528,7 +13640,13 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Global claim path to upstream header mappings
+          description: >-
+            Global claim path to upstream header mappings. Destination headers are
+            gateway-owned and always sanitized: every configured destination is
+            removed from the client request (case-insensitively) before verified
+            claim values are installed, so an absent, null, empty, or wrong-type
+            claim leaves the header absent instead of forwarding client-supplied
+            input.
         claim_headers_separator:
           type: string
           default: ","
@@ -13671,7 +13789,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Claim path to upstream header mappings
+                description: >-
+                  Claim path to upstream header mappings. Destination headers are
+                  gateway-owned and always sanitized: every configured destination is
+                  removed from the client request (case-insensitively) before verified
+                  claim values are installed, so an absent, null, empty, or wrong-type
+                  claim leaves the header absent instead of forwarding client-supplied
+                  input.
         allow_provider_fanout:
           type: boolean
           default: false
@@ -13790,6 +13914,13 @@ components:
                 type: object
                 additionalProperties:
                   type: string
+                description: >-
+                  Session claim path to upstream header mappings. Destination headers
+                  are gateway-owned and always sanitized: every configured destination
+                  is removed from the client request (case-insensitively) before
+                  verified claim values are installed, so an absent, null, empty, or
+                  wrong-type claim leaves the header absent instead of forwarding
+                  client-supplied input.
               id_token_clock_skew_secs:
                 type: integer
                 format: uint64
@@ -14965,7 +15096,16 @@ components:
           format: double
           minimum: 0
           maximum: 100
-          description: Tracing sampling percentage 0.0–100.0 (from Istio Telemetry CRD).
+          description: |
+            Tracing sampling percentage 0.0–100.0. Populated from Istio
+            `Telemetry.tracing.randomSamplingPercentage` and, as a baseline,
+            from `MeshProxyConfig.tracing_sampling` (Telemetry wins when both
+            are present). `ProxyConfig.spec.tracing.sampling` has no
+            counterpart in Istio's `networking.istio.io/v1beta1` ProxyConfig
+            CRD schema, so the Kubernetes API server prunes it and the
+            baseline arrives over native/file/xDS mesh config rather than the
+            CRD watcher. Non-numeric or out-of-range ProxyConfig / Telemetry
+            sampling values fail closed at Kubernetes translation.
         custom_tags:
           type: object
           maxProperties: 32
@@ -18262,7 +18402,7 @@ components:
           type: array
           items:
             type: string
-          description: "Header names to forward into the function payload (lowercased at config load)."
+          description: "Header names to forward into the function payload (lowercased at config load). Values come from the effective before_proxy header view, so a header an earlier plugin removed - authorization under strip_authorization_on_success, or a gateway-owned claim_headers destination with no verified claim - is omitted rather than re-read from the client's original request."
         forward_query_params:
           type: boolean
           default: false
@@ -18758,13 +18898,13 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Other or malformed SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Only a provider-declared unsigned index correlates fragments across deltas; array position is intra-delta identity only (exported as 'position:<n>' choice keys and a tool-call 'position' field, never as a fabricated index). Malformed optional fields do not abort reassembly (that would drop back to per-frame redaction, which cannot see a secret split across fragments): ignorable ones (finish_reason, delta, delta.content, tool_calls, id, type, function, function.name, function.arguments) are skipped, while a malformed identity-bearing index (choices[].index, tool_calls[].index) takes a collision-free per-occurrence bucket ('unattributed:<n>' choice key, index_unattributed:true plus occurrence:<n> on a tool call) rather than collapsing onto index 0, sharing one unattributed bucket, or being dropped. Where identity is a guess, payload is withheld instead of joined or split: ambiguous completion text becomes '[REDACTED:ambiguous_choice]' with choice_identity_ambiguous:true and completion_text_withheld:true, and ambiguous tool arguments become '[REDACTED:ambiguous_tool_call]' with arguments_withheld:true. Skipped or re-routed fields are listed in a sorted malformed_fields array of compiled-in field paths (never provider values); the key is omitted for well-formed streams. Other or non-parseable SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
           type: boolean
           default: false
@@ -20698,7 +20838,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -21359,7 +21499,12 @@ components:
             timeout_ms:
               type: integer
               minimum: 1
+              maximum: 600000
               default: 5000
+              description: >-
+                Per-attempt ClickHouse connect/request timeout. Bounded at ten
+                minutes so the cross-process spool claim lease remains finite
+                and strictly longer than the accepted request/retry budget.
         batch:
           type: object
           additionalProperties: false
@@ -21437,13 +21582,24 @@ components:
               default: 10737418240
               description: |
                 Hard ceiling on total encoded on-disk bytes owned by this sink under
-                spool.dir for the local node_id (after compression). Counts active
-                spool files (*.ndjson / *.ndjson.zst), in-progress atomic-write temps
-                (*.tmp), and quarantined (*.corrupt) files. A pending write is sized
-                before admission under the spool write lock; oldest owned files are
-                dropped until the incoming encoded file fits. If one encoded batch
-                still cannot fit, the write is rejected rather than exceeding the
-                ceiling.
+                its managed namespace
+                (<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/) after
+                compression. The owner digest binds the plugin config id, Ferrum
+                namespace/ledger, sanitized ClickHouse endpoint, database, table, and
+                node id; it contains no credentials. Counts active spool files
+                (*.ndjson / *.ndjson.zst), atomic-write temps
+                (*.write-<process_tag>-<generation>.tmp), in-flight replay claims
+                (*.inflight), and quarantined (*.corrupt) / dead-letter metadata
+                files. A pending write is sized before admission under the spool write
+                lock; the oldest evictable owned file is dropped until the incoming
+                encoded file fits. In-flight claims, temps under an active write,
+                and records carrying another owner's tag are never evictable, so a
+                write that cannot fit is rejected rather than exceeding the ceiling
+                or destroying another owner's or another delivery's records. Each
+                encoded and decoded artifact is also capped at 268435456 bytes;
+                zstd replay additionally applies a 200x expansion limit with a
+                1 MiB floor, and oversized artifacts are quarantined without first
+                being read or expanded without bound.
             replay_interval_secs:
               type: integer
               minimum: 1
@@ -21750,6 +21906,26 @@ components:
                 prepare_failures_total:
                   type: integer
                   minimum: 0
+                unbound_files:
+                  type: integer
+                  minimum: 0
+                  description: |
+                    Retained spool records across live instances that are not bound
+                    to a live destination identity (pre-namespace layouts,
+                    namespaces orphaned by a destination or configuration change,
+                    and records carrying another owner's tag). Never replayed,
+                    evicted, or deleted automatically. Aggregate discovery is
+                    capped at 100,000 entries across all sibling namespaces; if
+                    the rate-limited log reports `scan_truncated=true`, this value
+                    is an observed lower bound.
+                unbound_namespaces:
+                  type: integer
+                  minimum: 0
+                  description: |
+                    Managed spool namespaces still holding records for a destination
+                    identity no live instance owns. This is an observed lower bound
+                    when the bounded aggregate discovery log reports
+                    `scan_truncated=true`.
                 available:
                   type: boolean
                   description: |
@@ -21862,12 +22038,30 @@ components:
               type: integer
             files:
               type: integer
-              description: Count of owned spool files (active data, temps, and quarantined).
+              description: Count of owned spool files (active data, temps, in-flight claims, and quarantined).
             bytes:
               type: integer
-              description: Total encoded on-disk bytes for owned spool files (active data, temps, and quarantined).
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, in-flight claims, and quarantined).
             drops_total:
               type: integer
+            unbound_files:
+              type: integer
+              description: |
+                Retained spool records not bound to a live destination identity:
+                pre-namespace layouts, namespaces orphaned by a destination or
+                configuration change, and records carrying another owner's tag.
+                They are reported for operator reconciliation and are never
+                replayed, evicted, or deleted automatically. Aggregate discovery
+                is capped at 100,000 entries across all sibling namespaces; if
+                the rate-limited log reports `scan_truncated=true`, this value is
+                an observed lower bound.
+            unbound_namespaces:
+              type: integer
+              description: |
+                Managed spool namespaces under this node/plugin that still hold
+                records for a destination identity no live instance owns. This is
+                an observed lower bound when the bounded aggregate discovery log
+                reports `scan_truncated=true`.
             last_replay_at:
               type: [string, "null"]
               format: date-time
@@ -21899,7 +22093,7 @@ components:
                 const: redis
           then:
             required: [redis_url]
-      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed."
+      description: "Plugin: request_deduplication — Idempotency-key based request deduplication. Logical keys are scoped by stable plugin-config identity, proxy, peer SPIFFE identity when present, authenticated identity when configured, and idempotency header value, then stored as framed SHA-256 digests. Stable plugin identity partitions sibling Redis-backed instances even when they share an explicit/default prefix, while the same configured instance shares keys across gateways. Per-request completion ownership (logical key, fingerprint, local owner token, and optional Redis lock token) is held in an instance-keyed private structure rather than shared public metadata, so multiple scoped instances with distinct headers mark and token-release independently on the same request. Cached responses replay only when the request fingerprint also matches method, authority/host, exact path, raw query string, deterministic request headers that can affect routing/transforms, and request-body digest. Cached bytes are already-finalized representations and bypass ordinary presentation transforms on replay while remaining subject to response inspection and final-body validation; a current-policy redaction decision runs only its required transform and fails closed with 502 if rewriting cannot complete. Applicable methods with declared bodies are prebuffered so keys added by earlier header transforms can be fingerprinted. Reusing a logical idempotency key for a different fingerprint returns 409. A completed external operation performed by a synthetic short-circuit — for example an ai_federation provider call — retains the in-flight marker and any distributed lock until inflight_ttl_seconds instead of caching the synthetic body, so an identical idempotency-key retry cannot repeat the billable external operation; externally executed synthetic plugins that do not mark this provenance must define their own completion contract. Completed response retention is bounded by per-entry and exact local total byte limits; size-skipped responses return normally and are not retained. In local mode, ordinary skipped responses clear in-flight state immediately. Supports centralized Redis-backed mode for cross-instance deduplication; Redis mode uses token-owned in-flight locks before backend dispatch and publishes completed responses before releasing the lock. Redis values include the fingerprint, obey the per-entry size limit for both retained response size and serialized payload size, and v3 logical keys are not backward-compatible with earlier key versions. If an owned terminal response fits locally but its serialized Redis value exceeds the cap, Redis admission settles before ordinary local eviction; the matching local gateway preserves one replay while active entries occupy the cap, and later pressure converts an unretainable protected replay to an in-flight tombstone while peers remain blocked. If a completion is skipped only by the local total cap and Redis publication fails, local and distributed in-flight locks are left to expire under inflight_ttl_seconds to avoid immediate duplicate execution without a replay value. When sync_mode is redis, redis_url is required. Explicitly supplied Redis fields are validated even in local mode so latent configuration cannot become invalid only when the mode is changed. Every retained response, local or Redis, is stamped with the response-side presentation policy it was produced under: a content digest of the published response_transformer RTDS gate map plus a content digest of the effective static presentation rules of the proxy (response_transformer and sse), folded in configured execution order. A stored response replays only while both digests still match the live policy; a stamp that no longer matches, a record written without provenance, and a record with malformed provenance all return 409 rather than replaying under a superseded policy or re-executing a possibly completed side effect. A response whose request straddled a gate publication, or whose effective presentation policy could not be established, is retained for replay neither in Redis nor locally, while in-flight ownership is kept until its TTL. Only fixed-size digests are stored, never rule text or header values. request_deduplication cannot be composed with mcp_gateway on the same proxy: admission rejects the pair with 400 (fatal in file mode, rejected update in DP) because an MCP public-URI rewrite is derived from live upstream discovery state that no persisted digest can witness."
       properties:
         header_name:
           type: string
