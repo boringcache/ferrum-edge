@@ -4,6 +4,15 @@
 //! polling are defined here. Each backend (sqlx, MongoDB) provides its own
 //! implementation. The trait is object-safe so it can be used as `Arc<dyn DatabaseBackend>`.
 
+// Re-exported for `use crate::config::db_backend::{AtomicBatchGraph, ...}` call
+// sites. The `ferrum-edge` binary target reaches these names through
+// `crate::config::batch_atomicity` directly, so the re-export is unused there.
+#[allow(unused_imports)]
+pub use crate::config::batch_atomicity::{
+    ATOMIC_BATCH_UNSUPPORTED_MESSAGE, AtomicBatchCounts, AtomicBatchGraph, AtomicBatchUnsupported,
+    BATCH_ADMISSION_LEASE_LOST_MESSAGE, BatchAdmissionLeaseLost, NamespaceConfigAdmissionLeaseRef,
+    atomic_batch_unsupported, is_batch_admission_lease_lost,
+};
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
@@ -1161,6 +1170,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// Set the backend IP allowlist policy for SSRF protection.
     fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy);
 
+    /// Set optional age / per-namespace row retention for durable audit events.
+    fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy);
+
     // -----------------------------------------------------------------------
     // Full config loading
     // -----------------------------------------------------------------------
@@ -1440,6 +1452,40 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     // -----------------------------------------------------------------------
     // Batch operations
     // -----------------------------------------------------------------------
+
+    /// Whether this backend deployment can persist a whole batch graph
+    /// all-or-nothing right now.
+    ///
+    /// Callers must consult this **before** mutating anything so a deployment
+    /// that cannot provide the guarantee is refused rather than silently
+    /// applying a partial graph. Implementations that always support it keep
+    /// the default. Backends whose capability depends on live topology
+    /// (MongoDB replica set vs standalone) must re-check inside
+    /// [`DatabaseBackend::batch_create_config_graph_atomically`] so a reconnect
+    /// between the two cannot open a partial-commit window.
+    fn ensure_atomic_batch_supported(&self) -> Result<(), AtomicBatchUnsupported> {
+        Ok(())
+    }
+
+    /// Persist an entire validated batch graph in one transaction.
+    ///
+    /// Every dependency phase — consumers, upstreams, proxies, plugin configs,
+    /// proxy↔plugin associations — and every bounded chunk inside a phase share
+    /// one transaction and one commit. A failure anywhere, including a failure
+    /// after a chunk boundary, leaves nothing from the request durable, so a
+    /// retry of the identical payload is idempotent.
+    ///
+    /// The namespace config-admission lease in
+    /// [`AtomicBatchGraph::admission_lease`] is re-verified inside that same
+    /// transaction immediately before commit. A lapsed or stolen lease aborts
+    /// the transaction ([`BatchAdmissionLeaseLost`]) instead of committing a
+    /// graph another writer may have invalidated — there is no post-hoc
+    /// compensation to fail.
+    async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error>;
 
     async fn batch_create_proxies(
         &self,
@@ -1731,6 +1777,10 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         filter: &crate::admin::audit::AuditListFilter,
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error>;
+
+    /// Namespace-scoped, bounded audit retention prune. No-op when retention
+    /// policy is unset. Must never delete rows belonging to another namespace.
+    async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 }
 
 /// Extract resource IDs from a full config.

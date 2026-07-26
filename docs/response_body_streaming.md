@@ -176,7 +176,7 @@ Built-in plugins with per-request refinement:
 
 | Plugin | Skips buffering when |
 |--------|---------------------|
-| `compression` | The client's `Accept-Encoding` selects no supported nonzero coding — identity, unsupported-only, or all-`q=0` requests (nothing to compress) — or the request is `HEAD` / request `no-transform`. It also skips (streams identity) when `before_proxy` negotiated a supported coding but could not reserve bounded codec admission, or when `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is unlimited (`0`) or above the fixed 32 MiB compression safety ceiling. The buffered population therefore never exceeds the codec semaphore, and every compression-induced full-body collection has an absolute per-response bound. |
+| `compression` | The client's `Accept-Encoding` selects no supported nonzero coding — identity, unsupported-only, or all-`q=0` requests (nothing to compress) — or the request is `HEAD` / request `no-transform`. It also skips (streams identity) when `before_proxy` negotiated a supported coding but could not reserve bounded response-buffer admission, or when `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is unlimited (`0`) or above the fixed 32 MiB compression safety ceiling. The buffered population never exceeds the dedicated response-buffer semaphore, while codec CPU admission remains independent, and every compression-induced full-body collection has an absolute per-response bound. |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
 | `ai_response_guard` | Never from request-side intent. An active guard buffers conservatively until pristine backend headers are known. A genuine backend event stream is then decided before header commit: enforcing/redacting/structural policies reject with 502 because they cannot inspect an unbounded stream completely, while a warn-only guard records the uninspectable stream and permits it. |
@@ -317,17 +317,16 @@ buffering decision and may narrow that decision by request or response
 
 ## Interaction with Retry Logic
 
-When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. This creates an interaction with streaming:
+When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. That decision is made entirely at response-header time — `retry::should_retry` consults only the status code, the connection-error flag, the error class, and the request method — so retry does not require reading a response body:
 
-- **During retry attempts**: Ordinary responses are **buffered** so the gateway can discard the response and retry. Inherently streaming responses may stream after headers only through the all-plugin opt-in described above; a retryable status is still discarded before any bytes reach the client, while a failure after downstream streaming begins cannot be retried.
-- **Final attempt**: If streaming is enabled, the final response (after all retries are exhausted or the response is successful) is **streamed** to the client.
-
-This ensures retry logic works correctly while still providing streaming benefits for the final response.
+- **Every attempt**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
+- **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
+- **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
-Attempt 1: buffer → check status → retry needed? → discard body
-Attempt 2: buffer → check status → retry needed? → discard body
-Attempt 3 (final): stream → forward directly to client
+Attempt 1: headers → retryable status? → drop undrained body → retry
+Attempt 2: headers → retryable status? → drop undrained body → retry
+Attempt 3: headers → not retryable → stream body directly to client
 ```
 
 ## Interaction with Response Size Limits

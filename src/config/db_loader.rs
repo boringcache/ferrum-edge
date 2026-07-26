@@ -36,6 +36,7 @@ use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
@@ -48,6 +49,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
+#[allow(unused_imports)]
+pub use crate::config::batch_atomicity::{
+    AtomicBatchCounts, AtomicBatchFault, AtomicBatchGraph, AtomicBatchPhase,
+    BatchAdmissionLeaseLost,
+};
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
@@ -70,8 +76,25 @@ pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_ro
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
+    /// Runtime / poll full loads. Undecodable rows become
+    /// [`RowDecodeRejection`] so poll loops keep last-known-good config and
+    /// leave admin writes open for in-band repair (issue #2997 / #2158).
     Runtime,
+    /// Snapshot restore integrity path. Undecodable rows become
+    /// [`SnapshotDataIntegrityError`] (not a poll-repair marker).
     RestoreSnapshot,
+    /// Synchronous admin-write admission validation. Undecodable rows must
+    /// fail the write with the actionable decode reason, but must **not**
+    /// carry [`RowDecodeRejection`] — that marker means "keep admin writable
+    /// / keep last-known-good" for background poll loops, not for the
+    /// admission check that is already running inside an admin write.
+    AdmissionValidation,
+    /// Pre-mutation baseline graph read taken by a repair-safe DELETE before it
+    /// removes the row. Undecodable rows keep [`RowDecodeRejection`] so the
+    /// delete path can recognise that the baseline is blocked by the very row
+    /// being repaired and fall back to the strictest empty baseline instead of
+    /// failing the write (issue #2997).
+    RepairDeleteBaseline,
 }
 
 impl FullLoadPurpose {
@@ -79,6 +102,8 @@ impl FullLoadPurpose {
         match self {
             Self::Runtime => "load_full_config",
             Self::RestoreSnapshot => "load_namespace_snapshot",
+            Self::AdmissionValidation => "validate_namespace_admission",
+            Self::RepairDeleteBaseline => "mtls_dns_repair_delete_baseline",
         }
     }
 
@@ -88,15 +113,116 @@ impl FullLoadPurpose {
         resource_id: Option<String>,
         error: anyhow::Error,
     ) -> anyhow::Error {
-        if self == Self::RestoreSnapshot {
-            anyhow::Error::new(SnapshotDataIntegrityError::new(
+        match self {
+            Self::RestoreSnapshot => anyhow::Error::new(SnapshotDataIntegrityError::new(
                 resource_type,
                 resource_id,
                 error,
-            ))
-        } else {
-            error
+            )),
+            Self::AdmissionValidation => {
+                // Peel any poll-loop marker attached by row_to_* wrappers so
+                // synchronous admission returns a plain decode failure.
+                demote_row_decode_rejection(error)
+            }
+            Self::Runtime | Self::RepairDeleteBaseline => {
+                if is_proxy_plugin_association_load_error(&error)
+                    || is_transient_database_error(&error)
+                {
+                    // Association integrity markers and connectivity/driver
+                    // faults must not be rebadged as RowDecodeRejection
+                    // (issue #2997 precision).
+                    error
+                } else {
+                    mark_row_decode_rejection(resource_type, resource_id, error)
+                }
+            }
         }
+    }
+}
+
+/// Marker for a reachable-SQL row whose column values could not be decoded into
+/// the domain model (malformed JSON, `ColumnDecode`, etc.).
+///
+/// Distinct from connectivity/driver failures and from
+/// [`ConfigValidationRejection`]: the database answered, but one or more rows
+/// are undecodable. Poll loops treat this like a validation rejection — keep
+/// last-known-good runtime config and leave admin writable after the migration
+/// gate — while startup still marks the load non-transient so backup bootstrap
+/// cannot mask a broken row (issue #2997).
+///
+/// `Display` includes the underlying decode/parse reason so operator-facing
+/// `to_string()` / `{}` sites (poll logs, admin surfaces that render the
+/// chain) keep the actionable detail without requiring `{:#}`. The reason is
+/// the prior error's Display text (parse/decode messages), never raw column
+/// bodies.
+#[derive(Debug)]
+pub(crate) struct RowDecodeRejection {
+    pub resource_type: &'static str,
+    pub resource_id: Option<String>,
+    pub reason: String,
+}
+
+impl std::fmt::Display for RowDecodeRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.resource_id {
+            Some(id) => write!(
+                f,
+                "SQL row decode rejected for {} '{}': {}",
+                self.resource_type, id, self.reason
+            ),
+            None => write!(
+                f,
+                "SQL row decode rejected for {}: {}",
+                self.resource_type, self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RowDecodeRejection {}
+
+/// Returns `true` when the error carries a [`RowDecodeRejection`] marker.
+///
+/// The marker is attached as the owned [`anyhow::Error`] payload (or as an
+/// anyhow context value) and is downcastable through the chain via
+/// [`anyhow::Error::is`].
+pub(crate) fn is_row_decode_rejection(err: &anyhow::Error) -> bool {
+    err.is::<RowDecodeRejection>()
+}
+
+/// Attach a [`RowDecodeRejection`] marker unless one is already present.
+///
+/// Builds a self-contained marker via [`anyhow::Error::new`] (not
+/// `.context(...)`) so top-level `Display` / `to_string()` carry the decode
+/// reason without relying on the `{:#}` alternate formatter, and so `{:#}`
+/// does not duplicate the reason through a source link.
+pub(crate) fn mark_row_decode_rejection(
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if is_row_decode_rejection(&error) {
+        error
+    } else {
+        let reason = error.to_string();
+        anyhow::Error::new(RowDecodeRejection {
+            resource_type,
+            resource_id,
+            reason,
+        })
+    }
+}
+
+/// Drop a [`RowDecodeRejection`] marker, preserving the actionable decode
+/// reason. Used by synchronous admission validation so admin-write failures
+/// are not classified as poll-loop repairable rejections.
+fn demote_row_decode_rejection(error: anyhow::Error) -> anyhow::Error {
+    if !is_row_decode_rejection(&error) {
+        return error;
+    }
+    match error.downcast::<RowDecodeRejection>() {
+        Ok(rejection) => anyhow::Error::msg(rejection.reason),
+        Err(error) => error,
     }
 }
 
@@ -492,6 +618,11 @@ pub struct DatabaseStore {
     full_load_page_size: i64,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendEgressPolicy,
+    /// Optional age / per-namespace row retention for `audit_events`.
+    audit_retention: crate::admin::audit::AuditRetentionPolicy,
+    /// Per-namespace soft-cap cadence for max-row boundary scans (shared across
+    /// store clones in this process). See [`crate::admin::audit::AuditMaxRowsPruneGate`].
+    audit_max_rows_prune_gates: Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
     /// Set to `true` when the store was created via
     /// [`DatabaseStore::connect_offline_with_pool_config`] — the lazy pool
     /// never ran migrations because the DB was unreachable at startup.
@@ -1131,13 +1262,10 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
-        let proxies = self
-            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
-        let plugin_configs = self
-            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
+        let proxies = self.load_proxies_tx(namespace, purpose, tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, purpose, tx).await?;
         let mut candidate = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
@@ -1156,13 +1284,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         mut candidate: GatewayConfig,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         if !candidate.has_effective_mtls_dns_identity_policy() {
             return Ok(None);
         }
-        candidate.consumers = self
-            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
+        candidate.consumers = self.load_consumers_tx(namespace, purpose, tx).await?;
         candidate.normalize_fields();
         Ok(Some(candidate))
     }
@@ -1175,11 +1302,12 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(tx, namespace, purpose)
             .await?;
-        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate, purpose)
             .await
     }
 
@@ -1193,7 +1321,11 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1221,11 +1353,20 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1247,10 +1388,14 @@ impl DatabaseStore {
         validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         let mut candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         candidate.upstreams = self
-            .load_upstreams_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .load_upstreams_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
             .await?;
         candidate.normalize_fields();
         let recovered_graph = crate::config::db_backend::api_spec_recovered_proxy_graph(
@@ -1272,7 +1417,12 @@ impl DatabaseStore {
         .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1282,16 +1432,38 @@ impl DatabaseStore {
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
+    /// Pre-mutation ambiguity baseline for a repair-safe DELETE.
+    ///
+    /// Issue #2997: this read happens BEFORE the row is removed, so it decodes
+    /// the very reachable-but-undecodable row the DELETE is repairing. Failing
+    /// here would make the in-band admin repair path impossible for exactly the
+    /// resource kinds whose rows are always read into this baseline (proxies and
+    /// plugin configs unconditionally, consumers under an effective `san_dns`
+    /// policy). Fall back to an EMPTY baseline instead — the strictest possible
+    /// comparison, because `introduces_new_mtls_dns_identity_conflict` then
+    /// requires the post-delete graph to be entirely conflict-free. The
+    /// post-mutation validator re-reads the graph and remains the authority, so
+    /// this can only tighten admission, never loosen it. Every non-decode
+    /// failure (connectivity, driver, association integrity) still aborts.
     async fn mtls_dns_identity_conflicts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<BTreeMap<String, BTreeSet<String>>, anyhow::Error> {
-        Ok(self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
-            .await?
-            .map(|candidate| candidate.mtls_dns_identity_conflicts())
-            .unwrap_or_default())
+        match self
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::RepairDeleteBaseline,
+            )
+            .await
+        {
+            Ok(candidate) => Ok(candidate
+                .map(|candidate| candidate.mtls_dns_identity_conflicts())
+                .unwrap_or_default()),
+            Err(error) if is_row_decode_rejection(&error) => Ok(BTreeMap::new()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Deletes are repair-safe when every remaining ambiguity was already
@@ -1306,7 +1478,11 @@ impl DatabaseStore {
         prior_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1333,11 +1509,20 @@ impl DatabaseStore {
         prior_mtls_dns_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1566,6 +1751,8 @@ impl DatabaseStore {
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+            audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+            audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
@@ -1622,6 +1809,8 @@ impl DatabaseStore {
             full_load_page_size: Self::DEFAULT_FULL_LOAD_PAGE_SIZE,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+            audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+            audit_max_rows_prune_gates: Arc::new(DashMap::new()),
             migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
@@ -2402,7 +2591,16 @@ impl DatabaseStore {
             }
         }
         Self::ensure_no_unmatched_proxy_plugin_associations(purpose.operation(), &plugins_by_proxy)
-            .map_err(|error| purpose.map_row_error("proxy_plugin", None, error))?;
+            .map_err(|error| {
+                // Match association-query handling: only remap for restore
+                // snapshots. Runtime keeps ProxyPluginAssociationLoadError so it
+                // is not misclassified as RowDecodeRejection.
+                if purpose == FullLoadPurpose::RestoreSnapshot {
+                    purpose.map_row_error("proxy_plugin", None, error)
+                } else {
+                    error
+                }
+            })?;
 
         self.check_slow_query("load_proxies", start);
         Ok(proxies)
@@ -4531,6 +4729,14 @@ impl DatabaseStore {
             let fetched = rows.len();
             for row in rows {
                 let consumer_id: String = row.try_get("id")?;
+                // Skip the excluded consumer before parsing credentials so PUT
+                // overwrite repair of an undecodable row (issue #2997) is not
+                // blocked by its own corrupt body. Other malformed rows still
+                // fail closed below.
+                if exclude_consumer_id == Some(consumer_id.as_str()) {
+                    last_id = Some(consumer_id);
+                    continue;
+                }
                 let credentials_json: String = row.try_get("credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&credentials_json).map_err(|error| {
@@ -4540,19 +4746,16 @@ impl DatabaseStore {
                             error
                         )
                     })?;
-                let excluded = exclude_consumer_id == Some(consumer_id.as_str());
-                if !excluded
-                    && credentials.get("mtls_auth").is_some_and(|credential| {
-                        Consumer::credential_entries_from_value(credential)
-                            .iter()
-                            .any(|entry| {
-                                entry
-                                    .get("identity")
-                                    .and_then(serde_json::Value::as_str)
-                                    .is_some_and(|identity| identity.trim() == canonical_identity)
-                            })
-                    })
-                {
+                if credentials.get("mtls_auth").is_some_and(|credential| {
+                    Consumer::credential_entries_from_value(credential)
+                        .iter()
+                        .any(|entry| {
+                            entry
+                                .get("identity")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|identity| identity.trim() == canonical_identity)
+                        })
+                }) {
                     return Ok(false);
                 }
                 last_id = Some(consumer_id);
@@ -5388,12 +5591,43 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_proxies_in_tx(&mut tx, proxies, attach_plugins, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = proxies.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of proxies into a caller-owned transaction.
+    ///
+    /// Shared by the chunk-per-transaction import path and the
+    /// single-transaction atomic batch graph write so both write identical rows
+    /// and change records. The caller owns the namespace admission lock, the
+    /// post-write admission re-validation, change-log compaction, and the
+    /// commit.
+    async fn insert_proxies_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxies: &[Proxy],
+        attach_plugins: bool,
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let insert_sql = self.q(Self::PROXY_INSERT_SQL);
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
         for proxy in proxies {
-            self.ensure_proxy_route_unique_tx(&mut tx, proxy, None)
+            self.ensure_proxy_route_unique_tx(&mut *tx, proxy, None)
                 .await?;
 
             let circuit_breaker_json = proxy
@@ -5513,7 +5747,7 @@ impl DatabaseStore {
                 .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
                 .bind(proxy.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
 
             if attach_plugins {
@@ -5521,27 +5755,16 @@ impl DatabaseStore {
                     sqlx::query(&assoc_sql)
                         .bind(&proxy.id)
                         .bind(&assoc.plugin_config_id)
-                        .execute(&mut *tx)
+                        .execute(&mut **tx)
                         .await?;
                 }
             }
-            self.record_config_change_tx(&mut tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
+            self.record_config_change_tx(&mut *tx, &proxy.namespace, "proxy", &proxy.id, "upsert")
                 .await?;
             touched_namespaces.insert(proxy.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_namespace_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = proxies.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     pub async fn batch_attach_proxy_plugins(
@@ -5554,12 +5777,6 @@ impl DatabaseStore {
             return Ok(());
         }
 
-        let assoc_exists_sql = self
-            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
-        let assoc_sql =
-            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
-        let touch_proxy_sql =
-            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
             let mut tx = self.pool().begin().await?;
             let mut admission_namespaces: Vec<&str> =
@@ -5570,45 +5787,9 @@ impl DatabaseStore {
                 self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
                     .await?;
             }
-            let mut seen = HashSet::new();
-            let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
             let mut touched_namespaces = HashSet::new();
-            for proxy in chunk {
-                for assoc in &proxy.plugins {
-                    if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
-                        continue;
-                    }
-                    let already_attached = sqlx::query(&assoc_exists_sql)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .is_some();
-                    if already_attached {
-                        continue;
-                    }
-                    sqlx::query(&assoc_sql)
-                        .bind(&proxy.id)
-                        .bind(&assoc.plugin_config_id)
-                        .execute(&mut *tx)
-                        .await?;
-                    touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
-                    touched_namespaces.insert(proxy.namespace.clone());
-                }
-            }
-            if !touched_proxies.is_empty() {
-                let touch_ts = Utc::now().to_rfc3339();
-                for (proxy_id, namespace) in touched_proxies {
-                    sqlx::query(&touch_proxy_sql)
-                        .bind(&touch_ts)
-                        .bind(proxy_id)
-                        .bind(namespace)
-                        .execute(&mut *tx)
-                        .await?;
-                    self.record_config_change_tx(&mut tx, namespace, "proxy", proxy_id, "upsert")
-                        .await?;
-                }
-            }
+            self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
             if mode.validates_mtls_dns() {
                 for namespace in &admission_namespaces {
                     self.validate_namespace_admission_tx(&mut tx, namespace)
@@ -5622,6 +5803,62 @@ impl DatabaseStore {
         }
 
         self.check_slow_query("batch_attach_proxy_plugins", start);
+        Ok(())
+    }
+
+    /// Attach one chunk of proxy↔plugin associations inside a caller-owned
+    /// transaction. Idempotent per association, so a retry of the same graph
+    /// re-attaches nothing.
+    async fn attach_proxy_plugins_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        proxies: &[Proxy],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
+        let assoc_exists_sql = self
+            .q("SELECT 1 FROM proxy_plugins WHERE proxy_id = ? AND plugin_config_id = ? LIMIT 1");
+        let assoc_sql =
+            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        let touch_proxy_sql =
+            self.q("UPDATE proxies SET updated_at = ? WHERE id = ? AND namespace = ?");
+        let mut seen = HashSet::new();
+        let mut touched_proxies: HashSet<(&str, &str)> = HashSet::new();
+        for proxy in proxies {
+            for assoc in &proxy.plugins {
+                if !seen.insert((proxy.id.as_str(), assoc.plugin_config_id.as_str())) {
+                    continue;
+                }
+                let already_attached = sqlx::query(&assoc_exists_sql)
+                    .bind(&proxy.id)
+                    .bind(&assoc.plugin_config_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some();
+                if already_attached {
+                    continue;
+                }
+                sqlx::query(&assoc_sql)
+                    .bind(&proxy.id)
+                    .bind(&assoc.plugin_config_id)
+                    .execute(&mut **tx)
+                    .await?;
+                touched_proxies.insert((proxy.id.as_str(), proxy.namespace.as_str()));
+                touched_namespaces.insert(proxy.namespace.clone());
+            }
+        }
+        if !touched_proxies.is_empty() {
+            let touch_ts = Utc::now().to_rfc3339();
+            for (proxy_id, namespace) in touched_proxies {
+                sqlx::query(&touch_proxy_sql)
+                    .bind(&touch_ts)
+                    .bind(proxy_id)
+                    .bind(namespace)
+                    .execute(&mut **tx)
+                    .await?;
+                self.record_config_change_tx(&mut *tx, namespace, "proxy", proxy_id, "upsert")
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -5662,6 +5899,32 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_consumers_in_tx(&mut tx, consumers, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = consumers.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of consumers into a caller-owned transaction, including
+    /// the credential and identity index rows that must be written
+    /// transactionally with every consumer.
+    async fn insert_consumers_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        consumers: &[Consumer],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
@@ -5676,14 +5939,14 @@ impl DatabaseStore {
                 .bind(&acl_groups_json)
                 .bind(consumer.created_at.to_rfc3339())
                 .bind(consumer.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-            self.insert_consumer_credential_index_tx(&mut tx, consumer)
+            self.insert_consumer_credential_index_tx(&mut *tx, consumer)
                 .await?;
-            self.insert_consumer_identity_index_tx(&mut tx, consumer)
+            self.insert_consumer_identity_index_tx(&mut *tx, consumer)
                 .await?;
             self.record_config_change_tx(
-                &mut tx,
+                &mut *tx,
                 &consumer.namespace,
                 "consumer",
                 &consumer.id,
@@ -5693,18 +5956,7 @@ impl DatabaseStore {
             touched_namespaces.insert(consumer.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_mtls_dns_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = consumers.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     /// Batch-create multiple plugin configs. Graph-aware batches stay in one
@@ -5754,6 +6006,31 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_plugin_configs_in_tx(&mut tx, configs, &mut touched_namespaces)
+            .await?;
+
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = configs.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of plugin configs into a caller-owned transaction,
+    /// including the proxy-scoped association row each one implies.
+    async fn insert_plugin_configs_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        configs: &[PluginConfig],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
@@ -5776,7 +6053,7 @@ impl DatabaseStore {
                 .bind(pc.priority_override.map(|v| v as i32))
                 .bind(pc.created_at.to_rfc3339())
                 .bind(pc.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
 
             if pc.scope == PluginScope::Proxy
@@ -5785,28 +6062,23 @@ impl DatabaseStore {
                 sqlx::query(&assoc_sql)
                     .bind(proxy_id)
                     .bind(&pc.id)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
-                self.record_config_change_tx(&mut tx, &pc.namespace, "proxy", proxy_id, "upsert")
+                self.record_config_change_tx(&mut *tx, &pc.namespace, "proxy", proxy_id, "upsert")
                     .await?;
             }
-            self.record_config_change_tx(&mut tx, &pc.namespace, "plugin_config", &pc.id, "upsert")
-                .await?;
+            self.record_config_change_tx(
+                &mut *tx,
+                &pc.namespace,
+                "plugin_config",
+                &pc.id,
+                "upsert",
+            )
+            .await?;
             touched_namespaces.insert(pc.namespace.clone());
         }
 
-        if mode.validates_mtls_dns() {
-            for namespace in &admission_namespaces {
-                self.validate_namespace_admission_tx(&mut tx, namespace)
-                    .await?;
-            }
-        }
-        for namespace in &touched_namespaces {
-            self.compact_config_changes_tx(&mut tx, namespace).await?;
-        }
-        let count = configs.len();
-        tx.commit().await?;
-        Ok(count)
+        Ok(())
     }
 
     /// Batch-create multiple upstreams, chunked into transactions of
@@ -5846,6 +6118,24 @@ impl DatabaseStore {
                 .await?;
         }
         let mut touched_namespaces = HashSet::new();
+        self.insert_upstreams_in_tx(&mut tx, upstreams, &mut touched_namespaces)
+            .await?;
+
+        for namespace in &touched_namespaces {
+            self.compact_config_changes_tx(&mut tx, namespace).await?;
+        }
+        let count = upstreams.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Insert one chunk of upstreams into a caller-owned transaction.
+    async fn insert_upstreams_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        upstreams: &[Upstream],
+        touched_namespaces: &mut HashSet<String>,
+    ) -> Result<(), anyhow::Error> {
         let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, subsets, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, backend_tls_sni, backend_tls_san_allow_list, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
@@ -5893,10 +6183,10 @@ impl DatabaseStore {
                 .bind(&backend_tls_san_allow_list_json)
                 .bind(upstream.created_at.to_rfc3339())
                 .bind(upstream.updated_at.to_rfc3339())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             self.record_config_change_tx(
-                &mut tx,
+                &mut *tx,
                 &upstream.namespace,
                 "upstream",
                 &upstream.id,
@@ -5906,12 +6196,178 @@ impl DatabaseStore {
             touched_namespaces.insert(upstream.namespace.clone());
         }
 
+        Ok(())
+    }
+
+    /// Persist an entire validated batch graph in one transaction.
+    ///
+    /// Every dependency phase and every bounded chunk inside a phase share this
+    /// single transaction, so a failure anywhere — including after a chunk
+    /// boundary — rolls the whole graph back and leaves nothing durable
+    /// (issue #2401). Chunking survives only to bound how many statements are
+    /// prepared and issued at a time; a chunk boundary commits nothing.
+    ///
+    /// Ordering inside the transaction:
+    /// 1. Lock every touched namespace's admission row, so no other namespace
+    ///    resource writer can commit until this transaction ends.
+    /// 2. Write consumers, then upstreams, then proxies (without associations),
+    ///    then plugin configs, then the proxy↔plugin associations.
+    /// 3. Re-validate the merged namespace admission graph against this exact
+    ///    transaction candidate.
+    /// 4. Re-verify the caller's namespace config-admission lease, so a lapsed
+    ///    lease aborts instead of committing a graph another writer may have
+    ///    invalidated.
+    /// 5. Compact the change log and commit once.
+    pub async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error> {
+        let start = Instant::now();
+        if graph.is_empty() {
+            return Ok(AtomicBatchCounts::default());
+        }
+        let (fault, chunk_size_override) =
+            crate::config::batch_atomicity::atomic_batch_test_overrides(graph.namespace);
+        let chunk_size = chunk_size_override.unwrap_or(Self::BATCH_CHUNK_SIZE);
+        // The override registry already rejects zero, but `chunks(0)` panics,
+        // so clamp rather than trust it.
+        let chunk_size = chunk_size.max(1);
+        let admission_namespaces = graph.admission_namespaces();
+
+        let mut tx = self.pool().begin().await?;
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                .await?;
+        }
+        let mut touched_namespaces = HashSet::new();
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, 0)?;
+        for (index, chunk) in graph.consumers.chunks(chunk_size).enumerate() {
+            self.insert_consumers_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Consumers, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Upstreams, 0)?;
+        for (index, chunk) in graph.upstreams.chunks(chunk_size).enumerate() {
+            self.insert_upstreams_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Upstreams, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, 0)?;
+        for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
+            // Associations are attached in their own phase below so a plugin
+            // config submitted in the same graph is already present.
+            self.insert_proxies_in_tx(&mut tx, chunk, false, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Proxies, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::PluginConfigs, 0)?;
+        for (index, chunk) in graph.plugin_configs.chunks(chunk_size).enumerate() {
+            self.insert_plugin_configs_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(fault, AtomicBatchPhase::PluginConfigs, index + 1)?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::ProxyPluginAssociations, 0)?;
+        for (index, chunk) in graph.proxies.chunks(chunk_size).enumerate() {
+            self.attach_proxy_plugins_in_tx(&mut tx, chunk, &mut touched_namespaces)
+                .await?;
+            Self::check_atomic_batch_fault(
+                fault,
+                AtomicBatchPhase::ProxyPluginAssociations,
+                index + 1,
+            )?;
+        }
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::AdmissionRevalidation, 0)?;
+        if mode.validates_mtls_dns() {
+            for namespace in &admission_namespaces {
+                self.validate_namespace_admission_tx(&mut tx, namespace)
+                    .await?;
+            }
+        }
+
+        // Ownership is re-read inside the transaction that is about to commit,
+        // while this transaction still holds every touched namespace's
+        // admission row. Any writer that could have invalidated the validated
+        // graph had to take the lease first, so a matching owner and generation
+        // here proves nobody interleaved.
+        if let Some(lease) = graph.admission_lease {
+            self.verify_namespace_config_admission_lease_tx(&mut tx, graph.namespace, &lease)
+                .await?;
+        }
+
         for namespace in &touched_namespaces {
             self.compact_config_changes_tx(&mut tx, namespace).await?;
         }
-        let count = upstreams.len();
+
+        Self::check_atomic_batch_fault(fault, AtomicBatchPhase::Commit, 0)?;
         tx.commit().await?;
-        Ok(count)
+        self.check_slow_query("batch_create_config_graph_atomically", start);
+        Ok(AtomicBatchCounts {
+            consumers: graph.consumers.len(),
+            upstreams: graph.upstreams.len(),
+            proxies: graph.proxies.len(),
+            plugin_configs: graph.plugin_configs.len(),
+        })
+    }
+
+    fn check_atomic_batch_fault(
+        fault: Option<AtomicBatchFault>,
+        phase: AtomicBatchPhase,
+        completed_chunks: usize,
+    ) -> Result<(), anyhow::Error> {
+        match fault {
+            Some(fault) if fault.trips(phase, completed_chunks) => Err(fault.error()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Confirm inside `tx` that `lease` still owns the namespace's config
+    /// admission row and has not expired.
+    ///
+    /// `FOR UPDATE` pins the row until commit so a competing acquirer cannot
+    /// take the lease between this check and the commit. SQLite has no
+    /// `FOR UPDATE`, but this transaction already holds the database writer
+    /// lock (taken by `lock_mtls_dns_admission_for_owner_tx`), which gives the
+    /// same exclusion.
+    async fn verify_namespace_config_admission_lease_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        lease: &crate::config::batch_atomicity::NamespaceConfigAdmissionLeaseRef<'_>,
+    ) -> Result<(), anyhow::Error> {
+        let now = self.config_admission_lease_now_sql();
+        let for_update = if self.db_type == "sqlite" {
+            ""
+        } else {
+            " FOR UPDATE"
+        };
+        let sql = self.q(&format!(
+            "SELECT 1 FROM config_admission_locks \
+             WHERE namespace = ? AND owner = ? AND generation = ? AND expires_at > {now}{for_update}"
+        ));
+        let generation = i64::try_from(lease.generation).map_err(|_| {
+            anyhow::anyhow!("namespace config admission generation is out of range")
+        })?;
+        let held = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(lease.owner)
+            .bind(generation)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+        if held {
+            Ok(())
+        } else {
+            Err(anyhow::Error::new(BatchAdmissionLeaseLost).context(format!(
+                "namespace '{namespace}' config admission lease generation {generation} was not held at commit"
+            )))
+        }
     }
 
     /// Delete all resources from all tables in a single transaction.
@@ -8121,7 +8577,191 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
         self.check_slow_query("insert_audit_event", start);
+        // Retention is best-effort after a successful insert so enqueue/insert
+        // semantics stay unchanged when prune fails (see #2421 for delivery loss).
+        if self.audit_retention.is_enabled()
+            && let Err(error) = self
+                .prune_audit_events_with_mode(&event.namespace, /* force_max_rows */ false)
+                .await
+        {
+            warn!(
+                namespace = %event.namespace,
+                error = %error,
+                "Failed to prune audit_events after insert; retention will retry on later writes"
+            );
+        }
         Ok(())
+    }
+
+    /// Chunked, namespace-scoped audit retention. Age uses strict `ts < cutoff`;
+    /// the row cap keeps the newest `max_rows` by deterministic `(ts, id)`.
+    /// Work is bounded by [`AUDIT_RETENTION_PRUNE_BATCH_SIZE`] ×
+    /// [`AUDIT_RETENTION_PRUNE_MAX_BATCHES`] and uses `idx_audit_events_namespace_ts_id`.
+    ///
+    /// Explicit calls always evaluate the max-row soft cap. Insert-path
+    /// piggyback uses [`crate::admin::audit::AuditMaxRowsPruneGate`] so
+    /// steady-state inserts do not pay an O(max_rows) boundary scan on every
+    /// write.
+    pub async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        self.prune_audit_events_with_mode(namespace, /* force_max_rows */ true)
+            .await
+    }
+
+    async fn prune_audit_events_with_mode(
+        &self,
+        namespace: &str,
+        force_max_rows: bool,
+    ) -> Result<u64, anyhow::Error> {
+        if !self.audit_retention.is_enabled() {
+            return Ok(0);
+        }
+        let start = std::time::Instant::now();
+        let mut deleted = 0u64;
+        if let Some(days) = self.audit_retention.retention_days {
+            deleted =
+                deleted.saturating_add(self.prune_audit_events_by_age(namespace, days).await?);
+        }
+        if let Some(max_rows) = self.audit_retention.max_rows_per_namespace {
+            let should_run = crate::admin::audit::audit_max_rows_prune_gate_should_run(
+                &self.audit_max_rows_prune_gates,
+                namespace,
+                max_rows,
+                force_max_rows,
+            );
+            if should_run {
+                let (batch_deleted, hit_budget) = self
+                    .prune_audit_events_by_max_rows(namespace, max_rows)
+                    .await?;
+                deleted = deleted.saturating_add(batch_deleted);
+                if let Some(mut gate) = self.audit_max_rows_prune_gates.get_mut(namespace) {
+                    gate.note_max_rows_prune_result(hit_budget);
+                }
+            }
+        }
+        self.check_slow_query("prune_audit_events", start);
+        Ok(deleted)
+    }
+
+    async fn prune_audit_events_by_age(
+        &self,
+        namespace: &str,
+        retention_days: u64,
+    ) -> Result<u64, anyhow::Error> {
+        let days_i64 = i64::try_from(retention_days).unwrap_or(i64::MAX);
+        let cutoff = audit_ts_string(&(Utc::now() - chrono::Duration::days(days_i64)));
+        let delete_sql = self.audit_age_delete_sql();
+        let mut total = 0u64;
+        for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+            let result = sqlx::query(&delete_sql)
+                .bind(namespace)
+                .bind(&cutoff)
+                .execute(&self.pool())
+                .await?;
+            let batch = result.rows_affected();
+            total = total.saturating_add(batch);
+            if batch < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn prune_audit_events_by_max_rows(
+        &self,
+        namespace: &str,
+        max_rows: u64,
+    ) -> Result<(u64, bool), anyhow::Error> {
+        // Newest-first OFFSET max_rows is O(max_rows); insert-path callers gate
+        // this behind AuditMaxRowsPruneGate so steady state is not per-insert.
+        let offset = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        let boundary_sql = self.q("SELECT ts, id FROM audit_events WHERE namespace = ? \
+             ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?");
+        let boundary = sqlx::query(&boundary_sql)
+            .bind(namespace)
+            .bind(offset)
+            .fetch_optional(&self.pool())
+            .await?;
+        let Some(boundary) = boundary else {
+            return Ok((0, false));
+        };
+        let boundary_ts: String = boundary.try_get("ts")?;
+        let boundary_id: String = boundary.try_get("id")?;
+        let delete_sql = self.audit_max_rows_delete_sql();
+        let mut total = 0u64;
+        for _ in 0..crate::admin::audit::AUDIT_RETENTION_PRUNE_MAX_BATCHES {
+            let result = sqlx::query(&delete_sql)
+                .bind(namespace)
+                .bind(&boundary_ts)
+                .bind(&boundary_ts)
+                .bind(&boundary_id)
+                .execute(&self.pool())
+                .await?;
+            let batch = result.rows_affected();
+            total = total.saturating_add(batch);
+            if batch < crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE {
+                break;
+            }
+        }
+        let hit_batch_budget = crate::admin::audit::audit_retention_hit_prune_batch_budget(total);
+        Ok((total, hit_batch_budget))
+    }
+
+    fn audit_age_delete_sql(&self) -> String {
+        let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
+        match self.db_type.as_str() {
+            "postgres" => self.q(&format!(
+                "DELETE FROM audit_events WHERE ctid IN (\
+                     SELECT ctid FROM audit_events \
+                     WHERE namespace = ? AND ts < ? \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            )),
+            "sqlite" => format!(
+                "DELETE FROM audit_events WHERE rowid IN (\
+                     SELECT rowid FROM audit_events \
+                     WHERE namespace = ? AND ts < ? \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            ),
+            _ => format!(
+                "DELETE FROM audit_events \
+                 WHERE namespace = ? AND ts < ? \
+                 ORDER BY ts ASC, id ASC \
+                 LIMIT {batch}"
+            ),
+        }
+    }
+
+    fn audit_max_rows_delete_sql(&self) -> String {
+        let batch = crate::admin::audit::AUDIT_RETENTION_PRUNE_BATCH_SIZE;
+        // Include the boundary row itself: it is the first excess event under
+        // newest-first OFFSET max_rows, so `(ts, id) <= boundary` is correct.
+        match self.db_type.as_str() {
+            "postgres" => self.q(&format!(
+                "DELETE FROM audit_events WHERE ctid IN (\
+                     SELECT ctid FROM audit_events \
+                     WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            )),
+            "sqlite" => format!(
+                "DELETE FROM audit_events WHERE rowid IN (\
+                     SELECT rowid FROM audit_events \
+                     WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                     ORDER BY ts ASC, id ASC \
+                     LIMIT {batch}\
+                 )"
+            ),
+            _ => format!(
+                "DELETE FROM audit_events \
+                 WHERE namespace = ? AND (ts < ? OR (ts = ? AND id <= ?)) \
+                 ORDER BY ts ASC, id ASC \
+                 LIMIT {batch}"
+            ),
+        }
     }
 
     pub async fn list_audit_events(
@@ -8400,6 +9040,10 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_backend_allow_ips(&mut self, policy: crate::config::BackendEgressPolicy) {
         self.backend_allow_ips = policy;
+    }
+
+    fn set_audit_retention_policy(&mut self, policy: crate::admin::audit::AuditRetentionPolicy) {
+        self.audit_retention = policy;
     }
 
     async fn load_full_config_for_purpose(
@@ -8683,6 +9327,14 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, namespace, plugins).await
     }
 
+    async fn batch_create_config_graph_atomically(
+        &self,
+        graph: &AtomicBatchGraph<'_>,
+        mode: &BatchConfigWriteMode,
+    ) -> Result<AtomicBatchCounts, anyhow::Error> {
+        DatabaseStore::batch_create_config_graph_atomically(self, graph, mode).await
+    }
+
     async fn batch_create_proxies(
         &self,
         proxies: &[Proxy],
@@ -8923,6 +9575,10 @@ impl DatabaseBackend for DatabaseStore {
     ) -> Result<PaginatedResult<crate::admin::audit::AuditEvent>, anyhow::Error> {
         DatabaseStore::list_audit_events(self, namespace, filter).await
     }
+
+    async fn prune_audit_events(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseStore::prune_audit_events(self, namespace).await
+    }
 }
 
 /// Parse a stored backend scheme string into the canonical 6-variant
@@ -8935,9 +9591,12 @@ pub(crate) fn parse_scheme(s: &str) -> Result<BackendScheme, String> {
         "tcps" => Ok(BackendScheme::Tcps),
         "udp" => Ok(BackendScheme::Udp),
         "dtls" => Ok(BackendScheme::Dtls),
-        _ => Err(format!(
-            "unsupported backend_scheme '{s}' (expected one of: http, https, tcp, tcps, udp, dtls)"
-        )),
+        // Do not embed the raw scheme column — hostile/oversized DB values must
+        // not reach poll/startup rejection logs (issue #2997 redaction).
+        _ => Err(
+            "unsupported backend_scheme (expected one of: http, https, tcp, tcps, udp, dtls)"
+                .to_string(),
+        ),
     }
 }
 
@@ -8950,6 +9609,15 @@ pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
 
 /// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
 fn row_to_proxy(
+    row: &AnyRow,
+    id: String,
+    plugins: Vec<PluginAssociation>,
+) -> Result<Proxy, anyhow::Error> {
+    row_to_proxy_inner(row, id.clone(), plugins)
+        .map_err(|error| mark_row_decode_rejection("proxy", Some(id), error))
+}
+
+fn row_to_proxy_inner(
     row: &AnyRow,
     id: String,
     plugins: Vec<PluginAssociation>,
@@ -8969,12 +9637,9 @@ fn row_to_proxy(
         .try_get::<String, _>("hosts")
         .unwrap_or_else(|_| "[]".into());
     let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
-        anyhow::anyhow!(
-            "Proxy {}: failed to parse hosts JSON '{}': {}",
-            pid,
-            hosts_str,
-            e
-        )
+        // Do not embed the raw hosts column — poll/startup rejection logs
+        // surface this message (issue #2997 redaction).
+        anyhow::anyhow!("Proxy {}: failed to parse hosts JSON: {}", pid, e)
     })?;
 
     Ok(Proxy {
@@ -9217,6 +9882,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_consumer_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("consumer", id, error)
+    })
+}
+
+fn row_to_consumer_inner(row: &AnyRow, id_preview: &str) -> Result<Consumer, anyhow::Error> {
     let creds_str = required_utf8_text_column(row, "credentials").map_err(|e| {
         anyhow::anyhow!(
             "Consumer {}: failed to read credentials column: {}",
@@ -9240,10 +9912,12 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         )
     })?;
     let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
+        // Never embed the raw acl_groups column in the error — poll rejection
+        // logs would otherwise leak row content (issue #2997).
         anyhow::anyhow!(
-            "Failed to parse acl_groups JSON for consumer: {} (raw: {})",
-            e,
-            acl_groups_str
+            "Consumer {}: failed to parse acl_groups JSON: {}",
+            id_preview,
+            e
         )
     })?;
 
@@ -9264,6 +9938,16 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_plugin_config_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("plugin_config", id, error)
+    })
+}
+
+fn row_to_plugin_config_inner(
+    row: &AnyRow,
+    id_preview: &str,
+) -> Result<PluginConfig, anyhow::Error> {
     let config_str: String = row.try_get("config").map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to read config column: {}",
@@ -9320,6 +10004,13 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
     let id_preview: String = row
         .try_get("id")
         .unwrap_or_else(|_| "<unknown>".to_string());
+    row_to_upstream_inner(row, &id_preview).map_err(|error| {
+        let id = row.try_get::<String, _>("id").ok();
+        mark_row_decode_rejection("upstream", id, error)
+    })
+}
+
+fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
     let targets_str: String = row.try_get("targets").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read targets column: {}",
@@ -9343,13 +10034,11 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str.clone())).map_err(|e| {
-            anyhow::anyhow!(
-                "Upstream {}: failed to parse algorithm '{}': {}",
-                id_preview,
-                algo_str,
-                e
-            )
+        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|_| {
+            // Do not embed the raw algorithm column — hostile/oversized DB
+            // values must not reach poll/startup rejection logs through either
+            // this message or serde's unknown-variant error (issue #2997).
+            anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
         })?;
 
     let health_checks: Option<HealthCheckConfig> = match row.try_get::<String, _>("health_checks") {
@@ -9715,6 +10404,134 @@ mod proxy_insert_sql_drift_tests {
             DatabaseStore::PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT,
             "submit_api_spec_bundle proxy INSERT placeholder count must match \
              PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT — see drift-prevention contract",
+        );
+    }
+}
+
+#[cfg(test)]
+mod row_decode_rejection_classification_tests {
+    use super::{
+        FullLoadPurpose, ProxyPluginAssociationLoadError, is_row_decode_rejection,
+        is_transient_database_error, mark_row_decode_rejection,
+    };
+
+    #[test]
+    fn association_load_error_is_not_rebadged_as_row_decode_rejection() {
+        let err = anyhow::Error::new(ProxyPluginAssociationLoadError::new(
+            "operation=load_full_config resource=proxy_plugins proxy_id=missing: association row references a proxy that was not present in the loaded proxy candidate".to_string(),
+        ));
+        let mapped = FullLoadPurpose::Runtime.map_row_error("proxy_plugin", None, err);
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "ProxyPluginAssociationLoadError must not become RowDecodeRejection: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn transient_sqlx_error_is_not_rebadged_as_row_decode_rejection() {
+        let err = anyhow::Error::new(sqlx::Error::PoolTimedOut);
+        assert!(is_transient_database_error(&err));
+        let mapped = FullLoadPurpose::Runtime.map_row_error("consumer", Some("c1".into()), err);
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "connectivity/driver faults must stay non-repairable: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn genuine_decode_failure_is_marked_for_poll_repair() {
+        let err = anyhow::anyhow!("Consumer c-bad: failed to parse credentials JSON: EOF");
+        let marked = mark_row_decode_rejection("consumer", Some("c-bad".into()), err);
+        assert!(is_row_decode_rejection(&marked));
+        assert!(
+            marked
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "top-level Display must carry the decode reason for operator {{}} sites: {marked}"
+        );
+        let mapped =
+            FullLoadPurpose::Runtime.map_row_error("consumer", Some("c-bad".into()), marked);
+        assert!(
+            is_row_decode_rejection(&mapped),
+            "undecodable rows must remain RowDecodeRejection: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn admission_validation_purpose_does_not_retain_row_decode_marker() {
+        // Admin-write admission shares load_*_tx helpers with runtime full
+        // loads, but must not leave RowDecodeRejection on the returned error:
+        // that marker means "poll: keep admin writable / last-known-good".
+        let err = anyhow::anyhow!(
+            "Consumer malformed: failed to parse credentials JSON: expected ident at line 1 column 2"
+        );
+        let marked = mark_row_decode_rejection("consumer", Some("malformed".into()), err);
+        assert!(is_row_decode_rejection(&marked));
+        let mapped = FullLoadPurpose::AdmissionValidation.map_row_error(
+            "consumer",
+            Some("malformed".into()),
+            marked,
+        );
+        assert!(
+            !is_row_decode_rejection(&mapped),
+            "admission must demote the poll marker: {mapped:#}"
+        );
+        assert!(
+            mapped
+                .to_string()
+                .contains("failed to parse credentials JSON"),
+            "admission must still surface the decode reason: {mapped}"
+        );
+        assert!(
+            mapped.to_string().contains("malformed")
+                || mapped.to_string().contains("Consumer malformed"),
+            "admission must identify the offending consumer: {mapped}"
+        );
+    }
+
+    #[test]
+    fn decode_error_messages_must_not_embed_raw_column_bodies() {
+        let source = include_str!("db_loader.rs");
+        let consumer = source
+            .split("fn row_to_consumer_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn row_to_plugin_config(").next())
+            .expect("row_to_consumer_inner body");
+        assert!(
+            !consumer.contains("(raw: {})"),
+            "consumer decode errors must not embed raw column bodies"
+        );
+        let proxy = source
+            .split("fn row_to_proxy_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn row_to_consumer(").next())
+            .expect("row_to_proxy_inner body");
+        assert!(
+            !proxy.contains("hosts JSON '{}'"),
+            "proxy hosts decode errors must not embed the raw hosts column"
+        );
+        let parse_scheme = source
+            .split("pub(crate) fn parse_scheme(")
+            .nth(1)
+            .and_then(|s| s.split("\npub(crate) fn parse_auth_mode(").next())
+            .expect("parse_scheme body");
+        assert!(
+            !parse_scheme.contains("backend_scheme '{s}'")
+                && !parse_scheme.contains("backend_scheme '{}'"),
+            "proxy backend_scheme decode errors must not embed the raw scheme column"
+        );
+        let upstream = source
+            .split("fn row_to_upstream_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("row_to_upstream_inner body");
+        assert!(
+            !upstream.contains("algorithm '{}'"),
+            "upstream algorithm decode errors must not embed the raw algorithm column"
+        );
+        assert!(
+            !upstream.contains("failed to parse algorithm: {}"),
+            "upstream algorithm decode errors must not relay serde's raw unknown variant"
         );
     }
 }

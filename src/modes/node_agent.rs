@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self as kube_watcher, Event};
@@ -608,8 +608,11 @@ async fn start_node_agent_admin_listeners(
     }
 
     let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+        crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env_config.admin_allowed_cidrs,
+            "FERRUM_ADMIN_ALLOWED_CIDRS",
+        )
+        .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
     let metrics_auth = Arc::new(
         crate::admin::MetricsAuthPolicy::from_env(env_config).map_err(|e| anyhow::anyhow!(e))?,
@@ -662,6 +665,7 @@ async fn start_node_agent_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
@@ -833,6 +837,18 @@ fn create_backend(
     }
 }
 
+/// Why the node-agent pod-watcher select loop stopped.
+///
+/// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
+/// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
+/// `Err` so supervisors that restart only on nonzero exit will relaunch the
+/// agent (#2369).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodWatcherLoopExit {
+    ShutdownRequested,
+    WatcherExhausted,
+}
+
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
@@ -841,16 +857,103 @@ async fn run_with_backend(
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
+    // `initialize_backend` is transactional: any post-`load_programs` failure
+    // rolls back via `cleanup_all` before returning. Once it succeeds, THIS
+    // function owns cleanup exactly once through `InitializedBackendOwner`
+    // (normal shutdown, Kubernetes client construction failure, and Drop on
+    // any other exit). Do not call `cleanup_all` on a second path.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
+    let mut owner = InitializedBackendOwner::new(backend);
 
-    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-
-    let mut shutdown_rx = shutdown_tx.subscribe();
-    let client = build_node_agent_kube_client().await?;
+    let client = match build_node_agent_kube_client().await {
+        Ok(client) => client,
+        Err(err) => return Err(owner.fail_with(err)),
+    };
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
-    let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        Some(client),
+        pod_stream,
+        std::iter::empty(),
+    )
+    .await
+}
+
+/// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
+/// drive the node-agent watcher loop against an injected finite (or pending)
+/// pod-event stream without a live Kubernetes API. CNI is disabled; callers
+/// may seed already-attached pods to assert BPF detach/cleanup side effects.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+pub(crate) async fn run_with_pod_stream_for_test<S, I>(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    initialize_backend(backend, config, metrics.as_ref())?;
+    let mut owner = InitializedBackendOwner::borrowed(backend);
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let cni_config = CniListenerConfig {
+        enabled: false,
+        socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+    };
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        None,
+        pod_stream,
+        seed_pods,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_pod_stream<S, I>(
+    owner: &mut InitializedBackendOwner<'_>,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
+    kube_client: Option<Client>,
+    mut pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    // Caller must have already initialized the backend (`run_with_backend` or
+    // `run_with_pod_stream_for_test`) so production keeps init → kube-client
+    // ordering for cleanup-ownership compatibility with PR #3142.
+    if cni_config.enabled && kube_client.is_none() {
+        anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
+    }
+
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    for state in seed_pods {
+        pod_states.insert(state.pod_uid.clone(), state);
+    }
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
     let mut init_seen: Option<HashSet<String>> = None;
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
@@ -894,21 +997,26 @@ async fn run_with_backend(
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
 
-    loop {
+    let exit_reason = loop {
         if *shutdown_rx.borrow() {
-            break;
+            break PodWatcherLoopExit::ShutdownRequested;
         }
         tokio::select! {
+            // Prefer an operator-requested shutdown when it becomes ready in
+            // the same poll as watcher exhaustion. The None arm rechecks the
+            // watch value as well, closing the race where shutdown arrives
+            // after this arm was polled but before the stream is polled.
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
+                    break PodWatcherLoopExit::ShutdownRequested;
                 }
             }
             event = pod_stream.next() => {
                 match event {
                     Some(Ok(Event::Apply(pod))) => {
                         handle_kube_pod_applied(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -917,7 +1025,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::Delete(pod))) => {
                         if let Some(uid) = pod_uid(&pod) {
-                            handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                            handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                         }
                     }
                     Some(Ok(Event::Init)) => {
@@ -925,7 +1033,7 @@ async fn run_with_backend(
                     }
                     Some(Ok(Event::InitApply(pod))) => {
                         if let Some(uid) = handle_kube_pod_applied(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
@@ -938,13 +1046,13 @@ async fn run_with_backend(
                         if let Some(seen) = init_seen.take() {
                             let stale_uids = watcher_init_stale_uids(&pod_states, &seen);
                             for uid in stale_uids {
-                                handle_pod_removed(backend.as_mut(), &pod_states, config, metrics.as_ref(), &uid);
+                                handle_pod_removed(owner.backend_mut(), &pod_states, config, metrics.as_ref(), &uid);
                             }
                             // Also remove pods whose owned failure snapshots
                             // vanished across the relist; otherwise the retry
                             // loop replays them indefinitely (see helper docs).
                             prune_failed_enrollments_from_relist(
-                                backend.as_mut(),
+                                owner.backend_mut(),
                                 &pod_states,
                                 config,
                                 &metrics,
@@ -959,20 +1067,31 @@ async fn run_with_backend(
                         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     None => {
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
+                        }
                         warn!("Pod watcher ended unexpectedly");
-                        break;
+                        break PodWatcherLoopExit::WatcherExhausted;
                     }
                 }
             }
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
+                        let Some(client) = kube_client.as_ref() else {
+                            // Unreachable when CNI is enabled (gated at entry).
+                            // Respond fail-closed so the CNI binary cannot hang.
+                            let _ = work.respond.send(CniRpcResponse::Error {
+                                reason: "node-agent Kubernetes client unavailable".to_string(),
+                            });
+                            continue;
+                        };
                         let enrolled_uid = process_cni_work_item(
-                            backend.as_mut(),
+                            owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
-                            &client,
+                            client,
                             work,
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
@@ -992,37 +1111,37 @@ async fn run_with_backend(
                 // that would otherwise keep capture partially attached. Cheap
                 // no-ops when none are pending.
                 retry_backed_off_pod_enrollments(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                     false,
                 );
                 retry_pending_pod_detaches(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_pod_ip_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_updates(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     metrics.as_ref(),
                 );
                 retry_pending_node_probe_port_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
                 );
                 retry_pending_cgroup_map_removals(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1030,7 +1149,7 @@ async fn run_with_backend(
             }
             _ = udp_readiness_interval.tick(), if udp_readiness_reconcile_enabled(config) => {
                 reconcile_udp_capture_readiness_with_sync_state(
-                    backend.as_mut(),
+                    owner.backend_mut(),
                     &pod_states,
                     config,
                     metrics.as_ref(),
@@ -1039,16 +1158,26 @@ async fn run_with_backend(
                 );
             }
         }
-    }
+    };
+
+    // Same finally-style path for both exit reasons: stop background CNI work,
+    // detach BPF / maps, then await the listener. Watcher exhaustion must not
+    // skip this and must not hang waiting for a CNI task that never sees
+    // shutdown. Drop readiness before the potentially slow CNI join so probes
+    // do not keep reporting ready while capture is tearing down.
+    //
+    startup_ready.store(false, Ordering::Release);
+    let _ = shutdown_tx.send(true);
 
     info!(
+        exit_reason = ?exit_reason,
         pods_enrolled = metrics.pods_enrolled.load(Ordering::Relaxed),
         pods_unenrolled = metrics.pods_unenrolled.load(Ordering::Relaxed),
         attach_errors = metrics.attach_errors.load(Ordering::Relaxed),
         attached_pods = pod_states.len(),
         "Node agent shutting down, detaching BPF programs"
     );
-    cleanup_all_pods(backend.as_mut(), &pod_states, config);
+    owner.shutdown_pods(&pod_states, config);
 
     if let Some(handle) = cni_listener_handle
         && let Err(err) = handle.await
@@ -1056,7 +1185,12 @@ async fn run_with_backend(
         warn!(error = %err, "Node agent CNI listener task panicked");
     }
 
-    Ok(())
+    match exit_reason {
+        PodWatcherLoopExit::ShutdownRequested => Ok(()),
+        PodWatcherLoopExit::WatcherExhausted => {
+            Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
+        }
+    }
 }
 
 fn watcher_init_stale_uids(
@@ -5577,6 +5711,31 @@ fn initialize_backend(
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
         return Err(anyhow::Error::msg(e));
     }
+
+    // Programs (and any bpffs pins created during load) are live. Every
+    // subsequent failure must roll back via `cleanup_all` before returning so
+    // a crashed/retried startup cannot leave stale Ferrum maps under
+    // `/sys/fs/bpf/ferrum`. The guard also covers an unwind out of the init
+    // steps. `run_with_backend` takes ownership only after this function
+    // returns Ok, so exactly one of the two owners ever cleans up.
+    let mut rollback = LoadedBackendRollback::new(backend);
+    match initialize_backend_after_load(rollback.backend_mut(), config, metrics) {
+        Ok(()) => {
+            rollback.commit();
+            Ok(())
+        }
+        Err(err) => {
+            rollback.roll_back(&err);
+            Err(err)
+        }
+    }
+}
+
+fn initialize_backend_after_load(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
         metrics.set_topology_degraded("capture_unavailable");
@@ -5714,7 +5873,179 @@ fn initialize_backend(
     Ok(())
 }
 
-fn cleanup_all_pods(
+/// Rollback owner for the window between a successful `load_programs` and a
+/// successful `initialize_backend`. In that window the bpffs pins are live but
+/// nothing owns them yet, so any exit — error return **or unwind** — must
+/// `cleanup_all` exactly once. `commit` hands the window off to
+/// [`InitializedBackendOwner`] instead.
+struct LoadedBackendRollback<'a> {
+    backend: &'a mut dyn EbpfBackend,
+    /// Cleared by the first of `commit`/`roll_back`/`Drop`, so cleanup is
+    /// exactly-once no matter which one wins.
+    armed: bool,
+}
+
+impl<'a> LoadedBackendRollback<'a> {
+    fn new(backend: &'a mut dyn EbpfBackend) -> Self {
+        Self {
+            backend,
+            armed: true,
+        }
+    }
+
+    fn backend_mut(&mut self) -> &mut dyn EbpfBackend {
+        &mut *self.backend
+    }
+
+    /// Initialization succeeded: disarm without cleanup so the caller's
+    /// `InitializedBackendOwner` becomes the single cleanup owner.
+    fn commit(mut self) {
+        self.armed = false;
+    }
+
+    /// Roll back now. Cleanup errors are warned alongside the original cause
+    /// and never replace it.
+    fn roll_back(mut self, original: &anyhow::Error) {
+        self.armed = false;
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                original_error = %original,
+                "Failed to roll back BPF state after node-agent initialization failure; \
+                 original error preserved"
+            );
+        }
+    }
+}
+
+impl Drop for LoadedBackendRollback<'_> {
+    fn drop(&mut self) {
+        // Only reached on an unwind out of the init steps; the error and
+        // success paths disarm first. `cleanup_all` is synchronous, so this is
+        // safe to run in Drop.
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Err(cleanup_err) = self.backend.cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                "Failed to roll back BPF state while unwinding out of node-agent initialization"
+            );
+        }
+    }
+}
+
+/// Single owner of `cleanup_all` after successful `initialize_backend`.
+///
+/// Every post-init exit — Kubernetes client construction failure, normal
+/// shutdown, or Drop on unwind — must invoke cleanup exactly once through this
+/// type. `initialize_backend` owns rollback for pre-success failures so the
+/// two paths never double-clean.
+enum InitializedBackend<'a> {
+    Owned(Box<dyn EbpfBackend>),
+    Borrowed(&'a mut dyn EbpfBackend),
+}
+
+impl<'a> InitializedBackend<'a> {
+    fn as_mut(&mut self) -> &mut dyn EbpfBackend {
+        match self {
+            Self::Owned(backend) => backend.as_mut(),
+            Self::Borrowed(backend) => &mut **backend,
+        }
+    }
+}
+
+struct InitializedBackendOwner<'a> {
+    backend: InitializedBackend<'a>,
+    /// Latched by the first cleanup so every later path (including `Drop`) is a
+    /// no-op. This is the whole exactly-once mechanism; there is no second
+    /// cleanup owner after `initialize_backend` returns `Ok`.
+    cleaned_up: bool,
+}
+
+impl InitializedBackendOwner<'static> {
+    fn new(backend: Box<dyn EbpfBackend>) -> Self {
+        Self {
+            backend: InitializedBackend::Owned(backend),
+            cleaned_up: false,
+        }
+    }
+}
+
+impl<'a> InitializedBackendOwner<'a> {
+    fn borrowed(backend: &'a mut dyn EbpfBackend) -> Self {
+        Self {
+            backend: InitializedBackend::Borrowed(backend),
+            cleaned_up: false,
+        }
+    }
+
+    fn backend_mut(&mut self) -> &mut dyn EbpfBackend {
+        self.backend.as_mut()
+    }
+
+    /// Run the ordered shutdown teardown ([`shutdown_backend_state`]) exactly
+    /// once. A later `Drop` observes the latch and does nothing.
+    fn shutdown_pods(
+        &mut self,
+        pod_states: &DashMap<String, PodAttachmentState>,
+        config: &NodeAgentConfig,
+    ) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        shutdown_backend_state(self.backend.as_mut(), pod_states, config);
+    }
+
+    /// Cleanup after a late startup/runtime error (e.g. Kubernetes client
+    /// construction). Preserves `err` as the returned cause; cleanup failures
+    /// are surfaced as structured warnings only.
+    fn fail_with(mut self, err: anyhow::Error) -> anyhow::Error {
+        self.cleanup_once_preserving(&err, "startup/runtime error");
+        err
+    }
+
+    fn cleanup_once(&mut self, context: &'static str) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                context,
+                "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
+            );
+        }
+    }
+
+    fn cleanup_once_preserving(&mut self, original: &anyhow::Error, context: &'static str) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
+            warn!(
+                error = %cleanup_err,
+                original_error = %original,
+                context,
+                "Failed to cleanup BPF state after error; original error preserved"
+            );
+        }
+    }
+}
+
+impl Drop for InitializedBackendOwner<'_> {
+    fn drop(&mut self) {
+        // Panic / early-return safety net. No-op when `shutdown_pods` or
+        // `fail_with` already cleaned up.
+        self.cleanup_once("drop");
+    }
+}
+
+fn detach_enrolled_pods(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
     config: &NodeAgentConfig,
@@ -5734,23 +6065,277 @@ fn cleanup_all_pods(
             warn!(pod_uid = %state.pod_uid, error = %e, "Failed to detach BPF programs during shutdown");
         }
     }
-    if let Err(e) = backend.cleanup_all() {
-        warn!(error = %e, "Failed to cleanup BPF state during shutdown");
+}
+
+/// Ordered node-agent teardown: per-pod detach first (dropping each enrolled
+/// pod's registry entry and readiness markers), then the node-global
+/// `cleanup_all`.
+///
+/// This is the whole body of the normal shutdown path;
+/// [`InitializedBackendOwner::shutdown_pods`] adds only the exactly-once latch.
+/// Keeping it a free function over a *borrowed* backend is what lets the
+/// inline tests assert the ordering and the fail-closed UDP behaviour below
+/// against the real production code rather than a test-local copy (the owner
+/// takes the backend by value, so a consumed mock is no longer observable).
+///
+/// Deliberately does NOT write the `.udp-not-ready` ack. By this point
+/// `cleanup_all()` has detached the tc classifier and torn down the pod-IP
+/// registry, so the host-veth gate that normally drops pod-originated UDP is
+/// *gone*, not closed. If a mesh proxy keeps running across a node-agent
+/// DaemonSet restart, publishing the ack would tell its still-live per-netns
+/// producer that the host gate is closed (`retain_guard = false`) and let it
+/// tear its in-netns DROP guard down into plaintext — enrolled pods would then
+/// egress UDP uncaptured/unauthorized until the new node-agent re-enrolls and
+/// reopens the producer. Fail closed instead: withholding the ack makes
+/// `await_udp_not_ready_ack` time out on the producer side, so it retains the
+/// in-netns guard (self-healing — reaped on the producer's next open). A fresh
+/// ack is only ever published by `reconcile_udp_capture_readiness` once the BPF
+/// gate is verifiably re-closed, which a restarted node-agent re-derives from
+/// live state rather than trusting a persisted marker.
+fn shutdown_backend_state(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    config: &NodeAgentConfig,
+) {
+    detach_enrolled_pods(backend, pod_states, config);
+    if let Err(cleanup_err) = backend.cleanup_all() {
+        warn!(
+            error = %cleanup_err,
+            context = "shutdown",
+            "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
+        );
     }
-    // Deliberately do NOT write the `.udp-not-ready` ack here. By this point
-    // `cleanup_all()` has detached the tc classifier and torn down the pod-IP
-    // registry, so the host-veth gate that normally drops pod-originated UDP is
-    // *gone*, not closed. If a mesh proxy keeps running across a node-agent
-    // DaemonSet restart, publishing the ack would tell its still-live per-netns
-    // producer that the host gate is closed (`retain_guard = false`) and let it
-    // tear its in-netns DROP guard down into plaintext — enrolled pods would
-    // then egress UDP uncaptured/unauthorized until the new node-agent
-    // re-enrolls and reopens the producer. Fail closed instead: withholding the
-    // ack makes `await_udp_not_ready_ack` time out on the producer side, so it
-    // retains the in-netns guard (self-healing — reaped on the producer's next
-    // open). A fresh ack is only ever published by `reconcile_udp_capture_readiness`
-    // once the BPF gate is verifiably re-closed, which a restarted node-agent
-    // re-derives from live state rather than trusting a persisted marker.
+}
+
+/// Test-only seams for the issue #2371 startup-rollback contract.
+///
+/// Every item here exists solely so external unit tests (`tests/unit/`) can
+/// drive the *production* rollback paths through `crate::_test_support`. The
+/// library target reaches them through that bridge; `src/main.rs` re-declares
+/// every module **without** it, so in the binary target nothing in this module
+/// has a caller. That is the entire justification for the module-scoped
+/// `allow(dead_code)`: it covers only test-only items — no production item is
+/// suppressed, and `-D dead_code` still applies to the rest of the file. Same
+/// convention as the `_for_test` seams in `src/load_balancer.rs`.
+///
+/// These probes call the production entry points (`initialize_backend`,
+/// `InitializedBackendOwner::{shutdown_pods, fail_with}`) directly — there is no
+/// test-only twin of the cleanup logic to drift from.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod startup_cleanup_test_seams {
+    use super::*;
+    use crate::ebpf::{MockCleanupWatch, MockEbpfBackend};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// Did the *failed* step leave a live capture config behind?
+    ///
+    /// Read from the mock's pre-cleanup snapshot when rollback ran, because
+    /// `cleanup_all` clears `capture_config` — sampling the live field after a
+    /// rollback would report `false` no matter what the step did.
+    fn capture_config_set_before_cleanup(backend: &MockEbpfBackend) -> bool {
+        backend
+            .pre_cleanup_state
+            .as_ref()
+            .map(|pre| pre.capture_config_set)
+            .unwrap_or_else(|| backend.capture_config.is_some())
+    }
+
+    /// Observable result for the external #2371 startup-cleanup probes.
+    #[derive(Debug, Clone)]
+    pub struct NodeAgentStartupCleanupProbe {
+        pub ok: bool,
+        pub error: Option<String>,
+        pub cleanup_all_calls: usize,
+        pub cleaned_up: bool,
+        /// Sampled at the last point the mock is directly observable, i.e. just
+        /// before an `InitializedBackendOwner` takes it by value. `cleanup_all`
+        /// does not reset this flag, so it survives a rollback.
+        pub programs_loaded: bool,
+        /// Whether the capture config was live *before* any cleanup wiped it
+        /// (see `capture_config_set_before_cleanup`), so a rollback cannot make
+        /// this read `false` vacuously.
+        pub capture_config_set: bool,
+    }
+
+    fn local_pod_ebpf_test_config() -> NodeAgentConfig {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root: "/sys/fs/cgroup".to_string(),
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract: CaptureContract::local_pod_defaults(),
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        }
+    }
+
+    /// Mock state sampled just before an `InitializedBackendOwner` takes the
+    /// backend by value (after which it is no longer directly observable).
+    #[derive(Clone, Copy)]
+    struct SampledMock {
+        programs_loaded: bool,
+        capture_config_set: bool,
+    }
+
+    /// A successfully initialized mock, plus its pre-move sample.
+    struct InitializedMock {
+        config: NodeAgentConfig,
+        backend: MockEbpfBackend,
+        sampled: SampledMock,
+    }
+
+    /// Run `initialize_backend` over `backend`, which the caller must have set
+    /// up to reach a *successful* init. An unexpected init failure
+    /// short-circuits to a probe the calling test can report verbatim.
+    fn initialize_or_report(
+        mut backend: MockEbpfBackend,
+    ) -> Result<InitializedMock, NodeAgentStartupCleanupProbe> {
+        let config = local_pod_ebpf_test_config();
+        let metrics = NodeAgentMetrics::default();
+        if let Err(err) = initialize_backend(&mut backend, &config, &metrics) {
+            return Err(NodeAgentStartupCleanupProbe {
+                ok: false,
+                error: Some(format!("initialize_backend failed unexpectedly: {err}")),
+                cleanup_all_calls: backend.cleanup_all_calls,
+                cleaned_up: backend.cleaned_up,
+                programs_loaded: backend.programs_loaded,
+                capture_config_set: capture_config_set_before_cleanup(&backend),
+            });
+        }
+        let sampled = SampledMock {
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: backend.capture_config.is_some(),
+        };
+        Ok(InitializedMock {
+            config,
+            backend,
+            sampled,
+        })
+    }
+
+    /// Read cleanup counters back out of a backend the owner has consumed.
+    fn observed(
+        watch: &MockCleanupWatch,
+        sampled: SampledMock,
+        error: Option<String>,
+    ) -> NodeAgentStartupCleanupProbe {
+        NodeAgentStartupCleanupProbe {
+            ok: error.is_none(),
+            error,
+            cleanup_all_calls: watch.calls.load(Ordering::Relaxed),
+            cleaned_up: watch.cleaned_up.load(Ordering::Relaxed),
+            programs_loaded: sampled.programs_loaded,
+            capture_config_set: sampled.capture_config_set,
+        }
+    }
+
+    fn watched_backend(watch: &Arc<MockCleanupWatch>) -> MockEbpfBackend {
+        MockEbpfBackend {
+            cleanup_watch: Some(Arc::clone(watch)),
+            ..MockEbpfBackend::default()
+        }
+    }
+
+    /// `initialize_backend` must roll back with exactly one `cleanup_all` when a
+    /// step after a successful `load_programs` fails.
+    pub(crate) fn probe_post_load_init_failure_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
+        let config = local_pod_ebpf_test_config();
+        let mut backend = MockEbpfBackend {
+            fail_update_capture_config: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+        let result = initialize_backend(&mut backend, &config, &metrics);
+        NodeAgentStartupCleanupProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: capture_config_set_before_cleanup(&backend),
+        }
+    }
+
+    /// The mirror image of the post-load probe: a failure in `load_programs`
+    /// itself created nothing, so the rollback guard must NOT be armed yet and
+    /// `cleanup_all` must not run. This pins the guard to the `load_programs`
+    /// boundary — hoisting it above the load would start unpinning maps a
+    /// *different*, still-healthy node-agent may own.
+    pub(crate) fn probe_pre_load_failure_skips_cleanup_for_test() -> NodeAgentStartupCleanupProbe {
+        let config = local_pod_ebpf_test_config();
+        let mut backend = MockEbpfBackend {
+            fail_load_programs: true,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+        let result = initialize_backend(&mut backend, &config, &metrics);
+        NodeAgentStartupCleanupProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            cleanup_all_calls: backend.cleanup_all_calls,
+            cleaned_up: backend.cleaned_up,
+            programs_loaded: backend.programs_loaded,
+            capture_config_set: capture_config_set_before_cleanup(&backend),
+        }
+    }
+
+    /// A Kubernetes-client-construction-style failure after a *successful* init
+    /// must clean up exactly once through the owner and return the original
+    /// error unchanged.
+    pub(crate) fn probe_k8s_client_style_late_failure_cleanup_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let init = match initialize_or_report(watched_backend(&watch)) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
+        };
+        let sampled = init.sampled;
+        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        // Production path: `run_with_backend` funnels a kube-client error here.
+        let err = owner.fail_with(anyhow::anyhow!("injected kube client construction failure"));
+        observed(&watch, sampled, Some(err.to_string()))
+    }
+
+    /// Normal shutdown must call `cleanup_all` exactly once — the subsequent
+    /// `Drop` must not clean up a second time.
+    pub(crate) fn probe_normal_shutdown_cleanup_once_for_test() -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let init = match initialize_or_report(watched_backend(&watch)) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
+        };
+        let (config, sampled) = (init.config, init.sampled);
+        let mut owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        owner.shutdown_pods(&pod_states, &config);
+        // Drop must observe the latched flag and NOT clean up a second time.
+        drop(owner);
+        observed(&watch, sampled, None)
+    }
+
+    /// A failing `cleanup_all` must not hide the original startup/runtime error.
+    pub(crate) fn probe_cleanup_failure_preserves_original_error_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        let watch = Arc::new(MockCleanupWatch::default());
+        let backend = MockEbpfBackend {
+            fail_cleanup_all: true,
+            ..watched_backend(&watch)
+        };
+        let init = match initialize_or_report(backend) {
+            Ok(ready) => ready,
+            Err(probe) => return probe,
+        };
+        let sampled = init.sampled;
+        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let err = owner.fail_with(anyhow::anyhow!("original injected startup failure"));
+        observed(&watch, sampled, Some(err.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -6375,8 +6960,18 @@ mod tests {
             },
         );
 
-        assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert!(err.to_string().contains("SOCK_OPS identity bridge"));
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
+        // Read the attach state from the pre-rollback snapshot: rollback's
+        // `cleanup_all` clears `sock_ops_attached_cgroup_root`, so asserting on
+        // the live field here would pass even if the attach had succeeded.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert!(pre.sock_ops_attached_cgroup_root.is_none());
+        assert!(backend.sock_ops_attached_cgroup_root.is_none());
         assert_eq!(
             metrics.snapshot().topology_degraded_reason,
             Some("node_waypoint_sock_ops_unavailable")
@@ -6422,8 +7017,17 @@ mod tests {
         );
 
         assert!(err.to_string().contains("trusted node"));
-        assert!(backend.node_ips.is_empty());
-        assert!(backend.node_ips6.is_empty());
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
+        // Pre-rollback snapshot: `cleanup_all` clears the node-IP maps, so the
+        // "no trusted source was ever written" assertion has to read the state
+        // captured just before the wipe.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert_eq!(pre.node_ip_count, 0);
+        assert_eq!(pre.node_ip6_count, 0);
         assert_eq!(
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_UNAVAILABLE
@@ -6456,6 +7060,16 @@ mod tests {
 
         assert!(err.to_string().contains("capture config update failed"));
         assert!(backend.programs_loaded);
+        assert!(backend.cleaned_up);
+        assert_eq!(backend.cleanup_all_calls, 1);
+        // Pre-rollback snapshot: `cleanup_all` clears `capture_config`, so the
+        // live field is `None` either way. The snapshot proves the *failed*
+        // write left no config behind before rollback ran.
+        let pre = backend
+            .pre_cleanup_state
+            .as_ref()
+            .expect("rollback must snapshot state before wiping it");
+        assert!(!pre.capture_config_set);
         assert!(backend.capture_config.is_none());
         assert_eq!(
             metrics.snapshot().capture_state,
@@ -6464,7 +7078,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_detaches_attached() {
+    fn shutdown_backend_state_detaches_attached() {
         let mut backend = MockEbpfBackend::default();
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         pod_states.insert(
@@ -6513,7 +7127,7 @@ mod tests {
             trust_domain: "cluster.local".to_string(),
             node_waypoint_pod_registry_dir: None,
         };
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert_eq!(backend.detached_pods.len(), 1);
         assert_eq!(backend.detached_pods[0], "pod-1");
@@ -6521,7 +7135,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_removes_registry_and_ready_files() {
+    fn shutdown_backend_state_removes_registry_and_ready_files() {
         // Shutdown must drop each enrolled pod's registry entry + readiness
         // markers so a mesh proxy that keeps running doesn't leak dead
         // in-netns listeners.
@@ -6567,7 +7181,7 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
 
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert!(
             !registry.path().join("pod-x").exists(),
@@ -6600,7 +7214,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_all_pods_withholds_udp_not_ready_ack_for_fail_closed_restart() {
+    fn shutdown_backend_state_withholds_udp_not_ready_ack_for_fail_closed_restart() {
         // Regression for the node-agent DaemonSet restart path: even with a stale
         // `.udp-ready` marker present (producer still live), shutdown teardown must
         // never write the `.udp-not-ready` ack, so the surviving producer times out
@@ -6647,7 +7261,7 @@ mod tests {
             node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
         };
 
-        cleanup_all_pods(&mut backend, &pod_states, &config);
+        shutdown_backend_state(&mut backend, &pod_states, &config);
 
         assert!(
             !registry

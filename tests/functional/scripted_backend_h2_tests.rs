@@ -2829,6 +2829,143 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Issue #2952 — spoofed client Forwarded must not survive on direct-H2.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// With `FERRUM_ADD_FORWARDED_HEADER=true`, the direct-H2 builder must strip a
+/// spoofed client `Forwarded` and emit exactly one gateway-owned element.
+///
+/// Fixture notes (hosted jobs 89647762460 / 89765485950 returned a 502 here):
+///
+/// 1. **Body-size gate (deterministic)**: ordinary (non-SNI) direct-H2 dispatch
+///    requires `FERRUM_MAX_{REQUEST,RESPONSE}_BODY_SIZE_BYTES=0` via
+///    `can_dispatch_direct_http2_pool`. Defaults leave those nonzero, so the
+///    request falls through to reqwest against this ALPN-`h2`-only fixture and
+///    surfaces as `502 {"error":"Backend unavailable"}` with
+///    `error sending request for url (...)` — even when the registry already
+///    shows `h2_tls=supported`. Mirror `bodyless_direct_h2_sse_response_is_governed`.
+///
+/// 2. **Pooled probe / warmup connections**: capability probing and pool
+///    warmup dial this backend before the ownership GET. A one-shot script
+///    closes those connections after its final step, so a later request that
+///    reuses a pooled sender can 502. `repeat_script(true)` keeps every
+///    accepted connection serving unbounded streams. Warmup is enabled so the
+///    registry populates; the test still gates on `h2_tls=supported` before
+///    firing the ownership GET.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn direct_h2_strips_spoofed_client_forwarded_when_regenerating() {
+    let ca = TestCa::new("h2-forwarded-ownership").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .repeat_script(true)
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "2".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"ok"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = file_mode_yaml_for_backend_with(
+        backend_port,
+        json!({
+            "backend_scheme": "https",
+            "backend_host": "localhost",
+            "backend_tls_verify_server_cert": false,
+            "pool_enable_http2": true,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .capture_output()
+        // Opt into capability probing (registry gate below) and zero body
+        // limits so ordinary (non-SNI) dispatch stays on the direct-H2 pool —
+        // same contract as `bodyless_direct_h2_sse_response_is_governed`.
+        // `repeat_script(true)` absorbs any warmup `HEAD /` on the same
+        // connection without tearing it down.
+        .pool_warmup_enabled(true)
+        .env("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")
+        .env("FERRUM_ADD_FORWARDED_HEADER", "true")
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let entry = wait_for_h2_tls_supported(&harness, Duration::from_secs(15))
+        .await
+        .expect("backend must be classified h2_tls=supported for the direct-H2 arm");
+    assert_eq!(
+        entry["plain_http"]["h2_tls"].as_str(),
+        Some("supported"),
+        "precondition: direct-H2 ownership coverage requires h2_tls=supported; entry: {entry:#?}"
+    );
+
+    let response = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
+        .get(harness.proxy_url("/api/ownership"))
+        .header(reqwest::header::HOST, "example.com")
+        .header("forwarded", "for=10.0.0.1;proto=https")
+        .send()
+        .await
+        .expect("gateway response");
+    let status = response.status();
+    let body = response.text().await.expect("response body");
+    if status != StatusCode::OK {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "direct-H2 ownership request must succeed; status={status} body={body}\n\
+             --- registry: {entry:#?}\n--- logs ---\n{logs}"
+        );
+    }
+    assert_eq!(
+        body, "ok",
+        "direct-H2 ownership path must reach the scripted backend"
+    );
+
+    let streams = backend.received_streams().await;
+    let stream = streams
+        .iter()
+        .find(|s| s.method == "GET" && s.path == "/ownership")
+        .unwrap_or_else(|| {
+            panic!(
+                "direct-H2 backend never received the ownership GET — path not exercised. \
+                 streams={streams:#?}"
+            )
+        });
+    let forwarded: Vec<&str> = stream
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("forwarded"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        forwarded,
+        vec!["for=127.0.0.1;proto=http;host=example.com"],
+        "direct-H2 path must emit exactly one gateway-owned Forwarded; got {forwarded:?} \
+         (headers={:?})",
+        stream.headers
+    );
+    assert!(
+        forwarded.iter().all(|v| !v.contains("10.0.0.1")),
+        "spoofed client Forwarded must not reach the direct-H2 backend: {forwarded:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Issue #2954 — backend TLS SNI override must serve under default nonzero
 // body-size limits (direct-H2 in-path enforcement), not 502 all traffic.
 // ────────────────────────────────────────────────────────────────────────────

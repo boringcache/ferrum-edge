@@ -43,6 +43,7 @@ pub mod observability_delivery;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
+pub mod policy_path;
 pub mod pool;
 pub mod proxy;
 pub mod request_epoch;
@@ -90,6 +91,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
     /// Exercise DP's crate-private concurrent listener supervisor without
@@ -109,13 +111,13 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
-    pub fn take_compression_response_codec_permit_for_test(
+    pub fn take_compression_response_buffer_permit_for_test(
         ctx: &mut crate::plugins::RequestContext,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        ctx.take_compression_response_codec_permit()
+        ctx.take_compression_response_buffer_permit()
     }
 
-    /// Whether a compression instance reserved response codec admission for this
+    /// Whether a compression instance reserved response-buffer admission for this
     /// request in `before_proxy` (the early bound on the buffered population).
     pub fn compression_response_admission_reserved_for_test(
         ctx: &crate::plugins::RequestContext,
@@ -124,7 +126,7 @@ pub mod _test_support {
     }
 
     /// Whether `before_proxy` negotiated a compressible coding but could not
-    /// obtain bounded codec admission (so the response streams identity).
+    /// obtain bounded response-buffer admission (so the response streams identity).
     pub fn compression_response_admission_declined_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> bool {
@@ -132,7 +134,7 @@ pub mod _test_support {
     }
 
     /// Build the request-body-hook compatibility context. Used to prove the
-    /// reserved response codec permit stays on the donor (live) context rather
+    /// reserved response-buffer permit stays on the donor (live) context rather
     /// than being moved into this short-lived clone.
     pub fn clone_for_final_request_body_hooks_for_test(
         ctx: &mut crate::plugins::RequestContext,
@@ -148,14 +150,16 @@ pub mod _test_support {
 
     pub fn reconcile_aborted_gateway_response_encoding_for_test(
         ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        body_len: usize,
-    ) {
+        response_body: &mut Vec<u8>,
+    ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
+            response_status,
             response_headers,
-            body_len,
-        );
+            response_body,
+        )
     }
 
     pub fn validate_correlation_id_composition_for_test(
@@ -999,8 +1003,9 @@ pub mod _test_support {
         status_code: u16,
         headers: HashMap<String, String>,
         body: &[u8],
+        presentation_digest: Option<[u8; 32]>,
     ) -> Option<Vec<u8>> {
-        plugin.redis_payload_for_tests(status_code, headers, body)
+        plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────
@@ -1660,6 +1665,15 @@ pub mod _test_support {
         ctx.finalized_response_replay
     }
 
+    /// Stand in for the protocol entry paths, which copy this digest from the
+    /// request's plugin-cache view before any plugin runs.
+    pub fn set_response_presentation_policy_digest_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        digest: Option<[u8; 32]>,
+    ) {
+        ctx.set_response_presentation_policy_digest(digest);
+    }
+
     pub fn response_caching_current_total_size_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {
@@ -2125,6 +2139,27 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
+    // ── config/batch_atomicity ───────────────────────────────────────────────
+    pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
+
+    /// Install (or clear, with `None`) a deterministic failure point inside the
+    /// atomic `POST /batch` graph write for one namespace.
+    ///
+    /// Fault injection is how the all-or-nothing claim is actually exercised:
+    /// a duplicate key can only fail where the duplicate is, while these faults
+    /// reach every dependency phase and every chunk boundary. Keyed per
+    /// namespace so tests sharing a process cannot perturb each other. Always
+    /// clear the fault when the test finishes.
+    pub fn set_atomic_batch_fault_for_test(namespace: &str, fault: Option<AtomicBatchFault>) {
+        crate::config::batch_atomicity::set_atomic_batch_fault(namespace, fault);
+    }
+
+    /// Shrink the per-chunk write size for one namespace so a small fixture can
+    /// still cross a chunk boundary. `None` restores the backend default.
+    pub fn set_atomic_batch_chunk_size_for_test(namespace: &str, chunk_size: Option<usize>) {
+        crate::config::batch_atomicity::set_atomic_batch_chunk_size(namespace, chunk_size);
+    }
+
     pub async fn await_pool_connect_with_timeout<F, T>(
         timeout_seconds: u64,
         connect: F,
@@ -2188,6 +2223,43 @@ pub mod _test_support {
 
     pub fn is_config_validation_rejection(error: &anyhow::Error) -> bool {
         crate::config::validation_pipeline::is_config_validation_rejection(error)
+    }
+
+    pub fn is_row_decode_rejection(error: &anyhow::Error) -> bool {
+        crate::config::db_loader::is_row_decode_rejection(error)
+    }
+
+    pub fn row_decode_rejection_error(
+        resource_type: &'static str,
+        resource_id: Option<&str>,
+        message: &str,
+    ) -> anyhow::Error {
+        anyhow::Error::new(crate::config::db_loader::RowDecodeRejection {
+            resource_type,
+            resource_id: resource_id.map(str::to_string),
+            reason: message.to_string(),
+        })
+    }
+
+    pub fn is_poll_validation_rejection(error: &anyhow::Error) -> bool {
+        crate::modes::is_poll_validation_rejection(error)
+    }
+
+    pub async fn record_config_validation_rejection(
+        db: &std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        db_available: &std::sync::atomic::AtomicBool,
+        config_rejected: &std::sync::atomic::AtomicBool,
+        err: &anyhow::Error,
+        context: &str,
+    ) {
+        crate::modes::record_config_validation_rejection(
+            db,
+            db_available,
+            config_rejected,
+            err,
+            context,
+        )
+        .await
     }
 
     // ── config/mongo_store: classic (DocumentDB) migration-lease builders ─────
@@ -3673,6 +3745,57 @@ pub mod _test_support {
         crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
     }
 
+    /// Public mirror of the crate-private direct-H2 upload gate decision.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum DirectH2UploadGateForTest {
+        Forward,
+        RequestBodyTooLarge,
+        FailClosed,
+    }
+
+    /// Terminal outcome the size-limit adapter reports when it is dropped
+    /// without ever having been polled to a terminal state. Hyper's HTTP/2
+    /// client takes exactly that path for a known end-of-stream request body.
+    pub fn request_body_drop_outcome_for_test(
+        inner_is_end_stream: bool,
+    ) -> crate::proxy::body::RequestBodyOutcome {
+        crate::proxy::body::request_body_drop_outcome(inner_is_end_stream)
+    }
+
+    /// Gate a direct-H2 backend response on the terminal upload outcome.
+    /// `None` models a completion sender dropped without reporting.
+    pub fn direct_h2_upload_gate_for_test(
+        outcome: Option<crate::proxy::body::RequestBodyOutcome>,
+    ) -> DirectH2UploadGateForTest {
+        match crate::proxy::classify_direct_h2_upload_outcome(outcome) {
+            crate::proxy::DirectH2UploadGate::Forward => DirectH2UploadGateForTest::Forward,
+            crate::proxy::DirectH2UploadGate::RequestBodyTooLarge => {
+                DirectH2UploadGateForTest::RequestBodyTooLarge
+            }
+            crate::proxy::DirectH2UploadGate::FailClosed => DirectH2UploadGateForTest::FailClosed,
+        }
+    }
+
+    /// Public mirror of the direct-H2 upload cancellation signal.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum UploadCancelSignalForTest {
+        Cancelled,
+        Idle,
+    }
+
+    /// Drive exactly one cancellation poll of a size-limited request body,
+    /// using the same helper `SizeLimitedIncoming::poll_frame` calls.
+    pub fn poll_upload_cancel_for_test(
+        cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> UploadCancelSignalForTest {
+        match crate::proxy::body::poll_upload_cancel_once(cancel) {
+            crate::proxy::body::UploadCancelSignal::Cancelled => {
+                UploadCancelSignalForTest::Cancelled
+            }
+            crate::proxy::body::UploadCancelSignal::Idle => UploadCancelSignalForTest::Idle,
+        }
+    }
+
     pub fn effective_request_body_limit_for_protocol_for_test(
         is_grpc_request: bool,
         http_limit: usize,
@@ -3738,6 +3861,211 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
+
+    pub use crate::k8s_controller::reconciler::{
+        AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
+        store_accepted_k8s_overlay, swap_merged_k8s_translation,
+    };
+    pub use crate::k8s_controller::{
+        CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+    };
+
+    /// Thin wrapper over the production CP full-reload publication so external
+    /// tests can drive it against real broadcast channels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_full_reload_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+        refreshed_namespaces: &[String],
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) {
+        crate::modes::control_plane::publish_cp_full_reload(
+            publication_gate,
+            config_arc,
+            overlay_slot,
+            db_config,
+            refreshed_namespaces,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+    }
+
+    /// Thin wrapper over the production CP incremental publication.
+    ///
+    /// Returns `(accepted_namespaces, rejected_namespaces)`; the composed view
+    /// itself is not exposed because it carries consumer credentials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_incremental_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+        version: &str,
+        sequence_cursor: u64,
+        poll_timestamp: chrono::DateTime<chrono::Utc>,
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) -> (Vec<String>, Vec<String>) {
+        let outcome = crate::modes::control_plane::publish_cp_incremental(
+            publication_gate,
+            config_arc,
+            partitions,
+            version,
+            sequence_cursor,
+            poll_timestamp,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (accepted, rejected)
+    }
+
+    pub fn cas_publish_db_snapshot_with_k8s_overlay_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+    ) -> std::sync::Arc<crate::config::types::GatewayConfig> {
+        use crate::modes::control_plane::cas_publish_db_snapshot_with_k8s_overlay;
+        cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config)
+    }
+
+    /// Returns `(composed_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn compose_incremental_partitions_for_test(
+        base: &crate::config::types::GatewayConfig,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        use crate::modes::control_plane::compose_incremental_partitions;
+        let outcome = compose_incremental_partitions(base, partitions);
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (outcome.config, accepted, rejected)
+    }
+
+    /// Returns `(published_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn cas_publish_incremental_partitions_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        use crate::modes::control_plane::cas_publish_incremental_partitions;
+        let outcome = cas_publish_incremental_partitions(config_arc, partitions);
+        let published = (*config_arc.load_full()).clone();
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        // When nothing was accepted the ArcSwap is unchanged; return the
+        // compose view so callers can still inspect last-known-good state.
+        let config = if accepted.is_empty() {
+            outcome.config
+        } else {
+            published
+        };
+        (config, accepted, rejected)
+    }
+
+    // ── modes/node_agent watcher exit (#2369) ────────────────────────────────
+    pub type NodeAgentPodWatcherEventForTest = Result<
+        kube::runtime::watcher::Event<k8s_openapi::api::core::v1::Pod>,
+        kube::runtime::watcher::Error,
+    >;
+
+    pub async fn run_with_pod_stream_for_test<S, I>(
+        backend: &mut crate::ebpf::MockEbpfBackend,
+        config: &crate::modes::node_agent::NodeAgentConfig,
+        metrics: Arc<crate::ebpf::NodeAgentMetrics>,
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        pod_stream: S,
+        seed_pods: I,
+    ) -> Result<(), anyhow::Error>
+    where
+        S: futures_util::Stream<Item = NodeAgentPodWatcherEventForTest> + Unpin,
+        I: IntoIterator<Item = crate::ebpf::PodAttachmentState>,
+    {
+        crate::modes::node_agent::run_with_pod_stream_for_test(
+            backend,
+            config,
+            metrics,
+            shutdown_tx,
+            pod_stream,
+            seed_pods,
+        )
+        .await
+    }
+
+    // ── node-agent eBPF startup-rollback seams (issue #2371) ─────────────────
+    pub type NodeAgentStartupCleanupProbe = node_agent_cleanup_seams::NodeAgentStartupCleanupProbe;
+
+    /// Post-`load_programs` initialization failure must roll back BPF state.
+    pub fn node_agent_post_load_init_failure_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_post_load_init_failure_cleanup_for_test()
+    }
+
+    /// A `load_programs` failure created nothing, so it must NOT clean up.
+    pub fn node_agent_pre_load_failure_skips_cleanup_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_pre_load_failure_skips_cleanup_for_test()
+    }
+
+    /// Kubernetes-client-style late failure after successful eBPF init.
+    pub fn node_agent_k8s_client_style_late_failure_cleanup_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_k8s_client_style_late_failure_cleanup_for_test()
+    }
+
+    /// Normal shutdown must invoke `cleanup_all` exactly once.
+    pub fn node_agent_normal_shutdown_cleanup_once_probe_for_test() -> NodeAgentStartupCleanupProbe
+    {
+        node_agent_cleanup_seams::probe_normal_shutdown_cleanup_once_for_test()
+    }
+
+    /// Cleanup failure must preserve the original startup/runtime error.
+    pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
+    -> NodeAgentStartupCleanupProbe {
+        node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
     }
 
     // ── load_balancer first-wave counter seams ───────────────────────────────

@@ -37,7 +37,7 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_request_strip_header, is_proxy_generated_forwarding_header,
+    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
     parse_connection_listed_from_str_map, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
@@ -1290,6 +1290,46 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Placed at exactly
+    // the same point in the ordering as the HTTP/1.1 + HTTP/2 handler — after
+    // the transport-level checks, before routing, plugins, and backend
+    // dispatch — so all three frontend protocols accept and reject the same
+    // set of request targets. Both the local `path` and `ctx.path` are
+    // rebound: the H3 backend URL builders read the local value while plugins
+    // read the context.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for the overwhelming majority of traffic.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            warn!(
+                reason = rejection.reason(),
+                "Rejected HTTP/3 request: ambiguous percent-encoded request path"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path_for_hmac(raw_path);
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
@@ -1356,8 +1396,11 @@ async fn handle_h3_request(
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.
-    // Uses raw_header_get() to read specific headers without materializing the
-    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
+    // Uses the raw header accessors to read specific headers without
+    // materializing the full HashMap — only 2-3 targeted lookups on the raw
+    // HeaderMap. Parity with the H1/H2 path: the configured real-IP header is
+    // read as ALL of its field lines so duplicate lines cannot hide a competing
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
         if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
@@ -1367,15 +1410,6 @@ async fn handle_h3_request(
         ) {
             request_scheme = forwarded_scheme;
         }
-        let real_ip_header_val =
-            state
-                .env_config
-                .real_ip_header
-                .as_ref()
-                .and_then(|real_ip_header| {
-                    // real_ip_header is already lowercase from env config parsing
-                    ctx.raw_header_get(real_ip_header.as_str())
-                });
         let xff_chain = {
             let mut values = ctx.raw_header_values("x-forwarded-for");
             values.next().map(|first| {
@@ -1387,10 +1421,19 @@ async fn handle_h3_request(
                 combined
             })
         };
+        // Bound the immutable borrow of `ctx` (held by the field-line iterator)
+        // to this statement so the assignment below can take a mutable borrow.
         let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
             socket_ip,
             &socket_addr,
-            real_ip_header_val,
+            state
+                .env_config
+                .real_ip_header
+                .as_deref()
+                // real_ip_header is already lowercase from env config parsing
+                .map(|name| ctx.header_field_lines(name))
+                .into_iter()
+                .flatten(),
             xff_chain.as_deref(),
             &state.trusted_proxies,
         )
@@ -1696,6 +1739,11 @@ async fn handle_h3_request(
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    // Same cache generation as `plugins` above: replay provenance must describe
+    // exactly the response-side rules this request will run.
+    ctx.set_response_presentation_policy_digest(
+        plugin_cache_view.response_presentation_policy_digest(),
+    );
     // Resolve the effective gRPC policy before any plugin/body await. Native
     // H3 and the H3→H2 bridge both consume this same monotonic absolute instant
     // instead of reconstructing a fresh timer from a rewritten header.
@@ -7380,10 +7428,11 @@ fn build_h3_backend_headers(
             }
             // RFC 9110 §7.6.1 hop-by-hop strip — see `proxy::headers`.
             n if is_backend_request_strip_header(n) => continue,
-            // Ferrum regenerates X-Forwarded-* below; copying the inbound
-            // value too would duplicate the header (the H1/H2 reqwest paths
-            // and the H3 cross-protocol bridge apply the same skip).
-            n if is_proxy_generated_forwarding_header(n) => continue,
+            // Ferrum regenerates X-Forwarded-* (always) and Forwarded when
+            // `add_forwarded_header` is set. Copying the inbound value too
+            // would duplicate the header (reqwest appends; this Vec push
+            // path would leave the spoofed element first).
+            n if is_proxy_owned_forwarding_header(n, state.add_forwarded_header) => continue,
             // RFC 9110 §7.6.1 Connection-listed strip — see
             // `parse_connection_listed_from_str_map`.
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
@@ -13228,6 +13277,113 @@ mod build_h3_backend_headers_tests {
             header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
             Some("for=203.0.113.1;proto=http;host=api.example"),
             "Forwarded must carry a trusted original HTTP scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_strips_client_forwarded_when_regenerating() {
+        // Issue #2952: when FERRUM_ADD_FORWARDED_HEADER is on, client-supplied
+        // Forwarded must not survive beside the gateway-owned value.
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "forwarded".to_string(),
+            "for=10.0.0.1;proto=https".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str() == "forwarded")
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.1;proto=https;host=api.example"],
+            "only the gateway-owned Forwarded element may reach the H3 backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_strips_mixed_case_and_duplicate_forwarded_when_regenerating() {
+        // Hostile / plugin-injected mixed-case keys and folded duplicates must
+        // fail closed to a single gateway-owned element.
+        let mut state = minimal_proxy_state();
+        state.add_forwarded_header = true;
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "Forwarded".to_string(),
+            "for=10.0.0.1;proto=https, for=198.51.100.7".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        let forwarded: Vec<&str> = out
+            .iter()
+            .filter(|(n, _)| n.as_str().eq_ignore_ascii_case("forwarded"))
+            .filter_map(|(_, v)| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            forwarded,
+            vec!["for=203.0.113.1;proto=https;host=api.example"],
+            "mixed-case / duplicate client Forwarded must not survive regeneration"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_h3_passes_client_forwarded_when_not_regenerating() {
+        let state = minimal_proxy_state();
+        assert!(
+            !state.add_forwarded_header,
+            "default fixture must leave regeneration off"
+        );
+        let proxy = minimal_proxy();
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "api.example".to_string());
+        headers.insert(
+            "forwarded".to_string(),
+            "for=10.0.0.1;proto=https".to_string(),
+        );
+
+        let out = build_h3_backend_headers(
+            &proxy,
+            None,
+            &headers,
+            "203.0.113.1",
+            "203.0.113.1",
+            &state,
+            /* request_is_secure = */ true,
+            /* is_early_data = */ false,
+        );
+
+        assert_eq!(
+            header_value(&out, "forwarded").and_then(|v| v.to_str().ok()),
+            Some("for=10.0.0.1;proto=https"),
+            "client Forwarded passes through when Ferrum is not regenerating it"
         );
     }
 

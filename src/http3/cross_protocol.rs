@@ -2856,11 +2856,15 @@ where
                                 &mut response_headers,
                             );
                         } else {
-                            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                                 ctx,
+                                &mut response_status,
                                 &mut response_headers,
-                                response_body.len(),
-                            );
+                                &mut response_body,
+                            ) {
+                                response_body_rejected = true;
+                                break;
+                            }
                         }
                         ctx.record_deadline_response_header_plugin(
                             plugin.as_ref(),
@@ -4944,11 +4948,15 @@ where
                         );
                         representation_rewritten = true;
                     } else {
-                        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                        if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                             ctx,
+                            &mut response_status,
                             &mut plugin_response_headers,
-                            response_body.len(),
-                        );
+                            &mut response_body,
+                        ) {
+                            response_body_rejected = true;
+                            break;
+                        }
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),
@@ -7748,11 +7756,44 @@ fn parse_reqwest_method(method: &str) -> Option<reqwest::Method> {
     }
 }
 
+/// Closed inventory backing [`should_skip_cross_protocol_backend_header`].
+/// Lowercase; the predicate below matches these ASCII case-insensitively.
+const CROSS_PROTOCOL_BACKEND_SKIP_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "keep-alive",
+    "te",
+    "trailer",
+    "proxy-authorization",
+    "proxy-connection",
+    "upgrade",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+    "x-forwarded-host",
+    "via",
+    "forwarded",
+];
+
 /// Headers the H3 cross-protocol bridge must never forward to non-H3
 /// backends. This is the shared filter for both the plain and gRPC
 /// bridge paths so the two cannot drift.
+///
+/// The forwarding-identity names here (`x-forwarded-*`, `via`, `forwarded`)
+/// are the cross-protocol half of the ownership contract enforced on primary
+/// dispatch by `proxy::headers::is_proxy_owned_forwarding_header`: the bridge
+/// always strips them, then regenerates the gateway-owned values below.
+/// Matching is ASCII case-insensitive for the same reason that predicate is —
+/// H3 wire names are lowercase, but a plugin-synthesised mixed-case key in the
+/// materialised `HashMap<String, String>` would otherwise bypass the strip, and
+/// the plain builder's `reqwest::RequestBuilder::header` APPENDS, so a spoofed
+/// `Forwarded` would precede the gateway-owned element on the wire.
+///
+/// Hot path: the lowercase `matches!` arm answers every real request with no
+/// scan. The case-insensitive sweep is only reached for a name that actually
+/// carries an uppercase ASCII byte, and it allocates nothing.
 fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
-    matches!(
+    if matches!(
         name,
         "connection"
             | "content-length"
@@ -7768,7 +7809,13 @@ fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
             | "x-forwarded-host"
             | "via"
             | "forwarded"
-    )
+    ) {
+        return true;
+    }
+    name.bytes().any(|b| b.is_ascii_uppercase())
+        && CROSS_PROTOCOL_BACKEND_SKIP_NAMES
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 #[cfg(test)]
@@ -7916,6 +7963,42 @@ mod tests {
                 !should_skip_cross_protocol_backend_header(name),
                 "{name} should be forwarded"
             );
+        }
+    }
+
+    #[test]
+    fn cross_protocol_backend_header_filter_is_case_insensitive() {
+        // Issue #2952 ownership parity: the plain bridge builder appends via
+        // `reqwest::RequestBuilder::header`, so a mixed-case forwarding key
+        // that escaped the strip would land BEFORE the gateway-owned element.
+        for name in [
+            "Forwarded",
+            "FORWARDED",
+            "X-Forwarded-For",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Host",
+            "Via",
+            "Connection",
+            "Transfer-Encoding",
+        ] {
+            assert!(
+                should_skip_cross_protocol_backend_header(name),
+                "{name} must be stripped regardless of case"
+            );
+        }
+        for name in ["Content-Type", "User-Agent", "X-Forwarded"] {
+            assert!(
+                !should_skip_cross_protocol_backend_header(name),
+                "{name} should be forwarded"
+            );
+        }
+        // The lowercase inventory and the case-insensitive sweep are the same
+        // closed set — neither may grow a name the other lacks.
+        for name in super::CROSS_PROTOCOL_BACKEND_SKIP_NAMES {
+            assert!(should_skip_cross_protocol_backend_header(name));
+            assert!(should_skip_cross_protocol_backend_header(
+                &name.to_ascii_uppercase()
+            ));
         }
     }
 

@@ -957,3 +957,534 @@ async fn fetch_x509svid_rotation_task_exits_when_client_drops_stream() {
     .await
     .expect("rotation stream task did not exit after client dropped stream");
 }
+
+// ── Capacity-one / latest-wins rotation bounds ───────────────────────────
+
+#[tokio::test]
+async fn latest_wins_channel_drops_superseded_values_and_stays_capacity_one() {
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Probe {
+        id: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (tx, mut rx) = latest_wins::channel::<Probe>();
+
+    assert!(tx.publish(Probe {
+        id: 0,
+        drops: Arc::clone(&drops),
+    }));
+    assert_eq!(rx.pending_len(), 1);
+
+    for id in 1..=64 {
+        assert!(tx.publish(Probe {
+            id,
+            drops: Arc::clone(&drops),
+        }));
+        assert_eq!(
+            rx.pending_len(),
+            1,
+            "latest-wins must retain at most one unread value"
+        );
+    }
+
+    // 64 superseded probes dropped by replace; id 64 still pending.
+    assert_eq!(drops.load(Ordering::SeqCst), 64);
+    let newest = rx.recv().await.expect("newest probe");
+    assert_eq!(newest.id, 64);
+    assert_eq!(rx.pending_len(), 0);
+    drop(newest);
+    assert_eq!(drops.load(Ordering::SeqCst), 65);
+}
+
+#[tokio::test]
+async fn latest_wins_receiver_drop_clears_pending_and_wakes_closed() {
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Secret(Arc<AtomicUsize>);
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = latest_wins::channel::<Secret>();
+    assert!(tx.publish(Secret(Arc::clone(&drops))));
+    assert_eq!(rx.pending_len(), 1);
+
+    let closed = tokio::spawn(async move {
+        tx.closed().await;
+    });
+    drop(rx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), closed)
+        .await
+        .expect("closed() must resolve after receiver drop")
+        .expect("closed waiter panicked");
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "pending secret-bearing value must drop on stream cancel"
+    );
+}
+
+#[tokio::test]
+async fn latest_wins_publish_after_cancel_is_rejected_and_drops_payload() {
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Secret(Arc<AtomicUsize>);
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = latest_wins::channel::<Secret>();
+    drop(rx);
+
+    assert!(
+        !tx.publish(Secret(Arc::clone(&drops))),
+        "publish after cancel must report the receiver is gone"
+    );
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "a rejected publish must drop its private-key-bearing payload immediately, \
+         not park it in an orphaned slot"
+    );
+}
+
+#[tokio::test]
+async fn latest_wins_publish_racing_receiver_drop_never_retains_payload() {
+    // Regression: the cancel flag must be published under the slot lock. If it
+    // is stored only after the lock is released, a publish that acquires the
+    // lock in between sees `receiver_gone == false`, lands its value in the
+    // just-cleared slot, and that payload stays alive until the producer next
+    // notices the closure — for the client relay, until the agent sends
+    // another frame. Whichever side wins the lock, no value may be retained
+    // while the sender is still alive.
+    use ferrum_edge::identity::workload_api::latest_wins;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Secret(Arc<AtomicUsize>);
+    impl Drop for Secret {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    for round in 0..256 {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = latest_wins::channel::<Secret>();
+        let dropper = std::thread::spawn(move || drop(rx));
+        let _accepted = tx.publish(Secret(Arc::clone(&drops)));
+        dropper.join().expect("receiver dropper thread panicked");
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "round {round}: payload retained in an orphaned slot after stream cancel"
+        );
+        drop(tx);
+    }
+}
+
+#[tokio::test]
+async fn fetch_x509svid_slow_consumer_coalesces_rotations_to_newest_state() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::server::WorkloadApiService;
+    use tokio::sync::watch;
+    use tokio_stream::StreamExt;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
+
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca.clone(),
+        trust_domain,
+        600,
+        Arc::clone(&rotation),
+    );
+
+    let resp = svc
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .unwrap();
+    let mut stream = resp.into_inner();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("stream ended unexpectedly")
+        .expect("first message was an error");
+    assert_eq!(first.svids[0].x509_svid, b"stub-cert-0");
+    assert_eq!(
+        ca.counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "open must mint exactly once"
+    );
+
+    // Stop polling and fire many rotations. The producer must not retain a
+    // FIFO of private-key-bearing responses — only the newest state survives.
+    const ROTATIONS: u64 = 48;
+    for _ in 0..ROTATIONS {
+        rotation.send_modify(|v| *v += 1);
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let seen = ca.counter.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if ca.counter.load(std::sync::atomic::Ordering::SeqCst) == seen && seen > 1 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("rotation producer did not settle after burst");
+
+    let minted = ca.counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        minted > 1,
+        "slow-consumer burst must still advance issuance (got {minted})"
+    );
+    let expected_cert = format!("stub-cert-{}", minted - 1).into_bytes();
+
+    let latest = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for coalesced newest state")
+        .expect("stream ended unexpectedly")
+        .expect("coalesced push was an error");
+    assert_eq!(
+        latest.svids[0].x509_svid, expected_cert,
+        "resume must deliver the newest minted SVID, not an intermediate"
+    );
+
+    // No backlog of superseded rotations: without a further epoch, next() waits.
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    assert!(
+        no_backlog.is_err(),
+        "capacity-one delivery must not flush a FIFO of superseded SVIDs"
+    );
+}
+
+#[tokio::test]
+async fn fetch_x509_bundles_slow_consumer_coalesces_to_newest_state() {
+    use ferrum_edge::identity::workload_api::proto::X509BundlesRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use ferrum_edge::identity::workload_api::server::WorkloadApiService;
+    use tokio::sync::watch;
+    use tokio_stream::StreamExt;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let ca: Arc<dyn CertificateAuthority> = Arc::new(StubCa {
+        trust_domain: trust_domain.clone(),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
+
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca,
+        trust_domain.clone(),
+        600,
+        Arc::clone(&rotation),
+    );
+
+    let resp = svc
+        .fetch_x509_bundles(workload_request(X509BundlesRequest {}))
+        .await
+        .unwrap();
+    let mut stream = resp.into_inner();
+    let _first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first bundle")
+        .expect("stream ended unexpectedly")
+        .expect("first bundle was an error");
+
+    for _ in 0..32 {
+        rotation.send_modify(|v| *v += 1);
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let latest = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for coalesced bundle")
+        .expect("stream ended unexpectedly")
+        .expect("coalesced bundle was an error");
+    assert!(latest.bundles.contains_key(trust_domain.as_str()));
+
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    assert!(
+        no_backlog.is_err(),
+        "bundle stream must not retain a FIFO across slow-consumer rotations"
+    );
+}
+
+#[tokio::test]
+async fn client_relay_slow_consumer_coalesces_to_newest_bundle() {
+    use ferrum_edge::identity::workload_api::client::WorkloadApiClient;
+    use ferrum_edge::identity::workload_api::proto::{X509svid, X509svidResponse};
+    use tokio_stream::StreamExt;
+
+    fn test_x509_svid(spiffe_id: &str) -> X509svid {
+        use ferrum_edge::identity::spiffe::spiffe_id_to_san;
+        use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        let cert = params.self_signed(&key).expect("self-signed leaf");
+        X509svid {
+            spiffe_id: spiffe_id.to_string(),
+            x509_svid: cert.der().as_ref().to_vec(),
+            x509_svid_key: key.serialize_der(),
+            bundle: cert.der().as_ref().to_vec(),
+            hint: String::new(),
+        }
+    }
+
+    let spiffe = "spiffe://td.test/ns/default/sa/edge";
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<Result<X509svidResponse, tonic::Status>>(4);
+    let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+    let (mut stream, ready) = WorkloadApiClient::relay_x509_svid_stream(inbound, None);
+
+    let first_svid = test_x509_svid(spiffe);
+    let first_key = first_svid.x509_svid_key.clone();
+    inbound_tx
+        .send(Ok(X509svidResponse {
+            svids: vec![first_svid],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        }))
+        .await
+        .expect("send first");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), ready)
+        .await
+        .expect("oneshot first-ready timed out")
+        .expect("oneshot first-ready dropped");
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first relayed bundle")
+        .expect("relay ended")
+        .expect("first relay error");
+    assert_eq!(first.private_key_pkcs8_der.as_slice(), first_key.as_slice());
+
+    // Stop polling the client relay and push many rotations through the inbound
+    // stream. The capacity-one slot must retain only the newest decoded bundle.
+    const ROTATIONS: u64 = 40;
+    let mut last_key = Vec::new();
+    for _ in 1..=ROTATIONS {
+        let svid = test_x509_svid(spiffe);
+        last_key = svid.x509_svid_key.clone();
+        inbound_tx
+            .send(Ok(X509svidResponse {
+                svids: vec![svid],
+                crl: Vec::new(),
+                federated_bundles: Default::default(),
+            }))
+            .await
+            .expect("send rotation");
+    }
+
+    // Wait until the inbound queue is drained so the relay has published the
+    // newest frame (and dropped superseded private-key payloads) before we resume.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while inbound_tx.capacity() < 4 {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client relay did not drain inbound rotations");
+
+    let latest = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for coalesced client bundle")
+        .expect("relay ended")
+        .expect("coalesced relay error");
+    assert_eq!(
+        latest.private_key_pkcs8_der.as_slice(),
+        last_key.as_slice(),
+        "client relay resume must deliver the newest private-key-bearing bundle"
+    );
+
+    let no_backlog =
+        tokio::time::timeout(std::time::Duration::from_millis(75), stream.next()).await;
+    assert!(
+        no_backlog.is_err(),
+        "client relay must not retain a FIFO of superseded SVID bundles"
+    );
+}
+
+#[tokio::test]
+async fn client_relay_drop_cancels_silent_upstream_stream_promptly() {
+    use ferrum_edge::identity::workload_api::client::WorkloadApiClient;
+    use ferrum_edge::identity::workload_api::proto::X509svidResponse;
+
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<Result<X509svidResponse, tonic::Status>>(1);
+    let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+    let (stream, _ready) = WorkloadApiClient::relay_x509_svid_stream(inbound, None);
+
+    // No agent frame is ever sent. Dropping the downstream stream must wake
+    // the relay through LatestWinsSender::closed(), drop the inbound receiver,
+    // and therefore close the producer side without waiting for a rotation.
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), inbound_tx.closed())
+        .await
+        .expect("relay retained a silent upstream stream after consumer cancellation");
+}
+
+#[tokio::test]
+async fn client_relay_decode_error_is_terminal_and_not_masked_by_a_later_good_frame() {
+    // Regression: with an unbounded FIFO relay, a decode failure was always
+    // delivered. Under capacity-one latest-wins, a decode failure that stayed
+    // non-terminal could be overwritten by the next good frame before a slow
+    // consumer polled — so a pinned-SPIFFE-ID violation reached neither the
+    // consumer's `warn!` nor `mesh_cert_rotation_failures_total`. The decode
+    // error must be terminal, exactly like a transport error.
+    use ferrum_edge::identity::workload_api::client::WorkloadApiClient;
+    use ferrum_edge::identity::workload_api::proto::{X509svid, X509svidResponse};
+    use tokio_stream::StreamExt;
+
+    fn svid_frame(spiffe_id: &str) -> X509svidResponse {
+        use ferrum_edge::identity::spiffe::spiffe_id_to_san;
+        use rcgen::{CertificateParams, DistinguishedName, IsCa, KeyPair};
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(365);
+        let id = SpiffeId::new(spiffe_id).expect("valid SPIFFE ID");
+        params
+            .subject_alt_names
+            .push(spiffe_id_to_san(&id).expect("spiffe SAN"));
+        let cert = params.self_signed(&key).expect("self-signed leaf");
+        X509svidResponse {
+            svids: vec![X509svid {
+                spiffe_id: spiffe_id.to_string(),
+                x509_svid: cert.der().as_ref().to_vec(),
+                x509_svid_key: key.serialize_der(),
+                bundle: cert.der().as_ref().to_vec(),
+                hint: String::new(),
+            }],
+            crl: Vec::new(),
+            federated_bundles: Default::default(),
+        }
+    }
+
+    let pinned = SpiffeId::new("spiffe://td.test/ns/default/sa/edge").expect("pinned id");
+
+    // Buffer BOTH frames before the relay task can observe either one, so the
+    // ordering under test is deterministic: a wrong-identity frame immediately
+    // followed by a correct one.
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<Result<X509svidResponse, tonic::Status>>(4);
+    inbound_tx
+        .send(Ok(svid_frame("spiffe://td.test/ns/default/sa/attacker")))
+        .await
+        .expect("buffer wrong-identity frame");
+    inbound_tx
+        .send(Ok(svid_frame("spiffe://td.test/ns/default/sa/edge")))
+        .await
+        .expect("buffer good frame");
+    drop(inbound_tx);
+
+    let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+    let (mut stream, _ready) =
+        WorkloadApiClient::relay_x509_svid_stream(inbound, Some(pinned.clone()));
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for the relayed decode error")
+        .expect("relay ended without surfacing the decode error");
+    // `SvidBundle` deliberately has no `Debug` (it holds private-key material),
+    // so unwrap the error arm by hand rather than via `expect_err`.
+    let err = match first {
+        Err(e) => e,
+        Ok(_) => panic!("pinned-SPIFFE-ID violation must not be masked by a later good frame"),
+    };
+    assert!(
+        err.to_string().contains(pinned.as_str()),
+        "decode error must name the configured SPIFFE ID (got: {err})"
+    );
+
+    let after = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for relay termination");
+    assert!(
+        after.is_none(),
+        "a decode error must terminate the relay like a transport error does"
+    );
+}
+
+#[tokio::test]
+async fn workload_api_sources_avoid_unbounded_rotation_queues() {
+    // Guard against regressing to unbounded mpsc for secret-bearing rotation
+    // streams; capacity-one latest-wins + oneshot first-ready are load-bearing.
+    let server = include_str!("../../../src/identity/workload_api/server.rs");
+    let client = include_str!("../../../src/identity/workload_api/client.rs");
+    assert!(
+        server.contains("latest_wins::channel"),
+        "server rotation streams must use capacity-one latest-wins delivery"
+    );
+    assert!(
+        !server.contains("unbounded_channel"),
+        "server must not reintroduce unbounded rotation queues"
+    );
+    assert!(
+        client.contains("latest_wins::channel"),
+        "client relay must use capacity-one latest-wins delivery"
+    );
+    assert!(
+        client.contains("oneshot::channel"),
+        "client first-ready signal must be a oneshot"
+    );
+    assert!(
+        !client.contains("unbounded_channel"),
+        "client must not reintroduce unbounded relay queues"
+    );
+}

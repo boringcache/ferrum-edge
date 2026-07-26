@@ -946,6 +946,9 @@ pub struct EnvConfig {
     /// Shared observability lifecycle and per-process-sink drain timeout.
     /// Default: 2000 ms.
     pub log_shutdown_drain_timeout_ms: u64,
+    /// Aggregate admitted terminal/mirror/deadline-cleanup task budget.
+    /// Default: 4096.
+    pub log_delivery_max_tasks: usize,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
     /// include its own `?poll=` option. Clamped to 1 second minimum and 24 hours
@@ -1243,6 +1246,23 @@ pub struct EnvConfig {
     /// Path to PEM CA bundle for verifying DP client certificates (mTLS).
     /// When set, the CP requires and verifies client certificates from DPs.
     pub cp_grpc_tls_client_ca_path: Option<String>,
+    /// Maximum concurrent CP gRPC listener connections, counted from **before**
+    /// the TLS/mTLS handshake starts through the end of the served HTTP/2
+    /// session. A permit is acquired before any per-socket handshake task is
+    /// allocated, so an unauthenticated client cannot grow descriptor, memory,
+    /// or scheduler usage past this bound by opening sockets and withholding
+    /// the TLS ClientHello (advisory GHSA-2xqr-7j7p-77qp). Shared across the
+    /// plaintext listener and every TLS certificate-reload generation.
+    /// `FERRUM_CP_GRPC_MAX_CONNECTIONS`. Default 1024; `0` = unlimited (not
+    /// recommended on a reachable CP).
+    pub cp_grpc_max_connections: usize,
+    /// Maximum concurrent CP gRPC listener connections from one source IP, so a
+    /// single host cannot consume the whole `cp_grpc_max_connections` budget.
+    /// `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP`. Default 64; `0` disables per-IP
+    /// limiting. Must not exceed `cp_grpc_max_connections` when both are set —
+    /// a larger per-IP cap can never fire and is refused at startup rather than
+    /// silently ignored.
+    pub cp_grpc_max_connections_per_ip: usize,
     /// Capacity of the tokio broadcast channel used to fan out config deltas
     /// to subscribed Data Planes. When a DP lags behind by more than this many
     /// updates, it receives a full config snapshot instead of the missed deltas.
@@ -1701,6 +1721,15 @@ pub struct EnvConfig {
     pub admin_read_only: bool,
     /// Enable database-backed Admin API mutation audit events. Default: false.
     pub admin_audit_enabled: bool,
+    /// Optional age-based audit retention in days (`FERRUM_AUDIT_RETENTION_DAYS`).
+    /// Unset disables age prune. When set, must be in `1..=36_500`. Distinct from
+    /// audit delivery-loss hardening (#2421): this only bounds retained rows.
+    pub audit_retention_days: Option<u64>,
+    /// Per-namespace audit row cap (`FERRUM_AUDIT_RETENTION_MAX_ROWS`).
+    /// Defaults to 100,000. Set to `0` to disable the row cap (retain audit rows
+    /// indefinitely by count). Non-zero values must be in `1..=10_000_000`.
+    /// Newest events win under deterministic `(ts, id)` ordering.
+    pub audit_retention_max_rows: Option<u64>,
     /// Require admin JWTs to carry an `ns` claim authorizing the
     /// `X-Ferrum-Namespace` value on namespace-scoped admin routes.
     /// Mirrors `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` on the gRPC plane.
@@ -2056,6 +2085,38 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
+    /// Absolute deadline (seconds) for reading a **1 MiB** admin request body,
+    /// applied to every admin body-collecting handler including the API-spec
+    /// ones. A size cap alone does not bound *time*: a client that trickles one
+    /// byte per interval pins a task and its buffer indefinitely, and over
+    /// HTTP/2 a single connection can multiplex many such streams.
+    ///
+    /// Routes with a larger size cap scale the deadline by that cap, so the
+    /// bound is one shared minimum throughput rather than a flat wall clock
+    /// that would demand 25x/100x the upload rate from `POST`/`PUT /api-specs`
+    /// (`FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`) and `POST /restore`
+    /// (`FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`). At the defaults that is
+    /// 30 s for 1 MiB, 750 s for a 25 MiB spec, and 3000 s for a 100 MiB
+    /// restore. `0` disables the deadline on every route (bodies are then
+    /// bounded only by size). Default: 30 seconds.
+    pub admin_body_read_timeout_seconds: u64,
+
+    /// Server-advertised `SETTINGS_MAX_CONCURRENT_STREAMS` for admin HTTP/2
+    /// connections (TLS via ALPN `h2`, plaintext via h2c prior knowledge).
+    /// Bounds how many requests one admin connection can multiplex, so the
+    /// admin connection cap (`FERRUM_ADMIN_MAX_CONNECTIONS`) also bounds the
+    /// number of retained request tasks/buffers. Default: 64.
+    pub admin_http2_max_concurrent_streams: u32,
+
+    /// Server-advertised `SETTINGS_MAX_HEADER_LIST_SIZE` for admin HTTP/2
+    /// connections. Bounds the header block a single stream may accumulate
+    /// across `HEADERS` + `CONTINUATION` frames before the peer is reset, which
+    /// is the HTTP/2 analogue of the HTTP/1.1 header-read bound. Admin requests
+    /// carry only a bearer token and a few small headers. Clamped to a 1 KiB
+    /// floor so a misconfiguration cannot lock out ordinary JWTs.
+    /// Default: 65536 (64 KiB).
+    pub admin_http2_max_header_list_size_bytes: u32,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -2324,6 +2385,7 @@ impl Default for EnvConfig {
             log_max_record_bytes: crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT,
             log_shutdown_drain_timeout_ms: crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT
                 as u64,
+            log_delivery_max_tasks: crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT,
             secret_refresh_interval_seconds:
                 crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS,
             acme_auto_renew_enabled: false,
@@ -2396,6 +2458,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
+            cp_grpc_max_connections: 1024,
+            cp_grpc_max_connections_per_ip: 64,
             cp_broadcast_channel_capacity: 128,
             cp_namespaces: Vec::new(),
             cp_require_namespace_claim: false,
@@ -2506,6 +2570,8 @@ impl Default for EnvConfig {
             tls_no_verify: false,
             admin_read_only: false,
             admin_audit_enabled: false,
+            audit_retention_days: None,
+            audit_retention_max_rows: Some(crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT),
             admin_require_namespace_claim: false,
             admin_tls_no_verify: false,
             stream_proxy_bind_address: "0.0.0.0".into(),
@@ -2574,6 +2640,11 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_body_read_timeout_seconds: crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS,
+            admin_http2_max_concurrent_streams:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS,
+            admin_http2_max_header_list_size_bytes:
+                crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -2657,6 +2728,7 @@ impl EnvConfig {
             log_buffer_bytes: usize = "FERRUM_LOG_BUFFER_BYTES" => crate::logging::LOG_BUFFER_BYTES_DEFAULT, clamp(crate::logging::LOG_BUFFER_BYTES_MIN, crate::logging::LOG_BUFFER_BYTES_MAX);
             log_max_record_bytes: usize = "FERRUM_LOG_MAX_RECORD_BYTES" => crate::logging::LOG_MAX_RECORD_BYTES_DEFAULT, clamp(crate::logging::LOG_MAX_RECORD_BYTES_MIN, crate::logging::LOG_MAX_RECORD_BYTES_MAX);
             log_shutdown_drain_timeout_ms: u64 = "FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS" => crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT as u64, clamp(crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN as u64, crate::logging::LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX as u64);
+            log_delivery_max_tasks: usize = "FERRUM_LOG_DELIVERY_MAX_TASKS" => crate::logging::LOG_DELIVERY_MAX_TASKS_DEFAULT, clamp(crate::logging::LOG_DELIVERY_MAX_TASKS_MIN, crate::logging::LOG_DELIVERY_MAX_TASKS_MAX);
             secret_refresh_interval_seconds: u64 = "FERRUM_SECRET_REFRESH_INTERVAL_SECONDS" => crate::tls::source::subscription::DEFAULT_SECRET_REFRESH_INTERVAL_SECS, clamp(1u64, 86_400u64);
             acme_auto_renew_enabled: bool = "FERRUM_ACME_AUTO_RENEW_ENABLED" => false;
             acme_renew_when_remaining_days: u64 = "FERRUM_ACME_RENEW_WHEN_REMAINING_DAYS" => 30u64, clamp(1u64, 365u64);
@@ -2700,8 +2772,17 @@ impl EnvConfig {
             admin_jwt_max_ttl: u64 = "FERRUM_ADMIN_JWT_MAX_TTL" => 3600u64;
             admin_jwt_audience: Option<String> = "FERRUM_ADMIN_JWT_AUDIENCE";
             admin_audit_enabled: bool = "FERRUM_ADMIN_AUDIT_ENABLED" => false;
+            audit_retention_days: Option<u64> = "FERRUM_AUDIT_RETENTION_DAYS";
+            audit_retention_max_rows: u64 = "FERRUM_AUDIT_RETENTION_MAX_ROWS"
+                => crate::admin::audit::AUDIT_RETENTION_MAX_ROWS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
+        let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
+            audit_retention_days,
+            Some(audit_retention_max_rows),
+        )?;
+        let audit_retention_days = audit_retention_policy.retention_days;
+        let audit_retention_max_rows = audit_retention_policy.max_rows_per_namespace;
 
         env_config! {
             conf = conf, mode = &mode;
@@ -2799,6 +2880,8 @@ impl EnvConfig {
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
+            cp_grpc_max_connections: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS" => 1024usize;
+            cp_grpc_max_connections_per_ip: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP" => 64usize;
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
@@ -3009,6 +3092,9 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => crate::admin::DEFAULT_ADMIN_BODY_READ_TIMEOUT_SECONDS;
+            admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS, max(1u32);
+            admin_http2_max_header_list_size_bytes: u32 = "FERRUM_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES" => crate::admin::DEFAULT_ADMIN_HTTP2_MAX_HEADER_LIST_SIZE_BYTES, max(1_024u32);
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -3381,6 +3467,7 @@ impl EnvConfig {
             log_buffer_bytes,
             log_max_record_bytes,
             log_shutdown_drain_timeout_ms,
+            log_delivery_max_tasks,
             secret_refresh_interval_seconds,
             acme_auto_renew_enabled,
             acme_renew_when_remaining_days,
@@ -3451,6 +3538,8 @@ impl EnvConfig {
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
             cp_grpc_tls_client_ca_path,
+            cp_grpc_max_connections,
+            cp_grpc_max_connections_per_ip,
             cp_broadcast_channel_capacity,
             cp_namespaces,
             cp_require_namespace_claim,
@@ -3562,6 +3651,8 @@ impl EnvConfig {
             tls_no_verify,
             admin_read_only,
             admin_audit_enabled,
+            audit_retention_days,
+            audit_retention_max_rows,
             admin_require_namespace_claim,
             admin_tls_no_verify,
             enable_http3,
@@ -3630,6 +3721,9 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_body_read_timeout_seconds,
+            admin_http2_max_concurrent_streams,
+            admin_http2_max_header_list_size_bytes,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,
@@ -5073,6 +5167,92 @@ impl EnvConfig {
         // operator made an explicit, auditable choice to permit it.
         self.validate_cp_dp_grpc_transport_security()?;
 
+        // Bounded pre-authentication admission on the CP gRPC listener.
+        self.validate_cp_grpc_connection_limits()?;
+
+        // The forwarding trust boundary is parsed strictly here so a typo fails
+        // `ferrum-edge validate` and fails startup before any listener binds,
+        // rather than quietly shrinking the trust set at runtime.
+        self.validate_trusted_proxies()?;
+
+        Ok(())
+    }
+
+    /// Reject a `FERRUM_TRUSTED_PROXIES` list that is not entirely valid.
+    ///
+    /// This list decides whose `X-Forwarded-For`, `X-Forwarded-Proto`,
+    /// configured real-IP header, and inbound PROXY-protocol header Ferrum
+    /// believes. Retaining only the parseable entries after a typo is not a
+    /// smaller trust set in any useful sense — it silently moves an
+    /// authorization and abuse-control identity boundary: the mistyped hop stops
+    /// being trusted, so every client behind it collapses onto that hop's socket
+    /// address for `ip_restriction`, GeoIP, bot/client attribution, per-IP rate
+    /// and concurrency keys, and logs. Every entry must therefore parse, and
+    /// empty/trailing/doubled comma segments are typos, not empty configuration.
+    /// A wholly empty value stays valid: it is the secure default in which
+    /// forwarded metadata is ignored altogether.
+    ///
+    /// Parses through the shared `CidrSet` so validation and the runtime filter
+    /// agree on canonical IPv4/IPv6/mapped forms; the set is discarded here
+    /// because `ProxyState` builds the enforcing one (strictly, again) at
+    /// construction.
+    fn validate_trusted_proxies(&self) -> Result<(), String> {
+        crate::util::cidr::CidrSet::parse_strict(&self.trusted_proxies).map_err(|e| {
+            format!(
+                "Invalid FERRUM_TRUSTED_PROXIES {}: {e}. Every entry must be a valid IP or CIDR \
+                 and empty comma segments are rejected — a partially parsed forwarding trust \
+                 boundary would silently change which peers may assert a client identity.",
+                crate::secrets::quoted_env_value("FERRUM_TRUSTED_PROXIES", &self.trusted_proxies)
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Validate the CP gRPC pre-authentication admission caps
+    /// (`FERRUM_CP_GRPC_MAX_CONNECTIONS` / `..._PER_IP`, advisory
+    /// GHSA-2xqr-7j7p-77qp). Scoped to CP mode — no other mode builds the
+    /// limiter, so a stray variable elsewhere must not fail startup.
+    ///
+    /// Two rules, both fail-closed rather than silently degrading:
+    ///
+    /// 1. Neither value may exceed the tokio semaphore ceiling. `ConnLimiter`
+    ///    clamps, and a silent clamp hides that the configured number is not
+    ///    the enforced number.
+    /// 2. A per-IP cap larger than the global cap can never fire, so one host
+    ///    could still consume the entire global budget. That is exactly the
+    ///    condition the per-IP cap exists to prevent, so it is a configuration
+    ///    error rather than a no-op.
+    pub fn validate_cp_grpc_connection_limits(&self) -> Result<(), String> {
+        if !matches!(self.mode, OperatingMode::ControlPlane) {
+            return Ok(());
+        }
+        let max_conn_limit = crate::util::conn_limit::MAX_CONN_LIMIT;
+        if self.cp_grpc_max_connections > max_conn_limit {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the cap entirely.",
+                self.cp_grpc_max_connections
+            ));
+        }
+        if self.cp_grpc_max_connections_per_ip > max_conn_limit {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP ({}) exceeds the maximum supported value \
+                 {max_conn_limit}. Use 0 to disable the per-IP cap.",
+                self.cp_grpc_max_connections_per_ip
+            ));
+        }
+        if self.cp_grpc_max_connections > 0
+            && self.cp_grpc_max_connections_per_ip > self.cp_grpc_max_connections
+        {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP ({}) is greater than \
+                 FERRUM_CP_GRPC_MAX_CONNECTIONS ({}), so the per-IP cap can never be reached and \
+                 a single source IP could consume the entire CP gRPC connection budget. Lower the \
+                 per-IP cap, raise the global cap, or set the per-IP cap to 0 to disable it \
+                 deliberately.",
+                self.cp_grpc_max_connections_per_ip, self.cp_grpc_max_connections
+            ));
+        }
         Ok(())
     }
 

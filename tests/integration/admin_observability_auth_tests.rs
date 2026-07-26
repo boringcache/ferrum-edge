@@ -94,6 +94,7 @@ fn admin_state(metrics_auth: MetricsAuthPolicy) -> AdminState {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -375,7 +376,8 @@ async fn metrics_allows_allowlisted_cidr_unauthenticated() {
     // Loopback is allowlisted, so an unauthenticated scrape from 127.0.0.1
     // (the test client) is permitted.
     let policy = MetricsAuthPolicy {
-        allowed_cidrs: TrustedProxies::parse("127.0.0.1/32,::1"),
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
         bearer_token: None,
     };
     let (base, _sd) = start_admin(admin_state(policy)).await;

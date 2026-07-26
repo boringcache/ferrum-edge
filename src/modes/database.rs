@@ -938,6 +938,12 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            let retention_policy = crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            };
+            retention_policy.log_if_enabled();
+            store.set_audit_retention_policy(retention_policy);
             store.run_migrations().await?;
             Box::new(store)
         }
@@ -1003,6 +1009,12 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            let retention_policy = crate::admin::audit::AuditRetentionPolicy {
+                retention_days: env_config.audit_retention_days,
+                max_rows_per_namespace: env_config.audit_retention_max_rows,
+            };
+            retention_policy.log_if_enabled();
+            store.set_audit_retention_policy(retention_policy);
 
             // Connect read replica for admin-only read offload. Runtime
             // config polling remains primary-consistent.
@@ -1133,13 +1145,15 @@ pub async fn run(
             // (serve backup, publish config_rejected, and enable writes after
             // the recovery migration gate)
             // and is left unclassified so no "refusing to bootstrap" wrapper
-            // clouds the rejection log. Every OTHER non-transient failure
-            // (schema drift, bad rows, decode, query, auth) is classified and
-            // must fail startup rather than mask a broken database with stale
-            // on-disk config — the same policy the connect path applies via
-            // `is_non_transient_init_error`. Only transient connectivity/
-            // resource errors are silently backup-eligible.
-            let e = if crate::modes::is_poll_validation_rejection(&e) {
+            // clouds the rejection log. Row-DECODE rejections (issue #2997) are
+            // deliberately NOT backup-eligible here — startup stays fail-loud so
+            // a broken row cannot be masked by stale on-disk config; the poll
+            // loop still classifies them via `is_poll_validation_rejection` to
+            // keep admin writable after a successful boot. Every OTHER
+            // non-transient failure (schema drift, query, auth) is classified
+            // and must fail startup. Only transient connectivity/resource
+            // errors are silently backup-eligible.
+            let e = if crate::config::validation_pipeline::is_config_validation_rejection(&e) {
                 e
             } else {
                 DatabaseStore::classify_initial_config_load_error(e)
@@ -1155,8 +1169,12 @@ pub async fn run(
                     e, path
                 );
                 match load_config_backup(path) {
-                    Some(cfg) => {
-                        startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);
+                    // Result-shaped backup loader (#3153); startup seeds
+                    // config_rejected only for ConfigValidationRejection so
+                    // RowDecodeRejection stays fail-loud / non-backup-eligible.
+                    Ok(Some(cfg)) => {
+                        startup_config_rejected =
+                            crate::config::validation_pipeline::is_config_validation_rejection(&e);
                         if startup_config_rejected {
                             error!(
                                 "Initial database snapshot was rejected by runtime validation; \
@@ -1174,10 +1192,24 @@ pub async fn run(
                         );
                         (cfg, None)
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(anyhow::anyhow!(
                             "Database load failed and no usable backup at {}: {}",
                             path,
+                            e
+                        ));
+                    }
+                    Err(backup_err) => {
+                        // Surface the backup rejection itself — collapsing parse /
+                        // version / runtime-validation failures to a generic
+                        // "no usable backup" hides the actionable diagnostics
+                        // operators need when FERRUM_DB_CONFIG_BACKUP_PATH points
+                        // at a syntactically valid but runtime-fatal snapshot.
+                        return Err(anyhow::anyhow!(
+                            "Database load failed and config backup at {} was rejected: {}. \
+                             Original database error: {}",
+                            path,
+                            backup_err,
                             e
                         ));
                     }
@@ -1250,8 +1282,11 @@ pub async fn run(
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
     let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+        crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env_config.admin_allowed_cidrs,
+            "FERRUM_ADMIN_ALLOWED_CIDRS",
+        )
+        .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
     );
     let metrics_auth = Arc::new(
         crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
@@ -1770,6 +1805,7 @@ pub async fn run(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(&env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
     // Clone admin_state before the HTTP listener moves it, so we can reuse
@@ -3318,10 +3354,20 @@ mod tests {
     fn startup_backup_seeds_config_rejection_before_first_poll() {
         let source = include_str!("database.rs");
         assert!(
-            source.contains(
-                "startup_config_rejected = crate::modes::is_poll_validation_rejection(&e);"
-            ),
-            "backup startup must classify the initial full-load failure"
+            source
+                .contains("crate::config::validation_pipeline::is_config_validation_rejection(&e)"),
+            "backup startup must classify ONLY ConfigValidationRejection (not row-decode) \
+             so decode failures stay fail-loud / non-transient at startup"
+        );
+        // Split the forbidden poll-loop classifier reference so this assertion
+        // string itself does not match `include_str!("database.rs")`.
+        let forbidden = format!(
+            "startup_config_rejected = {}::is_poll_validation_rejection(&e);",
+            "crate::modes"
+        );
+        assert!(
+            !source.contains(&forbidden),
+            "startup must NOT use the poll-loop classifier (which includes RowDecodeRejection)"
         );
         assert!(
             source.contains("AtomicBool::new(startup_config_rejected)"),
@@ -3331,6 +3377,15 @@ mod tests {
             source.contains("if bootstrap_from_backup && startup_config_rejected")
                 && source.contains("initial validation-rejected snapshot"),
             "a validation-rejected offline bootstrap must run the recovery migration gate"
+        );
+        // Poll-loop sites must still use the broader classifier that includes
+        // RowDecodeRejection (issue #2997).
+        assert!(
+            source
+                .matches("crate::modes::is_poll_validation_rejection(")
+                .count()
+                >= 4,
+            "poll-loop full-load failure sites must classify via is_poll_validation_rejection"
         );
     }
 

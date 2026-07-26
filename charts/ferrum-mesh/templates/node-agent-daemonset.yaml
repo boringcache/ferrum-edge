@@ -42,12 +42,7 @@
 {{- end -}}
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
 {{- $nodeAgentAdminBindAddress := toString .Values.nodeAgent.admin.bindAddress -}}
-{{- $nodeAgentAdminProbeHost := $nodeAgentAdminBindAddress -}}
-{{- if or (eq $nodeAgentAdminProbeHost "") (eq $nodeAgentAdminProbeHost "0.0.0.0") (eq $nodeAgentAdminProbeHost "*") -}}
-{{- $nodeAgentAdminProbeHost = "127.0.0.1" -}}
-{{- else if eq $nodeAgentAdminProbeHost "::" -}}
-{{- $nodeAgentAdminProbeHost = "::1" -}}
-{{- end -}}
+{{- $nodeAgentAdminProbeHost := include "ferrum-mesh.adminProbeHost" $nodeAgentAdminBindAddress -}}
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
@@ -274,21 +269,20 @@ spec:
             {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
-          {{- if and .Values.nodeAgent.admin.enabled (ne (toString .Values.nodeAgent.admin.port) "0") }}
-          readinessProbe:
-            exec:
-              command:
-                - /app/ferrum-edge
-                - health
-                - --host
-                - {{ $nodeAgentAdminProbeHost | quote }}
-                - -p
-                - {{ .Values.nodeAgent.admin.port | quote }}
-            initialDelaySeconds: 2
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
-          {{- end }}
+          {{- /* Preserve special behavior: no computed probes when admin is
+                 disabled or port=0 (historical readiness omission). Overrides
+                 still render. Liveness uses --live so capture degradation does
+                 not restart-loop the agent. */ -}}
+          {{- $nodeAgentAdminAvailable := and .Values.nodeAgent.admin.enabled (ne (toString .Values.nodeAgent.admin.port) "0") -}}
+          {{- $nodeAgentHandlers := dict "live" (dict) "ready" (dict) -}}
+          {{- if $nodeAgentAdminAvailable -}}
+          {{- $nodeAgentHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" .Values.nodeAgent.admin.port "probeHost" $nodeAgentAdminProbeHost) | fromYaml -}}
+          {{- end -}}
+          {{- $nodeAgentLiveHandler := .Values.nodeAgent.probes.liveness.override | default dict -}}
+          {{- if not $nodeAgentLiveHandler }}{{- $nodeAgentLiveHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
+          {{- $nodeAgentReadyHandler := .Values.nodeAgent.probes.readiness.override | default dict -}}
+          {{- if not $nodeAgentReadyHandler }}{{- $nodeAgentReadyHandler = $nodeAgentHandlers.ready | default dict -}}{{- end -}}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.nodeAgent.probes "liveHandler" $nodeAgentLiveHandler "readyHandler" $nodeAgentReadyHandler) }}
       volumes:
         - name: bpf-fs
           hostPath:

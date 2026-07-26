@@ -1045,6 +1045,76 @@ async fn test_terminate_mode_returns_function_response_as_reject_binary() {
     }
 }
 
+/// `forward_headers` reads only the effective `before_proxy` header view.
+///
+/// GHSA-99wm-qwwv-33v9 scope: an earlier plugin that removed a gateway-owned
+/// destination — an unfilled `claim_headers` target, or `authorization` under
+/// `strip_authorization_on_success` — must not have the client's original value
+/// resurrected out of the pristine ingress map and handed to the function.
+#[tokio::test]
+async fn test_forward_headers_never_resurrect_stripped_client_values() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "forward_headers": ["x-authenticated-email", "authorization", "x-request-id"]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    // Pristine ingress: the client supplied a gateway-owned claim destination
+    // and a bearer credential.
+    ctx.headers.insert(
+        "x-authenticated-email".to_string(),
+        "attacker@example.test".to_string(),
+    );
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer client-token".to_string(),
+    );
+
+    // Effective view after an auth plugin sanitized its owned destination and
+    // stripped the credential it consumed.
+    let mut headers = HashMap::from([("x-request-id".to_string(), "req-1".to_string())]);
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 1, "the function must have been invoked");
+    let payload: Value = serde_json::from_slice(&requests[0].body).expect("json payload");
+    let forwarded = payload
+        .get("headers")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    assert_eq!(
+        forwarded.get("x-request-id").and_then(Value::as_str),
+        Some("req-1"),
+        "headers present in the effective view are still forwarded: {forwarded:?}"
+    );
+    assert!(
+        !forwarded.contains_key("x-authenticated-email"),
+        "a sanitized gateway-owned destination must not be re-read from client input: \
+         {forwarded:?}"
+    );
+    assert!(
+        !forwarded.contains_key("authorization"),
+        "a stripped credential must not be re-read from client input: {forwarded:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_terminate_rejects_out_of_range_function_status() {
     use wiremock::matchers::method;

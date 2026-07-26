@@ -581,7 +581,9 @@ jobs:
               integration::spec_expose_integration_tests
               integration::db_proxy_plugin_association_fail_closed_tests
               integration::admin_audit_rbac_tests
+              integration::audit_retention_tests
               integration::admin_backend_capabilities_tests
+              integration::admin_batch_atomicity_tests
               integration::admin_runtime_metrics_tests
               integration::admin_observability_auth_tests
               integration::admin_metrics_tls_inventory_snapshot_tests
@@ -645,11 +647,13 @@ jobs:
               integration::mesh_sidecar_e2e_tests
               integration::mesh_subscribe_validation_tests
               integration::cp_dp_grpc_tests
+              integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
               integration::grpc_proxy_tests
+              integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
@@ -665,6 +669,7 @@ jobs:
               integration::db_incremental_poll_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
+              integration::db_row_decode_rejection_tests
               integration::vendor_integrity_tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -989,6 +994,7 @@ jobs:
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_request_termination_h3_test
+              functional_policy_path_canonicalization_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_websocket_limits_test
@@ -1056,9 +1062,21 @@ jobs:
         # map to the runner's localhost exactly as the service containers did, so
         # the tests' localhost:6379 / localhost:27017 connections are unchanged.
         if: matrix.shard == 'data-plane'
+        #
+        # Two mongod instances on purpose: `POST /batch` is all-or-nothing
+        # (issue #2401), which on MongoDB needs multi-document transactions.
+        # The standalone instance covers the documented 501 refusal, and the
+        # single-node replica set covers the transactional path — neither can
+        # substitute for the other.
         run: |
           docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
           docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
+          # `--network host` with a real port: a replica-set member advertises
+          # its own host:port, and the driver reconnects to whatever is
+          # advertised. Behind a `-p` mapping it would advertise the container
+          # port and the driver would dial the wrong process.
+          docker run -d --name ferrum-ci-mongo-rs --network host \
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all
           # The runner used to gate steps on the services' --health-cmd; reproduce
           # that readiness wait using the tools shipped inside each image.
           redis_ok=""
@@ -1076,13 +1094,43 @@ jobs:
             fi
             sleep 2
           done
+          mongo_rs_ok=""
+          for _ in $(seq 1 30); do
+            if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_ok=1; break
+            fi
+            sleep 2
+          done
           if [ -z "$redis_ok" ]; then
             echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
           fi
           if [ -z "$mongo_ok" ]; then
             echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
           fi
-          echo "data-plane services ready (redis:6379, mongo:27017)"
+          if [ -z "$mongo_rs_ok" ]; then
+            echo "::error::mongo replica set did not become ready"
+            docker logs ferrum-ci-mongo-rs; exit 1
+          fi
+          docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 --eval \
+            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27020"}]}) }'
+          mongo_rs_primary=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
+                --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)' 2>/dev/null; then
+              mongo_rs_primary=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "$mongo_rs_primary" ]; then
+            echo "::error::mongo replica set did not elect a primary"
+            docker logs ferrum-ci-mongo-rs; exit 1
+          fi
+          {
+            echo "FERRUM_TEST_MONGO_REPLICA_SET=rs0"
+            echo "FERRUM_TEST_MONGO_REPLICA_SET_URL=mongodb://localhost:27020/ferrum_test"
+          } >> "$GITHUB_ENV"
+          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020)"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -1481,6 +1529,74 @@ jobs:
               exit 1
             fi
           done
+          # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
+          # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
+          # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set injector.enabled=true \
+            --set injector.tls.secretName=ferrum-mesh-injector-tls \
+            --set ca.enabled=true \
+            --set eastWest.enabled=true \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-default.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.startup.enabled=false \
+            --set controlPlane.probes.liveness.enabled=false \
+            --set controlPlane.probes.readiness.enabled=false \
+            --set injector.enabled=true \
+            --set injector.probes.startup.enabled=false \
+            --set injector.probes.liveness.enabled=false \
+            --set injector.probes.readiness.enabled=false \
+            --set eastWest.enabled=true \
+            --set eastWest.probes.startup.enabled=false \
+            --set eastWest.probes.liveness.enabled=false \
+            --set eastWest.probes.readiness.enabled=false \
+            --set ambient.enabled=true \
+            --set ambient.probes.startup.enabled=false \
+            --set ambient.probes.liveness.enabled=false \
+            --set ambient.probes.readiness.enabled=false \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set ca.enabled=true \
+            --set ca.probes.startup.enabled=false \
+            --set ca.probes.liveness.enabled=false \
+            --set ca.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-disabled.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.liveness.override.httpGet.path=/live \
+            --set controlPlane.probes.liveness.override.httpGet.port=admin-http \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-override.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            -f ./charts/ferrum-mesh/examples/development-values.yaml \
+            --set controlPlane.probes.override.httpGet.path=/health \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-coupled.err"; then
+            echo "::error title=Coupled mesh probe override accepted::controlPlane.probes.override must be rejected"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=ebpf \
+            --set nodeAgent.proxyMode=node_waypoint \
+            --set-string nodeAgent.admin.port=19090 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-waypoint.yaml"
+          python3 -I .github/scripts/verify_mesh_workload_probes.py \
+            --results-dir "$RUNNER_TEMP/ferrum-helm-results"
 
       - name: Core gateway chart static validation
         run: |
@@ -2635,11 +2751,17 @@ jobs:
           kubectl -n ferrum-prod create secret generic ferrum-mesh-production-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          # Kind smoke keeps the production example's secret wiring, but the
+          # example intentionally omits CP gRPC TLS. Without this escape hatch the
+          # binary refuses non-loopback plaintext at startup; readiness probes then
+          # correctly keep the Deployment non-Ready (previously a Ready-race hid
+          # the crash). Do not put ALLOW_PLAINTEXT back into the example values.
           helm install ferrum-prod ./charts/ferrum-mesh -n ferrum-prod \
             -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml \
             --set image.repository=ferrum-edge \
             --set image.tag=helm-chart-ci \
-            --set image.pullPolicy=IfNotPresent
+            --set image.pullPolicy=IfNotPresent \
+            --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
           kubectl -n ferrum-prod get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/production-pods.txt"
           kubectl -n ferrum-prod describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane-deployment.txt"

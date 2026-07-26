@@ -20,7 +20,11 @@
 //! See [`H2Step`]. The script runs per accepted connection — a test can
 //! have one connection run "accept headers → send GOAWAY" and the next run
 //! "accept headers → respond 200", or can script a single connection across
-//! a sequence of per-stream responses.
+//! a sequence of per-stream responses. A script is one-shot by default — the
+//! fixture closes the connection once its last step runs. Tests whose backend
+//! is held in a gateway connection pool want
+//! [`ScriptedH2BackendBuilder::repeat_script`] instead, so the fixture never
+//! closes a connection the gateway may still hand to a request.
 //!
 //! ## Observability
 //!
@@ -218,6 +222,7 @@ pub struct ScriptedH2BackendBuilder {
     steps: Vec<H2Step>,
     connection_scripts: Vec<Vec<H2Step>>,
     settings: ConnectionSettings,
+    repeat_script: bool,
 }
 
 /// TLS parameters for the H2 builder. Private — only meaningful inside this
@@ -237,6 +242,7 @@ impl ScriptedH2BackendBuilder {
             steps: Vec::new(),
             connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
+            repeat_script: false,
         }
     }
 
@@ -254,6 +260,7 @@ impl ScriptedH2BackendBuilder {
             steps: Vec::new(),
             connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
+            repeat_script: false,
         })
     }
 
@@ -276,6 +283,7 @@ impl ScriptedH2BackendBuilder {
             steps: Vec::new(),
             connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
+            repeat_script: false,
         })
     }
 
@@ -300,6 +308,30 @@ impl ScriptedH2BackendBuilder {
     /// [`Self::steps`].
     pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<H2Step>>) -> Self {
         self.connection_scripts.extend(scripts);
+        self
+    }
+
+    /// Restart the script from its first step once the last step completes,
+    /// for as long as the connection stays open, instead of tearing the
+    /// connection down.
+    ///
+    /// Default (`false`) makes every accepted connection *one-shot*: the
+    /// fixture closes the socket ~100ms after the script's final step. That
+    /// is exactly what a test wants when it is asserting on a connection
+    /// lifecycle event, and exactly what it does NOT want when the gateway
+    /// keeps the connection in a pool: startup capability probes, `HEAD /`
+    /// pool warmup, and the request under test all dial the same backend, so
+    /// "which connection still has an unconsumed script step when the request
+    /// dispatches" becomes a wall-clock race, and a pooled sender whose peer
+    /// already closed surfaces as a spurious 502.
+    ///
+    /// With `repeat_script(true)` the fixture behaves like an ordinary
+    /// server: unbounded streams per connection, and the fixture never closes
+    /// a connection the gateway might still have pooled. A peer that hangs up
+    /// while the script sits at its first step (an idle connection closed at a
+    /// request boundary) is recorded as a clean end, not a step error.
+    pub fn repeat_script(mut self, repeat: bool) -> Self {
+        self.repeat_script = repeat;
         self
     }
 
@@ -335,6 +367,7 @@ impl ScriptedH2BackendBuilder {
         let steps = self.steps;
         let connection_scripts = self.connection_scripts;
         let settings = self.settings;
+        let repeat_script = self.repeat_script;
 
         let handle = tokio::spawn(async move {
             loop {
@@ -360,13 +393,20 @@ impl ScriptedH2BackendBuilder {
                                 let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
                                 match acceptor.accept(tcp).await {
                                     Ok(tls_stream) => {
-                                        run_h2_connection(tls_stream, settings, script, conn_state)
-                                            .await
+                                        run_h2_connection(
+                                            tls_stream,
+                                            settings,
+                                            script,
+                                            repeat_script,
+                                            conn_state,
+                                        )
+                                        .await
                                     }
                                     Err(e) => Err(format!("TLS handshake failed: {e}")),
                                 }
                             } else {
-                                run_h2_connection(tcp, settings, script, conn_state).await
+                                run_h2_connection(tcp, settings, script, repeat_script, conn_state)
+                                    .await
                             };
                             if let Err(msg) = result {
                                 err_sink.step_errors.lock().await.push(msg);
@@ -538,6 +578,7 @@ async fn run_h2_connection<T>(
     io: T,
     settings: ConnectionSettings,
     script: Vec<H2Step>,
+    repeat_script: bool,
     state: Arc<H2State>,
 ) -> Result<(), String>
 where
@@ -572,7 +613,7 @@ where
 
     // Run the script. If it returns an error, stop the driver before
     // surfacing it; if the driver already exited, that's fine.
-    let script_result = run_script(&mut stream_rx, ctrl_tx, script, state).await;
+    let script_result = run_script(&mut stream_rx, ctrl_tx, script, repeat_script, state).await;
 
     // Tell the driver to stop on EVERY exit path. The happy-path branch
     // of `run_script` already emits `Stop` itself, but every `return
@@ -666,230 +707,263 @@ async fn run_script(
     stream_rx: &mut mpsc::UnboundedReceiver<StreamPair>,
     ctrl_tx: mpsc::UnboundedSender<DriverCtrl>,
     script: Vec<H2Step>,
+    repeat_script: bool,
     state: Arc<H2State>,
 ) -> Result<(), String> {
     let mut current_stream: Option<CurrentStream> = None;
     let mut current_body_sender: Option<h2::SendStream<Bytes>> = None;
 
-    for step in script {
-        match step {
-            H2Step::ExpectHeaders(matcher) => {
-                current_body_sender = None;
-                let _previous = current_stream.take();
+    loop {
+        for (step_index, step) in script.iter().cloned().enumerate() {
+            // In repeat mode the fixture is an ordinary server: a peer that hangs
+            // up while we sit at the top of the script is closing an *idle*
+            // connection at a request boundary, which is orderly, not a fixture
+            // failure. Anywhere else, "connection closed before any stream
+            // arrived" stays an error.
+            let closed_channel_is_clean_exit = repeat_script && step_index == 0;
+            match step {
+                H2Step::ExpectHeaders(matcher) => {
+                    current_body_sender = None;
+                    let _previous = current_stream.take();
 
-                let pair = stream_rx.recv().await;
-                match pair {
-                    Some((req, send)) => {
-                        let received = parse_request_head(&req);
-                        if !(matcher.0)(&received) {
-                            state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                    let pair = stream_rx.recv().await;
+                    match pair {
+                        Some((req, send)) => {
+                            let received = parse_request_head(&req);
+                            if !(matcher.0)(&received) {
+                                state.matcher_mismatches.fetch_add(1, Ordering::SeqCst);
+                            }
+                            state.stream_count.fetch_add(1, Ordering::SeqCst);
+                            // Capture the insertion index inside the lock so it
+                            // matches the slot we just appended — see
+                            // `CurrentStream::stream_index` for the race this
+                            // protects against.
+                            let stream_index = {
+                                let mut streams = state.streams.lock().await;
+                                let idx = streams.len();
+                                streams.push(received.clone());
+                                idx
+                            };
+                            let (_parts, body) = req.into_parts();
+                            current_stream = Some(CurrentStream {
+                                recorded: received,
+                                body,
+                                send,
+                                stream_index,
+                            });
                         }
-                        state.stream_count.fetch_add(1, Ordering::SeqCst);
-                        // Capture the insertion index inside the lock so it
-                        // matches the slot we just appended — see
-                        // `CurrentStream::stream_index` for the race this
-                        // protects against.
-                        let stream_index = {
-                            let mut streams = state.streams.lock().await;
-                            let idx = streams.len();
-                            streams.push(received.clone());
-                            idx
-                        };
-                        let (_parts, body) = req.into_parts();
-                        current_stream = Some(CurrentStream {
-                            recorded: received,
-                            body,
-                            send,
-                            stream_index,
-                        });
-                    }
-                    None => {
-                        return Err(
-                            "ExpectHeaders: connection closed before any stream arrived".into()
-                        );
-                    }
-                }
-            }
-            H2Step::DrainRequestBody => {
-                let Some(cs) = current_stream.as_mut() else {
-                    return Err("DrainRequestBody: no current stream".into());
-                };
-                let stream_index = cs.stream_index;
-                let mut accumulated = Vec::new();
-                loop {
-                    match cs.body.data().await {
-                        Some(Ok(chunk)) => {
-                            let _ = cs.body.flow_control().release_capacity(chunk.len());
-                            accumulated.extend_from_slice(&chunk);
-                        }
-                        Some(Err(e)) => {
-                            return Err(format!("DrainRequestBody: recv error: {e}"));
-                        }
-                        None => break,
-                    }
-                }
-                match cs.body.trailers().await {
-                    Ok(Some(map)) => {
-                        let trailers: Vec<(String, String)> = map
-                            .iter()
-                            .filter_map(|(k, v)| {
-                                v.to_str()
-                                    .ok()
-                                    .map(|vs| (k.as_str().to_string(), vs.to_string()))
-                            })
-                            .collect();
-                        cs.recorded.trailers = trailers.clone();
-                        // Use the captured `stream_index` rather than
-                        // `last_mut()` so concurrent script tasks across
-                        // multiple TCP connections each update their own
-                        // slot — see the PR-486 review note on `CurrentStream`.
-                        if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
-                            entry.trailers = trailers;
+                        None => {
+                            if closed_channel_is_clean_exit {
+                                return Ok(());
+                            }
+                            return Err(
+                                "ExpectHeaders: connection closed before any stream arrived".into(),
+                            );
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => return Err(format!("DrainRequestBody: trailers error: {e}")),
                 }
-                cs.recorded.body = accumulated.clone();
-                if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
-                    entry.body = accumulated;
-                }
-            }
-            H2Step::RespondHeaders(headers) => {
-                let Some(cs) = current_stream.as_mut() else {
-                    return Err("RespondHeaders: no current stream".into());
-                };
-                let send = &mut cs.send;
-                let status = headers
-                    .iter()
-                    .find(|(k, _)| *k == ":status")
-                    .and_then(|(_, v)| v.parse::<u16>().ok())
-                    .unwrap_or(200);
-                let mut resp = Response::builder()
-                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
-                for (k, v) in &headers {
-                    if *k == ":status" {
-                        continue;
-                    }
-                    resp = resp.header(*k, v);
-                }
-                let response = resp
-                    .body(())
-                    .map_err(|e| format!("RespondHeaders: build error: {e}"))?;
-                let body_sender = send
-                    .send_response(response, false)
-                    .map_err(|e| format!("send_response: {e}"))?;
-                current_body_sender = Some(body_sender);
-            }
-            H2Step::RespondHeadersEndStream(headers) => {
-                let Some(cs) = current_stream.as_mut() else {
-                    return Err("RespondHeadersEndStream: no current stream".into());
-                };
-                let status = headers
-                    .iter()
-                    .find(|(k, _)| *k == ":status")
-                    .and_then(|(_, v)| v.parse::<u16>().ok())
-                    .unwrap_or(200);
-                let mut resp = Response::builder()
-                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
-                for (k, v) in &headers {
-                    if *k == ":status" {
-                        continue;
-                    }
-                    resp = resp.header(*k, v);
-                }
-                let response = resp
-                    .body(())
-                    .map_err(|e| format!("RespondHeadersEndStream: build error: {e}"))?;
-                cs.send
-                    .send_response(response, true)
-                    .map_err(|e| format!("send trailers-only response: {e}"))?;
-                current_body_sender = None;
-            }
-            H2Step::RespondData { data, end_stream } => {
-                let Some(sender) = current_body_sender.as_mut() else {
-                    return Err("RespondData: no RespondHeaders sent yet".into());
-                };
-                sender.reserve_capacity(data.len());
-                sender
-                    .send_data(data, end_stream)
-                    .map_err(|e| format!("send_data: {e}"))?;
-                if end_stream {
-                    current_body_sender = None;
-                }
-            }
-            H2Step::RespondTrailers(trailers) => {
-                let Some(mut sender) = current_body_sender.take() else {
-                    return Err("RespondTrailers: no RespondHeaders sent yet".into());
-                };
-                let mut map = HeaderMap::new();
-                for (k, v) in trailers {
-                    if let (Ok(name), Ok(val)) = (
-                        http::header::HeaderName::from_bytes(k.as_bytes()),
-                        http::header::HeaderValue::from_str(&v),
-                    ) {
-                        // Use append so scripted duplicate metadata (gRPC
-                        // multi-value trailers) survives onto the wire.
-                        map.append(name, val);
-                    }
-                }
-                sender
-                    .send_trailers(map)
-                    .map_err(|e| format!("send_trailers: {e}"))?;
-            }
-            H2Step::SendGoaway { error_code } => {
-                let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
-            }
-            H2Step::SendGoawayAndClose { error_code } => {
-                let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
-                // Give the driver a moment to flush the GOAWAY.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = ctrl_tx.send(DriverCtrl::Stop);
-                return Ok(());
-            }
-            H2Step::SendRstStream { error_code } => {
-                let reason = Reason::from(error_code);
-                if let Some(sender) = current_body_sender.as_mut() {
-                    sender.send_reset(reason);
-                    current_body_sender = None;
-                }
-                if let Some(cs) = current_stream.as_mut() {
-                    cs.send.send_reset(reason);
-                }
-            }
-            H2Step::ExpectReset(duration) => {
-                let reset = {
-                    let Some(sender) = current_body_sender.as_mut() else {
-                        return Err("ExpectReset: no response stream is open".into());
+                H2Step::DrainRequestBody => {
+                    let Some(cs) = current_stream.as_mut() else {
+                        return Err("DrainRequestBody: no current stream".into());
                     };
-                    tokio::time::timeout(duration, std::future::poll_fn(|cx| sender.poll_reset(cx)))
-                        .await
-                };
-                match reset {
-                    Ok(Ok(_reason)) => {
-                        state.stream_resets.fetch_add(1, Ordering::SeqCst);
+                    let stream_index = cs.stream_index;
+                    let mut accumulated = Vec::new();
+                    loop {
+                        match cs.body.data().await {
+                            Some(Ok(chunk)) => {
+                                let _ = cs.body.flow_control().release_capacity(chunk.len());
+                                accumulated.extend_from_slice(&chunk);
+                            }
+                            Some(Err(e)) => {
+                                return Err(format!("DrainRequestBody: recv error: {e}"));
+                            }
+                            None => break,
+                        }
+                    }
+                    match cs.body.trailers().await {
+                        Ok(Some(map)) => {
+                            let trailers: Vec<(String, String)> = map
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.to_str()
+                                        .ok()
+                                        .map(|vs| (k.as_str().to_string(), vs.to_string()))
+                                })
+                                .collect();
+                            cs.recorded.trailers = trailers.clone();
+                            // Use the captured `stream_index` rather than
+                            // `last_mut()` so concurrent script tasks across
+                            // multiple TCP connections each update their own
+                            // slot — see the PR-486 review note on `CurrentStream`.
+                            if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
+                                entry.trailers = trailers;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => return Err(format!("DrainRequestBody: trailers error: {e}")),
+                    }
+                    cs.recorded.body = accumulated.clone();
+                    if let Some(entry) = state.streams.lock().await.get_mut(stream_index) {
+                        entry.body = accumulated;
+                    }
+                }
+                H2Step::RespondHeaders(headers) => {
+                    let Some(cs) = current_stream.as_mut() else {
+                        return Err("RespondHeaders: no current stream".into());
+                    };
+                    let send = &mut cs.send;
+                    let status = headers
+                        .iter()
+                        .find(|(k, _)| *k == ":status")
+                        .and_then(|(_, v)| v.parse::<u16>().ok())
+                        .unwrap_or(200);
+                    let mut resp = Response::builder()
+                        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+                    for (k, v) in &headers {
+                        if *k == ":status" {
+                            continue;
+                        }
+                        resp = resp.header(*k, v);
+                    }
+                    let response = resp
+                        .body(())
+                        .map_err(|e| format!("RespondHeaders: build error: {e}"))?;
+                    let body_sender = send
+                        .send_response(response, false)
+                        .map_err(|e| format!("send_response: {e}"))?;
+                    current_body_sender = Some(body_sender);
+                }
+                H2Step::RespondHeadersEndStream(headers) => {
+                    let Some(cs) = current_stream.as_mut() else {
+                        return Err("RespondHeadersEndStream: no current stream".into());
+                    };
+                    let status = headers
+                        .iter()
+                        .find(|(k, _)| *k == ":status")
+                        .and_then(|(_, v)| v.parse::<u16>().ok())
+                        .unwrap_or(200);
+                    let mut resp = Response::builder()
+                        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+                    for (k, v) in &headers {
+                        if *k == ":status" {
+                            continue;
+                        }
+                        resp = resp.header(*k, v);
+                    }
+                    let response = resp
+                        .body(())
+                        .map_err(|e| format!("RespondHeadersEndStream: build error: {e}"))?;
+                    cs.send
+                        .send_response(response, true)
+                        .map_err(|e| format!("send trailers-only response: {e}"))?;
+                    current_body_sender = None;
+                }
+                H2Step::RespondData { data, end_stream } => {
+                    let Some(sender) = current_body_sender.as_mut() else {
+                        return Err("RespondData: no RespondHeaders sent yet".into());
+                    };
+                    sender.reserve_capacity(data.len());
+                    sender
+                        .send_data(data, end_stream)
+                        .map_err(|e| format!("send_data: {e}"))?;
+                    if end_stream {
                         current_body_sender = None;
                     }
-                    Ok(Err(error)) => {
-                        return Err(format!("ExpectReset: polling reset failed: {error}"));
+                }
+                H2Step::RespondTrailers(trailers) => {
+                    let Some(mut sender) = current_body_sender.take() else {
+                        return Err("RespondTrailers: no RespondHeaders sent yet".into());
+                    };
+                    let mut map = HeaderMap::new();
+                    for (k, v) in trailers {
+                        if let (Ok(name), Ok(val)) = (
+                            http::header::HeaderName::from_bytes(k.as_bytes()),
+                            http::header::HeaderValue::from_str(&v),
+                        ) {
+                            // Use append so scripted duplicate metadata (gRPC
+                            // multi-value trailers) survives onto the wire.
+                            map.append(name, val);
+                        }
                     }
-                    Err(_) => {
-                        return Err(format!("ExpectReset: no stream reset within {duration:?}"));
+                    sender
+                        .send_trailers(map)
+                        .map_err(|e| format!("send_trailers: {e}"))?;
+                }
+                H2Step::SendGoaway { error_code } => {
+                    let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
+                }
+                H2Step::SendGoawayAndClose { error_code } => {
+                    let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
+                    // Give the driver a moment to flush the GOAWAY.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = ctrl_tx.send(DriverCtrl::Stop);
+                    return Ok(());
+                }
+                H2Step::SendRstStream { error_code } => {
+                    let reason = Reason::from(error_code);
+                    if let Some(sender) = current_body_sender.as_mut() {
+                        sender.send_reset(reason);
+                        current_body_sender = None;
+                    }
+                    if let Some(cs) = current_stream.as_mut() {
+                        cs.send.send_reset(reason);
                     }
                 }
-            }
-            H2Step::Sleep(d) | H2Step::StallWindowFor(d) => {
-                tokio::time::sleep(d).await;
-            }
-            H2Step::DropConnection => {
-                // Instruct the driver to stop; dropping the `Connection`
-                // inside the driver task closes the TCP socket.
-                let _ = ctrl_tx.send(DriverCtrl::Stop);
-                drop(current_body_sender);
-                drop(current_stream);
-                return Ok(());
+                H2Step::ExpectReset(duration) => {
+                    let reset = {
+                        let Some(sender) = current_body_sender.as_mut() else {
+                            return Err("ExpectReset: no response stream is open".into());
+                        };
+                        tokio::time::timeout(
+                            duration,
+                            std::future::poll_fn(|cx| sender.poll_reset(cx)),
+                        )
+                        .await
+                    };
+                    match reset {
+                        Ok(Ok(_reason)) => {
+                            state.stream_resets.fetch_add(1, Ordering::SeqCst);
+                            current_body_sender = None;
+                        }
+                        Ok(Err(error)) => {
+                            return Err(format!("ExpectReset: polling reset failed: {error}"));
+                        }
+                        Err(_) => {
+                            return Err(format!(
+                                "ExpectReset: no stream reset within {duration:?}"
+                            ));
+                        }
+                    }
+                }
+                H2Step::Sleep(d) | H2Step::StallWindowFor(d) => {
+                    tokio::time::sleep(d).await;
+                }
+                H2Step::DropConnection => {
+                    // Instruct the driver to stop; dropping the `Connection`
+                    // inside the driver task closes the TCP socket.
+                    let _ = ctrl_tx.send(DriverCtrl::Stop);
+                    // `take()` rather than `drop(..)`: this arm sits inside the
+                    // (repeatable) script loop, so moving the locals out here
+                    // would make the move-checker reason about a back-edge
+                    // this `return` can never take.
+                    let _ = current_body_sender.take();
+                    let _ = current_stream.take();
+                    return Ok(());
+                }
             }
         }
+
+        // `script.is_empty()` guards a repeat pass that would otherwise spin
+        // without ever awaiting.
+        if !repeat_script || script.is_empty() {
+            break;
+        }
+        // Repeat pass: release the finished stream so its trailers flush and
+        // the next `ExpectHeaders` starts clean, then run the script again on
+        // the SAME connection. No teardown, no sleep — the connection stays
+        // usable for whatever the gateway pools it for.
+        let _ = current_body_sender.take();
+        let _ = current_stream.take();
     }
 
     // End of script: release stream + sender so trailers flush cleanly.
