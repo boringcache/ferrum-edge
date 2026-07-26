@@ -156,8 +156,9 @@ message MeshConfigUpdate {
   // frame is refused fail-closed.
   string config_authority = 6;
   // Durable, monotonically increasing config-change sequence within
-  // `config_authority`. Meaningless (and ignored) when `config_authority` is
-  // empty. Never a wall clock: it survives control-plane restarts and is
-  // identical on every replica of one config store.
+  // `config_authority`. MUST be zero when `config_authority` is empty; a
+  // sequence without its ordering domain is malformed. Never a wall clock: it
+  // survives control-plane restarts and is identical on every replica of one
+  // config store.
   uint64 config_sequence = 7;
 }

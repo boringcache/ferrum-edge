@@ -10116,7 +10116,7 @@ async fn serve_mesh_runtime(
             // The scheme is authoritative for plaintext remotes: a `grpc://` /
             // `http://` control_plane_url must NOT get DP gRPC TLS material
             // attached just because TLS env vars are set, or
-            // `fetch_remote_slice_endpoints` would attempt a TLS handshake
+            // `fetch_remote_slice` would attempt a TLS handshake
             // against a plaintext port. (`build_dp_grpc_tls_config(.., &[], ..)`
             // returns `Some(tls)` whenever any TLS env is set, independent of
             // scheme — so force `None` here.) A `grpcs://` / `https://` remote
@@ -10127,6 +10127,7 @@ async fn serve_mesh_runtime(
             env_config.mesh_remote_discovery_poll_interval_seconds,
             env_config.mesh_remote_discovery_poll_timeout_seconds,
             env_config.mesh_remote_discovery_max_stale_seconds,
+            env_config.mesh_config_revision_adopt_secs,
             remote_grpc_secret,
             runtime.node_id.clone(),
             runtime.namespace.clone(),
@@ -20571,6 +20572,7 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             version: "test".to_string(),
+            revision: None,
             workloads: Vec::new(),
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),

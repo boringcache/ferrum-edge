@@ -27,7 +27,7 @@
 //!    leaves the gate (diagnostics, the operator reset, and the log lines built
 //!    from them), while ordering keeps the raw value.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,6 +49,9 @@ use ferrum_edge::modes::mesh::config_consumer::native_client::{
 };
 use ferrum_edge::modes::mesh::config_consumer::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejectReason, validate_mesh_config_update,
+};
+use ferrum_edge::modes::mesh::config_consumer::xds_client::{
+    XdsClientConfig, XdsConfigConsumer,
 };
 use ferrum_edge::modes::mesh::revision::{
     MeshConfigRevision, MeshRevisionGate, MeshRevisionOrder, MeshRevisionPolicy,
@@ -209,6 +212,30 @@ fn malformed_authorities_are_treated_as_absent() {
     );
 }
 
+#[test]
+fn maximum_sequence_orders_without_wrapping() {
+    let gate = MeshRevisionGate::new();
+    let now = Utc::now();
+
+    gate.admit(Some(&revision("db", u64::MAX - 1)), now)
+        .expect("the penultimate sequence establishes the baseline");
+    assert_eq!(
+        gate.admit(Some(&revision("db", u64::MAX)), now),
+        Ok(MeshRevisionOrder::Newer)
+    );
+    assert_eq!(
+        gate.admit(Some(&revision("db", u64::MAX)), now),
+        Ok(MeshRevisionOrder::Same),
+        "a replay at the maximum sequence remains installable"
+    );
+    assert_eq!(
+        gate.admit(Some(&revision("db", u64::MAX - 1)), now)
+            .expect_err("the maximum sequence must not wrap to a lower value")
+            .reason(),
+        MeshRevisionRejectReason::StaleRevision
+    );
+}
+
 // ── Gate state machine ─────────────────────────────────────────────────────
 
 #[test]
@@ -216,6 +243,7 @@ fn gate_quarantines_stale_and_keeps_accepting_forward_progress() {
     let gate = MeshRevisionGate::new();
     let now = Utc
         .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .single()
         .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), now)
@@ -269,6 +297,7 @@ fn gate_adopts_a_persistent_foreign_authority_after_the_grace_period() {
     });
     let t0 = Utc
         .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .single()
         .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), t0)
@@ -326,6 +355,7 @@ fn adoption_can_be_disabled_and_reset_is_the_operator_escape_hatch() {
     });
     let t0 = Utc
         .with_ymd_and_hms(2026, 7, 26, 12, 0, 0)
+        .single()
         .expect("fixture time");
 
     gate.admit(Some(&revision("db", 100)), t0)
@@ -381,6 +411,38 @@ fn install_slice_quarantines_a_stale_slice_without_touching_live_state() {
     );
     assert_eq!(state.accepted_revision(), Some(revision("db", 100)));
     assert!(state.revision_diagnostics().quarantine_active);
+}
+
+#[test]
+fn xds_consumer_surfaces_stale_revision_as_stream_terminal() {
+    let state = MeshRuntimeState::new();
+    let consumer = XdsConfigConsumer::new(
+        XdsClientConfig {
+            cp_urls: vec!["http://cp-a:50051".to_string(), "http://cp-b:50051".to_string()],
+            node_id: NODE_ID.to_string(),
+            cluster: "default".to_string(),
+            namespace: NAMESPACE.to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            ambient_udp_source_scoping: false,
+            stream_channel_capacity: 32,
+            primary_retry_secs: 300,
+            connect_timeout_seconds: 10,
+            labels: BTreeMap::new(),
+        },
+        state.clone(),
+    );
+
+    consumer
+        .apply_slice(slice_at("xds-v100", Some(revision("db", 100))))
+        .expect("the fresh xDS baseline installs");
+    let rejection = consumer
+        .apply_slice(slice_at("xds-v99", Some(revision("db", 99))))
+        .expect_err("a stale xDS slice must close ADS for multi-CP failover");
+
+    assert_eq!(rejection.reason(), MeshRevisionRejectReason::StaleRevision);
+    assert!(rejection.terminates_stream());
+    assert_eq!(installed_version(&state).as_deref(), Some("xds-v100"));
 }
 
 /// Unversioned sources (Kubernetes CRD controller, file source) keep working:
@@ -592,6 +654,21 @@ fn envelope_revision_must_match_the_slice_revision() {
         MeshUpdateConsumer::Native,
     )
     .expect("both copies absent is consistent");
+
+    let sequence_without_authority = MeshConfigUpdate {
+        config_sequence: 42,
+        ..update_for(&unversioned)
+    };
+    assert_eq!(
+        validate_mesh_config_update(
+            &sequence_without_authority,
+            &expected,
+            MeshUpdateConsumer::Native,
+        )
+        .expect_err("a sequence without its ordering domain is malformed")
+        .reason(),
+        MeshUpdateRejectReason::EnvelopeRevisionMismatch
+    );
 }
 
 // ── Live two-CP MeshSubscribe stream ───────────────────────────────────────

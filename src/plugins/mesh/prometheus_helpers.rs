@@ -565,9 +565,9 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
 /// `reason` is a compile-time constant
 /// (`MeshRevisionRejectReason::as_metric_label`), so the series' cardinality is
 /// fixed and no control-plane-supplied authority string or sequence number can
-/// reach `/metrics`. Those values ride the JWT-authenticated
-/// `GET /mesh/config-drift` `revision` block and the structured `warn!` instead
-/// — ordering detail goes to authenticated surfaces, not to scraping.
+/// reach `/metrics`. Local-slice detail rides the JWT-authenticated
+/// `GET /mesh/config-drift` `revision` block; local and remote-discovery gates
+/// both emit sanitized, bounded structured warnings instead of dynamic labels.
 pub fn increment_mesh_config_revision_rejection(reason: &'static str) {
     MESH_CONFIG_REVISION_REJECTIONS
         .entry(reason)

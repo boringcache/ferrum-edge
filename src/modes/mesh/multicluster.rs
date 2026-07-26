@@ -70,6 +70,9 @@ use crate::modes::mesh::config_consumer::common::{
     BACKOFF_INITIAL_SECS, MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE, jittered_backoff,
     next_backoff_secs as common_next_backoff_secs,
 };
+use crate::modes::mesh::revision::{
+    DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate, MeshRevisionPolicy,
+};
 
 /// Backoff bounds shared with [`super::federation`] and
 /// `src/grpc/dp_client.rs`. One cross-cluster backoff curve for operators to
@@ -1055,6 +1058,9 @@ pub struct RemoteDiscoveryManager {
     /// Matched against `RemoteCluster.discovery_credential_ref` in
     /// `start_cluster`; an empty map keeps shared-secret behavior.
     credentials: std::sync::Arc<std::collections::HashMap<String, GrpcJwtSecret>>,
+    /// Per-cluster ordering watermarks survive poller restarts and URL,
+    /// credential, or trust-source changes for the same declared cluster.
+    revision_gates: HashMap<String, Arc<MeshRevisionGate>>,
 }
 
 impl RemoteDiscoveryManager {
@@ -1072,6 +1078,7 @@ impl RemoteDiscoveryManager {
             source_factory: Arc::new(source_factory),
             running: HashMap::new(),
             credentials: std::sync::Arc::new(std::collections::HashMap::new()),
+            revision_gates: HashMap::new(),
         }
     }
 
@@ -1190,6 +1197,17 @@ impl RemoteDiscoveryManager {
                 }
             }
         }
+        let revision_gate = self
+            .revision_gates
+            .entry(target.cluster_name.clone())
+            .or_insert_with(|| {
+                let gate = MeshRevisionGate::new();
+                gate.set_policy(MeshRevisionPolicy {
+                    foreign_authority_adopt_secs: config.revision_adopt_secs,
+                });
+                Arc::new(gate)
+            })
+            .clone();
         let ctx = RemoteClusterPollContext {
             cluster_name: target.cluster_name.clone(),
             trust_domain: target.trust_domain.clone(),
@@ -1197,6 +1215,7 @@ impl RemoteDiscoveryManager {
             control_plane_url: target.control_plane_url.clone(),
             credential_ref: target.credential_ref.clone(),
             config,
+            revision_gate,
         };
         let source = (self.source_factory)(&ctx);
         let task_store = self.store.clone();
@@ -1295,6 +1314,9 @@ pub struct RemoteDiscoveryConfig {
     /// last-good endpoints indefinitely (dev/test only in production
     /// validation).
     pub max_stale_age: Option<Duration>,
+    /// Same foreign-authority adoption policy as the local native/xDS slice
+    /// consumer. Remote discovery keeps its own per-cluster revision gate.
+    pub revision_adopt_secs: u64,
     /// Production posture rejects plaintext remote-control-plane URLs.
     pub production_mode: bool,
     /// JWT secret + issuer for the remote CP gRPC handshake (reuses the
@@ -1325,6 +1347,7 @@ impl RemoteDiscoveryConfig {
             interval_seconds,
             timeout_seconds,
             DEFAULT_REMOTE_DISCOVERY_MAX_STALE_SECONDS,
+            DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             jwt_secret,
             node_id,
             namespace,
@@ -1336,6 +1359,7 @@ impl RemoteDiscoveryConfig {
         interval_seconds: u64,
         timeout_seconds: u64,
         max_stale_seconds: u64,
+        revision_adopt_secs: u64,
         jwt_secret: Option<GrpcJwtSecret>,
         node_id: String,
         namespace: String,
@@ -1347,7 +1371,9 @@ impl RemoteDiscoveryConfig {
         Some(Self {
             poll_interval: Duration::from_secs(interval_seconds),
             request_timeout: Duration::from_secs(timeout_seconds.max(1)),
-            max_stale_age: (max_stale_seconds > 0).then(|| Duration::from_secs(max_stale_seconds)),
+            max_stale_age: (max_stale_seconds > 0)
+                .then_some(Duration::from_secs(max_stale_seconds)),
+            revision_adopt_secs,
             production_mode: crate::identity::production_mode(),
             jwt_secret,
             node_id,
@@ -1609,6 +1635,8 @@ pub struct RemoteClusterPollContext {
     /// entries so `matches_declared` treats it as part of the poll identity.
     pub credential_ref: Option<String>,
     pub config: RemoteDiscoveryConfig,
+    /// Ordering watermark retained by the manager across poller/source changes.
+    pub revision_gate: Arc<MeshRevisionGate>,
 }
 
 async fn remote_discovery_loop(
@@ -1916,17 +1944,24 @@ fn sanitize_url_for_logging(url: &str) -> String {
 /// poller (each poll is independent; a failure keeps the last-good snapshot).
 pub struct NativeRemoteSource {
     control_plane_url: String,
+    cluster_name: String,
+    trust_domain: TrustDomain,
+    network: Option<String>,
     node_id: String,
     namespace: String,
     jwt_secret: GrpcJwtSecret,
     tls_config: Option<DpGrpcTlsConfig>,
     request_timeout: Duration,
+    revision_gate: Arc<MeshRevisionGate>,
 }
 
 impl NativeRemoteSource {
     pub fn new(ctx: &RemoteClusterPollContext, jwt_secret: GrpcJwtSecret) -> Self {
         Self {
             control_plane_url: ctx.control_plane_url.clone(),
+            cluster_name: ctx.cluster_name.clone(),
+            trust_domain: ctx.trust_domain.clone(),
+            network: ctx.network.clone(),
             node_id: ctx.config.node_id.clone(),
             namespace: ctx.config.namespace.clone(),
             jwt_secret,
@@ -1935,6 +1970,7 @@ impl NativeRemoteSource {
                 .tls_config
                 .for_control_plane_url(&ctx.control_plane_url),
             request_timeout: ctx.config.request_timeout,
+            revision_gate: ctx.revision_gate.clone(),
         }
     }
 }
@@ -1942,7 +1978,7 @@ impl NativeRemoteSource {
 #[async_trait]
 impl RemoteServiceSource for NativeRemoteSource {
     async fn fetch(&self) -> Result<RemoteClusterEndpoints, String> {
-        fetch_remote_slice_endpoints(
+        let slice = fetch_remote_slice(
             &self.control_plane_url,
             &self.node_id,
             &self.namespace,
@@ -1950,7 +1986,25 @@ impl RemoteServiceSource for NativeRemoteSource {
             self.tls_config.as_ref(),
             self.request_timeout,
         )
-        .await
+        .await?;
+        let mut endpoints = RemoteClusterEndpoints {
+            workloads: slice.workloads,
+            services: slice.services,
+        };
+        // Validate content before advancing the revision watermark: a
+        // structurally invalid far-future slice must not poison the gate and
+        // lock out the last-good generation.
+        validate_remote_endpoints(&self.cluster_name, &endpoints)?;
+        enforce_remote_trust_domain(&mut endpoints, &self.trust_domain, &self.cluster_name);
+        tag_remote_workloads(
+            &mut endpoints,
+            &self.cluster_name,
+            self.network.as_deref(),
+        );
+        self.revision_gate
+            .admit(slice.revision.as_ref(), chrono::Utc::now())
+            .map_err(|rejection| format!("remote MeshSubscribe revision rejected: {rejection}"))?;
+        Ok(endpoints)
     }
 }
 
@@ -1983,8 +2037,9 @@ impl RemoteServiceSource for MissingSecretSource {
     }
 }
 
-/// One-shot remote MeshSubscribe: connect, read the first non-heartbeat slice,
-/// return its workloads/services. Bounded by `request_timeout`.
+/// One-shot remote MeshSubscribe: connect, read and validate the first
+/// non-heartbeat slice, then return it to the source's content and revision
+/// gates. Bounded by `request_timeout`.
 ///
 /// The response is validated against the exact subscription request through the
 /// SAME centralized rules the local native consumer applies
@@ -1993,14 +2048,14 @@ impl RemoteServiceSource for MissingSecretSource {
 /// binding — before any endpoint is imported. Any rejection fails the whole
 /// poll, so `remote_discovery_loop` keeps the cluster's last-good endpoints,
 /// backs off, and never installs wrong-cluster or wrong-namespace endpoints.
-async fn fetch_remote_slice_endpoints(
+async fn fetch_remote_slice(
     control_plane_url: &str,
     node_id: &str,
     namespace: &str,
     jwt_secret: &GrpcJwtSecret,
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
-) -> Result<RemoteClusterEndpoints, String> {
+) -> Result<crate::modes::mesh::slice::MeshSlice, String> {
     use crate::grpc::dp_client::generate_dp_jwt_with_issuer_and_namespace;
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
@@ -2082,10 +2137,7 @@ async fn fetch_remote_slice_endpoints(
             }
             let slice = validate_mesh_config_update(&update, &expected, consumer)
                 .map_err(|rejection| format!("remote MeshSubscribe rejected: {rejection}"))?;
-            return Ok(RemoteClusterEndpoints {
-                workloads: slice.workloads,
-                services: slice.services,
-            });
+            return Ok(slice);
         }
         Err("remote MeshSubscribe stream closed before delivering a slice".to_string())
     };
@@ -3240,6 +3292,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
@@ -3367,6 +3420,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
@@ -3413,6 +3467,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             // A shared secret IS present; the unresolved ref must still fail
             // closed rather than silently borrow it.
@@ -3471,6 +3526,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
@@ -3544,6 +3600,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
@@ -3573,6 +3630,11 @@ mod tests {
 
         manager.reconcile(Some(&accepted), trusted.clone());
         assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        let accepted_revision_gate = manager
+            .revision_gates
+            .get("west")
+            .expect("eligible cluster has an ordering gate")
+            .clone();
         store.install_for_test(RemoteClusterEntry {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
@@ -3615,6 +3677,16 @@ mod tests {
         // The cluster is still eligible, so a fresh poller for the new identity
         // is started (it just hasn't fetched anything yet via the stub source).
         assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        assert!(
+            Arc::ptr_eq(
+                &accepted_revision_gate,
+                manager
+                    .revision_gates
+                    .get("west")
+                    .expect("replacement poller retains the ordering gate"),
+            ),
+            "a source-identity change must not reset the accepted revision"
+        );
         manager.shutdown();
     }
 
@@ -3690,6 +3762,7 @@ mod tests {
             poll_interval: Duration::from_secs(60),
             request_timeout: Duration::from_secs(1),
             max_stale_age: None,
+            revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             production_mode: false,
             jwt_secret: None,
             node_id: "dp-1".to_string(),
@@ -3706,6 +3779,7 @@ mod tests {
             control_plane_url: "https://cp.remote.example:15010".to_string(),
             credential_ref: None,
             config: config.clone(),
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         };
         let http_ctx = RemoteClusterPollContext {
             control_plane_url: "http://cp.remote.example:15010".to_string(),
@@ -3772,12 +3846,14 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 request_timeout: Duration::from_secs(1),
                 max_stale_age: None,
+                revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
                 production_mode: false,
                 jwt_secret: None,
                 node_id: "dp-1".to_string(),
                 namespace: "default".to_string(),
                 tls_config: RemoteDiscoveryTlsConfig::default(),
             },
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         };
 
         let task_store = store.clone();
@@ -4246,7 +4322,7 @@ mod tests {
     // The tests above stub `RemoteServiceSource::fetch` with `MockSource`. The
     // ones below stand up an in-process `MeshConfigSync` gRPC server on a
     // loopback port and point the *production* dialer
-    // ([`NativeRemoteSource`] -> `fetch_remote_slice_endpoints`) at it, so the
+    // ([`NativeRemoteSource`] -> `fetch_remote_slice`) at it, so the
     // real wire path is exercised end to end: channel dial, DP-JWT mint +
     // server-side verification (the same `verify_grpc_jwt_metadata` the real
     // `MeshGrpcServer` uses), `MeshSubscribe` streaming, heartbeat skipping,
@@ -4452,12 +4528,14 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 request_timeout,
                 max_stale_age: None,
+                revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
                 production_mode: false,
                 jwt_secret,
                 node_id: "dp-1".to_string(),
                 namespace: "default".to_string(),
                 tls_config: RemoteDiscoveryTlsConfig::default(),
             },
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         }
     }
 
@@ -4489,6 +4567,62 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_a_stale_remote_revision_across_reconnects() {
+        let secret = GrpcJwtSecret::new("multicluster-revision-secret-00000".to_string());
+        let mut fresh_slice = remote_slice_with_endpoints();
+        fresh_slice.version = "v-remote-100".to_string();
+        fresh_slice.revision = Some(crate::modes::mesh::revision::MeshConfigRevision::new(
+            "remote-db",
+            100,
+        ));
+        let fresh_handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(fresh_slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let mut stale_slice = remote_slice_with_endpoints();
+        stale_slice.version = "v-remote-99".to_string();
+        stale_slice.revision = Some(crate::modes::mesh::revision::MeshConfigRevision::new(
+            "remote-db",
+            99,
+        ));
+        let stale_handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(stale_slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(
+            &fresh_handle.url,
+            Some(secret.clone()),
+            Duration::from_secs(5),
+        );
+        let mut source = NativeRemoteSource::new(&ctx, secret);
+        source
+            .fetch()
+            .await
+            .expect("the fresh remote baseline must install");
+
+        // Preserve the source (and therefore its accepted watermark) while
+        // reconnecting it to a lagging replica of the same remote authority.
+        source.control_plane_url = stale_handle.url.clone();
+        let error = source
+            .fetch()
+            .await
+            .expect_err("a reconnect must not roll remote endpoints backwards");
+        assert!(
+            error.contains("stale_revision"),
+            "expected a bounded revision rejection, got: {error}"
+        );
+
+        fresh_handle.shutdown().await;
+        stale_handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

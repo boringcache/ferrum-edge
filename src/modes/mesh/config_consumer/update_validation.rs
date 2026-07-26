@@ -318,8 +318,15 @@ pub fn validate_mesh_config_update(
     // the envelope carries a copy of the slice's own `(authority, sequence)`.
     // A frame whose envelope and slice disagree is internally inconsistent, so
     // it is refused rather than silently ordered by one of the two values.
+    if update.config_authority.trim().is_empty() && update.config_sequence != 0 {
+        let detail = format!(
+            "envelope config sequence {} has no config authority",
+            update.config_sequence
+        );
+        return rejected(consumer, Reason::EnvelopeRevisionMismatch, detail);
+    }
     let envelope_revision = (!update.config_authority.trim().is_empty())
-        .then(|| (update.config_authority.as_str(), update.config_sequence));
+        .then_some((update.config_authority.as_str(), update.config_sequence));
     let slice_revision = slice
         .revision
         .as_ref()

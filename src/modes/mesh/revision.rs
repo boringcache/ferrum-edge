@@ -253,7 +253,7 @@ impl MeshRevisionRejection {
 
 impl std::fmt::Display for MeshRevisionRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.reason.as_metric_label(), self.detail)
+        write!(f, "{}: {}", self.reason.as_metric_label(), self.detail())
     }
 }
 

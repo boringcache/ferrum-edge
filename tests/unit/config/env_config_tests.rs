@@ -1819,6 +1819,68 @@ fn test_env_config_cp_mode_valid() {
     );
 }
 
+#[test]
+fn test_env_config_cp_rejects_control_characters_in_mesh_config_authority() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", "db\nforged"),
+        ],
+        || {
+            let error = EnvConfig::from_env().expect_err("control characters must fail closed");
+            assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+            assert!(error.contains("control-character-free"));
+            assert!(!error.contains("forged"), "the rejected value must not be echoed");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_cp_rejects_oversized_mesh_config_authority() {
+    let oversized = "a".repeat(129);
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", oversized.as_str()),
+        ],
+        || {
+            let error = EnvConfig::from_env().expect_err("oversized authority must fail closed");
+            assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+            assert!(error.contains("128 bytes"));
+            assert!(
+                !error.contains(oversized.as_str()),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+}
+
 // ============================================================================
 // DNS Enhanced Configuration Tests
 // ============================================================================

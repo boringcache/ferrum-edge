@@ -613,24 +613,22 @@ async fn load_full_config_multi_with_sequence(
     for ns in namespaces {
         sequences.insert(ns.clone(), db.latest_change_sequence(ns).await?);
     }
+    let mesh_sequence = if mesh_authority.is_some() {
+        db.latest_global_change_sequence()
+            .await?
+            .max(mesh_sequence_floor)
+    } else {
+        0
+    };
     let mut config = load_full_config_multi(db, namespaces).await?;
     // `config_changes.sequence` is a single globally monotonic change log, so
-    // the highest sequence across the polled namespaces is this snapshot's
-    // generation. The floor keeps that generation monotonic across polls: under
-    // `CpScope::All` the polled namespace SET can shrink (a namespace is
-    // deleted), and a bare max over the surviving namespaces would move the
-    // published revision BACKWARDS — which every subscribed data plane would
-    // correctly quarantine as a rollback.
-    stamp_mesh_revision(
-        &mut config,
-        mesh_authority,
-        sequences
-            .values()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .max(mesh_sequence_floor),
-    );
+    // its store-wide high-water mark is the snapshot generation. It must not be
+    // derived only from currently polled namespaces: under `CpScope::All` that
+    // set can shrink when a namespace is deleted, and a restarted CP has no
+    // in-process floor to remember the deleted namespace's newer sequence. The
+    // durable global cursor keeps publication monotonic across that restart;
+    // the floor also protects an in-process full reload.
+    stamp_mesh_revision(&mut config, mesh_authority, mesh_sequence);
     Ok((config, sequences))
 }
 
