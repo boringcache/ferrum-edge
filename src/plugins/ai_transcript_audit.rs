@@ -2621,21 +2621,170 @@ struct ReassembledToolCall {
     arguments: String,
 }
 
+/// Identity used to correlate reassembled SSE fragments across deltas.
+///
+/// The three key spaces are deliberately disjoint, and each one encodes exactly
+/// how much identity the provider actually asserted:
+///
+/// * [`ReassemblySlot::Indexed`] — a provider-declared valid unsigned `index`.
+///   This is the only assertion of identity trusted *across* frames, so it is
+///   the only slot whose fragments are concatenated over the whole stream.
+/// * [`ReassemblySlot::Positional`] — array position of an entry that carried
+///   no `index` at all. Position identifies an entry only *within* the delta
+///   that carried it; it is never treated as asserted cross-frame identity.
+/// * [`ReassemblySlot::Unattributed`] — a monotonically increasing occurrence
+///   ordinal for an entry whose `index` was present but not a valid unsigned
+///   integer (string, float, negative, `null`, oversized, object). Every such
+///   occurrence gets its **own** ordinal, so two unrelated malformed indices
+///   can never share a bucket: a malformed index is an absence of identity, not
+///   a shared identity. Collapsing them into one bucket (as a single `None` key
+///   would) lets a backend concatenate a complete sensitive JSON argument with
+///   unrelated junk, break the JSON, and thereby escape the recursive
+///   sensitive-key redaction that depends on the value parsing.
+///
+/// Fragments in the non-`Indexed` spaces are still captured and redacted —
+/// dropping them would let a malformed index hide payload from the audit record
+/// entirely — but once their identity is ambiguous their payload is withheld
+/// rather than joined on a guess or exported piecemeal (see
+/// [`AMBIGUOUS_COMPLETION_TEXT`] and [`AMBIGUOUS_TOOL_CALL_ARGUMENTS`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReassemblySlot {
+    /// Provider-declared `index`.
+    Indexed(u64),
+    /// Array position of an `index`-less entry within a single delta.
+    Positional(u64),
+    /// Occurrence ordinal of an entry whose `index` was present but malformed.
+    Unattributed(u64),
+}
+
+/// Placeholder exported in place of completion text whose owning choice could
+/// not be identified. Withholding is deliberate: the fragments cannot be safely
+/// joined (they may belong to different choices) and they cannot be safely
+/// exported apart either, because a sensitive JSON key and its value can be
+/// split across them and would then escape JSON-key redaction.
+const AMBIGUOUS_COMPLETION_TEXT: &str = "[REDACTED:ambiguous_choice]";
+
+/// Placeholder exported in place of tool-call arguments whose owning call could
+/// not be identified. Same reasoning as [`AMBIGUOUS_COMPLETION_TEXT`].
+const AMBIGUOUS_TOOL_CALL_ARGUMENTS: &str = "[REDACTED:ambiguous_tool_call]";
+
+/// Output key for a choice bucket. A provider index renders as the bare number;
+/// the other two spaces carry compiled-in prefixes, so no unidentified bucket
+/// can ever render as — or collide with — an index the provider declared.
+fn choice_slot_label(slot: ReassemblySlot) -> String {
+    match slot {
+        ReassemblySlot::Indexed(index) => index.to_string(),
+        ReassemblySlot::Positional(position) => format!("position:{position}"),
+        ReassemblySlot::Unattributed(occurrence) => format!("unattributed:{occurrence}"),
+    }
+}
+
 #[derive(Default)]
 struct ReassembledChoice {
     content: String,
-    tool_calls: BTreeMap<u64, ReassembledToolCall>,
+    tool_calls: BTreeMap<ReassemblySlot, ReassembledToolCall>,
+    /// Number of non-empty `delta.tool_calls` arrays applied to this choice.
+    /// Counted per applied array rather than per SSE frame so that several
+    /// `choices` entries collapsing onto the same choice bucket are recognized
+    /// as separate, uncorrelatable contributions. Empty arrays are ignored:
+    /// they contribute no correlatable fragment and must not poison a later
+    /// single unambiguous indexless call into withholding.
+    tool_call_deltas: usize,
+    /// Whether any applied tool-call entry lacked a usable provider `index`
+    /// (absent → positional, or malformed → unattributed).
+    saw_unidentified_tool_call: bool,
+    /// Occurrence counter backing [`ReassemblySlot::Unattributed`] tool calls
+    /// within this choice.
+    unattributed_tool_calls: u64,
     finish_reason: Option<String>,
+}
+
+impl ReassembledChoice {
+    /// True when this choice's tool-call arguments cannot be attributed to a
+    /// specific call with confidence.
+    ///
+    /// A single delta is always unambiguous: its array entries are distinct
+    /// calls by construction and nothing is joined across frames. Once a second
+    /// delta contributes to a choice that has any unidentified entry, no
+    /// fragment in the choice is trustworthy — the unidentified entry may
+    /// continue any earlier call (indexed or not), and conversely an earlier
+    /// fragment may be the prefix whose value half arrives in a differently
+    /// keyed slot. Both directions are handled by withholding every argument
+    /// fragment in the choice.
+    fn tool_call_identity_ambiguous(&self) -> bool {
+        self.saw_unidentified_tool_call && self.tool_call_deltas > 1
+    }
+}
+
+/// True when a choice bucket does not rest on provider-asserted identity.
+///
+/// An indexed bucket is asserted and correlates across frames. A positional
+/// bucket is asserted only *within* the one delta that carried it, so it stays
+/// trustworthy only while the stream contains no other choice-bearing delta:
+/// the moment a second delta exists, some fragment in it — positional or
+/// indexed — may be the other half of this bucket's text, and exporting the two
+/// halves apart lets a sensitive JSON key and its value escape the recursive
+/// key redaction that only runs when the value parses. That is why the test is
+/// stream-wide (`multi_delta_stream`) rather than per-bucket: a per-bucket
+/// delta count misses a positional bucket whose continuation landed in a
+/// *different* bucket, which is exactly the mixed indexed/indexless stream a
+/// hostile provider can construct. An unattributed bucket is never asserted at
+/// all: it holds exactly one occurrence and its neighbour fragments live in
+/// other buckets, so a key/value split across them could never be redacted as
+/// JSON.
+fn choice_identity_ambiguous(slot: ReassemblySlot, multi_delta_stream: bool) -> bool {
+    match slot {
+        ReassemblySlot::Indexed(_) => false,
+        ReassemblySlot::Positional(_) => multi_delta_stream,
+        ReassemblySlot::Unattributed(_) => true,
+    }
 }
 
 /// Reassemble captured OpenAI `chat.completion.chunk` SSE frames by choice.
 /// Text and tool-call fragments are concatenated in frame order, including
 /// fragmented arguments, before the caller applies sensitive-field and pattern
 /// redaction. Uniformly parseable tool-call-only streams use this path too.
+///
+/// Optional provider-controlled fields are classified by whether a malformed
+/// value can be safely ignored:
+///
+/// * **Ignorable** — `finish_reason`, `delta`, `delta.content`, `tool_calls`,
+///   `id`, `type`, `function`, `function.name`, `function.arguments`. A
+///   malformed value here carries no attribution meaning, so it is skipped
+///   rather than aborting reassembly. Aborting would fall back to per-frame
+///   redaction, which cannot see a secret or PII value split across adjacent
+///   fragments — the malformed field would become a redaction-bypass primitive.
+///   Malformed payload-bearing values (`content`, `arguments`) are dropped, not
+///   coerced to text: splicing a serialized non-string between two real
+///   fragments would break the very cross-fragment match this path exists for.
+/// * **Identity-bearing** — `choices[].index` and `tool_calls[].index`. These
+///   decide which bucket a fragment joins, so a malformed value is neither
+///   coerced to `0` nor dropped: it routes to a per-occurrence unattributed
+///   bucket (see [`ReassemblySlot`]) so it can neither concatenate onto an
+///   unrelated choice or call nor vanish from the record.
+///
+/// Nothing here ever returns to the raw per-frame fallback because of
+/// ambiguous optional identity: per-frame redaction cannot see a value split
+/// across adjacent fragments, so a provider that could force it would hold a
+/// redaction-bypass primitive. Ambiguity is answered by *withholding* the
+/// affected payload behind a fixed compiled-in placeholder plus an evidence
+/// flag, never by guessing an attribution and never by exporting the fragments
+/// separately.
+///
+/// Every ignored or re-routed field is reported in the excerpt's
+/// `malformed_fields` list so degraded fidelity is visible to the audit
+/// consumer instead of silent. That list holds only compiled-in field paths,
+/// never provider values, so it cannot become a secret-bearing diagnostic, and
+/// it is bounded by the number of distinct field paths below.
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
-    let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
-    let mut tool_call_choices_seen = BTreeSet::new();
+    let mut per_choice: BTreeMap<ReassemblySlot, ReassembledChoice> = BTreeMap::new();
+    let mut unattributed_choices: u64 = 0;
+    // Number of deltas (frames) that carried at least one `choices[]` entry.
+    // Counted per frame, not per entry, because entries inside one array are
+    // distinct choices by construction while separate frames are not.
+    let mut choice_deltas: usize = 0;
+    let mut malformed_fields: BTreeSet<&'static str> = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2652,68 +2801,155 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             return None;
         }
         let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            if let Some(choices) = frame.get("choices")
+                && !choices.is_null()
+            {
+                malformed_fields.insert("choices");
+            }
             continue;
         };
-        for choice in choices {
-            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-            let accumulated = per_choice.entry(index).or_default();
+        if !choices.is_empty() {
+            choice_deltas = choice_deltas.saturating_add(1);
+        }
+        for (choice_position, choice) in choices.iter().enumerate() {
+            // Identity-bearing: a present-but-malformed index must not collapse
+            // onto choice 0 (that would concatenate unrelated completions), must
+            // not share one bucket with every *other* malformed index (same
+            // concatenation, one step removed), and must not abort reassembly.
+            // Each malformed occurrence therefore gets its own ordinal. An
+            // *absent* index is keyed by position, which identifies the entry
+            // within its own delta only.
+            let slot = match choice.get("index") {
+                None => ReassemblySlot::Positional(choice_position as u64),
+                Some(index) => match index.as_u64() {
+                    Some(index) => ReassemblySlot::Indexed(index),
+                    None => {
+                        malformed_fields.insert("choices[].index");
+                        let occurrence = unattributed_choices;
+                        unattributed_choices = occurrence.saturating_add(1);
+                        ReassemblySlot::Unattributed(occurrence)
+                    }
+                },
+            };
+            let accumulated = per_choice.entry(slot).or_default();
             if let Some(finish_reason) = choice.get("finish_reason")
                 && !finish_reason.is_null()
             {
-                accumulated.finish_reason = Some(finish_reason.as_str()?.to_string());
+                if let Some(finish_reason) = finish_reason.as_str() {
+                    accumulated.finish_reason = Some(finish_reason.to_string());
+                } else {
+                    // Ignorable: keep any previously observed valid reason
+                    // rather than overwriting it with a guess.
+                    malformed_fields.insert("choices[].finish_reason");
+                }
             }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
-            let delta = delta.as_object()?;
+            let Some(delta) = delta.as_object() else {
+                if !delta.is_null() {
+                    malformed_fields.insert("choices[].delta");
+                }
+                continue;
+            };
             if let Some(content) = delta.get("content")
                 && !content.is_null()
             {
-                accumulated.content.push_str(content.as_str()?);
+                if let Some(content) = content.as_str() {
+                    accumulated.content.push_str(content);
+                } else {
+                    malformed_fields.insert("choices[].delta.content");
+                }
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
-                let tool_calls = tool_calls.as_array()?;
-                let has_indexless_call = tool_calls
-                    .iter()
-                    .any(|tool_call| tool_call.get("index").is_none());
-                if has_indexless_call && tool_call_choices_seen.contains(&index) {
-                    // Position is only an unambiguous fallback within one
-                    // frame. A later indexless frame could continue any prior
-                    // call, so keep the raw-frame redaction path rather than
-                    // joining potentially unrelated tool calls.
-                    return None;
+                let Some(tool_calls) = tool_calls.as_array() else {
+                    if !tool_calls.is_null() {
+                        malformed_fields.insert("choices[].delta.tool_calls");
+                    }
+                    continue;
+                };
+                // Only non-empty arrays contribute tool-call identity. An empty
+                // `tool_calls: []` is a no-op delta: counting it would let a
+                // provider poison a later single unambiguous indexless call into
+                // withholding without introducing any correlatable fragment.
+                if tool_calls.is_empty() {
+                    continue;
                 }
-                tool_call_choices_seen.insert(index);
+                accumulated.tool_call_deltas = accumulated.tool_call_deltas.saturating_add(1);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
-                    let tool_call = tool_call.as_object()?;
-                    let tool_index = match tool_call.get("index") {
-                        Some(index) => index.as_u64()?,
-                        None => position as u64,
+                    let Some(tool_call) = tool_call.as_object() else {
+                        if !tool_call.is_null() {
+                            malformed_fields.insert("choices[].delta.tool_calls[]");
+                        }
+                        continue;
                     };
-                    let call = accumulated.tool_calls.entry(tool_index).or_default();
+                    // Identity-bearing, same reasoning as the choice index: an
+                    // absent index is positional (intra-delta identity only) and
+                    // a malformed one takes its own occurrence ordinal, so it
+                    // can neither continue an unrelated call nor be dropped from
+                    // the record. Either way the choice is marked unidentified,
+                    // which withholds its arguments once a second delta lands.
+                    let slot = match tool_call.get("index") {
+                        None => {
+                            accumulated.saw_unidentified_tool_call = true;
+                            ReassemblySlot::Positional(position as u64)
+                        }
+                        Some(index) => match index.as_u64() {
+                            Some(index) => ReassemblySlot::Indexed(index),
+                            None => {
+                                malformed_fields.insert("choices[].delta.tool_calls[].index");
+                                accumulated.saw_unidentified_tool_call = true;
+                                let occurrence = accumulated.unattributed_tool_calls;
+                                accumulated.unattributed_tool_calls = occurrence.saturating_add(1);
+                                ReassemblySlot::Unattributed(occurrence)
+                            }
+                        },
+                    };
+                    let call = accumulated.tool_calls.entry(slot).or_default();
                     if let Some(id) = tool_call.get("id")
                         && !id.is_null()
                     {
-                        merge_sse_scalar_fragment(&mut call.id, id.as_str()?);
+                        if let Some(id) = id.as_str() {
+                            merge_sse_scalar_fragment(&mut call.id, id);
+                        } else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].id");
+                        }
                     }
                     if let Some(call_type) = tool_call.get("type")
                         && !call_type.is_null()
                     {
-                        merge_sse_scalar_fragment(&mut call.call_type, call_type.as_str()?);
+                        if let Some(call_type) = call_type.as_str() {
+                            merge_sse_scalar_fragment(&mut call.call_type, call_type);
+                        } else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].type");
+                        }
                     }
                     if let Some(function) = tool_call.get("function")
                         && !function.is_null()
                     {
-                        let function = function.as_object()?;
+                        let Some(function) = function.as_object() else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].function");
+                            continue;
+                        };
                         if let Some(name) = function.get("name")
                             && !name.is_null()
                         {
-                            merge_sse_scalar_fragment(&mut call.name, name.as_str()?);
+                            if let Some(name) = name.as_str() {
+                                merge_sse_scalar_fragment(&mut call.name, name);
+                            } else {
+                                malformed_fields
+                                    .insert("choices[].delta.tool_calls[].function.name");
+                            }
                         }
                         if let Some(arguments) = function.get("arguments")
                             && !arguments.is_null()
                         {
-                            call.arguments.push_str(arguments.as_str()?);
+                            if let Some(arguments) = arguments.as_str() {
+                                call.arguments.push_str(arguments);
+                            } else {
+                                malformed_fields
+                                    .insert("choices[].delta.tool_calls[].function.arguments");
+                            }
                         }
                     }
                 }
@@ -2726,32 +2962,84 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     {
         return None;
     }
+    // Choice identity is a stream-level property: once any bucket rests on a
+    // guess, a sensitive key in one bucket may have its value half in another,
+    // so no bucket's payload can be exported. Withholding (rather than joining
+    // on a guess, or exporting the halves apart) is the only answer that leaks
+    // neither direction.
+    let multi_delta_stream = choice_deltas > 1;
+    let choices_ambiguous = per_choice
+        .keys()
+        .any(|slot| choice_identity_ambiguous(*slot, multi_delta_stream));
     let mut completion_text = serde_json::Map::new();
     let mut response_tool_calls = serde_json::Map::new();
     let mut finish_reasons = serde_json::Map::new();
-    for (choice_index, choice) in per_choice {
-        let choice_key = choice_index.to_string();
+    for (choice_slot, choice) in per_choice {
+        let choice_key = choice_slot_label(choice_slot);
+        let tool_calls_ambiguous = choices_ambiguous || choice.tool_call_identity_ambiguous();
         if !choice.content.is_empty() {
-            completion_text.insert(choice_key.clone(), Value::String(choice.content));
+            let content = if choices_ambiguous {
+                AMBIGUOUS_COMPLETION_TEXT.to_string()
+            } else {
+                choice.content
+            };
+            completion_text.insert(choice_key.clone(), Value::String(content));
         }
         if !choice.tool_calls.is_empty() {
             let mut calls = Vec::with_capacity(choice.tool_calls.len());
-            for (tool_index, call) in choice.tool_calls {
+            for (slot, call) in choice.tool_calls {
                 let mut call_json = serde_json::Map::new();
-                call_json.insert("index".to_string(), Value::from(tool_index));
-                if !call.id.is_empty() {
-                    call_json.insert("id".to_string(), Value::String(call.id));
-                }
-                if !call.call_type.is_empty() {
-                    call_json.insert("type".to_string(), Value::String(call.call_type));
-                }
-                if !call.name.is_empty() || !call.arguments.is_empty() {
-                    let mut function = serde_json::Map::new();
-                    if !call.name.is_empty() {
-                        function.insert("name".to_string(), Value::String(call.name));
+                // Only a provider-declared index is exported as `index`; the
+                // other spaces are labelled for what they are, so the record
+                // never implies an identity the provider did not assert.
+                let unidentified = match slot {
+                    ReassemblySlot::Indexed(index) => {
+                        call_json.insert("index".to_string(), Value::from(index));
+                        false
                     }
-                    if !call.arguments.is_empty() {
-                        function.insert("arguments".to_string(), Value::String(call.arguments));
+                    ReassemblySlot::Positional(position) => {
+                        call_json.insert("position".to_string(), Value::from(position));
+                        true
+                    }
+                    ReassemblySlot::Unattributed(occurrence) => {
+                        call_json.insert("index_unattributed".to_string(), Value::Bool(true));
+                        call_json.insert("occurrence".to_string(), Value::from(occurrence));
+                        true
+                    }
+                };
+                // Under ambiguous identity the scalar fragments of an
+                // unidentified call may have been co-located with an unrelated
+                // call, so only provider-indexed identity survives.
+                let withhold_identity = tool_calls_ambiguous && unidentified;
+                if !withhold_identity {
+                    if !call.id.is_empty() {
+                        call_json.insert("id".to_string(), Value::String(call.id));
+                    }
+                    if !call.call_type.is_empty() {
+                        call_json.insert("type".to_string(), Value::String(call.call_type));
+                    }
+                }
+                let name = if withhold_identity {
+                    String::new()
+                } else {
+                    call.name
+                };
+                let withhold_arguments = tool_calls_ambiguous && !call.arguments.is_empty();
+                let arguments = if withhold_arguments {
+                    AMBIGUOUS_TOOL_CALL_ARGUMENTS.to_string()
+                } else {
+                    call.arguments
+                };
+                if withhold_arguments {
+                    call_json.insert("arguments_withheld".to_string(), Value::Bool(true));
+                }
+                if !name.is_empty() || !arguments.is_empty() {
+                    let mut function = serde_json::Map::new();
+                    if !name.is_empty() {
+                        function.insert("name".to_string(), Value::String(name));
+                    }
+                    if !arguments.is_empty() {
+                        function.insert("arguments".to_string(), Value::String(arguments));
                     }
                     call_json.insert("function".to_string(), Value::Object(function));
                 }
@@ -2769,7 +3057,8 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
         "object".to_string(),
         Value::String("chat.completion.chunk".to_string()),
     );
-    if !completion_text.is_empty() {
+    let completion_text_present = !completion_text.is_empty();
+    if completion_text_present {
         annotated.insert(
             "completion_text".to_string(),
             Value::Object(completion_text),
@@ -2780,6 +3069,26 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     }
     if !finish_reasons.is_empty() {
         annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
+    }
+    if choices_ambiguous {
+        // Fixed-schema evidence: the consumer learns the excerpt was withheld
+        // for identity reasons rather than silently seeing a shorter record.
+        annotated.insert("choice_identity_ambiguous".to_string(), Value::Bool(true));
+        if completion_text_present {
+            annotated.insert("completion_text_withheld".to_string(), Value::Bool(true));
+        }
+    }
+    if !malformed_fields.is_empty() {
+        // Compiled-in field paths only, never provider values: the audit
+        // consumer learns that some optional fields were malformed and skipped
+        // (or re-routed to `unattributed`) without the record itself becoming a
+        // channel for the malformed content. Omitted entirely for well-formed
+        // streams, so the documented shape is unchanged in the normal case.
+        let reported: Vec<Value> = malformed_fields
+            .into_iter()
+            .map(|field| Value::String(field.to_string()))
+            .collect();
+        annotated.insert("malformed_fields".to_string(), Value::Array(reported));
     }
     Some(Value::Object(annotated))
 }
