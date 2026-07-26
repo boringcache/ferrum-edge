@@ -319,10 +319,11 @@ async fn test_admin_mysql_runtime_resource_crud_matrix() {
 async fn test_admin_mongodb_runtime_resource_crud_matrix() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
     if !continue_if_backend_available(
         "mongodb",
         mongodb_is_available(&mongo_url).await,
-        &format!("not available at {mongo_url}"),
+        &format!("not available at {mongo_host_port}"),
     ) {
         return;
     }
@@ -374,8 +375,12 @@ async fn test_admin_restore_persists_normalized_canonical_fields_mongodb() {
     // Hosted-CI functional coverage for issue #2402 on the MongoDB path.
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
-        eprintln!("MongoDB is not available at {mongo_url}; skipping restore normalization");
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
         return;
     }
 

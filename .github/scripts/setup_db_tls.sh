@@ -253,6 +253,11 @@ wait_for_containers() {
     docker exec "$MYSQL_CONTAINER" mysql -u root "-p$DB_PASSWORD" -e \
         "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;" \
         >/dev/null
+    # Match plaintext CI: functional cells CREATE/DROP per-cell databases.
+    # Official images make POSTGRES_USER a superuser, but set CREATEDB explicitly
+    # so isolation does not depend on that image default.
+    docker exec "$PG_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER USER \"$DB_USER\" WITH CREATEDB;" >/dev/null
 
     log "All containers are healthy and ready for testing."
     log ""

@@ -168,51 +168,72 @@ pub struct IsolatedSqlDatabase {
 
 impl Drop for IsolatedSqlDatabase {
     fn drop(&mut self) {
-        let output = match self.kind {
-            IsolatedSqlKind::Postgres => std::process::Command::new("docker")
-                .args([
-                    "exec",
-                    &self.container,
-                    "psql",
-                    "-U",
-                    &self.user,
-                    "-d",
-                    "postgres",
-                    "-v",
-                    "ON_ERROR_STOP=1",
-                    "-c",
-                    &format!(
-                        "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE);",
-                        self.db_name
-                    ),
-                ])
-                .output(),
-            IsolatedSqlKind::Mysql => std::process::Command::new("docker")
-                .args([
-                    "exec",
-                    &self.container,
-                    "mysql",
-                    &format!("-u{}", self.user),
-                    &format!("-p{}", self.password),
-                    "-e",
-                    &format!("DROP DATABASE IF EXISTS `{}`;", self.db_name),
-                ])
-                .output(),
+        // MySQL rejects DROP DATABASE while sessions still hold the schema;
+        // gateway Drop kills the child, but server-side cleanup can lag briefly.
+        // Postgres uses WITH (FORCE); MySQL gets a short sync retry loop.
+        let attempts = match self.kind {
+            IsolatedSqlKind::Postgres => 1,
+            IsolatedSqlKind::Mysql => 5,
         };
-        if let Ok(output) = output {
-            if !output.status.success() {
-                eprintln!(
-                    "WARN: failed to drop isolated {} database {} in {}: {}",
-                    match self.kind {
-                        IsolatedSqlKind::Postgres => "postgres",
-                        IsolatedSqlKind::Mysql => "mysql",
-                    },
-                    self.db_name,
-                    self.container,
-                    String::from_utf8_lossy(&output.stderr)
-                );
+        let mut last_stderr = String::new();
+        for attempt in 0..attempts {
+            let output = match self.kind {
+                IsolatedSqlKind::Postgres => std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        &self.container,
+                        "psql",
+                        "-U",
+                        &self.user,
+                        "-d",
+                        "postgres",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-c",
+                        &format!(
+                            "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE);",
+                            self.db_name
+                        ),
+                    ])
+                    .output(),
+                IsolatedSqlKind::Mysql => std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        &self.container,
+                        "mysql",
+                        &format!("-u{}", self.user),
+                        &format!("-p{}", self.password),
+                        "-e",
+                        &format!("DROP DATABASE IF EXISTS `{}`;", self.db_name),
+                    ])
+                    .output(),
+            };
+            match output {
+                Ok(output) if output.status.success() => return,
+                Ok(output) => {
+                    last_stderr = scrub_secret(
+                        &String::from_utf8_lossy(&output.stderr),
+                        &self.password,
+                    );
+                }
+                Err(error) => {
+                    last_stderr = scrub_secret(&error.to_string(), &self.password);
+                }
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        eprintln!(
+            "WARN: failed to drop isolated {} database {} in {}: {}",
+            match self.kind {
+                IsolatedSqlKind::Postgres => "postgres",
+                IsolatedSqlKind::Mysql => "mysql",
+            },
+            self.db_name,
+            self.container,
+            last_stderr
+        );
     }
 }
 
@@ -241,7 +262,44 @@ fn sql_url_credentials(url: &str) -> Option<(String, String)> {
         return None;
     }
     let (user, password) = userinfo.split_once(':')?;
-    Some((user.to_string(), password.to_string()))
+    // Connection URLs percent-encode reserved characters; docker CLI args need
+    // the decoded secret.
+    let user = percent_decode(user);
+    let password = percent_decode(password);
+    Some((user, password))
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            // application/x-www-form-urlencoded treats '+' as space; URL userinfo
+            // does not, so keep literal '+'.
+            out.push(b'+');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn rewrite_sql_url_database(url: &str, db_name: &str) -> Option<String> {
@@ -252,6 +310,17 @@ fn rewrite_sql_url_database(url: &str, db_name: &str) -> Option<String> {
         Some(query) => format!("{scheme}://{authority}/{db_name}{query}"),
         None => format!("{scheme}://{authority}/{db_name}"),
     })
+}
+
+fn redact_db_url(url: &str) -> String {
+    ferrum_edge::config::db_backend::redact_url(url)
+}
+
+fn scrub_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    text.replace(secret, "***")
 }
 
 /// Create a unique database on a known CI SQL container and return a URL that
@@ -267,7 +336,8 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
     let Some((user, password)) = sql_url_credentials(base_url) else {
         if db_backends_required() || db_tls_required() {
             panic!(
-                "cannot isolate SQL database for required CI backend: credentials missing in {base_url}"
+                "cannot isolate SQL database for required CI backend: credentials missing in {}",
+                redact_db_url(base_url)
             );
         }
         return (base_url.to_string(), None);
@@ -311,6 +381,7 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
         let detail = create_output
             .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
             .unwrap_or_else(|error| error.to_string());
+        let detail = scrub_secret(&detail, &password);
         if db_backends_required() || db_tls_required() {
             panic!(
                 "failed to create isolated SQL database {db_name} in {container} \
@@ -324,7 +395,10 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
     }
 
     let Some(url) = rewrite_sql_url_database(base_url, &db_name) else {
-        panic!("failed to rewrite isolated database URL for {base_url}");
+        panic!(
+            "failed to rewrite isolated database URL for {}",
+            redact_db_url(base_url)
+        );
     };
     (
         url,

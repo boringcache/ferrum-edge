@@ -656,10 +656,11 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
 
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
     if !continue_if_backend_available(
         "mongodb",
         mongodb_is_available(&mongo_url).await,
-        &format!("not available at {mongo_url}"),
+        &format!("not available at {mongo_host_port}"),
     ) {
         return;
     }
