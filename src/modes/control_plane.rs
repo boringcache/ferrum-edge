@@ -505,6 +505,15 @@ async fn load_full_config_multi(
     let mut failed_namespaces = Vec::new();
     let mut any_success = false;
     let mut last_hard_error: Option<anyhow::Error> = None;
+    // `loaded_at` of the first namespace that actually loaded. A published CP
+    // FULL_SNAPSHOT carries `ConfigUpdate.version = config.loaded_at`, which is
+    // the DP's monotonic ordering watermark and its cross-source staleness
+    // fence. When the first namespaces in the list fail, `combined` is seeded
+    // from `previous` — so without this the snapshot would be broadcast under
+    // the *already applied* stamp, leaving the DP watermark stuck behind
+    // content that did change. Taken from the load (not `Utc::now()`) so the
+    // stamp still precedes every query, preserving the full-load safety margin.
+    let mut fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
     for ns in namespaces {
         match db
@@ -515,6 +524,9 @@ async fn load_full_config_multi(
                 Ok(mut next) => {
                     any_success = true;
                     refreshed_namespaces.push(ns.clone());
+                    if fresh_loaded_at.is_none() {
+                        fresh_loaded_at = Some(next.loaded_at);
+                    }
                     match &mut combined {
                         None => combined = Some(next),
                         Some(acc) => {
@@ -604,6 +616,12 @@ async fn load_full_config_multi(
     }
 
     let mut config = combined.unwrap_or_else(|| previous.clone());
+    // Stamp the snapshot with the first successful load's timestamp even when
+    // the accumulator was seeded from `previous`, so the broadcast
+    // `ConfigUpdate.version` advances with the content it describes.
+    if let Some(loaded_at) = fresh_loaded_at {
+        config.loaded_at = loaded_at;
+    }
     // Preserve non-namespaced mesh overlay ownership: mesh comes from the
     // K8s overlay re-merge at publication time, not from DB full loads.
     config.mesh = None;

@@ -32,7 +32,10 @@ const GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP: usize = 256;
 /// DB-authored `GatewayConfig` snapshot. CP full reloads re-merge this overlay
 /// before publication so a DB poll can no longer wipe in-memory K8s-derived
 /// state and broadcast the wipe (issues #2982 / #2984).
-#[derive(Debug, Clone)]
+/// Deliberately not `Debug`: `translation` is a `GatewayConfig`, which carries
+/// consumer credentials. Matching the CP-side `FullLoadMultiOutcome` /
+/// `PartitionComposeOutcome` contract keeps the overlay out of any log line.
+#[derive(Clone)]
 pub struct AcceptedK8sOverlay {
     pub translation: GatewayConfig,
     pub managed_namespaces: BTreeSet<String>,
