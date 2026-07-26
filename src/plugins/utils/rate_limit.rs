@@ -1067,7 +1067,20 @@ impl SlidingWindow {
         let slot = (self.current_bucket % SLIDING_WINDOW_BUCKET_COUNT as u64) as usize;
         self.buckets[slot] = self.buckets[slot].saturating_add(1);
         self.total = self.total.saturating_add(1);
-        self.last_activity = Some(now);
+        // `LocalLimiter::check` samples `Instant::now()` before the per-key
+        // DashMap write guard, so concurrent admissions can arrive in reverse
+        // timestamp order. Never move the cleanup watermark backwards: a delayed
+        // older sample must not make still-live newer usage look idle.
+        self.note_activity(now);
+    }
+
+    /// Advance the idle/activity watermark only forward.
+    #[inline]
+    fn note_activity(&mut self, now: Instant) {
+        match self.last_activity {
+            Some(last) if now < last => {}
+            _ => self.last_activity = Some(now),
+        }
     }
 
     pub fn remaining(&self) -> u64 {
@@ -1556,6 +1569,10 @@ pub struct TokenUsageWindow {
     window_duration: Duration,
     limit: u64,
     total: u64,
+    /// Newest admission/reconciliation watermark for idle cleanup. Updated only
+    /// forward so reverse-ordered `now` samples (captured before the per-key
+    /// write guard) cannot make still-live newer usage look stale.
+    last_activity: Option<Instant>,
     /// Monotonic per-window source of reservation ids. `0` is reserved as the
     /// "no reservation" sentinel, so ids handed out start at `1`.
     next_reservation_id: u64,
@@ -1568,6 +1585,7 @@ impl TokenUsageWindow {
             window_duration,
             limit,
             total: 0,
+            last_activity: None,
             next_reservation_id: 1,
         }
     }
@@ -1595,8 +1613,15 @@ impl TokenUsageWindow {
     /// reconciliation deltas and any anonymous usage). Returns the id assigned.
     fn record_usage(&mut self, now: Instant, tokens: u64) -> u64 {
         let id = self.allocate_id();
+        // Clamp reverse-ordered samples forward so the deque stays chronological
+        // for window expiry and the cleanup watermark never moves backward.
+        let at = match self.last_activity {
+            Some(last) if now < last => last,
+            _ => now,
+        };
+        self.last_activity = Some(at);
         self.entries.push_back(TokenEntry {
-            at: now,
+            at,
             id,
             tokens,
         });
@@ -1742,12 +1767,14 @@ impl TokenUsageWindow {
     }
 
     fn has_recent_activity(&self, now: Instant) -> bool {
-        self.entries
-            .back()
-            .is_some_and(|entry| {
-                now.checked_duration_since(entry.at)
-                    .is_none_or(|elapsed| elapsed < self.window_duration)
-            })
+        // Prefer the forward-only watermark over `entries.back()`: concurrent
+        // reverse-timestamp admissions can leave an older sample at the back
+        // even when newer usage is still live.
+        let Some(last) = self.last_activity else {
+            return false;
+        };
+        now.checked_duration_since(last)
+            .is_none_or(|elapsed| elapsed < self.window_duration)
     }
 }
 
@@ -2287,7 +2314,13 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
             state.bytes.store(0, Ordering::Release);
         }
 
-        state.last_check_secs.store(now_secs, Ordering::Relaxed);
+        // Same reverse-arrival hazard as SlidingWindow/`TokenBucket`: `now` is
+        // sampled before the per-key write guard. `fetch_max` keeps the idle
+        // watermark monotonic so a delayed older datagram cannot make newer
+        // live usage look stale to cleanup.
+        state
+            .last_check_secs
+            .fetch_max(now_secs, Ordering::Relaxed);
 
         let new_count = saturating_atomic_add(&state.count, 1);
         let new_bytes = saturating_atomic_add(&state.bytes, op.datagram_size);

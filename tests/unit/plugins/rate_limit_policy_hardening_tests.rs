@@ -565,6 +565,113 @@ fn token_bucket_ignores_reverse_ordered_concurrent_timestamps() {
 }
 
 #[test]
+fn sliding_window_reverse_arrival_keeps_live_state_through_cleanup() {
+    // Newer sample lands first; an older pre-lock sample follows. The activity
+    // watermark must stay at the newer instant so a sweep past the older
+    // sample's retention horizon cannot evict still-live aggregate usage.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 100,
+        duration: Duration::from_secs(60),
+    }]);
+    let limiter = LocalLimiter::new(DynamicHttpRateLimitAlgorithm::new(), 2);
+    let t0 = Instant::now();
+    let t_newer = t0
+        .checked_add(Duration::from_secs(1))
+        .expect("test Instant supports a one-second offset");
+
+    assert!(limiter.check_at("live-key".to_string(), &op, t_newer).allowed);
+    assert!(limiter.check_at("live-key".to_string(), &op, t0).allowed);
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    // For a 60s window, retention is ceil(60*64/63) ≈ 60.95s. A sweep at
+    // t0+61s would treat last_activity=t0 as idle, but last_activity=t_newer
+    // (t0+1s) is still inside the retention horizon.
+    let sweep = t0
+        .checked_add(Duration::from_secs(61))
+        .expect("test Instant supports a 61-second offset");
+    limiter.prune_stale_at(sweep);
+    assert!(
+        limiter.contains_key(&"live-key".to_string()),
+        "reverse-ordered older sample must not rewind activity and prune live state"
+    );
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    // Direct window: older sample after newer must not move the watermark back.
+    let mut window = SlidingWindow::new(10, Duration::from_secs(60));
+    assert!(window.would_allow(t_newer));
+    window.increment(t_newer);
+    assert!(window.would_allow(t0));
+    window.increment(t0);
+    assert!(
+        window.has_recent_activity(sweep),
+        "activity watermark must remain at the newer admission"
+    );
+    assert_eq!(window.retained_buckets(), SLIDING_WINDOW_BUCKET_COUNT);
+}
+
+#[test]
+fn udp_reverse_arrival_keeps_live_state_through_cleanup() {
+    let epoch = Instant::now();
+    let algorithm = UdpRateLimitAlgorithm::new(Some(1_000), None, 1, epoch);
+    let limiter = LocalLimiter::new(algorithm, 2);
+    let op = UdpRateLimitOp { datagram_size: 1 };
+    let t_newer = epoch
+        .checked_add(Duration::from_secs(5))
+        .expect("test Instant supports a five-second offset");
+    let t_older = epoch
+        .checked_add(Duration::from_secs(1))
+        .expect("test Instant supports a one-second offset");
+
+    assert!(limiter.check_at("10.0.0.9".to_string(), &op, t_newer).allowed);
+    assert!(limiter.check_at("10.0.0.9".to_string(), &op, t_older).allowed);
+
+    // Idle threshold is max(window*2, 10) == 10s. With last_check wrongly
+    // rewound to 1s, a sweep at epoch+12s looks idle (11s); with a forward
+    // watermark at 5s it is still live (7s).
+    let sweep = epoch
+        .checked_add(Duration::from_secs(12))
+        .expect("test Instant supports a 12-second offset");
+    limiter.prune_stale_at(sweep);
+    assert!(
+        limiter.contains_key(&"10.0.0.9".to_string()),
+        "UDP last_check_secs must not move backward under reverse arrival"
+    );
+}
+
+#[test]
+fn ai_token_window_reverse_arrival_keeps_live_state_through_cleanup() {
+    let algorithm = AiTokenRateAlgorithm::new(1_000, 60);
+    let limiter = LocalLimiter::new(algorithm, 2);
+    let t0 = Instant::now();
+    let t_newer = t0
+        .checked_add(Duration::from_secs(1))
+        .expect("test Instant supports a one-second offset");
+    let reserve = AiRateLimitOp::Reserve { tokens: 10 };
+
+    assert!(
+        limiter
+            .check_at("consumer:a".to_string(), &reserve, t_newer)
+            .allowed
+    );
+    assert!(
+        limiter
+            .check_at("consumer:a".to_string(), &reserve, t0)
+            .allowed
+    );
+
+    // Activity uses a < window_duration check. At exactly t0+60s an activity
+    // marker of t0 looks idle, while a forward marker of t_newer remains live.
+    let sweep = t0
+        .checked_add(Duration::from_secs(60))
+        .expect("test Instant supports a 60-second offset");
+    limiter.prune_stale_at(sweep);
+    assert!(
+        limiter.contains_key(&"consumer:a".to_string()),
+        "AI TokenUsageWindow activity must not follow a reverse-ordered back entry"
+    );
+}
+
+#[test]
 fn ai_maximum_window_uses_checked_instant_arithmetic() {
     let algorithm = AiTokenRateAlgorithm::new(10, MAX_RATE_LIMIT_WINDOW_SECONDS);
     let mut state = algorithm.new_state();
