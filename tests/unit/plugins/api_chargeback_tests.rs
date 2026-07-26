@@ -3923,6 +3923,27 @@ fn test_same_identity_multi_status_consumes_distinct_entry_slots() {
     assert_eq!(json["registry"]["identity_overflow_total"], 1);
 }
 
+/// `DashMap::with_shard_amount` panics when the shard count is not a power of
+/// two strictly greater than one. Empty `/charges` helpers must use the
+/// dedicated minimum valid shard constant, not `1`.
+#[test]
+fn test_empty_charges_render_uses_valid_dashmap_shard_amount() {
+    const MIN_VALID: usize = 2;
+    assert!(
+        MIN_VALID.is_power_of_two() && MIN_VALID > 1,
+        "DashMap requires a power of two strictly greater than one"
+    );
+    let source = include_str!("../../../src/plugins/api_chargeback.rs");
+    assert!(
+        source.contains("EMPTY_CHARGES_RENDER_SHARD_AMOUNT"),
+        "empty /charges render must use the dedicated valid shard constant"
+    );
+    assert!(
+        !source.contains("with_shard_amount(1)"),
+        "with_shard_amount(1) panics in DashMap; empty render must not use it"
+    );
+}
+
 /// Authenticated empty `/charges` must not claim the process-global OnceLock.
 /// Otherwise a scrape before any `api_chargeback` plugin is configured locks
 /// auto sharding in and a later accepted generation cannot honor

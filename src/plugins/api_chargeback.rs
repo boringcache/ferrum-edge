@@ -132,17 +132,25 @@ pub fn try_global_registry() -> Option<Arc<ChargebackRegistry>> {
     CHARGEBACK_REGISTRY.get().cloned()
 }
 
+/// Smallest shard count accepted by `DashMap::with_shard_amount` (power of two
+/// and strictly greater than one). Ephemeral empty `/charges` renders use this
+/// so the non-owning path never panics before any plugin owns the registry.
+const EMPTY_CHARGES_RENDER_SHARD_AMOUNT: usize = 2;
+const _: () = assert!(EMPTY_CHARGES_RENDER_SHARD_AMOUNT.is_power_of_two());
+const _: () = assert!(EMPTY_CHARGES_RENDER_SHARD_AMOUNT > 1);
+
 /// Authenticated empty `/charges` JSON shape used when the registry has never
 /// been created. Allocates only an ephemeral local registry — it does **not**
 /// claim [`CHARGEBACK_REGISTRY`].
 pub fn empty_charges_json() -> Result<String, String> {
-    ChargebackRegistry::with_shard_amount(1).render_json_uncached()
+    ChargebackRegistry::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT).render_json_uncached()
 }
 
 /// Authenticated empty `/charges` Prometheus shape used when the registry has
 /// never been created. Does **not** claim [`CHARGEBACK_REGISTRY`].
 pub fn empty_charges_prometheus() -> Result<String, String> {
-    ChargebackRegistry::with_shard_amount(1).render_prometheus_uncached()
+    ChargebackRegistry::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT)
+        .render_prometheus_uncached()
 }
 
 /// Resolve the process-global registry, creating it with `shard_amount` shards
