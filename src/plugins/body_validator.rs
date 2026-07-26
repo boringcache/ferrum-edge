@@ -1006,7 +1006,9 @@ impl ProtobufWalkBudget {
     fn charge(&mut self) -> Result<(), String> {
         self.messages += 1;
         if self.messages > MAX_PROTOBUF_MESSAGES {
-            return Err("Protobuf message exceeds the initialization inspection budget".to_string());
+            return Err(
+                "Protobuf message exceeds the initialization inspection budget".to_string(),
+            );
         }
         Ok(())
     }
