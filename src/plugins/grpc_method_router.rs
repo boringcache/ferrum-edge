@@ -15,11 +15,14 @@ use tracing::{debug, warn};
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, apply_rate_limit_cleanup,
+    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, validate_max_requests, validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{
     GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
@@ -28,6 +31,41 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// enforcement skips this cooldown so a sampled observation of pressure
 /// still force-reclaims without waiting for the next cool-down window.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+
+/// `grpc_method_router`-specific top-level config keys (excludes Redis fields).
+const GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS: &[&str] = &[
+    "allow_methods",
+    "deny_methods",
+    "method_rate_limits",
+    "limit_by",
+];
+
+/// Closed top-level key set for `grpc_method_router` plugin config.
+///
+/// Must stay aligned with OpenAPI `GrpcMethodRouterConfig`,
+/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. Unknown root keys fail
+/// closed: a valid method rule previously masked a misspelled `sync_mdoe`,
+/// `limit_byy`, or `redis_key_prefx`, so the plugin loaded with local, IP-keyed,
+/// or shared-prefix enforcement instead of the intended policy.
+pub const GRPC_METHOD_ROUTER_CONFIG_KEYS: &[&str] = &[
+    "allow_methods",
+    "deny_methods",
+    "method_rate_limits",
+    "limit_by",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
+/// Closed key set for one `method_rate_limits` entry.
+const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -49,6 +87,35 @@ pub struct GrpcMethodRouter {
 
 impl GrpcMethodRouter {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `grpc_method_router`
+    /// instances in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| format!("grpc_method_router: config must be an object, got: {config}"))?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity.
+        debug_assert_closed_root_keys(
+            GRPC_METHOD_ROUTER_CONFIG_KEYS,
+            GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            GRPC_METHOD_ROUTER_CONFIG_KEYS,
+            "grpc_method_router: ",
+        )?;
+
         let allow_methods = parse_optional_method_set(config, "allow_methods")?;
         let deny_methods = parse_optional_method_set(config, "deny_methods")?.unwrap_or_default();
 
@@ -83,6 +150,13 @@ impl GrpcMethodRouter {
                 let spec_obj = spec.as_object().ok_or_else(|| {
                     format!("grpc_method_router: method_rate_limits['{method}'] must be an object")
                 })?;
+                let label = format!("grpc_method_router: method_rate_limits['{method}']");
+                reject_unknown_keys(
+                    spec_obj,
+                    &format!("config.method_rate_limits[{method}]"),
+                    RATE_SPEC_KEYS,
+                    "grpc_method_router: ",
+                )?;
                 let max_requests = spec_obj
                     .get("max_requests")
                     .and_then(Value::as_u64)
@@ -99,16 +173,9 @@ impl GrpcMethodRouter {
                             "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
                         )
                     })?;
-                if max_requests == 0 {
-                    return Err(format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'max_requests' must be greater than zero"
-                    ));
-                }
-                if window_seconds == 0 {
-                    return Err(format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' must be greater than zero"
-                    ));
-                }
+                let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+                let window_seconds =
+                    validate_window_seconds(&label, "window_seconds", window_seconds)?;
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
                 let window = Duration::from_secs(window_seconds);
                 if method_rate_limits
@@ -147,8 +214,9 @@ impl GrpcMethodRouter {
             deny_methods,
             method_rate_limits,
             limit_by,
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "grpc_method_router",
+                config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
@@ -163,6 +231,13 @@ impl GrpcMethodRouter {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.

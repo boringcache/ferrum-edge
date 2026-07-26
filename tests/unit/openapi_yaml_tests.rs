@@ -1630,6 +1630,79 @@ fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     }
 }
 
+/// GHSA-q3p3-94cj-8wh6 / GHSA-jjjw-rqjm-fvf3: the remaining rate-limiter
+/// components must expose closed root objects and bounded numeric ranges that
+/// match the runtime allowlists, so a typo or an extreme value is rejected by
+/// schema-driven authoring tools and by admission alike.
+#[test]
+fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
+    use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
+    use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
+    use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (schema_name, runtime_keys) in [
+        ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
+        ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
+        ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must be a closed object"
+        );
+        let schema_fields: BTreeSet<_> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<_> = runtime_keys.iter().copied().collect();
+        assert_eq!(
+            schema_fields, runtime_fields,
+            "{schema_name} OpenAPI/runtime key drift"
+        );
+    }
+
+    let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
+    let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);
+    for pointer in [
+        "/components/schemas/RateLimitingRuleConfig/properties/window_seconds/maximum",
+        "/components/schemas/UdpRateLimitingConfig/properties/window_seconds/maximum",
+        "/components/schemas/AiRateLimiterConfig/properties/window_seconds/maximum",
+        "/components/schemas/GraphqlRateSpec/properties/window_seconds/maximum",
+        "/components/schemas/RateSpec/properties/window_seconds/maximum",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer),
+            Some(&window_max),
+            "{pointer} must advertise the runtime window bound"
+        );
+    }
+    for pointer in [
+        "/components/schemas/RateLimitingRuleConfig/properties/max_requests/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_second/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_minute/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_hour/maximum",
+        "/components/schemas/GraphqlRateSpec/properties/max_requests/maximum",
+        "/components/schemas/RateSpec/properties/max_requests/maximum",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer),
+            Some(&requests_max),
+            "{pointer} must advertise the runtime request-cap bound"
+        );
+    }
+}
+
 #[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
@@ -1650,10 +1723,10 @@ fn graphql_config_schema_matches_runtime_validation() {
         spec.pointer("/components/schemas/GraphqlRateSpec/additionalProperties"),
         Some(&json!(false))
     );
-    assert_ne!(
+    assert_eq!(
         spec.pointer("/components/schemas/RateSpec/additionalProperties"),
         Some(&json!(false)),
-        "GraphQL hardening must not close the shared gRPC RateSpec ahead of its runtime"
+        "the gRPC runtime now rejects unknown per-method spec keys, so RateSpec must be closed too"
     );
     assert_eq!(
         schema["properties"]["type_rate_limits"]["properties"]

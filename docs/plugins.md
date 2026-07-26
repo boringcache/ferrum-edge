@@ -2524,8 +2524,18 @@ Enforces request rate limits per time window. Supports limiting by client IP, au
 Configure one or more rules in `limits`. Exactly one rule must use `scope: default`; it applies to every IP/SPIFFE key, every consumer without a specific rule, and the IP fallback when `limit_by: consumer` has no identity. Additional `scope: consumers` rules are only valid with `limit_by: consumer`; each rule can name one or many consumer identities in `consumers`, and each listed identity gets its own independent counter using that rule's windows.
 
 Each `limits[]` rule configures rate windows in one of two ways:
-1. `window_seconds` + `max_requests` — exact custom window of any duration
+1. `window_seconds` + `max_requests` — exact custom window
 2. One or more of `requests_per_second` / `requests_per_minute` / `requests_per_hour`
+
+**Configuration bounds (all rate-limit plugins).** Every window is capped at
+`2678400` seconds (31 days) and every request cap at `1000000`. Zero is rejected,
+and so is anything above the cap. The window bound keeps the value representable
+as a monotonic duration, as a signed Redis `EXPIRE` TTL (`2 × window + 1`), and
+as the stale-state retention horizon; unbounded values previously wrapped into a
+zero/negative TTL that deleted the counter on every increment and removed
+enforcement entirely. The request-cap bound exists because the local sliding
+window retains one timestamp per admitted request until it ages out, so the cap
+is what bounds per-key memory. Unknown top-level keys are rejected.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
@@ -2540,15 +2550,15 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `limits` | Array | required | One default rule plus optional consumer-scoped rules |
 | `limits[].scope` | String | required | `default` or `consumers`; exactly one `default` rule is required |
 | `limits[].consumers` | String array | — | Required for `scope: consumers`; one or many effective consumer identities, each with an independent counter using this rule's windows |
-| `limits[].window_seconds` | u64 (optional) | — | Custom window duration in seconds. Must be paired with `max_requests` |
-| `limits[].max_requests` | u64 (optional) | — | Maximum requests allowed within `window_seconds`. Must be paired with `window_seconds` and greater than zero |
-| `limits[].requests_per_second` | u64 (optional) | — | Max requests per second |
-| `limits[].requests_per_minute` | u64 (optional) | — | Max requests per minute |
-| `limits[].requests_per_hour` | u64 (optional) | — | Max requests per hour |
+| `limits[].window_seconds` | u64 (optional) | — | Custom window duration in seconds. Must be paired with `max_requests`. Range 1–2678400 (31 days) |
+| `limits[].max_requests` | u64 (optional) | — | Maximum requests allowed within `window_seconds`. Must be paired with `window_seconds`. Range 1–1000000 |
+| `limits[].requests_per_second` | u64 (optional) | — | Max requests per second. Range 1–1000000 |
+| `limits[].requests_per_minute` | u64 (optional) | — | Max requests per minute. Range 1–1000000 |
+| `limits[].requests_per_hour` | u64 (optional) | — | Max requests per hour. Range 1–1000000 |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -2577,7 +2587,7 @@ For grouped consumer rules, the list is not a shared budget. For example, `consu
 
 **Centralized mode** (`sync_mode: "redis"`): Rate limit counters are stored in Redis so multiple gateway instances (e.g., multiple data planes) share a single global rate limit. Uses a two-window weighted approximation algorithm with native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined) for smooth sliding window semantics: window index and elapsed fraction are derived from one epoch timestamp with subsecond precision, so one-second and other short windows decay continuously through `[0, 1)` rather than in whole-second steps. Background Redis health observers and recovery checkers are owned by the limiter/client instance and stop when that generation is dropped (config reload or shutdown), so retired instances do not retain connections or keep pinging obsolete endpoints. If Redis becomes unreachable, the plugin automatically falls back to local in-memory rate limiting and switches back when connectivity is restored. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
-> **Namespace isolation:** When `FERRUM_NAMESPACE` is set to a non-default value, the default `redis_key_prefix` automatically includes the namespace (e.g., `staging:rate_limiting` instead of `ferrum:rate_limiting`). This prevents key collisions when multiple gateway instances with different namespaces share the same Redis cluster. An explicit `redis_key_prefix` in the plugin config overrides this behavior entirely.
+> **Namespace and policy isolation:** The default `redis_key_prefix` is `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` (e.g. `staging:rate_limiting:rl-public-api`). The namespace component prevents collisions when gateway instances with different namespaces share one Redis cluster; the plugin-config id component prevents collisions between two independent policies of the same plugin type *inside* one namespace, which previously incremented and rejected against each other's counters. The id is the configured plugin-config resource id, so replicas of the same policy across data planes still share one distributed budget. This applies to `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`. An explicit `redis_key_prefix` overrides this behavior entirely and is the supported way to opt two policies into a deliberately shared budget.
 
 ```yaml
 plugin_name: rate_limiting
@@ -3746,7 +3756,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `sync_mode` | String | `local` | Exact lowercase `local` (in-memory per instance) or `redis` (centralized) for GraphQL rate-limit counters |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:graphql:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
@@ -3856,12 +3866,12 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 |---|---|---|---|
 | `allow_methods` | String[] | *(none)* | Only these gRPC methods are permitted (allowlist) |
 | `deny_methods` | String[] | `[]` | These gRPC methods are explicitly blocked (checked before allow) |
-| `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path |
+| `method_rate_limits` | Object | `{}` | Per-method rate limits keyed by full method path. Each entry accepts only `max_requests` (1–1000000) and `window_seconds` (1–2678400); unknown keys are rejected |
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) for method rate-limit counters |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:grpc_method_router:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -3872,7 +3882,7 @@ Each configured method accepts one optional leading slash and must use protobuf 
 
 Each rate limit entry is `{max_requests: u64, window_seconds: u64}`. Both fields are required and must be positive — missing or zero values are rejected at plugin load time so a typo cannot silently disable a rate limit. In Redis mode, `redis_url` and `redis_key_prefix` must be non-empty, the URL must use `redis://` or `rediss://` with an authority, and pool/connect/health numeric settings must be positive.
 
-The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
+The plugin requires at least one effective rule (`allow_methods`, a non-empty `deny_methods`, or a non-empty `method_rate_limits`) — an empty config is rejected. Unknown top-level keys are rejected so a valid method rule cannot mask a misspelled synchronization, identity, or Redis field that would otherwise silently fall back to local, IP-keyed, or shared-prefix enforcement. An explicitly empty `allow_methods` is valid block-all policy. Deny takes precedence over allow. When `allow_methods` is set, only listed methods are permitted.
 
 `on_request_received` may populate provisional client-path metadata for early consumers. After the first backend target is selected, `on_backend_path_resolved` clears those three fields, replaces them from the backend-effective method, and enforces allow/deny/rate policy exactly once. Deferred external routing-header hooks run only after that enforcement and cannot change the pinned target. An invalid backend-effective gRPC path fails closed for every policy shape, including deny-only and rate-only configurations. Retries may rotate hosts or ports but do not rotate to a target-specific path that would change the already authorized method.
 
@@ -4877,7 +4887,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
-| `window_seconds` | Integer | `60` | Sliding window duration in seconds |
+| `window_seconds` | Integer | `60` | Sliding window duration in seconds. Range 1–2678400 (31 days) |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers. On successful buffered metered responses, `x-ai-ratelimit-usage` and `x-ai-ratelimit-remaining` describe the bucket **after** provider-usage reconciliation (not the pre-request reservation estimate). `x-ai-ratelimit-limit` and `x-ai-ratelimit-window` stay coherent with the configured budget. Admission-time values may appear briefly after `after_proxy` and are refreshed once `on_response_body` reconciles. Unmetered `charge_estimate` keeps the reservation (and those header values); `warn` releases and refreshes; `reject` substitutes a 502 without ratelimit headers. Non-2xx and gateway-rejection releases refresh to the post-release bucket. Federation reconciles in rejection-path `after_proxy` before headers are copied, so federation responses already expose post-reconcile values. Synthetic short-circuits (non-federation) do not charge and do not rewrite these headers from a fake usage block. |
@@ -4886,7 +4896,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter` | Redis key namespace prefix. Defaults to `ferrum:ai_rate_limiter` when namespace is `"ferrum"` |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:ai_rate_limiter:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -5325,7 +5335,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:ws_rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
@@ -5406,18 +5416,18 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 |---|---|---|---|
 | `datagrams_per_second` | u64 (optional) | — | Maximum datagrams per `window_seconds` per client IP |
 | `bytes_per_second` | u64 (optional) | — | Maximum bytes per `window_seconds` per client IP (sum of datagram payload sizes) |
-| `window_seconds` | u64 | `1` | Window length in seconds (minimum 1). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
+| `window_seconds` | u64 | `1` | Window length in seconds. Range 1–2678400 (31 days). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
-| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:udp_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:udp_rate_limiting` when namespace is `"ferrum"` |
+| `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:udp_rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
-At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram. Unknown top-level keys are rejected.
 IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once at UDP/DTLS session admission, before local or Redis key construction, so both textual forms share one datagram and byte budget without adding per-datagram allocation.
 
 **Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes and falls back to local counters while Redis is unavailable.

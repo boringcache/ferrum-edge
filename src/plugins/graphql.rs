@@ -39,7 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, apply_rate_limit_cleanup,
+    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    validate_max_requests, validate_window_seconds,
 };
 use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -136,6 +137,18 @@ pub struct GraphqlPlugin {
 
 impl GraphqlPlugin {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `graphql` instances in the
+    /// same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "graphql: config must be an object".to_string())?;
@@ -214,8 +227,9 @@ impl GraphqlPlugin {
             limit_by,
             type_rate_limits,
             operation_rate_limits,
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "graphql",
+                config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
@@ -231,6 +245,13 @@ impl GraphqlPlugin {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
@@ -422,6 +443,13 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     reject_unknown_keys(object, &path, RATE_SPEC_KEYS, "graphql: ")?;
     let max_requests = required_positive_u64(spec, field, key, "max_requests")?;
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
+    // Bound both axes before they reach the shared dynamic HTTP window: an
+    // extreme window underflows local `Instant` subtraction and overflows the
+    // signed Redis TTL, and an extreme cap lets one hot key retain an unbounded
+    // number of per-request timestamps.
+    let label = format!("graphql: {field}['{key}']");
+    let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+    let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)?;
     let window = Duration::from_secs(window_seconds);
     Ok(RateSpec {
         max_requests,

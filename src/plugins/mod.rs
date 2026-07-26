@@ -7414,6 +7414,12 @@ pub fn create_plugin_with_http_client_and_config_id(
     // LDAP repeats this screen at every dial; config admission remains useful for
     // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+    // Rate limiters partition their default Redis key space by this id so two
+    // independent policies of one plugin type in a namespace never share
+    // counters (GHSA-gr3x-g777-hm78). Validation/direct construction has no
+    // resource id and uses the standalone placeholder.
+    let rate_limit_config_id =
+        plugin_config_id.unwrap_or(utils::rate_limit::STANDALONE_RATE_LIMIT_CONFIG_ID);
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -7529,20 +7535,32 @@ pub fn create_plugin_with_http_client_and_config_id(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "graphql" => {
+            let plugin = graphql::GraphqlPlugin::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "grpc_method_router" => {
+            let plugin = grpc_method_router::GrpcMethodRouter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "rate_limiting" => {
+            let plugin = rate_limiting::RateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_mirror" => Ok(Some(Arc::new(
             request_mirror::RequestMirror::new_with_config_id(
                 config,
@@ -7631,10 +7649,14 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )?))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "ai_rate_limiter" => {
+            let plugin = ai_rate_limiter::AiRateLimiter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
@@ -7678,13 +7700,22 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
             config,
         )?))),
-        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "udp_rate_limiting" => Ok(Some(Arc::new(
-            udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http_client.clone())?,
-        ))),
+        "ws_rate_limiting" => {
+            let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "udp_rate_limiting" => {
+            let plugin = udp_rate_limiting::UdpRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
             config,
             http_client,

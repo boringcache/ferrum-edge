@@ -9,9 +9,12 @@ use tracing::warn;
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, apply_rate_limit_cleanup,
+    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, validate_max_requests, validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::util::unknown_keys::reject_unknown_keys;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
@@ -20,6 +23,34 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// still force-reclaims without waiting for the next cool-down window.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
+
+/// `rate_limiting`-specific top-level config keys (excludes shared Redis fields).
+const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers", "limits"];
+
+/// Closed top-level key set for `rate_limiting` plugin config.
+///
+/// Must stay aligned with OpenAPI `RateLimitingConfig` (which already declares
+/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `docs/plugins.md`. Unknown root keys fail closed: a misspelled `sync_mdoe`,
+/// `limit_byy`, `redis_tls`, or `redis_key_prefix` previously passed admission
+/// whenever a valid `limits` rule let construction succeed, silently replacing
+/// distributed enforcement, the caller-identity boundary, Redis transport, or
+/// counter isolation with defaults.
+pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
+    "limit_by",
+    "expose_headers",
+    "limits",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LimitBy {
@@ -41,9 +72,32 @@ pub struct RateLimiting {
 
 impl RateLimiting {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `rate_limiting` instances
+    /// in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| format!("rate_limiting: config must be an object, got: {config}"))?;
+        // Legacy root window fields get their own actionable diagnostic before
+        // the closed-key sweep would report them as merely "unknown".
+        reject_legacy_window_fields(object)?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity.
+        debug_assert_closed_root_keys(
+            RATE_LIMITING_CONFIG_KEYS,
+            RATE_LIMITING_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(object, "config", RATE_LIMITING_CONFIG_KEYS, "rate_limiting: ")?;
         let limit_by = parse_limit_by(object)?;
         let expose_headers = parse_optional_bool(object, "expose_headers")?.unwrap_or(false);
 
@@ -55,8 +109,9 @@ impl RateLimiting {
             );
         }
 
-        let limiter = RateLimitBackend::from_plugin_config(
+        let limiter = RateLimitBackend::from_plugin_config_with_config_id(
             "rate_limiting",
+            config_id,
             config,
             &http_client,
             DynamicHttpRateLimitAlgorithm::new(),
@@ -78,6 +133,13 @@ impl RateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
@@ -493,17 +555,11 @@ fn parse_window_specs(
     }
 
     if let Some(window_seconds) = parse_optional_u64(object, "window_seconds")? {
-        if window_seconds == 0 {
-            return Err(format!(
-                "{label}: 'window_seconds' must be greater than zero"
-            ));
-        }
+        let window_seconds = validate_window_seconds(label, "window_seconds", window_seconds)?;
         let max_requests = parse_optional_u64(object, "max_requests")?.ok_or_else(|| {
             format!("{label}: 'max_requests' is required when 'window_seconds' is set")
         })?;
-        if max_requests == 0 {
-            return Err(format!("{label}: 'max_requests' must be greater than zero"));
-        }
+        let max_requests = validate_max_requests(label, "max_requests", max_requests)?;
         return Ok(vec![RateLimitWindowSpec {
             limit: max_requests,
             duration: Duration::from_secs(window_seconds),
@@ -517,11 +573,7 @@ fn parse_window_specs(
     let mut specs = Vec::new();
 
     if let Some(limit) = parse_optional_u64(object, "requests_per_second")? {
-        if limit == 0 {
-            return Err(format!(
-                "{label}: 'requests_per_second' must be greater than zero"
-            ));
-        }
+        let limit = validate_max_requests(label, "requests_per_second", limit)?;
         specs.push(RateLimitWindowSpec {
             limit,
             duration: Duration::from_secs(1),
@@ -529,11 +581,7 @@ fn parse_window_specs(
     }
 
     if let Some(limit) = parse_optional_u64(object, "requests_per_minute")? {
-        if limit == 0 {
-            return Err(format!(
-                "{label}: 'requests_per_minute' must be greater than zero"
-            ));
-        }
+        let limit = validate_max_requests(label, "requests_per_minute", limit)?;
         specs.push(RateLimitWindowSpec {
             limit,
             duration: Duration::from_secs(60),
@@ -541,11 +589,7 @@ fn parse_window_specs(
     }
 
     if let Some(limit) = parse_optional_u64(object, "requests_per_hour")? {
-        if limit == 0 {
-            return Err(format!(
-                "{label}: 'requests_per_hour' must be greater than zero"
-            ));
-        }
+        let limit = validate_max_requests(label, "requests_per_hour", limit)?;
         specs.push(RateLimitWindowSpec {
             limit,
             duration: Duration::from_secs(3600),

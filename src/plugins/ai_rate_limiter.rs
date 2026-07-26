@@ -13,7 +13,7 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
-    apply_rate_limit_cleanup,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
@@ -164,6 +164,18 @@ pub struct AiRateLimiter {
 
 impl AiRateLimiter {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis token counters from sibling `ai_rate_limiter`
+    /// instances in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         if !config.is_object() {
             return Err("ai_rate_limiter: config must be an object".to_string());
         }
@@ -173,10 +185,11 @@ impl AiRateLimiter {
             return Err("ai_rate_limiter: 'token_limit' must be greater than zero".to_string());
         }
 
-        let window_seconds = optional_u64(config, "window_seconds")?.unwrap_or(60);
-        if window_seconds == 0 {
-            return Err("ai_rate_limiter: 'window_seconds' must be greater than zero".to_string());
-        }
+        let window_seconds = validate_window_seconds(
+            "ai_rate_limiter",
+            "window_seconds",
+            optional_u64(config, "window_seconds")?.unwrap_or(60),
+        )?;
 
         let count_mode = optional_string(config, "count_mode")?
             .unwrap_or("total_tokens")
@@ -255,8 +268,9 @@ impl AiRateLimiter {
             provider,
             on_unmetered_response,
             federation_flag_key,
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "ai_rate_limiter",
+                config_id,
                 config,
                 &http_client,
                 AiTokenRateAlgorithm::new(token_limit, window_seconds),

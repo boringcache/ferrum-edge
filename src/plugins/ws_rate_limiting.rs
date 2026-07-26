@@ -12,7 +12,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::rate_limit::{
-    RateLimitBackend, WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup,
+    RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp,
+    apply_rate_limit_cleanup,
 };
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 
@@ -35,6 +36,18 @@ impl WsRateLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis frame counters from sibling `ws_rate_limiting`
+    /// instances in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         if !config.is_object() {
             return Err("ws_rate_limiting: config must be an object".to_string());
         }
@@ -75,8 +88,9 @@ impl WsRateLimiting {
             close_reason,
             frame_counter: AtomicU64::new(0),
             redis_instance_id: Uuid::new_v4().simple().to_string(),
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "ws_rate_limiting",
+                config_id,
                 config,
                 &http_client,
                 WsFrameRateAlgorithm::new(frames_per_second, burst_size),

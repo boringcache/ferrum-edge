@@ -13,6 +13,95 @@ use tracing::{info, warn};
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 
+/// Placeholder plugin-config identity for constructions that have no stable
+/// resource id (config validation, direct/test construction).
+///
+/// Production `PluginCache` always supplies the real plugin-config resource id
+/// so sibling policies never share a default Redis key space.
+pub const STANDALONE_RATE_LIMIT_CONFIG_ID: &str = "standalone";
+
+/// Largest accepted rate-limit window, in seconds (31 days).
+///
+/// Every window is used three ways, and this bound has to be safe for all of
+/// them: as a monotonic [`Duration`] subtracted from [`Instant::now`], as a
+/// signed Redis `EXPIRE` TTL derived from `window * 2 + 1`, and as the
+/// stale-state retention horizon. Values near `u64::MAX` previously wrapped or
+/// underflowed at each of those sites, which either aborted the process or
+/// wrote a zero/negative expiry that deleted the counter and removed
+/// enforcement entirely.
+pub const MAX_RATE_LIMIT_WINDOW_SECONDS: u64 = 31 * 24 * 60 * 60;
+
+/// Largest accepted request cap for one rate-limit window.
+///
+/// The local sliding window retains one [`Instant`] (16 bytes) per admitted
+/// request until it ages out, so the per-key worst case is bounded by this
+/// value. Anything larger turns a single hot identity into attacker-driven,
+/// request-controlled memory growth inside one window.
+pub const MAX_RATE_LIMIT_MAX_REQUESTS: u64 = 1_000_000;
+
+/// Reject a configured window that is zero or beyond [`MAX_RATE_LIMIT_WINDOW_SECONDS`].
+///
+/// `label` is the caller's diagnostic prefix (for example
+/// `"rate_limiting: limits[0]"`) and `field` the offending key.
+pub fn validate_window_seconds(label: &str, field: &str, value: u64) -> Result<u64, String> {
+    if value == 0 {
+        return Err(format!("{label}: '{field}' must be greater than zero"));
+    }
+    if value > MAX_RATE_LIMIT_WINDOW_SECONDS {
+        return Err(format!(
+            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_WINDOW_SECONDS} seconds, got: {value}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Reject a configured request cap that is zero or beyond
+/// [`MAX_RATE_LIMIT_MAX_REQUESTS`].
+pub fn validate_max_requests(label: &str, field: &str, value: u64) -> Result<u64, String> {
+    if value == 0 {
+        return Err(format!("{label}: '{field}' must be greater than zero"));
+    }
+    if value > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "{label}: '{field}' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {value}"
+        ));
+    }
+    Ok(value)
+}
+
+/// TTL for a two-window (previous + current) Redis sliding-window pair.
+///
+/// Saturating rather than wrapping: admission already bounds `window_seconds`,
+/// but a wrapped `window * 2 + 1` produced a zero or negative `EXPIRE` that
+/// deleted the counter on every increment — silently disabling enforcement.
+/// The result is additionally clamped into the signed range redis-rs sends.
+pub fn two_window_ttl_seconds(window_seconds: u64) -> u64 {
+    window_seconds
+        .saturating_mul(2)
+        .saturating_add(1)
+        .min(i64::MAX as u64)
+}
+
+/// TTL for a single fixed-window Redis counter (`window + 1`), saturating.
+pub fn single_window_ttl_seconds(window_seconds: u64) -> u64 {
+    window_seconds.saturating_add(1).min(i64::MAX as u64)
+}
+
+/// Debug-only parity check that a plugin's closed root key set is exactly the
+/// union of its policy keys and the shared Redis keys.
+///
+/// Keeps the documented key groups, the admission allowlist, and OpenAPI from
+/// drifting apart when a field is added to only one of them.
+pub fn debug_assert_closed_root_keys(full: &[&str], policy: &[&str], redis: &[&str]) {
+    debug_assert!(
+        policy
+            .iter()
+            .chain(redis.iter())
+            .all(|key| full.contains(key))
+            && full.len() == policy.len() + redis.len()
+    );
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RateLimitOutcome {
     pub allowed: bool,
@@ -291,7 +380,10 @@ where
 pub struct RedisLimiter<A: RateLimitAlgorithm> {
     redis_client: Arc<RedisRateLimitClient>,
     algorithm: A,
-    #[cfg(test)]
+    /// Effective Redis key prefix (explicit `redis_key_prefix`, or the
+    /// policy-isolated default). Retained unconditionally so isolation between
+    /// sibling policies is observable from external tests; one cold `String`
+    /// per plugin instance, never touched on the hot path.
     key_prefix: String,
     health_check_interval: Duration,
 }
@@ -303,12 +395,44 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         http_client: &PluginHttpClient,
         algorithm: A,
     ) -> Result<Option<Self>, String> {
-        let default_prefix = format!("{}:{plugin_name}", http_client.namespace());
+        Self::new_with_config_id(
+            plugin_name,
+            STANDALONE_RATE_LIMIT_CONFIG_ID,
+            config,
+            http_client,
+            algorithm,
+        )
+    }
+
+    /// Build the Redis-backed limiter with a policy-isolated default key prefix.
+    ///
+    /// The default prefix is `{namespace}:{plugin_name}:{config_id}`. Without
+    /// `config_id`, every instance of one plugin type in a namespace shared a
+    /// single key space, so two independent policies (different proxies,
+    /// routes, or tenants) incremented and rejected against the same counters.
+    /// The plugin-config resource id is stable across reloads and identical on
+    /// every data plane serving that policy, so replicas of the *same* policy
+    /// still share a distributed budget while distinct policies do not.
+    ///
+    /// An explicit `redis_key_prefix` still wins: it is the documented
+    /// opt-in for deliberately shared budgets.
+    pub fn new_with_config_id(
+        plugin_name: &str,
+        config_id: &str,
+        config: &Value,
+        http_client: &PluginHttpClient,
+        algorithm: A,
+    ) -> Result<Option<Self>, String> {
+        if config_id.trim().is_empty() {
+            return Err(format!(
+                "{plugin_name}: plugin config id must be a non-empty stable identity"
+            ));
+        }
+        let default_prefix = format!("{}:{plugin_name}:{config_id}", http_client.namespace());
         let Some(cfg) = RedisConfig::from_plugin_config(config, &default_prefix)? else {
             return Ok(None);
         };
         let health_check_interval = Duration::from_secs(cfg.health_check_interval_seconds.max(1));
-        #[cfg(test)]
         let key_prefix = cfg.key_prefix.clone();
 
         Ok(Some(Self {
@@ -319,7 +443,6 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
                 http_client.tls_ca_bundle_path(),
             )),
             algorithm,
-            #[cfg(test)]
             key_prefix,
             health_check_interval,
         }))
@@ -335,7 +458,6 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         self.redis_client.warmup_hostname()
     }
 
-    #[cfg(test)]
     pub fn key_prefix(&self) -> &str {
         &self.key_prefix
     }
@@ -554,11 +676,36 @@ where
         http_client: &PluginHttpClient,
         algorithm: A,
     ) -> Result<Self, String> {
+        Self::from_plugin_config_with_config_id(
+            plugin_name,
+            STANDALONE_RATE_LIMIT_CONFIG_ID,
+            config,
+            http_client,
+            algorithm,
+        )
+    }
+
+    /// [`Self::from_plugin_config`] with the stable plugin-config resource id
+    /// that isolates this policy's default Redis key space from sibling
+    /// instances of the same plugin type. See [`RedisLimiter::new_with_config_id`].
+    pub fn from_plugin_config_with_config_id(
+        plugin_name: &'static str,
+        config_id: &str,
+        config: &Value,
+        http_client: &PluginHttpClient,
+        algorithm: A,
+    ) -> Result<Self, String> {
         // Normalize once via PluginHttpClient so local-only and Redis-fallback
         // maps share the same effective FERRUM_POOL_SHARD_AMOUNT.
         let shard_amount = http_client.pool_shard_amount();
         let local = LocalLimiter::new(algorithm.clone(), shard_amount);
-        match RedisLimiter::new(plugin_name, config, http_client, algorithm) {
+        match RedisLimiter::new_with_config_id(
+            plugin_name,
+            config_id,
+            config,
+            http_client,
+            algorithm,
+        ) {
             Ok(Some(redis)) => Ok(Self::Failover(FailoverLimiter::new(
                 plugin_name,
                 redis,
@@ -566,6 +713,17 @@ where
             ))),
             Ok(None) => Ok(Self::Local(local)),
             Err(err) => Err(err),
+        }
+    }
+
+    /// Effective Redis key prefix, or `None` when this backend is local-only.
+    ///
+    /// Exposed so policy-isolation coverage can prove that two independent
+    /// plugin configs of the same type do not share a default key space.
+    pub fn redis_key_prefix(&self) -> Option<&str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Failover(failover) => Some(failover.primary.key_prefix()),
         }
     }
 
@@ -839,7 +997,16 @@ impl SlidingWindow {
     }
 
     fn evict(&mut self, now: Instant) {
-        let cutoff = now - self.window_duration;
+        // `now - window` panics (aborts in release profiles) when the window is
+        // longer than the process' monotonic clock has been running. Admission
+        // bounds the window, but the subtraction must still be checked: a
+        // freshly booted host plus a legitimately long window (up to
+        // `MAX_RATE_LIMIT_WINDOW_SECONDS`) can land before the `Instant` epoch.
+        // No representable cutoff means nothing recorded so far can be older
+        // than the window, so there is nothing to evict.
+        let Some(cutoff) = now.checked_sub(self.window_duration) else {
+            return;
+        };
         while let Some(front) = self.timestamps.front() {
             if *front < cutoff {
                 self.timestamps.pop_front();
@@ -1063,7 +1230,7 @@ async fn check_http_windows_redis(
         let elapsed_fraction = progress.elapsed_fraction;
         let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
-        let ttl = window.window_seconds * 2 + 1;
+        let ttl = two_window_ttl_seconds(window.window_seconds);
 
         let (prev_count, curr_count) = redis
             .sliding_window_increment(&prev_key, &curr_key, ttl)
@@ -1622,7 +1789,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let elapsed_fraction = progress.elapsed_fraction;
                 let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
                 let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
-                let ttl = self.window_seconds * 2 + 1;
+                let ttl = two_window_ttl_seconds(self.window_seconds);
                 let increment = u64_to_i64_saturating(tokens);
                 let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
                 let (prev_count, _) = redis.get_two_counters(&prev_key, &curr_key).await?;
@@ -1688,7 +1855,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
                 let (mut prev_count, mut curr_count) =
                     redis.get_two_counters(&prev_key, &curr_key).await?;
-                let ttl = self.window_seconds * 2 + 1;
+                let ttl = two_window_ttl_seconds(self.window_seconds);
 
                 // `reservation_id` identifies the matching entry only in the
                 // local in-memory window; the Redis counter is aggregate, so it
@@ -1852,7 +2019,7 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let elapsed_fraction = progress.elapsed_fraction;
         let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
-        let ttl = window_seconds * 2 + 1;
+        let ttl = two_window_ttl_seconds(window_seconds);
 
         let (prev_count, curr_count) = redis
             .sliding_window_increment(&prev_key, &curr_key, ttl)
@@ -1999,7 +2166,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
         let window_idx = RedisRateLimitClient::window_index(self.window_seconds);
-        let ttl = self.window_seconds + 1;
+        let ttl = single_window_ttl_seconds(self.window_seconds);
 
         match self.datagrams_per_window {
             Some(max_datagrams) if self.bytes_per_window.is_some() => {
@@ -2063,7 +2230,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
         let now_secs = now.duration_since(self.epoch_base).as_secs();
-        let max_idle = (self.window_seconds * 2).max(10);
+        let max_idle = self.window_seconds.saturating_mul(2).max(10);
         !state.is_stale(now_secs, max_idle)
     }
 }
@@ -3002,8 +3169,8 @@ mod tests {
             },
         );
 
-        assert_eq!(default.key_prefix(), "ferrum:rate_limiting");
-        assert_eq!(tenant.key_prefix(), "tenant-a:rate_limiting");
+        assert_eq!(default.key_prefix(), "ferrum:rate_limiting:standalone");
+        assert_eq!(tenant.key_prefix(), "tenant-a:rate_limiting:standalone");
     }
 
     #[test]

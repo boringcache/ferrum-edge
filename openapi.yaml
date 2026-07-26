@@ -8787,8 +8787,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ws_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -8817,9 +8823,11 @@ components:
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. Counter storage supports
+        datagrams within the same window per client IP. Unknown top-level keys
+        are rejected by the runtime and by this schema. Counter storage supports
         only local memory and Redis; database-backed counters are intentionally
         unsupported.
+      additionalProperties: false
       anyOf:
         - required: [datagrams_per_second]
         - required: [bytes_per_second]
@@ -8844,10 +8852,13 @@ components:
           format: uint64
           default: 1
           minimum: 1
+          maximum: 2678400
           description: >-
-            Window length in seconds. Defaults to 1 second. The effective
-            per-window cap is `datagrams_per_second × window_seconds` (and
-            similarly for bytes).
+            Window length in seconds. Defaults to 1 second. Capped at 2678400
+            (31 days) so the derived Redis TTL (`window_seconds + 1`) and
+            activity-retention horizon (`window_seconds × 2`) cannot wrap. The
+            effective per-window cap is `datagrams_per_second × window_seconds`
+            (and similarly for bytes).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -8862,8 +8873,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:udp_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -16545,27 +16562,38 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per second
+          maximum: 1000000
+          description: Max requests per second. Capped at 1000000 (see `max_requests`).
         requests_per_minute:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per minute
+          maximum: 1000000
+          description: Max requests per minute. Capped at 1000000 (see `max_requests`).
         requests_per_hour:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per hour
+          maximum: 1000000
+          description: Max requests per hour. Capped at 1000000 (see `max_requests`).
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`.
+          maximum: 2678400
+          description: >-
+            Custom rate-limit window length in seconds. Must be paired with
+            `max_requests`. Capped at 2678400 (31 days) so the window stays
+            representable as a monotonic duration and as a signed Redis TTL.
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests permitted within `window_seconds`.
+          maximum: 1000000
+          description: >-
+            Maximum requests permitted within `window_seconds`. Capped at
+            1000000: the local sliding window retains one timestamp per
+            admitted request until it ages out, so this bounds per-key memory.
 
     RateLimitingConfig:
       type: object
@@ -16606,8 +16634,14 @@ components:
           description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:rate_limiting"
-          description: Key prefix for all Redis keys (namespace isolation)
+          default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18449,8 +18483,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:graphql"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:graphql:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18481,13 +18521,15 @@ components:
 
     GrpcMethodRouterConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
         for gRPC services. Authorizes the backend-effective gRPC path after
         route rewrites, listen-path stripping, backend-path composition, and
         initial target selection, then populates grpc_service, grpc_method, and
         grpc_full_method metadata with that final method. At least one access or
-        rate rule is required. Rate-limit counter storage supports only local
+        rate rule is required. Unknown top-level keys are rejected by the runtime
+        and by this schema. Rate-limit counter storage supports only local
         memory and Redis; database-backed counters are intentionally unsupported.
       allOf:
         - anyOf:
@@ -18565,8 +18607,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:grpc_method_router"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -19587,8 +19635,12 @@ components:
         window_seconds:
           type: integer
           minimum: 1
+          maximum: 2678400
           default: 60
-          description: Sliding window duration in seconds
+          description: >-
+            Sliding window duration in seconds. Capped at 2678400 (31 days) so
+            the window stays representable as a monotonic duration and a signed
+            Redis TTL.
         count_mode:
           type: string
           enum: [total_tokens, prompt_tokens, completion_tokens]
@@ -19638,8 +19690,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_rate_limiter"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -22068,32 +22126,44 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 so one hot
+            key cannot retain an unbounded number of per-request timestamps.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     RateSpec:
       type: object
+      additionalProperties: false
       description: >-
-        Rate limit specification used by grpc_method_router. Both fields are
-        required and must be positive integers. The gRPC runtime currently
-        ignores additional keys, so this shared component remains open to
-        preserve schema/runtime parity.
+        Closed rate limit specification used by grpc_method_router. Both fields
+        are required and must be positive integers; unknown keys are rejected by
+        the runtime and by this schema.
       required: [max_requests, window_seconds]
       properties:
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 so one hot
+            key cannot retain an unbounded number of per-request timestamps.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     # ── Cluster Status ─────────────────────────────────────────────────
 
