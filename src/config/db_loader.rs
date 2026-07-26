@@ -84,6 +84,12 @@ enum FullLoadPurpose {
     /// / keep last-known-good" for background poll loops, not for the
     /// admission check that is already running inside an admin write.
     AdmissionValidation,
+    /// Pre-mutation baseline graph read taken by a repair-safe DELETE before it
+    /// removes the row. Undecodable rows keep [`RowDecodeRejection`] so the
+    /// delete path can recognise that the baseline is blocked by the very row
+    /// being repaired and fall back to the strictest empty baseline instead of
+    /// failing the write (issue #2997).
+    RepairDeleteBaseline,
 }
 
 impl FullLoadPurpose {
@@ -92,6 +98,7 @@ impl FullLoadPurpose {
             Self::Runtime => "load_full_config",
             Self::RestoreSnapshot => "load_namespace_snapshot",
             Self::AdmissionValidation => "validate_namespace_admission",
+            Self::RepairDeleteBaseline => "mtls_dns_repair_delete_baseline",
         }
     }
 
@@ -112,7 +119,7 @@ impl FullLoadPurpose {
                 // synchronous admission returns a plain decode failure.
                 demote_row_decode_rejection(error)
             }
-            Self::Runtime => {
+            Self::Runtime | Self::RepairDeleteBaseline => {
                 if is_proxy_plugin_association_load_error(&error)
                     || is_transient_database_error(&error)
                 {
@@ -1250,13 +1257,10 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<GatewayConfig, anyhow::Error> {
-        let proxies = self
-            .load_proxies_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
-            .await?;
-        let plugin_configs = self
-            .load_plugin_configs_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
-            .await?;
+        let proxies = self.load_proxies_tx(namespace, purpose, tx).await?;
+        let plugin_configs = self.load_plugin_configs_tx(namespace, purpose, tx).await?;
         let mut candidate = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
@@ -1275,13 +1279,12 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
         mut candidate: GatewayConfig,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         if !candidate.has_effective_mtls_dns_identity_policy() {
             return Ok(None);
         }
-        candidate.consumers = self
-            .load_consumers_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
-            .await?;
+        candidate.consumers = self.load_consumers_tx(namespace, purpose, tx).await?;
         candidate.normalize_fields();
         Ok(Some(candidate))
     }
@@ -1294,11 +1297,12 @@ impl DatabaseStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
+        purpose: FullLoadPurpose,
     ) -> Result<Option<GatewayConfig>, anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(tx, namespace, purpose)
             .await?;
-        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+        self.load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate, purpose)
             .await
     }
 
@@ -1312,7 +1316,11 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1340,11 +1348,20 @@ impl DatabaseStore {
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1366,7 +1383,11 @@ impl DatabaseStore {
         validation_http_client: &crate::plugins::PluginHttpClient,
     ) -> Result<(), anyhow::Error> {
         let mut candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         candidate.upstreams = self
             .load_upstreams_tx(namespace, FullLoadPurpose::AdmissionValidation, tx)
@@ -1391,7 +1412,12 @@ impl DatabaseStore {
         .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1401,16 +1427,38 @@ impl DatabaseStore {
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
     }
 
+    /// Pre-mutation ambiguity baseline for a repair-safe DELETE.
+    ///
+    /// Issue #2997: this read happens BEFORE the row is removed, so it decodes
+    /// the very reachable-but-undecodable row the DELETE is repairing. Failing
+    /// here would make the in-band admin repair path impossible for exactly the
+    /// resource kinds whose rows are always read into this baseline (proxies and
+    /// plugin configs unconditionally, consumers under an effective `san_dns`
+    /// policy). Fall back to an EMPTY baseline instead — the strictest possible
+    /// comparison, because `introduces_new_mtls_dns_identity_conflict` then
+    /// requires the post-delete graph to be entirely conflict-free. The
+    /// post-mutation validator re-reads the graph and remains the authority, so
+    /// this can only tighten admission, never loosen it. Every non-decode
+    /// failure (connectivity, driver, association integrity) still aborts.
     async fn mtls_dns_identity_conflicts_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<BTreeMap<String, BTreeSet<String>>, anyhow::Error> {
-        Ok(self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
-            .await?
-            .map(|candidate| candidate.mtls_dns_identity_conflicts())
-            .unwrap_or_default())
+        match self
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::RepairDeleteBaseline,
+            )
+            .await
+        {
+            Ok(candidate) => Ok(candidate
+                .map(|candidate| candidate.mtls_dns_identity_conflicts())
+                .unwrap_or_default()),
+            Err(error) if is_row_decode_rejection(&error) => Ok(BTreeMap::new()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Deletes are repair-safe when every remaining ambiguity was already
@@ -1425,7 +1473,11 @@ impl DatabaseStore {
         prior_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let Some(candidate) = self
-            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .load_mtls_dns_admission_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());
@@ -1452,11 +1504,20 @@ impl DatabaseStore {
         prior_mtls_dns_conflicts: &BTreeMap<String, BTreeSet<String>>,
     ) -> Result<(), anyhow::Error> {
         let candidate = self
-            .load_namespace_admission_policy_candidate_tx(tx, namespace)
+            .load_namespace_admission_policy_candidate_tx(
+                tx,
+                namespace,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?;
         Self::validate_tcp_connection_throttle_admission_candidate(&candidate)?;
         let Some(candidate) = self
-            .load_mtls_dns_consumers_for_candidate_tx(tx, namespace, candidate)
+            .load_mtls_dns_consumers_for_candidate_tx(
+                tx,
+                namespace,
+                candidate,
+                FullLoadPurpose::AdmissionValidation,
+            )
             .await?
         else {
             return Ok(());

@@ -396,6 +396,115 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
     );
 }
 
+/// A corrupt *proxy* row is read back by the pre-delete mTLS-DNS ambiguity
+/// baseline (`mtls_dns_identity_conflicts_tx` loads every proxy and plugin
+/// config unconditionally, before the row is removed). That baseline read must
+/// not turn the in-band DELETE repair into a 5xx — issue #2997.
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_proxy_row_allows_delete_repair() {
+    let (store, _tmp) = sqlite_store().await;
+    let ns = default_namespace();
+
+    store
+        .create_proxy(&test_proxy("p-keep", "/keep"))
+        .await
+        .expect("create surviving proxy");
+    store
+        .create_proxy(&test_proxy("p-bad", "/bad"))
+        .await
+        .expect("create proxy to corrupt");
+    let good = store
+        .load_full_config(&ns)
+        .await
+        .expect("initial full load must succeed");
+
+    // Out-of-band corruption: the hosts column is no longer JSON.
+    sqlx::query("UPDATE proxies SET hosts = '{not json' WHERE id = ? AND namespace = ?")
+        .bind("p-bad")
+        .bind(&ns)
+        .execute(&store.pool())
+        .await
+        .expect("corrupt hosts");
+
+    let load_err = store
+        .load_full_config(&ns)
+        .await
+        .expect_err("full load must reject the undecodable proxy row");
+    assert!(
+        is_row_decode_rejection(&load_err),
+        "full load must attach RowDecodeRejection: {load_err:#}"
+    );
+
+    let db_available = Arc::new(AtomicBool::new(true));
+    let config_rejected = Arc::new(AtomicBool::new(false));
+    let db_backend: Arc<dyn DatabaseBackend> = store.clone();
+    record_config_validation_rejection(
+        &db_backend,
+        &db_available,
+        &config_rejected,
+        &load_err,
+        "row-decode proxy delete repair",
+    )
+    .await;
+    assert!(
+        db_available.load(Ordering::Relaxed),
+        "reachable row-decode rejection must keep db_available=true"
+    );
+
+    let cached = Arc::new(ArcSwap::new(Arc::new(good)));
+    let state = AdminState {
+        db: Some(store.clone()),
+        jwt_manager: jwt_manager(),
+        metrics_auth: Default::default(),
+        cached_config: Some(cached),
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: Some(db_available),
+        config_rejected: Some(config_rejected),
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    };
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = admin_token();
+
+    let (del_status, del_body) = admin_delete(&base_url, "/proxies/p-bad", &token).await;
+    assert!(
+        (200..300).contains(&del_status),
+        "DELETE must repair an undecodable proxy row (got {del_status}): {del_body:?}"
+    );
+
+    let repaired = store
+        .load_full_config(&ns)
+        .await
+        .expect("full load must succeed after deleting the undecodable proxy");
+    assert!(
+        repaired.proxies.iter().all(|p| p.id != "p-bad"),
+        "corrupted proxy must be gone after DELETE"
+    );
+    assert!(
+        repaired.proxies.iter().any(|p| p.id == "p-keep"),
+        "unrelated proxy must survive the repair delete"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn undecodable_consumer_row_allows_put_overwrite_repair() {
     let (store, _tmp) = sqlite_store().await;
