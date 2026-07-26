@@ -1941,9 +1941,7 @@ mod tests {
         let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
         std::fs::write(
             &path,
-            format!(
-                "{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
-            ),
+            format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
         )
         .expect("write mixed CA bundle");
 
@@ -1976,9 +1974,7 @@ mod tests {
         let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
         std::fs::write(
             &path,
-            format!(
-                "{valid}-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n"
-            ),
+            format!("{valid}-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n"),
         )
         .expect("write unusable root bundle");
 

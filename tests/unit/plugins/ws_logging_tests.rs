@@ -174,9 +174,7 @@ async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
     let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
     std::fs::write(
         &ca_path,
-        format!(
-            "{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
-        ),
+        format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
     )
     .expect("write mixed CA");
 

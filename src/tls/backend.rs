@@ -848,16 +848,13 @@ fn load_cert_chain(
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let material = load_backend_material(path, material_kind, kind)?;
     let source_id = material.display_source_id.clone();
-    let certs = crate::tls::parse_pem_certificate_bundle(
-        material.bytes.expose_secret(),
-        kind,
-        &source_id,
-    )
-    .map_err(|error| TlsError::Pem {
-        kind,
-        path: PathBuf::from(&source_id),
-        details: error.to_string(),
-    })?;
+    let certs =
+        crate::tls::parse_pem_certificate_bundle(material.bytes.expose_secret(), kind, &source_id)
+            .map_err(|error| TlsError::Pem {
+                kind,
+                path: PathBuf::from(&source_id),
+                details: error.to_string(),
+            })?;
 
     Ok(certs)
 }

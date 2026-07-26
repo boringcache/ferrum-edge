@@ -76,9 +76,8 @@ fn unusable_trust_root_error_withholds_rejected_certificate_material() {
     const UNUSABLE_CERT_BASE64: &str = "AQIDBA==";
 
     let dir = TempDir::new().unwrap();
-    let bundle = format!(
-        "-----BEGIN CERTIFICATE-----\n{UNUSABLE_CERT_BASE64}\n-----END CERTIFICATE-----\n"
-    );
+    let bundle =
+        format!("-----BEGIN CERTIFICATE-----\n{UNUSABLE_CERT_BASE64}\n-----END CERTIFICATE-----\n");
     let path = write_pem(&dir, "unusable-root.pem", &bundle);
 
     let error = build_client_cert_verifier(&path, &[])

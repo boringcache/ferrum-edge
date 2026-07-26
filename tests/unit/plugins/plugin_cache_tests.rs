@@ -2111,9 +2111,7 @@ fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
 
     std::fs::write(
         &ca_path,
-        format!(
-            "{valid_ca}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
-        ),
+        format!("{valid_ca}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
     )
     .expect("replace CA with mixed bundle");
     let mut replacement = valid.clone();

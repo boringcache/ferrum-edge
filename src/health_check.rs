@@ -1755,8 +1755,7 @@ async fn build_grpc_probe_channel_no_verify(
     // Build root cert store (still needed for mTLS client auth builder)
     let ca_path = tls_config.server_ca_cert_path.as_deref().or(global_ca_path);
     let root_store = if let Some(ca_path) = ca_path {
-        load_probe_tls_root_store(ca_path, "gRPC health probe CA")
-            .map_err(std::io::Error::other)?
+        load_probe_tls_root_store(ca_path, "gRPC health probe CA").map_err(std::io::Error::other)?
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
@@ -2283,8 +2282,7 @@ mod tests {
         let key_path = dir.path().join("client-key.pem");
         let key_pair =
             KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
-        let params =
-            CertificateParams::new(vec!["client.local".to_string()]).expect("cert params");
+        let params = CertificateParams::new(vec!["client.local".to_string()]).expect("cert params");
         let certificate = params.self_signed(&key_pair).expect("self-sign cert");
         std::fs::write(
             &cert_path,
@@ -2327,8 +2325,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cert_path = dir.path().join("client-chain.pem");
         let key_path = dir.path().join("client-key.pem");
-        let key_pair =
-            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
         std::fs::write(
             &cert_path,
             b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
