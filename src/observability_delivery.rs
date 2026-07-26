@@ -1082,7 +1082,7 @@ pub fn render_prometheus() -> String {
          # HELP ferrum_observability_delivery_rejected_tasks_total Delivery tasks rejected after lifecycle admission closed, task-budget exhaustion, or without a runtime.\n\
          # TYPE ferrum_observability_delivery_rejected_tasks_total counter\n\
          ferrum_observability_delivery_rejected_tasks_total {}\n\
-         # HELP ferrum_observability_delivery_cancelled_tasks_total Delivery tasks cancelled when the shutdown budget expired.\n\
+         # HELP ferrum_observability_delivery_cancelled_tasks_total Delivery tasks cancelled on shutdown-budget expiry or during spawn/cancel handoff races.\n\
          # TYPE ferrum_observability_delivery_cancelled_tasks_total counter\n\
          ferrum_observability_delivery_cancelled_tasks_total {}\n\
          # HELP ferrum_observability_delivery_lost_worker_records_total Queued records abandoned when worker drain exceeded the shutdown budget.\n\
@@ -1411,5 +1411,50 @@ mod tests {
         assert_eq!(lifecycle.tasks.len(), 0);
         assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
         release.close();
+    }
+
+    /// Regression for the send-failure/cancel race: the loser of registry removal
+    /// must disarm without a second `record_cancelled`, or cancelled counters
+    /// can exceed the number of inserted task ids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_spawn_handoff_race_counts_cancelled_at_most_once_per_task() {
+        for _ in 0..64 {
+            let lifecycle = Arc::new(DeliveryLifecycle::with_limits(0, 1, 64));
+            let start_id = lifecycle.next_task_id.load(Ordering::Relaxed);
+            let spawner_lifecycle = Arc::clone(&lifecycle);
+            let cancel_lifecycle = Arc::clone(&lifecycle);
+
+            let spawner = tokio::spawn(async move {
+                for _ in 0..64 {
+                    let _ = spawner_lifecycle.spawn(
+                        TaskAdmission::External,
+                        DeliveryTaskKind::Terminal,
+                        std::future::pending::<()>(),
+                    );
+                }
+            });
+            let canceller = tokio::spawn(async move {
+                for _ in 0..8 {
+                    cancel_lifecycle.cancel_remaining();
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            spawner.await.expect("spawner must join");
+            canceller.await.expect("canceller must join");
+            lifecycle.cancel_remaining();
+
+            let ids_issued = lifecycle
+                .next_task_id
+                .load(Ordering::Relaxed)
+                .saturating_sub(start_id);
+            let cancelled = lifecycle.counters.cancelled_terminal.load(Ordering::Relaxed);
+            assert_eq!(lifecycle.tasks.len(), 0);
+            assert_eq!(lifecycle.admitted_tasks.load(Ordering::Acquire), 0);
+            assert!(
+                cancelled <= ids_issued,
+                "cancelled={cancelled} must not exceed inserted task ids={ids_issued}"
+            );
+        }
     }
 }
