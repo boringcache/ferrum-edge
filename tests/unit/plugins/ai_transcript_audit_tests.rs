@@ -923,13 +923,17 @@ async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away()
 async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behavior() {
     let saturated_server = mock_sink().await;
     let saturated_endpoint = format!("{}/ingest", saturated_server.uri());
+    // `batch_size: 1` on the shortest admitted flush interval: any record this
+    // instance leaks reaches `saturated_server` within one flush cycle, so the
+    // emptiness assertion at the end of this test cannot be satisfied merely by
+    // a slow default flush (batch 50 / 1000 ms).
     let plugin = AiTranscriptAudit::new(
         &json!({
             "mode": "metadata_only",
             "capture": {
                 "request": true,
                 "response": true,
-                "streaming_response": false
+                "streaming_response": true
             },
             "sampling": {
                 "rate": 0.0,
@@ -940,6 +944,8 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
                 "type": "http",
                 "endpoint_url": saturated_endpoint,
                 "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 100,
                 "on_buffer_full": "reject"
             }
         }),
@@ -1074,18 +1080,6 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
     plugin
         .on_response_stream_terminated(&mut peer_overflow, 200, &BodyOutcome::success(0))
         .await;
-    // `request_rejected_for_sink` can preserve a prior "rejected" stamp even
-    // across a successful enqueue, so prove non-emission via the sink and prove
-    // the peer still holds the commit capability.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    assert!(
-        saturated_server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .is_empty(),
-        "a saturated instance must not emit a response record for a peer's candidate"
-    );
     assert!(
         peer.forces_reqwest_dispatch(&peer_overflow),
         "peer must retain its staging commit capability after saturated response hooks"
@@ -1111,6 +1105,35 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
             }
         ),
         "saturated instance must remain at the 4096-entry bound"
+    );
+
+    // `request_rejected_for_sink` can preserve a prior "rejected" stamp even
+    // across a successful enqueue, so non-emission has to be proven at the sink.
+    // The peer's OWN commit is the positive control: waiting for its record to
+    // land proves the export pipeline is live and that at least one flush cycle
+    // elapsed on both identically configured (`batch_size: 1`,
+    // `flush_interval_ms: 100`) background workers. Only then does an empty
+    // `saturated_server` mean the saturated instance emitted nothing, rather
+    // than that nothing had flushed yet.
+    peer.capture_final_response_body(
+        &mut peer_overflow,
+        200,
+        &headers,
+        br#"{"choices":[{"message":{"content":"ok"}}]}"#,
+    )
+    .await;
+    assert_eq!(
+        wait_for_records(&peer_server).await.len(),
+        1,
+        "the peer that owns the staging entry must export exactly one record"
+    );
+    assert!(
+        saturated_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "a saturated instance must not emit a response record for a peer's candidate"
     );
 }
 
