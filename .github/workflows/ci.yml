@@ -661,6 +661,7 @@ jobs:
               integration::frontend_tls_live_reload_tests
               integration::tcp_frontend_tls_order_tests
               integration::tcp_fast_path_l4_plugins_tests
+              integration::udp_hook_concurrency_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
