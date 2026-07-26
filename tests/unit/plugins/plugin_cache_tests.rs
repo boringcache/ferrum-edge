@@ -9614,3 +9614,101 @@ fn test_initial_response_header_policy_resolves_by_namespaced_key() {
         "standalone policy lookup must match the request view for the same proxy"
     );
 }
+
+// ── priority_override must not erase replay provenance ──────────────────────
+//
+// `PriorityOverridePlugin` wraps ANY plugin config that carries a
+// `priority_override` and forwards the trait surface to the inner instance. It
+// still runs the inner response-body transform, so it must also report the
+// inner `response_presentation_policy()`. Falling back to the trait default
+// would silently drop an enrolled instance out of the per-proxy fold — a stored
+// `request_deduplication` replay would then keep matching across a redaction
+// rule edit, which is exactly the replay the provenance digest retires.
+
+fn presentation_digest_for_proxy(config: &GatewayConfig) -> Option<[u8; 32]> {
+    PluginCache::new(config)
+        .expect("plugin cache must build")
+        .request_view(ferrum_edge::config::types::DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http)
+        .response_presentation_policy_digest()
+}
+
+fn redaction_transformer_config(id: &str, value: &str, priority: Option<u16>) -> PluginConfig {
+    let mut plugin = make_plugin_config_with_json(
+        id,
+        "response_transformer",
+        json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "x-account",
+                "value": value,
+            }],
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.priority_override = priority;
+    plugin
+}
+
+#[test]
+fn priority_override_preserves_static_replay_provenance() {
+    let baseline = presentation_digest_for_proxy(&make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![redaction_transformer_config("rt", "kept", None)],
+    ))
+    .expect("a purely static presentation policy is provable");
+
+    let overridden = presentation_digest_for_proxy(&make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![redaction_transformer_config("rt", "kept", Some(4100))],
+    ))
+    .expect("a priority override does not make the policy unprovable");
+    assert_eq!(
+        baseline, overridden,
+        "priority_override changes execution order only; the same rules must fold to the \
+         same replay provenance"
+    );
+
+    let edited = presentation_digest_for_proxy(&make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![redaction_transformer_config("rt", "REDACTED", Some(4100))],
+    ))
+    .expect("a priority override does not make the policy unprovable");
+    assert_ne!(
+        overridden, edited,
+        "editing a priority-overridden transformer's rules must move the presentation digest, \
+         or a dedup replay captured under the old rules would still be replayed"
+    );
+}
+
+#[test]
+fn priority_override_preserves_dynamic_replay_provenance() {
+    let mut mcp = make_plugin_config_with_json(
+        "mcp1",
+        "mcp_gateway",
+        json!({
+            "enabled": true,
+            "mode": "aggregate_router",
+            "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+            "servers": {
+                "github": {
+                    "upstream_url": "http://mcp-alpha:8080",
+                    "namespace": "github",
+                    "enabled": true,
+                }
+            },
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    mcp.priority_override = Some(2993);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["mcp1"])], vec![mcp]);
+
+    assert_eq!(
+        presentation_digest_for_proxy(&config),
+        None,
+        "a priority-overridden mcp_gateway must still collapse the proxy's presentation policy \
+         to unprovable; otherwise the runtime backstop for the dedup composition is defeated"
+    );
+}

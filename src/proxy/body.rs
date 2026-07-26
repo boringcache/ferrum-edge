@@ -11,6 +11,7 @@ use http_body::Frame;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1476,6 +1477,26 @@ where
 
 // -- SizeLimitedIncoming ------------------------------------------------------
 
+/// Terminal state of a client request body as observed by
+/// [`SizeLimitedIncoming`].
+///
+/// Reported exactly once through the optional completion channel so a caller
+/// that must not expose a backend response before the request-size decision is
+/// final can distinguish a clean upload from a rejected or truncated one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyOutcome {
+    /// The client body was fully consumed, or it was already known to be
+    /// end-of-stream so the consumer never needed to poll the adapter.
+    Completed,
+    /// The configured request body size limit was exceeded.
+    Exceeded,
+    /// The client body yielded a transport or protocol error.
+    Errored,
+    /// The adapter was dropped while the client body still had frames
+    /// outstanding — the upload was abandoned, not completed.
+    Abandoned,
+}
+
 /// A size-limited stream adapter over hyper's `Incoming` body.
 ///
 /// Wraps `Incoming` and counts bytes as they flow through. If the
@@ -1496,6 +1517,41 @@ pub struct SizeLimitedIncoming {
     /// because ownership has already transferred to reqwest's request builder.
     bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     exceeded: Arc<AtomicBool>,
+    completion: Option<tokio::sync::oneshot::Sender<RequestBodyOutcome>>,
+    /// Wakes the detached hyper H2 upload pipe when the response-side gate
+    /// times out after receiving early backend headers. Returning an error from
+    /// `poll_frame` makes hyper reset the backend stream (`on_user_err` sends
+    /// `RST_STREAM`) and drop the inbound client body instead of leaving that
+    /// pipe task pinned in the pool.
+    ///
+    /// Best-effort by construction: it is only observed when hyper actually
+    /// polls the body. `PipeToSendStream` reserves and awaits send capacity
+    /// *before* calling `poll_frame`, so while the backend's stream send window
+    /// is exhausted the pipe parks in `poll_capacity` and no body-side signal
+    /// can reach it. Teardown then waits for window credit, a backend reset, or
+    /// the connection closing. Resetting the stream directly is not reachable
+    /// from here: the `h2::SendStream` that could do it is owned by hyper's
+    /// detached task and never exposed.
+    cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// Outcome to report when the adapter is dropped without having reached a
+/// terminal poll.
+///
+/// Hyper's HTTP/2 client sends `END_STREAM` alongside the request headers when
+/// `Body::is_end_stream()` is already true, then drops the body without ever
+/// polling it. That is a normal empty upload, so it must report
+/// [`RequestBodyOutcome::Completed`]; only a body that still had frames
+/// outstanding was genuinely abandoned. `is_end_stream()` is the same predicate
+/// hyper used to skip polling, and it can only be true once every DATA frame
+/// has already been counted.
+#[inline]
+pub(crate) fn request_body_drop_outcome(inner_is_end_stream: bool) -> RequestBodyOutcome {
+    if inner_is_end_stream {
+        RequestBodyOutcome::Completed
+    } else {
+        RequestBodyOutcome::Abandoned
+    }
 }
 
 impl SizeLimitedIncoming {
@@ -1547,7 +1603,49 @@ impl SizeLimitedIncoming {
             max_bytes,
             bytes_seen,
             exceeded,
+            completion: None,
+            cancel: None,
         }
+    }
+
+    /// Construct with a signal that resolves when the client body reaches a
+    /// terminal state. Direct-H2 callers use this to avoid exposing early
+    /// backend response headers before a request-size decision is final.
+    ///
+    /// The signal is delivered from every terminal poll path and, failing that,
+    /// from `Drop` — so a consumer that never polls the adapter (a known
+    /// end-of-stream body) still resolves the receiver rather than leaving it
+    /// pending or cancelled.
+    pub fn new_with_counter_and_completion(
+        incoming: Incoming,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+        bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+        completion: tokio::sync::oneshot::Sender<RequestBodyOutcome>,
+        cancel: tokio::sync::oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            inner: incoming,
+            max_bytes,
+            bytes_seen,
+            exceeded,
+            completion: Some(completion),
+            cancel: Some(cancel),
+        }
+    }
+
+    /// Arm the upload cancellation channel without installing a completion
+    /// signal.
+    ///
+    /// The direct-H2 dispatch path uses this when request-size limits are
+    /// disabled: there is no response-side gate to satisfy, but an early return
+    /// after `send_request` (a response-header timeout) must still be able to
+    /// tear down hyper's detached HTTP/2 upload pipe instead of leaving it
+    /// draining the client body toward a response nobody will read.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: tokio::sync::oneshot::Receiver<()>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// Clone the internal byte counter so the caller can observe `bytes_seen`
@@ -1587,6 +1685,79 @@ impl SizeLimitedIncoming {
     pub fn into_reqwest_body(self) -> reqwest::Body {
         reqwest::Body::wrap(SyncBody::new(self))
     }
+
+    /// Report the terminal outcome once. Later calls are no-ops because the
+    /// sender has already been taken, so `Drop` cannot overwrite a decision
+    /// that `poll_frame` already made.
+    #[inline]
+    fn signal_completion(&mut self, outcome: RequestBodyOutcome) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(outcome);
+        }
+    }
+}
+
+/// Result of one poll of the direct-H2 upload cancellation channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadCancelSignal {
+    /// The response-side gate timed out and asked for the detached upload pipe
+    /// to be torn down.
+    Cancelled,
+    /// Nothing to do: either no channel is armed, the gate finished normally
+    /// and dropped its sender, or no signal has arrived yet.
+    Idle,
+}
+
+/// Poll the cancellation channel, disarming it once it reaches a terminal
+/// state so a completed `oneshot::Receiver` is never polled twice.
+///
+/// A dropped sender is *not* a cancellation — it means the response-side gate
+/// resolved on its own — so it only disarms the channel. A pending channel
+/// stays armed and leaves `cx`'s waker registered, which is what lets an upload
+/// parked in `poll_frame` (waiting on the *client*) wake up when the gate later
+/// signals. An upload parked on backend send capacity is not reachable this way;
+/// see the `cancel` field docs on [`SizeLimitedIncoming`].
+#[inline]
+fn poll_upload_cancel(
+    cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    cx: &mut Context<'_>,
+) -> UploadCancelSignal {
+    let Some(receiver) = cancel.as_mut() else {
+        return UploadCancelSignal::Idle;
+    };
+    match Pin::new(receiver).poll(cx) {
+        Poll::Ready(Ok(())) => {
+            *cancel = None;
+            UploadCancelSignal::Cancelled
+        }
+        Poll::Ready(Err(_)) => {
+            *cancel = None;
+            UploadCancelSignal::Idle
+        }
+        Poll::Pending => UploadCancelSignal::Idle,
+    }
+}
+
+/// Test hook: drive exactly one [`poll_upload_cancel`] with a no-op waker.
+///
+/// Reached only through `crate::_test_support`, which the binary target does
+/// not compile, so it is dead code there.
+#[allow(dead_code)]
+pub(crate) fn poll_upload_cancel_once(
+    cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+) -> UploadCancelSignal {
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    poll_upload_cancel(cancel, &mut cx)
+}
+
+impl Drop for SizeLimitedIncoming {
+    fn drop(&mut self) {
+        if self.completion.is_none() {
+            return;
+        }
+        let outcome = request_body_drop_outcome(http_body::Body::is_end_stream(&self.inner));
+        self.signal_completion(outcome);
+    }
 }
 
 impl http_body::Body for SizeLimitedIncoming {
@@ -1598,6 +1769,12 @@ impl http_body::Body for SizeLimitedIncoming {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+        if poll_upload_cancel(&mut this.cancel, cx) == UploadCancelSignal::Cancelled {
+            this.signal_completion(RequestBodyOutcome::Abandoned);
+            return Poll::Ready(Some(Err(
+                "request body forwarding cancelled after upload timeout".into(),
+            )));
+        }
         match http_body::Body::poll_frame(Pin::new(&mut this.inner), cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -1613,13 +1790,20 @@ impl http_body::Body for SizeLimitedIncoming {
                     let total = prev.saturating_add(data_len);
                     if total > this.max_bytes as u64 {
                         this.exceeded.store(true, Ordering::Release);
+                        this.signal_completion(RequestBodyOutcome::Exceeded);
                         return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => {
+                this.signal_completion(RequestBodyOutcome::Errored);
+                Poll::Ready(Some(Err(Box::new(e))))
+            }
+            Poll::Ready(None) => {
+                this.signal_completion(RequestBodyOutcome::Completed);
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }

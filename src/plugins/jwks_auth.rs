@@ -20,8 +20,8 @@ use super::utils::auth_flow::{
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_attempt,
-    parse_claim_headers, parse_separator,
+    ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
+    emit_claim_headers_to_attempt, parse_claim_headers, parse_separator,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
@@ -110,6 +110,10 @@ pub struct JwksAuth {
     consumer_header_claim: String,
     claim_headers: Vec<ClaimHeaderMapping>,
     claim_headers_separator: String,
+    /// Complete gateway-owned destination set across the plugin-level mappings
+    /// and every provider override. Precomputed so `before_proxy` can sanitize
+    /// without walking the provider list.
+    claim_header_destinations: ClaimHeaderDestinations,
     strip_authorization_on_success: bool,
     has_custom_query_token_locations: bool,
     emit_mesh_request_principal_metadata: bool,
@@ -461,6 +465,14 @@ impl JwksAuth {
                 .any(|location| matches!(location, TokenLocation::QueryParam(_)))
         });
 
+        let claim_header_destinations = ClaimHeaderDestinations::from_mapping_groups(
+            std::iter::once(claim_headers.as_slice()).chain(
+                providers
+                    .iter()
+                    .map(|provider| provider.claim_headers.as_slice()),
+            ),
+        );
+
         Ok(Self {
             providers,
             global_scope_claim,
@@ -469,6 +481,7 @@ impl JwksAuth {
             consumer_header_claim,
             claim_headers,
             claim_headers_separator,
+            claim_header_destinations,
             strip_authorization_on_success,
             has_custom_query_token_locations,
             emit_mesh_request_principal_metadata,
@@ -1063,7 +1076,7 @@ impl super::Plugin for JwksAuth {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, &self.claim_header_destinations);
         PluginResult::Continue
     }
 

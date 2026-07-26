@@ -7,7 +7,11 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 
 const TEST_PROXY: &str = "test-proxy";
 
@@ -1095,6 +1099,310 @@ async fn test_restart_when_all_upstreams_removed() {
     );
 }
 
+// ─── Production start → take → restart ownership (issue #2383) ───────────────
+
+/// TCP accept counter used to observe whether a drained startup generation
+/// keeps probing after reload.
+async fn counting_tcp_server() -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicU64::new(0));
+    let count_task = count.clone();
+    tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            count_task.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (addr, count)
+}
+
+async fn wait_for_min_probes(count: &AtomicU64, min: u64, timeout: Duration) {
+    let started = Instant::now();
+    loop {
+        if count.load(Ordering::SeqCst) >= min {
+            return;
+        }
+        if started.elapsed() > timeout {
+            panic!(
+                "timed out waiting for {min} probes; saw {}",
+                count.load(Ordering::SeqCst)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Await every drained `JoinHandle` of a retired generation and assert the
+/// task actually ended.
+///
+/// Awaiting (rather than polling `is_finished()` a fixed number of times) keeps
+/// the assertion deterministic on a busy hosted runner. A retired task ends
+/// either because `HealthChecker` aborted it through its retained AbortHandle
+/// (`JoinError::is_cancelled`) or because it observed the generation fence and
+/// returned cleanly.
+async fn assert_generation_retired(taken: Vec<tokio::task::JoinHandle<()>>, context: &str) {
+    for handle in taken {
+        let join = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap_or_else(|_| panic!("{context}: retired task did not finish"));
+        assert!(
+            join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+            "{context}: retired task must end via abort cancel or fence exit: {join:?}"
+        );
+    }
+}
+
+fn make_upstream_with_active_probe_tls(
+    id: &str,
+    targets: Vec<UpstreamTarget>,
+    interval_seconds: u64,
+    use_tls: bool,
+) -> Upstream {
+    let mut upstream = make_upstream_with_active_probe(id, targets, interval_seconds);
+    if let Some(hc) = upstream.health_checks.as_mut()
+        && let Some(active) = hc.active.as_mut()
+    {
+        active.use_tls = use_tls;
+    }
+    upstream
+}
+
+#[tokio::test]
+async fn test_take_retains_cancel_visibility_for_reload() {
+    // Production ownership: ProxyState::new starts tasks then immediately
+    // drains JoinHandles. Cancel ownership must remain with HealthChecker.
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-take",
+        vec![make_target("take-host", 9400)],
+        60,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must not hide the startup generation from reload/drop cancel"
+    );
+    assert!(
+        !taken[0].is_finished(),
+        "drained JoinHandle must remain awaitable for graceful shutdown"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_stops_probes_for_removed_target() {
+    // Reproduces the production sequence that previously orphaned the
+    // startup generation: start_with_shutdown → take → restart.
+    let (addr_keep, count_keep) = counting_tcp_server().await;
+    let (addr_remove, count_remove) = counting_tcp_server().await;
+
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![
+        make_upstream_with_active_probe(
+            "up-keep",
+            vec![make_target(&addr_keep.ip().to_string(), addr_keep.port())],
+            1,
+        ),
+        make_upstream_with_active_probe(
+            "up-remove",
+            vec![make_target(
+                &addr_remove.ip().to_string(),
+                addr_remove.port(),
+            )],
+            1,
+        ),
+    ]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 2);
+
+    wait_for_min_probes(&count_keep, 1, Duration::from_secs(5)).await;
+    wait_for_min_probes(&count_remove, 1, Duration::from_secs(5)).await;
+
+    let after_remove = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-keep",
+        vec![make_target(&addr_keep.ip().to_string(), addr_keep.port())],
+        1,
+    )]);
+    checker.restart_with_shutdown(&after_remove, None);
+
+    assert_generation_retired(taken, "restart must abort the drained startup generation").await;
+    assert_eq!(checker.active_task_count(), 1);
+
+    let remove_baseline = count_remove.load(Ordering::SeqCst);
+    let keep_baseline = count_keep.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+
+    assert_eq!(
+        count_remove.load(Ordering::SeqCst),
+        remove_baseline,
+        "removed target must not receive probes from an orphaned startup generation"
+    );
+    assert!(
+        count_keep.load(Ordering::SeqCst) > keep_baseline,
+        "kept target must still be probed by the replacement generation"
+    );
+    assert!(
+        !checker.active_unhealthy_targets.contains_key(&format!(
+            "{}::{}:{}",
+            rk("up-remove"),
+            addr_remove.ip(),
+            addr_remove.port()
+        )),
+        "stale unhealthy state for the removed upstream must be pruned"
+    );
+    assert!(
+        !checker.has_active_target_state_for_test(&format!(
+            "{}::{}:{}",
+            rk("up-remove"),
+            addr_remove.ip(),
+            addr_remove.port()
+        )),
+        "retired mid-flight probes must not re-insert pruned target_states keys"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_picks_up_interval_change() {
+    // Same target, slower interval after reload. If the drained 1s generation
+    // survived, accepts would keep arriving every second.
+    let (addr, count) = counting_tcp_server().await;
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-iv",
+        vec![make_target(&addr.ip().to_string(), addr.port())],
+        1,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    wait_for_min_probes(&count, 1, Duration::from_secs(5)).await;
+
+    let after_change = config_with_upstreams(vec![make_upstream_with_active_probe(
+        "up-iv",
+        vec![make_target(&addr.ip().to_string(), addr.port())],
+        3600,
+    )]);
+    checker.restart_with_shutdown(&after_change, None);
+
+    assert_generation_retired(
+        taken,
+        "interval change must retire the drained 1s generation",
+    )
+    .await;
+
+    // Replacement generation fires one immediate interval tick, then sleeps
+    // for 3600s. An orphaned 1s generation would add ~2 more probes here.
+    let baseline = count.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let after = count.load(Ordering::SeqCst);
+    assert!(
+        after <= baseline + 1,
+        "interval change must retire the drained 1s generation; baseline={baseline} after={after}"
+    );
+    assert_eq!(checker.active_task_count(), 1);
+}
+
+#[tokio::test]
+async fn test_take_then_restart_picks_up_tls_policy_change() {
+    // use_tls flip must abort the drained generation and spawn a replacement
+    // under the new probe client policy (same host/port).
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_with_active_probe_tls(
+        "up-tls",
+        vec![make_target("tls-host", 9443)],
+        60,
+        false,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(checker.active_task_count(), 1);
+
+    let after_tls = config_with_upstreams(vec![make_upstream_with_active_probe_tls(
+        "up-tls",
+        vec![make_target("tls-host", 9443)],
+        60,
+        true,
+    )]);
+    checker.restart_with_shutdown(&after_tls, None);
+
+    assert_generation_retired(
+        taken,
+        "TLS policy reload must abort the drained startup probe task",
+    )
+    .await;
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "replacement generation must own exactly one probe task"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_restart_stops_stale_passive_recovery() {
+    // Drained passive-recovery scanner must exit after reload removes recovery
+    // with no pending auto-recover ejection (AbortHandle cancel + generation
+    // fence). Adapted from the pre-#3128 per-upstream timer ownership test.
+    let checker = HealthChecker::new();
+    let initial = config_with_upstreams(vec![make_upstream_passive_only(
+        "up-passive",
+        vec![make_target("passive-host", 9500)],
+        30,
+    )]);
+    checker.start_with_shutdown(&initial, None);
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 1, "passive recovery scanner must be spawned");
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must retain cancel visibility for the recovery scanner"
+    );
+
+    checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
+
+    assert_generation_retired(
+        taken,
+        "reload must retire the drained passive-recovery scanner",
+    )
+    .await;
+    assert_eq!(
+        checker.active_task_count(),
+        0,
+        "no pending auto-recover ejection and no passive policy must not spawn a scanner"
+    );
+}
+
+#[tokio::test]
+async fn test_take_then_shutdown_signal_drains_taken_handles_cleanly() {
+    // Graceful shutdown path: modes await the drained JoinHandles while the
+    // watch channel — not abort — retires the tasks. Retaining AbortHandles
+    // must not detach or pre-abort them, so every join here has to come back
+    // clean (never `JoinError::Cancelled`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let checker = HealthChecker::new();
+    let config = config_with_upstreams(vec![
+        make_upstream_with_active_probe("up-sd", vec![make_target("sd-host", 9600)], 3600),
+        make_upstream_passive_only("up-sd-passive", vec![make_target("sd-host", 9601)], 30),
+    ]);
+    checker.start_with_shutdown(&config, Some(shutdown_rx));
+
+    let taken = checker.take_active_check_handles();
+    assert_eq!(taken.len(), 2, "one active probe + one recovery scanner");
+
+    shutdown_tx.send(true).expect("shutdown receiver alive");
+
+    for handle in taken {
+        let join = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("shutdown signal must drain the taken handle");
+        join.expect("graceful shutdown must not abort a drained task");
+    }
+}
+
 // ─── Passive recovery scoping (#2388 / #2943) ─────────────────────────────────
 
 fn make_upstream_passive_only(
@@ -1467,9 +1775,9 @@ fn success_based_recovery_still_clears_passive_ejection() {
 
 #[tokio::test]
 async fn passive_recovery_scanner_exits_on_generation_fence_after_take() {
-    // Modes drain JoinHandles via take_active_check_handles at startup, so a
-    // later restart cannot abort the taken scanner. The generation fence must
-    // still force that stale scanner to exit when recovery is disabled.
+    // Modes drain JoinHandles via take_active_check_handles at startup.
+    // AbortHandles retain cancel ownership across take (issue #2383), and the
+    // generation fence still forces a stale scanner to exit on its next tick.
     let checker = HealthChecker::new();
     let upstream = make_upstream_passive_only("up-fence", vec![make_target("fence-a", 8080)], 30);
     checker.start_with_shutdown(&config_with_upstreams(vec![upstream]), None);
@@ -1477,7 +1785,11 @@ async fn passive_recovery_scanner_exits_on_generation_fence_after_take() {
 
     let taken = checker.take_active_check_handles();
     assert_eq!(taken.len(), 1);
-    assert_eq!(checker.active_task_count(), 0);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must not hide the scanner from reload/drop cancel ownership"
+    );
 
     checker.restart_with_shutdown(&config_with_upstreams(vec![]), None);
     assert_eq!(
@@ -1487,10 +1799,14 @@ async fn passive_recovery_scanner_exits_on_generation_fence_after_take() {
     );
 
     let handle = taken.into_iter().next().expect("taken scanner handle");
-    tokio::time::timeout(Duration::from_secs(3), handle)
+    let join = tokio::time::timeout(Duration::from_secs(3), handle)
         .await
-        .expect("stale scanner must exit after generation fence without relying on abort")
-        .expect("scanner task should join cleanly");
+        .expect("stale scanner must exit after abort and/or generation fence");
+    // AbortHandle cancel yields JoinError::Cancelled; a pure fence exit is Ok(()).
+    assert!(
+        join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "scanner task should finish via abort cancel or clean fence exit: {join:?}"
+    );
 }
 
 #[tokio::test]
@@ -1501,16 +1817,25 @@ async fn passive_recovery_scanner_replaces_taken_generation_on_reload() {
 
     let taken = checker.take_active_check_handles();
     assert_eq!(taken.len(), 1);
+    assert_eq!(
+        checker.active_task_count(),
+        1,
+        "take must retain cancel visibility for the drained scanner"
+    );
 
-    // Reload still needs passive recovery: spawn a fresh scanner and fence the taken one.
+    // Reload still needs passive recovery: spawn a fresh scanner and
+    // fence/abort the taken one.
     checker.restart_with_shutdown(&config_with_upstreams(vec![upstream]), None);
     assert_eq!(checker.active_task_count(), 1);
 
     let stale = taken.into_iter().next().expect("taken scanner handle");
-    tokio::time::timeout(Duration::from_secs(3), stale)
+    let join = tokio::time::timeout(Duration::from_secs(3), stale)
         .await
-        .expect("previous generation scanner must exit after reload fence")
-        .expect("scanner task should join cleanly");
+        .expect("previous generation scanner must exit after reload fence/abort");
+    assert!(
+        join.is_ok() || join.as_ref().err().is_some_and(|e| e.is_cancelled()),
+        "scanner task should finish via abort cancel or clean fence exit: {join:?}"
+    );
     assert_eq!(
         checker.active_task_count(),
         1,

@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
 // Thread-local buffer for formatting "host:port" keys in `report_response()`;
@@ -218,7 +219,11 @@ pub struct HealthChecker {
     /// Default HTTP client for active health check probes (no mTLS).
     /// Used when the upstream has no TLS config.
     default_http_client: Arc<reqwest::Client>,
-    /// Active check abort handles.
+    /// JoinHandles for the current generation of active-check /
+    /// passive-recovery tasks. Modes may drain these via
+    /// [`Self::take_active_check_handles`] so they can `await` them during
+    /// graceful shutdown. Reload visibility does **not** depend on this
+    /// vec — see `active_check_aborts`.
     ///
     /// Wrapped in `Mutex` so [`Self::start_with_shutdown`] and
     /// [`Self::restart_with_shutdown`] can re-spawn probe tasks on config
@@ -227,14 +232,43 @@ pub struct HealthChecker {
     /// at startup, config reload, and drop — never on the proxy hot path,
     /// so the lock is uncontested.
     active_check_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// AbortHandles for every live active-check / passive-recovery task,
+    /// including generations whose `JoinHandle`s were drained by
+    /// [`Self::take_active_check_handles`].
+    ///
+    /// `HealthChecker` is the single lifecycle owner for cancel: reload and
+    /// drop always abort through this list, so the production
+    /// `start_with_shutdown` → `take_active_check_handles` →
+    /// `restart_with_shutdown` sequence cannot orphan the startup
+    /// generation. Modes still own the drained `JoinHandle`s for await.
+    active_check_aborts: Mutex<Vec<AbortHandle>>,
+    /// Monotonic generation for spawned active probe tasks.
+    ///
+    /// Bumped at the start of every [`Self::start_with_shutdown`] (including
+    /// reload) before prior tasks are aborted. Each active probe captures its
+    /// generation at spawn and refuses to dial or mutate health state once
+    /// the checker has advanced, so a mid-flight stale probe cannot
+    /// reintroduce removed targets or apply retired policy after replacement.
+    task_generation: Arc<AtomicU64>,
+    /// Orders reload generation rollover against publication of active-probe
+    /// and passive-recovery results.
+    ///
+    /// A generation check by itself has a check-then-mutate window: reload can
+    /// advance the generation after the check but before the stale task updates
+    /// shared counters or health maps. Probe/recovery publication takes a read
+    /// guard and re-checks its generation under that guard; reload takes the
+    /// write guard before advancing either generation. This is a cold-path
+    /// lifecycle lock and is never touched by proxied requests.
+    lifecycle_publish_guard: Arc<std::sync::RwLock<()>>,
     /// Monotonic generation for the gateway-scoped passive recovery scanner.
     ///
     /// Bumped on every [`Self::start_with_shutdown`] /
     /// [`Self::restart_with_shutdown`]. Modes often
     /// [`Self::take_active_check_handles`] at startup, so a later reload cannot
-    /// abort the previously taken scanner JoinHandle — the generation fence
-    /// makes that stale scanner exit on its next tick instead of continuing
-    /// alongside a replacement (or after passive recovery has been disabled).
+    /// abort the previously taken scanner JoinHandle via that vec — AbortHandles
+    /// retain cancel ownership, and this generation fence makes a stale scanner
+    /// exit on its next tick if it races past abort (or after passive recovery
+    /// has been disabled).
     passive_recovery_generation: Arc<AtomicU64>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
@@ -252,6 +286,15 @@ pub struct HealthChecker {
     global_backend_tls_client_key_path: Option<String>,
     /// Global TLS no-verify flag.
     global_tls_no_verify: bool,
+}
+
+/// Per-active-check identity and lifecycle inputs for `start_active_check`.
+struct ActiveCheckStartParams<'a> {
+    target: &'a UpstreamTarget,
+    upstream_namespace: &'a str,
+    upstream_id: &'a str,
+    shutdown_rx: Option<&'a tokio::sync::watch::Receiver<bool>>,
+    generation: u64,
 }
 
 impl Default for HealthChecker {
@@ -285,6 +328,9 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            active_check_aborts: Mutex::new(Vec::new()),
+            task_generation: Arc::new(AtomicU64::new(0)),
+            lifecycle_publish_guard: Arc::new(std::sync::RwLock::new(())),
             passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
@@ -332,6 +378,9 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            active_check_aborts: Mutex::new(Vec::new()),
+            task_generation: Arc::new(AtomicU64::new(0)),
+            lifecycle_publish_guard: Arc::new(std::sync::RwLock::new(())),
             passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
@@ -360,24 +409,19 @@ impl HealthChecker {
     /// background-drain phase.
     ///
     /// `start_with_shutdown` records every spawned task in
-    /// `active_check_handles` so that [`Drop for HealthChecker`] can abort
-    /// them on cleanup. `Drop` only fires once the last `Arc<HealthChecker>`
-    /// clone is dropped — which happens at process exit, AFTER the
-    /// background-drain phase. That late abort lets active HTTP probes
-    /// race with shutdown: a probe connecting to a backend mid-shutdown
-    /// can emit a misleading "unhealthy" log line right before exit.
+    /// `active_check_handles` **and** `active_check_aborts`. Modes call this
+    /// immediately after `ProxyState::new` to take ownership of the
+    /// `JoinHandle`s and `await` them alongside DNS / metrics / overload
+    /// tasks. The shutdown receiver passed into `start_with_shutdown` lets
+    /// each spawned loop observe shutdown via `tokio::select!` and exit
+    /// cleanly before the await completes.
     ///
-    /// Modes call this immediately after `ProxyState::new` to take
-    /// ownership of the handles and `await` them alongside DNS / metrics
-    /// / overload tasks. The shutdown receiver passed into
-    /// `start_with_shutdown` lets each spawned loop observe shutdown via
-    /// `tokio::select!` and exit cleanly before the await completes.
-    ///
-    /// After this call `active_check_handles` is empty, so `Drop` becomes
-    /// a no-op safety net — the modes own the handles. If a future caller
-    /// re-invokes `start_with_shutdown` (e.g. on config reload) the
-    /// existing drain logic at the top of `start_with_shutdown` still
-    /// aborts whatever was pushed since the last `take`.
+    /// Taking handles does **not** detach cancel ownership: AbortHandles
+    /// stay with `HealthChecker` so a later [`Self::restart_with_shutdown`]
+    /// (or `Drop`) can still abort the drained startup generation. Without
+    /// that retained cancel path, reload would only see an empty handle
+    /// list, spawn a replacement generation, and leave the startup probes
+    /// / passive-recovery timers running with stale targets and policy.
     pub fn take_active_check_handles(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut guard = match self.active_check_handles.lock() {
             Ok(g) => g,
@@ -389,21 +433,51 @@ impl HealthChecker {
     /// Start health checks with an optional shutdown signal.
     ///
     /// Aborts any previously spawned active-check / passive-recovery tasks
-    /// before re-spawning, so this is also the entry point used by
-    /// [`Self::restart_with_shutdown`] on config reload. Active probe state
-    /// (`active_unhealthy_targets`, `active_target_states`) is intentionally
-    /// preserved across the restart so consecutive_successes/failures
-    /// counters carry over and the next probe tick continues from current
-    /// state — avoiding probe flapping during reload.
+    /// (including generations whose `JoinHandle`s were drained via
+    /// [`Self::take_active_check_handles`]) before re-spawning, so this is
+    /// also the entry point used by [`Self::restart_with_shutdown`] on
+    /// config reload. Active probe state (`active_unhealthy_targets`,
+    /// `active_target_states`) is intentionally preserved across the restart
+    /// so consecutive_successes/failures counters carry over and the next
+    /// probe tick continues from current state — avoiding probe flapping
+    /// during reload. Generation gating inside each task refuses stale dials
+    /// and stale health mutations as soon as the generation advances, which is
+    /// why [`Self::restart_with_shutdown`] prunes removed targets only after
+    /// this call returns.
     pub fn start_with_shutdown(
         &self,
         config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Drain old handles into a temporary so we can release the lock
-        // before any `await` inside the spawned tasks could touch anything
-        // else. `Vec::drain` collects the aborted handles in declaration
-        // order; abort() is non-blocking so this is cheap.
+        // Advance both generations while excluding result publication. A task
+        // that was already publishing finishes before rollover; a task that
+        // reaches publication afterward observes the new generation and exits
+        // without mutating shared health state.
+        let publish_guard = match self.lifecycle_publish_guard.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let generation = self
+            .task_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let recovery_generation = self
+            .passive_recovery_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+
+        // Cancel every prior generation via AbortHandles (covers drained
+        // startup handles) and any JoinHandles still owned here.
+        let old_aborts: Vec<AbortHandle> = {
+            let mut guard = match self.active_check_aborts.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *guard)
+        };
+        for abort in old_aborts {
+            abort.abort();
+        }
         let old_handles: Vec<tokio::task::JoinHandle<()>> = {
             let mut guard = match self.active_check_handles.lock() {
                 Ok(g) => g,
@@ -415,14 +489,10 @@ impl HealthChecker {
             handle.abort();
         }
 
-        // Fence any previously taken scanners that abort() cannot reach
-        // (modes drain JoinHandles at startup via take_active_check_handles).
-        let recovery_generation = self
-            .passive_recovery_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
+        drop(publish_guard);
 
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut new_aborts: Vec<AbortHandle> = Vec::new();
         for upstream in &config.upstreams {
             if let Some(hc_config) = &upstream.health_checks {
                 // Start active health checks
@@ -432,15 +502,16 @@ impl HealthChecker {
                     let upstream_client =
                         self.build_upstream_health_client(&tls_config, active.use_tls);
                     for target in &upstream.targets {
-                        let handle = self.start_active_check(
+                        let start = ActiveCheckStartParams {
                             target,
-                            active,
-                            &upstream.namespace,
-                            &upstream.id,
-                            shutdown_rx.clone(),
-                            &upstream_client,
-                            &tls_config,
-                        );
+                            upstream_namespace: &upstream.namespace,
+                            upstream_id: &upstream.id,
+                            shutdown_rx: shutdown_rx.as_ref(),
+                            generation,
+                        };
+                        let handle =
+                            self.start_active_check(start, active, &upstream_client, &tls_config);
+                        new_aborts.push(handle.abort_handle());
                         new_handles.push(handle);
                     }
                 }
@@ -459,14 +530,19 @@ impl HealthChecker {
                 .any(|entry| entry.value().auto_recover)
         });
         if config_needs_passive_recovery(config) || pending_passive_recovery {
-            new_handles.push(
-                self.start_passive_recovery_scanner(shutdown_rx.clone(), recovery_generation),
-            );
+            let handle =
+                self.start_passive_recovery_scanner(shutdown_rx.clone(), recovery_generation);
+            new_aborts.push(handle.abort_handle());
+            new_handles.push(handle);
         }
 
         match self.active_check_handles.lock() {
             Ok(mut guard) => *guard = new_handles,
             Err(poisoned) => *poisoned.into_inner() = new_handles,
+        }
+        match self.active_check_aborts.lock() {
+            Ok(mut guard) => *guard = new_aborts,
+            Err(poisoned) => *poisoned.into_inner() = new_aborts,
         }
     }
 
@@ -503,8 +579,23 @@ impl HealthChecker {
         new_config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Prune active-probe state for upstreams that are no longer in the
-        // config so the shared maps don't accumulate stale entries.
+        // Retire the previous generation and spawn the replacement FIRST.
+        // `start_with_shutdown` advances `task_generation` before aborting,
+        // so every prior probe task is fenced (and aborted) before the prune
+        // below runs. Pruning first would leave the whole spawn phase —
+        // which builds per-upstream TLS clients and can touch the
+        // filesystem — as a window in which a still-running old-generation
+        // probe could re-insert a target that was just removed.
+        self.start_with_shutdown(new_config, shutdown_rx);
+
+        // Prune active-probe state for upstreams / targets that are no longer
+        // in the config so the shared maps don't accumulate stale entries.
+        // The replacement generation only ever writes keys that are in
+        // `active_keys`, so running this after the spawn cannot drop live
+        // state. Active probes defer `target_states` / `unhealthy` entry until
+        // after the post-dial generation fence and re-check generation while
+        // holding the DashMap entry lock, so a retired mid-flight probe cannot
+        // resurrect a just-pruned key in the TOCTOU between fence and insert.
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
@@ -521,8 +612,6 @@ impl HealthChecker {
             .retain(|key, _| active_keys.contains(key));
         self.active_target_states
             .retain(|key, _| active_keys.contains(key));
-
-        self.start_with_shutdown(new_config, shutdown_rx);
     }
 
     /// Get or create the per-proxy passive health state.
@@ -793,22 +882,34 @@ impl HealthChecker {
 
     /// Return the number of currently-spawned probe / passive-recovery tasks.
     ///
-    /// This counts both active probe tasks (one per upstream target with an
-    /// `active` health check configured) and the optional gateway-scoped
-    /// passive recovery scanner (at most one, when any effective passive
-    /// policy has a non-zero `healthy_after_seconds`). Intended for tests
+    /// Counts unfinished AbortHandles so drained (taken) startup generations
+    /// remain visible until reload/drop aborts them. This includes both active
+    /// probe tasks (one per upstream target with an `active` health check
+    /// configured) and the optional gateway-scoped passive recovery scanner
+    /// (at most one, when any effective passive policy has a non-zero
+    /// `healthy_after_seconds` or a pending auto-recover ejection remains).
+    /// Intended for tests
     /// asserting that [`Self::start_with_shutdown`] /
     /// [`Self::restart_with_shutdown`] correctly aborts old handles and
-    /// spawns new ones on config reload. The runtime crate itself doesn't
-    /// call it (the gateway uses operator metrics like `active_unhealthy_targets`
-    /// for observability), hence `#[allow(dead_code)]`.
+    /// spawns new ones on config reload — including the production
+    /// `start → take → restart` ownership sequence. The runtime crate itself
+    /// doesn't call it (the gateway uses operator metrics like
+    /// `active_unhealthy_targets` for observability), hence
+    /// `#[allow(dead_code)]`.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn active_task_count(&self) -> usize {
-        match self.active_check_handles.lock() {
-            Ok(g) => g.len(),
-            Err(p) => p.into_inner().len(),
+        match self.active_check_aborts.lock() {
+            Ok(g) => g.iter().filter(|a| !a.is_finished()).count(),
+            Err(p) => p.into_inner().iter().filter(|a| !a.is_finished()).count(),
         }
+    }
+
+    /// Test-only view of whether one active-probe state key is present.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn has_active_target_state_for_test(&self, key: &str) -> bool {
+        self.active_target_states.contains_key(key)
     }
 
     /// Run one passive-recovery pass: clear every auto-recoverable ejection
@@ -850,6 +951,7 @@ impl HealthChecker {
         let passive_health = self.passive_health.clone();
         let lb_cache = self.lb_cache.clone();
         let recovery_generation = Arc::clone(&self.passive_recovery_generation);
+        let lifecycle_publish_guard = Arc::clone(&self.lifecycle_publish_guard);
         // Fixed 1s tick: per-entry deadlines already encode the effective
         // healthy_after_seconds, so the scanner does not need a per-upstream
         // interval and must not outlive reload/shutdown ownership.
@@ -881,14 +983,19 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
-                if recovery_generation.load(Ordering::Acquire) != generation {
-                    info!(
-                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
-                    );
-                    return;
+                {
+                    let _publish_guard = match lifecycle_publish_guard.read() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if recovery_generation.load(Ordering::Acquire) != generation {
+                        info!(
+                            "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                        );
+                        return;
+                    }
+                    recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
                 }
-
-                recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
             }
         })
     }
@@ -932,17 +1039,24 @@ impl HealthChecker {
     }
 
     /// Start an active health check background task for a target.
-    #[allow(clippy::too_many_arguments)]
     fn start_active_check(
         &self,
-        target: &UpstreamTarget,
+        start: ActiveCheckStartParams<'_>,
         config: &ActiveHealthCheck,
-        upstream_namespace: &str,
-        upstream_id: &str,
-        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         upstream_client: &Arc<reqwest::Client>,
         tls_config: &BackendTlsConfig,
     ) -> tokio::task::JoinHandle<()> {
+        // Destructure by value: taking `start` by reference would bind
+        // `target` as `&&UpstreamTarget`, and `target.clone()` below would
+        // then clone the *reference* into the `'static` spawn (E0521).
+        let ActiveCheckStartParams {
+            target,
+            upstream_namespace,
+            upstream_id,
+            shutdown_rx,
+            generation,
+        } = start;
+        let shutdown_rx = shutdown_rx.cloned();
         let upstream_key =
             crate::config::db_backend::namespaced_runtime_key(upstream_namespace, upstream_id);
         let key = target_key(&upstream_key, target);
@@ -952,6 +1066,8 @@ impl HealthChecker {
         let unhealthy_threshold = config.unhealthy_threshold;
         let unhealthy_targets = self.active_unhealthy_targets.clone();
         let target_states = self.active_target_states.clone();
+        let task_generation = self.task_generation.clone();
+        let lifecycle_publish_guard = Arc::clone(&self.lifecycle_publish_guard);
 
         let probe_type = config.probe_type;
         let host = target.host.clone();
@@ -990,6 +1106,9 @@ impl HealthChecker {
             let mut timer = tokio::time::interval(interval);
 
             loop {
+                if task_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
                 if let Some(ref rx) = shutdown_rx {
                     tokio::select! {
                         _ = timer.tick() => {}
@@ -1001,11 +1120,9 @@ impl HealthChecker {
                 } else {
                     timer.tick().await;
                 }
-
-                let state = target_states
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(TargetHealth::new()))
-                    .clone();
+                if task_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
 
                 let probe_start = std::time::Instant::now();
                 // A target whose literal IP is denied by the egress policy is
@@ -1139,9 +1256,54 @@ impl HealthChecker {
                     }
                 };
 
+                // Serialize publication against reload generation rollover,
+                // then re-check under the guard. This closes the
+                // check-then-mutate window for shared counters, maps, and the
+                // latency cache; a retired probe cannot publish after reload.
+                let _publish_guard = match lifecycle_publish_guard.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if task_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+
+                // Defer entry until after the probe and re-check generation
+                // while holding the DashMap entry lock, so prune cannot race a
+                // pre-insert fence and leave a resurrected removed-target key.
+                let state = {
+                    use dashmap::mapref::entry::Entry;
+                    match target_states.entry(key.clone()) {
+                        Entry::Occupied(entry) => {
+                            if task_generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            entry.get().clone()
+                        }
+                        Entry::Vacant(entry) => {
+                            if task_generation.load(Ordering::Acquire) != generation {
+                                return;
+                            }
+                            entry.insert(Arc::new(TargetHealth::new())).clone()
+                        }
+                    }
+                };
+
+                if task_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+
                 if probe_outcome.success {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
                     let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    // Shared TargetHealth / LB cache intentionally survive reload.
+                    // Bail before side effects if this probe retired mid-mutation so
+                    // a drained generation cannot publish latency or clear marks
+                    // under replacement policy.
+                    if task_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
 
                     if let Some(ref cache) = lb_cache {
                         let latency_us = probe_start.elapsed().as_micros() as u64;
@@ -1153,31 +1315,59 @@ impl HealthChecker {
                         );
                     }
 
-                    if successes >= healthy_threshold && unhealthy_targets.remove(&key).is_some() {
-                        info!(
-                            "Active health check: target {} is healthy ({:?} probe)",
-                            key, probe_type
-                        );
-                        if let Some(ref cache) = lb_cache {
-                            cache.reset_recovered_target_latency(
-                                &upstream_namespace_owned,
-                                &upstream_id_owned,
-                                &probe_target,
+                    if successes >= healthy_threshold {
+                        // Only clear unhealthy under the still-current
+                        // generation so a retired success cannot drop a mark
+                        // the replacement probe just wrote.
+                        let removed = unhealthy_targets.remove_if(&key, |_, _| {
+                            task_generation.load(Ordering::Acquire) == generation
+                        });
+                        if removed.is_some() {
+                            info!(
+                                "Active health check: target {} is healthy ({:?} probe)",
+                                key, probe_type
                             );
+                            if let Some(ref cache) = lb_cache {
+                                cache.reset_recovered_target_latency(
+                                    &upstream_namespace_owned,
+                                    &upstream_id_owned,
+                                    &probe_target,
+                                );
+                            }
                         }
                     }
                 } else {
                     state.consecutive_successes.store(0, Ordering::Relaxed);
                     let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
+                    if task_generation.load(Ordering::Acquire) != generation {
+                        return;
+                    }
+
                     if failures >= unhealthy_threshold {
-                        let key_ref = key.clone();
                         let elapsed_ms = probe_start.elapsed().as_millis() as u64;
                         let last_failure =
                             probe_outcome.failure.as_deref().unwrap_or("probe failed");
-                        unhealthy_targets.entry(key.clone()).or_insert_with(|| {
+                        // Insert under the entry lock with only a generation
+                        // re-check in between — never log while holding the
+                        // DashMap shard (logging can stall concurrent prune /
+                        // probe ownership on the same shard).
+                        let inserted = {
+                            use dashmap::mapref::entry::Entry;
+                            match unhealthy_targets.entry(key.clone()) {
+                                Entry::Occupied(_) => false,
+                                Entry::Vacant(entry) => {
+                                    if task_generation.load(Ordering::Acquire) != generation {
+                                        return;
+                                    }
+                                    entry.insert(now_epoch_ms());
+                                    true
+                                }
+                            }
+                        };
+                        if inserted {
                             warn!(
-                                target = %key_ref,
+                                target = %key,
                                 probe_type = ?probe_type,
                                 failures = failures,
                                 unhealthy_threshold = unhealthy_threshold,
@@ -1185,10 +1375,10 @@ impl HealthChecker {
                                 last_failure = %last_failure,
                                 "Active health check: target is unhealthy"
                             );
-                            now_epoch_ms()
-                        });
+                        }
                     }
                 }
+                drop(_publish_guard);
             }
         })
     }
@@ -1200,6 +1390,17 @@ impl Drop for HealthChecker {
         // abort whatever handles we can recover so spawned tasks don't leak
         // past the HealthChecker. `get_mut` avoids a lock entirely since
         // we have unique access via `&mut self` in Drop.
+        //
+        // Abort via AbortHandles first so generations whose JoinHandles were
+        // drained by `take_active_check_handles` are still cancelled.
+        let aborts = self.active_check_aborts.get_mut();
+        let aborts = match aborts {
+            Ok(v) => v,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for abort in aborts.iter() {
+            abort.abort();
+        }
         let handles = self.active_check_handles.get_mut();
         let handles = match handles {
             Ok(v) => v,

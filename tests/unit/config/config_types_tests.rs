@@ -5525,3 +5525,249 @@ fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
         );
     }
 }
+
+// ── request_deduplication / mcp_gateway replay-provenance composition ────────
+//
+// A `request_deduplication` hit short-circuits `before_proxy` at priority 2750,
+// ahead of `mcp_gateway` at 2992, and serves a *finalized* representation whose
+// presentation transforms are deliberately skipped. `mcp_gateway`'s public
+// URI/name rewrite is resolved against a per-session catalog re-listed from
+// upstream on a discovery TTL, so nothing computed from configuration can prove
+// a stored replay still matches the live mapping. Admission refuses the pair
+// rather than replaying under an unprovable policy.
+
+fn dedup_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "request_deduplication".into(),
+        config: serde_json::json!({}),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn mcp_gateway_plugin_config(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mcp_gateway".into(),
+        config: serde_json::json!({
+            "enabled": true,
+            "mode": "aggregate_router",
+            "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+            "servers": {
+                "github": {
+                    "upstream_url": "http://mcp-alpha:8080",
+                    "namespace": "github",
+                    "enabled": true,
+                }
+            },
+        }),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn associate(proxy: &mut Proxy, plugin_config_ids: &[&str]) {
+    proxy.plugins = plugin_config_ids
+        .iter()
+        .map(|id| PluginAssociation {
+            plugin_config_id: (*id).to_string(),
+        })
+        .collect();
+}
+
+#[test]
+fn dedup_and_mcp_gateway_on_one_proxy_are_rejected() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1")),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp1"]);
+    config.proxies = vec![proxy];
+
+    let errs = config
+        .validate_plugin_references()
+        .expect_err("dedup + mcp_gateway on one proxy must be refused");
+    let joined = errs.join("; ");
+    assert!(
+        joined.contains("request_deduplication cannot be composed with mcp_gateway"),
+        "unexpected errors: {joined}"
+    );
+    // Operators need both offending ids to act on the error.
+    assert!(
+        joined.contains("dedup1") && joined.contains("mcp1"),
+        "{joined}"
+    );
+    assert!(joined.contains("p1"), "{joined}");
+}
+
+#[test]
+fn dedup_and_a_global_mcp_gateway_are_rejected() {
+    // The global instance is effective on every proxy that has no local
+    // `mcp_gateway`, so it composes with a proxy-scoped dedup just the same.
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1"]);
+    config.proxies = vec![proxy];
+
+    let errs = config
+        .validate_plugin_references()
+        .expect_err("a global mcp_gateway still composes with a proxy-scoped dedup");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("request_deduplication cannot be composed with mcp_gateway")),
+        "unexpected errors: {errs:?}"
+    );
+}
+
+#[test]
+fn a_disabled_mcp_gateway_does_not_block_dedup() {
+    let mut config = empty_config();
+    let mut mcp = mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1"));
+    mcp.enabled = false;
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "a disabled mcp_gateway applies no rewrite and must not block deduplication"
+    );
+}
+
+#[test]
+fn an_internally_disabled_mcp_gateway_does_not_block_dedup() {
+    let mut config = empty_config();
+    let mut mcp = mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1"));
+    mcp.config["enabled"] = serde_json::Value::Bool(false);
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "an internally disabled mcp_gateway applies no rewrite and must not block deduplication"
+    );
+}
+
+#[test]
+fn dedup_and_mcp_gateway_on_separate_proxies_are_admitted() {
+    // The documented remedy: keep both behaviors by splitting them across
+    // proxies, where no replay is ever served under the MCP mapping.
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p2")),
+    ];
+    let mut dedup_proxy = make_proxy("p1", "/api");
+    associate(&mut dedup_proxy, &["dedup1"]);
+    let mut mcp_proxy = make_proxy("p2", "/mcp");
+    associate(&mut mcp_proxy, &["mcp1"]);
+    config.proxies = vec![dedup_proxy, mcp_proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "the two plugins on separate proxies never compose and must be admitted"
+    );
+}
+
+#[test]
+fn a_proxy_local_mcp_gateway_shadowing_a_global_one_is_still_rejected() {
+    // Scope resolution must mirror the runtime merge: the local instance
+    // replaces the global for this proxy, and it is still effective.
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None),
+        mcp_gateway_plugin_config("mcp-local", PluginScope::Proxy, Some("p1")),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp-local"]);
+    config.proxies = vec![proxy];
+
+    let errs = config
+        .validate_plugin_references()
+        .expect_err("a proxy-local mcp_gateway is effective and must be refused");
+    let joined = errs.join("; ");
+    assert!(
+        joined.contains("mcp-local"),
+        "the effective local instance must be named: {joined}"
+    );
+    assert!(
+        !joined.contains("mcp-global"),
+        "the shadowed global instance is not effective on this proxy: {joined}"
+    );
+}
+
+#[test]
+fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
+    // Globals are namespace-partitioned by the runtime merge (each proxy takes
+    // only the globals of its own namespace), so a global `mcp_gateway` in one
+    // tenant must not refuse deduplication in another.
+    let mut config = empty_config();
+    let mut dedup = dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1"));
+    dedup.namespace = "tenant-a".to_string();
+    let mut mcp = mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None);
+    mcp.namespace = "tenant-b".to_string();
+    config.plugin_configs = vec![dedup, mcp];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.namespace = "tenant-a".to_string();
+    associate(&mut proxy, &["dedup1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "a global mcp_gateway is never merged into a proxy in a different namespace"
+    );
+}
+
+#[test]
+fn an_internally_disabled_local_mcp_gateway_shadows_an_enabled_global_one() {
+    // The runtime decides shadowing on the outer `enabled` flag alone: the
+    // local instance is constructed and replaces the global for this proxy even
+    // though its inner switch is off. Resolving the effective set before asking
+    // which members are active is what keeps this composition admitted.
+    let mut config = empty_config();
+    let mut local = mcp_gateway_plugin_config("mcp-local", PluginScope::Proxy, Some("p1"));
+    local.config["enabled"] = serde_json::Value::Bool(false);
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None),
+        local,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp-local"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "the effective mcp_gateway on this proxy is the internally disabled local instance, \
+         which applies no rewrite"
+    );
+}
