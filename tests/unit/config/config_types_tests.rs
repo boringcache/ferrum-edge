@@ -5329,7 +5329,10 @@ fn a_disabled_mcp_gateway_does_not_block_dedup() {
     let mut config = empty_config();
     let mut mcp = mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1"));
     mcp.enabled = false;
-    config.plugin_configs = vec![dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")), mcp];
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp,
+    ];
     let mut proxy = make_proxy("p1", "/api");
     associate(&mut proxy, &["dedup1", "mcp1"]);
     config.proxies = vec![proxy];
@@ -5337,6 +5340,25 @@ fn a_disabled_mcp_gateway_does_not_block_dedup() {
     assert!(
         config.validate_plugin_references().is_ok(),
         "a disabled mcp_gateway applies no rewrite and must not block deduplication"
+    );
+}
+
+#[test]
+fn an_internally_disabled_mcp_gateway_does_not_block_dedup() {
+    let mut config = empty_config();
+    let mut mcp = mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1"));
+    mcp.config["enabled"] = serde_json::Value::Bool(false);
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "an internally disabled mcp_gateway applies no rewrite and must not block deduplication"
     );
 }
 

@@ -193,6 +193,25 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
+fn dynamic_response_presentation_is_active(
+    plugin: &crate::config::types::PluginConfig,
+) -> bool {
+    if !plugin.enabled {
+        return false;
+    }
+    match plugin.plugin_name.as_str() {
+        // `mcp_gateway` retains an explicit, validated inner enable switch.
+        // When false, none of its request or response hooks apply, so there is
+        // no dynamic presentation policy to make deduplication unprovable.
+        "mcp_gateway" => plugin
+            .config
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false),
+        _ => true,
+    }
+}
+
 /// Reject composing `request_deduplication` with a plugin whose response-body
 /// presentation policy cannot be proven stable for a retained representation.
 ///
@@ -236,7 +255,9 @@ pub fn validate_composition(
                     PluginScope::ProxyGroup => true,
                     PluginScope::Global => false,
                 };
-                (plugin.enabled && plugin.plugin_name == name && scope_applies)
+                (dynamic_response_presentation_is_active(plugin)
+                    && plugin.plugin_name == name
+                    && scope_applies)
                     .then(|| plugin.id.clone())
             })
             .collect();
@@ -247,7 +268,9 @@ pub fn validate_composition(
             .plugin_configs
             .iter()
             .filter(|plugin| {
-                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
+                dynamic_response_presentation_is_active(plugin)
+                    && plugin.scope == PluginScope::Global
+                    && plugin.plugin_name == name
             })
             .map(|plugin| plugin.id.clone())
             .collect()

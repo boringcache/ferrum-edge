@@ -1038,6 +1038,25 @@ fn mcp_gateway_reports_a_dynamic_presentation_policy() {
     );
 }
 
+#[test]
+fn internally_disabled_mcp_gateway_reports_no_presentation_policy() {
+    let mut config = mcp_gateway_config("http://mcp-alpha:8080");
+    config["enabled"] = serde_json::Value::Bool(false);
+    let plugin = create_plugin_with_http_client(
+        "mcp_gateway",
+        &config,
+        PluginHttpClient::default(),
+    )
+    .expect("disabled mcp_gateway config must be valid")
+    .expect("disabled mcp_gateway must remain a built-in plugin");
+
+    assert_eq!(
+        plugin.response_presentation_policy(),
+        None,
+        "an internally disabled mcp_gateway applies no response rewrite"
+    );
+}
+
 /// The name list config admission uses must not drift from the runtime
 /// behavior it stands in for: admission works on `PluginConfig` names before any
 /// plugin exists, so the join between the two surfaces is by name alone.
