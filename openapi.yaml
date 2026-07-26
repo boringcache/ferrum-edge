@@ -3252,8 +3252,7 @@ paths:
                     type: string
                     enum: [reset]
                   cleared_revision:
-                    type: object
-                    nullable: true
+                    type: [object, "null"]
                     description: |
                       The revision that was cleared, or `null` when the gate
                       held no accepted revision.
