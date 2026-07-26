@@ -53,7 +53,9 @@ mod inner {
         ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SortOrder,
         TcpConnectionThrottleAttachmentConflict,
     };
-    use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
+    use crate::config::db_loader::{
+        credential_value_hash, mark_row_decode_rejection, proxy_route_key_hash,
+    };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -6345,9 +6347,15 @@ mod inner {
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
 
+                                // Namespace-predicated: a same proxy_id owner row
+                                // in another namespace must not classify or cascade
+                                // this delete (parity with standalone preflight).
                                 let spec_owner: Option<(String, String)> = this
                                     .api_specs()
-                                    .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                    .find_one(mongodb::bson::doc! {
+                                        "proxy_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?
                                     .map(|doc| {
@@ -6672,7 +6680,14 @@ mod inner {
                 .await?;
             self.check_slow_query("get_proxy", start);
             match result {
-                Some(doc) => Ok(Some(doc_to_proxy(doc)?)),
+                // Mark decode failures like SQL `row_to_proxy` so admin DELETE
+                // can take the undecodable-row repair path. That path still
+                // runs `delete_proxy`, whose standalone ownership preflight
+                // reads raw BSON and refuses malformed `api_spec_id` stamps
+                // with `501` before any graph mutation.
+                Some(doc) => Ok(Some(doc_to_proxy(doc).map_err(|error| {
+                    mark_row_decode_rejection("proxy", Some(id.to_string()), error)
+                })?)),
                 None => Ok(None),
             }
         }

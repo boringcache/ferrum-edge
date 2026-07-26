@@ -1529,6 +1529,24 @@ async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp(
         .expect("delete proxy with malformed ownership stamp");
     let status = response.status();
     let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    let proxies_after = db
+        .collection::<Document>("proxies")
+        .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .await
+        .expect("count proxy after refusal");
+    let changes_after = db
+        .collection::<Document>("config_changes")
+        .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
+        .await
+        .expect("count proxy changes after refusal");
+
+    // Remove the intentionally undecodable fixture before asserts so a failed
+    // expectation cannot poison the shared CI MongoDB used by later startups.
+    db.collection::<Document>("proxies")
+        .delete_one(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .await
+        .expect("cleanup malformed ownership fixture");
+
     assert_eq!(status.as_u16(), 501, "malformed ownership must fail closed");
     assert_eq!(
         body["error"],
@@ -1546,19 +1564,11 @@ async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp(
         "refusal must not expose the proxy identifier: {body:?}"
     );
     assert_eq!(
-        db.collection::<Document>("proxies")
-            .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
-            .await
-            .expect("count proxy after refusal"),
-        1,
+        proxies_after, 1,
         "malformed ownership refusal must happen before proxy mutation"
     );
     assert_eq!(
-        db.collection::<Document>("config_changes")
-            .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
-            .await
-            .expect("count proxy changes after refusal"),
-        changes_before,
+        changes_after, changes_before,
         "malformed ownership refusal must not append config changes"
     );
 }
