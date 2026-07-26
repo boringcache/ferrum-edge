@@ -25,14 +25,16 @@
 //! `before_proxy` short-circuit, the reject/synthetic response hooks) over the
 //! backend-visible body, and only after cheap capture admission confirms an
 //! exportable record is still possible: the sampling roll must be able to emit
-//! (directly or via an `always_capture_on_*` override) and
-//! `sampling.max_records_per_minute` must still have window budget. A candidate
-//! that cannot be exported therefore costs a classification pass and a staging
-//! slot, not a cryptographic pass plus a retained excerpt. The deliberate
-//! trade-off is that a candidate whose transaction ends before ANY of those
-//! hooks run (e.g. a client disconnect after `before_proxy` but before
-//! dispatch) emits its `log`-fallback record without a request hash/excerpt;
-//! see the documented limitation in `docs/plugins.md`.
+//! (directly or via an `always_capture_on_*` override) and a finite
+//! `sampling.max_records_per_minute` window must atomically reserve budget.
+//! Concurrent candidates therefore cannot all pay capture work beyond the
+//! configured ceiling. A candidate that cannot be exported therefore costs a
+//! classification pass and a staging slot, not a cryptographic pass plus a
+//! retained excerpt. The deliberate trade-off is that a candidate whose
+//! transaction ends before ANY of those hooks run (e.g. a client disconnect
+//! after `before_proxy` but before dispatch) emits its `log`-fallback record
+//! without a request hash/excerpt; see the documented limitation in
+//! `docs/plugins.md`.
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
@@ -419,6 +421,12 @@ struct AuditStaging {
     /// `Some` means this record can never be exported, so `enqueue` drops it
     /// rather than shipping a hash-less, body-less envelope.
     capture_skipped: Option<&'static str>,
+    /// Finite-window limiter slot reserved at capture admission. `enqueue`
+    /// commits it (so queue-full/sink drops still consume budget, matching the
+    /// historical acquire-before-`try_send` order); Drop releases an
+    /// uncommitted reservation when the candidate is discarded, loses staging,
+    /// expires, or does not emit.
+    rate_reservation: Option<RateLimitReservation>,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -561,6 +569,9 @@ struct RequestCapture {
     model: BoundedModel,
     tools: BoundedToolNames,
     skipped: Option<&'static str>,
+    /// Limiter slot reserved before expensive work when admission succeeded.
+    /// Moved onto [`AuditStaging`]; Drop releases it if staging never accepts it.
+    rate_reservation: Option<RateLimitReservation>,
 }
 
 /// Owned request/response envelope fields, sourced from either a live
@@ -610,13 +621,47 @@ const MAX_RECORDS_PER_WINDOW: u64 = (u32::MAX as u64) - 1;
 ///
 /// Lock-free by design: the window index and the in-window count are packed
 /// into one `AtomicU64` (`window << 32 | count`) and advanced by CAS. Capture
-/// admission consults this limiter on the request path — before any hashing,
-/// redaction, or excerpt work — so a mutex here would add a hot-path lock.
-/// Windows are anchored to the process-monotonic clock rather than to the last
-/// reset, which keeps the peek a single relaxed load with no mutation.
+/// admission **reserves** a slot on the request path — before any hashing,
+/// redaction, or excerpt work — so concurrent candidates cannot all observe
+/// headroom and pay capture cost beyond the configured ceiling. A mutex here
+/// would add a hot-path lock. Windows are anchored to the process-monotonic
+/// clock.
 struct RecordsPerMinute {
     max_per_minute: u64,
     state: AtomicU64,
+}
+
+/// RAII token for one reserved records-per-minute slot.
+///
+/// Created by [`RecordsPerMinute::try_reserve`] before expensive capture work.
+/// [`Self::commit`] consumes the slot without releasing (enqueue / sink-drop
+/// path). Drop releases an uncommitted reservation, but only while the token's
+/// window is still the current window — an older-window release never
+/// decrements the live counter.
+struct RateLimitReservation {
+    slot: Option<RateLimitSlot>,
+}
+
+struct RateLimitSlot {
+    limiter: Arc<RecordsPerMinute>,
+    window: u64,
+}
+
+impl RateLimitReservation {
+    /// Consume the reservation without returning budget. Used when an
+    /// exportable record reaches enqueue (including queue-full/sink drops,
+    /// which historically acquired before `try_send`).
+    fn commit(mut self) {
+        self.slot = None;
+    }
+}
+
+impl Drop for RateLimitReservation {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.limiter.release(slot.window);
+        }
+    }
 }
 
 impl RecordsPerMinute {
@@ -639,21 +684,12 @@ impl RecordsPerMinute {
         (window << 32) | (count & u32::MAX as u64)
     }
 
-    /// Non-consuming check: does the CURRENT window still have budget? Used to
-    /// decide whether paying full capture cost can ever produce a record. It
-    /// never reserves, so a candidate whose capture is skipped cannot strand
-    /// limiter budget, and a saturated window cannot be starved by peeks.
-    fn has_window_headroom(&self) -> bool {
+    /// Atomically reserve one slot in the current window for upcoming capture
+    /// work. `None` means the window is saturated. Unlimited (`max == 0`)
+    /// returns an empty reservation that neither increments nor releases.
+    fn try_reserve(self: &Arc<Self>) -> Option<RateLimitReservation> {
         if self.max_per_minute == 0 {
-            return true;
-        }
-        let (window, count) = Self::unpack(self.state.load(Ordering::Relaxed));
-        window != Self::current_window() || count < self.max_per_minute
-    }
-
-    fn try_acquire(&self) -> bool {
-        if self.max_per_minute == 0 {
-            return true;
+            return Some(RateLimitReservation { slot: None });
         }
         let mut observed = self.state.load(Ordering::Relaxed);
         loop {
@@ -661,7 +697,7 @@ impl RecordsPerMinute {
             let (window, count) = Self::unpack(observed);
             let count = if window == now { count } else { 0 };
             if count >= self.max_per_minute {
-                return false;
+                return None;
             }
             match self.state.compare_exchange_weak(
                 observed,
@@ -669,10 +705,53 @@ impl RecordsPerMinute {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    return Some(RateLimitReservation {
+                        slot: Some(RateLimitSlot {
+                            limiter: Arc::clone(self),
+                            window: now,
+                        }),
+                    });
+                }
                 Err(actual) => observed = actual,
             }
         }
+    }
+
+    /// Release an uncommitted reservation from `window`. No-op when the live
+    /// window has already advanced past `window`, so stale releases cannot
+    /// inflate the current window's budget.
+    fn release(&self, window: u64) {
+        if self.max_per_minute == 0 {
+            return;
+        }
+        let mut observed = self.state.load(Ordering::Relaxed);
+        loop {
+            let now = Self::current_window();
+            if window != now {
+                return;
+            }
+            let (state_window, count) = Self::unpack(observed);
+            if state_window != now || count == 0 {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                Self::pack(now, count - 1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    /// Late acquire for the rare path that reaches enqueue without a
+    /// capture-time reservation (transaction ended before any request-side
+    /// capture hook). Identical CAS shape to [`Self::try_reserve`].
+    fn try_acquire(self: &Arc<Self>) -> bool {
+        self.try_reserve().map(RateLimitReservation::commit).is_some()
     }
 }
 
@@ -1129,8 +1208,21 @@ impl AiTranscriptAudit {
         if precluded {
             return SinkOutcome::Dropped;
         }
-        if !self.rate_limiter.try_acquire() {
-            return SinkOutcome::Dropped;
+        // Prefer the capture-time reservation: committing it consumes the slot
+        // without a second CAS. Queue-full / sink drops after this point still
+        // keep the slot (historical acquire-before-`try_send` semantics). The
+        // late `try_acquire` path covers transactions that reach enqueue
+        // without any request-side capture hook.
+        match staging
+            .as_mut()
+            .and_then(|staged| staged.rate_reservation.take())
+        {
+            Some(reservation) => reservation.commit(),
+            None => {
+                if !self.rate_limiter.try_acquire() {
+                    return SinkOutcome::Dropped;
+                }
+            }
         }
         if let Some(permit) = staging.and_then(|staging| staging.commit_permit.take()) {
             permit.send(record);
@@ -1294,23 +1386,29 @@ impl AiTranscriptAudit {
     /// backend-visible body — before any hashing, redaction, excerpt shaping,
     /// or model/tool extraction.
     ///
-    /// `None` admits full capture. `Some(reason)` means no exportable record
+    /// `None` admits full capture (and, for a finite limiter, returns a
+    /// reserved slot via [`RecordsPerMinute::try_reserve`] inside
+    /// [`Self::capture_request`]). `Some(reason)` means no exportable record
     /// can result, so the expensive work is skipped entirely:
     /// * [`CAPTURE_SKIP_NOT_SAMPLED`] — the sampling roll lost and neither
     ///   override is configured, so [`Self::emit_decision`] can never emit.
     ///   Exact: this is the same predicate the emit decision would apply later.
-    /// * [`CAPTURE_SKIP_RATE_LIMITED`] — `sampling.max_records_per_minute` has
-    ///   no budget left in the current window. The limiter decision moves from
-    ///   enqueue time to capture-admission time so a saturated instance stops
-    ///   paying capture CPU (and retaining excerpts) for records it will drop.
-    fn capture_skip_reason(&self, sample_hit: bool) -> Option<&'static str> {
+    /// * [`CAPTURE_SKIP_RATE_LIMITED`] — `sampling.max_records_per_minute` had
+    ///   no reservable budget in the current window. The limiter decision moves
+    ///   from enqueue time to capture-admission time so a saturated instance
+    ///   stops paying capture CPU (and retaining excerpts) for records it will
+    ///   drop; the reservation is atomic so concurrent candidates cannot all
+    ///   pass a non-consuming peek and amplify past the ceiling.
+    fn capture_skip_reason(
+        &self,
+        sample_hit: bool,
+    ) -> Result<RateLimitReservation, &'static str> {
         if !self.commit_may_emit(sample_hit) {
-            return Some(CAPTURE_SKIP_NOT_SAMPLED);
+            return Err(CAPTURE_SKIP_NOT_SAMPLED);
         }
-        if !self.rate_limiter.has_window_headroom() {
-            return Some(CAPTURE_SKIP_RATE_LIMITED);
-        }
-        None
+        self.rate_limiter
+            .try_reserve()
+            .ok_or(CAPTURE_SKIP_RATE_LIMITED)
     }
 
     /// Perform (or deliberately skip) the expensive request-side capture over a
@@ -1327,14 +1425,17 @@ impl AiTranscriptAudit {
         body: &[u8],
         sample_hit: bool,
     ) -> RequestCapture {
-        if let Some(skipped) = self.capture_skip_reason(sample_hit) {
-            self.request_captures_skipped
-                .fetch_add(1, Ordering::Relaxed);
-            return RequestCapture {
-                skipped: Some(skipped),
-                ..RequestCapture::default()
-            };
-        }
+        let reservation = match self.capture_skip_reason(sample_hit) {
+            Ok(reservation) => reservation,
+            Err(skipped) => {
+                self.request_captures_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return RequestCapture {
+                    skipped: Some(skipped),
+                    ..RequestCapture::default()
+                };
+            }
+        };
         self.request_captures.fetch_add(1, Ordering::Relaxed);
         // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
         // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
@@ -1371,6 +1472,7 @@ impl AiTranscriptAudit {
             model,
             tools,
             skipped: None,
+            rate_reservation: Some(reservation),
         }
     }
 
@@ -1505,6 +1607,7 @@ impl AiTranscriptAudit {
                 stream_active: false,
                 captured: phase == BodyPhase::Final,
                 capture_skipped: capture.skipped,
+                rate_reservation: capture.rate_reservation,
             },
         );
         PluginResult::Continue
@@ -1578,6 +1681,10 @@ impl AiTranscriptAudit {
             staged.tool_names_truncated = capture.tools.truncated;
             staged.tool_names_omitted = capture.tools.omitted;
             staged.tool_names_hash = capture.tools.hash;
+            // Replace any prior reservation (there should be none on the
+            // classification-only provisional staging path). If staging vanished
+            // between build and publish, `capture`'s Drop releases the new slot.
+            staged.rate_reservation = capture.rate_reservation;
         }
     }
 

@@ -7280,9 +7280,11 @@ async fn short_circuit_capture_runs_once_on_the_reject_path() {
 }
 
 /// A saturated `max_records_per_minute` window stops paying capture cost: the
-/// limiter is consulted when the backend-visible body arrives, so dropped
+/// limiter atomically reserves when the backend-visible body arrives, so dropped
 /// transactions never hash, redact, excerpt, or assemble anything — and no
-/// hash-less envelope is exported in their place.
+/// hash-less envelope is exported in their place. The first record's reservation
+/// is committed at enqueue (not acquired again), which is why it can still queue
+/// after the window count is already 1.
 #[tokio::test]
 async fn saturated_records_per_minute_skips_capture_before_hashing() {
     let server = mock_sink().await;
@@ -7316,7 +7318,7 @@ async fn saturated_records_per_minute_skips_capture_before_hashing() {
     assert_eq!(
         plugin.capture_counters(),
         (1, 2),
-        "only the record that fits the window budget may pay capture cost"
+        "only the record that reserves window budget may pay capture cost"
     );
     assert_eq!(outcomes[0], ("queued".to_string(), true));
     assert_eq!(outcomes[1], ("dropped".to_string(), false));
@@ -7379,17 +7381,22 @@ async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
     assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
 }
 
-/// After `max_records_per_minute` is saturated, a sampling-roll winner whose
-/// capture admission was precluded must not tee or pin reqwest dispatch — even
-/// though `commit_may_emit` is still true — while an admissible candidate
-/// under the same streaming policy still does both.
+/// Two candidates may reach capture admission before either enqueues. With
+/// `max_records_per_minute = 1`, only the admitted/reserved candidate may pay
+/// capture cost; the loser's staging carries `capture_skipped` so streaming
+/// capture neither pins reqwest dispatch nor installs an SSE inspector. The
+/// reserved winner must still enqueue by committing its existing reservation
+/// (a second limiter acquisition would fail because the window count is already
+/// 1), while an independently configured admissible candidate still tees.
 #[tokio::test]
 async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
     let stream_body =
         br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(
-            "https://audit.example.com/x",
+            &endpoint,
             json!({
                 "capture": { "streaming_response": true },
                 "sampling": { "max_records_per_minute": 1 }
@@ -7403,11 +7410,13 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
     let headers = json_headers();
     let sse = Some("text/event-stream");
 
+    // Concurrent-admission window: both reach capture before either enqueues.
     let mut first = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
         .await;
     assert_eq!(plugin.capture_counters(), (1, 0));
+    assert!(audit_meta(&first, HASH_KEY).is_some());
 
     let mut limited = make_ctx();
     plugin
@@ -7416,8 +7425,9 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
     assert_eq!(
         plugin.capture_counters(),
         (1, 1),
-        "rate-limited candidate must skip capture once the window is saturated"
+        "only the reserved candidate may capture once the window is saturated"
     );
+    assert_eq!(audit_meta(&limited, HASH_KEY), None);
     assert!(
         !plugin.forces_reqwest_dispatch(&limited),
         "rate-limited candidate must not pin reqwest dispatch"
@@ -7426,6 +7436,15 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         plugin.response_stream_inspector(&limited, 200, sse).is_none(),
         "rate-limited candidate must not install an SSE inspector"
     );
+
+    // The reserved first record commits its existing reservation at enqueue —
+    // it must not attempt a second acquisition against the already-full window.
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(audit_meta(&first, SINK_KEY).as_deref(), Some("queued"));
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "reserved capture must still be exportable");
 
     let admissible = AiTranscriptAudit::new(
         &config_with_sink(
@@ -7444,6 +7463,69 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
         .await;
     assert!(admissible.forces_reqwest_dispatch(&hit));
     assert!(admissible.response_stream_inspector(&hit, 200, sse).is_some());
+}
+
+/// A capture-time reservation that never emits must release its slot so a later
+/// candidate in the same window can be admitted. Configured as a sampling loser
+/// that only *might* emit via `always_capture_on_error`; a successful 200 path
+/// does not emit, drops staging, and frees the reservation.
+#[tokio::test]
+async fn discarded_rate_reservation_is_released_for_later_candidate() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": true,
+                    "max_records_per_minute": 1
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "override-eligible loser still reserves and captures"
+    );
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        audit_meta(&first, SINK_KEY).as_deref(),
+        Some("skipped"),
+        "successful response without error/guardrail must not emit"
+    );
+
+    let mut second = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut second, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (2, 0),
+        "released reservation must admit a later candidate in the same window"
+    );
+    plugin
+        .capture_final_response_body(&mut second, 500, &headers, br#"{"error":"x"}"#)
+        .await;
+    assert_eq!(audit_meta(&second, SINK_KEY).as_deref(), Some("queued"));
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "error");
 }
 
 /// A streamed (`stream: true`) transaction also pays exactly one request
