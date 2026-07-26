@@ -3128,10 +3128,27 @@ fn cache_telemetry_value_admitted(suffix: &str, value: &str) -> bool {
     match suffix {
         "cache_status" => matches!(value, "HIT" | "MISS" | "BYPASS"),
         "cache_match" => value == "semantic",
-        "cache_similarity" => value
-            .parse::<f64>()
-            .is_ok_and(|similarity| similarity.is_finite() && (0.0..=1.0).contains(&similarity)),
+        "cache_similarity" => cache_similarity_value_admitted(value),
         "replayed" => matches!(value, "true" | "false"),
+        _ => false,
+    }
+}
+
+/// Admit only the exact `format!("{similarity:.6}")` spelling the semantic
+/// cache producer writes for similarities in `[0, 1]`.
+///
+/// `f64::from_str` would also accept short forms (`0.95`), signs (`+1.0`), and
+/// exponents (`1e0`). Those are not producer output and would widen the
+/// collector's observed value space past the documented fixed six-fraction
+/// decimal, so they are dropped here.
+fn cache_similarity_value_admitted(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 8 || bytes[1] != b'.' {
+        return false;
+    }
+    match bytes[0] {
+        b'0' => bytes[2..].iter().all(u8::is_ascii_digit),
+        b'1' => &bytes[2..] == b"000000",
         _ => false,
     }
 }

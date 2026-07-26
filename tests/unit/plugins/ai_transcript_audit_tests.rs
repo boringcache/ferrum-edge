@@ -2944,6 +2944,12 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         ("ai_semantic_cache.10.cache_match", "exact"),
         ("ai_semantic_cache.9.cache_similarity", "not-a-number"),
         ("ai_semantic_cache.10.cache_similarity", "12.5"),
+        // In-range floats that are not the producer's `{:.6}` spelling.
+        ("ai_semantic_cache.11.cache_similarity", "0.95"),
+        ("ai_semantic_cache.13.cache_similarity", "1"),
+        ("ai_semantic_cache.14.cache_similarity", "1e0"),
+        ("ai_semantic_cache.15.cache_similarity", "+0.950000"),
+        ("ai_semantic_cache.16.cache_similarity", "1.000001"),
         // Sibling namespace under the dedup producer.
         ("request_deduplication.cached_body", "cached response text"),
     ];
@@ -2984,6 +2990,62 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
         !serialized.contains("who is the ceo of acme"),
         "off-schema metadata reached the record through another field"
     );
+}
+
+/// Oversized multi-instance chains must truncate the `cache` section in sorted
+/// key order (not `HashMap` iteration order) so the surviving subset is stable.
+#[tokio::test]
+async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+
+    let mut expected = std::collections::BTreeMap::new();
+    for instance_id in 0..40u64 {
+        let key = format!("ai_semantic_cache.{instance_id}.cache_status");
+        let value = if instance_id % 2 == 0 { "HIT" } else { "MISS" };
+        ctx.metadata.insert(key.clone(), value.to_string());
+        expected.insert(key, value.to_string());
+    }
+    let boundary = expected.keys().nth(32).cloned();
+    if let Some(boundary) = boundary {
+        expected.retain(|key, _| *key < boundary);
+    }
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let cache = records[0]["cache"]
+        .as_object()
+        .expect("cache section is an object");
+    assert_eq!(cache.len(), 32);
+    assert_eq!(expected.len(), 32);
+    for (key, value) in &expected {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value.as_str()),
+            "sorted truncation dropped or rewrote {key}"
+        );
+    }
+    for key in cache.keys() {
+        assert!(
+            expected.contains_key(key),
+            "unsorted survivor {key} escaped the sorted cap"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
