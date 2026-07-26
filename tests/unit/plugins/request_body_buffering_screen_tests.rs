@@ -122,49 +122,49 @@ fn conditional_buffering_matrix() -> Vec<Row> {
     let no_body_forward = json!({"forward_body": false});
     let no_body_inspection = json!({"request_body_inspection": false});
 
-    let mut matrix = Vec::new();
-    matrix.push(base("a2a_gateway", ParityOnly));
-    matrix.push(row("a2a_gateway", disabled.clone(), ParityOnly));
-    matrix.push(base("ai_federation", Exactly(Buffers)));
-    matrix.push(base("ai_prompt_compressor", Exactly(Buffers)));
-    matrix.push(base("ai_prompt_shield", ParityOnly));
-    matrix.push(row("ai_prompt_shield", redact, ParityOnly));
-    matrix.push(base("ai_rate_limiter", Exactly(Buffers)));
-    matrix.push(base("ai_request_guard", ParityOnly));
-    matrix.push(row("ai_request_guard", token_limited, ParityOnly));
-    matrix.push(base("ai_semantic_cache", Exactly(Buffers)));
-    matrix.push(base("ai_semantic_firewall", ParityOnly));
-    matrix.push(base("ai_stream_router", Exactly(Buffers)));
-    matrix.push(row("ai_stream_router", disabled.clone(), Exactly(Streams)));
-    matrix.push(base("ai_tool_governor", ParityOnly));
-    matrix.push(row("ai_tool_governor", disabled.clone(), ParityOnly));
-    matrix.push(base("ai_transcript_audit", ParityOnly));
-    matrix.push(row("ai_transcript_audit", capture_off, ParityOnly));
-    matrix.push(base("body_validator", Exactly(Buffers)));
-    matrix.push(row("body_validator", response_only, Exactly(Streams)));
-    matrix.push(base("compression", Exactly(Streams)));
-    matrix.push(row("compression", decompress, Exactly(Buffers)));
-    matrix.push(base("graphql", Exactly(Buffers)));
-    matrix.push(base("grpc_web", Exactly(Buffers)));
-    matrix.push(base("hmac_auth", Exactly(Buffers)));
-    matrix.push(base("load_testing", Exactly(Buffers)));
-    matrix.push(base("mcp_gateway", ParityOnly));
-    matrix.push(row("mcp_gateway", disabled, ParityOnly));
-    matrix.push(base("opa", Exactly(Streams)));
-    matrix.push(row("opa", include_body, Exactly(Buffers)));
-    matrix.push(base("openapi_validator", Exactly(Streams)));
-    matrix.push(row("openapi_validator", no_req_valid, Exactly(Streams)));
-    matrix.push(base("request_deduplication", Exactly(Buffers)));
-    matrix.push(base("request_mirror", Exactly(Buffers)));
-    matrix.push(row("request_mirror", no_body_mirroring, Exactly(Streams)));
-    matrix.push(base("request_transformer", Exactly(Streams)));
-    matrix.push(row("request_transformer", body_rules, Exactly(Buffers)));
-    matrix.push(base("serverless_function", ParityOnly));
-    matrix.push(row("serverless_function", no_body_forward, ParityOnly));
-    matrix.push(base("soap_ws_security", Exactly(Buffers)));
-    matrix.push(base("waf", ParityOnly));
-    matrix.push(row("waf", no_body_inspection, Exactly(Streams)));
-    matrix
+    vec![
+        base("a2a_gateway", ParityOnly),
+        row("a2a_gateway", disabled.clone(), ParityOnly),
+        base("ai_federation", Exactly(Buffers)),
+        base("ai_prompt_compressor", Exactly(Buffers)),
+        base("ai_prompt_shield", ParityOnly),
+        row("ai_prompt_shield", redact, ParityOnly),
+        base("ai_rate_limiter", Exactly(Buffers)),
+        base("ai_request_guard", ParityOnly),
+        row("ai_request_guard", token_limited, ParityOnly),
+        base("ai_semantic_cache", Exactly(Buffers)),
+        base("ai_semantic_firewall", ParityOnly),
+        base("ai_stream_router", Exactly(Buffers)),
+        row("ai_stream_router", disabled.clone(), Exactly(Streams)),
+        base("ai_tool_governor", ParityOnly),
+        row("ai_tool_governor", disabled.clone(), ParityOnly),
+        base("ai_transcript_audit", ParityOnly),
+        row("ai_transcript_audit", capture_off, ParityOnly),
+        base("body_validator", Exactly(Buffers)),
+        row("body_validator", response_only, Exactly(Streams)),
+        base("compression", Exactly(Streams)),
+        row("compression", decompress, Exactly(Buffers)),
+        base("graphql", Exactly(Buffers)),
+        base("grpc_web", Exactly(Buffers)),
+        base("hmac_auth", Exactly(Buffers)),
+        base("load_testing", Exactly(Buffers)),
+        base("mcp_gateway", ParityOnly),
+        row("mcp_gateway", disabled, ParityOnly),
+        base("opa", Exactly(Streams)),
+        row("opa", include_body, Exactly(Buffers)),
+        base("openapi_validator", Exactly(Streams)),
+        row("openapi_validator", no_req_valid, Exactly(Streams)),
+        base("request_deduplication", Exactly(Buffers)),
+        base("request_mirror", Exactly(Buffers)),
+        row("request_mirror", no_body_mirroring, Exactly(Streams)),
+        base("request_transformer", Exactly(Streams)),
+        row("request_transformer", body_rules, Exactly(Buffers)),
+        base("serverless_function", ParityOnly),
+        row("serverless_function", no_body_forward, ParityOnly),
+        base("soap_ws_security", Exactly(Buffers)),
+        base("waf", ParityOnly),
+        row("waf", no_body_inspection, Exactly(Streams)),
+    ]
 }
 
 /// Merge `overlay` onto `base_config`; a `null` overlay value removes the key.
