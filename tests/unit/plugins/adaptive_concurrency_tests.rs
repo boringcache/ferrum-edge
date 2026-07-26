@@ -2354,3 +2354,74 @@ fn adaptive_concurrency_invalid_reload_preserves_last_good_state() {
     let released = expect_admitted(acquire_from_cache(&cache, &config));
     drop(released);
 }
+
+/// A shared (global / proxy-group) `adaptive_concurrency` instance serves
+/// proxies from every namespace through ONE limiter, and `key_by =
+/// proxy_target` is the default. The `proxy`-scope cache used to be keyed by
+/// the bare `proxy.id` while caching the namespace-qualified
+/// `proxy:{namespace}:{id}` scope, so the first tenant to warm the cache handed
+/// its own scope to a second tenant's same-id proxy and both were admitted
+/// against a single limiter row (issue #3094). Independent rows — and
+/// independent in-flight accounting — are the observable.
+#[test]
+fn proxy_scope_cache_keeps_same_id_proxies_in_two_namespaces_independent() {
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = limiter_config(4);
+
+    let mut tenant_a = proxy();
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.id = "api".to_string();
+    let mut tenant_b = proxy();
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.id = "api".to_string();
+
+    let backend = target("backend.local", 8080);
+
+    let permit_a = limiter
+        .try_acquire(&tenant_a, Some(&backend), Arc::clone(&config))
+        .expect("tenant-a request should be admitted");
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    let permit_b = limiter
+        .try_acquire(&tenant_b, Some(&backend), Arc::clone(&config))
+        .expect("tenant-b request should be admitted");
+    assert_eq!(
+        limiter.tracked_keys_count(),
+        2,
+        "same proxy id in two namespaces must own independent limiter rows"
+    );
+
+    let snapshot_a = limiter
+        .snapshot(&tenant_a, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-a state should exist after acquire");
+    let snapshot_b = limiter
+        .snapshot(&tenant_b, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-b state should exist after acquire");
+    assert_eq!(snapshot_a.in_flight, 1);
+    assert_eq!(
+        snapshot_b.in_flight, 1,
+        "tenant-b in-flight must not accumulate onto tenant-a's row"
+    );
+
+    // Feedback on one tenant's row must not shrink the other tenant's limit.
+    permit_a.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 503,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(5),
+    });
+    let after_a = limiter
+        .snapshot(&tenant_a, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-a state should still exist");
+    let after_b = limiter
+        .snapshot(&tenant_b, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-b state should still exist");
+    assert_eq!(after_a.limit, 2, "tenant-a absorbs its own 503 backoff");
+    assert_eq!(
+        after_b.limit, 4,
+        "tenant-b's limit must be untouched by tenant-a's backend failure"
+    );
+
+    drop(permit_a);
+    drop(permit_b);
+}
