@@ -66,12 +66,7 @@
 {{- if hasKey $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS" -}}
 {{- $ambientAdminBindAddress = toString (index $ambientEnv "FERRUM_ADMIN_BIND_ADDRESS") -}}
 {{- end -}}
-{{- $ambientAdminProbeHost := $ambientAdminBindAddress -}}
-{{- if or (eq $ambientAdminProbeHost "") (eq $ambientAdminProbeHost "0.0.0.0") (eq $ambientAdminProbeHost "*") -}}
-{{- $ambientAdminProbeHost = "127.0.0.1" -}}
-{{- else if eq $ambientAdminProbeHost "::" -}}
-{{- $ambientAdminProbeHost = "::1" -}}
-{{- end -}}
+{{- $ambientAdminProbeHost := include "ferrum-mesh.adminProbeHost" $ambientAdminBindAddress -}}
 {{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
 {{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
 {{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
@@ -229,21 +224,19 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-          {{- if $nodeWaypointRegistryEnabled }}
-          readinessProbe:
-            exec:
-              command:
-                - /app/ferrum-edge
-                - health
-                - --host
-                - {{ $ambientAdminProbeHost | quote }}
-                - -p
-                - {{ $ambientAdminPort | quote }}
-            initialDelaySeconds: 2
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 3
-          {{- end }}
+          {{- /* Admin-backed probes when the listener is enabled. NodeWaypoint
+                 still requires a non-zero admin port (validated above). Ordinary
+                 ambient also probes admin when available so rollouts wait for
+                 /health. Liveness uses --live so a degraded mesh stays alive. */ -}}
+          {{- $ambientHandlers := dict "live" (dict) "ready" (dict) -}}
+          {{- if ne $ambientAdminPort "0" -}}
+          {{- $ambientHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" $ambientAdminPort "probeHost" $ambientAdminProbeHost) | fromYaml -}}
+          {{- end -}}
+          {{- $ambientLiveHandler := .Values.ambient.probes.liveness.override | default dict -}}
+          {{- if not $ambientLiveHandler }}{{- $ambientLiveHandler = $ambientHandlers.live | default dict -}}{{- end -}}
+          {{- $ambientReadyHandler := .Values.ambient.probes.readiness.override | default dict -}}
+          {{- if not $ambientReadyHandler }}{{- $ambientReadyHandler = $ambientHandlers.ready | default dict -}}{{- end -}}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.ambient.probes "liveHandler" $ambientLiveHandler "readyHandler" $ambientReadyHandler) }}
       {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
       volumes:
         {{- if $nodeWaypointRegistryEnabled }}

@@ -1,4 +1,14 @@
 {{- if .Values.controlPlane.enabled }}
+{{- $cpEnv := .Values.controlPlane.env | default dict -}}
+{{- $adminTarget := include "ferrum-mesh.adminProbeTargetFromEnv" $cpEnv | fromYaml -}}
+{{- $handlers := dict "live" (dict) "ready" (dict) -}}
+{{- if ne (toString $adminTarget.port) "0" -}}
+{{- $handlers = include "ferrum-mesh.adminHealthHandlers" $adminTarget | fromYaml -}}
+{{- end -}}
+{{- $liveHandler := .Values.controlPlane.probes.liveness.override | default dict -}}
+{{- if not $liveHandler }}{{- $liveHandler = $handlers.live | default dict -}}{{- end -}}
+{{- $readyHandler := .Values.controlPlane.probes.readiness.override | default dict -}}
+{{- if not $readyHandler }}{{- $readyHandler = $handlers.ready | default dict -}}{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -40,6 +50,7 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.controlPlane.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
 ---
 apiVersion: v1
 kind: Service
