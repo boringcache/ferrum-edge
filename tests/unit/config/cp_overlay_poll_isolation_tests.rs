@@ -13,14 +13,13 @@ use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use ferrum_edge::_test_support::{
-    CpNamespaceFullLoadTestBackend, CpPublicationGate, K8sOverlaySlot,
-    cas_publish_db_snapshot_with_k8s_overlay_for_test, cas_publish_incremental_partitions_for_test,
-    compose_db_with_k8s_overlay, compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
-    load_full_config_multi_for_test, publish_cp_full_reload_for_test,
-    publish_cp_incremental_for_test, publish_k8s_reconcile, store_accepted_k8s_overlay,
-    swap_merged_k8s_translation,
+    CpPublicationGate, K8sOverlaySlot, cas_publish_db_snapshot_with_k8s_overlay_for_test,
+    cas_publish_incremental_partitions_for_test, compose_db_with_k8s_overlay,
+    compose_incremental_partitions_for_test, empty_k8s_overlay_slot,
+    publish_cp_full_reload_for_test, publish_cp_incremental_for_test, publish_k8s_reconcile,
+    store_accepted_k8s_overlay, swap_merged_k8s_translation,
 };
 use ferrum_edge::config::db_backend::{IncrementalResult, NamespacedResourceId};
 use ferrum_edge::config::types::{
@@ -207,59 +206,6 @@ fn full_reload_with_no_refreshed_namespaces_leaves_subscribers_untouched() {
         drain(&mut mesh_rx).is_empty(),
         "mesh subscribers must see no emission"
     );
-}
-
-#[tokio::test]
-async fn partial_full_reload_advances_loaded_at_from_first_success() {
-    // When the first namespaces in a multi-tenant full reload fail, the
-    // accumulator is seeded from `previous` but the published snapshot must
-    // still carry the first successful namespace load's `loaded_at` so
-    // `ConfigUpdate.version` advances with the content it describes.
-    let old_loaded_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-    let fresh_loaded_at = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
-
-    let mut previous = GatewayConfig::default();
-    previous.loaded_at = old_loaded_at;
-    previous.proxies.push(make_proxy("a-old", "ns-a"));
-    previous.proxies.push(make_proxy("b-old", "ns-b"));
-
-    let mut ns_b_config = GatewayConfig::default();
-    ns_b_config.loaded_at = fresh_loaded_at;
-    ns_b_config.proxies.push(make_proxy("b-new", "ns-b"));
-
-    let db = CpNamespaceFullLoadTestBackend::new(HashMap::from([
-        (
-            "ns-a".to_string(),
-            Err(anyhow::anyhow!("ns-a full load failed")),
-        ),
-        ("ns-b".to_string(), Ok(ns_b_config)),
-    ]));
-    let namespaces = vec!["ns-a".to_string(), "ns-b".to_string()];
-
-    let outcome = load_full_config_multi_for_test(&db, &namespaces, &previous)
-        .await
-        .expect("partial reload must succeed when at least one namespace loads");
-
-    assert_eq!(
-        outcome.config.loaded_at, fresh_loaded_at,
-        "combined snapshot must use the first successful namespace stamp, not previous.loaded_at"
-    );
-    assert_ne!(outcome.config.loaded_at, old_loaded_at);
-    assert!(
-        outcome.config.proxies.iter().any(|p| p.id == "a-old"),
-        "failed first namespace must retain last-known-good resources from previous"
-    );
-    assert!(
-        outcome.config.proxies.iter().any(|p| p.id == "b-new"),
-        "later successful namespace must apply refreshed resources"
-    );
-    assert!(
-        !outcome.config.proxies.iter().any(|p| p.id == "b-old"),
-        "refreshed namespace must not keep stale resources"
-    );
-    assert_eq!(outcome.refreshed_namespaces, vec!["ns-b".to_string()]);
-    assert_eq!(outcome.failed_namespaces, vec!["ns-a".to_string()]);
-    assert!(outcome.rejected_namespaces.is_empty());
 }
 
 #[test]

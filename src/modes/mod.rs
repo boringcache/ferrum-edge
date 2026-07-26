@@ -18,7 +18,6 @@
 //! via `ArcSwap` — in-flight requests see old or new config, never partial.
 
 pub mod control_plane;
-pub(crate) mod cp_namespace_full_load_test_backend;
 pub mod data_plane;
 pub mod database;
 pub mod db_poll_supervision;

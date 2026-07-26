@@ -499,21 +499,8 @@ async fn load_full_config_multi(
         });
     }
 
-    let mut combined: Option<GatewayConfig> = None;
-    let mut rejected_namespaces = Vec::new();
-    let mut refreshed_namespaces = Vec::new();
-    let mut failed_namespaces = Vec::new();
-    let mut any_success = false;
+    let mut acc = MultiNsFullLoadAcc::new();
     let mut last_hard_error: Option<anyhow::Error> = None;
-    // `loaded_at` of the first namespace that actually loaded. A published CP
-    // FULL_SNAPSHOT carries `ConfigUpdate.version = config.loaded_at`, which is
-    // the DP's monotonic ordering watermark and its cross-source staleness
-    // fence. When the first namespaces in the list fail, `combined` is seeded
-    // from `previous` — so without this the snapshot would be broadcast under
-    // the *already applied* stamp, leaving the DP watermark stuck behind
-    // content that did change. Taken from the load (not `Utc::now()`) so the
-    // stamp still precedes every query, preserving the full-load safety margin.
-    let mut fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>> = None;
 
     for ns in namespaces {
         match db
@@ -521,21 +508,8 @@ async fn load_full_config_multi(
             .await
         {
             Ok(raw) => match prepare_cp_full_snapshot(raw) {
-                Ok(mut next) => {
-                    any_success = true;
-                    refreshed_namespaces.push(ns.clone());
-                    if fresh_loaded_at.is_none() {
-                        fresh_loaded_at = Some(next.loaded_at);
-                    }
-                    match &mut combined {
-                        None => combined = Some(next),
-                        Some(acc) => {
-                            acc.proxies.append(&mut next.proxies);
-                            acc.consumers.append(&mut next.consumers);
-                            acc.plugin_configs.append(&mut next.plugin_configs);
-                            acc.upstreams.append(&mut next.upstreams);
-                        }
-                    }
+                Ok(next) => {
+                    acc.apply_success(ns, next);
                 }
                 Err(error) => {
                     error!(
@@ -543,16 +517,7 @@ async fn load_full_config_multi(
                         error = %error,
                         "CP full config rejected for namespace; retaining last-known-good resources"
                     );
-                    rejected_namespaces.push((ns.clone(), error.to_string()));
-                    append_namespace_resources_from(
-                        combined.get_or_insert_with(|| {
-                            let mut seed = previous.clone();
-                            clear_namespaced_resources(&mut seed);
-                            seed
-                        }),
-                        previous,
-                        ns,
-                    );
+                    acc.apply_rejected(previous, ns, error.to_string());
                 }
             },
             Err(error) => {
@@ -562,75 +527,136 @@ async fn load_full_config_multi(
                         error = %error,
                         "CP full config load rejected for namespace; retaining last-known-good resources"
                     );
-                    rejected_namespaces.push((ns.clone(), error.to_string()));
-                    append_namespace_resources_from(
-                        combined.get_or_insert_with(|| {
-                            // Seed metadata from the previous snapshot so
-                            // trust_bundles / version stay coherent.
-                            let mut seed = previous.clone();
-                            clear_namespaced_resources(&mut seed);
-                            seed
-                        }),
-                        previous,
-                        ns,
-                    );
+                    acc.apply_rejected(previous, ns, error.to_string());
                 } else {
                     error!(
                         namespace = %ns,
                         error = %error,
                         "CP full config load failed for namespace; retaining last-known-good resources"
                     );
-                    append_namespace_resources_from(
-                        combined.get_or_insert_with(|| {
-                            let mut seed = previous.clone();
-                            clear_namespaced_resources(&mut seed);
-                            seed
-                        }),
-                        previous,
-                        ns,
-                    );
-                    failed_namespaces.push(ns.clone());
+                    acc.apply_failed(previous, ns);
                     last_hard_error = Some(error);
                 }
             }
         }
     }
 
-    if !any_success {
-        if !rejected_namespaces.is_empty() {
-            // All namespaces failed validation — surface a typed rejection so
-            // the poll loop raises config_rejected and keeps admin writable.
-            let errors: Vec<String> = rejected_namespaces
-                .iter()
-                .map(|(ns, msg)| format!("namespace '{ns}': {msg}"))
-                .collect();
-            return Err(ConfigValidationRejection {
-                backend: "CP",
-                errors,
-            }
-            .into_anyhow());
+    acc.finish(previous, last_hard_error)
+}
+
+/// Pure accumulator for multi-namespace CP full loads. `load_full_config_multi`
+/// feeds per-namespace outcomes here so stamp / LKG aggregation is unit-testable
+/// without implementing `DatabaseBackend`.
+///
+/// Not `Debug`: the combined `GatewayConfig` carries consumer credentials.
+struct MultiNsFullLoadAcc {
+    combined: Option<GatewayConfig>,
+    /// `loaded_at` of the first namespace that actually loaded. A published CP
+    /// FULL_SNAPSHOT carries `ConfigUpdate.version = config.loaded_at`, which is
+    /// the DP's monotonic ordering watermark and its cross-source staleness
+    /// fence. When the first namespaces in the list fail, `combined` is seeded
+    /// from `previous` — so without this the snapshot would be broadcast under
+    /// the *already applied* stamp, leaving the DP watermark stuck behind
+    /// content that did change. Taken from the load (not `Utc::now()`) so the
+    /// stamp still precedes every query, preserving the full-load safety margin.
+    fresh_loaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    rejected_namespaces: Vec<(String, String)>,
+    refreshed_namespaces: Vec<String>,
+    failed_namespaces: Vec<String>,
+    any_success: bool,
+}
+
+impl MultiNsFullLoadAcc {
+    fn new() -> Self {
+        Self {
+            combined: None,
+            fresh_loaded_at: None,
+            rejected_namespaces: Vec::new(),
+            refreshed_namespaces: Vec::new(),
+            failed_namespaces: Vec::new(),
+            any_success: false,
         }
-        return Err(last_hard_error.unwrap_or_else(|| {
-            anyhow::anyhow!("CP full multi-namespace load failed for every namespace")
-        }));
     }
 
-    let mut config = combined.unwrap_or_else(|| previous.clone());
-    // Stamp the snapshot with the first successful load's timestamp even when
-    // the accumulator was seeded from `previous`, so the broadcast
-    // `ConfigUpdate.version` advances with the content it describes.
-    if let Some(loaded_at) = fresh_loaded_at {
-        config.loaded_at = loaded_at;
+    fn ensure_seeded(&mut self, previous: &GatewayConfig) -> &mut GatewayConfig {
+        self.combined.get_or_insert_with(|| {
+            // Seed metadata from the previous snapshot so trust_bundles /
+            // version stay coherent while namespaced resources are rebuilt.
+            let mut seed = previous.clone();
+            clear_namespaced_resources(&mut seed);
+            seed
+        })
     }
-    // Preserve non-namespaced mesh overlay ownership: mesh comes from the
-    // K8s overlay re-merge at publication time, not from DB full loads.
-    config.mesh = None;
-    Ok(FullLoadMultiOutcome {
-        config,
-        rejected_namespaces,
-        refreshed_namespaces,
-        failed_namespaces,
-    })
+
+    fn apply_success(&mut self, ns: &str, mut next: GatewayConfig) {
+        self.any_success = true;
+        self.refreshed_namespaces.push(ns.to_string());
+        if self.fresh_loaded_at.is_none() {
+            self.fresh_loaded_at = Some(next.loaded_at);
+        }
+        match &mut self.combined {
+            None => self.combined = Some(next),
+            Some(acc) => {
+                acc.proxies.append(&mut next.proxies);
+                acc.consumers.append(&mut next.consumers);
+                acc.plugin_configs.append(&mut next.plugin_configs);
+                acc.upstreams.append(&mut next.upstreams);
+            }
+        }
+    }
+
+    fn apply_rejected(&mut self, previous: &GatewayConfig, ns: &str, message: String) {
+        self.rejected_namespaces.push((ns.to_string(), message));
+        append_namespace_resources_from(self.ensure_seeded(previous), previous, ns);
+    }
+
+    fn apply_failed(&mut self, previous: &GatewayConfig, ns: &str) {
+        self.failed_namespaces.push(ns.to_string());
+        append_namespace_resources_from(self.ensure_seeded(previous), previous, ns);
+    }
+
+    fn finish(
+        self,
+        previous: &GatewayConfig,
+        last_hard_error: Option<anyhow::Error>,
+    ) -> Result<FullLoadMultiOutcome, anyhow::Error> {
+        if !self.any_success {
+            if !self.rejected_namespaces.is_empty() {
+                // All namespaces failed validation — surface a typed rejection so
+                // the poll loop raises config_rejected and keeps admin writable.
+                let errors: Vec<String> = self
+                    .rejected_namespaces
+                    .iter()
+                    .map(|(ns, msg)| format!("namespace '{ns}': {msg}"))
+                    .collect();
+                return Err(ConfigValidationRejection {
+                    backend: "CP",
+                    errors,
+                }
+                .into_anyhow());
+            }
+            return Err(last_hard_error.unwrap_or_else(|| {
+                anyhow::anyhow!("CP full multi-namespace load failed for every namespace")
+            }));
+        }
+
+        let mut config = self.combined.unwrap_or_else(|| previous.clone());
+        // Stamp the snapshot with the first successful load's timestamp even when
+        // the accumulator was seeded from `previous`, so the broadcast
+        // `ConfigUpdate.version` advances with the content it describes.
+        if let Some(loaded_at) = self.fresh_loaded_at {
+            config.loaded_at = loaded_at;
+        }
+        // Preserve non-namespaced mesh overlay ownership: mesh comes from the
+        // K8s overlay re-merge at publication time, not from DB full loads.
+        config.mesh = None;
+        Ok(FullLoadMultiOutcome {
+            config,
+            rejected_namespaces: self.rejected_namespaces,
+            refreshed_namespaces: self.refreshed_namespaces,
+            failed_namespaces: self.failed_namespaces,
+        })
+    }
 }
 
 /// Not `Debug`: `GatewayConfig` carries consumer credentials, so this outcome
@@ -646,29 +672,6 @@ struct FullLoadMultiOutcome {
     /// Namespaces whose snapshot load failed outright (connectivity / decode)
     /// rather than being rejected by validation.
     failed_namespaces: Vec<String>,
-}
-
-/// External-test view of [`load_full_config_multi`]. Not `Debug`: carries
-/// consumer credentials inside `GatewayConfig`.
-pub struct LoadFullConfigMultiTestOutcome {
-    pub config: GatewayConfig,
-    pub rejected_namespaces: Vec<(String, String)>,
-    pub refreshed_namespaces: Vec<String>,
-    pub failed_namespaces: Vec<String>,
-}
-
-pub async fn load_full_config_multi_for_test(
-    db: &dyn DatabaseBackend,
-    namespaces: &[String],
-    previous: &GatewayConfig,
-) -> Result<LoadFullConfigMultiTestOutcome, anyhow::Error> {
-    let outcome = load_full_config_multi(db, namespaces, previous).await?;
-    Ok(LoadFullConfigMultiTestOutcome {
-        config: outcome.config,
-        rejected_namespaces: outcome.rejected_namespaces,
-        refreshed_namespaces: outcome.refreshed_namespaces,
-        failed_namespaces: outcome.failed_namespaces,
-    })
 }
 
 fn clear_namespaced_resources(config: &mut GatewayConfig) {
@@ -3217,7 +3220,7 @@ mod tests {
     use super::*;
     use crate::config::db_backend::{IncrementalResult, NamespacedResourceId};
     use crate::config::types::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use std::time::Instant;
 
     fn empty_incremental() -> IncrementalResult {
@@ -3336,6 +3339,64 @@ mod tests {
                 .to_string()
                 .contains("CP configuration validation failed"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn partial_multi_ns_full_load_advances_loaded_at_from_first_success() {
+        // Drive the same pure aggregator `load_full_config_multi` uses: an old
+        // previous snapshot, a failed first namespace, then a successful later
+        // namespace with a fixed fresh stamp. Failed-ns LKG is retained,
+        // successful-ns resources are replaced, and the combined snapshot must
+        // carry the fresh stamp (not previous.loaded_at).
+        let old_loaded_at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let fresh_loaded_at = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+
+        let mut previous = GatewayConfig::default();
+        previous.loaded_at = old_loaded_at;
+        let mut a_old = make_proxy("a-old");
+        a_old.namespace = "ns-a".to_string();
+        let mut b_old = make_proxy("b-old");
+        b_old.namespace = "ns-b".to_string();
+        previous.proxies.push(a_old);
+        previous.proxies.push(b_old);
+
+        let mut ns_b = GatewayConfig::default();
+        ns_b.loaded_at = fresh_loaded_at;
+        let mut b_new = make_proxy("b-new");
+        b_new.namespace = "ns-b".to_string();
+        ns_b.proxies.push(b_new);
+
+        let mut acc = MultiNsFullLoadAcc::new();
+        acc.apply_failed(&previous, "ns-a");
+        acc.apply_success("ns-b", ns_b);
+        let outcome = acc
+            .finish(&previous, None)
+            .expect("partial reload must succeed when at least one namespace loads");
+
+        assert_eq!(
+            outcome.config.loaded_at, fresh_loaded_at,
+            "combined snapshot must use the first successful namespace stamp, not previous.loaded_at"
+        );
+        assert_ne!(outcome.config.loaded_at, old_loaded_at);
+        assert!(
+            outcome.config.proxies.iter().any(|p| p.id == "a-old"),
+            "failed first namespace must retain last-known-good resources from previous"
+        );
+        assert!(
+            outcome.config.proxies.iter().any(|p| p.id == "b-new"),
+            "later successful namespace must apply refreshed resources"
+        );
+        assert!(
+            !outcome.config.proxies.iter().any(|p| p.id == "b-old"),
+            "refreshed namespace must not keep stale resources"
+        );
+        assert_eq!(outcome.refreshed_namespaces, vec!["ns-b".to_string()]);
+        assert_eq!(outcome.failed_namespaces, vec!["ns-a".to_string()]);
+        assert!(outcome.rejected_namespaces.is_empty());
+        assert!(
+            outcome.config.mesh.is_none(),
+            "DB multi full-load finalize must clear mesh for overlay re-merge"
         );
     }
 
