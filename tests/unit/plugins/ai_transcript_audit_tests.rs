@@ -4975,10 +4975,10 @@ async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
 
 #[tokio::test]
 async fn malformed_tool_call_array_element_does_not_force_raw_frame_fallback() {
-    // A non-object `tool_calls` element reports no `index`, so counting it as an
-    // indexless call would let one malformed element trip the cross-frame
-    // ambiguity guard and hand back the per-frame fallback — which cannot see
-    // the email split across the two `delta.content` fragments.
+    // A non-object `tool_calls` element carries no fragment at all, so it must
+    // neither abort reassembly (per-frame redaction cannot see the email split
+    // across the two `delta.content` fragments) nor mark the choice as holding
+    // an unidentified call: the well-formed indexed sibling keeps full fidelity.
     let excerpt = reassembled_sse_excerpt(&[
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"carol@","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.net","tool_calls":[42]}}]}"#,
@@ -5002,10 +5002,11 @@ async fn malformed_tool_call_array_element_does_not_force_raw_frame_fallback() {
 }
 
 #[tokio::test]
-async fn empty_tool_call_array_does_not_arm_indexless_ambiguity_guard() {
-    // An empty `tool_calls` array delivers no continuation, so it must not mark
-    // the choice as "already has tool calls" — otherwise a later, legitimately
-    // indexless frame aborts reassembly and the split email leaks per-frame.
+async fn empty_tool_call_array_never_forces_the_raw_frame_fallback() {
+    // An empty `tool_calls` array must not abort reassembly: the split email
+    // spans two `delta.content` fragments and per-frame redaction cannot see
+    // it. The later indexless entry is unidentified across two contributing
+    // deltas, so its arguments and identity are withheld rather than guessed.
     let excerpt = reassembled_sse_excerpt(&[
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"dave@","tool_calls":[]}}]}"#,
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.org","tool_calls":[{"id":"call_y","type":"function","function":{"name":"notify","arguments":"{}"}}]}}]}"#,
@@ -5020,54 +5021,94 @@ async fn empty_tool_call_array_does_not_arm_indexless_ambiguity_guard() {
     );
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
     assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
-    assert_eq!(parsed["tool_calls"]["0"][0]["index"], 0);
-    assert_eq!(parsed["tool_calls"]["0"][0]["id"], "call_y");
+    // Position is exported as `position`, never as a fabricated `index`.
+    assert_eq!(parsed["tool_calls"]["0"][0]["position"], 0, "{excerpt}");
+    assert!(
+        parsed["tool_calls"]["0"][0].get("index").is_none(),
+        "{excerpt}"
+    );
+    assert_eq!(
+        parsed["tool_calls"]["0"][0]["arguments_withheld"],
+        true,
+        "{excerpt}"
+    );
+    assert!(!excerpt.contains("call_y"), "{excerpt}");
 }
 
 #[tokio::test]
-async fn genuinely_repeated_indexless_tool_calls_still_keep_raw_fallback_after_empty_array() {
-    // The relaxation above must not weaken the real ambiguity case: once a
-    // fragment has actually been attributed, a later indexless frame is still
-    // unresolvable and still keeps the raw-frame fallback.
+async fn repeated_indexless_tool_calls_withhold_arguments_instead_of_falling_back() {
+    // The real ambiguity case: a later indexless frame could continue any prior
+    // call. Guessing would splice unrelated calls; falling back to raw frames
+    // would export the two argument halves separately (and a sensitive key can
+    // straddle them). Both fragments are therefore withheld behind the fixed
+    // placeholder, and the capture stays on the reassembled path.
     let excerpt = reassembled_sse_excerpt(&[
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[]}}]}"#,
-        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_z","function":{"arguments":"{\"id\":"}}]}}]}"#,
-        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"42}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_z","function":{"arguments":"{\"client_secret\":"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"sk-live-zzz\"}"}}]}}]}"#,
         "[DONE]",
     ])
     .await;
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
     assert!(
-        !excerpt.contains("sse_reassembled"),
-        "ambiguous indexless continuations must not be guessed: {excerpt}"
+        !excerpt.contains("sk-live-zzz") && !excerpt.contains("client_secret"),
+        "split tool arguments must not be exported piecemeal: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1, "{excerpt}");
+    assert_eq!(calls[0]["arguments_withheld"], true, "{excerpt}");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        "[REDACTED:ambiguous_tool_call]",
+        "{excerpt}"
     );
 }
 
 #[tokio::test]
-async fn malformed_choice_index_routes_to_unattributed_bucket() {
-    // `index` is identity-bearing: coercing a malformed value to 0 (the old
-    // `unwrap_or(0)`) would concatenate two unrelated completions into one
-    // bucket. Each malformed shape must land in the separate `unattributed`
-    // bucket instead, and never abort reassembly.
+async fn malformed_choice_indices_never_share_one_unattributed_bucket() {
+    // `index` is identity-bearing: coercing a malformed value to 0 would
+    // concatenate unrelated completions, and routing every malformed value to
+    // one shared bucket does the same thing one step removed. Each malformed
+    // occurrence gets its own ordinal, including two collisions inside a single
+    // frame, and the ambiguous payload is withheld rather than guessed.
     for malformed_index in ["\"0\"", "-1", "1.5", "null", "18446744073709551616", "{}"] {
-        let malformed_frame = format!(
-            r#"{{"object":"chat.completion.chunk","choices":[{{"index":{malformed_index},"delta":{{"content":"beta"}}}}]}}"#
+        let same_frame_collision = format!(
+            r#"{{"object":"chat.completion.chunk","choices":[{{"index":{malformed_index},"delta":{{"content":"beta"}}}},{{"index":{malformed_index},"delta":{{"content":"gamma"}}}}]}}"#
         );
         let excerpt = reassembled_sse_excerpt(&[
             r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"alpha"}}]}"#,
-            malformed_frame.as_str(),
+            same_frame_collision.as_str(),
             "[DONE]",
         ])
         .await;
         let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+        let completion_text = parsed["completion_text"]
+            .as_object()
+            .expect("completion text");
+        // Three distinct buckets: the real choice plus two per-occurrence
+        // unattributed buckets that must not have merged with each other.
         assert_eq!(
-            parsed["completion_text"]["0"],
-            "alpha",
+            completion_text.len(),
+            3,
+            "index {malformed_index} collapsed buckets: {excerpt}"
+        );
+        for key in ["0", "unattributed:0", "unattributed:1"] {
+            assert_eq!(
+                completion_text[key],
+                "[REDACTED:ambiguous_choice]",
+                "index {malformed_index} key {key}: {excerpt}"
+            );
+        }
+        assert_eq!(
+            parsed["choice_identity_ambiguous"],
+            true,
             "index {malformed_index}: {excerpt}"
         );
         assert_eq!(
-            parsed["completion_text"]["unattributed"],
-            "beta",
-            "index {malformed_index} must not merge into choice 0: {excerpt}"
+            parsed["completion_text_withheld"],
+            true,
+            "index {malformed_index}: {excerpt}"
         );
         assert_eq!(
             parsed["malformed_fields"],
@@ -5078,58 +5119,36 @@ async fn malformed_choice_index_routes_to_unattributed_bucket() {
 }
 
 #[tokio::test]
-async fn absent_choice_index_uses_frame_position_not_a_shared_zero_bucket() {
-    // An absent index is a well-formed omission, not a malformed value: it maps
-    // to the position within the frame, which preserves the historical `0` for
-    // the single-choice shape while keeping two indexless choices apart.
+async fn complete_sensitive_arguments_followed_by_junk_are_not_concatenated() {
+    // The concrete leak a shared unattributed bucket creates: a *complete*
+    // sensitive JSON argument concatenated with unrelated junk stops parsing as
+    // JSON, so the recursive sensitive-key redaction never runs and the value
+    // escapes through the generic-pattern fallback. Two malformed tool indices
+    // must land in different buckets, and the ambiguity must withhold both.
     let excerpt = reassembled_sse_excerpt(&[
-        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"first"}},{"delta":{"content":"second"}}]}"#,
-        "[DONE]",
-    ])
-    .await;
-    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
-    assert_eq!(parsed["completion_text"]["0"], "first", "{excerpt}");
-    assert_eq!(parsed["completion_text"]["1"], "second", "{excerpt}");
-    assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
-}
-
-#[tokio::test]
-async fn malformed_tool_call_index_is_captured_unattributed_not_dropped_or_merged() {
-    // Dropping a fragment whose index is malformed would let a provider keep
-    // tool arguments out of the audit record entirely; merging it positionally
-    // would splice it onto an unrelated call. It goes to the unattributed
-    // bucket, where it is still redacted.
-    let excerpt = reassembled_sse_excerpt(&[
-        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ok\"}"}}]}}]}"#,
-        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":-1,"function":{"arguments":"{\"password\":\"s3cr3t-value\"}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":"x","function":{"arguments":"{\"password\":\"s3cr3t-value\"}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":"y","function":{"arguments":"trailing junk"}}]}}]}"#,
         "[DONE]",
     ])
     .await;
     assert!(
         !excerpt.contains("s3cr3t-value"),
-        "unattributed arguments must still be redacted: {excerpt}"
+        "a complete sensitive argument must never be broken out of JSON shape by \
+         an unrelated malformed-index fragment: {excerpt}"
     );
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
     let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
-    assert_eq!(calls.len(), 2, "{excerpt}");
-    // `None` sorts first, so the unattributed entry leads.
-    assert_eq!(calls[0]["index_unattributed"], true, "{excerpt}");
-    assert!(calls[0].get("index").is_none(), "{excerpt}");
-    let unattributed_args: Value = serde_json::from_str(
-        calls[0]["function"]["arguments"]
-            .as_str()
-            .expect("arguments"),
-    )
-    .expect("unattributed arguments JSON");
-    assert_eq!(unattributed_args["password"], "[REDACTED]", "{excerpt}");
-    // The real call keeps its own identity and arguments — nothing was spliced.
-    assert_eq!(calls[1]["index"], 0, "{excerpt}");
-    assert_eq!(calls[1]["id"], "call_real", "{excerpt}");
-    assert_eq!(
-        calls[1]["function"]["arguments"],
-        r#"{"q":"ok"}"#,
-        "{excerpt}"
-    );
+    assert_eq!(calls.len(), 2, "malformed indices merged: {excerpt}");
+    for (occurrence, call) in calls.iter().enumerate() {
+        assert_eq!(call["index_unattributed"], true, "{excerpt}");
+        assert_eq!(call["occurrence"], occurrence as u64, "{excerpt}");
+        assert_eq!(call["arguments_withheld"], true, "{excerpt}");
+        assert_eq!(
+            call["function"]["arguments"],
+            "[REDACTED:ambiguous_tool_call]",
+            "{excerpt}"
+        );
+    }
     assert_eq!(
         parsed["malformed_fields"],
         json!(["choices[].delta.tool_calls[].index"]),
@@ -5138,11 +5157,134 @@ async fn malformed_tool_call_index_is_captured_unattributed_not_dropped_or_merge
 }
 
 #[tokio::test]
-async fn unattributed_tool_call_does_not_arm_indexless_ambiguity_guard() {
-    // A fragment routed to the unattributed bucket establishes no positional
-    // index, so it must not make a later indexless frame "ambiguous" — that
-    // would be a one-frame trigger for the per-frame fallback and the split-PII
-    // exposure it carries.
+async fn two_malformed_tool_indices_in_one_frame_stay_separate_and_redacted() {
+    // Same-frame collision: two malformed indices inside one delta are distinct
+    // array entries, so each keeps its own bucket and its own parseable
+    // arguments. Concatenating them would break both JSON documents and defeat
+    // sensitive-key redaction; a single delta is not ambiguous, so nothing is
+    // withheld here.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":"a","function":{"arguments":"{\"password\":\"alpha-secret\"}"}},{"index":[],"function":{"arguments":"{\"password\":\"beta-secret\"}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("alpha-secret") && !excerpt.contains("beta-secret"),
+        "{excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "same-frame merge: {excerpt}");
+    for (occurrence, call) in calls.iter().enumerate() {
+        assert_eq!(call["index_unattributed"], true, "{excerpt}");
+        assert_eq!(call["occurrence"], occurrence as u64, "{excerpt}");
+        assert!(call.get("arguments_withheld").is_none(), "{excerpt}");
+        let raw_arguments = call["function"]["arguments"].as_str().expect("arguments");
+        let arguments: Value = serde_json::from_str(raw_arguments).expect("bucket JSON");
+        assert_eq!(arguments["password"], "[REDACTED]", "{excerpt}");
+    }
+}
+
+#[tokio::test]
+async fn absent_choice_index_is_positional_within_one_delta_only() {
+    // An absent index is a well-formed omission, not a malformed value, but
+    // position identifies a choice only inside the delta that carried it. Two
+    // indexless choices in one frame are distinct and unambiguous, and neither
+    // is exported under a fabricated provider `index`.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"first"}},{"delta":{"content":"second"}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["completion_text"]["position:0"],
+        "first",
+        "{excerpt}"
+    );
+    assert_eq!(
+        parsed["completion_text"]["position:1"],
+        "second",
+        "{excerpt}"
+    );
+    assert!(
+        parsed["completion_text"].get("0").is_none(),
+        "positional choices must not claim a provider index: {excerpt}"
+    );
+    assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
+    assert!(
+        parsed.get("choice_identity_ambiguous").is_none(),
+        "{excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn absent_choice_indices_across_frames_are_not_asserted_identity() {
+    // Position is intra-delta identity: reusing it across frames would assert an
+    // identity the provider never declared, and joining on that guess is what
+    // makes the sensitive key in frame one adopt the value from frame two. The
+    // bucket is withheld instead.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"{\"api_key\":"}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"\"leak-me-please\"}"}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("leak-me-please"),
+        "cross-frame positional guessing must not export the fragments: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["completion_text"]["position:0"],
+        "[REDACTED:ambiguous_choice]",
+        "{excerpt}"
+    );
+    assert_eq!(parsed["choice_identity_ambiguous"], true, "{excerpt}");
+    assert_eq!(parsed["completion_text_withheld"], true, "{excerpt}");
+}
+
+#[tokio::test]
+async fn malformed_tool_call_index_is_captured_unattributed_not_dropped_or_merged() {
+    // Dropping a fragment whose index is malformed would let a provider keep
+    // tool arguments out of the audit record entirely; merging it positionally
+    // would splice it onto an unrelated call. It gets its own bucket, and
+    // because a second delta contributed to a choice holding an unidentified
+    // entry, every argument fragment in that choice is withheld.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ok\"}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":-1,"function":{"arguments":"{\"password\":\"s3cr3t-value\"}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("s3cr3t-value"),
+        "unattributed arguments must not be exported: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    // Indexed slots sort before unattributed ones, and the real call keeps its
+    // provider-declared identity even though its arguments are withheld.
+    assert_eq!(calls[0]["index"], 0, "{excerpt}");
+    assert_eq!(calls[0]["id"], "call_real", "{excerpt}");
+    assert_eq!(calls[0]["arguments_withheld"], true, "{excerpt}");
+    assert_eq!(calls[1]["index_unattributed"], true, "{excerpt}");
+    assert!(calls[1].get("index").is_none(), "{excerpt}");
+    assert_eq!(calls[1]["arguments_withheld"], true, "{excerpt}");
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!(["choices[].delta.tool_calls[].index"]),
+        "{excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn unattributed_tool_call_never_forces_the_raw_frame_fallback() {
+    // A malformed tool index must not hand back the per-frame fallback: the
+    // email is split across two `delta.content` fragments, whose choice is
+    // properly indexed and therefore still joined and redacted. Only the
+    // tool-call layer degrades to withholding.
     let excerpt = reassembled_sse_excerpt(&[
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"heidi@","tool_calls":[{"index":"nope","function":{"arguments":"{}"}}]}}]}"#,
         r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.net","tool_calls":[{"id":"call_w","type":"function","function":{"name":"notify","arguments":"{}"}}]}}]}"#,
@@ -5156,16 +5298,58 @@ async fn unattributed_tool_call_does_not_arm_indexless_ambiguity_guard() {
         "{excerpt}"
     );
     let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    // Choice identity is intact, so completion text is not withheld.
+    assert!(
+        parsed.get("choice_identity_ambiguous").is_none(),
+        "{excerpt}"
+    );
     let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
     assert_eq!(calls.len(), 2, "{excerpt}");
-    assert_eq!(calls[0]["index_unattributed"], true, "{excerpt}");
-    assert_eq!(calls[1]["index"], 0, "{excerpt}");
-    assert_eq!(calls[1]["id"], "call_w", "{excerpt}");
+    assert_eq!(calls[0]["position"], 0, "{excerpt}");
+    assert_eq!(calls[1]["index_unattributed"], true, "{excerpt}");
+    assert!(!excerpt.contains("call_w"), "{excerpt}");
     assert_eq!(
         parsed["malformed_fields"],
         json!(["choices[].delta.tool_calls[].index"]),
         "{excerpt}"
     );
+}
+
+#[tokio::test]
+async fn fresh_indexed_choice_and_tool_progress_keeps_full_fidelity() {
+    // The unambiguous path must not be collateral damage: provider-declared
+    // indices correlate across deltas, so fragments join, sensitive keys are
+    // redacted in place, and no withholding or diagnostic key appears.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"looking "}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"it up","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{\"password\":"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hunter2\"}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(!excerpt.contains("hunter2"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(parsed["completion_text"]["0"], "looking it up", "{excerpt}");
+    assert_eq!(parsed["finish_reason"]["0"], "tool_calls", "{excerpt}");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1, "{excerpt}");
+    assert_eq!(calls[0]["index"], 0, "{excerpt}");
+    assert_eq!(calls[0]["id"], "call_a", "{excerpt}");
+    assert_eq!(calls[0]["function"]["name"], "lookup", "{excerpt}");
+    let raw_arguments = calls[0]["function"]["arguments"]
+        .as_str()
+        .expect("arguments");
+    let arguments: Value = serde_json::from_str(raw_arguments).expect("joined JSON");
+    assert_eq!(arguments["password"], "[REDACTED]", "{excerpt}");
+    for absent in [
+        "malformed_fields",
+        "choice_identity_ambiguous",
+        "completion_text_withheld",
+    ] {
+        assert!(parsed.get(absent).is_none(), "{absent}: {excerpt}");
+    }
+    assert!(calls[0].get("arguments_withheld").is_none(), "{excerpt}");
 }
 
 #[tokio::test]
@@ -5384,7 +5568,7 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
 }
 
 #[tokio::test]
-async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
+async fn repeated_indexless_tool_call_frames_stay_reassembled_with_withheld_arguments() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -5415,14 +5599,27 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let excerpt = records[0]["response_body"]
         .as_str()
         .expect("response excerpt");
-    assert!(
-        !excerpt.contains("sse_reassembled"),
-        "ambiguous indexless continuations must not be guessed: {excerpt}"
-    );
-    assert!(
-        excerpt.contains("chat.completion.chunk"),
-        "raw-frame fallback must retain the captured OpenAI frames: {excerpt}"
-    );
+    // Ambiguous indexless continuations are neither guessed nor dropped back to
+    // the raw-frame path (which would export both argument halves separately):
+    // the capture stays reassembled and the arguments are withheld.
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    for call in calls {
+        assert_eq!(call["arguments_withheld"], true, "{excerpt}");
+        assert_eq!(
+            call["function"]["arguments"],
+            "[REDACTED:ambiguous_tool_call]",
+            "{excerpt}"
+        );
+    }
+    // The indexed call keeps the identity the provider declared; the positional
+    // one is exported as a position and its scalar identity is withheld.
+    assert_eq!(calls[0]["index"], 0, "{excerpt}");
+    assert_eq!(calls[0]["id"], "call_1", "{excerpt}");
+    assert_eq!(calls[1]["position"], 0, "{excerpt}");
+    assert!(calls[1].get("id").is_none(), "{excerpt}");
 }
 
 #[tokio::test]
