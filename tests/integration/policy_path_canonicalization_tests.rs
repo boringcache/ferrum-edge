@@ -136,6 +136,10 @@ fn overlapping_openapi_validator() -> OpenapiValidator {
     // regardless of how the client spelled the path — the advisory's
     // scenario 2, where the parameterized schema accepted a body the literal
     // operation forbids.
+    // Media entries must be bare JSON Schema (or `{schema, encoding}` when an
+    // Encoding Object is present). A lone `{"schema": {...}}` wrapper is not
+    // unwrapped: `schema` is treated as an ordinary/custom keyword and ignored,
+    // so the body would vacuously pass and this advisory check would be inert.
     OpenapiValidator::new(&json!({
         "fail_on_unknown_operation": true,
         "operations": [
@@ -145,7 +149,7 @@ fn overlapping_openapi_validator() -> OpenapiValidator {
                 "path_regex": "^/[^/]+$",
                 "request_body": {
                     "content": {
-                        "application/json": { "schema": { "type": "object" } }
+                        "application/json": { "type": "object" }
                     }
                 }
             },
@@ -156,12 +160,10 @@ fn overlapping_openapi_validator() -> OpenapiValidator {
                 "request_body": {
                     "content": {
                         "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "required": ["confirm"],
-                                "additionalProperties": false,
-                                "properties": { "confirm": { "const": true } }
-                            }
+                            "type": "object",
+                            "required": ["confirm"],
+                            "additionalProperties": false,
+                            "properties": { "confirm": { "const": true } }
                         }
                     }
                 }
