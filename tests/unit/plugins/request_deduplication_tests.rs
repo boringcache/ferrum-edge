@@ -730,7 +730,12 @@ fn presentation_digest_for(configs: &[serde_json::Value]) -> [u8; 32] {
 fn redaction_transformer(value: &str) -> serde_json::Value {
     json!({
         "runtime_overlay_scope": "redaction",
-        "rules": [{"operation": "update", "target": "headers", "key": "x-account", "value": value}],
+        "rules": [{
+            "operation": "update",
+            "target": "headers",
+            "key": "x-account",
+            "value": value,
+        }],
     })
 }
 

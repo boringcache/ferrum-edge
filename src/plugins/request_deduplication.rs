@@ -625,7 +625,9 @@ impl RequestDeduplication {
         if cached.response_policy != ctx.response_policy_provenance() {
             return PluginResult::Reject {
                 status_code: 409,
-                body: r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#.to_string(),
+                body:
+                    r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
+                        .to_string(),
                 headers: HashMap::new(),
             };
         }
