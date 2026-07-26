@@ -2565,8 +2565,19 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // Force a single pooled sender so the second RPC reuses the GOAWAY'd
         // connection instead of landing on a healthy sibling shard.
         .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "1")
-        // `accepted_connections()` is asserted below, so warmup must not add
-        // an extra dial to the count.
+        // `accepted_connections()` is asserted below, so the reqwest `HEAD /`
+        // warmup must not add an extra dial to the count. Note this does NOT
+        // make the gateway cold: with warmup off, `modes::file::serve` sets
+        // `run_initial_refresh = true` and the backend-capability refresh task
+        // immediately probes this plaintext backend via
+        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender()`. That probe uses
+        // a clone of this proxy whose only delta is a clamped connect timeout —
+        // a field deliberately excluded from the pool key — so it lands on the
+        // SAME single-shard gRPC pool entry the request path uses, and it is
+        // spawned rather than awaited before readiness. `wait_for_probe_dial`
+        // below closes that race; without it, whether the warmup RPC reuses the
+        // probe's connection or dials its own is a coin flip, and the scripted
+        // `connection_scripts` ring is assigned by accept order.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .capture_output()
         .spawn()
@@ -2579,6 +2590,15 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         .expect("gateway port");
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
 
+    // Settle the startup capability probe before any traffic. It is the only
+    // thing that can dial the backend before the first RPC, so once its h2c
+    // handshake has completed the accept ring is deterministic: connection 0 is
+    // the probe (script 0), and the pooled sender for the single shard is the
+    // probe's. Bounded and non-fatal — if a future refactor stops probing, the
+    // wait simply falls through and the test keeps its original semantics
+    // rather than newly hanging.
+    wait_for_probe_dial(&backend, Duration::from_secs(2)).await;
+
     let first = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
         .await
@@ -2586,7 +2606,11 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     assert_eq!(
         first.grpc_status(),
         Some(0),
-        "warmup RPC must succeed: {first:?}"
+        "warmup RPC must succeed: {first:?}; accepted_connections={}, \
+         backend_step_errors={:?}\n--- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
     );
 
     // Brief pause so the scripted GOAWAY lands while the pooled sender is idle.
@@ -2599,14 +2623,46 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     assert_eq!(
         second.grpc_status(),
         Some(0),
-        "buffered unary after pooled GOAWAY must redial and succeed; got {second:?}"
+        "buffered unary after pooled GOAWAY must redial and succeed; got \
+         {second:?}; accepted_connections={}, backend_step_errors={:?}\n\
+         --- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
     );
     assert!(
         backend.accepted_connections() >= 2,
         "retry must dial a fresh backend connection after DispatchCanceled; \
-         accepted={}",
-        backend.accepted_connections()
+         accepted={}\n--- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        harness.captured_combined().unwrap_or_default()
     );
+}
+
+/// Wait until the gateway's startup backend-capability probe has completed its
+/// h2c handshake against `backend`, or `timeout` elapses.
+///
+/// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
+/// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
+/// capability-refresh pass dials plaintext backends through the shared gRPC
+/// pool at an unsynchronized moment. Tests that key assertions off
+/// `ScriptedGrpcBackend::connection_scripts` (assigned by accept order) or off
+/// which pooled sender the first request reuses must drain that probe first.
+///
+/// Returns without failing on timeout: the probe is a gateway implementation
+/// detail, and a test must not start failing merely because it stopped running.
+async fn wait_for_probe_dial(backend: &ScriptedGrpcBackend, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if backend.handshakes_completed() >= 1 {
+            // The handshake is observable slightly before `get_sender` inserts
+            // the sender into the pool; give that insert a moment to land so
+            // the first RPC deterministically reuses the probe's connection.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// #2934: retry attempts must preserve duplicate metadata field lines from
