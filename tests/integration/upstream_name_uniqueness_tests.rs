@@ -245,7 +245,7 @@ async fn unnamed_upstreams_may_coexist_and_names_are_per_namespace() {
     store
         .create_upstream(&named_upstream(
             "tenant-a",
-            "shared-id",
+            "tenant-a-id",
             Some("shared-name"),
         ))
         .await
@@ -253,7 +253,7 @@ async fn unnamed_upstreams_may_coexist_and_names_are_per_namespace() {
     store
         .create_upstream(&named_upstream(
             "tenant-b",
-            "shared-id",
+            "tenant-b-id",
             Some("shared-name"),
         ))
         .await
