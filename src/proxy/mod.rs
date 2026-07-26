@@ -18355,6 +18355,14 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
+    // domain validation to load shedding costs a certificate. The lookup
+    // resolves the *canonical* policy path (advisory GHSA-69xf-42xm-4w4f), so an
+    // escaped-but-legal spelling of a live challenge cannot slip past the ACME
+    // handler here and then fall through to routing under a different reading.
+    // A refused or ambiguous target resolves to `None` and reaches the single
+    // canonicalization boundary in `handle_proxy_request_inner`, which is the
+    // only place a path is rejected.
     if req.method() == hyper::Method::GET
         && let Some(key_authorization) =
             crate::tls::acme::http01_key_authorization_for_path(req.uri().path())

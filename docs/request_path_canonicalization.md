@@ -109,6 +109,19 @@ routing, every plugin phase, and backend dispatch. All three accept and reject
 the same set of targets. HTTP/3 shapes the rejection for gRPC / gRPC-Web the
 same way its other `400` rejections are shaped.
 
+## ACME HTTP-01 serving
+
+ACME HTTP-01 key authorizations are answered ahead of overload admission, so
+losing a domain validation to load shedding cannot cost a certificate. That
+makes challenge serving the one handler that resolves a target before the check
+above runs, so it resolves the *canonical* path too: an escaped-but-legal
+spelling of a live challenge (`/%2Ewell-known/acme-challenge/<token>`,
+`/.well-known/acme-challenge/tok%5FABC`) serves exactly what its literal
+spelling serves, rather than missing the handler and falling through to ordinary
+routing. Challenge serving never decides what an ambiguous path means: a target
+the canonicalizer refuses resolves to no challenge and reaches the same fixed,
+non-echoing `400` every other request does.
+
 ## Configured paths must be canonical too
 
 Operator-authored path values are compared against the canonical request path,

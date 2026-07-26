@@ -14,11 +14,16 @@ use crate::common::TestGateway;
 use crate::scaffolding::clients::Http3Client;
 
 use bytes::Bytes;
+use ferrum_edge::tls::acme::{
+    AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord, AcmeOrderStatus,
+    AcmeOrderStore,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
@@ -148,7 +153,16 @@ plugin_configs:
     )
 }
 
-async fn spawn_gateway(backend_port: u16) -> (TestGateway, u16) {
+/// Spawn the gateway against `backend_port`.
+///
+/// `acme_store_dir` points the child's process-global ACME order store at a
+/// caller-owned directory, so a pending HTTP-01 order seeded before the spawn is
+/// the one the child resolves. `None` leaves the ambient default store path
+/// alone.
+async fn spawn_gateway(
+    backend_port: u16,
+    acme_store_dir: Option<&std::path::Path>,
+) -> (TestGateway, u16) {
     const MAX_ATTEMPTS: usize = 5;
     let mut last_error = String::new();
 
@@ -173,7 +187,7 @@ async fn spawn_gateway(backend_port: u16) -> (TestGateway, u16) {
         };
         drop(reservation);
 
-        let result = TestGateway::builder()
+        let mut builder = TestGateway::builder()
             .mode_file(build_config(backend_port))
             .log_level("warn")
             .max_attempts(1)
@@ -181,9 +195,14 @@ async fn spawn_gateway(backend_port: u16) -> (TestGateway, u16) {
             .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
-            .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-            .spawn()
-            .await;
+            .env("FERRUM_POOL_WARMUP_ENABLED", "false");
+        if let Some(store_dir) = acme_store_dir {
+            builder = builder.env(
+                "FERRUM_TLS_MANAGED_STORE_PATH",
+                store_dir.to_string_lossy().into_owned(),
+            );
+        }
+        let result = builder.spawn().await;
         match result {
             Ok(gateway) => return (gateway, https_port),
             Err(error) => {
@@ -203,6 +222,13 @@ async fn spawn_gateway(backend_port: u16) -> (TestGateway, u16) {
 /// HTTP/1.1 over a raw socket: the only way to control the request-line bytes
 /// exactly, including targets no URL type would round-trip (`/canon/%zz`).
 async fn send_h1(proxy_port: u16, target: &str) -> u16 {
+    send_h1_full(proxy_port, target).await.0
+}
+
+/// The same raw HTTP/1.1 exchange, keeping the response body. The ACME cases
+/// need it: an HTTP-01 challenge is proven by the key-authorization bytes, and a
+/// refusal is proven by a fixed body that does not echo the target.
+async fn send_h1_full(proxy_port: u16, target: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", proxy_port))
         .await
         .expect("connect h1");
@@ -220,6 +246,14 @@ async fn send_h1(proxy_port: u16, target: &str) -> u16 {
         .await
         .expect("read h1 response");
     let text = String::from_utf8_lossy(&response).into_owned();
+    let body = match text.split_once("\r\n\r\n") {
+        Some((_, body)) => body.to_string(),
+        None => String::new(),
+    };
+    (h1_status(&text, target), body)
+}
+
+fn h1_status(text: &str, target: &str) -> u16 {
     text.lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
@@ -473,7 +507,7 @@ fn assert_case(protocol: &str, case: &Case, status: u16, observed: Vec<String>) 
 #[tokio::test]
 async fn functional_policy_path_canonicalization_is_identical_across_h1_h2_h3() {
     let backend = RecordingBackend::start().await;
-    let (mut gateway, https_port) = spawn_gateway(backend.port).await;
+    let (mut gateway, https_port) = spawn_gateway(backend.port, None).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(15))
         .await
@@ -503,6 +537,202 @@ async fn functional_policy_path_canonicalization_is_identical_across_h1_h2_h3() 
         backend.targets().is_empty(),
         "no stray backend traffic should remain"
     );
+
+    gateway.shutdown();
+}
+
+// ============================================================================
+// ACME HTTP-01 shares the one canonical coordinate
+// ============================================================================
+
+/// Token and key authorization of the order seeded below. The token is
+/// deliberately spellable with escapes of `pchar`-legal bytes (`%74` = `t`,
+/// `%5F` = `_`, `%2D` = `-`), which is what makes the raw-path regression
+/// reachable.
+const ACME_TOKEN: &str = "tok_ABC-123";
+const ACME_KEY_AUTHORIZATION: &str = "tok_ABC-123.policy-path-thumbprint";
+
+/// Persist a pending HTTP-01 order before the child opens its process-global
+/// order store, using the same `AcmeOrderStore` mechanism production order
+/// creation uses.
+fn seed_pending_http01_order(store_dir: &std::path::Path) {
+    let store = AcmeOrderStore::open(store_dir).expect("open ACME order store");
+    let order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+        id: "policy-path-http01-order".to_string(),
+        certificate_id: None,
+        domains: vec!["policy-path.example.com".to_string()],
+        directory_url: "https://acme.test/directory".to_string(),
+        account_id: None,
+        account_credentials_json: None,
+        order_url: Some("https://acme.test/order/policy-path".to_string()),
+        status: AcmeOrderStatus::PendingChallenges,
+        http01_challenges: vec![AcmeHttp01ChallengeRecord {
+            identifier: "policy-path.example.com".to_string(),
+            token: ACME_TOKEN.to_string(),
+            key_authorization: ACME_KEY_AUTHORIZATION.to_string(),
+        }],
+        tls_alpn01_challenges: Vec::new(),
+        dns01_challenges: Vec::new(),
+        error: None,
+    })
+    .expect("build ACME order");
+    store.upsert_order(order, false).expect("persist ACME order");
+}
+
+/// What an ACME-shaped target must produce.
+enum Acme {
+    /// The pending challenge is served: exactly the key-authorization bytes.
+    KeyAuthorization,
+    /// The central canonicalization boundary refuses it with this fixed body.
+    /// ACME must not have normalized or accepted the spelling on the way past.
+    Refused(&'static str),
+    /// No challenge, no rejection: the request continues through the single
+    /// request boundary onto ordinary routing, which has no such route.
+    RoutedAndUnmatched,
+}
+
+struct AcmeCase {
+    target: &'static str,
+    status: u16,
+    outcome: Acme,
+    why: &'static str,
+}
+
+/// HTTP-01 is answered before overload admission, so it is the one handler that
+/// establishes its own request coordinate. These cases pin it to the *same*
+/// coordinate everything else uses. Only HTTP/1.1 is exercised: the ACME lookup
+/// lives in `handle_proxy_request_on_frontend_port`, which H1 and H2 enter
+/// identically, and H3 never serves HTTP-01 at all — the per-protocol parity
+/// that does matter is the canonicalizer itself, covered by the matrix above.
+const ACME_CASES: &[AcmeCase] = &[
+    AcmeCase {
+        target: "/.well-known/acme-challenge/tok_ABC-123",
+        status: 200,
+        outcome: Acme::KeyAuthorization,
+        why: "the literal challenge coordinate is still served",
+    },
+    // The regression: before the ACME lookup consumed the canonical path, an
+    // escaped-but-legal spelling missed the handler, canonicalized a moment
+    // later, and fell through to routing and backend handling.
+    AcmeCase {
+        target: "/%2Ewell-known/acme-challenge/tok_ABC-123",
+        status: 200,
+        outcome: Acme::KeyAuthorization,
+        why: "an escaped prefix byte resolves the same challenge",
+    },
+    AcmeCase {
+        target: "/.well-known/acme-challenge/tok%5FABC-123",
+        status: 200,
+        outcome: Acme::KeyAuthorization,
+        why: "an escaped base64url token byte resolves the same challenge",
+    },
+    AcmeCase {
+        target: "/%2ewell-known/acme-challenge/%74ok%5fABC%2D123",
+        status: 200,
+        outcome: Acme::KeyAuthorization,
+        why: "escapes throughout, in mixed hex case, are one coordinate",
+    },
+    // Ambiguous ACME-shaped targets still reach the central rejection. ACME is
+    // not a second place that decides what a path means.
+    AcmeCase {
+        target: "/.well-known/acme-challenge/tok%2FABC-123",
+        status: 400,
+        outcome: Acme::Refused(r#"{"error":"Request path contains an encoded path separator"}"#),
+        why: "an encoded separator is refused, not folded into a token",
+    },
+    AcmeCase {
+        target: "/.well-known/acme-challenge/tok%20ABC-123",
+        status: 400,
+        outcome: Acme::Refused(
+            r#"{"error":"Request path contains an unrepresentable percent-escape"}"#,
+        ),
+        why: "an unrepresentable escape is refused for an ACME-shaped target too",
+    },
+    AcmeCase {
+        target: "/.well-known/acme-challenge/../canon/blocked",
+        status: 400,
+        outcome: Acme::Refused(r#"{"error":"Request path contains a dot segment"}"#),
+        why: "a dot segment is refused before it can escape the challenge prefix",
+    },
+    AcmeCase {
+        target: "/.well-known/acme-challenge/tok%252FABC-123",
+        status: 400,
+        outcome: Acme::Refused(
+            r#"{"error":"Request path contains a double-encoded percent-escape"}"#,
+        ),
+        why: "a double encoding cannot survive a second decode",
+    },
+    // No live challenge: the request must continue through the ordinary
+    // coordinate rather than be answered by ACME either way.
+    AcmeCase {
+        target: "/.well-known/acme-challenge/not_a_live_token",
+        status: 404,
+        outcome: Acme::RoutedAndUnmatched,
+        why: "an unknown token falls through to routing",
+    },
+    AcmeCase {
+        target: "/%2Ewell-known/acme-challenge/not_a_live_token",
+        status: 404,
+        outcome: Acme::RoutedAndUnmatched,
+        why: "an escaped spelling of an unknown token falls through identically",
+    },
+];
+
+#[ignore]
+#[tokio::test]
+async fn functional_acme_http01_shares_the_canonical_policy_path() {
+    let store_dir = TempDir::new().expect("acme store temp dir");
+    seed_pending_http01_order(store_dir.path());
+
+    let backend = RecordingBackend::start().await;
+    let (mut gateway, _https_port) = spawn_gateway(backend.port, Some(store_dir.path())).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(15))
+        .await
+        .expect("proxy port ready");
+    let proxy_port = gateway.proxy_port;
+
+    let _ = backend.take_targets();
+
+    for case in ACME_CASES {
+        let (status, body) = send_h1_full(proxy_port, case.target).await;
+        assert_eq!(
+            status, case.status,
+            "{}: expected {} ({}), got {status} with body {body:?}",
+            case.target, case.status, case.why
+        );
+        match case.outcome {
+            Acme::KeyAuthorization => assert_eq!(
+                body, ACME_KEY_AUTHORIZATION,
+                "{}: must serve the key authorization ({})",
+                case.target, case.why
+            ),
+            Acme::Refused(expected_body) => {
+                assert_eq!(
+                    body, expected_body,
+                    "{}: must carry the fixed rejection body ({})",
+                    case.target, case.why
+                );
+                assert!(
+                    !body.contains('%') && !body.contains(ACME_TOKEN),
+                    "{}: the rejection body must not echo request bytes",
+                    case.target
+                );
+            }
+            Acme::RoutedAndUnmatched => assert!(
+                body.contains("Not Found"),
+                "{}: must fall through to routing ({}), got body {body:?}",
+                case.target,
+                case.why
+            ),
+        }
+        assert!(
+            backend.take_targets().is_empty(),
+            "{}: no ACME-shaped target may reach a backend ({})",
+            case.target,
+            case.why
+        );
+    }
 
     gateway.shutdown();
 }
