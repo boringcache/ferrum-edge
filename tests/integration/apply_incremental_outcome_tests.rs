@@ -300,9 +300,14 @@ fn proxy_state_with_config(config: GatewayConfig) -> ProxyState {
 }
 
 fn proxy_state_with_config_and_mode(
-    config: GatewayConfig,
+    mut config: GatewayConfig,
     mode: ferrum_edge::config::env_config::OperatingMode,
 ) -> ProxyState {
+    // Production loaders normalize before `ProxyState::new`. Without that, the
+    // stored snapshot keeps Default `resolved_tls` (verify=false) while the
+    // first `apply_incremental` re-resolves verify=true and falsely rebuilds
+    // the route table on plugin-only deltas.
+    config.normalize_fields();
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: HashMap::new(),
         resolver_addresses: None,

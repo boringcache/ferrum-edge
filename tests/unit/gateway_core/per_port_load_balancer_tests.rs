@@ -204,6 +204,7 @@ fn port_wrr_zero_weight_fallback_uses_port_counter() {
         .map(|_| {
             LoadBalancerCache::select_target_for_port_from(
                 &control_snapshot,
+                "ferrum",
                 "u1",
                 "port",
                 8080,
@@ -271,6 +272,7 @@ fn port_least_latency_warmup_fallback_uses_port_counter() {
         .map(|_| {
             LoadBalancerCache::select_target_for_port_from(
                 &control_snapshot,
+                "ferrum",
                 "u1",
                 "port",
                 8080,

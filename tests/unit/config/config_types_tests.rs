@@ -3894,7 +3894,7 @@ fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_differen
     prod_upstream.namespace = "prod".to_string();
     let mut staging_upstream = make_upstream("shared");
     staging_upstream.namespace = "staging".to_string();
-    let mut prod_plugin = PluginConfig {
+    let prod_plugin = PluginConfig {
         id: "shared".into(),
         namespace: "prod".into(),
         plugin_name: "rate_limiting".into(),
