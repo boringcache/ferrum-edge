@@ -2524,6 +2524,16 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     let backend_port = reservation.port;
     let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
         .connection_scripts([
+            // Connection 0 is reserved for the binary harness's startup h2c
+            // capability probe (`probe_h2c` → `grpc_pool.get_sender()` only —
+            // no RPC). An empty script lets the fixture's end-of-script Stop
+            // close TCP after its 100ms flush tail so the probe's pooled
+            // sender becomes unhealthy before the warmup RPC. Hosted CI
+            // showed that handing the warmup the still-cached probe sender
+            // on the single shard fails with hyper `connection error` /
+            // grpc-status 14 while `accepted_connections=1` and
+            // `backend_step_errors=[]` (request never reached AcceptRpc).
+            vec![],
             vec![
                 GrpcStep::AcceptRpc(MatchRpc::any()),
                 GrpcStep::SendInitialHeaders,
@@ -2574,10 +2584,11 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         // a clone of this proxy whose only delta is a clamped connect timeout —
         // a field deliberately excluded from the pool key — so it lands on the
         // SAME single-shard gRPC pool entry the request path uses, and it is
-        // spawned rather than awaited before readiness. `wait_for_grpc_h2c_probe_pool_ready`
-        // below closes that race by waiting for the registry to record
-        // `grpc_transport.h2c = supported` (probe `get_sender` finished and
-        // inserted the sender); handshake completion alone is insufficient.
+        // spawned rather than awaited before readiness.
+        // `drain_grpc_h2c_probe_before_traffic` below waits for that probe to
+        // finish *and* for connection 0's empty script to tear the sender
+        // down, so the warmup RPC deterministically dials connection 1 (the
+        // GOAWAY script) rather than racing the probe's pooled sender.
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .capture_output()
         .spawn()
@@ -2590,12 +2601,10 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         .expect("gateway port");
     let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
 
-    // Settle the startup capability probe before any traffic. It is the only
-    // thing that can dial the backend before the first RPC. Wait for the
-    // registry to record h2c=supported so the probe's `get_sender` has
-    // finished and cached its sender on the single shard; only then is the
-    // accept ring deterministic (connection 0 = probe / script 0).
-    wait_for_grpc_h2c_probe_pool_ready(&harness, &backend, Duration::from_secs(5)).await;
+    // Drain the startup capability probe (and its pooled sender) before any
+    // traffic so connection 1 owns the GOAWAY script and the warmup RPC is
+    // the first AcceptRpc on that connection.
+    drain_grpc_h2c_probe_before_traffic(&harness, &backend, Duration::from_secs(5)).await;
 
     let first = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
@@ -2637,29 +2646,33 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
     );
 }
 
-/// Wait until the gateway's startup h2c capability probe has finished
-/// `grpc_pool.get_sender()` and committed `grpc_transport.h2c = supported`.
+/// Drain the binary harness's startup h2c capability probe before this test
+/// sends traffic.
 ///
 /// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
 /// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
 /// capability-refresh pass dials plaintext backends through the shared gRPC
-/// pool at an unsynchronized moment. Tests that key assertions off
-/// `ScriptedGrpcBackend::connection_scripts` (assigned by accept order) or off
-/// which pooled sender the first request reuses must drain that probe first.
+/// pool via `probe_h2c` → `get_sender()`. Under
+/// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
+/// shard. Hosted evidence for this test showed the warmup RPC then failing
+/// with hyper `connection error` / grpc-status 14 while still on that single
+/// accepted connection and before any scripted `AcceptRpc` ran.
 ///
-/// The registry flip is the production-observable signal that pool insertion
-/// completed. `handshakes_completed()` alone precedes `get_sender` returning
-/// and is not sufficient — a fixed sleep after handshake is nondeterministic.
+/// Connection 0's script is intentionally empty so the fixture's end-of-script
+/// Stop closes the probe TCP. This helper waits for the production-observable
+/// pool-ready signals (`h2c=supported` plus a completed backend handshake),
+/// then for the fixture's 100ms end-of-script flush tail plus client-side
+/// close propagation, so the warmup's `get_sender` observes `is_closed` and
+/// redials onto connection 1 (the GOAWAY script) instead of racing the dying
+/// probe sender.
 ///
-/// Both signals are required, and both are loop conditions rather than a
+/// Both registry and handshake signals are loop conditions rather than a
 /// post-flip assertion: hyper's client-side h2c handshake resolves once the
 /// connection preface is flushed, without waiting for the peer's SETTINGS, so
 /// the registry can commit `supported` a hair before the backend's own
-/// server-side handshake bookkeeping lands. Asserting on that ordering would
-/// convert a scheduling hiccup into a failure; waiting on it cannot. A probe
-/// that never dials this backend still fails closed on `timeout` below, with
-/// the same diagnostics.
-async fn wait_for_grpc_h2c_probe_pool_ready(
+/// server-side handshake bookkeeping lands. A probe that never dials this
+/// backend still fails closed on `timeout` below, with the same diagnostics.
+async fn drain_grpc_h2c_probe_before_traffic(
     harness: &GatewayHarness,
     backend: &ScriptedGrpcBackend,
     timeout: Duration,
@@ -2672,6 +2685,10 @@ async fn wait_for_grpc_h2c_probe_pool_ready(
             && entry["grpc_transport"]["h2c"].as_str() == Some("supported")
             && backend.handshakes_completed() >= 1
         {
+            // ScriptedH2Backend end-of-script sleeps 100ms before Stop; the
+            // driver then gives poll_closed up to another 200ms. Wait past
+            // both so warmup cannot reuse the probe sender mid-teardown.
+            tokio::time::sleep(Duration::from_millis(350)).await;
             return;
         }
         if Instant::now() >= deadline {
