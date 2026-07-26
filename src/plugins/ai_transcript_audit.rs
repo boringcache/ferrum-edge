@@ -2582,21 +2582,80 @@ struct ReassembledToolCall {
     arguments: String,
 }
 
+/// Bucket key for a reassembled choice or tool call.
+///
+/// `Some(index)` is a provider-supplied unsigned index. `None` is the
+/// conservative *unattributed* bucket used when the index was present but not a
+/// valid unsigned integer (string, float, negative, null, oversized, object).
+/// Such fragments are still reassembled and redacted — dropping them would let
+/// a malformed index hide payload from the audit record entirely — but they are
+/// never merged into a real index's bucket, so an attacker-controlled malformed
+/// index cannot concatenate unrelated choices or tool calls. `None` sorts first
+/// in the `BTreeMap`, and no valid `u64` renders as the `unattributed` output
+/// key, so the two spaces cannot collide.
+type ReassembledKey = Option<u64>;
+
+/// Output key for the unattributed bucket. Not a valid `u64` rendering, so it
+/// can never collide with a real choice index.
+const REASSEMBLED_UNATTRIBUTED_KEY: &str = "unattributed";
+
 #[derive(Default)]
 struct ReassembledChoice {
     content: String,
-    tool_calls: BTreeMap<u64, ReassembledToolCall>,
+    tool_calls: BTreeMap<ReassembledKey, ReassembledToolCall>,
     finish_reason: Option<String>,
+}
+
+fn reassembled_key_label(key: ReassembledKey) -> String {
+    match key {
+        Some(index) => index.to_string(),
+        None => REASSEMBLED_UNATTRIBUTED_KEY.to_string(),
+    }
+}
+
+/// A `tool_calls` entry is *indexless* only when it is an object carrying no
+/// `index` key. A non-object entry also reports no `index`, so counting it as
+/// indexless would let one malformed array element trip the cross-frame
+/// ambiguity guard and force the per-frame fallback.
+fn is_indexless_tool_call(tool_call: &Value) -> bool {
+    tool_call
+        .as_object()
+        .is_some_and(|tool_call| !tool_call.contains_key("index"))
 }
 
 /// Reassemble captured OpenAI `chat.completion.chunk` SSE frames by choice.
 /// Text and tool-call fragments are concatenated in frame order, including
 /// fragmented arguments, before the caller applies sensitive-field and pattern
 /// redaction. Uniformly parseable tool-call-only streams use this path too.
+///
+/// Optional provider-controlled fields are classified by whether a malformed
+/// value can be safely ignored:
+///
+/// * **Ignorable** — `finish_reason`, `delta`, `delta.content`, `tool_calls`,
+///   `id`, `type`, `function`, `function.name`, `function.arguments`. A
+///   malformed value here carries no attribution meaning, so it is skipped
+///   rather than aborting reassembly. Aborting would fall back to per-frame
+///   redaction, which cannot see a secret or PII value split across adjacent
+///   fragments — the malformed field would become a redaction-bypass primitive.
+///   Malformed payload-bearing values (`content`, `arguments`) are dropped, not
+///   coerced to text: splicing a serialized non-string between two real
+///   fragments would break the very cross-fragment match this path exists for.
+/// * **Identity-bearing** — `choices[].index` and `tool_calls[].index`. These
+///   decide which bucket a fragment joins, so a malformed value is neither
+///   coerced to `0` nor dropped: it routes to the `unattributed` bucket (see
+///   [`ReassembledKey`]) so it can neither concatenate onto an unrelated call
+///   nor vanish from the record.
+///
+/// Every ignored or re-routed field is reported in the excerpt's
+/// `malformed_fields` list so degraded fidelity is visible to the audit
+/// consumer instead of silent. That list holds only compiled-in field paths,
+/// never provider values, so it cannot become a secret-bearing diagnostic, and
+/// it is bounded by the number of distinct field paths below.
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
-    let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
-    let mut tool_call_choices_seen = BTreeSet::new();
+    let mut per_choice: BTreeMap<ReassembledKey, ReassembledChoice> = BTreeMap::new();
+    let mut tool_call_choices_seen: BTreeSet<ReassembledKey> = BTreeSet::new();
+    let mut malformed_fields: BTreeSet<&'static str> = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2613,33 +2672,71 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             return None;
         }
         let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            if let Some(choices) = frame.get("choices")
+                && !choices.is_null()
+            {
+                malformed_fields.insert("choices");
+            }
             continue;
         };
-        for choice in choices {
-            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+        for (choice_position, choice) in choices.iter().enumerate() {
+            // Identity-bearing: a present-but-malformed index must not collapse
+            // onto choice 0 (that would concatenate unrelated completions into
+            // one bucket), and must not abort reassembly either. An *absent*
+            // index falls back to position within the frame, which is identical
+            // to the historical `0` for the single-choice shape but keeps two
+            // indexless choices in one frame apart.
+            let index = match choice.get("index") {
+                None => Some(choice_position as u64),
+                Some(index) => match index.as_u64() {
+                    Some(index) => Some(index),
+                    None => {
+                        malformed_fields.insert("choices[].index");
+                        None
+                    }
+                },
+            };
             let accumulated = per_choice.entry(index).or_default();
             if let Some(finish_reason) = choice.get("finish_reason")
                 && !finish_reason.is_null()
-                && let Some(finish_reason) = finish_reason.as_str()
             {
-                accumulated.finish_reason = Some(finish_reason.to_string());
+                if let Some(finish_reason) = finish_reason.as_str() {
+                    accumulated.finish_reason = Some(finish_reason.to_string());
+                } else {
+                    // Ignorable: keep any previously observed valid reason
+                    // rather than overwriting it with a guess.
+                    malformed_fields.insert("choices[].finish_reason");
+                }
             }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
             let Some(delta) = delta.as_object() else {
+                if !delta.is_null() {
+                    malformed_fields.insert("choices[].delta");
+                }
                 continue;
             };
             if let Some(content) = delta.get("content")
                 && !content.is_null()
-                && let Some(content) = content.as_str()
             {
-                accumulated.content.push_str(content);
+                if let Some(content) = content.as_str() {
+                    accumulated.content.push_str(content);
+                } else {
+                    malformed_fields.insert("choices[].delta.content");
+                }
             }
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                let has_indexless_call = tool_calls
-                    .iter()
-                    .any(|tool_call| tool_call.get("index").is_none());
+            if let Some(tool_calls) = delta.get("tool_calls") {
+                let Some(tool_calls) = tool_calls.as_array() else {
+                    if !tool_calls.is_null() {
+                        malformed_fields.insert("choices[].delta.tool_calls");
+                    }
+                    continue;
+                };
+                // Object entries only: a malformed element such as
+                // `"tool_calls":[42]` must not force the `return None` below and
+                // hand an attacker the per-frame fallback this path avoids.
+                let has_indexless_call = tool_calls.iter().any(is_indexless_tool_call);
                 if has_indexless_call && tool_call_choices_seen.contains(&index) {
                     // Position is only an unambiguous fallback within one
                     // frame. A later indexless frame could continue any prior
@@ -2647,48 +2744,83 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                     // joining potentially unrelated tool calls.
                     return None;
                 }
-                tool_call_choices_seen.insert(index);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let Some(tool_call) = tool_call.as_object() else {
+                        if !tool_call.is_null() {
+                            malformed_fields.insert("choices[].delta.tool_calls[]");
+                        }
                         continue;
                     };
+                    // Identity-bearing, same reasoning as the choice index:
+                    // route to the unattributed bucket instead of guessing a
+                    // position (which could continue an unrelated call) or
+                    // dropping the fragment (which would let a malformed index
+                    // keep tool arguments out of the audit record entirely).
                     let tool_index = match tool_call.get("index") {
-                        Some(index) => {
-                            let Some(index) = index.as_u64() else {
-                                continue;
-                            };
-                            index
-                        }
-                        None => position as u64,
+                        None => Some(position as u64),
+                        Some(index) => match index.as_u64() {
+                            Some(index) => Some(index),
+                            None => {
+                                malformed_fields.insert("choices[].delta.tool_calls[].index");
+                                None
+                            }
+                        },
                     };
+                    // Armed only once a fragment lands in a *positional* bucket.
+                    // An empty array, an array of unusable entries, or a
+                    // fragment routed to the unattributed bucket establishes no
+                    // index that a later positional fallback could collide with,
+                    // so none of them may arm the guard above — otherwise a
+                    // provider forces the per-frame fallback (and the split-PII
+                    // exposure it carries) with one throwaway frame.
+                    if tool_index.is_some() {
+                        tool_call_choices_seen.insert(index);
+                    }
                     let call = accumulated.tool_calls.entry(tool_index).or_default();
                     if let Some(id) = tool_call.get("id")
                         && !id.is_null()
-                        && let Some(id) = id.as_str()
                     {
-                        merge_sse_scalar_fragment(&mut call.id, id);
+                        if let Some(id) = id.as_str() {
+                            merge_sse_scalar_fragment(&mut call.id, id);
+                        } else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].id");
+                        }
                     }
                     if let Some(call_type) = tool_call.get("type")
                         && !call_type.is_null()
-                        && let Some(call_type) = call_type.as_str()
                     {
-                        merge_sse_scalar_fragment(&mut call.call_type, call_type);
+                        if let Some(call_type) = call_type.as_str() {
+                            merge_sse_scalar_fragment(&mut call.call_type, call_type);
+                        } else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].type");
+                        }
                     }
                     if let Some(function) = tool_call.get("function")
                         && !function.is_null()
-                        && let Some(function) = function.as_object()
                     {
+                        let Some(function) = function.as_object() else {
+                            malformed_fields.insert("choices[].delta.tool_calls[].function");
+                            continue;
+                        };
                         if let Some(name) = function.get("name")
                             && !name.is_null()
-                            && let Some(name) = name.as_str()
                         {
-                            merge_sse_scalar_fragment(&mut call.name, name);
+                            if let Some(name) = name.as_str() {
+                                merge_sse_scalar_fragment(&mut call.name, name);
+                            } else {
+                                malformed_fields
+                                    .insert("choices[].delta.tool_calls[].function.name");
+                            }
                         }
                         if let Some(arguments) = function.get("arguments")
                             && !arguments.is_null()
-                            && let Some(arguments) = arguments.as_str()
                         {
-                            call.arguments.push_str(arguments);
+                            if let Some(arguments) = arguments.as_str() {
+                                call.arguments.push_str(arguments);
+                            } else {
+                                malformed_fields
+                                    .insert("choices[].delta.tool_calls[].function.arguments");
+                            }
                         }
                     }
                 }
@@ -2705,7 +2837,7 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let mut response_tool_calls = serde_json::Map::new();
     let mut finish_reasons = serde_json::Map::new();
     for (choice_index, choice) in per_choice {
-        let choice_key = choice_index.to_string();
+        let choice_key = reassembled_key_label(choice_index);
         if !choice.content.is_empty() {
             completion_text.insert(choice_key.clone(), Value::String(choice.content));
         }
@@ -2713,7 +2845,16 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             let mut calls = Vec::with_capacity(choice.tool_calls.len());
             for (tool_index, call) in choice.tool_calls {
                 let mut call_json = serde_json::Map::new();
-                call_json.insert("index".to_string(), Value::from(tool_index));
+                // `index` stays numeric for real indices; an unattributed call
+                // is flagged instead of being given a fabricated index.
+                match tool_index {
+                    Some(tool_index) => {
+                        call_json.insert("index".to_string(), Value::from(tool_index));
+                    }
+                    None => {
+                        call_json.insert("index_unattributed".to_string(), Value::Bool(true));
+                    }
+                }
                 if !call.id.is_empty() {
                     call_json.insert("id".to_string(), Value::String(call.id));
                 }
@@ -2755,6 +2896,18 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     }
     if !finish_reasons.is_empty() {
         annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
+    }
+    if !malformed_fields.is_empty() {
+        // Compiled-in field paths only, never provider values: the audit
+        // consumer learns that some optional fields were malformed and skipped
+        // (or re-routed to `unattributed`) without the record itself becoming a
+        // channel for the malformed content. Omitted entirely for well-formed
+        // streams, so the documented shape is unchanged in the normal case.
+        let reported: Vec<Value> = malformed_fields
+            .into_iter()
+            .map(|field| Value::String(field.to_string()))
+            .collect();
+        annotated.insert("malformed_fields".to_string(), Value::Array(reported));
     }
     Some(Value::Object(annotated))
 }

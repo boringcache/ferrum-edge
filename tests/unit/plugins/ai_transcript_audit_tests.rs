@@ -4915,6 +4915,351 @@ async fn malformed_optional_sse_fields_do_not_bypass_split_pii_redaction() {
     assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
     assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
     assert!(!excerpt.contains("alice@") && !excerpt.contains("example.com"));
+    // Skipped optional fields are reported rather than silently dropped, and
+    // the report carries only compiled-in field paths.
+    let parsed: Value = serde_json::from_str(excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!([
+            "choices[].delta.tool_calls[].function.arguments",
+            "choices[].delta.tool_calls[].function.name",
+            "choices[].delta.tool_calls[].id",
+            "choices[].delta.tool_calls[].type",
+            "choices[].finish_reason",
+        ]),
+        "{excerpt}"
+    );
+    // A malformed `finish_reason` is ignorable, so no reason is claimed.
+    assert!(parsed.get("finish_reason").is_none(), "{excerpt}");
+}
+
+/// Drive one SSE capture through the streaming tee and return the exported
+/// response excerpt. Shared by the malformed-field regressions below, which all
+/// differ only in the frames they feed.
+async fn reassembled_sse_excerpt(frames: &[&str]) -> String {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut total = 0u64;
+    for frame in frames {
+        let chunk = format!("data: {frame}\n\n");
+        let _ = inspector.on_chunk(chunk.as_bytes()).await;
+        total += chunk.len() as u64;
+    }
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
+        .await;
+    let records = wait_for_records(&server).await;
+    records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt")
+        .to_string()
+}
+
+#[tokio::test]
+async fn malformed_tool_call_array_element_does_not_force_raw_frame_fallback() {
+    // A non-object `tool_calls` element reports no `index`, so counting it as an
+    // indexless call would let one malformed element trip the cross-frame
+    // ambiguity guard and hand back the per-frame fallback — which cannot see
+    // the email split across the two `delta.content` fragments.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"carol@","tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.net","tool_calls":[42]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
+    assert!(
+        !excerpt.contains("carol@") && !excerpt.contains("example.net"),
+        "split PII must not survive a malformed tool-call element: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!(["choices[].delta.tool_calls[]"]),
+        "{excerpt}"
+    );
+    // The well-formed sibling call is still attributed normally.
+    assert_eq!(parsed["tool_calls"]["0"][0]["id"], "call_x");
+}
+
+#[tokio::test]
+async fn empty_tool_call_array_does_not_arm_indexless_ambiguity_guard() {
+    // An empty `tool_calls` array delivers no continuation, so it must not mark
+    // the choice as "already has tool calls" — otherwise a later, legitimately
+    // indexless frame aborts reassembly and the split email leaks per-frame.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"dave@","tool_calls":[]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.org","tool_calls":[{"id":"call_y","type":"function","function":{"name":"notify","arguments":"{}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
+    assert!(
+        !excerpt.contains("dave@") && !excerpt.contains("example.org"),
+        "{excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
+    assert_eq!(parsed["tool_calls"]["0"][0]["index"], 0);
+    assert_eq!(parsed["tool_calls"]["0"][0]["id"], "call_y");
+}
+
+#[tokio::test]
+async fn genuinely_repeated_indexless_tool_calls_still_keep_raw_fallback_after_empty_array() {
+    // The relaxation above must not weaken the real ambiguity case: once a
+    // fragment has actually been attributed, a later indexless frame is still
+    // unresolvable and still keeps the raw-frame fallback.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_z","function":{"arguments":"{\"id\":"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"42}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("sse_reassembled"),
+        "ambiguous indexless continuations must not be guessed: {excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_choice_index_routes_to_unattributed_bucket() {
+    // `index` is identity-bearing: coercing a malformed value to 0 (the old
+    // `unwrap_or(0)`) would concatenate two unrelated completions into one
+    // bucket. Each malformed shape must land in the separate `unattributed`
+    // bucket instead, and never abort reassembly.
+    for malformed_index in ["\"0\"", "-1", "1.5", "null", "18446744073709551616", "{}"] {
+        let malformed_frame = format!(
+            r#"{{"object":"chat.completion.chunk","choices":[{{"index":{malformed_index},"delta":{{"content":"beta"}}}}]}}"#
+        );
+        let excerpt = reassembled_sse_excerpt(&[
+            r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"alpha"}}]}"#,
+            malformed_frame.as_str(),
+            "[DONE]",
+        ])
+        .await;
+        let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+        assert_eq!(
+            parsed["completion_text"]["0"],
+            "alpha",
+            "index {malformed_index}: {excerpt}"
+        );
+        assert_eq!(
+            parsed["completion_text"]["unattributed"],
+            "beta",
+            "index {malformed_index} must not merge into choice 0: {excerpt}"
+        );
+        assert_eq!(
+            parsed["malformed_fields"],
+            json!(["choices[].index"]),
+            "index {malformed_index}: {excerpt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn absent_choice_index_uses_frame_position_not_a_shared_zero_bucket() {
+    // An absent index is a well-formed omission, not a malformed value: it maps
+    // to the position within the frame, which preserves the historical `0` for
+    // the single-choice shape while keeping two indexless choices apart.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"delta":{"content":"first"}},{"delta":{"content":"second"}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(parsed["completion_text"]["0"], "first", "{excerpt}");
+    assert_eq!(parsed["completion_text"]["1"], "second", "{excerpt}");
+    assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
+}
+
+#[tokio::test]
+async fn malformed_tool_call_index_is_captured_unattributed_not_dropped_or_merged() {
+    // Dropping a fragment whose index is malformed would let a provider keep
+    // tool arguments out of the audit record entirely; merging it positionally
+    // would splice it onto an unrelated call. It goes to the unattributed
+    // bucket, where it is still redacted.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_real","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"ok\"}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":-1,"function":{"arguments":"{\"password\":\"s3cr3t-value\"}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(
+        !excerpt.contains("s3cr3t-value"),
+        "unattributed arguments must still be redacted: {excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    // `None` sorts first, so the unattributed entry leads.
+    assert_eq!(calls[0]["index_unattributed"], true, "{excerpt}");
+    assert!(calls[0].get("index").is_none(), "{excerpt}");
+    let unattributed_args: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("unattributed arguments JSON");
+    assert_eq!(unattributed_args["password"], "[REDACTED]", "{excerpt}");
+    // The real call keeps its own identity and arguments — nothing was spliced.
+    assert_eq!(calls[1]["index"], 0, "{excerpt}");
+    assert_eq!(calls[1]["id"], "call_real", "{excerpt}");
+    assert_eq!(
+        calls[1]["function"]["arguments"],
+        r#"{"q":"ok"}"#,
+        "{excerpt}"
+    );
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!(["choices[].delta.tool_calls[].index"]),
+        "{excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn unattributed_tool_call_does_not_arm_indexless_ambiguity_guard() {
+    // A fragment routed to the unattributed bucket establishes no positional
+    // index, so it must not make a later indexless frame "ambiguous" — that
+    // would be a one-frame trigger for the per-frame fallback and the split-PII
+    // exposure it carries.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"heidi@","tool_calls":[{"index":"nope","function":{"arguments":"{}"}}]}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.net","tool_calls":[{"id":"call_w","type":"function","function":{"name":"notify","arguments":"{}"}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
+    assert!(
+        !excerpt.contains("heidi@") && !excerpt.contains("example.net"),
+        "{excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    assert_eq!(calls[0]["index_unattributed"], true, "{excerpt}");
+    assert_eq!(calls[1]["index"], 0, "{excerpt}");
+    assert_eq!(calls[1]["id"], "call_w", "{excerpt}");
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!(["choices[].delta.tool_calls[].index"]),
+        "{excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_delta_and_tool_calls_containers_are_skipped_not_fatal() {
+    // A non-object `delta` and a non-array `tool_calls` are ignorable: they
+    // carry no attribution, so surrounding valid fragments must still join.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"erin@"}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":"not-an-object"}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":"not-an-array"}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":["split"],"tool_calls":"not-an-array"}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"example.io","tool_calls":[{"index":0,"function":"not-an-object"}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    assert!(excerpt.contains("[REDACTED:email"), "{excerpt}");
+    assert!(
+        !excerpt.contains("erin@") && !excerpt.contains("example.io"),
+        "{excerpt}"
+    );
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(
+        parsed["malformed_fields"],
+        json!([
+            "choices",
+            "choices[].delta",
+            "choices[].delta.content",
+            "choices[].delta.tool_calls",
+            "choices[].delta.tool_calls[].function",
+        ]),
+        "{excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_fields_never_carry_provider_values() {
+    // The diagnostic must stay a list of compiled-in field paths: a malformed
+    // value that is itself a secret must not be echoed into the record by the
+    // very annotation that reports it.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":{"leak":"sk-live-deadbeef"},"delta":{"content":"hello","tool_calls":[{"index":0,"id":["sk-live-cafebabe"],"function":{"name":{"n":"sk-live-feedface"},"arguments":["sk-live-baddcafe"]}}]}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    for secret in [
+        "sk-live-deadbeef",
+        "sk-live-cafebabe",
+        "sk-live-feedface",
+        "sk-live-baddcafe",
+    ] {
+        assert!(
+            !excerpt.contains(secret),
+            "malformed value {secret} leaked into the record: {excerpt}"
+        );
+    }
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    assert_eq!(parsed["completion_text"]["0"], "hello", "{excerpt}");
+    for field in parsed["malformed_fields"]
+        .as_array()
+        .expect("malformed_fields")
+    {
+        let field = field.as_str().expect("field path");
+        assert!(
+            field.starts_with("choices"),
+            "unexpected diagnostic entry {field}: {excerpt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn duplicate_choice_indices_across_frames_still_join_one_bucket() {
+    // The normal streaming case: repeated `index` for the same choice is a
+    // continuation, and split PII across those fragments must be joined before
+    // redaction even when interleaved with a second choice.
+    let excerpt = reassembled_sse_excerpt(&[
+        r#"{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"frank@"}},{"index":1,"delta":{"content":"grace@"}}]}"#,
+        r#"{"object":"chat.completion.chunk","choices":[{"index":1,"delta":{"content":"example.co"}},{"index":0,"delta":{"content":"example.dev"}}]}"#,
+        "[DONE]",
+    ])
+    .await;
+    for fragment in ["frank@", "grace@", "example.co", "example.dev"] {
+        assert!(
+            !excerpt.contains(fragment),
+            "cross-frame fragment {fragment} must be joined and redacted: {excerpt}"
+        );
+    }
+    let parsed: Value = serde_json::from_str(&excerpt).expect("excerpt JSON");
+    for choice in ["0", "1"] {
+        let text = parsed["completion_text"][choice]
+            .as_str()
+            .expect("choice text");
+        assert!(text.contains("[REDACTED:email"), "choice {choice}: {text}");
+    }
+    assert!(parsed.get("malformed_fields").is_none(), "{excerpt}");
 }
 
 #[tokio::test]
