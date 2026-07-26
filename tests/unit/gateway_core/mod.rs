@@ -1,5 +1,7 @@
 mod adaptive_buffer_tests;
 mod allowed_methods_logging_tests;
+mod backend_capability_commit_tests;
+mod backend_capability_probe_merge_tests;
 mod backend_dispatch_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
@@ -11,6 +13,7 @@ mod consumer_index_tests;
 mod cp_listener_supervision_tests;
 mod cp_server_tests;
 mod date_cache_tests;
+mod db_poll_supervision_tests;
 mod dns_tests;
 mod dp_client_tests;
 mod dp_listener_supervision_tests;
