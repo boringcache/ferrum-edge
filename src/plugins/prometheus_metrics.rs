@@ -664,6 +664,11 @@ pub struct MetricsRegistry {
     /// listener starts. Rendered as gauge/counter so operators can observe
     /// management-plane connection pressure and rejections.
     admin_conn_metrics: ArcSwap<Option<Arc<crate::admin::AdminConnLimiter>>>,
+    /// CP gRPC pre-authentication connection limiter, registered when the CP
+    /// gRPC listener starts (advisory GHSA-2xqr-7j7p-77qp). Rendered as
+    /// gauge/counters so operators can observe pre-auth connection pressure and
+    /// limit hits. Fixed cardinality — no source-IP labels.
+    cp_grpc_conn_metrics: ArcSwap<Option<Arc<crate::util::conn_limit::ConnLimiter>>>,
     /// Database-mode incremental polling rejection/backoff metrics.
     database_delta_poll_metrics:
         ArcSwap<Option<Arc<crate::modes::database::DatabaseDeltaPollMetrics>>>,
@@ -742,6 +747,7 @@ impl MetricsRegistry {
             tls_cert_rotation_counter: DashMap::new(),
             node_agent_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
+            cp_grpc_conn_metrics: ArcSwap::from_pointee(None),
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
             configsync_divergence_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
@@ -1032,6 +1038,13 @@ impl MetricsRegistry {
     /// and a TLS listener registers the same shared limiter `Arc` twice.
     pub fn set_admin_conn_metrics(&self, limiter: Arc<crate::admin::AdminConnLimiter>) {
         self.admin_conn_metrics.store(Arc::new(Some(limiter)));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    /// Register the CP gRPC pre-authentication connection limiter so
+    /// `/metrics` exposes its gauge/counters (advisory GHSA-2xqr-7j7p-77qp).
+    pub fn set_cp_grpc_conn_metrics(&self, limiter: Arc<crate::util::conn_limit::ConnLimiter>) {
+        self.cp_grpc_conn_metrics.store(Arc::new(Some(limiter)));
         self.render_cache.store(Arc::new(None));
     }
 
@@ -1726,6 +1739,11 @@ impl MetricsRegistry {
                 0
             }
             + if self.admin_conn_metrics.load().is_some() {
+                512
+            } else {
+                0
+            }
+            + if self.cp_grpc_conn_metrics.load().is_some() {
                 512
             } else {
                 0
@@ -2595,6 +2613,60 @@ impl MetricsRegistry {
             ] {
                 output.push_str(&format!(
                     "ferrum_admin_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
+                ));
+            }
+        }
+
+        // CP gRPC pre-authentication connection admission (advisory
+        // GHSA-2xqr-7j7p-77qp). Fixed cardinality: no source-IP label, and the
+        // reason labels come from a closed `&'static str` set.
+        let cp_grpc_conn_metrics = self.cp_grpc_conn_metrics.load_full();
+        if let Some(limiter) = cp_grpc_conn_metrics.as_ref() {
+            let snapshot = limiter.snapshot();
+            output.push_str(
+                "# HELP ferrum_cp_grpc_active_connections CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_active_connections gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_cp_grpc_active_connections",
+                snapshot.active_connections,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_max_connections Configured CP gRPC connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_max_connections gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_cp_grpc_max_connections",
+                snapshot.max_connections as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_max_connections_per_ip Configured per-source-IP CP gRPC connection cap (0 = unlimited).\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_max_connections_per_ip gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_cp_grpc_max_connections_per_ip",
+                snapshot.max_connections_per_ip as u64,
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_cp_grpc_rejected_connections_total CP gRPC connections rejected before any handshake work was allocated, by reason.\n",
+            );
+            output.push_str("# TYPE ferrum_cp_grpc_rejected_connections_total counter\n");
+            // Emit both reason buckets even at zero so dashboards can pin them.
+            for (reason, value) in [
+                ("max_connections", snapshot.rejected_max_connections),
+                (
+                    "max_connections_per_ip",
+                    snapshot.rejected_max_connections_per_ip,
+                ),
+            ] {
+                output.push_str(&format!(
+                    "ferrum_cp_grpc_rejected_connections_total{{reason=\"{reason}\"{ns_label}}} {value}\n"
                 ));
             }
         }

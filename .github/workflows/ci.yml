@@ -646,6 +646,7 @@ jobs:
               integration::mesh_sidecar_e2e_tests
               integration::mesh_subscribe_validation_tests
               integration::cp_dp_grpc_tests
+              integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
