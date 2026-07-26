@@ -61,11 +61,14 @@
 //!   instance, the cache generation, and the process. A gate identity is
 //!   meaningless there, so it stores content digests instead: the gate map's
 //!   content *and* the per-proxy fold of every enrolled plugin's
-//!   `response_presentation_policy_digest()` — this plugin's being the digest
-//!   of its whole accepted static config. A rule edit that leaves the gate map
+//!   `response_presentation_policy()` — this plugin's being the digest of its
+//!   whole accepted static config. A rule edit that leaves the gate map
 //!   untouched therefore still retires every replay captured before it, as does
-//!   a change to any other presentation plugin the replay path skips (`sse`,
-//!   `mcp_gateway`) or to their configured order.
+//!   a change to any other presentation plugin the replay path skips (`sse`) or
+//!   to their configured order. A plugin whose rewrite is not a function of
+//!   configuration at all (`mcp_gateway`, driven by live upstream discovery)
+//!   cannot be folded in and is refused composition with deduplication
+//!   entirely.
 //!
 //! ## Representation metadata after a body rewrite
 //!
@@ -769,8 +772,17 @@ impl Plugin for ResponseTransformer {
     /// disappear from the per-proxy digest based on live gate state, which the
     /// gate fingerprint already covers, and would hide the static rules of a
     /// disabled instance from a representation stored while it was disabled.
-    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
-        Some(self.static_policy_digest)
+    ///
+    /// `Static` is accurate: every rule this plugin applies to a response body
+    /// comes from its accepted configuration, and the instance holds no
+    /// interior mutable state. The one runtime input, the RTDS gate, is carried
+    /// by the separate gate fingerprint; the one non-config input,
+    /// `ctx.route_override_response_transform`, is header-only and is consumed
+    /// without being applied on a finalized replay.
+    fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
+        Some(super::ResponsePresentationPolicy::Static(
+            self.static_policy_digest,
+        ))
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {

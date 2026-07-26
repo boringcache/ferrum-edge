@@ -1646,17 +1646,21 @@ impl HeldCodecPermit {
 ///   a representation retained in a shared store has to be compared against.
 /// - `presentation` — content digest of the effective *static* rules of every
 ///   plugin whose response-body transform the replay skips, folded in
-///   configured execution order (see
-///   `Plugin::response_presentation_policy_digest` for the enrolled set and the
-///   audited exclusions). Static rules cannot change under one live instance, but a
-///   representation persisted to Redis outlives the instance, the generation,
-///   and the process, so an unchanged gate map says nothing about whether the
-///   redaction/header/body rules still match. `None` means the effective static
-///   policy was never observed for this request; callers must treat that as
-///   unprovable and refuse to persist, never as "no policy".
+///   configured execution order (see [`Plugin::response_presentation_policy`]
+///   for the enrolled set and the audited exclusions). Static rules cannot
+///   change under one live instance, but a representation persisted to Redis
+///   outlives the instance, the generation, and the process, so an unchanged
+///   gate map says nothing about whether the redaction/header/body rules still
+///   match. `None` means the effective presentation policy could not be
+///   established for this request — either no plugin-cache view was attached,
+///   or the proxy carries a plugin whose response-body rewrite is derived from
+///   live runtime state that no construction-time digest can describe
+///   ([`ResponsePresentationPolicy::Dynamic`]). Both are "unprovable", never
+///   "no policy".
 ///
-/// Equality is the whole security decision: replay is admitted only when the
-/// stored value equals the live one, so a change to either half retires every
+/// Provability, then equality, is the whole security decision: replay is
+/// admitted only when both sides are complete *and* equal, so a change to
+/// either half — or the inability to establish either half — retires every
 /// representation captured under the old policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResponsePolicyProvenance {
@@ -1665,14 +1669,32 @@ pub(crate) struct ResponsePolicyProvenance {
 }
 
 impl ResponsePolicyProvenance {
-    /// The two halves, or `None` when the static policy was never observed and
-    /// the provenance is therefore incomplete.
+    /// The two halves, or `None` when the presentation policy could not be
+    /// established and the provenance is therefore incomplete.
     ///
-    /// Only a complete value may be written to a store that outlives this
-    /// process.
+    /// Only a complete value may be retained for replay at all — in Redis,
+    /// which outlives this process, or in the local map, where a later request
+    /// under the same live policy would otherwise be served bytes whose
+    /// producing policy was never witnessed.
     pub(crate) fn complete(&self) -> Option<([u8; 32], [u8; 32])> {
         let presentation = self.presentation?;
         Some((self.gate, presentation))
+    }
+
+    /// Whether this (live) provenance admits replaying a representation stored
+    /// under `stored`.
+    ///
+    /// An incomplete value matches nothing — including another incomplete
+    /// value. Two requests that both failed to establish the presentation
+    /// policy have not thereby proven they share one: "unknown" is not
+    /// evidence, and deriving `PartialEq` alone would have made
+    /// `None == None` silently admit exactly the replay this guard exists to
+    /// stop.
+    pub(crate) fn admits_replay_of(&self, stored: &Self) -> bool {
+        match (self.complete(), stored.complete()) {
+            (Some(live), Some(stored)) => live == stored,
+            _ => false,
+        }
     }
 
     /// Rebuild a value from a persisted record. Both halves are required, so a
@@ -1683,6 +1705,32 @@ impl ResponsePolicyProvenance {
             presentation: Some(presentation),
         }
     }
+}
+
+/// How completely a plugin's response-side *presentation* policy can be
+/// described to a representation that will be replayed later.
+///
+/// See [`Plugin::response_presentation_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsePresentationPolicy {
+    /// The client-visible rewrite is a pure function of accepted static
+    /// configuration, captured by this content digest. Two processes loading
+    /// equivalent configuration derive the same value, so a retained
+    /// representation can be proven compatible anywhere.
+    Static([u8; 32]),
+    /// The client-visible rewrite is derived from live runtime state — data
+    /// this gateway refreshes from upstream on its own schedule, per session,
+    /// after the plugin was constructed — so no digest computed at construction
+    /// describes it, and no digest of *any* fixed size could without persisting
+    /// the runtime state itself.
+    ///
+    /// A proxy carrying such a plugin has no provable presentation policy at
+    /// all: the per-proxy fold collapses to `None` and every consumer that
+    /// would retain a finalized representation must fail closed. Config
+    /// admission rejects the composition outright
+    /// (`request_deduplication::validate_composition`); this variant is the
+    /// runtime backstop for the paths that only warn.
+    Dynamic,
 }
 
 /// Context passed through the plugin pipeline for a single request.
@@ -1967,13 +2015,15 @@ pub struct RequestContext {
     pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
     /// Content digest of the effective *static* response-side presentation
     /// policy for this request's proxy and protocol: every enrolled instance's
-    /// accepted config (`Plugin::response_presentation_policy_digest`), folded
-    /// in configured execution order.
+    /// accepted config ([`Plugin::response_presentation_policy`]), folded in
+    /// configured execution order.
     ///
     /// Copied once from the request's plugin-cache view, so it describes
     /// exactly the instances that will run on this request's response path.
-    /// `None` means no view was attached and the effective policy is therefore
-    /// unknown; a plugin that persists a representation for cross-process
+    /// `None` means the effective policy could not be established — either no
+    /// view was attached, or the proxy carries a
+    /// [`ResponsePresentationPolicy::Dynamic`] plugin whose rewrite comes from
+    /// live runtime state. A plugin that retains a representation for later
     /// replay must fail closed on `None` rather than claim provenance it cannot
     /// substantiate. Kept private so request metadata cannot forge one.
     pub(crate) response_presentation_policy_digest: Option<[u8; 32]>,
@@ -6397,36 +6447,46 @@ pub trait Plugin: Send + Sync {
     ) {
     }
 
-    /// Content-derived digest of this plugin's static, response-side
-    /// *presentation* policy — the client-facing header/body rewrites that a
-    /// finalized replay (`RequestContext::finalized_response_replay`)
-    /// deliberately skips so non-idempotent rules cannot run twice over an
-    /// already-transformed representation.
+    /// How completely this plugin's response-side *presentation* policy — the
+    /// client-facing body rewrites that a finalized replay
+    /// (`RequestContext::finalized_response_replay`) deliberately skips so
+    /// non-idempotent rules cannot run twice over an already-transformed
+    /// representation — can be described to a representation retained for
+    /// replay.
     ///
-    /// Returning `Some` enrolls the instance in replay provenance: the plugin
-    /// cache folds every contribution, in configured execution order, into one
-    /// per-proxy digest (`PluginCacheRequestView::response_presentation_policy_digest`)
-    /// that `request_deduplication` binds into every representation it persists.
-    /// A stored representation replays only while that digest still matches, so
-    /// newly configured redaction can never be skipped by a retained replay.
+    /// Returning `Some` enrolls the instance in replay provenance. The plugin
+    /// cache folds every `Static` contribution, in configured execution order,
+    /// into one per-proxy digest
+    /// (`PluginCacheRequestView::response_presentation_policy_digest`) that
+    /// `request_deduplication` binds into every representation it retains; a
+    /// stored representation replays only while that digest still matches, so
+    /// newly configured redaction can never be skipped by a retained replay. A
+    /// single [`ResponsePresentationPolicy::Dynamic`] contribution collapses the
+    /// whole per-proxy fold to `None`, because a fold that silently omitted an
+    /// undescribable member would assert a completeness it does not have.
     ///
-    /// Implementations must derive the digest **only** from static
-    /// configuration — never from per-request data, pointers, timestamps, or
-    /// process-random state — so two processes loading equivalent configuration
-    /// derive the same value, and it must change whenever any rule that shapes
-    /// the client-visible representation changes. Use
-    /// `utils::policy_digest::static_config_digest` with a plugin-specific
+    /// `Static` implementations must derive the digest **only** from static
+    /// configuration — never from per-request data, live discovery state,
+    /// pointers, timestamps, or process-random state — so two processes loading
+    /// equivalent configuration derive the same value, and it must change
+    /// whenever any rule that shapes the client-visible representation changes.
+    /// Use `utils::policy_digest::static_config_digest` with a plugin-specific
     /// domain separator. Return only the digest: the value is persisted outside
     /// this process, so raw configuration must never be exposed here.
     ///
     /// Only response *body* transforms need enrollment. `after_proxy` header
     /// hooks — including the rejection-path hooks a synthetic replay runs
     /// through — still execute on a finalized replay, so header policy is
-    /// enforced live and is never skipped.
+    /// enforced live and is never skipped. (`response_transformer` consuming
+    /// `ctx.route_override_response_transform` without applying it on a
+    /// finalized replay is the deliberate counterpart: those route rules are
+    /// header-only and are already baked into the stored header map.)
     ///
     /// Every current implementor of `transform_response_body` /
     /// `transform_response_body_with_context` has been audited against that
-    /// rule. Enrolled: `response_transformer`, `sse`, `mcp_gateway`.
+    /// rule. Enrolled `Static`: `response_transformer`, `sse` — both rewrite
+    /// bodies purely from accepted configuration and hold no interior mutable
+    /// presentation state. Enrolled `Dynamic`: `mcp_gateway`.
     /// Deliberately not enrolled, and why the skip drops no live decision:
     ///
     /// - `compression` — content coding, not presentation. A replay is
@@ -6447,7 +6507,11 @@ pub trait Plugin: Send + Sync {
     ///   failing closed when it cannot rewrite. Newly configured redaction is
     ///   therefore applied to a replay under the *live* policy, which is
     ///   strictly stronger than proving a stored digest still matches.
-    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
+    ///
+    /// The `Dynamic` case is `compression`/`grpc_web`'s opposite: neither of
+    /// those has any interior mutable state that shapes a body (their atomics
+    /// are instance counters and metrics), so exclusion stays sound.
+    fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
         None
     }
 

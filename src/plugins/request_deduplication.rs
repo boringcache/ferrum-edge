@@ -32,8 +32,8 @@
 //! `ResponsePolicyProvenance` — the content digest of the published RTDS
 //! response-side gate map *and* the content digest of the effective static
 //! rules of **every** plugin whose response-body transform the replay skips
-//! (`response_transformer`, `sse`, and `mcp_gateway` today; see
-//! `Plugin::response_presentation_policy_digest` for the audited set and why
+//! (`response_transformer` and `sse` today; see
+//! `Plugin::response_presentation_policy` for the audited set and why
 //! `compression`, `grpc_web`, `ai_response_guard`, and `ai_tool_governor` are
 //! excluded) — and replays only while both still match:
 //!
@@ -43,8 +43,10 @@
 //!   representation and repeating the operation are both unacceptable, and the
 //!   client must retry after the bounded TTL.
 //! - **Store**: a response whose request straddled a gate publication, or whose
-//!   effective static policy was never observed, is not persisted to Redis at
-//!   all — its bytes belong to no provable policy.
+//!   effective presentation policy could not be established, is retained
+//!   nowhere — not in Redis and not in the local map. Its bytes belong to no
+//!   provable policy. In-flight ownership is untouched, so concurrent-duplicate
+//!   protection still holds; only the finalized replay is given up.
 //! - **Legacy/malformed payloads**: a Redis record without complete, decodable
 //!   provenance is rejected. It can never be replayed on the strength of an
 //!   assumed policy.
@@ -53,9 +55,33 @@
 //! flips of an RTDS-scoped instance; a redaction/header/body *rule* edit — or
 //! the addition, removal, or reordering of any other enrolled presentation
 //! plugin — that leaves the gate map identical would otherwise let an old Redis
-//! representation match the current digest and skip the new transform. Only
-//! fixed-size digests are stored — never rule text, header values, or any other
-//! configuration content.
+//! representation match the current digest and skip the new transform. An
+//! *incomplete* provenance matches nothing, including another incomplete one:
+//! two requests that both failed to establish the policy have not proven they
+//! share it. Only fixed-size digests are stored — never rule text, header
+//! values, catalog entries, upstream URLs, session identifiers, or any other
+//! configuration or runtime content.
+//!
+//! ## Plugins that cannot be composed with deduplication
+//!
+//! Some response-body rewrites are not a function of configuration at all.
+//! `mcp_gateway` resolves public resource/tool/prompt URIs against a
+//! per-downstream-session catalog it re-lists from upstream whenever its
+//! discovery TTL expires; entries appear, disappear, get remapped, or become
+//! ambiguous with no config edit and no plugin-cache rebuild. Worse, this
+//! plugin's `before_proxy` short-circuits at priority
+//! `priorities::REQUEST_DEDUPLICATION`, ahead of `priorities::MCP_GATEWAY`, so
+//! a replay is served without MCP validating or routing the request against the
+//! current catalog at all. No digest available before the lookup can witness
+//! that state, and deriving one would mean an upstream round trip under a
+//! per-session lock on the hot path.
+//!
+//! Rather than replay under an unprovable policy, the composition is refused:
+//! [`validate_composition`] rejects the pair at config admission and at
+//! plugin-cache construction. For the admission paths that only warn on
+//! pre-existing data, `ResponsePresentationPolicy::Dynamic` collapses the
+//! proxy's presentation digest to `None` at runtime, which fails both storage
+//! and replay closed through the rules above.
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -154,6 +180,110 @@ use super::utils::body_transform::is_event_stream_content_type;
 use super::utils::cache_headers::{is_per_request_trace_header, sanitize_cached_headers};
 use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePolicyProvenance};
+
+/// Plugins whose response-body rewrite is derived from live runtime state that
+/// no construction-time digest can describe, and which therefore cannot be
+/// composed with `request_deduplication` on the same proxy.
+///
+/// This is the config-admission mirror of the plugins that report
+/// [`super::ResponsePresentationPolicy::Dynamic`]. Admission works on
+/// `PluginConfig` names before any plugin is constructed, so the two surfaces
+/// are joined by name; `tests/unit/plugins/request_deduplication_tests.rs`
+/// asserts a constructed instance of each name actually reports `Dynamic`, so
+/// the list cannot drift away from the runtime behavior it stands in for.
+pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
+
+/// Reject composing `request_deduplication` with a plugin whose response-body
+/// presentation policy cannot be proven stable for a retained representation.
+///
+/// A dedup replay is a *finalized* representation: the synthetic replay path
+/// skips ordinary presentation transforms, and `request_deduplication`'s
+/// `before_proxy` short-circuits ahead of every plugin with a higher priority
+/// value — including `mcp_gateway`. So a hit is served without the MCP catalog
+/// ever being consulted, under a public-URI mapping that this gateway refreshes
+/// from upstream on its own schedule. There is no digest that can witness that
+/// state, so the composition is refused here rather than silently replaying
+/// bytes whose producing policy cannot be established.
+///
+/// Runtime plugin-cache construction repeats this check as a fail-closed
+/// backstop, and `ResponsePresentationPolicy::Dynamic` degrades the request
+/// path to never retaining or replaying, for the admission paths that only warn
+/// on pre-existing bad data.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    use crate::config::types::{PluginConfig, PluginScope};
+
+    let plugin_by_id: HashMap<&str, &PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| (plugin.id.as_str(), plugin))
+        .collect();
+
+    // A proxy/group-scoped instance replaces a same-named global for that
+    // proxy, so resolve each name the way the runtime merge does before
+    // deciding whether the pair is actually effective together.
+    let effective_ids = |proxy: &crate::config::types::Proxy, name: &str| -> Vec<String> {
+        let local: Vec<String> = proxy
+            .plugins
+            .iter()
+            .filter_map(|association| {
+                let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                let scope_applies = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                    // Proxy-group instances are required to omit `proxy_id`;
+                    // the explicit association is what makes them applicable.
+                    PluginScope::ProxyGroup => true,
+                    PluginScope::Global => false,
+                };
+                (plugin.enabled && plugin.plugin_name == name && scope_applies)
+                    .then(|| plugin.id.clone())
+            })
+            .collect();
+        if !local.is_empty() {
+            return local;
+        }
+        config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| {
+                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
+            })
+            .map(|plugin| plugin.id.clone())
+            .collect()
+    };
+
+    let mut errors = Vec::new();
+    for proxy in &config.proxies {
+        let dedup_ids = effective_ids(proxy, "request_deduplication");
+        if dedup_ids.is_empty() {
+            continue;
+        }
+        for dynamic_name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+            let dynamic_ids = effective_ids(proxy, dynamic_name);
+            if dynamic_ids.is_empty() {
+                continue;
+            }
+            errors.push(format!(
+                "request_deduplication cannot be composed with {dynamic_name} on proxy '{}': \
+                 an idempotent replay is served without re-running {dynamic_name}'s response \
+                 rewrite, which is derived from live upstream discovery state rather than \
+                 configuration, so a replay cannot be proven to match the current policy. \
+                 request_deduplication: {}; {dynamic_name}: {}. \
+                 Disable one of them on this proxy",
+                proxy.id,
+                dedup_ids.join(", "),
+                dynamic_ids.join(", ")
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// A cached response stored for deduplication replay.
 #[derive(Debug, Clone)]
@@ -624,15 +754,30 @@ impl RequestDeduplication {
         // The replay below suppresses ordinary presentation transforms, so it
         // is sound only while the stored bytes are provably the product of the
         // live response-side policy — both the RTDS gate content and the
-        // effective static rules. Any difference retires the representation.
+        // effective static rules. Any difference retires the representation,
+        // and so does an unprovable policy on either side: `admits_replay_of`
+        // refuses two incomplete values rather than letting "unknown" match
+        // "unknown". That is what fails a proxy carrying a
+        // `ResponsePresentationPolicy::Dynamic` plugin closed on the local
+        // path, where nothing else would have caught it.
         // 409 rather than a re-execution: the original backend side effect may
         // already have run under this idempotency key.
-        if cached.response_policy != ctx.response_policy_provenance() {
+        let live_policy = ctx.response_policy_provenance();
+        if !live_policy.admits_replay_of(&cached.response_policy) {
+            // Distinguish the two refusals for operators: a policy that moved
+            // is a transient, self-healing state, while an unestablished policy
+            // means this proxy composes deduplication with a presentation
+            // plugin whose rewrite cannot be witnessed and will never replay.
+            let body = if live_policy.complete().is_none()
+                || cached.response_policy.complete().is_none()
+            {
+                r#"{"error":"The response policy for this request could not be established, so a stored idempotent response cannot be replayed"}"#
+            } else {
+                r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
+            };
             return PluginResult::Reject {
                 status_code: 409,
-                body:
-                    r#"{"error":"The stored idempotent response was produced under a superseded response policy"}"#
-                        .to_string(),
+                body: body.to_string(),
                 headers: HashMap::new(),
             };
         }
@@ -2300,6 +2445,26 @@ impl Plugin for RequestDeduplication {
             return PluginResult::Continue;
         }
         let response_policy = ctx.response_policy_provenance();
+        if response_policy.complete().is_none() {
+            // The effective response-side presentation policy could not be
+            // established — no plugin-cache view, or this proxy carries a
+            // plugin whose response rewrite comes from live runtime state
+            // (`ResponsePresentationPolicy::Dynamic`). These bytes belong to no
+            // provable policy, so they are retained nowhere: not in Redis,
+            // which `redis_payload_for_response` would refuse anyway, and not
+            // in the local map, where a later request under an equally
+            // unprovable policy would otherwise be served them.
+            //
+            // Concurrent-duplicate protection is unaffected — the in-flight
+            // marking already happened and is kept until its bounded TTL, so a
+            // retry cannot repeat a possibly completed external side effect.
+            // Only the finalized *replay* is given up.
+            debug!(
+                "request_deduplication: response-side presentation policy could not be \
+                 established for this request; retaining no replayable representation"
+            );
+            return PluginResult::Continue;
+        }
 
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
         // marked in-flight is then short-circuited by a LATER `before_proxy`

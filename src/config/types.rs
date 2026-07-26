@@ -4516,6 +4516,12 @@ impl GatewayConfig {
             errors.extend(chargeback_errors);
         }
 
+        if let Err(dedup_errors) =
+            crate::plugins::request_deduplication::validate_composition(self)
+        {
+            errors.extend(dedup_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject

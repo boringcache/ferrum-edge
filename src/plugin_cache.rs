@@ -35,8 +35,8 @@ use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnecti
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
-    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
-    create_plugin_with_http_client_and_config_id,
+    Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
+    create_plugin_with_http_client, create_plugin_with_http_client_and_config_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -2657,6 +2657,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     http_client: &PluginHttpClient,
 ) -> Result<(), String> {
     validate_api_chargeback_ownership(config)?;
+    validate_replay_provenance_composition(config)?;
     let mut errors = Vec::new();
     let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
@@ -2873,13 +2874,20 @@ pub struct PluginPhaseData {
     /// Content-derived digest of the effective static response-side
     /// *presentation* policy for this proxy/protocol pair, folded in configured
     /// execution order from every plugin that opted in through
-    /// `Plugin::response_presentation_policy_digest()`.
+    /// `Plugin::response_presentation_policy()`.
     ///
-    /// Plugins that persist a finalized client representation for replay bind
+    /// Plugins that retain a finalized client representation for replay bind
     /// this value, so a stored representation can be proven compatible with the
     /// live rules in a different process and after arbitrary reloads. Computed
     /// once per cache generation; the request path only copies 32 bytes.
-    pub response_presentation_policy_digest: [u8; 32],
+    ///
+    /// `None` when any enrolled instance reported
+    /// `ResponsePresentationPolicy::Dynamic` — its client-visible rewrite comes
+    /// from live runtime state that no construction-time digest describes, so
+    /// this proxy has no provable presentation policy and every replay consumer
+    /// must fail closed. Folding the remaining static members would produce a
+    /// digest that matches while an undescribed transform silently changes.
+    pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
@@ -2898,9 +2906,18 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     // instances in a different order produce a different client-visible
     // representation and must not share replay provenance.
     let mut presentation_policy_contributions: Vec<(&str, [u8; 32])> = Vec::new();
+    // Set by an enrolled instance whose rewrite is derived from live runtime
+    // state. It poisons the whole fold rather than being skipped: a digest that
+    // omitted an undescribable member would keep matching while that member's
+    // behavior changed underneath every retained representation.
+    let mut presentation_policy_unprovable = false;
     for p in plugins {
-        if let Some(digest) = p.response_presentation_policy_digest() {
-            presentation_policy_contributions.push((p.name(), digest));
+        match p.response_presentation_policy() {
+            Some(ResponsePresentationPolicy::Static(digest)) => {
+                presentation_policy_contributions.push((p.name(), digest));
+            }
+            Some(ResponsePresentationPolicy::Dynamic) => presentation_policy_unprovable = true,
+            None => {}
         }
         if p.requires_grpc_deadline_preflight() {
             grpc_deadline.push(Arc::clone(p));
@@ -2987,9 +3004,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
-        response_presentation_policy_digest: presentation_policy_digest(
-            presentation_policy_contributions,
-        ),
+        response_presentation_policy_digest: (!presentation_policy_unprovable)
+            .then(|| presentation_policy_digest(presentation_policy_contributions)),
     }
 }
 
@@ -3541,12 +3557,14 @@ impl PluginCacheInner {
             .unwrap_or_default()
     }
 
-    /// Effective static response-presentation policy digest, or `None` when
-    /// this cache generation has no entry for the proxy/protocol pair.
+    /// Effective static response-presentation policy digest, or `None` when it
+    /// cannot be established: this cache generation has no entry for the
+    /// proxy/protocol pair, or the entry's policy is unprovable because an
+    /// enrolled plugin's rewrite comes from live runtime state.
     ///
-    /// `None` is deliberately not folded into an "empty policy" digest here:
-    /// an absent entry means the effective policy is unknown, and callers that
-    /// persist representations must fail closed on it rather than record a
+    /// `None` is deliberately not folded into an "empty policy" digest here.
+    /// Both causes mean the effective policy is *unknown*, and callers that
+    /// retain representations must fail closed on it rather than record a
     /// provenance claim they cannot substantiate.
     pub(crate) fn get_response_presentation_policy_digest(
         &self,
@@ -3554,7 +3572,7 @@ impl PluginCacheInner {
         protocol: ProxyProtocol,
     ) -> Option<[u8; 32]> {
         self.protocol_entry(proxy_id, protocol)
-            .map(|entry| entry.phase.response_presentation_policy_digest)
+            .and_then(|entry| entry.phase.response_presentation_policy_digest)
     }
 
     pub(crate) fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
@@ -3634,9 +3652,7 @@ impl PluginCacheInner {
                 &entry.phase.initial_response_header_policy_names,
             ),
             response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-            response_presentation_policy_digest: Some(
-                entry.phase.response_presentation_policy_digest,
-            ),
+            response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -3724,8 +3740,10 @@ impl PluginCacheRequestView {
     }
 
     /// Effective static response-presentation policy digest for this request,
-    /// or `None` when this cache generation had no entry for the proxy and
-    /// protocol (so the policy is unknown, not empty).
+    /// or `None` when it could not be established — no entry for the proxy and
+    /// protocol in this cache generation, or an enrolled plugin whose rewrite
+    /// is driven by live runtime state. Either way the policy is unknown, not
+    /// empty, and replay consumers must fail closed.
     pub fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
         self.response_presentation_policy_digest
     }
@@ -3811,6 +3829,17 @@ fn validate_prometheus_metrics_ownership(config: &GatewayConfig) -> Result<(), S
 /// ownership (issue #2564).
 fn validate_api_chargeback_ownership(config: &GatewayConfig) -> Result<(), String> {
     crate::plugins::api_chargeback::validate_composition(config).map_err(|errors| errors.join("; "))
+}
+
+/// A `request_deduplication` replay is a finalized representation served
+/// without re-running the response-body rewrites of higher-priority plugins.
+/// Reject composing it with a plugin whose rewrite is derived from live
+/// upstream discovery state (`mcp_gateway`), which no persisted digest can
+/// witness, before constructing a cache generation that would otherwise replay
+/// under an unprovable policy.
+fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), String> {
+    crate::plugins::request_deduplication::validate_composition(config)
+        .map_err(|errors| errors.join("; "))
 }
 
 /// `__mesh_bpf_metrics` is a single scrape exporter per process. Require at
@@ -3903,6 +3932,7 @@ impl PluginCache {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
+        validate_replay_provenance_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4257,6 +4287,7 @@ impl PluginCache {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
+        validate_replay_provenance_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4298,6 +4329,7 @@ impl PluginCache {
         validate_prometheus_metrics_ownership(config)?;
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
+        validate_replay_provenance_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);

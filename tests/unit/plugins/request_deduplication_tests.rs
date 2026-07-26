@@ -15,13 +15,16 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
-use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
+use ferrum_edge::plugins::request_deduplication::{
+    DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, RequestDeduplication,
+};
 use ferrum_edge::plugins::response_transformer::ResponseTransformer;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::utils::policy_digest::presentation_policy_digest;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
-    create_plugin_with_http_client, create_plugin_with_http_client_and_config_id, priority,
+    ResponsePresentationPolicy, create_plugin_with_http_client,
+    create_plugin_with_http_client_and_config_id, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::json;
@@ -719,9 +722,12 @@ fn presentation_digest_for(configs: &[serde_json::Value]) -> [u8; 32] {
     }
     let mut contributions: Vec<(&str, [u8; 32])> = Vec::new();
     for plugin in &plugins {
-        let digest = plugin
-            .response_presentation_policy_digest()
-            .expect("response_transformer must enroll in replay provenance");
+        let ResponsePresentationPolicy::Static(digest) = plugin
+            .response_presentation_policy()
+            .expect("response_transformer must enroll in replay provenance")
+        else {
+            panic!("response_transformer policy must be statically provable");
+        };
         contributions.push((plugin.name(), digest));
     }
     presentation_policy_digest(contributions)
@@ -925,10 +931,12 @@ fn presentation_digest_for_plugin_specs(specs: &[(&str, serde_json::Value)]) -> 
         .collect();
     let contributions: Vec<(&str, [u8; 32])> = plugins
         .iter()
-        .filter_map(|plugin| {
-            plugin
-                .response_presentation_policy_digest()
-                .map(|digest| (plugin.name(), digest))
+        .filter_map(|plugin| match plugin.response_presentation_policy() {
+            Some(ResponsePresentationPolicy::Static(digest)) => Some((plugin.name(), digest)),
+            Some(ResponsePresentationPolicy::Dynamic) => {
+                panic!("{} has no statically provable policy to fold", plugin.name())
+            }
+            None => None,
         })
         .collect();
     presentation_policy_digest(contributions)
@@ -1009,33 +1017,68 @@ async fn replay_is_rejected_when_a_non_response_transformer_presentation_policy_
     assert!(!finalized_response_replay_for_test(&replay_ctx));
 }
 
-/// The `mcp_gateway` public-URI mapping is the other non-`response_transformer`
-/// enrollment: rewriting an upstream resource URI onto a different gateway URI
-/// changes the client representation a replay would otherwise keep serving.
+/// `mcp_gateway` must not claim a statically provable presentation policy. Its
+/// public URI/name rewrite is resolved against a per-session catalog re-listed
+/// from upstream on a discovery TTL, so no digest computed at construction
+/// describes it and a static enrollment would be a false compatibility claim.
+#[test]
+fn mcp_gateway_reports_a_dynamic_presentation_policy() {
+    let plugin = create_plugin_with_http_client(
+        "mcp_gateway",
+        &mcp_gateway_config("http://mcp-alpha:8080"),
+        PluginHttpClient::default(),
+    )
+    .expect("mcp_gateway config must be valid")
+    .expect("mcp_gateway must be a built-in plugin");
+
+    assert_eq!(
+        plugin.response_presentation_policy(),
+        Some(ResponsePresentationPolicy::Dynamic),
+        "mcp_gateway's rewrite comes from live catalog state, not configuration"
+    );
+}
+
+/// The name list config admission uses must not drift from the runtime
+/// behavior it stands in for: admission works on `PluginConfig` names before any
+/// plugin exists, so the join between the two surfaces is by name alone.
+#[test]
+fn every_dynamic_presentation_plugin_name_reports_dynamic_when_constructed() {
+    for name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+        let config = match *name {
+            "mcp_gateway" => mcp_gateway_config("http://mcp-alpha:8080"),
+            other => panic!("no test config for dynamic presentation plugin '{other}'"),
+        };
+        let plugin = create_plugin_with_http_client(name, &config, PluginHttpClient::default())
+            .unwrap_or_else(|err| panic!("{name} config must be valid: {err}"))
+            .unwrap_or_else(|| panic!("{name} must be a built-in plugin"));
+        assert_eq!(
+            plugin.response_presentation_policy(),
+            Some(ResponsePresentationPolicy::Dynamic),
+            "{name} is listed as dynamic for config admission but does not report Dynamic"
+        );
+    }
+}
+
+/// A proxy whose presentation policy cannot be established retains nothing for
+/// replay. Without this, a `Dynamic` plugin's `None` digest would compare equal
+/// to the next request's `None` and replay under a catalog nobody witnessed.
 #[tokio::test]
-async fn replay_is_rejected_when_the_mcp_public_uri_mapping_changes() {
+async fn unprovable_presentation_policy_retains_no_replayable_representation() {
     let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
     ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
     let plugin = make_plugin(json!({}));
 
-    let alpha = mcp_gateway_config("http://mcp-alpha:8080");
-    let beta = mcp_gateway_config("http://mcp-beta:8080");
-    let before = presentation_digest_for_plugin_specs(&[("mcp_gateway", alpha)]);
-    let after = presentation_digest_for_plugin_specs(&[("mcp_gateway", beta)]);
-    assert_ne!(
-        before, after,
-        "an mcp_gateway server-catalog edit must change the presentation policy digest"
-    );
-
-    let mut first_ctx = policy_bound_ctx(Some(before));
-    let mut headers = HashMap::from([("idempotency-key".to_string(), "mcp-catalog".to_string())]);
+    let mut first_ctx = policy_bound_ctx(None);
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "unprovable".to_string())]);
     assert!(matches!(
         plugin.before_proxy(&mut first_ctx, &mut headers).await,
         PluginResult::Continue
     ));
     complete_response(&plugin, &mut first_ctx).await;
 
-    let mut replay_ctx = policy_bound_ctx(Some(after));
+    // Same unestablished policy on both sides. "Unknown" must not match
+    // "unknown" — the second request is refused rather than replayed.
+    let mut replay_ctx = policy_bound_ctx(None);
     let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
     assert!(
         matches!(
@@ -1045,7 +1088,42 @@ async fn replay_is_rejected_when_the_mcp_public_uri_mapping_changes() {
                 ..
             }
         ),
-        "a replay stored under a superseded mcp catalog must be refused, got {result:?}"
+        "an unprovable presentation policy must never replay, got {result:?}"
+    );
+    assert!(!finalized_response_replay_for_test(&replay_ctx));
+}
+
+/// A representation stored under a provable policy must not be replayed to a
+/// later request whose policy could not be established — the direction that
+/// matters after a reload adds an `mcp_gateway` to a proxy that already has
+/// retained responses.
+#[tokio::test]
+async fn provable_stored_policy_does_not_replay_under_an_unprovable_live_policy() {
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    ferrum_edge::plugins::response_transformer::runtime_overlay::reset_for_test();
+    let plugin = make_plugin(json!({}));
+
+    let stored_under = presentation_digest_for(&[redaction_transformer("[redacted]")]);
+    let mut first_ctx = policy_bound_ctx(Some(stored_under));
+    let mut headers =
+        HashMap::from([("idempotency-key".to_string(), "provable-then-not".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut first_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut first_ctx).await;
+
+    let mut replay_ctx = policy_bound_ctx(None);
+    let result = plugin.before_proxy(&mut replay_ctx, &mut headers).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "a stored replay must not be served once the live policy is unprovable, got {result:?}"
     );
     assert!(!finalized_response_replay_for_test(&replay_ctx));
 }
@@ -1144,13 +1222,6 @@ fn presentation_policy_digest_covers_presence_multiplicity_and_order_across_plug
         with_sse, duplicated,
         "a second instance of the same plugin must change the digest"
     );
-
-    let mcp = ("mcp_gateway", mcp_gateway_config("http://mcp-alpha:8080"));
-    let with_mcp = presentation_digest_for_plugin_specs(&[sse, transformer, mcp]);
-    assert_ne!(
-        with_sse, with_mcp,
-        "mcp_gateway must contribute to the presentation policy digest"
-    );
 }
 
 /// Pins the audited exclusion set. These plugins transform response bodies but
@@ -1176,7 +1247,7 @@ fn audited_non_presentation_body_transforms_do_not_contribute_provenance() {
             .unwrap_or_else(|err| panic!("{name} config must be valid: {err}"))
             .unwrap_or_else(|| panic!("{name} must be a built-in plugin"));
         assert!(
-            plugin.response_presentation_policy_digest().is_none(),
+            plugin.response_presentation_policy().is_none(),
             "{name} is an audited exclusion from replay provenance; enrolling it must be \
              a deliberate change with its own reasoning"
         );

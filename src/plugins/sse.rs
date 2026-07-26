@@ -128,7 +128,7 @@ pub struct SsePlugin {
     wrap_non_sse_responses: bool,
 
     /// Content-derived digest of this instance's whole accepted static config,
-    /// used as replay provenance (see `response_presentation_policy_digest`).
+    /// used as replay provenance (see `response_presentation_policy`).
     ///
     /// Computed once at construction from the canonical form of the validated
     /// configuration, so it covers every present and future static knob without
@@ -350,8 +350,13 @@ impl super::Plugin for SsePlugin {
     /// itself the policy a stored representation must be bound to, and a
     /// conditional contribution would make the per-proxy digest depend on live
     /// request state rather than static configuration.
-    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
-        Some(self.static_policy_digest)
+    ///
+    /// `Static` is accurate: the wrapped framing is a pure function of accepted
+    /// configuration and the instance holds no interior mutable state.
+    fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
+        Some(super::ResponsePresentationPolicy::Static(
+            self.static_policy_digest,
+        ))
     }
 
     fn should_buffer_response_body_for_content_type(
