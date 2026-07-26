@@ -456,6 +456,164 @@ async fn test_db_config_backup_bootstrap() {
 }
 
 // ============================================================================
+// Test 2a: Invalid backup must fail closed (runtime validation)
+// ============================================================================
+
+/// When the DB is unreachable AND `FERRUM_DB_CONFIG_BACKUP_PATH` points at a
+/// syntactically valid JSON snapshot that violates the rejecting runtime
+/// contract (duplicate listen path), startup must fail closed rather than
+/// serving the ambiguous backup.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_db_config_backup_bootstrap_rejects_invalid_runtime_config() {
+    println!("\n=== DB Config Backup: unreachable DB + invalid backup JSON ===\n");
+    ensure_built().expect("Failed to build gateway binary");
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let backup_path: PathBuf = temp_dir.path().join("backup-invalid.json");
+
+        // Two proxies share the same catch-all listen_path — accepted by JSON
+        // deserialize/normalize but rejected by collect_rejecting_runtime_config_errors.
+        let backup_json = json!({
+            "version": "1",
+            "proxies": [
+                {
+                    "id": "dup-a",
+                    "listen_path": "/boot",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": 9,
+                    "strip_listen_path": true,
+                },
+                {
+                    "id": "dup-b",
+                    "listen_path": "/boot",
+                    "backend_scheme": "http",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": 9,
+                    "strip_listen_path": true,
+                }
+            ],
+            "consumers": [],
+            "upstreams": [],
+            "plugin_configs": [],
+        });
+        std::fs::write(&backup_path, backup_json.to_string()).expect("write backup");
+
+        let bogus_primary = "sqlite:/nonexistent/bootstrap/bogus-invalid-backup.db?mode=ro";
+        let jwt_secret = "backup-bootstrap-reject-test-jwt-secret".to_string();
+        let jwt_issuer = "ferrum-edge-backup-reject-test".to_string();
+
+        let mut child = Command::new(binary_path())
+            .env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", bogus_primary)
+            .env(
+                "FERRUM_DB_CONFIG_BACKUP_PATH",
+                backup_path.to_string_lossy().to_string(),
+            )
+            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
+            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
+            // Both listeners are irrelevant to this pre-serving rejection
+            // path. Disabling them avoids introducing a bind/drop/rebind race
+            // into a test whose sole success condition is a non-zero exit.
+            .env("FERRUM_ADMIN_HTTP_PORT", "0")
+            .env("FERRUM_PROXY_HTTP_PORT", "0")
+            .env("FERRUM_DB_POLL_INTERVAL", "2")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            .env("FERRUM_LOG_LEVEL", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn gateway");
+
+        // An invalid backup should fail closed with a non-zero status once the
+        // unreachable primary pool times out and the backup rejection path
+        // runs. If the process keeps running, it accepted the invalid snapshot.
+        let deadline = SystemTime::now() + Duration::from_secs(25);
+        let mut try_wait_err = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if SystemTime::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Ok(None) => break None,
+                Err(e) => {
+                    try_wait_err = Some(format!("attempt {}: try_wait failed: {}", attempt, e));
+                    break None;
+                }
+            }
+        };
+
+        // stderr is a pipe: reading it while a timed-out child is still alive
+        // can block forever waiting for EOF. Terminate and reap first.
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let stderr = child
+            .stderr
+            .take()
+            .map(|mut pipe| {
+                use std::io::Read;
+                let mut buf = String::new();
+                let _ = pipe.read_to_string(&mut buf);
+                buf
+            })
+            .unwrap_or_default();
+
+        match status {
+            Some(status) if !status.success() => {
+                let lower = stderr.to_lowercase();
+                assert!(
+                    lower.contains("failed runtime validation")
+                        || lower.contains("config backup")
+                            && (lower.contains("rejected") || lower.contains("overlapping")),
+                    "stderr must mention backup runtime rejection.\nstderr:\n{stderr}"
+                );
+                println!(
+                    "  Gateway failed closed on invalid backup (exit={:?})",
+                    status,
+                );
+                println!("\n=== DB Config Backup Bootstrap Rejection Test PASSED ===\n");
+                return;
+            }
+            Some(status) => {
+                last_err = format!(
+                    "attempt {}: gateway exited successfully ({:?}) despite invalid backup\nstderr:\n{}",
+                    attempt, status, stderr
+                );
+            }
+            None => {
+                last_err = try_wait_err.unwrap_or_else(|| {
+                    format!(
+                        "attempt {}: gateway did not exit after accepting an invalid backup\nstderr:\n{}",
+                        attempt, stderr
+                    )
+                });
+            }
+        }
+
+        eprintln!("  {}", last_err);
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    panic!(
+        "Invalid config backup was not rejected after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+// ============================================================================
 // Test 2b: Backup bootstrap recovers via failover URL (no primary ever up)
 // ============================================================================
 
