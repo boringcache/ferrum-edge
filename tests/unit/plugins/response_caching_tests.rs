@@ -2396,12 +2396,21 @@ async fn test_consumer_keyed_caching() {
         "cache_key_include_consumer": true
     }));
 
+    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in.
+    // `cache_key_include_consumer` only partitions keys; it cannot authorize
+    // storage (see `test_consumer_key_partition_does_not_override_shared_cache_admission`).
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
     // Cache response for user A
     let mut ctx_a = make_ctx("GET", "/api/data");
     ctx_a.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
     let mut h = HashMap::new();
     plugin.before_proxy(&mut ctx_a, &mut h).await;
-    let mut rh = HashMap::new();
+    let mut rh = public_response.clone();
     plugin.after_proxy(&mut ctx_a, 200, &mut rh).await;
     plugin
         .on_final_response_body(&mut ctx_a, 200, &rh, b"alice-data")
@@ -2428,11 +2437,17 @@ async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
         "cache_key_include_consumer": true
     }));
 
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
     let mut ctx_external = make_ctx("GET", "/api/data");
     ctx_external.authenticated_identity = Some("oidc-alice".to_string());
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx_external, &mut headers).await;
-    let mut response_headers = HashMap::new();
+    let mut response_headers = public_response.clone();
     plugin
         .after_proxy(&mut ctx_external, 200, &mut response_headers)
         .await;
