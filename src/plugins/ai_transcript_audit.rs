@@ -41,7 +41,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
@@ -119,10 +118,14 @@ pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
     "include_consumer_username",
     "include_client_ip",
     "include_raw_headers",
+    "path_mode",
 ];
 
 /// Accepted keys under `sink`. `custom_headers` remains an intentional free-form
-/// string map; every other sink property is fixed-shape.
+/// string map (arbitrary header names -> value templates); every other sink
+/// property is fixed-shape. Header value templates are literal text plus
+/// `${secret:NAME}` references, which resolve only the
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_*` env namespace (see [`SINK_SECRET_ENV_PREFIX`]).
 pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "type",
     "endpoint_url",
@@ -136,6 +139,14 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "on_buffer_full",
     "on_sink_error",
 ];
+
+/// Env-var namespace that transcript-sink custom headers may reference. A
+/// `${secret:NAME}` header-value reference resolves
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` only, so a config writer can never
+/// expand unrelated Ferrum/database/cloud/system environment variables into an
+/// outbound header. There is no generic `${NAME}` process-environment
+/// interpolation; any other `${...}` form is rejected at config parse.
+const SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_";
 
 /// Deployment-safe hard maximum for `limits.max_request_bytes` (1 MiB). Aligns
 /// with shared logger `HARD_MAX_ENTRY_BYTES` so a single excerpt cannot exceed
@@ -262,6 +273,39 @@ enum SinkErrorPolicy {
     Reject,
 }
 
+/// How the request path is exported. Applications routinely embed emails,
+/// account ids, document names, or tokens in path segments, so the literal
+/// path is never exported by default in a privacy mode — the safe default is
+/// the low-cardinality route identifier (`Template`) for every mode except the
+/// explicit `full_body` raw-capture opt-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathMode {
+    /// Do not export the path at all.
+    Omit,
+    /// Export the matched route identifier (proxy `listen_path`, else proxy
+    /// name) instead of the user-controlled request path. Omitted when no
+    /// route identifier is available.
+    Template,
+    /// Export the literal path with the configured PII redactor applied.
+    Redact,
+    /// Export a keyed HMAC-SHA256 hex digest of the literal path (stable
+    /// correlation token, not brute-forceable offline; shares the redaction key).
+    Hash,
+    /// Export the literal path verbatim. Must be opted into explicitly.
+    Raw,
+}
+
+/// Default path privacy for a capture mode. `full_body` is the deliberate raw
+/// capture opt-in, so it defaults to the literal path; every privacy mode
+/// defaults to the route identifier so a literal path is never exported by
+/// accident under `metadata_only`, `redacted_body`, or `hash_only`.
+fn default_path_mode(mode: AuditMode) -> PathMode {
+    match mode {
+        AuditMode::FullBody => PathMode::Raw,
+        _ => PathMode::Template,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CaptureConfig {
     request: bool,
@@ -320,6 +364,7 @@ struct PrivacyConfig {
     include_consumer_username: bool,
     include_client_ip: bool,
     include_raw_headers: bool,
+    path_mode: PathMode,
 }
 
 /// Per-request request-side capture, keyed by `record_id`. Never holds a full
@@ -393,7 +438,11 @@ struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     client_ip: Option<String>,
     method: String,
-    path: String,
+    /// Request path, transformed per `privacy.path_mode` (omitted, route
+    /// identifier, redacted, keyed hash, or raw). Absent when omitted or when
+    /// `template` mode has no route identifier available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -462,7 +511,12 @@ struct EnvelopeOwned {
     consumer_username: Option<String>,
     client_ip: Option<String>,
     method: String,
+    /// Literal request path (never exported directly; transformed by
+    /// `privacy.path_mode` in `build_record`).
     path: String,
+    /// Low-cardinality route identifier for `path_mode = template`: the matched
+    /// proxy `listen_path` (else proxy name). `None` when unavailable.
+    route_template: Option<String>,
     status_code: u16,
 }
 
@@ -521,11 +575,34 @@ impl RecordsPerMinute {
 #[derive(Clone)]
 struct HttpFlushConfig {
     endpoint_url: String,
-    /// Header name + `${VAR}`-expandable value template. The template (not the
-    /// resolved secret) is stored, so a config dump never leaks the token.
-    custom_headers: Vec<(HeaderName, String)>,
+    /// Fully materialized outbound headers, resolved once at background-task
+    /// activation from [`CustomHeaderSpec`]s (secrets marked sensitive so they
+    /// are never logged). Empty until `start_background_tasks` publishes the
+    /// materialized set; the hot send path never re-parses templates or reads
+    /// the environment per batch, and there is no fallible per-field
+    /// construction that could skip a header and send anyway.
+    custom_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     http_client: PluginHttpClient,
     sink_healthy: Arc<AtomicBool>,
+}
+
+/// One segment of a custom-header value template.
+enum HeaderSegment {
+    /// Literal text validated as header-value-safe at config parse.
+    Literal(String),
+    /// A `${secret:NAME}` reference; holds the fully-qualified env var name
+    /// (`FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>`), resolved at activation only.
+    Secret(String),
+}
+
+/// A parsed, statically-validated custom outbound header. The value is a
+/// template of literal and secret segments; the secret is materialized once at
+/// activation (never stored resolved in config, never logged).
+struct CustomHeaderSpec {
+    name: HeaderName,
+    /// Original header-name text for diagnostics (never the secret value).
+    display_name: String,
+    segments: Vec<HeaderSegment>,
 }
 
 pub struct AiTranscriptAudit {
@@ -539,6 +616,11 @@ pub struct AiTranscriptAudit {
     redactor: Arc<PiiRedactor>,
     batch_config: BatchConfig,
     flush_config: HttpFlushConfig,
+    /// Statically-validated custom header templates. Materialized into
+    /// `flush_config.custom_headers` at `start_background_tasks`, so a missing/
+    /// empty/invalid secret or header value fails activation (the generation is
+    /// never published) rather than being silently skipped at send time.
+    custom_header_specs: Vec<CustomHeaderSpec>,
     logger: DeferredBatchingLogger<AuditRecord>,
     endpoint_hostname: String,
     namespace: String,
@@ -711,6 +793,32 @@ impl AiTranscriptAudit {
             AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS,
         )?;
         let privacy_obj = cfg_object(config, "privacy", "privacy")?.unwrap_or(&empty);
+        let path_mode = match cfg_str(privacy_obj, "path_mode", "privacy")? {
+            Some("omit") => PathMode::Omit,
+            Some("template") => PathMode::Template,
+            Some("redact") => PathMode::Redact,
+            Some("hash") => PathMode::Hash,
+            Some("raw") => PathMode::Raw,
+            Some(other) => {
+                return Err(format!(
+                    "ai_transcript_audit: 'privacy.path_mode' must be one of omit, template, \
+                     redact, hash, raw (got {other:?})"
+                ));
+            }
+            None => default_path_mode(mode),
+        };
+        // `redact` path mode with an empty pattern set would export the literal
+        // path unchanged while claiming redaction — the same silent
+        // pass-through the body-redaction guard rejects. `hash_only`/`full_body`
+        // are exempt from that body guard, so re-check here for the path.
+        if path_mode == PathMode::Redact && builtins.is_empty() && custom.is_empty() {
+            return Err(
+                "ai_transcript_audit: 'privacy.path_mode: redact' requires at least one \
+                 'redaction.builtins' or 'redaction.custom_patterns' pattern; otherwise the \
+                 literal path would be exported unredacted — use 'omit', 'template', or 'hash'"
+                    .to_string(),
+            );
+        }
         let privacy = PrivacyConfig {
             include_consumer_username: cfg_bool(
                 privacy_obj,
@@ -720,6 +828,7 @@ impl AiTranscriptAudit {
             )?,
             include_client_ip: cfg_bool(privacy_obj, "include_client_ip", false, "privacy")?,
             include_raw_headers: cfg_bool(privacy_obj, "include_raw_headers", false, "privacy")?,
+            path_mode,
         };
 
         // ---- sink ----
@@ -761,7 +870,7 @@ impl AiTranscriptAudit {
                 );
             }
         }
-        let custom_headers = parse_sink_headers(sink_obj)?;
+        let custom_header_specs = parse_sink_headers(sink_obj)?;
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",
             batch_size: 50,
@@ -799,7 +908,8 @@ impl AiTranscriptAudit {
         let sink_healthy = Arc::new(AtomicBool::new(true));
         let flush_config = HttpFlushConfig {
             endpoint_url,
-            custom_headers,
+            // Materialized from `custom_header_specs` at `start_background_tasks`.
+            custom_headers: Arc::new(Vec::new()),
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
         };
@@ -822,6 +932,7 @@ impl AiTranscriptAudit {
             redactor: Arc::new(redactor),
             batch_config,
             flush_config,
+            custom_header_specs,
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
             namespace,
@@ -1281,7 +1392,7 @@ impl AiTranscriptAudit {
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
-        let (proxy_id, proxy_name, namespace) = match ctx.matched_proxy.as_ref() {
+        let (proxy_id, proxy_name, namespace, route_template) = match ctx.matched_proxy.as_ref() {
             Some(proxy) => (
                 Some(proxy.id.clone()),
                 proxy.name.clone(),
@@ -1290,8 +1401,11 @@ impl AiTranscriptAudit {
                 } else {
                     proxy.namespace.clone()
                 },
+                // Prefer the operator-configured `listen_path` (a path-shaped,
+                // low-cardinality route identifier), else the proxy name.
+                proxy.listen_path.clone().or_else(|| proxy.name.clone()),
             ),
-            None => (None, None, self.namespace.clone()),
+            None => (None, None, self.namespace.clone(), None),
         };
         EnvelopeOwned {
             proxy_id,
@@ -1309,6 +1423,7 @@ impl AiTranscriptAudit {
             },
             method: ctx.method.clone(),
             path: ctx.path.clone(),
+            route_template,
             status_code: status,
         }
     }
@@ -1334,7 +1449,23 @@ impl AiTranscriptAudit {
             },
             method: summary.http_method.clone(),
             path: summary.request_path.clone(),
+            // The summary carries no `listen_path`; the proxy name is the
+            // available low-cardinality route identifier on this fallback path.
+            route_template: summary.proxy_name.clone(),
             status_code: summary.response_status_code,
+        }
+    }
+
+    /// Apply `privacy.path_mode` to the envelope's literal path. Returns the
+    /// value to export (or `None` to omit). Runs off the request hot path (only
+    /// during record assembly for a captured transaction).
+    fn resolve_export_path(&self, envelope: &EnvelopeOwned) -> Option<String> {
+        match self.privacy.path_mode {
+            PathMode::Omit => None,
+            PathMode::Raw => Some(envelope.path.clone()),
+            PathMode::Redact => Some(self.redactor.redact(&envelope.path)),
+            PathMode::Hash => Some(self.redactor.keyed_hash_hex(envelope.path.as_bytes())),
+            PathMode::Template => envelope.route_template.clone(),
         }
     }
 
@@ -1457,6 +1588,7 @@ impl AiTranscriptAudit {
             (None, false, None)
         };
         let provider = if harvests { harvest.provider } else { None };
+        let path = self.resolve_export_path(&envelope);
         // Raw headers require BOTH the capture switch and the privacy opt-in
         // (defense in depth); values are still redacted by key.
         let headers = if harvests && self.capture.headers && self.privacy.include_raw_headers {
@@ -1477,7 +1609,7 @@ impl AiTranscriptAudit {
             consumer_username: envelope.consumer_username,
             client_ip: envelope.client_ip,
             method: envelope.method,
-            path: envelope.path,
+            path,
             model,
             provider,
             status_code: envelope.status_code,
@@ -1576,7 +1708,18 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
-        let flush_config = self.flush_config.clone();
+        // Materialize every custom header (resolving `${secret:NAME}` references
+        // against `FERRUM_TRANSCRIPT_SINK_SECRET_*`) BEFORE the batching worker
+        // starts. A missing, empty, or invalid secret/header value fails
+        // activation here, so the generation is never published and admission
+        // never begins healthy under a predictable invalid-auth/routing header
+        // config — instead of silently dropping the field and sending the first
+        // batch unauthenticated. Runs on serving nodes only (CP/admin config
+        // validation never starts background tasks), so secrets that live on the
+        // data plane are not required at CP admission time.
+        let materialized = materialize_sink_headers(&self.custom_header_specs)?;
+        let mut flush_config = self.flush_config.clone();
+        flush_config.custom_headers = Arc::new(materialized);
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
@@ -2306,15 +2449,12 @@ impl ResponseStreamInspector for AuditStreamInspector {
 async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<(), String> {
     let entry_count = batch.len();
     let mut request = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
-    for (name, template) in &cfg.custom_headers {
-        let value = expand_env_vars(template);
-        match HeaderValue::from_str(&value) {
-            Ok(header_value) => request = request.header(name.clone(), header_value),
-            Err(_) => warn!(
-                header = %name,
-                "ai_transcript_audit: dropping custom header with an invalid value after env expansion"
-            ),
-        }
+    // Headers were fully validated and materialized at activation
+    // (`materialize_sink_headers`), so there is no per-batch env expansion,
+    // template parsing, or fallible construction here — a required header can
+    // never be silently skipped while the batch is still sent.
+    for (name, value) in cfg.custom_headers.iter() {
+        request = request.header(name.clone(), value.clone());
     }
     let response = cfg
         .http_client
@@ -2322,7 +2462,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
         .await;
     // Sink health is derived from the raw collector response, NOT from the
     // shared `handle_http_batch_response` result: that helper treats a
-    // non-retryable non-2xx (401/403/413, e.g. an expired ${AUDIT_TOKEN}) as a
+    // non-retryable non-2xx (401/403/413, e.g. an expired sink token) as a
     // discarded-but-Ok batch so the other logging sinks do not retry it, but
     // for this plugin every record in that batch was silently lost — under
     // `on_sink_error: reject` the sink must go unhealthy so audited traffic
@@ -3182,40 +3322,152 @@ fn bool_str(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-/// Expand `${NAME}` occurrences from the process environment (unset/unknown ->
-/// empty). Malformed `${...}` is left literal. Applied lazily at send time so
-/// the resolved secret is never stored in config.
-fn expand_env_vars(template: &str) -> String {
-    if !template.contains("${") {
-        return template.to_string();
-    }
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find('}') {
-            let name = &after[..end];
-            if is_valid_env_name(name) {
-                if let Ok(value) = std::env::var(name) {
-                    out.push_str(&value);
-                }
-                rest = &after[end + 1..];
-                continue;
-            }
-        }
-        out.push_str("${");
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+/// Whether every byte of `text` is legal inside an HTTP header value
+/// (visible ASCII, space, or HTAB, plus obs-text). Rejects the CR/LF/NUL and
+/// other control bytes that would make `HeaderValue::from_str` fail, so a
+/// literal template segment can be validated at config parse independently of
+/// the (unknown) secret bytes.
+fn is_header_value_safe(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
 }
 
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
-        })
+/// Push a validated literal segment (skipping empty runs). A literal that
+/// carries bytes illegal in a header value is a hard config error.
+fn push_literal_segment(
+    segments: &mut Vec<HeaderSegment>,
+    text: &str,
+    display_name: &str,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if !is_header_value_safe(text) {
+        return Err(format!(
+            "ai_transcript_audit: sink.custom_headers['{display_name}'] value contains bytes \
+             that are invalid in an HTTP header value"
+        ));
+    }
+    segments.push(HeaderSegment::Literal(text.to_string()));
+    Ok(())
+}
+
+/// Parse a single custom-header value template into literal/secret segments.
+///
+/// The only secret syntax is `${secret:NAME}`, which resolves
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` at activation. `NAME` is uppercase
+/// `[A-Z_][A-Z0-9_]*`. Any other `${...}` form — including a bare
+/// `${SOME_VAR}` process-environment reference — is a hard error, so unrelated
+/// environment secrets can never be interpolated and a malformed reference can
+/// never be silently emitted as literal text.
+fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<HeaderSegment>, String> {
+    let mut segments: Vec<HeaderSegment> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        push_literal_segment(&mut segments, &rest[..start], display_name)?;
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] has an unterminated \
+                 '${{...}}' reference; only '${{secret:NAME}}' references are supported"
+            ));
+        };
+        let inner = &after[..end];
+        let Some(suffix) = inner.strip_prefix("secret:") else {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] uses an unsupported \
+                 reference '${{{inner}}}'; only '${{secret:NAME}}' is permitted (it resolves \
+                 the {SINK_SECRET_ENV_PREFIX}NAME environment variable and cannot read any other \
+                 process environment variable)"
+            ));
+        };
+        if !is_valid_secret_suffix(suffix) {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] secret reference name \
+                 '{suffix}' must be uppercase [A-Z_][A-Z0-9_]* (it resolves \
+                 {SINK_SECRET_ENV_PREFIX}{suffix})"
+            ));
+        }
+        segments.push(HeaderSegment::Secret(format!(
+            "{SINK_SECRET_ENV_PREFIX}{suffix}"
+        )));
+        rest = &after[end + 1..];
+    }
+    push_literal_segment(&mut segments, rest, display_name)?;
+    if segments.is_empty() {
+        return Err(format!(
+            "ai_transcript_audit: sink.custom_headers['{display_name}'] value must not be empty"
+        ));
+    }
+    Ok(segments)
+}
+
+/// Secret-reference name charset: uppercase letters/underscore, then also
+/// digits. Mirrors env-var naming and keeps the resolved name inside the
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_` namespace with no way to escape it.
+fn is_valid_secret_suffix(suffix: &str) -> bool {
+    let mut bytes = suffix.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_uppercase()) {
+        return false;
+    }
+    bytes.all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+/// Resolve every [`CustomHeaderSpec`] against the environment into concrete
+/// headers. Called once at background-task activation. A secret that is unset
+/// or empty, or a value that is not a legal `HeaderValue`, is a hard error so
+/// activation fails closed. The resolved secret value is never logged or placed
+/// in any error message; produced values are marked sensitive.
+fn materialize_sink_headers(
+    specs: &[CustomHeaderSpec],
+) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut value = String::new();
+        for segment in &spec.segments {
+            match segment {
+                HeaderSegment::Literal(text) => value.push_str(text),
+                HeaderSegment::Secret(env_name) => {
+                    let resolved = std::env::var(env_name).map_err(|_| {
+                        format!(
+                            "ai_transcript_audit: sink.custom_headers['{}'] requires environment \
+                             variable {env_name}, which is not set",
+                            spec.display_name
+                        )
+                    })?;
+                    if resolved.is_empty() {
+                        return Err(format!(
+                            "ai_transcript_audit: sink.custom_headers['{}'] environment variable \
+                             {env_name} is set but empty",
+                            spec.display_name
+                        ));
+                    }
+                    value.push_str(&resolved);
+                }
+            }
+        }
+        // A purely-literal empty value is rejected at parse; this guards the
+        // case where every segment resolved but combined to empty.
+        if value.is_empty() {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] materialized to an empty value",
+                spec.display_name
+            ));
+        }
+        let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
+            format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] materialized to a value that is \
+                 not a valid HTTP header",
+                spec.display_name
+            )
+        })?;
+        header_value.set_sensitive(true);
+        out.push((spec.name.clone(), header_value));
+    }
+    Ok(out)
 }
 
 // ---- config parsing helpers ----
@@ -3279,8 +3531,12 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> {
-    let mut out = Vec::new();
+/// Parse and statically validate `sink.custom_headers`. Header names and value
+/// templates (literal + `${secret:NAME}` segments) are validated here at config
+/// admission (CP/admin-safe: no environment is read). Secrets are resolved only
+/// later, at activation, by [`materialize_sink_headers`].
+fn parse_sink_headers(obj: &Value) -> Result<Vec<CustomHeaderSpec>, String> {
+    let mut out: Vec<CustomHeaderSpec> = Vec::new();
     let Some(value) = obj.get("custom_headers") else {
         return Ok(out);
     };
@@ -3294,8 +3550,13 @@ fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> 
         let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
             format!("ai_transcript_audit: invalid sink.custom_headers name '{key}': {error}")
         })?;
-        out.retain(|(existing, _)| *existing != name);
-        out.push((name, value.to_string()));
+        let segments = parse_header_template(value, key)?;
+        out.retain(|spec| spec.name != name);
+        out.push(CustomHeaderSpec {
+            name,
+            display_name: key.clone(),
+            segments,
+        });
     }
     Ok(out)
 }
