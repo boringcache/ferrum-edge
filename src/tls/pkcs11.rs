@@ -53,8 +53,7 @@ const MAX_RSA_EXPONENT_BYTES: usize = 16;
 /// Maximum DER size of the PKCS#1 `RSAPublicKey` carried in an accepted leaf
 /// certificate. This covers the bounded modulus and exponent above plus their
 /// INTEGER and SEQUENCE headers.
-const MAX_RSA_PUBLIC_KEY_DER_BYTES: usize =
-    MAX_RSA_MODULUS_BYTES + MAX_RSA_EXPONENT_BYTES + 32;
+const MAX_RSA_PUBLIC_KEY_DER_BYTES: usize = MAX_RSA_MODULUS_BYTES + MAX_RSA_EXPONENT_BYTES + 32;
 
 /// Size of the random challenge signed by the token when the SPKI comparison
 /// is unavailable. Fresh per attempt so a captured signature from an earlier
