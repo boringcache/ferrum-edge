@@ -200,6 +200,9 @@ fn make_redis_sibling(header_name: &str, config_id: &str, prefix: &str) -> Reque
             "redis_url": "redis://127.0.0.1:1/0",
             "redis_connect_timeout_seconds": 1,
             "redis_key_prefix": prefix,
+            // Redis mode fails closed with 503 by default; these lifecycle
+            // fixtures deliberately exercise the opt-in local-only fallback.
+            "on_redis_unavailable": "local_only",
         }),
         PluginHttpClient::default(),
         config_id,
@@ -563,6 +566,134 @@ fn test_new_with_redis_config() {
         plugin.warmup_hostnames(),
         vec!["dedup-redis.internal".to_string()]
     );
+}
+
+/// GHSA-h2c3-j3cm-7ghh: unknown root keys must fail closed with a
+/// path-qualified diagnostic instead of being replaced by permissive defaults.
+#[test]
+fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
+    for (config, unknown, suggestion) in [
+        (json!({"enforce_requred": true}), "enforce_requred", "enforce_required"),
+        (json!({"sync_mod": "redis"}), "sync_mod", "sync_mode"),
+        (json!({"scope_by_consumers": false}), "scope_by_consumers", "scope_by_consumer"),
+        (json!({"ttl_second": 30}), "ttl_second", "ttl_seconds"),
+        (json!({"redis_ur": "redis://host:6379"}), "redis_ur", "redis_url"),
+    ] {
+        let error = RequestDeduplication::new(&config, PluginHttpClient::default())
+            .expect_err("unknown key must be rejected");
+        assert!(
+            error.contains("request_deduplication: unknown configuration key(s)"),
+            "{error}"
+        );
+        assert!(error.contains(&format!("'config.{unknown}'")), "{error}");
+        assert!(error.contains(suggestion), "{error}");
+    }
+
+    // Also rejected through the shared admission entrypoint used by file,
+    // database, and CP/DP validation.
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config(
+            "request_deduplication",
+            &json!({"enforce_requred": true})
+        )
+        .is_err(),
+        "shared plugin-config validation must reject unknown keys"
+    );
+}
+
+/// Every documented field is accepted, so the closed allowlist cannot drift
+/// into rejecting a legitimate configuration.
+#[test]
+fn every_documented_config_key_is_accepted() {
+    let config = json!({
+        "header_name": "X-Idempotency-Key",
+        "ttl_seconds": 120,
+        "inflight_ttl_seconds": 30,
+        "max_entries": 100,
+        "max_entry_size_bytes": 4096,
+        "max_total_size_bytes": 65536,
+        "applicable_methods": ["POST", "PUT"],
+        "scope_by_consumer": false,
+        "enforce_required": true,
+        "sync_mode": "redis",
+        "redis_url": "redis://dedup-redis.internal:6379/0",
+        "redis_tls": false,
+        "redis_key_prefix": "ferrum:dedup",
+        "redis_pool_size": 2,
+        "redis_connect_timeout_seconds": 2,
+        "redis_health_check_interval_seconds": 2,
+        "redis_username": "dedup",
+        "redis_password": "unused-in-tests",
+        "on_redis_unavailable": "local_only"
+    });
+    assert!(RequestDeduplication::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+/// GHSA-h2c3-j3cm-7ghh: a Redis-only field supplied outside Redis mode is the
+/// signature of a misspelled `sync_mode`, and must fail rather than leaving the
+/// deployment silently process-local.
+#[test]
+fn redis_only_keys_outside_redis_mode_are_rejected() {
+    for config in [
+        json!({"redis_url": "redis://host:6379"}),
+        json!({"sync_mode": "local", "redis_url": "redis://host:6379"}),
+        json!({"sync_mode": "local", "redis_key_prefix": "dedup"}),
+        json!({"on_redis_unavailable": "local_only"}),
+    ] {
+        let error = RequestDeduplication::new(&config, PluginHttpClient::default())
+            .expect_err("Redis-only key outside Redis mode must be rejected");
+        assert!(
+            error.contains("require sync_mode='redis'"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn on_redis_unavailable_requires_a_known_policy() {
+    let error = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "on_redis_unavailable": "fallback"
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect_err("unknown policy must be rejected");
+    assert!(error.contains("'on_redis_unavailable'"), "{error}");
+}
+
+/// GHSA-f72h-jm2p-mc73: an unreachable coordination store must not silently
+/// downgrade to a per-process ownership decision. The default refuses; the
+/// opt-in policy preserves the previous availability behavior.
+#[tokio::test]
+async fn unreachable_redis_fails_closed_by_default_and_local_only_on_request() {
+    let fail_closed = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1
+    }));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":1}"#);
+    let mut headers = keyed_headers("outage-key", "api.example.test", 12);
+    match fail_closed.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        other => panic!("expected fail-closed 503, got {other:?}"),
+    }
+    assert!(request_identity(&fail_closed, &ctx).is_none());
+
+    let local_only = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only"
+    }));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":1}"#);
+    let mut headers = keyed_headers("outage-key", "api.example.test", 12);
+    assert!(matches!(
+        local_only.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&local_only, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -2925,7 +3056,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
     assert_eq!(
         dedup.tracked_keys_count(),
         Some(1),
-        "an uncertain serverless side effect must retain the streamed fallback marker until TTL"
+        "an uncertain serverless side effect must retain a completion for the streamed fallback"
     );
 
     let mut retry_ctx = RequestContext::new(
@@ -2938,13 +3069,91 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
         "idempotency-key".to_string(),
         "serverless-stream-key".to_string(),
     );
-    assert!(matches!(
-        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
-        PluginResult::Reject {
-            status_code: 409,
-            ..
+    // GHSA-8cr6-rw38-7j59: the streamed fallback publishes a durable
+    // non-replayable tombstone rather than a bare in-flight marker, so the
+    // retry is refused for the completed-response TTL instead of becoming
+    // executable again the moment `inflight_ttl_seconds` elapses.
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "unexpected tombstone body"
+            );
         }
+        other => panic!("expected a non-replayable completion tombstone, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// GHSA-8cr6-rw38-7j59: an interrupted stream (client disconnect) behind a
+/// terminate-mode serverless invocation must also leave a durable completion,
+/// not merely an in-flight marker that expires into a fresh execution.
+#[tokio::test]
+async fn interrupted_stream_after_serverless_side_effect_publishes_durable_tombstone() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-interrupted-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
     ));
+    assert!(matches!(
+        serverless.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    dedup
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(8))
+        .await;
+
+    // The completion outlives the in-flight lease: expiring in-flight markers
+    // must not resurrect an executable key.
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-interrupted-key".to_string(),
+    );
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 409),
+        other => panic!("expected a non-replayable completion tombstone, got {other:?}"),
+    }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
@@ -3307,6 +3516,7 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
         "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only",
         "max_entry_size_bytes": 2048,
         "max_total_size_bytes": 768
     }));
@@ -4457,7 +4667,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v3:"));
+    assert!(logical_key.starts_with("v4:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -4553,7 +4763,8 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
     let redis_plugin = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
-        "redis_connect_timeout_seconds": 1
+        "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only"
     }));
 
     let mut local_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");

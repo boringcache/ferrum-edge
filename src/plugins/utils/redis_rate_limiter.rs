@@ -1856,6 +1856,103 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Replace a key's value with a TTL **only** when its current byte value
+    /// exactly matches `expected` — a single-key compare-and-set.
+    ///
+    /// This is the fencing primitive for ownership-token protocols: the caller
+    /// writes an ownership record, performs work, and then publishes its result
+    /// into the same key. Because the compare and the write happen inside one
+    /// `WATCH`/`MULTI`/`EXEC` transaction on a dedicated connection, an owner
+    /// whose record has since expired or been replaced by a successor can
+    /// neither overwrite the successor's value nor resurrect a key that Redis
+    /// already dropped:
+    ///
+    /// - `Ok(true)` — the caller still owned the key and the new value is live.
+    /// - `Ok(false)` — the key is missing, holds a different value, or was
+    ///   concurrently modified between `WATCH` and `EXEC`. Nothing was written.
+    /// - `Err(())` — Redis is unavailable; the caller must not assume either
+    ///   outcome.
+    ///
+    /// `WATCH`-based rather than Lua so RESP-compatible servers without
+    /// scripting still fence correctly (same rationale as
+    /// [`Self::delete_if_value_matches`]). Only one key is touched, so the
+    /// transaction is also slot-safe on sharded deployments.
+    pub async fn set_bytes_with_expire_if_value_matches(
+        &self,
+        key: &str,
+        expected: &[u8],
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<bool, ()> {
+        let mut conn = self.get_dedicated_connection().await.ok_or(())?;
+
+        let watch_result: Result<(), redis::RedisError> =
+            redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
+        if let Err(e) = watch_result {
+            warn!(
+                key = %key,
+                error = %e,
+                "Redis WATCH failed"
+            );
+            self.mark_unavailable();
+            return Err(());
+        }
+
+        let current: Result<Option<Vec<u8>>, redis::RedisError> =
+            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        match current {
+            Ok(Some(current)) if current == expected => {}
+            Ok(_) => {
+                let _: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                self.available.store(true, Ordering::Relaxed);
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-and-set GET failed"
+                );
+                self.mark_unavailable();
+                return Err(());
+            }
+        }
+
+        // A `nil` EXEC reply means the watched key changed after the compare,
+        // so the caller lost ownership in the race window. That is reported as
+        // `Ok(false)`, never as a successful publication.
+        let result: Result<Option<(String,)>, redis::RedisError> = redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(key)
+            .arg(value)
+            .arg("EX")
+            .arg(ttl_seconds as i64)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(Some(_)) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis compare-and-set transaction failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Build a full Redis key with the configured prefix.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();

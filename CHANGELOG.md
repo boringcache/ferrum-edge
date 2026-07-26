@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`request_deduplication` Redis ownership is now atomically fenced**
+  (GHSA-f72h-jm2p-mc73). Ownership and completion share one versioned operation
+  record per logical key. Completion is a compare-and-set on the owner's exact
+  in-flight record, so an owner whose `inflight_ttl_seconds` lease expired can
+  neither overwrite a successor's completed response nor publish while a
+  successor owns the operation; such a completion is discarded locally too
+  instead of being replayed as a non-authoritative result. Redis-mode logical
+  keys move to `v4` and the record format is versioned, so a rolling upgrade
+  reads and writes disjoint keys instead of mixing formats. A new
+  `on_redis_unavailable` field decides outage behavior and **defaults to
+  `fail_closed` (HTTP 503)**; deployments that prefer the previous
+  process-local fallback must set `on_redis_unavailable: "local_only"`.
+- **`request_deduplication` rejects unknown configuration keys**
+  (GHSA-h2c3-j3cm-7ghh). The runtime constructor and the OpenAPI
+  `RequestDeduplicationConfig` schema now share one closed allowlist, so a
+  misspelled `enforce_required` or `sync_mode` fails admission with a
+  path-qualified diagnostic instead of silently reverting to a permissive
+  default. Redis-only keys are additionally rejected outside
+  `sync_mode: "redis"`. Existing configurations carrying stray keys, or
+  `redis_*` fields in local mode, must be corrected before upgrade.
+- **Completed external operations behind a synthetic response now leave a
+  durable completion** (GHSA-8cr6-rw38-7j59). `serverless_function` terminate
+  mode and `ai_federation` provider calls declare that their short-circuit
+  performed the protected billable operation; deduplication publishes a
+  non-replayable 409 completion tombstone for `ttl_seconds` — fenced in Redis
+  mode — on buffered, empty/HEAD, streamed-fallthrough, and interrupted-delivery
+  outcomes alike. Previously an interrupted delivery only held a bare in-flight
+  marker, so an identical retry re-executed the operation once
+  `inflight_ttl_seconds` elapsed. The provenance contract is documented in
+  `docs/plugin_execution_order.md`.
+
 ### Changed
 
 - Authenticated `/metrics` now renders TLS certificate gauges from a cached,
