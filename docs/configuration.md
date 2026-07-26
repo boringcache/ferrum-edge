@@ -864,7 +864,9 @@ Core environment parsing lives in `src/config/env_config.rs`; early startup/pool
 
 ## Backend Egress / SSRF Protection
 
-The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). On shared-cache egress paths, each resolved IP is screened against the backend egress policy on **every** fresh resolve and cache insertion, including stale/background refreshes, so a hostname that re-resolves to a denied address is rejected rather than cached or served. LDAP applies a stricter connection-establishment path: every connection/reconnection bypasses DNS caches, resolves both A and AAAA, rejects the complete answer if any candidate is denied, and rechecks each concrete candidate immediately before dialing while retaining the configured hostname for TLS/SNI verification.
+The gateway dials backends, upstream targets, service-discovery results, and plugin endpoints (AI providers, log sinks, JWKS/OIDC, webhooks). On shared-cache egress paths, each resolved IP is screened against the backend egress policy on **every** fresh resolve and cache insertion, including stale/background refreshes, so a hostname that re-resolves to a denied address is rejected rather than cached or served. LDAP and `ws_logging` apply a stricter connection-establishment path: every connection/reconnection bypasses DNS caches, resolves both A and AAAA, rejects the complete answer if any candidate is denied, and rechecks each concrete candidate immediately before dialing while retaining the configured hostname for TLS/SNI verification.
+
+Plugin HTTP clients are also isolated from **ambient proxy environment**. Every policy-governed plugin `reqwest` client — the shared `PluginHttpClient` and its HTTP/2 companion, every fallback builder, and the dedicated clients built by `api_chargeback_sink` (custom ClickHouse TLS), `spec_expose`, and `load_testing` — is constructed with `no_proxy()`. Inherited `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` process state is therefore ignored. Without this, a selected proxy would be the address Ferrum resolves and screens while the *proxy* resolved and connected to the configured hostname, so the ultimate destination would never pass the policy — and a plain-HTTP endpoint would additionally disclose plugin payloads and authentication headers to that intermediary. There is no supported way to route plugin egress through a proxy; model an intended intermediary as the configured endpoint itself.
 
 The policy is composed from four `FERRUM_BACKEND_*` env vars and evaluated in this precedence (first match wins) for each resolved IP:
 
@@ -886,6 +888,16 @@ A fresh gateway runs `both` + baseline-on. It still reaches **loopback and RFC19
 - **Restore the legacy fully-open behaviour** (not recommended): `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`. With `both` + no deny CIDRs this makes egress unrestricted and the gateway logs a startup warning to that effect.
 
 The allow/deny CIDR lists accept comma-separated CIDRs or bare IPs (`10.0.0.0/8, 192.168.1.1, fc00::/7, ::1`); an invalid entry fails startup rather than silently failing open. The same policy is enforced by config validation, the DNS resolver, the connection pool, service discovery, and plugin endpoint screening.
+
+### `kafka_logging` requires a fully-open egress policy
+
+`kafka_logging` produces through librdkafka (`rdkafka 0.39`, `rdkafka-sys 4.10.0+2.12.1`), which owns its own resolution and connection path. It resolves bootstrap hostnames itself, and after the first Metadata response it **creates and dials brokers advertised by the cluster** — addresses Ferrum never sees. Enforcing them needs librdkafka's `connect_cb` / `resolve_cb`; the pinned Rust client exposes neither (`ThreadedProducer` builds its `NativeClientConfig` internally and `BaseProducer::from_client` is private), so there is no supported injection point.
+
+Rather than leave an unenforced egress path, **`kafka_logging` fails closed**: it is refused whenever the backend egress policy is able to deny any address. Concretely it is admitted only under a fully-open policy — `FERRUM_BACKEND_ALLOW_IPS=both`, no `FERRUM_BACKEND_DENY_CIDRS`, and `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`. The **default posture is not fully open**, so a default gateway rejects `kafka_logging` configuration at admission (file mode fails startup; database/CP admin writes return 400; a data plane refuses the update and keeps the previous generation).
+
+Bootstrap entries are still parsed with librdkafka's exact grammar (`[proto://]host[:port]`, URL-path truncation, bracketed-IPv6 port rules, empty host → `localhost`) and denied literal destinations are rejected — so a protocol-prefixed literal such as `PLAINTEXT://169.254.169.254:9092` cannot slip past screening. An entry whose protocol prefix disagrees with `security_protocol` is also rejected, because librdkafka would silently discard it and stop parsing the rest of the list.
+
+If you need Kafka log shipping under a restrictive egress policy, use a sink that dials through Ferrum's policy-aware path (`http_logging`, `tcp_logging`, `ws_logging`, `loki_logging`) and bridge to Kafka outside the gateway. Loosening the gateway-wide egress policy just to re-enable this sink weakens every other outbound path and is not recommended.
 
 ### Known limitation: `rediss://` (TLS) Redis hostnames
 
