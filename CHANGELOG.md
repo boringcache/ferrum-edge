@@ -33,11 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   durable completion** (GHSA-8cr6-rw38-7j59). `serverless_function` terminate
   mode and `ai_federation` provider calls declare that their short-circuit
   performed the protected billable operation; deduplication publishes a
-  non-replayable 409 completion tombstone for `ttl_seconds` — fenced in Redis
-  mode — on buffered, empty/HEAD, streamed-fallthrough, and interrupted-delivery
-  outcomes alike. Previously an interrupted delivery only held a bare in-flight
-  marker, so an identical retry re-executed the operation once
-  `inflight_ttl_seconds` elapsed. The provenance contract is documented in
+  non-replayable 409 completion tombstone — fenced in Redis mode — on buffered,
+  empty/HEAD, streamed-fallthrough, and interrupted-delivery outcomes alike.
+  Previously an interrupted delivery only held a bare in-flight marker, so an
+  identical retry re-executed the operation once `inflight_ttl_seconds` elapsed.
+  The tombstone is retained for `max(ttl_seconds, inflight_ttl_seconds)`: it
+  replaces a marker that blocked duplicates for `inflight_ttl_seconds`, so a
+  deployment configured with `inflight_ttl_seconds > ttl_seconds` never becomes
+  re-executable sooner than it was before. Ordinary replayable completions keep
+  `ttl_seconds`. The provenance contract is documented in
   `docs/plugin_execution_order.md`.
 
 ### Changed

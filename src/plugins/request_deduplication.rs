@@ -180,6 +180,7 @@ const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "x-forwarded-authorization",
 ];
 /// Plugin-specific root config keys, excluding the shared Redis fields.
+#[allow(dead_code)] // Used by external unit tests that verify OpenAPI/allowlist parity.
 pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
     "header_name",
     "ttl_seconds",
@@ -423,6 +424,18 @@ struct CachedResponse {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    /// How long this completion stays authoritative, measured from
+    /// `inserted_at`.
+    ///
+    /// An ordinary replayable completion uses `ttl_seconds`: once it expires the
+    /// key is legitimately re-executable. A completion published only to
+    /// *refuse* re-execution — the non-replayable external-operation tombstone —
+    /// uses [`RequestDeduplication::execution_barrier_retention`] instead,
+    /// because it replaces an in-flight marker that would have blocked for
+    /// `inflight_ttl_seconds`. Reusing `ttl_seconds` there would make a
+    /// deployment with `inflight_ttl_seconds > ttl_seconds` re-execute an
+    /// already-performed billable operation *sooner* than the bare marker did.
+    retention: Duration,
     /// Response-side presentation policy this representation was produced
     /// under. Replay is admitted only while it still equals the live policy.
     response_policy: ResponsePolicyProvenance,
@@ -608,6 +621,8 @@ struct LocalCompletionCandidate<'a> {
     body: &'a [u8],
     retain_inflight_on_skip: bool,
     retain_inflight_on_eviction: bool,
+    /// See [`CachedResponse::retention`].
+    retention: Duration,
     response_policy: ResponsePolicyProvenance,
 }
 
@@ -881,6 +896,26 @@ impl RequestDeduplication {
         })
     }
 
+    /// Lifetime of a completion that exists only to refuse re-execution rather
+    /// than to serve a representation of the real response: the non-replayable
+    /// external-operation tombstone, and any Redis record published without a
+    /// replay payload.
+    ///
+    /// Such a completion replaces an in-flight record that would otherwise have
+    /// blocked duplicates for `inflight_ttl_seconds`, so it must never expire
+    /// sooner than that. `inflight_ttl_seconds` may legitimately exceed
+    /// `ttl_seconds` (a long-running backend with a short replay-retention
+    /// window); publishing the barrier for only `ttl_seconds` there would make
+    /// an already-performed billable operation executable again *earlier* than
+    /// the bare marker did — the exposure GHSA-8cr6-rw38-7j59 closes.
+    ///
+    /// Ordinary replayable completions are unaffected and keep `ttl_seconds`:
+    /// they answer a retry by replaying, and expiring on schedule is the
+    /// documented meaning of `ttl_seconds`.
+    fn execution_barrier_retention(&self) -> Duration {
+        self.ttl.max(self.inflight_ttl)
+    }
+
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
         self.accounting_lock
             .lock()
@@ -943,12 +978,14 @@ impl RequestDeduplication {
     #[allow(dead_code)]
     pub(crate) fn expire_completed_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
-        let expired_at = Instant::now()
-            .checked_sub(self.ttl.saturating_add(Duration::from_secs(1)))
-            .unwrap_or_else(Instant::now);
+        let now = Instant::now();
         for mut entry in self.local_cache.iter_mut() {
             if let DeduplicationEntry::Completed { cached, .. } = entry.value_mut() {
-                cached.inserted_at = expired_at;
+                // Per-entry retention: an execution-barrier tombstone outlives
+                // `ttl_seconds`, so back-date past its own retention window.
+                cached.inserted_at = now
+                    .checked_sub(cached.retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
             }
         }
         self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
@@ -1115,7 +1152,7 @@ impl RequestDeduplication {
                         fingerprint: cached_fingerprint,
                         ..
                     } => {
-                        if now.duration_since(cached.inserted_at) < self.ttl {
+                        if now.duration_since(cached.inserted_at) < cached.retention {
                             if cached_fingerprint == fingerprint {
                                 return LocalDeduplicationAction::Replay(cached.clone());
                             }
@@ -1169,7 +1206,7 @@ impl RequestDeduplication {
                 return None;
             };
             if cached_fingerprint == fingerprint
-                && now.duration_since(cached.inserted_at) < self.ttl
+                && now.duration_since(cached.inserted_at) < cached.retention
             {
                 Some(cached.clone())
             } else {
@@ -1203,7 +1240,7 @@ impl RequestDeduplication {
                     fingerprint: cached_fingerprint,
                     ..
                 } => {
-                    if now.duration_since(cached.inserted_at) < self.ttl {
+                    if now.duration_since(cached.inserted_at) < cached.retention {
                         if cached_fingerprint == fingerprint {
                             LocalDeduplicationAction::Replay(cached.clone())
                         } else {
@@ -1295,9 +1332,12 @@ impl RequestDeduplication {
                             status_code: replay.status_code,
                             headers: replay.headers,
                             body: Bytes::from(replay.body),
-                            // Not meaningful for Redis entries: expiry is
-                            // enforced by the key TTL, not by this timestamp.
+                            // Neither field is meaningful for a Redis-sourced
+                            // record: expiry is enforced by the key TTL, and
+                            // this value is only ever replayed, never inserted
+                            // into the local map.
                             inserted_at: Instant::now(),
+                            retention: self.ttl,
                             response_policy,
                         })
                     }
@@ -1409,14 +1449,21 @@ impl RequestDeduplication {
     /// When `response` is absent, or its serialized payload exceeds
     /// `max_entry_size_bytes`, a small non-replayable completed tombstone is
     /// published instead. That still transitions ownership, so peers receive a
-    /// deterministic conflict for `ttl_seconds` rather than being freed to
-    /// re-execute the operation once the raw in-flight lease expires.
+    /// deterministic conflict rather than being freed to re-execute the
+    /// operation once the raw in-flight lease expires.
+    ///
+    /// `execution_barrier` marks a publication whose only purpose is refusing
+    /// re-execution — the fixed external-operation tombstone. Together with a
+    /// record that carries no replay payload at all, it selects
+    /// [`Self::execution_barrier_retention`] as the record TTL so the barrier
+    /// can never expire sooner than the in-flight lease it replaced.
     async fn redis_publish_completed(
         &self,
         key: &str,
         fingerprint: &str,
         ownership: &RedisOwnership,
         response: Option<&CachedResponse>,
+        execution_barrier: bool,
     ) -> RedisPublication {
         let Some(redis) = self.redis_client.as_ref() else {
             return RedisPublication::Unavailable;
@@ -1445,6 +1492,15 @@ impl RequestDeduplication {
             }
         });
         let replayable = replay.is_some();
+        // A record with no replay payload, and the fixed external-operation
+        // tombstone, exist only to refuse re-execution. Publishing either for
+        // `ttl_seconds` when `inflight_ttl_seconds` is longer would free the key
+        // earlier than the in-flight record it replaces.
+        let record_ttl = if replayable && !execution_barrier {
+            self.ttl
+        } else {
+            self.execution_barrier_retention()
+        };
         let record = SerializableDedupRecord::completed(fingerprint, replay);
         let Ok(record_bytes) = serde_json::to_vec(&record) else {
             return RedisPublication::Unavailable;
@@ -1456,7 +1512,7 @@ impl RequestDeduplication {
                 &redis_key,
                 &ownership.record,
                 &record_bytes,
-                self.ttl.as_secs().max(1),
+                record_ttl.as_secs().max(1),
             )
             .await
         {
@@ -1497,9 +1553,10 @@ impl RequestDeduplication {
     /// that has no safe replay value.
     ///
     /// The stored value is a small deterministic 409 so an identical retry is
-    /// refused for `ttl_seconds` instead of re-running the operation once the
-    /// raw in-flight lease expires. Interrupted delivery of a synthetic
-    /// externally-executed response therefore cannot silently repeat a charge.
+    /// refused for [`Self::execution_barrier_retention`] instead of re-running
+    /// the operation once the raw in-flight lease expires. Interrupted delivery
+    /// of a synthetic externally-executed response therefore cannot silently
+    /// repeat a charge.
     async fn publish_external_operation_tombstone(&self, ctx: &mut RequestContext) {
         let external_key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
         let synthetic_key = crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
@@ -1661,6 +1718,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            retention: self.ttl,
             response_policy: ctx.response_policy_provenance(),
         };
         match self.redis_payload_for_response("test-fingerprint", &response) {
@@ -1682,6 +1740,7 @@ impl RequestDeduplication {
             body,
             retain_inflight_on_skip,
             retain_inflight_on_eviction,
+            retention,
             response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
@@ -1722,6 +1781,7 @@ impl RequestDeduplication {
                     headers,
                     body: Bytes::copy_from_slice(body),
                     inserted_at: Instant::now(),
+                    retention,
                     response_policy,
                 })
             } else {
@@ -1753,6 +1813,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            retention,
             response_policy,
         };
         let redis_copy = cached.clone();
@@ -1843,7 +1904,7 @@ impl RequestDeduplication {
             DeduplicationEntry::Completed {
                 cached, sequence, ..
             } => {
-                let keep = now.duration_since(cached.inserted_at) < self.ttl;
+                let keep = now.duration_since(cached.inserted_at) < cached.retention;
                 if !keep {
                     let retained_size = cached.retained_size();
                     self.mark_completed_sequence_pruned(*sequence);
@@ -3014,6 +3075,16 @@ impl Plugin for RequestDeduplication {
         // sanitization on store. See [`super::utils::cache_headers`].
         let safe_headers = sanitize_cached_headers(response_headers);
 
+        // The external-operation tombstone is an execution barrier, not a
+        // representation of the real response: it replaces an in-flight marker
+        // that blocked duplicates for `inflight_ttl_seconds`, so it must live at
+        // least that long. Ordinary completions keep `ttl_seconds`.
+        let retention = if publishing_external_tombstone {
+            self.execution_barrier_retention()
+        } else {
+            self.ttl
+        };
+
         let (cached, sequence, completed, inflight) = match self.local_publish_completed(
             &key,
             &fingerprint,
@@ -3025,6 +3096,7 @@ impl Plugin for RequestDeduplication {
                 retain_inflight_on_skip: retain_inflight_on_storage_skip,
                 retain_inflight_on_eviction: retain_inflight_on_storage_skip
                     || redis_lock_token.is_some(),
+                retention,
                 response_policy,
             },
         ) {
@@ -3066,14 +3138,17 @@ impl Plugin for RequestDeduplication {
                     // the only protection. Transition it to a completed record
                     // through the fence: a replayable one when the payload fits,
                     // otherwise a non-replayable tombstone. Either way peers get
-                    // a deterministic answer for `ttl_seconds` instead of being
-                    // released to re-execute once the raw lease expires.
+                    // a deterministic answer instead of being released to
+                    // re-execute once the raw lease expires; a record with no
+                    // replay is held for `execution_barrier_retention()`, so it
+                    // never expires sooner than the lease it replaced.
                     match self
                         .redis_publish_completed(
                             &key,
                             &fingerprint,
                             ownership,
                             redis_candidate.as_ref(),
+                            publishing_external_tombstone,
                         )
                         .await
                     {
@@ -3114,7 +3189,13 @@ impl Plugin for RequestDeduplication {
             self.redis_client.is_none() && retain_inflight_on_storage_skip;
         if let Some(ownership) = redis_lock_token.as_ref() {
             match self
-                .redis_publish_completed(&key, &fingerprint, ownership, Some(&cached))
+                .redis_publish_completed(
+                    &key,
+                    &fingerprint,
+                    ownership,
+                    Some(&cached),
+                    publishing_external_tombstone,
+                )
                 .await
             {
                 RedisPublication::Published { replayable: true } => {

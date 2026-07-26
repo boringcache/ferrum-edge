@@ -2079,6 +2079,76 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
     }
 }
 
+/// GHSA-8cr6-rw38-7j59: the external-operation tombstone replaces an in-flight
+/// marker that blocked duplicates for `inflight_ttl_seconds`, so it must never
+/// expire sooner than that lease. `inflight_ttl_seconds` may legitimately exceed
+/// `ttl_seconds` (a long-running backend with a short replay-retention window);
+/// retaining the barrier for only `ttl_seconds` there would make an
+/// already-performed billable operation executable again EARLIER than the bare
+/// marker did.
+#[tokio::test]
+async fn external_operation_tombstone_outlives_a_shorter_ttl_than_the_inflight_lease() {
+    // Short replay retention, long in-flight protection.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 1,
+        "inflight_ttl_seconds": 60
+    }));
+
+    let mut ctx1 = new_ctx("POST", "/api");
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "barrier-key".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx1, &mut headers1).await,
+        PluginResult::Continue
+    ));
+
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx1.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+            .await,
+        PluginResult::Continue
+    ));
+    ctx1.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    plugin
+        .on_response_committed(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+        .await;
+
+    // Past `ttl_seconds`, well inside `inflight_ttl_seconds`. An ordinary
+    // completed replay would legitimately have expired here; the execution
+    // barrier must not.
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+
+    let mut ctx2 = new_ctx("POST", "/api");
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "barrier-key".to_string());
+    match plugin.before_proxy(&mut ctx2, &mut headers2).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "unexpected barrier body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        other => panic!(
+            "the external-operation barrier must outlive ttl_seconds when \
+             inflight_ttl_seconds is longer, got {other:?}"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     use wiremock::matchers::method;
