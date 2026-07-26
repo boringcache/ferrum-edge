@@ -6226,9 +6226,19 @@ fn test_response_buffer_budget_constant_is_independent_of_codec_budget() {
         src.contains("Semaphore::new(MAX_CONCURRENT_RESPONSE_BUFFERS)"),
         "response-buffer semaphore must be sized from MAX_CONCURRENT_RESPONSE_BUFFERS"
     );
+    // Pin the response-buffer LazyLock initializer to the buffer constant so a
+    // future edit cannot quietly retarget it at MAX_CONCURRENT_CODEC_JOBS.
+    let budget_idx = src
+        .find("static RESPONSE_BUFFER_BUDGET")
+        .expect("RESPONSE_BUFFER_BUDGET must exist");
+    let budget_window = &src[budget_idx..budget_idx.saturating_add(220).min(src.len())];
     assert!(
-        !src.contains("RESPONSE_BUFFER_BUDGET: LazyLock<Arc<Semaphore>> =\n    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)))"),
-        "response-buffer budget must not share the codec concurrency constant"
+        budget_window.contains("MAX_CONCURRENT_RESPONSE_BUFFERS"),
+        "RESPONSE_BUFFER_BUDGET initializer must reference MAX_CONCURRENT_RESPONSE_BUFFERS"
+    );
+    assert!(
+        !budget_window.contains("MAX_CONCURRENT_CODEC_JOBS"),
+        "RESPONSE_BUFFER_BUDGET must not be sized from the codec concurrency constant"
     );
 }
 
