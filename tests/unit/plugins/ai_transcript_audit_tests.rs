@@ -7248,9 +7248,7 @@ async fn json_acknowledgement_policy_distinguishes_reported_failures_from_succes
 async fn retained_byte_budget_bounds_queued_records_before_count_capacity() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
         .mount(&server)
         .await;
     let endpoint = format!("{}/ingest", server.uri());
@@ -7437,7 +7435,10 @@ async fn oversized_redacted_body_is_withheld_with_an_explicit_reason() {
         record.get("request_body").is_none(),
         "an over-limit body must not be redacted or exported: {record}"
     );
-    assert_eq!(record["request_body_omitted_reason"], "redaction_scan_limit");
+    assert_eq!(
+        record["request_body_omitted_reason"],
+        "redaction_scan_limit"
+    );
     assert_eq!(record["request_body_truncated"], true);
     assert!(
         record["request_hash"].is_string(),
