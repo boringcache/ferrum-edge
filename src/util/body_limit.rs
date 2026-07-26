@@ -1,4 +1,4 @@
-//! Helpers for request-body size limit errors.
+//! Helpers for bounding request-body collection in size **and** time.
 //!
 //! `http_body_util::Limited` returns a boxed `dyn Error` whose root cause is a
 //! `LengthLimitError` when the configured cap is hit. Callers used to detect
@@ -8,8 +8,16 @@
 //! to contain that phrase. [`is_length_limit_error`] walks the
 //! [`std::error::Error::source`] chain and looks for a concrete
 //! `LengthLimitError` via downcast, which is the API the crate intends.
+//!
+//! A size cap alone does not bound *time*. A client that trickles one byte per
+//! interval never trips `Limited` yet pins the collecting task, its buffer, and
+//! the underlying HTTP/1 connection or HTTP/2 stream for as long as it likes.
+//! [`collect_body_with_limits`] pairs the size cap with an absolute deadline so
+//! both failure modes are bounded at one place, and reports which one fired via
+//! [`BodyCollectError`].
 
-use http_body_util::LengthLimitError;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
+use std::time::Duration;
 
 /// Returns `true` when `error` (or any error in its source chain) is a
 /// [`LengthLimitError`] produced by [`http_body_util::Limited`].
@@ -29,10 +37,68 @@ pub fn is_length_limit_error(error: &(dyn std::error::Error + 'static)) -> bool 
     false
 }
 
+/// Why a bounded body collection failed.
+///
+/// Callers map these onto protocol-appropriate responses: `413` for
+/// [`BodyCollectError::TooLarge`], `408` for [`BodyCollectError::Timeout`], and
+/// `400` for [`BodyCollectError::Transport`].
+#[derive(Debug)]
+pub enum BodyCollectError {
+    /// The client sent more bytes than the configured cap allows.
+    TooLarge,
+    /// The body did not finish arriving inside the configured deadline.
+    Timeout,
+    /// The transport failed (reset, malformed framing, client disconnect).
+    /// Carries the underlying error for logging; it never contains request
+    /// headers, so it cannot leak credentials.
+    Transport(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Collect `body` into a `Vec<u8>`, bounded by `max_bytes` and — when
+/// `timeout` is `Some` — by an absolute wall-clock deadline.
+///
+/// The deadline is absolute rather than idle by design: every caller already
+/// caps the total size, so the worst-case legitimate transfer time is knowable
+/// up front, while an idle-only bound still lets a client stretch a body across
+/// an unbounded total duration by dripping a byte just inside every window.
+///
+/// On timeout the collect future is dropped, which drops the body and lets the
+/// protocol layer release the HTTP/1 connection or reset the HTTP/2 stream.
+pub async fn collect_body_with_limits<B>(
+    body: B,
+    max_bytes: usize,
+    timeout: Option<Duration>,
+) -> Result<Vec<u8>, BodyCollectError>
+where
+    B: http_body::Body,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let collect = async move {
+        match Limited::new(body, max_bytes).collect().await {
+            Ok(collected) => Ok(collected.to_bytes().to_vec()),
+            Err(e) => {
+                if is_length_limit_error(e.as_ref()) {
+                    Err(BodyCollectError::TooLarge)
+                } else {
+                    Err(BodyCollectError::Transport(e))
+                }
+            }
+        }
+    };
+
+    match timeout {
+        Some(deadline) => match tokio::time::timeout(deadline, collect).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(BodyCollectError::Timeout),
+        },
+        None => collect.await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::{BodyExt, Full, Limited};
+    use http_body_util::Full;
     use std::error::Error;
     use std::fmt;
 

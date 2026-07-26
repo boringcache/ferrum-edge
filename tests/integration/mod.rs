@@ -33,6 +33,7 @@ mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
 mod db_offline_bootstrap_tests;
 mod db_proxy_plugin_association_fail_closed_tests;
+mod db_row_decode_rejection_tests;
 mod deferred_log_tests;
 mod dtls_accept_isolation_tests;
 mod dtls_integration_tests;

@@ -337,6 +337,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -393,6 +394,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -444,6 +446,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -497,6 +500,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -545,6 +549,7 @@ async fn test_get_proxy_not_found_in_cache() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -591,6 +596,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -639,6 +645,7 @@ async fn test_get_consumer_not_found_in_cache() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -685,6 +692,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -734,6 +742,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -780,6 +789,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -829,6 +839,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -878,6 +889,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -931,6 +943,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -990,6 +1003,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -1046,6 +1060,7 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -1110,6 +1125,7 @@ async fn test_cached_config_reflects_live_updates() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -1223,6 +1239,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -1444,6 +1461,7 @@ async fn create_seeded_db_admin_state(
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -1713,6 +1731,7 @@ fn db_admin_state(
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     }
 }
@@ -2066,6 +2085,7 @@ async fn create_db_admin_state_with_availability(
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     (state, temp_dir)
@@ -3148,6 +3168,7 @@ async fn test_batch_create_read_only_rejected() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -4858,6 +4879,7 @@ async fn test_restore_read_only_rejected() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -5274,6 +5296,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -5330,6 +5353,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -5378,6 +5402,7 @@ async fn test_get_upstream_not_found_in_cache() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -5422,6 +5447,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -5471,6 +5497,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6045,6 +6072,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6098,6 +6126,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6150,6 +6179,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6199,6 +6229,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6294,6 +6325,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -6838,6 +6870,7 @@ async fn test_health_endpoint_shows_db_availability() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7095,6 +7128,7 @@ async fn test_cluster_endpoint_requires_auth() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7143,6 +7177,7 @@ async fn test_cluster_endpoint_cp_mode_empty_registry() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7206,6 +7241,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7273,6 +7309,7 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7338,6 +7375,7 @@ async fn test_cluster_endpoint_dp_mode_connected() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7394,6 +7432,7 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7445,6 +7484,7 @@ async fn test_cluster_endpoint_database_mode() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -7498,9 +7538,12 @@ async fn admin_request_with_body(
 const OVERSIZED_BODY: usize = 2 * 1024 * 1024;
 
 /// A paginated GET must resolve `limit`/`offset` from the request line before
-/// the shared `Limited::collect` body read. Otherwise an oversized (and wholly
-/// unused) GET body turns the documented malformed-pagination `400` into a
-/// `413`, after buffering up to the cap on a read endpoint.
+/// the shared body read. Otherwise an oversized (and wholly unused) GET body
+/// turns the documented malformed-pagination `400` into a `413`, after
+/// buffering up to the cap on a read endpoint. Issue #2404 additionally stopped
+/// read routes from having their body collected at all, so this gate is now
+/// defence in depth for GETs — but it still decides the status on the mutation
+/// routes below, whose bodies *are* collected.
 #[tokio::test]
 async fn malformed_pagination_on_get_list_precedes_body_buffering() {
     let tc = TestConfig::default();
@@ -7563,8 +7606,8 @@ async fn malformed_pagination_on_get_list_precedes_body_buffering() {
 
 /// `/audit` narrows the shared `i64` offset to the audit store's `u32`. That
 /// route-specific ceiling has to be replayed in the pre-body gate too, or an
-/// offset the handler would reject with `400` instead buffers an unused body
-/// and returns `413`.
+/// offset the handler would reject with `400` is answered by some later stage
+/// instead of the documented pagination error.
 #[tokio::test]
 async fn audit_offset_ceiling_precedes_body_buffering() {
     let tc = TestConfig::default();
@@ -7596,9 +7639,12 @@ async fn audit_offset_ceiling_precedes_body_buffering() {
     assert_eq!(status, 400, "no-body audit offset: {body:?}");
     assert_eq!(body["error"], "Audit offset exceeds supported range");
 
-    // The bound is exact: `u32::MAX` is still accepted, so the oversized body
-    // reaches the shared reader and its `413` — proving the `400` above came
-    // from the ceiling, not from a blanket rejection of the route.
+    // The bound is exact: `u32::MAX` is still accepted, so the request runs on
+    // to the handler and reports the handler's own `503 No database` — proving
+    // the `400` above came from the ceiling, not from a blanket rejection of
+    // the route. `GET /audit` does not consume a request body, so per issue
+    // #2404 the oversized body is never buffered and can no longer be the
+    // witness here; the handler's status is.
     let (status, body) = admin_request_with_body(
         reqwest::Method::GET,
         &base_url,
@@ -7608,8 +7654,12 @@ async fn audit_offset_ceiling_precedes_body_buffering() {
     )
     .await;
     assert_eq!(
-        status, 413,
+        status, 503,
         "u32::MAX offset is in range and must not be pre-rejected: {body:?}"
+    );
+    assert_eq!(
+        body["error"], "No database",
+        "the in-range offset must reach the handler, not any earlier gate: {body:?}"
     );
 
     // Unrelated list routes keep the wider `i64` contract: the same offset is a

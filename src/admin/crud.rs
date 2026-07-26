@@ -23,7 +23,7 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
     validate_api_spec_restore_inputs,
 };
-use crate::config::db_loader::is_proxy_plugin_association_load_error;
+use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
     backend_tls_sni_direct_h2_conflict_messages, first_effective_mesh_transport_conflict_with_mesh,
@@ -896,6 +896,107 @@ async fn persist_update_to_settlement<R: AdminResource>(
             &namespace,
             &written,
             Some(&previous),
+            WriteAction::Update { id: &id },
+        )
+        .await;
+    }
+    result
+}
+
+/// Issue #2997: DELETE of a reachable-but-undecodable row is the in-band repair
+/// path. The row cannot be hydrated for pre-delete snapshot / late-write
+/// compensation, and `load_namespace_snapshot` fails for the same reason, so
+/// delete by primary key under the admission lock and audit identity only.
+async fn persist_undecodable_delete_repair<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        guard,
+        http_client: _,
+        state,
+        actor,
+    } = context;
+    let success_db = db.clone();
+    let result =
+        match run_db_write_while_held(guard.as_ref(), R::db_delete(db.as_ref(), &namespace, &id))
+            .await
+        {
+            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+                Ok(false) => Ok(false),
+                // Without a hydratable previous row or namespace snapshot we cannot
+                // compensate a late write. Fail closed rather than claiming success
+                // after an unverified admission loss.
+                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    "namespace config admission was lost during undecodable-row delete repair"
+                ))),
+                Err(persistence_error) => Err(persistence_error),
+            },
+            Err(error) => Err(error),
+        };
+    if matches!(&result, Ok(true)) {
+        let event = AuditEvent::new(
+            &actor,
+            "delete",
+            R::RESOURCE_NAME.replace(' ', "_"),
+            &id,
+            &namespace,
+            audit::delete_diff(json!({
+                "id": id,
+                "namespace": namespace,
+                "undecodable_row_repair": true,
+            })),
+        );
+        if let Err(error) = audit::record(state.admin_audit_enabled, success_db, event) {
+            super::log_audit_enqueue_failure(&error);
+        }
+    }
+    result
+}
+
+/// Issue #2997: PUT overwrite of a reachable-but-undecodable row is an in-band
+/// repair path. The prior row cannot be hydrated for `prepare_for_update` /
+/// late-write compensation, so persist the request body by primary key under
+/// the admission lock and audit against a null before-image.
+async fn persist_undecodable_update_repair<R: AdminResource>(
+    context: OwnedWriteSettlementContext,
+    id: String,
+    written: R,
+) -> DbResult<bool> {
+    let OwnedWriteSettlementContext {
+        db,
+        namespace,
+        guard,
+        http_client: _,
+        state,
+        actor,
+    } = context;
+    let result =
+        match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
+            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+                Ok(false) => Ok(false),
+                // Without a hydratable previous row or namespace snapshot we cannot
+                // compensate a late write. Fail closed rather than claiming success
+                // after an unverified admission loss.
+                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                    "namespace config admission was lost during undecodable-row update repair"
+                ))),
+                Err(persistence_error) => Err(persistence_error),
+            },
+            Err(error) => Err(error),
+        };
+    if matches!(&result, Ok(true)) {
+        finish_write_success(
+            db,
+            &state,
+            &actor,
+            &namespace,
+            &written,
+            None,
             WriteAction::Update { id: &id },
         )
         .await;
@@ -2022,6 +2123,34 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     let existing = match R::db_get_for_write(db, namespace, id).await {
         Ok(None) => {
             return Ok(not_found_response::<R>());
+        }
+        Err(error) if is_row_decode_rejection(&error) => {
+            // Issue #2997: the target row exists but cannot be decoded. Skip
+            // namespace-snapshot recovery (that load fails for the same row) and
+            // delete by id so admin remains the in-band repair path.
+            let persistence = match tokio::spawn(persist_undecodable_delete_repair::<R>(
+                OwnedWriteSettlementContext {
+                    db: db_arc.clone(),
+                    namespace: namespace.to_string(),
+                    guard: namespace_config_admission_guard.take(),
+                    http_client: super::plugin_validation_http_client(state),
+                    state: state.clone(),
+                    actor: actor.clone(),
+                },
+                id.to_string(),
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "namespace undecodable-row delete persistence task failed: {error}"
+                )),
+            };
+            return match persistence {
+                Ok(true) => Ok(super::empty_response(StatusCode::NO_CONTENT)),
+                Ok(false) => Ok(not_found_response::<R>()),
+                Err(error) => Ok(R::map_delete_db_error(&error)),
+            };
         }
         Err(error) => {
             return Ok(R::map_precheck_db_error(&error));
@@ -4877,6 +5006,7 @@ async fn handle_write<R: AdminResource>(
         }
     };
 
+    let mut undecodable_update_repair = false;
     let existing = match action {
         WriteAction::Create => None,
         WriteAction::Update { id } => match R::db_get_for_write(db, namespace, id).await {
@@ -4887,6 +5017,13 @@ async fn handle_write<R: AdminResource>(
                 return Ok(not_found_response::<R>());
             }
             Ok(existing) => existing,
+            Err(error) if is_row_decode_rejection(&error) => {
+                // Issue #2997: row exists but cannot be hydrated. Proceed
+                // without prepare_for_update / late-write previous so PUT
+                // remains an in-band overwrite repair (must not be 503).
+                undecodable_update_repair = true;
+                None
+            }
             Err(error) => {
                 return Ok(R::map_precheck_db_error(&error));
             }
@@ -4937,6 +5074,19 @@ async fn handle_write<R: AdminResource>(
                 ));
             }
             Ok(None) => {}
+            // Issue #2997: an undecodable row still occupies the id — treat as
+            // conflict (409), not connectivity 503, so operators see a clear
+            // repair signal rather than a false outage.
+            Err(error) if is_row_decode_rejection(&error) => {
+                return Ok(super::json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": format!(
+                        "{} with ID '{}' already exists",
+                        R::ID_CONFLICT_LABEL,
+                        resource.id()
+                    )}),
+                ));
+            }
             Err(error) => return Ok(R::map_precheck_db_error(&error)),
         }
     }
@@ -5012,39 +5162,66 @@ async fn handle_write<R: AdminResource>(
             }
         }
         WriteAction::Update { id } => {
-            let Some(previous) = existing.clone() else {
-                return Ok(super::json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &json!({"error": "Update persistence is missing the prior resource"}),
-                ));
-            };
-            let persistence = match tokio::spawn(persist_update_to_settlement(
-                OwnedWriteSettlementContext {
-                    db: db_arc.clone(),
-                    namespace: namespace.to_string(),
-                    guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
-                    state: state.clone(),
-                    actor: actor.clone(),
-                },
-                id.to_string(),
-                resource.clone(),
-                previous,
-            ))
-            .await
-            {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!(
-                    "namespace update persistence task failed: {error}"
-                )),
-            };
-            // The row vanished between the precheck and the write (concurrent
-            // delete). The backend recorded no change — report not-found
-            // rather than a phantom success (issue #2122 DB-M4).
-            match persistence {
-                Ok(false) => return Ok(not_found_response::<R>()),
-                Ok(true) => {}
-                Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+            if undecodable_update_repair {
+                let persistence = match tokio::spawn(persist_undecodable_update_repair(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                    resource.clone(),
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace undecodable-row update persistence task failed: {error}"
+                    )),
+                };
+                match persistence {
+                    Ok(false) => return Ok(not_found_response::<R>()),
+                    Ok(true) => {}
+                    Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+                }
+            } else {
+                let Some(previous) = existing.clone() else {
+                    return Ok(super::json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &json!({"error": "Update persistence is missing the prior resource"}),
+                    ));
+                };
+                let persistence = match tokio::spawn(persist_update_to_settlement(
+                    OwnedWriteSettlementContext {
+                        db: db_arc.clone(),
+                        namespace: namespace.to_string(),
+                        guard: namespace_config_admission_guard.take(),
+                        http_client: super::plugin_validation_http_client(state),
+                        state: state.clone(),
+                        actor: actor.clone(),
+                    },
+                    id.to_string(),
+                    resource.clone(),
+                    previous,
+                ))
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "namespace update persistence task failed: {error}"
+                    )),
+                };
+                // The row vanished between the precheck and the write (concurrent
+                // delete). The backend recorded no change — report not-found
+                // rather than a phantom success (issue #2122 DB-M4).
+                match persistence {
+                    Ok(false) => return Ok(not_found_response::<R>()),
+                    Ok(true) => {}
+                    Err(error) => return Ok(R::map_persist_db_error(&error, action)),
+                }
             }
         }
     }

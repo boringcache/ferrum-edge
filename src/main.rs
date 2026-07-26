@@ -854,7 +854,10 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
-    observability_delivery::initialize(env_config.pool_shard_amount);
+    observability_delivery::initialize(
+        env_config.pool_shard_amount,
+        env_config.log_delivery_max_tasks,
+    );
     let observability_delivery_timeout =
         std::time::Duration::from_millis(env_config.log_shutdown_drain_timeout_ms);
     let gateway_exit_code: i32 = rt.block_on(async {
