@@ -674,9 +674,7 @@ impl DtlsConnection {
                                     return;
                                 }
                             }
-                            Output::Connected
-                            | Output::PeerCert(_)
-                            | Output::PeerCertChain(_) => {
+                            Output::Connected | Output::PeerCert(_) | Output::PeerCertChain(_) => {
                                 // Already handled during handshake
                             }
                             _ => {

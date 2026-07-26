@@ -719,13 +719,9 @@ async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
     );
     let key_path = write_pem(&temp_dir, "server.key", &leaf.key_pem);
     let root_path = write_pem(&temp_dir, "root.pem", &root.cert_pem);
-    let frontend_config = ferrum_edge::dtls::build_frontend_dtls_config(
-        &cert_path,
-        &key_path,
-        None,
-        &[],
-    )
-    .expect("build chained frontend");
+    let frontend_config =
+        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[])
+            .expect("build chained frontend");
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind(
             "127.0.0.1:0".parse().expect("server bind address"),
