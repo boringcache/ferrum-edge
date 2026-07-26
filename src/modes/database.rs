@@ -676,10 +676,10 @@ fn rejected_delta_change_set_hash(result: &db_backend::IncrementalResult) -> u64
             .iter()
             .map(|proxy| (proxy.id.as_str(), proxy)),
     );
-    hash_sorted_ids(
+    hash_sorted_namespaced_ids(
         &mut hasher,
         "removed_proxy_ids",
-        result.removed_proxy_ids.iter().map(String::as_str),
+        result.removed_proxy_ids.iter(),
     );
     hash_sorted_resource_fingerprints(
         &mut hasher,
@@ -702,10 +702,10 @@ fn rejected_delta_change_set_hash(result: &db_backend::IncrementalResult) -> u64
             .iter()
             .map(|plugin_config| (plugin_config.id.as_str(), plugin_config)),
     );
-    hash_sorted_ids(
+    hash_sorted_namespaced_ids(
         &mut hasher,
         "removed_plugin_config_ids",
-        result.removed_plugin_config_ids.iter().map(String::as_str),
+        result.removed_plugin_config_ids.iter(),
     );
     hash_sorted_resource_fingerprints(
         &mut hasher,
@@ -715,10 +715,10 @@ fn rejected_delta_change_set_hash(result: &db_backend::IncrementalResult) -> u64
             .iter()
             .map(|upstream| (upstream.id.as_str(), upstream)),
     );
-    hash_sorted_ids(
+    hash_sorted_namespaced_ids(
         &mut hasher,
         "removed_upstream_ids",
-        result.removed_upstream_ids.iter().map(String::as_str),
+        result.removed_upstream_ids.iter(),
     );
     hasher.finish()
 }
@@ -790,20 +790,6 @@ fn hash_json_value(
                 }
             }
         }
-    }
-}
-
-fn hash_sorted_ids<'a>(
-    hasher: &mut std::collections::hash_map::DefaultHasher,
-    label: &'static str,
-    ids: impl Iterator<Item = &'a str>,
-) {
-    label.hash(hasher);
-    let mut ids: Vec<&str> = ids.collect();
-    ids.sort_unstable();
-    ids.len().hash(hasher);
-    for id in ids {
-        id.hash(hasher);
     }
 }
 
@@ -3419,7 +3405,7 @@ mod tests {
     ) -> db_backend::IncrementalResult {
         db_backend::IncrementalResult {
             added_or_modified_proxies: vec![],
-            removed_proxy_ids: vec![proxy_id.to_string()],
+            removed_proxy_ids: vec![db_backend::NamespacedResourceId::new("ferrum", proxy_id)],
             added_or_modified_consumers: vec![],
             removed_consumer_ids: vec![],
             added_or_modified_plugin_configs: vec![],
