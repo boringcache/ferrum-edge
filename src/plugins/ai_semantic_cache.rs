@@ -757,7 +757,7 @@ impl RedisQuarantineSuppressor {
             fingerprint,
             expires_at: now + self.ttl,
         };
-        self.insert(cache_key, marker, now);
+        self.insert(cache_key, marker);
     }
 
     fn clear(&self, cache_key: &str) {
@@ -766,7 +766,14 @@ impl RedisQuarantineSuppressor {
         }
     }
 
-    fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker, now: Instant) {
+    /// Insert or refresh a marker under the hard cap.
+    ///
+    /// Capacity pressure uses constant-work victim selection (one arbitrary
+    /// DashMap sample), never a request-driven full-map expired sweep.
+    /// Expired markers are cleared lazily on lookup (`is_suppressed` /
+    /// `matches_active`). Slot accounting stays exact under concurrency via
+    /// `entry_count` reserve/release without a process-wide lock.
+    fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker) {
         use dashmap::mapref::entry::Entry as DashEntry;
 
         let mut marker = Some(marker);
@@ -797,7 +804,8 @@ impl RedisQuarantineSuppressor {
                 }
             }
 
-            self.evict_expired(now);
+            // Hard cap reached: free one arbitrary victim (O(1) sample), then
+            // retry. Do not scan the map for expired keys on this path.
             if self.entry_count.load(Ordering::Acquire) >= self.max_entries {
                 let victim = self.entries.iter().next().map(|entry| entry.key().clone());
                 if let Some(victim) = victim {
@@ -806,17 +814,6 @@ impl RedisQuarantineSuppressor {
                     return;
                 }
             }
-        }
-    }
-
-    fn evict_expired(&self, now: Instant) {
-        let expired: Vec<String> = self
-            .entries
-            .iter()
-            .filter_map(|entry| (entry.expires_at <= now).then(|| entry.key().clone()))
-            .collect();
-        for key in expired {
-            self.clear(&key);
         }
     }
 
@@ -1722,10 +1719,30 @@ impl AiSemanticCache {
         })
     }
 
-    /// Quarantine an inadmissible Redis entry: attempt `DEL`, and on failure
-    /// install a bounded local suppressor so the same remote value is not
-    /// immediately re-downloaded/reparsed. Delete success clears any marker.
-    /// Never converts a miss into a hit; never logs key/payload material.
+    /// Apply a Redis quarantine-`DEL` outcome (production and test seam).
+    ///
+    /// Success clears any local suppressor. Failure installs a fingerprint+TTL
+    /// marker and emits a rate-limited redacted warning. Never converts a miss
+    /// into a hit; never logs key/payload material.
+    fn apply_redis_quarantine_delete_outcome(
+        &self,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        if delete_ok {
+            self.redis_quarantine.clear(cache_key);
+            return;
+        }
+        let now = Instant::now();
+        self.redis_quarantine
+            .record_delete_failure(cache_key, fingerprint, now);
+        self.redis_quarantine
+            .maybe_warn_delete_failure(self.instance_id, self.created_at);
+    }
+
+    /// Quarantine an inadmissible Redis entry: attempt `DEL`, then map the
+    /// outcome through [`Self::apply_redis_quarantine_delete_outcome`].
     async fn quarantine_invalid_redis_entry(
         &self,
         redis: &RedisRateLimitClient,
@@ -1733,18 +1750,8 @@ impl AiSemanticCache {
         cache_key: &str,
         fingerprint: [u8; 32],
     ) {
-        match redis.delete(redis_key).await {
-            Ok(()) => {
-                self.redis_quarantine.clear(cache_key);
-            }
-            Err(()) => {
-                let now = Instant::now();
-                self.redis_quarantine
-                    .record_delete_failure(cache_key, fingerprint, now);
-                self.redis_quarantine
-                    .maybe_warn_delete_failure(self.instance_id, self.created_at);
-            }
-        }
+        let delete_ok = redis.delete(redis_key).await.is_ok();
+        self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
     async fn build_vector_snapshot(
@@ -2287,7 +2294,8 @@ impl AiSemanticCache {
             .store(ms, Ordering::Relaxed);
     }
 
-    /// Simulate a quarantine-delete outcome without contacting Redis.
+    /// Exercise the production quarantine-delete outcome handler with a
+    /// synthetic Redis `DEL` result (no network).
     #[allow(dead_code)]
     pub(crate) fn apply_redis_quarantine_delete_outcome_for_tests(
         &self,
@@ -2295,15 +2303,7 @@ impl AiSemanticCache {
         fingerprint: [u8; 32],
         delete_ok: bool,
     ) {
-        if delete_ok {
-            self.redis_quarantine.clear(cache_key);
-            return;
-        }
-        let now = Instant::now();
-        self.redis_quarantine
-            .record_delete_failure(cache_key, fingerprint, now);
-        self.redis_quarantine
-            .maybe_warn_delete_failure(self.instance_id, self.created_at);
+        self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
     /// Whether the local Redis quarantine suppressor is active for `cache_key`.
@@ -4588,38 +4588,43 @@ impl Plugin for AiSemanticCache {
                     .await
                 {
                     Ok(BoundedRedisValue::Found(data)) => {
-                        let fingerprint = redis_quarantine_fingerprint_content(&data);
-                        // Same poison already marked after a failed delete: skip
-                        // re-admit/re-delete without serving (fail closed).
-                        if self.redis_quarantine.matches_active(
-                            &cache_key,
-                            &fingerprint,
-                            Instant::now(),
-                        ) {
-                            self.redis_quarantine.note_suppression();
-                        } else {
-                            match serde_json::from_slice::<SerializableCacheEntry>(&data)
-                                .ok()
-                                .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
-                            {
-                                Some(cached) => {
-                                    debug!(
-                                        cache_key = %cache_key,
-                                        "ai_semantic_cache: Redis cache HIT, returning cached response"
-                                    );
-                                    self.redis_quarantine.clear(&cache_key);
-                                    let mut response_headers = cached.headers;
-                                    response_headers
-                                        .insert("x-ai-cache-status".to_string(), "HIT".to_string());
-                                    self.clear_instance_staging(ctx);
-                                    self.set_cache_status(ctx, "HIT");
-                                    return PluginResult::RejectBinary {
-                                        status_code: cached.status_code,
-                                        body: cached.body,
-                                        headers: response_headers,
-                                    };
-                                }
-                                None => {
+                        // Admit first: a valid hit must not pay a full-buffer
+                        // quarantine fingerprint. Fingerprints exist only for
+                        // poison quarantine/races after the value is known
+                        // inadmissible. A concurrent valid replacement clears
+                        // any stale marker without hashing.
+                        match serde_json::from_slice::<SerializableCacheEntry>(&data)
+                            .ok()
+                            .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
+                        {
+                            Some(cached) => {
+                                debug!(
+                                    cache_key = %cache_key,
+                                    "ai_semantic_cache: Redis cache HIT, returning cached response"
+                                );
+                                self.redis_quarantine.clear(&cache_key);
+                                let mut response_headers = cached.headers;
+                                response_headers
+                                    .insert("x-ai-cache-status".to_string(), "HIT".to_string());
+                                self.clear_instance_staging(ctx);
+                                self.set_cache_status(ctx, "HIT");
+                                return PluginResult::RejectBinary {
+                                    status_code: cached.status_code,
+                                    body: cached.body,
+                                    headers: response_headers,
+                                };
+                            }
+                            None => {
+                                let fingerprint = redis_quarantine_fingerprint_content(&data);
+                                // Concurrent same-poison marker (installed while
+                                // this request was fetching): skip another DEL.
+                                if self.redis_quarantine.matches_active(
+                                    &cache_key,
+                                    &fingerprint,
+                                    Instant::now(),
+                                ) {
+                                    self.redis_quarantine.note_suppression();
+                                } else {
                                     debug!(
                                         cache_key = %cache_key,
                                         "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"

@@ -5638,3 +5638,110 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
         "before_proxy must observe the local suppressor on the Redis path"
     );
 }
+
+#[test]
+fn redis_quarantine_found_hit_admits_before_fingerprint() {
+    // Behavioral seam that counted hash invocations would distort production;
+    // pin the Found-path order in source so valid hits never pay a quarantine
+    // SHA-256 pass and fingerprints run only after admission failure.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let found = source
+        .split_once("Ok(BoundedRedisValue::Found(data)) => {")
+        .and_then(|(_, rest)| rest.split_once("Ok(BoundedRedisValue::Oversized { length }) => {"))
+        .map(|(body, _)| body)
+        .expect("BoundedRedisValue::Found hit-path region");
+    let admit = found
+        .find("admit_redis_hit(")
+        .expect("Found path must admit before fingerprinting");
+    let fingerprint = found
+        .find("redis_quarantine_fingerprint_content(&data)")
+        .expect("Found path must fingerprint only after admission failure");
+    assert!(
+        admit < fingerprint,
+        "valid Redis Found hits must admit/serve without a quarantine fingerprint pass"
+    );
+    assert!(
+        found.contains("None => {")
+            && found[fingerprint..].contains("matches_active(")
+            && found[fingerprint..].contains("quarantine_invalid_redis_entry("),
+        "inadmissible Found values must fingerprint, then check concurrent same-poison markers before DEL"
+    );
+    assert!(
+        !found[..admit].contains("redis_quarantine_fingerprint_content"),
+        "quarantine fingerprint must not precede admit_redis_hit on the Found path"
+    );
+}
+
+#[test]
+fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
+    // Sustained over-cap unique poison churn must not invoke a request-driven
+    // O(capacity) expired sweep; pin constant-work victim policy in source.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let insert = source
+        .split_once("fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker)")
+        .and_then(|(_, rest)| rest.split_once("fn release_slot(&self)"))
+        .map(|(body, _)| body)
+        .expect("RedisQuarantineSuppressor::insert region");
+    assert!(
+        !insert.contains("evict_expired"),
+        "insert must not call a full-map expired sweep under capacity pressure"
+    );
+    assert!(
+        !insert.contains("Vec<String>") && !insert.contains(".collect()"),
+        "insert must not allocate a vector of cloned keys for a map-wide scan"
+    );
+    assert!(
+        insert.contains("entries.iter().next()")
+            || insert.contains("self.entries.iter().next()"),
+        "over-cap insert must use constant-work arbitrary/sample victim selection"
+    );
+    assert!(
+        !source.contains("fn evict_expired(&self"),
+        "request-path full-map expired sweep helper must remain removed"
+    );
+    // Behavioral: sustained unique over-cap churn stays hard-capped.
+    let plugin = make_plugin(json!({ "max_entries": 16 }));
+    let cap = ai_semantic_cache_redis_quarantine_cap_for_test(&plugin);
+    for i in 0..(cap * 8) {
+        let key = format!("churn-{i}");
+        let fp = quarantine_fp(&key);
+        ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, &key, fp, false);
+    }
+    assert!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin) <= cap);
+}
+
+#[test]
+fn redis_quarantine_delete_outcome_handler_is_shared() {
+    // Production DEL mapping and the external test seam must share one private
+    // synchronous outcome handler rather than duplicating success/failure logic.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let production = source
+        .split_once("async fn quarantine_invalid_redis_entry(")
+        .and_then(|(_, rest)| rest.split_once("async fn build_vector_snapshot("))
+        .map(|(body, _)| body)
+        .expect("quarantine_invalid_redis_entry region");
+    assert!(
+        production.contains("apply_redis_quarantine_delete_outcome(")
+            && production.contains("redis.delete(redis_key).await.is_ok()"),
+        "production must map the real Redis DEL result through the shared handler"
+    );
+    assert!(
+        !production.contains("record_delete_failure(")
+            && !production.contains("maybe_warn_delete_failure("),
+        "production quarantine path must not re-implement outcome mapping inline"
+    );
+    let test_seam = source
+        .split_once("fn apply_redis_quarantine_delete_outcome_for_tests(")
+        .and_then(|(_, rest)| rest.split_once("fn redis_quarantine_suppressed_for_tests("))
+        .map(|(body, _)| body)
+        .expect("apply_redis_quarantine_delete_outcome_for_tests region");
+    assert!(
+        test_seam.contains("self.apply_redis_quarantine_delete_outcome("),
+        "test seam must call the same private outcome handler"
+    );
+    assert!(
+        !test_seam.contains("record_delete_failure(")
+            && !test_seam.contains("maybe_warn_delete_failure("),
+        "test seam must not duplicate success/failure mapping"
+    );
+}
