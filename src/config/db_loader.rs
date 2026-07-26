@@ -9699,14 +9699,11 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|e| {
+        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|_| {
             // Do not embed the raw algorithm column — hostile/oversized DB
-            // values must not reach poll/startup rejection logs (issue #2997).
-            anyhow::anyhow!(
-                "Upstream {}: failed to parse algorithm: {}",
-                id_preview,
-                e
-            )
+            // values must not reach poll/startup rejection logs through either
+            // this message or serde's unknown-variant error (issue #2997).
+            anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
         })?;
 
     let health_checks: Option<HealthCheckConfig> = match row.try_get::<String, _>("health_checks") {
@@ -10186,6 +10183,10 @@ mod row_decode_rejection_classification_tests {
         assert!(
             !upstream.contains("algorithm '{}'"),
             "upstream algorithm decode errors must not embed the raw algorithm column"
+        );
+        assert!(
+            !upstream.contains("failed to parse algorithm: {}"),
+            "upstream algorithm decode errors must not relay serde's raw unknown variant"
         );
     }
 }
