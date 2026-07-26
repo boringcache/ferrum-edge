@@ -142,6 +142,55 @@ restart validation. For file mode, edit the YAML/JSON copy and run the staged
 validation step again. Do not bypass the check by adding placeholder HTTP/UDP
 targets; disable or remove a policy that has no TCP listener to protect.
 
+### Body Validator Enforcement Hardening
+
+`body_validator` now enforces the policy it advertises, which makes several
+previously-accepted configurations fail closed. Because the plugin is
+fail-closed, a rejected configuration keeps the last known-good generation:
+database and control-plane publication rejects the row, a DP keeps its last
+accepted snapshot, and file-mode startup or reload rejects the file. Audit every
+`body_validator` config in the cloned database or staging config before cutover.
+
+Configuration is now rejected when:
+
+- an unknown top-level key is present (previously ignored), or a
+  `protobuf_method_messages` entry contains any key other than `request` /
+  `response`. Typos such as `response_json_scheam` or `respones` used to be
+  silently dropped while the remaining valid rule kept admission succeeding.
+- `json_schema` / `response_json_schema` is not a valid JSON Schema under the
+  configured draft. Schemas are now compiled with the `jsonschema` crate at
+  plugin construction instead of being interpreted by a partial evaluator, so
+  malformed keyword shapes, invalid type names (`"type": "objcet"`), and invalid
+  `pattern` regexes are configuration errors rather than no-ops.
+- a schema uses a non-local `$ref`/`$dynamicRef` (anything not starting with
+  `#`), a non-fragment `$id`, a `$vocabulary` declaration, or a `$schema` naming
+  a draft other than the configured one. No external reference is ever fetched:
+  the dependency is built without HTTP or file retrievers.
+- a schema nests deeper than 32 levels or contains more than 20000 nodes.
+- `json_schema_draft` (new, default `draft2020-12`, also accepts `draft7`) has
+  any other value. Draft-4 spellings such as a boolean `exclusiveMinimum` are
+  rejected; convert them to the numeric draft-7/2020-12 form.
+
+Runtime behavior also tightens:
+
+- Standard keywords the old evaluator ignored are now enforced. `$ref`/`$defs`,
+  array `type` unions, conditionals, and dependent keywords all take effect, so
+  traffic a schema was always meant to reject now actually gets rejected.
+- XML bodies are parsed by a real XML parser instead of a tag-balancing scan.
+  Documents with multiple roots, text outside the root, invalid element or
+  attribute names, unquoted or duplicated attributes, undeclared entity
+  references, or invalid characters are now rejected. `required_xml_elements`
+  matches parsed element names: a bare name matches that local name in any
+  namespace, `{uri}local` requires both, and `{}local` requires no namespace. A
+  configured entry that previously relied on a raw `prefix:local` source match
+  must be rewritten as `local` or `{uri}local`.
+- External XML entity declarations (`SYSTEM` / `PUBLIC`) are always rejected.
+- Decoded gRPC protobuf messages must satisfy proto2 required-field
+  initialization, recursively through present nested, repeated, map, and
+  extension message values. proto3 descriptors are unaffected. Clients that
+  relied on sending an uninitialized proto2 message must be fixed before
+  upgrade.
+
 ### Chargeback Scrape Authentication
 
 `GET /charges` now requires an admin JWT. Update Prometheus or external billing

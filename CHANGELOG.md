@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `body_validator` now enforces the validation it advertises on all four of its
+  surfaces. Configured JSON Schemas are compiled once at plugin construction with
+  the `jsonschema` crate under an explicit draft (`json_schema_draft`, default
+  `draft2020-12`) instead of being interpreted by a partial handwritten
+  evaluator, so `$ref`/`$defs`, union types, conditionals, and other standard
+  keywords take effect and malformed schemas, invalid type names, non-local
+  references, `$vocabulary` declarations, and over-budget schemas fail
+  configuration closed; no external reference is ever retrieved. XML bodies are
+  parsed with `roxmltree` rather than scanned for balanced tags, so multiple
+  roots, text outside the root, invalid names or characters, malformed/unquoted/
+  duplicate attributes, and undeclared entity references are rejected, external
+  entity declarations are refused outright, and `required_xml_elements` matches
+  parsed namespace-expanded names. Decoded gRPC protobuf messages must satisfy
+  proto2 `required`-field initialization recursively, including inside present
+  nested, repeated, map, and extension message values. Unknown top-level config
+  keys and unknown keys inside a `protobuf_method_messages` entry are rejected
+  before defaults, so a typo can no longer silently replace enforcement with a
+  weaker policy. This is a breaking configuration change; see the
+  [Safe Upgrade Guide](docs/upgrade_guide.md#body-validator-enforcement-hardening).
+
 ### Changed
 
 - Authenticated `/metrics` now renders TLS certificate gauges from a cached,
