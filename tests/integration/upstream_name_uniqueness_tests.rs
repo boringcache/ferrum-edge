@@ -243,11 +243,19 @@ async fn unnamed_upstreams_may_coexist_and_names_are_per_namespace() {
         .expect("unnamed B must coexist");
 
     store
-        .create_upstream(&named_upstream("tenant-a", "shared-id", Some("shared-name")))
+        .create_upstream(&named_upstream(
+            "tenant-a",
+            "shared-id",
+            Some("shared-name"),
+        ))
         .await
         .expect("tenant-a");
     store
-        .create_upstream(&named_upstream("tenant-b", "shared-id", Some("shared-name")))
+        .create_upstream(&named_upstream(
+            "tenant-b",
+            "shared-id",
+            Some("shared-name"),
+        ))
         .await
         .expect("same name in another namespace must be allowed");
 }

@@ -71,7 +71,8 @@ fn canonical_plan_is_non_empty_and_covers_core_collections() {
     let upstream_name_unique = plan
         .iter()
         .find(|entry| {
-            entry.collection == "upstreams" && entry.model.keys == doc! { "namespace": 1, "name": 1 }
+            entry.collection == "upstreams"
+                && entry.model.keys == doc! { "namespace": 1, "name": 1 }
         })
         .expect("upstreams (namespace, name) index");
     let upstream_opts = upstream_name_unique
