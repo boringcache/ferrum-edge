@@ -408,6 +408,13 @@ The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PO
 
 The Helm chart sets `nodeAgent.admin.port` to `19090` by default. The binary default remains `9000`, but the chart uses a different host-network port so an ambient NodeWaypoint proxy and node-agent can run on the same node without an admin listener collision.
 
+`nodeAgent.probes` configures independently toggleable startup/liveness/readiness
+checks. Defaults exec `ferrum-edge health --live` for startup/liveness and
+`ferrum-edge health` for readiness against the chart-managed admin listener.
+When admin is disabled or `nodeAgent.admin.port=0`, computed probes are omitted
+unless a per-probe `override` handler is supplied — the same historical
+no-readiness behavior used before startup/liveness were added.
+
 `/metrics` is unauthenticated, matching the rest of Ferrum's Prometheus surface. To prevent an opt-in to `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` from accidentally exposing unauthenticated `/metrics` and `/health` to the network, the node-agent admin listener defaults to loopback (`127.0.0.1`) when **none** of the following operator signals are configured:
 
 - `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or
