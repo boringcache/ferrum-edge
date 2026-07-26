@@ -382,18 +382,12 @@ async fn echo_round_trip(
 
 #[tokio::test]
 async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
-    let backend = Arc::new(
-        UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("backend bind"),
-    );
+    let backend = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("backend bind"));
     let backend_port = backend.local_addr().expect("backend addr").port();
     let _backend = spawn_udp_echo_backend(Arc::clone(&backend)).await;
 
     // Bind client A first so we know its source IP for the gated plugin.
-    let client_a = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("client A bind");
+    let client_a = UdpSocket::bind("127.0.0.1:0").await.expect("client A bind");
     let client_a_ip = Arc::from(
         client_a
             .local_addr()
@@ -406,9 +400,7 @@ async fn slow_udp_datagram_hook_for_client_a_does_not_block_client_b() {
     let gateway = spawn_udp_gateway_with_retry(backend_port, Arc::clone(&client_a_ip)).await;
     let gateway_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gateway.listen_port);
 
-    let client_b = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("client B bind");
+    let client_b = UdpSocket::bind("127.0.0.1:0").await.expect("client B bind");
 
     // Establish both sessions with fast (non-gated) datagrams first. The bug
     // is in the established-session recv path, not first-datagram setup.
