@@ -133,7 +133,11 @@ fn spki_round_trips_against_a_real_rsa_certificate() {
 fn rejects_a_non_rsa_leaf_certificate() {
     let certificate = ecdsa_test_certificate();
     let error = leaf_rsa_public_key_der(&certificate).expect_err("EC leaf is not RSA");
-    assert!(error.to_string().contains("does not carry an RSA public key"));
+    assert!(
+        error
+            .to_string()
+            .contains("does not carry an RSA public key")
+    );
 }
 
 #[test]

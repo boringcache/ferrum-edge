@@ -106,7 +106,10 @@ fn assert_rejected_without_disclosure(message: &str) {
         );
     }
     if let Ok(pin) = std::env::var("FERRUM_PKCS11_PIN") {
-        assert!(!message.contains(&pin), "rejection must not disclose the PIN");
+        assert!(
+            !message.contains(&pin),
+            "rejection must not disclose the PIN"
+        );
     }
 }
 
