@@ -3361,9 +3361,11 @@ fn test_validate_composition_resolves_associations_by_namespace_and_id() {
     tenant_a_proxy.namespace = "tenant-a".to_string();
     // Second association names an id that exists ONLY in tenant-b. A bare-id
     // index would resolve it and count two effective instances on this proxy.
-    tenant_a_proxy.plugins.push(ferrum_edge::config::types::PluginAssociation {
-        plugin_config_id: "cb-other".to_string(),
-    });
+    tenant_a_proxy
+        .plugins
+        .push(ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "cb-other".to_string(),
+        });
 
     let mut tenant_a_plugin = chargeback_chain_plugin(
         "cb-local",
@@ -3394,8 +3396,6 @@ fn test_validate_composition_resolves_associations_by_namespace_and_id() {
     };
 
     ferrum_edge::plugins::api_chargeback::validate_composition(&config).unwrap_or_else(|err| {
-        panic!(
-            "same-id plugin in another namespace must not attach: {err:?}"
-        )
+        panic!("same-id plugin in another namespace must not attach: {err:?}")
     });
 }

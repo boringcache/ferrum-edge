@@ -3819,12 +3819,7 @@ fn test_validate_resource_ids_rejects_malformed_namespaces_for_every_resource_ki
     consumer.namespace = "tenant/prod".to_string();
     let mut upstream = make_upstream("upstream-1");
     upstream.namespace = "tenant prod".to_string();
-    let mut plugin = mtls_plugin(
-        "plugin-1",
-        PluginScope::Global,
-        None,
-        serde_json::json!({}),
-    );
+    let mut plugin = mtls_plugin("plugin-1", PluginScope::Global, None, serde_json::json!({}));
     plugin.namespace = String::new();
 
     let config = GatewayConfig {
