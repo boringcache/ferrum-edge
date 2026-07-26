@@ -24,6 +24,21 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 
 The eBPF connect programs read `FERRUM_CAPTURE_CONFIG` before rewriting to loopback. If the singleton config entry is absent, they fall back to ABI defaults so older loaders fail open to the historical `15001` behavior.
 
+### Startup rollback of pinned eBPF state
+
+`load_programs` pins original-destination maps under `/sys/fs/bpf/ferrum`. Those pins outlive a dropped userspace object, so a failed startup must not rely on the backend's `Drop` alone.
+
+Cleanup ownership is handed off between exactly two owners, so `cleanup_all` runs exactly once on every path after a successful load:
+
+1. **During initialization** — from the moment `load_programs` succeeds until `initialize_backend` returns `Ok`, a rollback guard owns the pins. Any later failure inside map/config/SOCK_OPS/readiness setup, and any unwind out of those steps, calls `cleanup_all` before returning.
+2. **After initialization** — `run_with_backend` takes ownership and cleans up exactly once for every remaining exit: Kubernetes client construction failure, ordinary watcher-loop shutdown (signalled shutdown, or the watcher stream ending — a transient watcher *error* is logged and retried by kube-rs, it does not exit the loop), and `Drop` on unwind.
+
+The guard is armed strictly *after* `load_programs` returns `Ok`. A failure in `load_programs` itself created nothing this process owns, so it must not run `cleanup_all` — unpinning there could tear down maps a different, still-healthy node-agent owns.
+
+Both owners latch on the first cleanup, so the handoff can never double-clean, and both do their cleanup synchronously — there is no async teardown in `Drop` and no background cleanup task. Cleanup failures are surfaced as structured warnings; the original startup/runtime error is always the returned cause.
+
+Ordering on the normal shutdown path is per-pod first, then node-global: enrolled pods are detached (dropping their registry entries and readiness markers) before `cleanup_all` tears down the shared maps and pins. The `Drop` safety net has no access to the pod table, so it performs the node-global `cleanup_all` only; it exists to guarantee the pins are released, not to substitute for an orderly shutdown.
+
 ## Pod Lifecycle Events
 
 The node-agent watches pods on the local node via kube-rs (`spec.nodeName={node_name}` field selector) and reacts to three Kubernetes event flavors. `Event::Apply` from the watcher conflates "added" and "modified", so the same code path handles initial enrollment and mid-life updates.
