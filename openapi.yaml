@@ -21315,7 +21315,11 @@ components:
                 encoded file fits. In-flight claims, temps under an active write,
                 and records carrying another owner's tag are never evictable, so a
                 write that cannot fit is rejected rather than exceeding the ceiling
-                or destroying another owner's or another delivery's records.
+                or destroying another owner's or another delivery's records. Each
+                encoded and decoded artifact is also capped at 268435456 bytes;
+                zstd replay additionally applies a 200x expansion limit with a
+                1 MiB floor, and oversized artifacts are quarantined without first
+                being read or expanded without bound.
             replay_interval_secs:
               type: integer
               minimum: 1

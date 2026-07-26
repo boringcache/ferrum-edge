@@ -12,7 +12,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    set_spool_write_hook_for_tests, spool_claim_lease_secs_for_tests,
+    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
@@ -3447,6 +3448,29 @@ fn spool_walk_bounds_empty_directory_entries() {
 
 #[cfg(unix)]
 #[test]
+fn configured_spool_directory_symlink_is_rejected_before_write_probe() {
+    let parent = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let linked_spool = parent.path().join("spool-link");
+    std::os::unix::fs::symlink(outside.path(), &linked_spool).unwrap();
+
+    let error =
+        match SpoolManager::for_tests(spool_settings(&linked_spool, 1024 * 1024), "node-a") {
+            Err(error) => error,
+            Ok(_) => panic!("a symlinked spool root must fail before its write probe"),
+        };
+    assert!(
+        error.contains("symlinked spool path"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "failed preparation must not create or truncate files through the symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn namespace_root_symlink_swap_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -3673,6 +3697,30 @@ fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     fs::write(&ok_path, &ok).unwrap();
     let decoded = decode_spool_file_for_tests(&ok_path).unwrap();
     assert_eq!(decoded.len(), ok_plain.len());
+}
+
+#[test]
+fn spool_replay_caps_large_encoded_and_decoded_artifacts_absolutely() {
+    let hard_limit = spool_artifact_byte_limit_for_tests();
+    assert_eq!(
+        spool_decompression_limit_for_tests(u64::MAX),
+        hard_limit,
+        "the ratio allowance must never bypass the absolute artifact ceiling"
+    );
+
+    // A sparse file proves the encoded-size boundary is checked from metadata
+    // before replay attempts to allocate or read its attacker-selected length.
+    let temp = tempfile::tempdir().unwrap();
+    let oversized_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FB5.ndjson");
+    let oversized = fs::File::create(&oversized_path).unwrap();
+    oversized.set_len(hard_limit.saturating_add(1)).unwrap();
+    drop(oversized);
+    let err = decode_spool_file_for_tests(&oversized_path)
+        .expect_err("an oversized raw artifact must fail before allocation");
+    assert!(
+        err.contains("hard") && err.contains("artifact bound"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -122,6 +122,14 @@ const SPOOL_MAX_DECOMPRESSION_RATIO: u64 = 200;
 /// Floor for the expansion allowance so a very small legitimate record is never
 /// bounded below its own framing overhead.
 const SPOOL_MIN_DECOMPRESSED_BYTES: u64 = 1024 * 1024;
+/// Hard ceiling for both encoded and decoded bytes in one spool artifact.
+///
+/// This matches the process-wide retained-byte ceiling accepted for sink
+/// buffers. The writer refuses a larger artifact, so replay never rejects a
+/// record this build successfully published. The absolute bound complements
+/// the ratio check: a ratio alone still permits a multi-gigabyte allocation
+/// when a same-UID attacker plants a large archive in the managed tree.
+const SPOOL_MAX_ARTIFACT_BYTES: u64 = HARD_MAX_BUFFER_MAX_BYTES as u64;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -5145,8 +5153,19 @@ impl SpoolManager {
         let _after_hook = SpoolWriteHookAfterGuard;
         self.prepare_live_storage_locked()?;
         let body = serialize_json_each_row(events)?;
+        if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: serialized spool batch ({} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)",
+                body.len()
+            ));
+        }
         let bytes = encode_spool_bytes(body.as_bytes(), self.cfg.compression)?;
         let incoming_len = bytes.len() as u64;
+        if incoming_len > SPOOL_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)"
+            ));
+        }
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
@@ -6559,30 +6578,35 @@ pub fn encode_spool_bytes_for_tests(
 }
 
 fn decode_spool_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| {
+    let file = File::open(path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
             path.display()
         )
     })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
+    let encoded_len = file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
+                path.display()
+            )
+        })?
+        .len();
+    if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
             path.display()
-        )
-    })?;
+        ));
+    }
     let decoded = if path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains(".ndjson.zst"))
     {
-        let limit = (bytes.len() as u64)
-            .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
-            .max(SPOOL_MIN_DECOMPRESSED_BYTES);
-        decode_zstd_bounded(&bytes, limit, path)?
+        decode_zstd_bounded(file, spool_decompression_limit(encoded_len), path)?
     } else {
-        bytes
+        read_spool_bytes_bounded(file, SPOOL_MAX_ARTIFACT_BYTES, path)?
     };
     String::from_utf8(decoded).map_err(|error| {
         format!(
@@ -6596,37 +6620,71 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
 ///
 /// The caller quarantines an undecodable record to `<data-name>.corrupt` rather
 /// than deleting it, so a rejected archive stays on disk for operator review.
-fn decode_zstd_bounded(bytes: &[u8], limit: u64, path: &Path) -> Result<Vec<u8>, String> {
-    let decoder = zstd::stream::read::Decoder::new(bytes).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
-            path.display()
-        )
-    })?;
+fn spool_decompression_limit(encoded_len: u64) -> u64 {
+    encoded_len
+        .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
+        .max(SPOOL_MIN_DECOMPRESSED_BYTES)
+        .min(SPOOL_MAX_ARTIFACT_BYTES)
+}
+
+fn read_spool_bytes_bounded(
+    reader: impl Read,
+    limit: u64,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::new();
-    // Read one byte past the allowance so an over-limit record is detected
-    // without ever materializing the rest of its expansion.
-    decoder
+    reader
         .take(limit.saturating_add(1))
         .read_to_end(&mut decoded)
         .map_err(|error| {
             format!(
-                "{PLUGIN_NAME}: failed to decompress spool file '{}': {error}",
+                "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
                 path.display()
             )
         })?;
     if decoded.len() as u64 > limit {
         return Err(format!(
-            "{PLUGIN_NAME}: spool file '{}' expands past its {limit}-byte decompression bound",
+            "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
             path.display()
         ));
     }
     Ok(decoded)
 }
 
+fn decode_zstd_bounded(
+    reader: impl Read,
+    limit: u64,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
+            path.display()
+        )
+    })?;
+    read_spool_bytes_bounded(decoder, limit, path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: spool file '{}' exceeded its decompression bound: {error}",
+            path.display()
+        )
+    })
+}
+
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
     decode_spool_file(path)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_artifact_byte_limit_for_tests() -> u64 {
+    SPOOL_MAX_ARTIFACT_BYTES
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_decompression_limit_for_tests(encoded_len: u64) -> u64 {
+    spool_decompression_limit(encoded_len)
 }
 
 #[doc(hidden)]
@@ -6871,12 +6929,17 @@ fn write_private_file_atomically_inner(
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    // Refuse a pre-existing symlink before `create_dir_all` or chmod can follow
+    // it, then lstat again after creation to close the ordinary check/create
+    // race as far as path-based filesystem APIs permit.
+    reject_symlinked_spool_path(path)?;
     fs::create_dir_all(path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to create spool directory '{}': {error}",
             path.display()
         )
     })?;
+    reject_symlinked_spool_path(path)?;
     #[cfg(unix)]
     {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
@@ -6886,27 +6949,49 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
             )
         })?;
     }
-    let probe = path.join(".ferrum-write-test");
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&probe)
-            .map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
-                    path.display()
-                )
-            })?;
-        file.write_all(b"ok").map_err(|error| {
+    // A fixed `create + truncate` probe lets a same-UID actor pre-plant a
+    // symlink and redirect truncation outside the managed tree. Use an
+    // unpredictable name and `create_new` so an existing path of any type is
+    // never followed.
+    let probe = path.join(format!(".ferrum-write-test-{}.tmp", new_ulid()));
+    #[cfg(unix)]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+        .map_err(|error| {
             format!(
-                "{PLUGIN_NAME}: spool directory '{}' write probe failed: {error}",
+                "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
                 path.display()
             )
         })?;
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
+                path.display()
+            )
+        })?;
+    if let Err(error) = file.write_all(b"ok") {
+        drop(file);
+        let _ = fs::remove_file(&probe);
+        return Err(format!(
+            "{PLUGIN_NAME}: spool directory '{}' write probe failed: {error}",
+            path.display()
+        ));
     }
-    let _ = fs::remove_file(&probe);
+    drop(file);
+    fs::remove_file(&probe).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to remove spool directory write probe '{}': {error}",
+            probe.display()
+        )
+    })?;
     Ok(())
 }
 

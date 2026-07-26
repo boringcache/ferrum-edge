@@ -449,11 +449,13 @@ fields are never logged.
 
 - Unreadable local spool files are renamed with a `.corrupt` suffix so newer
   files can continue to replay.
-- A `zstd` spool record may expand to at most 200x its encoded size (floor
-  1 MiB) during replay. Charge batches compress far below that, so the bound
-  never rejects a record Ferrum wrote; a planted high-ratio archive inside the
-  managed tree is quarantined as `.corrupt` instead of expanding without limit
-  inside the billing process.
+- Every encoded and decoded spool artifact is hard-capped at 256 MiB, matching
+  the sink's maximum accepted retained-byte budget. The writer refuses a larger
+  artifact, so it cannot publish a record this build will not replay. Within
+  that ceiling, a `zstd` record may expand to at most 200x its encoded size
+  (floor 1 MiB). A planted large raw file or high-ratio archive inside the
+  managed tree is quarantined as `.corrupt` without first being read or expanded
+  without limit inside the billing process.
 - Permanently rejected rows (and single-row 413 failures) are discarded only
   after one deterministic sibling `.rejected.meta` JSON document has been
   durably written for the source file. The document contains the aggregate
