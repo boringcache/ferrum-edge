@@ -349,36 +349,40 @@ async fn handle_startup_plugin_migrations_with_list(
 }
 
 // ---------------------------------------------------------------------------
-// Shared config-validation-rejection handling for writable poll loops
-// (database + control-plane), issue #2158.
+// Shared reachable-config-rejection handling for writable poll loops
+// (database + control-plane), issues #2158 / #2997.
 //
 // Both the `database` and `cp` runtimes poll an authoritative primary and are
 // WRITABLE through the admin API. When a reachable backend returns a
-// semantically-invalid full snapshot, admin writes are the in-band repair tool,
+// semantically-invalid or undecodable full snapshot, admin writes are the
+// in-band repair tool,
 // so the poll loop must keep the admin API writable (rather than fail closed as
 // it does for a genuine connectivity outage). These helpers centralize that
 // classification so the two runtimes cannot drift.
 // ---------------------------------------------------------------------------
 
-/// Classify a poll-loop full-load failure: `true` for a config-VALIDATION
-/// rejection (reachable backend, semantically-invalid snapshot), `false` for a
-/// connectivity/driver failure. A validation rejection is downcast-discoverable
-/// through the `anyhow` source chain (see
-/// [`crate::config::validation_pipeline::ConfigValidationRejection`]).
+/// Classify a poll-loop full-load failure: `true` for a reachable-backend config
+/// rejection (semantic VALIDATION via
+/// [`crate::config::validation_pipeline::ConfigValidationRejection`], or SQL
+/// row DECODE via [`crate::config::db_loader::RowDecodeRejection`]), `false` for
+/// a connectivity/driver failure. Both markers are downcast-discoverable through
+/// the `anyhow` source chain so poll loops keep `db_available=true` (after the
+/// migration gate) and raise `config_rejected` (issues #2158 / #2997).
 pub(crate) fn is_poll_validation_rejection(err: &anyhow::Error) -> bool {
     crate::config::validation_pipeline::is_config_validation_rejection(err)
+        || crate::config::db_loader::is_row_decode_rejection(err)
 }
 
-/// Apply the config-validation-rejection state transition once the deferred
+/// Apply the reachable-config-rejection state transition once the deferred
 /// migration gate has decided whether admin writes may be re-enabled.
 ///
-/// `writes_enabled` is the result of the migration gate: a validation rejection
-/// proves the backend is reachable, so writes are re-enabled — but ONLY if any
-/// deferred migrations applied cleanly, so writes never land on an unmigrated
-/// schema (issue #2158). `config_rejected` is raised regardless so the
-/// authenticated `/health` detail reports the degraded snapshot. Logs loudly
-/// only on the transition INTO the rejected state; repeats log at debug to
-/// avoid per-poll spam.
+/// `writes_enabled` is the result of the migration gate: a semantic-validation
+/// or row-decode rejection proves the backend is reachable, so writes are
+/// re-enabled — but ONLY if any deferred migrations applied cleanly, so writes
+/// never land on an unmigrated schema (issues #2158 / #2997).
+/// `config_rejected` is raised regardless so the authenticated `/health` detail
+/// reports the degraded snapshot. Logs loudly only on the transition INTO the
+/// rejected state; repeats log at debug to avoid per-poll spam.
 ///
 /// Kept pure (no async, no backend) so the state machine is unit-testable.
 pub(crate) fn apply_config_validation_rejection(
@@ -392,38 +396,38 @@ pub(crate) fn apply_config_validation_rejection(
     if !config_rejected.swap(true, Ordering::Relaxed) {
         if writes_enabled {
             error!(
-                "Full config load rejected by validation ({}); backend is reachable so KEEPING \
-                 admin API writable to repair the offending resource in-band, serving last \
-                 known-good runtime config: {}",
+                "Full config load rejected by validation or row decode ({}); backend is reachable \
+                 so KEEPING admin API writable to repair the offending resource in-band, serving \
+                 last known-good runtime config: {}",
                 context, err
             );
         } else {
             error!(
-                "Full config load rejected by validation ({}); backend is reachable but deferred \
-                 migrations are still pending, so admin writes stay BLOCKED until the schema is \
-                 applied; serving last known-good runtime config: {}",
+                "Full config load rejected by validation or row decode ({}); backend is reachable \
+                 but deferred migrations are still pending, so admin writes stay BLOCKED until \
+                 the schema is applied; serving last known-good runtime config: {}",
                 context, err
             );
         }
     } else {
         debug!(
-            "Full config load still rejected by validation ({}); serving last known-good \
-             runtime config: {}",
+            "Full config load still rejected by validation or row decode ({}); serving \
+             last known-good runtime config: {}",
             context, err
         );
     }
 }
 
 /// Raise the config-rejection signal for a full load rejected by the
-/// runtime-config VALIDATION contract (issue #2158). A validation rejection is
-/// positive proof the backend is REACHABLE, so re-enable admin writes so the
-/// offending resource can be repaired in-band — but gate that on
-/// [`DatabaseBackend::maybe_apply_deferred_migrations`] first so a reachable
-/// backend with a still-pending schema never enables writes against an
-/// unmigrated schema (the common case is a cheap no-op). On migration failure
-/// admin writes stay blocked while `config_rejected` is still raised. The last
-/// known-good runtime config keeps serving (the caches were never rebuilt — the
-/// load returned `Err`).
+/// runtime-config validation contract or by typed SQL row decoding (issues
+/// #2158 / #2997). Either rejection is positive proof the backend is REACHABLE,
+/// so re-enable admin writes so the offending resource can be repaired in-band
+/// — but gate that on [`DatabaseBackend::maybe_apply_deferred_migrations`] first
+/// so a reachable backend with a still-pending schema never enables writes
+/// against an unmigrated schema (the common case is a cheap no-op). On migration
+/// failure admin writes stay blocked while `config_rejected` is still raised.
+/// The last-known-good runtime config keeps serving (the caches were never
+/// rebuilt — the load returned `Err`).
 pub(crate) async fn record_config_validation_rejection(
     db: &Arc<dyn DatabaseBackend>,
     db_available: &AtomicBool,
@@ -435,8 +439,8 @@ pub(crate) async fn record_config_validation_rejection(
         Ok(_) => true,
         Err(migration_err) => {
             warn!(
-                "Deferred migrations failed while handling a reachable-backend config-validation \
-                 rejection ({}): {}. Admin writes remain blocked until the schema is applied.",
+                "Deferred migrations failed while handling a reachable-backend config rejection \
+                 ({}): {}. Admin writes remain blocked until the schema is applied.",
                 context, migration_err
             );
             false
@@ -665,6 +669,14 @@ mod tests {
         .into_anyhow()
     }
 
+    fn row_decode_rejection_error() -> anyhow::Error {
+        anyhow::Error::new(crate::config::db_loader::RowDecodeRejection {
+            resource_type: "consumer",
+            resource_id: Some("bad".to_string()),
+            reason: "Consumer bad: failed to parse credentials JSON: EOF".to_string(),
+        })
+    }
+
     #[test]
     fn is_poll_validation_rejection_classifies_marker_and_ignores_connectivity() {
         assert!(
@@ -674,6 +686,14 @@ mod tests {
         // Context-wrapped rejections must still classify.
         let wrapped = validation_rejection_error().context("while polling authoritative primary");
         assert!(is_poll_validation_rejection(&wrapped));
+        // Row-decode rejections from a reachable SQL backend (issue #2997).
+        assert!(
+            is_poll_validation_rejection(&row_decode_rejection_error()),
+            "a RowDecodeRejection must classify as a poll rejection so admin stays writable"
+        );
+        let wrapped_decode =
+            row_decode_rejection_error().context("while polling authoritative primary");
+        assert!(is_poll_validation_rejection(&wrapped_decode));
         // A plain connectivity error must fall through to fail-closed handling.
         assert!(!is_poll_validation_rejection(&anyhow::anyhow!(
             "connection refused (os error 61)"

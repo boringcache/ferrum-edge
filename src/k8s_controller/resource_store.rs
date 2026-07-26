@@ -336,4 +336,54 @@ mod tests {
         assert_eq!(objects[0].metadata.namespace, "default");
         assert_eq!(objects[0].metadata.name, "edge");
     }
+
+    /// ProxyConfig rides the same scoped-store + remove-on-stream-end path as
+    /// every other Istio CRD: a live store keeps last-known-good objects in
+    /// `snapshot_all` until the watcher explicitly deregisters the scope
+    /// (reprobe then restarts). This pins the store identity used by
+    /// `start_crd_watchers` for `networking.istio.io/v1beta1` ProxyConfig.
+    #[test]
+    fn proxy_config_scoped_store_keeps_last_known_until_scope_removed() {
+        let mut set = ResourceStoreSet::new();
+        let api_version = "networking.istio.io/v1beta1";
+        let kind = "ProxyConfig";
+        let scope = "namespace:default";
+
+        let ar = ApiResource {
+            group: "networking.istio.io".to_string(),
+            version: "v1beta1".to_string(),
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            plural: "proxyconfigs".to_string(),
+        };
+        let mut writer = reflector::store::Writer::new(ar.clone());
+        let object = DynamicObject::new("pc-defaults", &ar)
+            .within("default")
+            .data(json!({
+                "spec": { "concurrency": 4, "tracing": { "sampling": 42.0 } }
+            }));
+        writer.apply_watcher_event(&Event::Init);
+        writer.apply_watcher_event(&Event::InitApply(object));
+        writer.apply_watcher_event(&Event::InitDone);
+        let store = Arc::new(CrdResourceStore::new_scoped(
+            api_version.to_string(),
+            kind.to_string(),
+            scope.to_string(),
+            writer.as_reader(),
+        ));
+
+        assert!(set.add_store(store));
+        assert!(set.has_store_for_scope(api_version, kind, scope));
+        let snap = set.snapshot_all();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].kind, "ProxyConfig");
+        assert_eq!(snap[0].metadata.name, "pc-defaults");
+        assert_eq!(snap[0].api_version, api_version);
+
+        // Stream-end path removes only this scope; last-known objects leave
+        // with the store. Reprobe can re-add without clobbering other scopes.
+        assert!(set.remove_store_for_scope(api_version, kind, scope));
+        assert!(!set.has_store_for_scope(api_version, kind, scope));
+        assert!(set.snapshot_all().is_empty());
+    }
 }
