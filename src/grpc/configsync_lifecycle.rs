@@ -919,9 +919,10 @@ pub enum ConfigSyncAttemptOutcome {
     /// inconsistent, rejected, or a pre-snapshot DELTA). Fail over with
     /// accumulating backoff; never treat as delivered config.
     InvalidSubscriptionBase,
-    /// A DELTA carried an envelope/body timestamp mismatch or an
-    /// implausibly-future committed timestamp. Fail over with accumulating
-    /// backoff so a skewed or hostile CP cannot poison the freshness watermark.
+    /// A DELTA carried an envelope/body timestamp mismatch, an
+    /// implausibly-future committed timestamp, or a stamp older than the
+    /// applied authority watermark. Fail over with accumulating backoff so a
+    /// skewed, hostile, or lagging CP cannot poison or roll back freshness.
     InvalidDeltaFreshness,
     /// An unusable FULL_SNAPSHOT arrived after a base was already accepted, or a
     /// non-empty DELTA was rejected. Keep serving last-known-good config, reset

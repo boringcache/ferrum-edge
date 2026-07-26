@@ -4788,7 +4788,7 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
         wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
         "DP should apply the primary CP's snapshot"
     );
-    let watermark = proxy_state.config.load().loaded_at;
+    let primary_watermark = proxy_state.config.load().loaded_at;
     let accepted_at = connection_state.load().last_config_received_at;
 
     // Fail over to the equivalent-but-older CP.
@@ -4803,11 +4803,26 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
         connection_state.load().cp_url == older_url,
         "DP must be attached to the fallback CP after failover"
     );
+    // Equivalent older snapshots keep AppliedSnapshotAuthority monotonic at the
+    // primary watermark, but update_config's Unchanged path still stores the
+    // candidate body — so GatewayConfig.loaded_at may move backwards. Capture
+    // that post-base stamp so the ABA candidate can be placed strictly between
+    // body stamp and authority watermark (only evaluate_delta_authority stops it).
+    let loaded_at_after_base = proxy_state.config.load().loaded_at;
 
-    // The ABA delta: stamped inside the history the applied config already
+    // The ABA delta: stamped inside the history the applied authority already
     // superseded, and structurally valid, so only the freshness fence stops it.
     let rollback = create_test_proxy("aba-rollback", "/aba");
     let stale = add_proxy_delta_at(rollback, Utc::now() - chrono::Duration::hours(3));
+    assert!(
+        stale.poll_timestamp < primary_watermark,
+        "ABA candidate must predate the monotonic authority watermark"
+    );
+    assert!(
+        stale.poll_timestamp > loaded_at_after_base,
+        "ABA candidate must postdate the older equivalent body stamp so only \
+         evaluate_delta_authority (not GatewayConfig.loaded_at) can refuse it"
+    );
     // Re-broadcast a few times: a delta sent while the DP is momentarily between
     // attempts is simply dropped, which would pass this test for the wrong
     // reason. Every delivery must be fenced.
@@ -4820,9 +4835,10 @@ async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_t
         !wait_for_proxy_id(&proxy_state, "aba-rollback", Duration::from_secs(5)).await,
         "a DELTA older than the applied authority watermark must never apply"
     );
-    assert!(
-        proxy_state.config.load().loaded_at >= watermark,
-        "a refused DELTA must not roll the applied config's committed stamp backwards"
+    assert_eq!(
+        proxy_state.config.load().loaded_at,
+        loaded_at_after_base,
+        "a refused DELTA must not mutate the applied config's committed stamp"
     );
 
     client_handle.abort();

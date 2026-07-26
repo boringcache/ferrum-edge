@@ -631,10 +631,12 @@ pub async fn start_dp_client_with_stream_timings(
             }
             Ok(DpStreamEnd::InvalidDeltaFreshness) => {
                 // The CP supplied a DELTA whose envelope timestamp did not
-                // describe its body, or whose committed timestamp was
-                // implausibly far in the future. The delta was refused before
-                // apply, so fail over with accumulating backoff rather than
-                // letting that source poison the cross-CP freshness watermark.
+                // describe its body, whose committed timestamp was implausibly
+                // far in the future, or whose committed stamp predates the
+                // monotonic authority watermark (ABA / lagging-CP replay). The
+                // delta was refused before apply, so fail over with accumulating
+                // backoff rather than letting that source poison or roll back
+                // freshness authority.
                 warn!(
                     "Refused invalid DELTA freshness from CP [{}/{}] ({}); failing over \
                      without applying while keeping last-known-good config",
@@ -801,9 +803,10 @@ enum DpStreamEnd {
     /// the newer active config. The outer loop treats this as a
     /// failover-with-backoff failure — never as delivered config (issue #2970).
     StaleSnapshotFenced,
-    /// A DELTA envelope/body timestamp was inconsistent or implausibly far in
-    /// the future. The update is refused before apply and the outer loop fails
-    /// over with accumulating backoff so freshness authority cannot be poisoned.
+    /// A DELTA envelope/body timestamp was inconsistent, implausibly far in the
+    /// future, or older than the applied authority watermark. The update is
+    /// refused before apply and the outer loop fails over with accumulating
+    /// backoff so freshness authority cannot be poisoned or rolled back.
     InvalidDeltaFreshness,
     /// This subscription never committed a valid FULL_SNAPSHOT base (invalid /
     /// unparseable / rejected initial snapshot, or a pre-snapshot DELTA). Fail
