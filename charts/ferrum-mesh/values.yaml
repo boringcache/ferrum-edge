@@ -84,6 +84,28 @@ controlPlane:
         name: ""
         key: cp-dp-grpc-jwt-secret
       valueFrom: {}
+  # Independently configurable probes. Liveness/startup run
+  # `ferrum-edge health --live` (GET /live: process + admin up). Readiness runs
+  # `ferrum-edge health` (GET /health: 503 while starting/unavailable; ready-but-
+  # degraded stays HTTP 200 with JSON status "degraded"). Do NOT point liveness
+  # at /health — that restart-loops an alive-but-unready CP.
+  # failureThreshold*periodSeconds covers cert/config/DB startup (~3 min).
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      # Replaces the computed liveness handler (also used by startup).
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      override: {}
 
 injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should
@@ -132,6 +154,24 @@ injector:
     keyPath: /etc/ferrum/injector/tls/tls.key
   env:
     FERRUM_MODE: injector
+  # Injector mode has no admin /live|/health surface. Defaults use a TCP probe
+  # against the webhook listen port (TLS listener accept = process up). Overrides
+  # may supply httpGet/tcpSocket/exec; keep liveness process-only.
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      override: {}
 
 ambient:
   enabled: false
@@ -154,6 +194,25 @@ ambient:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: ambient
     FERRUM_MESH_HBONE_LISTEN_ADDR: 0.0.0.0:15008
+  # Admin-backed probes (health --live / health). Readiness is skipped when
+  # FERRUM_ADMIN_HTTP_PORT=0 except NodeWaypoint, which still requires admin for
+  # the DaemonSet readiness contract. Timing keeps ambient/node-waypoint boot
+  # (slice + SPIRE) inside the startup window.
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 2
+      periodSeconds: 5
+      override: {}
 
 eastWest:
   enabled: false
@@ -162,6 +221,24 @@ eastWest:
   env:
     FERRUM_MODE: mesh
     FERRUM_MESH_TOPOLOGY: east_west_gateway
+  # East-west is SNI passthrough on listenPort. Defaults use a TCP probe on that
+  # port so kubelet proves the datapath listener without coupling liveness to
+  # mesh-slice readiness. Override with admin health exec if preferred.
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      override: {}
 
 ca:
   # Disabled by default. This Deployment runs the Ferrum binary in CP mode, so
@@ -169,6 +246,22 @@ ca:
   enabled: false
   env:
     FERRUM_MESH_PRODUCTION_MODE: "true"
+  # Same admin health semantics as controlPlane (CP mode).
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      override: {}
 
 observability:
   # Master switch for the observability subtree. Default `false` so a fresh
@@ -258,6 +351,25 @@ nodeAgent:
     # Non-conflicting with the ambient mesh admin listener's binary default
     # (9000) when both DaemonSets run on the host network.
     port: 19090
+  # Admin-backed probes. When admin is disabled or port=0, computed probes are
+  # omitted (preserve the historical no-readiness behavior) unless an override
+  # handler is supplied. Liveness uses --live so capture degradation does not
+  # restart-loop the agent.
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 36
+      periodSeconds: 5
+    liveness:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      override: {}
+    readiness:
+      enabled: true
+      initialDelaySeconds: 2
+      periodSeconds: 5
+      override: {}
   # Default to fail because the published Ferrum image is distroless and does
   # not include /bin/sh, iptables, or ip6tables. Set to `iptables` only when
   # running a custom node-agent image that provides those binaries.
