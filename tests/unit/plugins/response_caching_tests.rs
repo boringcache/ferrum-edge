@@ -4362,7 +4362,10 @@ async fn test_qualified_private_field_is_not_retained() {
     let plugin = default_plugin();
     let request = HashMap::new();
     let response = advisory_headers(&[
-        ("cache-control", "public, max-age=300, private=\"x-account\""),
+        (
+            "cache-control",
+            "public, max-age=300, private=\"x-account\"",
+        ),
         ("x-account", "tenant-a"),
         ("content-type", "application/json"),
     ]);
@@ -4562,10 +4565,8 @@ async fn test_partial_representation_is_never_stored() {
 async fn test_validator_only_not_modified_is_never_stored() {
     let plugin = plugin_with_config(json!({ "cacheable_status_codes": [200] }));
     let request = HashMap::new();
-    let response = advisory_headers(&[
-        ("cache-control", "public, max-age=300"),
-        ("etag", "\"v1\""),
-    ]);
+    let response =
+        advisory_headers(&[("cache-control", "public, max-age=300"), ("etag", "\"v1\"")]);
 
     advisory_miss_cycle(&plugin, "/api/validator", &request, 304, &response, b"").await;
 
