@@ -71,15 +71,9 @@ pub fn shared_crl_list(crls: CrlList) -> SharedCrlList {
     Arc::new(arc_swap::ArcSwap::new(crls))
 }
 
-/// Fixed operator-facing PEM parse failure classes. Never interpolate
-/// rustls-pemfile diagnostics: they can echo malformed PEM lines or bytes.
-fn pem_certificate_parse_failure_class(error: rustls_pemfile::Error) -> &'static str {
-    match error {
-        rustls_pemfile::Error::IllegalSectionStart { .. } => "illegal PEM section start",
-        rustls_pemfile::Error::MissingSectionEnd { .. } => "missing PEM section end marker",
-        rustls_pemfile::Error::Base64Decode(_) => "invalid PEM base64 encoding",
-    }
-}
+/// Fixed operator-facing PEM parse failure class. Never interpolate
+/// rustls-pemfile or I/O diagnostics: they can echo malformed PEM lines or bytes.
+const PEM_CERTIFICATE_PARSE_FAILURE_CLASS: &str = "malformed PEM certificate record";
 
 /// Fixed operator-facing trust-anchor admission failure class. Never interpolate
 /// the rejected certificate DER or rustls admission diagnostics.
@@ -98,13 +92,13 @@ pub(crate) fn parse_pem_certificate_bundle(
     let certificates = rustls_pemfile::certs(&mut Cursor::new(pem_data))
         .enumerate()
         .map(|(index, result)| {
-            result.map_err(|error| {
+            result.map_err(|_error| {
                 anyhow::anyhow!(
                     "{}: certificate record #{} in '{}' is malformed: {}",
                     label,
                     index + 1,
                     display_source,
-                    pem_certificate_parse_failure_class(error)
+                    PEM_CERTIFICATE_PARSE_FAILURE_CLASS
                 )
             })
         })
