@@ -579,7 +579,11 @@ fn sliding_window_reverse_arrival_keeps_live_state_through_cleanup() {
         .checked_add(Duration::from_secs(1))
         .expect("test Instant supports a one-second offset");
 
-    assert!(limiter.check_at("live-key".to_string(), &op, t_newer).allowed);
+    assert!(
+        limiter
+            .check_at("live-key".to_string(), &op, t_newer)
+            .allowed
+    );
     assert!(limiter.check_at("live-key".to_string(), &op, t0).allowed);
     assert_eq!(limiter.tracked_keys_count(), 1);
 
@@ -622,8 +626,16 @@ fn udp_reverse_arrival_keeps_live_state_through_cleanup() {
         .checked_add(Duration::from_secs(1))
         .expect("test Instant supports a one-second offset");
 
-    assert!(limiter.check_at("10.0.0.9".to_string(), &op, t_newer).allowed);
-    assert!(limiter.check_at("10.0.0.9".to_string(), &op, t_older).allowed);
+    assert!(
+        limiter
+            .check_at("10.0.0.9".to_string(), &op, t_newer)
+            .allowed
+    );
+    assert!(
+        limiter
+            .check_at("10.0.0.9".to_string(), &op, t_older)
+            .allowed
+    );
 
     // Idle threshold is max(window*2, 10) == 10s. With last_check wrongly
     // rewound to 1s, a sweep at epoch+12s looks idle (11s); with a forward
@@ -676,11 +688,7 @@ fn ai_maximum_window_uses_checked_instant_arithmetic() {
     let algorithm = AiTokenRateAlgorithm::new(10, MAX_RATE_LIMIT_WINDOW_SECONDS);
     let mut state = algorithm.new_state();
     let now = Instant::now();
-    let outcome = algorithm.check_local(
-        &mut state,
-        &AiRateLimitOp::Reserve { tokens: 1 },
-        now,
-    );
+    let outcome = algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 1 }, now);
     assert!(outcome.allowed);
     assert!(algorithm.is_state_active(&state, now));
 }

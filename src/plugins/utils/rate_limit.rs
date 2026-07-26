@@ -55,8 +55,7 @@ pub const SLIDING_WINDOW_BUCKET_COUNT: usize = 64;
 
 /// Number of sub-intervals in one configured sliding window. One additional
 /// ring slot retains the oldest partially overlapping bucket.
-const SLIDING_WINDOW_INTERVALS_PER_WINDOW: u128 =
-    (SLIDING_WINDOW_BUCKET_COUNT - 1) as u128;
+const SLIDING_WINDOW_INTERVALS_PER_WINDOW: u128 = (SLIDING_WINDOW_BUCKET_COUNT - 1) as u128;
 
 /// Local windows at or below this many whole seconds use a token bucket;
 /// longer windows use the bounded aggregate [`SlidingWindow`].
@@ -1146,8 +1145,7 @@ impl SlidingWindow {
 fn absolute_sliding_bucket(elapsed: Duration, window: Duration) -> u64 {
     let window_nanos = window.as_nanos().max(1);
     let elapsed_nanos = elapsed.as_nanos();
-    let indexed =
-        elapsed_nanos.saturating_mul(SLIDING_WINDOW_INTERVALS_PER_WINDOW) / window_nanos;
+    let indexed = elapsed_nanos.saturating_mul(SLIDING_WINDOW_INTERVALS_PER_WINDOW) / window_nanos;
     u64::try_from(indexed).unwrap_or(u64::MAX)
 }
 
@@ -1243,8 +1241,7 @@ impl TokenBucket {
             return;
         };
         self.last_refill = now;
-        self.tokens =
-            (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.capacity);
+        self.tokens = (self.tokens + elapsed.as_secs_f64() * self.refill_rate).min(self.capacity);
     }
 }
 
@@ -1620,11 +1617,7 @@ impl TokenUsageWindow {
             _ => now,
         };
         self.last_activity = Some(at);
-        self.entries.push_back(TokenEntry {
-            at,
-            id,
-            tokens,
-        });
+        self.entries.push_back(TokenEntry { at, id, tokens });
         self.total = self.total.saturating_add(tokens);
         id
     }
@@ -2318,9 +2311,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
         // sampled before the per-key write guard. `fetch_max` keeps the idle
         // watermark monotonic so a delayed older datagram cannot make newer
         // live usage look stale to cleanup.
-        state
-            .last_check_secs
-            .fetch_max(now_secs, Ordering::Relaxed);
+        state.last_check_secs.fetch_max(now_secs, Ordering::Relaxed);
 
         let new_count = saturating_atomic_add(&state.count, 1);
         let new_bytes = saturating_atomic_add(&state.bytes, op.datagram_size);
