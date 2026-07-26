@@ -2475,40 +2475,6 @@ impl Plugin for RequestDeduplication {
         let local_inflight_owner_token = state.local_inflight_owner_token;
         let redis_lock_token = state.redis_lock_token;
 
-        // `response_policy_stamp_stable()` compares the pinned publication
-        // *identity*, not its content, so an A→B→A cycle observed during this
-        // request is still treated as a straddle. The gate content read by the
-        // transforms that shaped these bytes is then unknown, and the
-        // representation belongs to no provable policy.
-        if !ctx.response_policy_stamp_stable() {
-            // The final representation may have straddled a policy
-            // publication, so it is unsafe to persist. Keep the in-flight
-            // ownership until its bounded TTL rather than allowing a retry to
-            // repeat a possibly completed external side effect.
-            return PluginResult::Continue;
-        }
-        let response_policy = ctx.response_policy_provenance();
-        if response_policy.complete().is_none() {
-            // The effective response-side presentation policy could not be
-            // established — no plugin-cache view, or this proxy carries a
-            // plugin whose response rewrite comes from live runtime state
-            // (`ResponsePresentationPolicy::Dynamic`). These bytes belong to no
-            // provable policy, so they are retained nowhere: not in Redis,
-            // which `redis_payload_for_response` would refuse anyway, and not
-            // in the local map, where a later request under an equally
-            // unprovable policy would otherwise be served them.
-            //
-            // Concurrent-duplicate protection is unaffected — the in-flight
-            // marking already happened and is kept until its bounded TTL, so a
-            // retry cannot repeat a possibly completed external side effect.
-            // Only the finalized *replay* is given up.
-            debug!(
-                "request_deduplication: response-side presentation policy could not be \
-                 established for this request; retaining no replayable representation"
-            );
-            return PluginResult::Continue;
-        }
-
         // Synthetic short-circuit guard. When a *fresh* request that this plugin
         // marked in-flight is then short-circuited by a LATER `before_proxy`
         // plugin (e.g. a 2xx `fault_injection`/`mesh_route_dispatch` abort,
@@ -2567,6 +2533,49 @@ impl Plugin for RequestDeduplication {
             if let Some(token) = redis_lock_token.as_deref() {
                 self.redis_release_inflight(&key, &fingerprint, token).await;
             }
+            return PluginResult::Continue;
+        }
+
+        // Replay provenance is checked only once a representation is actually
+        // going to be retained. It must stay BELOW the synthetic guard above:
+        // a synthetic short-circuit stores nothing either way, so failing it
+        // closed here would hold both in-flight markers until `inflight_ttl`
+        // for a request that never reached the backend — turning, e.g., a
+        // probabilistic `fault_injection` abort into a hard 409 lockout for the
+        // whole TTL — while buying no safety, because there are no bytes whose
+        // producing policy could be misrepresented.
+        //
+        // `response_policy_stamp_stable()` compares the pinned publication
+        // *identity*, not its content, so an A→B→A cycle observed during this
+        // request is still treated as a straddle. The gate content read by the
+        // transforms that shaped these bytes is then unknown, and the
+        // representation belongs to no provable policy.
+        if !ctx.response_policy_stamp_stable() {
+            // The final representation may have straddled a policy
+            // publication, so it is unsafe to persist. Keep the in-flight
+            // ownership until its bounded TTL rather than allowing a retry to
+            // repeat a possibly completed external side effect.
+            return PluginResult::Continue;
+        }
+        let response_policy = ctx.response_policy_provenance();
+        if response_policy.complete().is_none() {
+            // The effective response-side presentation policy could not be
+            // established — no plugin-cache view, or this proxy carries a
+            // plugin whose response rewrite comes from live runtime state
+            // (`ResponsePresentationPolicy::Dynamic`). These bytes belong to no
+            // provable policy, so they are retained nowhere: not in Redis,
+            // which `redis_payload_for_response` would refuse anyway, and not
+            // in the local map, where a later request under an equally
+            // unprovable policy would otherwise be served them.
+            //
+            // Concurrent-duplicate protection is unaffected — the in-flight
+            // marking already happened and is kept until its bounded TTL, so a
+            // retry cannot repeat a possibly completed external side effect.
+            // Only the finalized *replay* is given up.
+            debug!(
+                "request_deduplication: response-side presentation policy could not be \
+                 established for this request; retaining no replayable representation"
+            );
             return PluginResult::Continue;
         }
 

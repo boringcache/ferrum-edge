@@ -829,6 +829,16 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
         self.inner.requires_replay_response_body_transform(ctx)
     }
+    /// Must forward: this wrapper still runs the inner plugin's response-body
+    /// transform above, so falling back to the trait default (`None`) would
+    /// drop an enrolled instance out of the per-proxy replay-provenance fold
+    /// purely because an operator set `priority_override`. A stored dedup
+    /// replay would then keep matching across a redaction/header/body rule
+    /// edit, and a `Dynamic` contribution would stop poisoning the fold — both
+    /// exactly the replays `ResponsePolicyProvenance` exists to retire.
+    fn response_presentation_policy(&self) -> Option<ResponsePresentationPolicy> {
+        self.inner.response_presentation_policy()
+    }
     fn enforces_response_body_policy(
         &self,
         ctx: &RequestContext,
