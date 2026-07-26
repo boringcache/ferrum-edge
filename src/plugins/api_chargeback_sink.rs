@@ -27,7 +27,7 @@ use http::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,33 @@ const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
+/// Versioned on-disk ownership format for managed chargeback spool trees.
+const SPOOL_FORMAT_VERSION: u32 = 1;
+const SPOOL_META_FILENAME: &str = "spool.meta.json";
+const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool-owner\0";
+/// Hex characters of the ownership digest kept in the namespace path component.
+const SPOOL_OWNER_DIGEST_LEN: usize = 32;
+/// Hex characters of the ownership digest embedded in every managed filename.
+const SPOOL_OWNER_TAG_LEN: usize = 32;
+const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
+const SPOOL_CLAIM_MARKER: &str = ".claim-";
+const SPOOL_WRITE_MARKER: &str = ".write-";
+const SPOOL_TMP_SUFFIX: &str = ".tmp";
+/// Bound recursive spool walks (day dirs + namespace depth headroom).
+const MAX_SPOOL_TRAVERSAL_DEPTH: u32 = 8;
+/// Hard cap on directory entries visited by one bounded tree walk, and on the
+/// aggregate legacy/sibling-namespace portion of the unbound-record scan.
+/// Counting directories and symlinks as well as regular files prevents an
+/// attacker-controlled tree of empty directories from escaping the bound.
+const MAX_SPOOL_TRAVERSAL_ENTRIES: usize = 100_000;
+/// Production age before a foreign or unattributable temp may be reconciled.
+const STALE_TEMP_AGE_SECS: u64 = 300;
+/// Floor for the in-flight replay claim lease derived from the configured
+/// ClickHouse delivery budget.
+const SPOOL_CLAIM_LEASE_MIN_SECS: u64 = 300;
+/// Safety multiplier applied to the worst-case delivery budget so an expiring
+/// lease cannot overtake a delivery that is still legitimately in progress.
+const SPOOL_CLAIM_LEASE_BUDGET_FACTOR: u64 = 4;
 
 fn default_buffer_max_bytes() -> usize {
     DEFAULT_BUFFER_MAX_BYTES
@@ -86,6 +113,40 @@ const MAX_RETRY_MAX_ATTEMPTS: u32 = 32;
 /// Deployment-safe ceiling for each configured inter-attempt delay field
 /// (`retry.initial_delay_ms` and `retry.max_delay_ms`).
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Bound on how far one compressed spool record may expand during replay.
+///
+/// JSONEachRow charge batches compress at roughly 5-20x, so a 200x allowance
+/// never rejects a record this plugin wrote, while a planted high-ratio archive
+/// inside the managed tree can no longer expand without limit inside the billing
+/// process. An over-limit record is quarantined, never silently dropped.
+const SPOOL_MAX_DECOMPRESSION_RATIO: u64 = 200;
+/// Floor for the expansion allowance so a very small legitimate record is never
+/// bounded below its own framing overhead.
+const SPOOL_MIN_DECOMPRESSED_BYTES: u64 = 1024 * 1024;
+/// Hard ceiling for both encoded and decoded bytes in one spool artifact.
+///
+/// This matches the process-wide retained-byte ceiling accepted for sink
+/// buffers. The writer refuses a larger artifact, so replay never rejects a
+/// record this build successfully published. The absolute bound complements
+/// the ratio check: a ratio alone still permits a multi-gigabyte allocation
+/// when a same-UID attacker plants a large archive in the managed tree.
+const SPOOL_MAX_ARTIFACT_BYTES: u64 = HARD_MAX_BUFFER_MAX_BYTES as u64;
+// `spool_decompression_limit` clamps into this range, and `clamp` panics when
+// the upper bound is below the lower one. Prove the ordering at compile time so
+// the replay path can never panic inside the billing process.
+const _: () = assert!(SPOOL_MIN_DECOMPRESSED_BYTES <= SPOOL_MAX_ARTIFACT_BYTES);
+/// Bound for the ownership manifest (`spool.meta.json`).
+///
+/// The manifest is a small fixed-shape record, but it is read *before* this
+/// owner's identity is established and on every prepare and replay listing, so
+/// it is the one managed file a same-UID actor can inflate without first
+/// deriving the owner tag. 64 KiB is orders of magnitude above the real record
+/// and keeps a planted manifest from allocating inside the billing process.
+const SPOOL_MAX_META_BYTES: u64 = 64 * 1024;
+/// Bound one ClickHouse attempt so the derived cross-process claim lease remains
+/// finite and representable. Ten minutes is already substantially above the
+/// default five-second export timeout.
+const MAX_CLICKHOUSE_TIMEOUT_MS: u64 = 600_000;
 /// Worst-case cumulative inter-attempt delay budget across retries after the
 /// initial try (exponential/capped schedule, ignoring jitter reduction).
 const MAX_RETRY_TOTAL_DELAY_MS: u64 = 600_000;
@@ -99,6 +160,8 @@ const WAIT_FOR_ASYNC_INSERT_PARAM: &str = "wait_for_async_insert";
 /// Standalone / validation constructors that omit a plugin-config resource id.
 /// Production `PluginCache` always supplies the configured resource id.
 const DEFAULT_PLUGIN_CONFIG_ID: &str = "__standalone__";
+/// Ledger identity used when a caller supplies no Ferrum namespace.
+const DEFAULT_FERRUM_NAMESPACE: &str = "ferrum";
 
 /// Accepted active sinks published after PluginCache commit. Keyed by stable
 /// plugin-config ID so sibling configurations coexist while a newly accepted
@@ -1015,6 +1078,10 @@ pub struct ApiChargebackSink {
     /// observability. Production cache supplies `PluginConfig.id`; standalone
     /// constructors fall back to [`DEFAULT_PLUGIN_CONFIG_ID`].
     plugin_config_id: Arc<str>,
+    /// Ferrum namespace (billing ledger) this instance was built for. Part of
+    /// the durable spool ownership identity so two ledgers can never share a
+    /// managed spool namespace.
+    ferrum_namespace: Arc<str>,
     /// Shared gateway client retained for dedicated ClickHouse client build at start.
     http_client: PluginHttpClient,
     /// Live sink runtime after [`Plugin::start_background_tasks`].
@@ -1770,6 +1837,11 @@ struct SinkMetrics {
     spool_jobs_written_total: AtomicU64,
     spool_jobs_lost_total: AtomicU64,
     spool_events_lost_total: AtomicU64,
+    /// Retained spool records this identity does not own: pre-namespace layouts
+    /// and namespaces orphaned by a destination/configuration change. Never
+    /// replayed, never deleted; reported so operators can reconcile them.
+    spool_unbound_files: AtomicU64,
+    spool_unbound_namespaces: AtomicU64,
     snapshot_emits_total: AtomicU64,
     snapshot_overflow_spooled_total: AtomicU64,
     snapshot_overflow_pending_total: AtomicU64,
@@ -1798,6 +1870,8 @@ impl Default for SinkMetrics {
             spool_jobs_written_total: AtomicU64::new(0),
             spool_jobs_lost_total: AtomicU64::new(0),
             spool_events_lost_total: AtomicU64::new(0),
+            spool_unbound_files: AtomicU64::new(0),
+            spool_unbound_namespaces: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
             snapshot_overflow_spooled_total: AtomicU64::new(0),
             snapshot_overflow_pending_total: AtomicU64::new(0),
@@ -1989,7 +2063,7 @@ impl ApiChargebackSink {
     pub fn new_with_config_id(
         raw_config: &Value,
         http_client: PluginHttpClient,
-        _namespace: &str,
+        namespace: &str,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
         if !raw_config.is_object() {
@@ -2035,11 +2109,18 @@ impl ApiChargebackSink {
             http_client.backend_allow_ips(),
         )?;
 
+        let ferrum_namespace = if namespace.trim().is_empty() {
+            Arc::<str>::from(DEFAULT_FERRUM_NAMESPACE)
+        } else {
+            Arc::<str>::from(namespace.trim())
+        };
+
         Ok(Self {
             pricing,
             config: Arc::new(config),
             node_id: Arc::<str>::from(resolve_node_id()),
             plugin_config_id,
+            ferrum_namespace,
             http_client,
             runtime: OnceLock::new(),
             snapshot_accumulator: OnceLock::new(),
@@ -2068,11 +2149,28 @@ impl ApiChargebackSink {
             None
         };
         let metrics = Arc::new(SinkMetrics::default());
+        let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let spool = if self.config.spool.enabled {
+            // Ownership binds the stable plugin-config id, the Ferrum namespace
+            // (ledger), the sanitized ClickHouse endpoint, and the destination
+            // schema. `endpoint` is credential-free by construction, so nothing
+            // secret reaches a path, a manifest, or a log line.
+            let owner = SpoolOwner::new(
+                Arc::clone(&self.plugin_config_id),
+                Arc::clone(&self.ferrum_namespace),
+                endpoint.clone(),
+                self.config.clickhouse.database.clone(),
+                self.config.clickhouse.table.clone(),
+                Arc::clone(&self.node_id),
+            );
             Some(Arc::new(SpoolManager::new(
                 self.config.spool.clone(),
-                Arc::clone(&self.node_id),
+                owner,
+                generation,
                 Arc::clone(&metrics),
+                STALE_TEMP_AGE_SECS,
+                spool_claim_lease_secs(&self.config),
+                SpoolFsOps::REAL,
             )?))
         } else {
             None
@@ -2181,7 +2279,6 @@ impl ApiChargebackSink {
                 .buffer_max_bytes
                 .max(MAX_CHARGE_EVENT_BYTES),
         ));
-        let generation = NEXT_SINK_GENERATION.fetch_add(1, Ordering::Relaxed);
         let runtime = Arc::new(SinkRuntime {
             plugin_config_id: Arc::clone(&self.plugin_config_id),
             generation,
@@ -2865,6 +2962,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut spool_bytes = 0u64;
     let mut spool_drops = 0u64;
     let mut spool_prepare_failures = 0u64;
+    let mut spool_unbound_files = 0u64;
+    let mut spool_unbound_namespaces = 0u64;
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut events_enqueued = 0u64;
@@ -2901,6 +3000,13 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
         );
         spool_drops =
             spool_drops.saturating_add(runtime.metrics.spool_drops_total.load(Ordering::Relaxed));
+        let unbound_files = runtime.metrics.spool_unbound_files.load(Ordering::Relaxed);
+        spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
+        let unbound_ns = runtime
+            .metrics
+            .spool_unbound_namespaces
+            .load(Ordering::Relaxed);
+        spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         if let Some(spool) = runtime.spool.as_ref() {
             spool_enabled_any = true;
             let stats = spool.scan_stats().unwrap_or_default();
@@ -2932,6 +3038,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
                 "bytes": spool_bytes,
                 "drops_total": spool_drops,
                 "prepare_failures_total": spool_prepare_failures,
+                "unbound_files": spool_unbound_files,
+                "unbound_namespaces": spool_unbound_namespaces,
                 "available": spool_enabled_any && spool_all_available
             },
             "export": {
@@ -2999,6 +3107,8 @@ impl SinkRuntime {
                 "files": spool_files,
                 "bytes": spool_bytes,
                 "drops_total": self.metrics.spool_drops_total.load(Ordering::Relaxed),
+                "unbound_files": self.metrics.spool_unbound_files.load(Ordering::Relaxed),
+                "unbound_namespaces": self.metrics.spool_unbound_namespaces.load(Ordering::Relaxed),
                 "delivery_queue_depth": self
                     .spool_delivery
                     .as_ref()
@@ -3106,6 +3216,8 @@ fn render_prometheus_for_sinks(
     let mut spool_jobs_written = 0u64;
     let mut spool_jobs_lost = 0u64;
     let mut spool_events_lost = 0u64;
+    let mut spool_unbound_files = 0u64;
+    let mut spool_unbound_namespaces = 0u64;
     let mut spool_enabled_any = false;
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
@@ -3152,6 +3264,10 @@ fn render_prometheus_for_sinks(
             spool_jobs_lost.saturating_add(metrics.spool_jobs_lost_total.load(Ordering::Relaxed));
         spool_events_lost = spool_events_lost
             .saturating_add(metrics.spool_events_lost_total.load(Ordering::Relaxed));
+        let unbound_files = metrics.spool_unbound_files.load(Ordering::Relaxed);
+        spool_unbound_files = spool_unbound_files.saturating_add(unbound_files);
+        let unbound_ns = metrics.spool_unbound_namespaces.load(Ordering::Relaxed);
+        spool_unbound_namespaces = spool_unbound_namespaces.saturating_add(unbound_ns);
         queue_retained_bytes =
             queue_retained_bytes.saturating_add(runtime.byte_budget.used() as u64);
         queue_byte_budget_exhausted = queue_byte_budget_exhausted.saturating_add(
@@ -3318,6 +3434,18 @@ fn render_prometheus_for_sinks(
     output.push_str(&format!(
         "chargeback_sink_spool_prepare_failures_total {}\n",
         spool_prepare_failures
+    ));
+    output.push_str("# HELP chargeback_sink_spool_unbound_files Retained spool records not bound to a live destination identity. Never replayed or deleted; an observed lower bound when the bounded aggregate scan is truncated.\n");
+    output.push_str("# TYPE chargeback_sink_spool_unbound_files gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_unbound_files {}\n",
+        spool_unbound_files
+    ));
+    output.push_str("# HELP chargeback_sink_spool_unbound_namespaces Managed spool namespaces still holding records for a destination identity no live instance owns; an observed lower bound when the bounded aggregate scan is truncated.\n");
+    output.push_str("# TYPE chargeback_sink_spool_unbound_namespaces gauge\n");
+    output.push_str(&format!(
+        "chargeback_sink_spool_unbound_namespaces {}\n",
+        spool_unbound_namespaces
     ));
     output.push_str(
         "# HELP chargeback_sink_spool_jobs_enqueued_total Chargeback sink jobs accepted by the async spool delivery worker.\n",
@@ -3748,9 +3876,10 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     }
     validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
     validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
-    if config.clickhouse.timeout_ms == 0 {
+    if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
+    {
         return Err(format!(
-            "{PLUGIN_NAME}: clickhouse.timeout_ms must be at least 1"
+            "{PLUGIN_NAME}: clickhouse.timeout_ms must be between 1 and {MAX_CLICKHOUSE_TIMEOUT_MS}"
         ));
     }
     validate_query_params(&config.clickhouse.insert_query_params)?;
@@ -4163,42 +4292,932 @@ pub struct SpoolStats {
     pub bytes: u64,
 }
 
+/// Versioned durable ownership record for one managed chargeback spool namespace.
+///
+/// Binds the whole namespace to the accepted plugin-config identity, the Ferrum
+/// namespace/ledger, the node identity, and the ClickHouse destination/schema it
+/// was produced for. It holds no credentials: `destination_endpoint` is the
+/// credential-free configured base URL (including its path, when present) and
+/// the ClickHouse password is deliberately excluded so neither the record nor
+/// the derived digest is credential-derived. Replay validates this record before
+/// touching any billing file, and every individual file additionally carries
+/// [`SpoolOwner::tag`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SpoolNamespaceMeta {
+    version: u32,
+    owner_digest: String,
+    owner_tag: String,
+    plugin_config_id: String,
+    ferrum_namespace: String,
+    destination_endpoint: String,
+    database: String,
+    table: String,
+    node_id: String,
+    created_at_unix: i64,
+}
+
+/// Stable, validated, non-secret spool ownership identity.
+#[derive(Debug, Clone)]
+struct SpoolOwner {
+    plugin_config_id: Arc<str>,
+    ferrum_namespace: Arc<str>,
+    destination_endpoint: Arc<str>,
+    database: Arc<str>,
+    table: Arc<str>,
+    node_id: Arc<str>,
+    /// Full hex digest over the complete ownership tuple.
+    digest: Arc<str>,
+    /// Digest prefix embedded in every managed filename.
+    tag: Arc<str>,
+}
+
+impl SpoolOwner {
+    fn new(
+        plugin_config_id: impl Into<Arc<str>>,
+        ferrum_namespace: impl Into<Arc<str>>,
+        destination_endpoint: impl Into<Arc<str>>,
+        database: impl Into<Arc<str>>,
+        table: impl Into<Arc<str>>,
+        node_id: impl Into<Arc<str>>,
+    ) -> Self {
+        let plugin_config_id = plugin_config_id.into();
+        let ferrum_namespace = ferrum_namespace.into();
+        let destination_endpoint = destination_endpoint.into();
+        let database = database.into();
+        let table = table.into();
+        let node_id = node_id.into();
+        let digest = spool_owner_digest(&[
+            plugin_config_id.as_ref(),
+            ferrum_namespace.as_ref(),
+            destination_endpoint.as_ref(),
+            database.as_ref(),
+            table.as_ref(),
+            node_id.as_ref(),
+        ]);
+        let tag = digest[..SPOOL_OWNER_TAG_LEN].to_string();
+        Self {
+            plugin_config_id,
+            ferrum_namespace,
+            destination_endpoint,
+            database,
+            table,
+            node_id,
+            digest: Arc::<str>::from(digest),
+            tag: Arc::<str>::from(tag),
+        }
+    }
+
+    fn to_meta(&self, created_at_unix: i64) -> SpoolNamespaceMeta {
+        SpoolNamespaceMeta {
+            version: SPOOL_FORMAT_VERSION,
+            owner_digest: self.digest.to_string(),
+            owner_tag: self.tag.to_string(),
+            plugin_config_id: self.plugin_config_id.to_string(),
+            ferrum_namespace: self.ferrum_namespace.to_string(),
+            destination_endpoint: self.destination_endpoint.to_string(),
+            database: self.database.to_string(),
+            table: self.table.to_string(),
+            node_id: self.node_id.to_string(),
+            created_at_unix,
+        }
+    }
+
+    fn matches_meta(&self, meta: &SpoolNamespaceMeta) -> bool {
+        meta.version == SPOOL_FORMAT_VERSION
+            && meta.owner_digest == self.digest.as_ref()
+            && meta.owner_tag == self.tag.as_ref()
+            && meta.plugin_config_id == self.plugin_config_id.as_ref()
+            && meta.ferrum_namespace == self.ferrum_namespace.as_ref()
+            && meta.destination_endpoint == self.destination_endpoint.as_ref()
+            && meta.database == self.database.as_ref()
+            && meta.table == self.table.as_ref()
+            && meta.node_id == self.node_id.as_ref()
+    }
+}
+
+/// Domain-separated, length-prefixed ownership digest.
+///
+/// Length prefixes keep two different tuples from colliding by shifting text
+/// across a field boundary (`db="a", table="bc"` versus `db="ab", table="c"`).
+fn spool_owner_digest(fields: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(SPOOL_OWNER_DIGEST_DOMAIN);
+    hasher.update(u64::from(SPOOL_FORMAT_VERSION).to_be_bytes());
+    for field in fields {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    let digest = hasher.finalize();
+    hex::encode(&digest[..])
+}
+
+/// Durable-write step a test asks one spool manager to fail at.
+///
+/// Fault selection is per-[`SpoolManager`] state supplied at construction, not a
+/// process-global switch, so no production sink can be steered away from the
+/// real filesystem calls.
+///
+/// Non-`None` variants are constructed only by the external unit-test suite via
+/// [`SpoolManager::for_tests_with_owner_and_faults`]; the binary crate never
+/// builds them, so clippy's dead-code lint is expected there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SpoolFsFault {
+    None,
+    FileSync,
+    Rename,
+    DirOpen,
+    DirSync,
+    /// A peer republishes the final path between this attempt's rename and its
+    /// parent-directory fsync, and that fsync then fails. Models the
+    /// interleaving in which a path-based rollback would unlink an entry this
+    /// attempt no longer owns.
+    PeerRepublishThenDirSync,
+}
+
+/// Whether this write attempt exclusively owns the name it publishes to.
+///
+/// Rollback after a failed publish may only unlink a final path when no other
+/// writer can be publishing to that same name, because a path unlink cannot be
+/// made atomic with any proof about which file the name currently resolves to.
+/// Stat-then-unlink, content comparison, and timestamp comparison all lose the
+/// race against an atomic `rename` by a peer between the check and the unlink,
+/// and an in-process lock says nothing about a peer process sharing the volume.
+/// So the distinction is drawn statically, at each call site, instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolFinalOwnership {
+    /// A name no other writer can publish to: the ULID-derived data batch
+    /// `<ulid>.<owner_tag>.<ext>`, and the `<that name>.rejected.meta`
+    /// dead-letter record derived from one. Rollback unlinks such a final,
+    /// because the only entry it can ever destroy is this attempt's own
+    /// unsynced publication.
+    Unique,
+    /// A well-known name every writer of the namespace publishes to — currently
+    /// only `spool.meta.json`. Rollback never unlinks such a final.
+    Shared,
+}
+
+/// Injectable durable-write steps for the atomic spool publish sequence.
+///
+/// Parent-directory fsync is a Unix-only step, so the two directory hooks are
+/// unread on other targets.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+struct SpoolFsOps {
+    sync_file: fn(&File, &Path) -> Result<(), String>,
+    rename: fn(&Path, &Path) -> Result<(), String>,
+    /// Runs immediately after a successful rename. Production wires it to a
+    /// no-op; tests use it to interleave a peer republication of the final path
+    /// between this attempt's rename and its parent-directory fsync.
+    after_rename: fn(&Path),
+    open_dir: fn(&Path) -> Result<File, String>,
+    sync_dir: fn(&File, &Path) -> Result<(), String>,
+}
+
+impl SpoolFsOps {
+    const REAL: Self = Self {
+        sync_file: real_sync_spool_file,
+        rename: real_rename_spool_file,
+        after_rename: noop_after_rename,
+        open_dir: real_open_spool_dir,
+        sync_dir: real_sync_spool_dir,
+    };
+
+    fn with_fault(fault: SpoolFsFault) -> Self {
+        let mut ops = Self::REAL;
+        match fault {
+            SpoolFsFault::None => {}
+            SpoolFsFault::FileSync => ops.sync_file = fail_sync_spool_file,
+            SpoolFsFault::Rename => ops.rename = fail_rename_spool_file,
+            SpoolFsFault::DirOpen => ops.open_dir = fail_open_spool_dir,
+            SpoolFsFault::DirSync => ops.sync_dir = fail_sync_spool_dir,
+            SpoolFsFault::PeerRepublishThenDirSync => {
+                ops.after_rename = republish_final_path_as_peer;
+                ops.sync_dir = fail_sync_spool_dir;
+            }
+        }
+        ops
+    }
+}
+
+fn noop_after_rename(_final_path: &Path) {}
+
+fn real_sync_spool_file(file: &File, path: &Path) -> Result<(), String> {
+    file.sync_all().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to fsync spool temp file '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn real_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to rename spool temp file '{}' to '{}': {error}",
+            from.display(),
+            to.display()
+        )
+    })
+}
+
+fn real_open_spool_dir(path: &Path) -> Result<File, String> {
+    File::open(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to open spool parent directory '{}' after rename: {error}",
+            path.display()
+        )
+    })
+}
+
+fn real_sync_spool_dir(dir: &File, path: &Path) -> Result<(), String> {
+    dir.sync_all().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to fsync spool parent directory '{}' after rename: {error}",
+            path.display()
+        )
+    })
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_sync_spool_file(_file: &File, path: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to fsync spool temp file '{}'",
+        path.display()
+    ))
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_rename_spool_file(from: &Path, to: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to rename spool temp file '{}' to '{}'",
+        from.display(),
+        to.display()
+    ))
+}
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_open_spool_dir(path: &Path) -> Result<File, String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to open spool parent directory '{}' after rename",
+        path.display()
+    ))
+}
+
+/// Atomically replace the just-published final path with a distinct file, as a
+/// peer writer racing this attempt would. The replacement is renamed into place
+/// so the entry always names a complete file with a different inode.
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn republish_final_path_as_peer(final_path: &Path) {
+    let mut peer_tmp = final_path.as_os_str().to_os_string();
+    peer_tmp.push(".peer-republish");
+    let peer_tmp = PathBuf::from(peer_tmp);
+    if fs::write(&peer_tmp, PEER_REPUBLISH_MARKER).is_ok() {
+        let _ = fs::rename(&peer_tmp, final_path);
+    }
+}
+
+/// Contents written by [`republish_final_path_as_peer`]; asserted by tests that
+/// check a peer publication survived another writer's rollback.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub const PEER_REPUBLISH_MARKER: &[u8] = b"{\"peer_republished\":true}\n";
+
+#[allow(dead_code)] // reachable only through the test-only faulted constructors
+fn fail_sync_spool_dir(_dir: &File, path: &Path) -> Result<(), String> {
+    Err(format!(
+        "{PLUGIN_NAME}: injected fault: failed to fsync spool parent directory '{}' after rename",
+        path.display()
+    ))
+}
+
+static SPOOL_PROCESS_TAG: OnceLock<String> = OnceLock::new();
+static LIVE_SPOOL_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Per-process instance tag embedded in every temp and in-flight claim name.
+///
+/// Distinguishes this process's live files from those left behind by a crashed
+/// or restarted process sharing the same persistent volume: a restart always
+/// draws a fresh tag, so leftovers are recovered through the lease path instead
+/// of being mistaken for live work.
+fn spool_process_tag() -> &'static str {
+    SPOOL_PROCESS_TAG
+        .get_or_init(|| {
+            let nonce = uuid::Uuid::new_v4();
+            hex::encode(nonce.as_bytes())
+        })
+        .as_str()
+}
+
+/// Managed paths this process is actively writing or delivering.
+///
+/// Shared by every [`SpoolManager`] in the process so an overlapping accepted
+/// generation, or a replacement generation created by a reload, can never
+/// reconcile or reclaim a live peer's temp or in-flight claim.
+fn live_spool_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    LIVE_SPOOL_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn is_live_spool_path(path: &Path) -> bool {
+    let live = match live_spool_paths().lock() {
+        Ok(live) => live,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    live.contains(path)
+}
+
+/// RAII lease keeping one managed path registered as live for this process.
+pub struct LiveSpoolPathGuard {
+    path: PathBuf,
+}
+
+impl LiveSpoolPathGuard {
+    fn new(path: PathBuf) -> Self {
+        let mut live = match live_spool_paths().lock() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live.insert(path.clone());
+        drop(live);
+        Self { path }
+    }
+}
+
+impl Drop for LiveSpoolPathGuard {
+    fn drop(&mut self) {
+        let mut live = match live_spool_paths().lock() {
+            Ok(live) => live,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        live.remove(&self.path);
+    }
+}
+
+fn short_spool_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    hex::encode(&digest[..16])
+}
+
+/// Reject absolute, parent, separator, NUL, drive/UNC, and platform-prefix forms.
+fn is_hostile_path_component(value: &str) -> bool {
+    if value.is_empty() || value == "." || value == ".." {
+        return true;
+    }
+    if value.contains('\0') {
+        return true;
+    }
+    if value.contains('/') || value.contains('\\') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    if bytes.starts_with(b"/") {
+        return true;
+    }
+    // Windows drive / path prefix forms (`C:`, `\\?\`, `\\.`, UNC).
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return true;
+    }
+    if value.starts_with(r"\\") || value.starts_with("//") {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\")
+        || lower.starts_with(r"\\.\")
+        || lower.starts_with("//?/")
+        || lower.starts_with("//./")
+    {
+        return true;
+    }
+    false
+}
+
+fn is_safe_literal_path_component(value: &str) -> bool {
+    !is_hostile_path_component(value)
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Encode operator/config text as one managed path component that cannot escape
+/// the configured spool root. Hostile or overlong values are hashed.
+fn encode_spool_path_component(raw: &str, prefix: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool path component must not be empty"
+        ));
+    }
+    if trimmed.contains('\0') {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool path component must not contain NUL bytes"
+        ));
+    }
+    if is_safe_literal_path_component(trimmed) {
+        return Ok(trimmed.to_string());
+    }
+    Ok(format!("{prefix}_{}", short_spool_hash(trimmed)))
+}
+
+/// Managed path components for one owner: `<safe_node>/<safe_plugin>/o<digest>`.
+///
+/// The readable node/plugin components keep operator navigation possible; the
+/// `o<digest>` component is what actually partitions ownership, because it also
+/// covers the Ferrum namespace/ledger and the ClickHouse destination/schema.
+struct SpoolNamespaceComponents {
+    node: String,
+    plugin: String,
+    owner: String,
+}
+
+fn spool_namespace_components(owner: &SpoolOwner) -> Result<SpoolNamespaceComponents, String> {
+    Ok(SpoolNamespaceComponents {
+        node: encode_spool_path_component(owner.node_id.as_ref(), "n")?,
+        plugin: encode_spool_path_component(owner.plugin_config_id.as_ref(), "p")?,
+        owner: format!("o{}", &owner.digest[..SPOOL_OWNER_DIGEST_LEN]),
+    })
+}
+
+fn build_namespace_root(spool_dir: &Path, owner: &SpoolOwner) -> Result<PathBuf, String> {
+    let components = spool_namespace_components(owner)?;
+    let root = spool_dir
+        .join(&components.node)
+        .join(&components.plugin)
+        .join(&components.owner);
+    ensure_path_within_root(spool_dir, &root)?;
+    Ok(root)
+}
+
+/// Derive the in-flight claim lease from the configured worst-case delivery
+/// budget so a lease cannot expire while a legitimate delivery is still running.
+fn spool_claim_lease_secs(config: &ApiChargebackSinkConfig) -> u64 {
+    let attempts = u64::from(config.retry.max_attempts.max(1));
+    let attempt_budget_ms = config.clickhouse.timeout_ms.saturating_mul(attempts);
+    let delay_budget_ms = worst_case_inter_attempt_delay_ms(
+        config.retry.max_attempts,
+        config.retry.initial_delay_ms,
+        config.retry.max_delay_ms,
+    );
+    attempt_budget_ms
+        .saturating_add(delay_budget_ms)
+        .div_ceil(1_000)
+        .saturating_mul(SPOOL_CLAIM_LEASE_BUDGET_FACTOR)
+        .max(SPOOL_CLAIM_LEASE_MIN_SECS)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn spool_claim_lease_secs_for_tests(config: &ApiChargebackSinkConfig) -> u64 {
+    spool_claim_lease_secs(config)
+}
+
+fn ensure_path_within_root(root: &Path, candidate: &Path) -> Result<(), String> {
+    // Lexical containment first (no filesystem touch): reject `..` escape and
+    // absolute replacement joins before any create/scan/delete.
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: managed spool path '{}' escapes root '{}'",
+                        candidate.display(),
+                        root.display()
+                    ));
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized = PathBuf::from(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if !normalized.starts_with(root) {
+        return Err(format!(
+            "{PLUGIN_NAME}: managed spool path '{}' is outside root '{}'",
+            candidate.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Prove one existing directory resolves beneath the canonical managed root.
+///
+/// Used once per prepare for the namespace root itself and once per directory
+/// descended during a walk. Individual files do not need this: every managed
+/// file path is built by joining validated components onto the namespace root,
+/// and every walk rejects symlinks with `symlink_metadata` at every level, so no
+/// reachable file can resolve outside the canonical root.
+fn directory_is_within_canonical_root(canonical_root: &Path, dir: &Path) -> Result<(), String> {
+    let canonical_dir = fs::canonicalize(dir).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to canonicalize spool directory '{}': {error}",
+            dir.display()
+        )
+    })?;
+    if !canonical_dir.starts_with(canonical_root) {
+        return Err(format!(
+            "{PLUGIN_NAME}: canonical spool directory '{}' escapes root '{}'",
+            canonical_dir.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a managed path that is itself a symlink.
+///
+/// Spool maintenance must operate on the real file it enumerated, never on a
+/// link planted by a same-UID process pointing outside the managed tree.
+fn reject_symlinked_spool_path(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{PLUGIN_NAME}: refusing to operate on symlinked spool path '{}'",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Reject an existing symlink at any managed component below `root`.
+///
+/// `create_dir_all` follows existing directory symlinks. Preflighting the
+/// validated node/plugin/owner chain prevents initial preparation from chmoding
+/// or write-probing a replacement tree before canonical containment is
+/// established.
+fn reject_symlinked_managed_chain(root: &Path, candidate: &Path) -> Result<(), String> {
+    ensure_path_within_root(root, candidate)?;
+    let relative = candidate.strip_prefix(root).map_err(|_| {
+        format!(
+            "{PLUGIN_NAME}: managed spool path '{}' is outside root '{}'",
+            candidate.display(),
+            root.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "{PLUGIN_NAME}: invalid managed spool component in '{}'",
+                candidate.display()
+            ));
+        };
+        current.push(part);
+        reject_symlinked_spool_path(&current)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DirIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn dir_identity(meta: &fs::Metadata) -> Option<DirIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(DirIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DirIdentity;
+
+#[cfg(not(unix))]
+fn dir_identity(_meta: &fs::Metadata) -> Option<DirIdentity> {
+    None
+}
+
+/// Test-facing description of one spool owner identity.
+///
+/// Mirrors the fields production derives from the accepted plugin config so
+/// external tests can build sibling instances without a live ClickHouse.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // constructed only by the test-only entry points below
+pub struct SpoolOwnerSpec<'a> {
+    pub node_id: &'a str,
+    pub plugin_config_id: &'a str,
+    pub ferrum_namespace: &'a str,
+    pub destination_endpoint: &'a str,
+    pub database: &'a str,
+    pub table: &'a str,
+}
+
+impl SpoolOwnerSpec<'_> {
+    fn to_owner(&self) -> SpoolOwner {
+        SpoolOwner::new(
+            self.plugin_config_id.to_string(),
+            self.ferrum_namespace.to_string(),
+            self.destination_endpoint.to_string(),
+            self.database.to_string(),
+            self.table.to_string(),
+            self.node_id.to_string(),
+        )
+    }
+}
+
 pub struct SpoolManager {
     cfg: SpoolSettings,
-    node_id: Arc<str>,
+    owner: SpoolOwner,
+    generation: u64,
+    namespace_root: PathBuf,
+    /// Canonicalized namespace root, resolved once the tree exists.
+    canonical_root: OnceLock<PathBuf>,
     metrics: Arc<SinkMetrics>,
     last_drop_warn_at: AtomicI64,
+    last_unbound_warn_at: AtomicI64,
     live_storage_prepared: AtomicBool,
     write_lock: Mutex<()>,
+    /// Foreign or unattributable temps are reconciled only once this old.
+    stale_temp_age_secs: u64,
+    /// Lifetime of an in-flight replay claim before another owner may recover it.
+    claim_lease_secs: u64,
+    /// Durable-write steps; production always uses [`SpoolFsOps::REAL`].
+    fs_ops: SpoolFsOps,
 }
 
 impl SpoolManager {
     fn new(
         cfg: SpoolSettings,
-        node_id: Arc<str>,
+        owner: SpoolOwner,
+        generation: u64,
         metrics: Arc<SinkMetrics>,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+        fs_ops: SpoolFsOps,
     ) -> Result<Self, String> {
+        let namespace_root = build_namespace_root(&cfg.dir, &owner)?;
         Ok(Self {
             cfg,
-            node_id,
+            owner,
+            generation,
+            namespace_root,
+            canonical_root: OnceLock::new(),
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
+            last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
+            stale_temp_age_secs,
+            claim_lease_secs,
+            fs_ops,
         })
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // external unit tests only
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
+        Self::for_tests_with_owner(cfg, &default_test_spool_owner_spec(node_id), 1)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+    ) -> Result<Self, String> {
+        Self::for_tests_with_owner_and_faults(cfg, spec, generation, SpoolFsFault::None)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner_and_faults(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fault: SpoolFsFault,
+    ) -> Result<Self, String> {
+        Self::for_tests_with_owner_faults_and_ages(
+            cfg,
+            spec,
+            generation,
+            fault,
+            // Tests treat a foreign temp as immediately reconcilable unless a
+            // live in-process writer lease protects it.
+            0,
+            SPOOL_CLAIM_LEASE_MIN_SECS,
+        )
+    }
+
+    /// Same as [`Self::for_tests_with_owner_and_faults`] with explicit
+    /// stale-temp and claim-lease horizons, so age-gated recovery is exercised
+    /// without wall-clock sleeps.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn for_tests_with_owner_faults_and_ages(
+        cfg: SpoolSettings,
+        spec: &SpoolOwnerSpec<'_>,
+        generation: u64,
+        fault: SpoolFsFault,
+        stale_temp_age_secs: u64,
+        claim_lease_secs: u64,
+    ) -> Result<Self, String> {
         let manager = Self::new(
             cfg,
-            Arc::<str>::from(node_id.to_string()),
+            spec.to_owner(),
+            generation,
             Arc::new(SinkMetrics::default()),
+            stale_temp_age_secs,
+            claim_lease_secs,
+            SpoolFsOps::REAL,
         )?;
         // Test callers model a committed/live sink and retain the historical
-        // eager startup validation contract.
+        // eager startup validation contract. The managed tree is prepared with
+        // the real filesystem so an injected fault applies only to the durable
+        // writes actually under test.
         manager.prepare_live_storage()?;
-        Ok(manager)
+        Ok(Self {
+            fs_ops: SpoolFsOps::with_fault(fault),
+            ..manager
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn namespace_root_for_tests(&self) -> &Path {
+        &self.namespace_root
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn owner_tag_for_tests(&self) -> &str {
+        self.owner.tag.as_ref()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn generation_for_tests(&self) -> u64 {
+        self.generation
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn prepare_live_storage_for_tests(&self) -> Result<(), String> {
+        self.prepare_live_storage()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn namespace_root_path_for_tests(
+        spool_dir: &Path,
+        spec: &SpoolOwnerSpec<'_>,
+    ) -> Result<PathBuf, String> {
+        build_namespace_root(spool_dir, &spec.to_owner())
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn owner_tag_of_spec_for_tests(spec: &SpoolOwnerSpec<'_>) -> String {
+        spec.to_owner().tag.to_string()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn encode_spool_path_component_for_tests(raw: &str) -> Result<String, String> {
+        encode_spool_path_component(raw, "n")
+    }
+
+    /// Exercise the lexical containment guard that every managed create,
+    /// rename, and unlink runs before touching the filesystem.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn ensure_path_within_root_for_tests(root: &Path, candidate: &Path) -> Result<(), String> {
+        ensure_path_within_root(root, candidate)
+    }
+
+    /// Renew a held claim onto an explicit lease deadline so the rename half of
+    /// the claim protocol is covered deterministically.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn renew_claim_at_for_tests(
+        &self,
+        claim: &mut SpoolClaimHandle,
+        lease_deadline_unix: i64,
+    ) -> Result<(), String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.renew_claim_locked_at(claim, lease_deadline_unix)
+    }
+
+    /// Claim one replay candidate, returning `None` when another owner,
+    /// generation, or process won the atomic rename first.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn claim_replay_file_for_tests(&self, path: &Path) -> Result<Option<PathBuf>, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        Ok(self
+            .claim_replay_file_locked(path)?
+            .map(|claim| claim.path().to_path_buf()))
+    }
+
+    /// Claim one replay candidate and keep the live-path lease held for the
+    /// caller so tests can model an in-flight delivery across other operations.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn hold_replay_claim_for_tests(
+        &self,
+        path: &Path,
+    ) -> Result<Option<SpoolClaimHandle>, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.claim_replay_file_locked(path)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn release_inflight_file_for_tests(
+        &self,
+        inflight: &Path,
+    ) -> Result<Option<PathBuf>, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.release_claim_locked(inflight)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn list_owned_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
+        self.list_owned_spool_files()
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn list_owned_spool_files_with_entry_limit_for_tests(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<PathBuf>, String> {
+        self.validate_namespace_meta_if_present()?;
+        let mut files = Vec::new();
+        self.collect_with_entry_limit(&mut files, SpoolFileClass::Owned, max_entries)?;
+        files.sort();
+        Ok(files)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn list_replayable_spool_files_for_tests(&self) -> Result<Vec<PathBuf>, String> {
+        self.list_replayable_spool_files()
+    }
+
+    /// Register one managed path as live for this process, as an in-progress
+    /// write or delivery would.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn hold_live_spool_path_for_tests(path: &Path) -> LiveSpoolPathGuard {
+        LiveSpoolPathGuard::new(path.to_path_buf())
+    }
+
+    /// Build the generation-owned temp name `write_events` would use.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn write_temp_path_for_tests(&self, final_path: &Path) -> Result<PathBuf, String> {
+        spool_write_temp_path(final_path, self.generation)
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn unbound_record_counts_for_tests(&self) -> (u64, u64) {
+        (
+            self.metrics.spool_unbound_files.load(Ordering::Relaxed),
+            self.metrics
+                .spool_unbound_namespaces
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// Re-run the aggregate unbound-record scan with a deterministic global
+    /// entry budget. External tests use this to prove sibling namespaces share
+    /// one bound rather than each receiving a fresh traversal allowance.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn scan_unbound_records_with_entry_limit_for_tests(
+        &self,
+        max_entries: usize,
+    ) -> (u64, u64, bool) {
+        self.scan_unbound_records_with_entry_limit(max_entries)
     }
 
     pub fn write_events(&self, events: &[ChargeEvent]) -> Result<PathBuf, String> {
@@ -4215,11 +5234,20 @@ impl SpoolManager {
         run_spool_write_hook_for_tests(SpoolWriteHookPoint::BeforeWrite);
         let _after_hook = SpoolWriteHookAfterGuard;
         self.prepare_live_storage_locked()?;
-        // Size the pending encoded file before admission so max_bytes is a hard
-        // ceiling over existing owned bytes plus this write.
         let body = serialize_json_each_row(events)?;
+        if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: serialized spool batch ({} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)",
+                body.len()
+            ));
+        }
         let bytes = encode_spool_bytes(body.as_bytes(), self.cfg.compression)?;
         let incoming_len = bytes.len() as u64;
+        if incoming_len > SPOOL_MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds the hard per-artifact limit ({SPOOL_MAX_ARTIFACT_BYTES} bytes)"
+            ));
+        }
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
@@ -4228,18 +5256,36 @@ impl SpoolManager {
         }
         self.evict_until_can_admit(incoming_len)?;
         let day = Utc::now().format("%Y%m%d").to_string();
-        let dir = self.cfg.dir.join(self.node_id.as_ref()).join(day);
+        let dir = self.namespace_root.join(day);
+        self.assert_managed_path(&dir)?;
         ensure_private_dir(&dir)?;
-        let id = new_ulid();
-        let final_path = dir.join(format!("{}.{}", id, self.cfg.compression.extension()));
-        let tmp_path = final_path.with_file_name(format!(
-            "{}.tmp",
-            final_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?
+        // Every file carries the owner tag, so a record can be attributed to its
+        // intended plugin config / namespace / destination / schema even if it is
+        // later moved between directories.
+        let final_path = dir.join(format!(
+            "{}.{}.{}",
+            new_ulid(),
+            self.owner.tag,
+            self.cfg.compression.extension()
         ));
-        write_private_file_atomically(&tmp_path, &final_path, &bytes)?;
+        let tmp_path = spool_write_temp_path(&final_path, self.generation)?;
+        self.assert_managed_path(&final_path)?;
+        self.assert_managed_path(&tmp_path)?;
+        // Hold the live-path lease across the whole atomic write so no peer
+        // generation in this process can reconcile the temp mid-write.
+        let write_result = {
+            let _live = LiveSpoolPathGuard::new(tmp_path.clone());
+            // The final name carries a freshly minted ULID, so no peer can be
+            // publishing to it and a failed publish rolls its own file back.
+            write_private_file_atomically_with_ops(
+                &tmp_path,
+                &final_path,
+                &bytes,
+                self.fs_ops,
+                SpoolFinalOwnership::Unique,
+            )
+        };
+        write_result?;
         invalidate_status_cache();
         Ok(final_path)
     }
@@ -4274,24 +5320,178 @@ impl SpoolManager {
     }
 
     fn prepare_live_storage_locked_inner(&self) -> Result<(), String> {
-        let node_dir = self.cfg.dir.join(self.node_id.as_ref());
-        // Avoid repeated chmod/write probes on every batch and replay tick.
-        // If an operator removes either live directory, fall through and
-        // securely recreate/re-probe it instead of creating permissive parents
-        // implicitly from the later day-directory write.
+        ensure_path_within_root(&self.cfg.dir, &self.namespace_root)?;
         if self.live_storage_prepared.load(Ordering::Acquire)
             && self.cfg.dir.is_dir()
-            && node_dir.is_dir()
+            && self.namespace_root.is_dir()
         {
+            self.verify_stable_namespace_root()?;
+            self.validate_namespace_meta()?;
+            // Recover only claims whose owning process/generation is demonstrably
+            // gone or whose lease expired; a live delivery keeps its claim.
+            self.recover_expired_claims()?;
             return Ok(());
         }
         ensure_private_dir(&self.cfg.dir)?;
-        ensure_private_dir(&node_dir)?;
-        warn_on_sibling_spool_dirs(&self.cfg.dir, self.node_id.as_ref());
-        // Crash-left *.tmp files consume disk but are incomplete; delete them
-        // only after publication and before any live quota decision.
+        reject_symlinked_managed_chain(&self.cfg.dir, &self.namespace_root)?;
+        ensure_private_dir(&self.namespace_root)?;
+        self.resolve_canonical_root()?;
+        self.persist_or_validate_namespace_meta()?;
+        self.scan_unbound_records();
+        self.recover_expired_claims()?;
         self.reconcile_stale_temp_files()?;
         self.live_storage_prepared.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Canonicalize the managed root once and prove it resolves under the
+    /// configured `spool.dir`, so later walks only need lexical containment plus
+    /// symlink rejection.
+    fn resolve_canonical_root(&self) -> Result<(), String> {
+        if self.canonical_root.get().is_some() {
+            return self.verify_stable_namespace_root();
+        }
+        reject_symlinked_managed_chain(&self.cfg.dir, &self.namespace_root)?;
+        reject_symlinked_spool_path(&self.namespace_root)?;
+        let canonical_dir = fs::canonicalize(&self.cfg.dir).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize spool.dir '{}': {error}",
+                self.cfg.dir.display()
+            )
+        })?;
+        directory_is_within_canonical_root(&canonical_dir, &self.namespace_root)?;
+        let canonical_root = fs::canonicalize(&self.namespace_root).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize managed spool namespace '{}': {error}",
+                self.namespace_root.display()
+            )
+        })?;
+        let _ = self.canonical_root.set(canonical_root);
+        Ok(())
+    }
+
+    /// Verify that the namespace path still names the exact directory prepared
+    /// for this manager.
+    ///
+    /// A same-UID process can replace a directory entry after initial prepare.
+    /// Reject both a symlink replacement and any canonical-target change before
+    /// validating metadata, walking, replaying, renaming, or unlinking.
+    fn verify_stable_namespace_root(&self) -> Result<(), String> {
+        let expected = self.canonical_root.get().ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' has no canonical root",
+                self.namespace_root.display()
+            )
+        })?;
+        reject_symlinked_spool_path(&self.namespace_root)?;
+        let current = fs::canonicalize(&self.namespace_root).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to canonicalize managed spool namespace '{}': {error}",
+                self.namespace_root.display()
+            )
+        })?;
+        if &current != expected {
+            return Err(format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' changed canonical target from '{}' to '{}'",
+                self.namespace_root.display(),
+                expected.display(),
+                current.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove one path is a managed, non-symlinked node of this namespace before
+    /// any create, rename, or unlink.
+    fn assert_managed_path(&self, path: &Path) -> Result<(), String> {
+        ensure_path_within_root(&self.namespace_root, path)?;
+        reject_symlinked_spool_path(path)?;
+        if let Some(canonical_root) = self.canonical_root.get() {
+            self.verify_stable_namespace_root()?;
+            if let Some(parent) = path.parent()
+                && parent.is_dir()
+            {
+                directory_is_within_canonical_root(canonical_root, parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn meta_path(&self) -> PathBuf {
+        self.namespace_root.join(SPOOL_META_FILENAME)
+    }
+
+    fn persist_or_validate_namespace_meta(&self) -> Result<(), String> {
+        let path = self.meta_path();
+        self.assert_managed_path(&path)?;
+        if path.exists() {
+            return self.validate_namespace_meta();
+        }
+        let meta = self.owner.to_meta(unix_timestamp_seconds());
+        let bytes = serde_json::to_vec_pretty(&meta).map_err(|error| {
+            format!("{PLUGIN_NAME}: failed to serialize spool namespace metadata: {error}")
+        })?;
+        // Attribute the manifest temp to this process and generation like every
+        // other managed temp. A fixed `spool.meta.json.tmp` is the same name for
+        // every peer, so a concurrent first prepare by another generation or
+        // another process sharing the volume would collide on `create_new` and
+        // then unlink the live writer's temp during rollback — exactly the
+        // cross-writer clobber the rest of this protocol forbids. The attributed
+        // name is also recognized by `reconcile_stale_temp_files`, so a crash
+        // leftover is reclaimed and quota-accounted instead of leaking.
+        let tmp = spool_write_temp_path(&path, self.generation)?;
+        self.assert_managed_path(&tmp)?;
+        let _live = LiveSpoolPathGuard::new(tmp.clone());
+        // `spool.meta.json` is the one shared final name in this protocol: every
+        // writer of the namespace publishes to it. A failed publish therefore
+        // cleans only the attributed temp above and leaves the manifest entry
+        // alone — see the rollback in `write_private_file_atomically_with_ops`.
+        // The error still propagates, so `live_storage_prepared` stays unset and
+        // the next prepare revalidates or regenerates the manifest.
+        write_private_file_atomically_with_ops(
+            &tmp,
+            &path,
+            &bytes,
+            self.fs_ops,
+            SpoolFinalOwnership::Shared,
+        )
+    }
+
+    /// Fail closed when the on-disk ownership record does not name this exact
+    /// sink identity. Nothing is deleted, replayed, or rerouted on mismatch.
+    fn validate_namespace_meta(&self) -> Result<(), String> {
+        self.verify_stable_namespace_root()?;
+        let path = self.meta_path();
+        if !path.exists() {
+            return Err(format!(
+                "{PLUGIN_NAME}: missing spool namespace metadata at '{}'",
+                path.display()
+            ));
+        }
+        reject_symlinked_spool_path(&path)?;
+        // The manifest is read before ownership is established, on every prepare
+        // and every replay listing, so it is the one managed file a same-UID
+        // actor can grow without first knowing this owner's tag. Bound it like
+        // any other spool artifact instead of reading it whole.
+        let file = File::open(&path).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to read spool namespace metadata '{}': {error}",
+                path.display()
+            )
+        })?;
+        let bytes = read_spool_bytes_bounded(file, SPOOL_MAX_META_BYTES, &path)?;
+        let meta: SpoolNamespaceMeta = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: invalid spool namespace metadata '{}': {error}",
+                path.display()
+            )
+        })?;
+        if !self.owner.matches_meta(&meta) {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool namespace metadata at '{}' does not match this sink identity (format version/plugin_config_id/ferrum namespace/destination/schema/node)",
+                path.display()
+            ));
+        }
         Ok(())
     }
 
@@ -4299,8 +5499,11 @@ impl SpoolManager {
         let files = self.list_owned_spool_files()?;
         let mut stats = SpoolStats::default();
         for file in files {
-            match fs::metadata(&file) {
+            match fs::symlink_metadata(&file) {
                 Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
                     stats.files = stats.files.saturating_add(1);
                     stats.bytes = stats.bytes.saturating_add(meta.len());
                 }
@@ -4315,12 +5518,17 @@ impl SpoolManager {
         Ok(stats)
     }
 
-    /// Drop oldest owned spool files until `owned_bytes + incoming_len <= max_bytes`.
+    /// Drop oldest evictable owned spool files until
+    /// `owned_bytes + incoming_len <= max_bytes`.
     ///
     /// Owned bytes include active data files, crash-left temps, corrupt
-    /// quarantine, and metadata-only dead-letter (`.rejected.meta`) files.
-    /// When a single encoded batch cannot fit even after emptying the spool,
-    /// the write is rejected (never silently over-admitted).
+    /// quarantine, metadata-only dead-letter (`.rejected.meta`) files, in-flight
+    /// replay claims, and any unattributable record still occupying the tree.
+    /// Eviction never selects an in-flight claim, a temp under an active write,
+    /// or a record whose owner tag is not ours: deleting any of them would
+    /// destroy another owner's or another delivery's billing data. When only
+    /// such files remain the write fails closed instead of over-admitting or
+    /// stealing them.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
@@ -4333,12 +5541,20 @@ impl SpoolManager {
             if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 return Ok(());
             }
-            let Some(oldest) = self.list_owned_spool_files()?.into_iter().next() else {
+            let owned = self.list_owned_spool_files()?;
+            let wall_clock = SystemTime::now();
+            let Some(oldest) = owned
+                .iter()
+                .find(|path| self.is_evictable_owned_file(path.as_path(), wall_clock))
+                .cloned()
+            else {
+                let protected = owned.len();
                 return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}) after eviction",
+                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
                     self.cfg.max_bytes
                 ));
             };
+            self.assert_managed_path(&oldest)?;
             match fs::remove_file(&oldest) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -4370,130 +5586,931 @@ impl SpoolManager {
         }
     }
 
+    /// Whether one owned file may be dropped to make room for a new batch.
+    ///
+    /// Eviction runs per [`SpoolManager`], so two accepted generations in one
+    /// process (or two processes sharing the volume) hold different writer
+    /// locks. A temp that a peer is actively publishing is therefore protected
+    /// by exactly the reconciliation predicate: unlinking it would leave the
+    /// peer's already-fsynced payload with no directory entry to rename onto,
+    /// failing that publish and silently losing a billing batch. Crash-left
+    /// temps stay reclaimable, so quota pressure still makes progress.
+    fn is_evictable_owned_file(&self, path: &Path, now: SystemTime) -> bool {
+        if is_spool_inflight_file(path) || is_live_spool_path(path) {
+            return false;
+        }
+        if is_spool_temp_file(path) && !self.temp_is_reclaimable(path, now) {
+            return false;
+        }
+        match spool_file_owner_tag(path) {
+            // Untagged retained artifacts (legacy temps, dead-letter metadata for
+            // pre-tag files) belong to this namespace and stay evictable.
+            None => true,
+            Some(tag) => tag == self.owner.tag.as_ref(),
+        }
+    }
+
+    /// Same ownership/age test [`Self::reconcile_stale_temp_files`] applies,
+    /// minus the live-path check the caller has already made. An unreadable
+    /// temp is treated as protected so a transient stat failure can never
+    /// escalate into deleting a peer's in-progress write.
+    fn temp_is_reclaimable(&self, path: &Path, now: SystemTime) -> bool {
+        let owned_by_this_process = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_spool_write_temp)
+            .is_some_and(|temp| temp.process_tag == spool_process_tag());
+        if owned_by_this_process {
+            return true;
+        }
+        spool_temp_is_stale(path, now, self.stale_temp_age_secs).unwrap_or(false)
+    }
+
+    fn collect(&self, files: &mut Vec<PathBuf>, class: SpoolFileClass) -> Result<(), String> {
+        self.collect_with_entry_limit(files, class, MAX_SPOOL_TRAVERSAL_ENTRIES)
+    }
+
+    fn collect_with_entry_limit(
+        &self,
+        files: &mut Vec<PathBuf>,
+        class: SpoolFileClass,
+        max_entries: usize,
+    ) -> Result<(), String> {
+        self.verify_stable_namespace_root()?;
+        let canonical_root = self.canonical_root.get().ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: managed spool namespace '{}' has no canonical root",
+                self.namespace_root.display()
+            )
+        })?;
+        let mut walk = SpoolWalk::new_with_expected_root(
+            self.namespace_root.as_path(),
+            class,
+            canonical_root,
+            max_entries,
+        )?;
+        walk.run(&self.namespace_root, files)
+    }
+
+    /// Reconcile abandoned atomic-write temps.
+    ///
+    /// A temp is removed only when this process demonstrably owns it and is no
+    /// longer writing it, or when it is foreign/unattributable and older than
+    /// `stale_temp_age_secs`. A reloaded generation therefore cannot unlink the
+    /// active temp of an older accepted generation or of a peer process sharing
+    /// the volume.
     fn reconcile_stale_temp_files(&self) -> Result<(), String> {
-        let root = self.cfg.dir.join(self.node_id.as_ref());
         let mut temps = Vec::new();
-        collect_spool_files(&root, &mut temps, SpoolFileClass::Temp)?;
+        self.collect(&mut temps, SpoolFileClass::Temp)?;
+        let now = SystemTime::now();
         for path in temps {
-            match fs::remove_file(&path) {
-                Ok(()) => {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        path = %path.display(),
-                        "Chargeback sink removed a stale spool temp file left by an interrupted write"
-                    );
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to remove stale spool temp file '{}': {error}",
-                        path.display()
-                    ));
-                }
+            self.assert_managed_path(&path)?;
+            if is_live_spool_path(&path) {
+                // A live writer in this process owns it, whichever generation.
+                continue;
+            }
+            let owned_by_this_process = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_spool_write_temp)
+                .is_some_and(|temp| temp.process_tag == spool_process_tag());
+            if owned_by_this_process {
+                self.remove_stale_temp(&path, "interrupted write in this process")?;
+                continue;
+            }
+            if spool_temp_is_stale(&path, now, self.stale_temp_age_secs)? {
+                self.remove_stale_temp(&path, "stale unattributed temp")?;
             }
         }
         Ok(())
     }
 
-    fn list_owned_spool_files(&self) -> Result<Vec<PathBuf>, String> {
-        let root = self.cfg.dir.join(self.node_id.as_ref());
-        let mut files = Vec::new();
-        collect_spool_files(&root, &mut files, SpoolFileClass::Owned)?;
-        files.sort();
-        Ok(files)
-    }
-
-    fn list_replayable_spool_files(&self) -> Result<Vec<PathBuf>, String> {
-        let root = self.cfg.dir.join(self.node_id.as_ref());
-        let mut files = Vec::new();
-        collect_spool_files(&root, &mut files, SpoolFileClass::Replayable)?;
-        files.sort();
-        Ok(files)
-    }
-}
-
-fn warn_on_sibling_spool_dirs(root: &Path, node_id: &str) {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_dir() {
-            continue;
+    fn remove_stale_temp(&self, path: &Path, reason: &'static str) -> Result<(), String> {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %path.display(),
+                    generation = self.generation,
+                    reason,
+                    "Chargeback sink removed a stale spool temp file left by an interrupted write"
+                );
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to remove stale spool temp file '{}': {error}",
+                path.display()
+            )),
         }
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if name != node_id {
+    }
+
+    /// Return crash-left in-flight claims to their durable replayable names.
+    ///
+    /// Live claims held by this process are skipped outright, so in-process
+    /// exclusion is absolute. A claim written by another process (or by an
+    /// earlier run of this one) is recovered only after its lease deadline
+    /// passes. That cross-process bound is temporal, not a proof the peer
+    /// stopped: a peer stalled past its lease can still be delivering. The lease
+    /// is four times the accepted worst-case delivery budget and is renewed per
+    /// chunk so ordinary slow delivery cannot reach that window, and the
+    /// residual outcome is a duplicate insert the stable `event_id` /
+    /// `ReplacingMergeTree` contract deduplicates — never a misrouted or lost
+    /// record, because the owner tag still gates the destination.
+    fn recover_expired_claims(&self) -> Result<(), String> {
+        let mut claims = Vec::new();
+        self.collect(&mut claims, SpoolFileClass::Inflight)?;
+        let now = unix_timestamp_seconds();
+        let wall_clock = SystemTime::now();
+        for path in claims {
+            self.assert_managed_path(&path)?;
+            if is_live_spool_path(&path) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let reason = match parse_spool_claim(name) {
+                Some(claim) if claim.process_tag == spool_process_tag() => {
+                    // Our process, no live lease: the owning replay task was
+                    // aborted or its generation was dropped mid-delivery.
+                    "aborted delivery in this process"
+                }
+                Some(claim) if now >= claim.lease_deadline_unix => "expired peer claim lease",
+                Some(_) => continue,
+                None => {
+                    // Unparseable claim marker: treat conservatively as a peer's
+                    // and wait out a full lease horizon by mtime.
+                    if !spool_temp_is_stale(&path, wall_clock, self.claim_lease_secs)? {
+                        continue;
+                    }
+                    "expired unattributed claim"
+                }
+            };
+            let Some(restored) = self.restore_claim_path(&path)? else {
+                continue;
+            };
             warn!(
                 plugin = PLUGIN_NAME,
-                node_id,
-                sibling_node_id = %name,
-                spool_dir = %root.display(),
-                "Chargeback sink found a sibling spool directory; use a stable FERRUM_NODE_ID when spool.dir is backed by persistent storage"
+                path = %path.display(),
+                restored = %restored.display(),
+                generation = self.generation,
+                reason,
+                "Chargeback sink recovered an in-flight spool claim"
             );
         }
+        Ok(())
     }
-}
 
-#[derive(Clone, Copy)]
-enum SpoolFileClass {
-    /// Active data, crash-left temps, corrupt quarantine, and metadata-only
-    /// dead-letter files — quota/status.
-    Owned,
-    /// Only durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
-    Replayable,
-    /// Interrupted atomic-write temps (`*.ndjson.tmp` / `*.ndjson.zst.tmp`).
-    Temp,
-}
+    /// Rename one claim back to its durable replayable name.
+    ///
+    /// `Ok(None)` means the claim disappeared (already recovered or finalized by
+    /// its owner) and is not an error.
+    fn restore_claim_path(&self, claim: &Path) -> Result<Option<PathBuf>, String> {
+        let restored = spool_claim_restore_path(claim)?;
+        self.assert_managed_path(&restored)?;
+        match fs::rename(claim, &restored) {
+            Ok(()) => Ok(Some(restored)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to restore in-flight spool claim '{}' to '{}': {error}",
+                claim.display(),
+                restored.display()
+            )),
+        }
+    }
 
-fn collect_spool_files(
-    dir: &Path,
-    files: &mut Vec<PathBuf>,
-    class: SpoolFileClass,
-) -> Result<(), String> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
+    fn list_owned_spool_files(&self) -> Result<Vec<PathBuf>, String> {
+        self.validate_namespace_meta_if_present()?;
+        let mut files = Vec::new();
+        self.collect(&mut files, SpoolFileClass::Owned)?;
+        files.sort();
+        Ok(files)
+    }
+
+    /// Replay candidates owned by this exact identity.
+    ///
+    /// Ownership metadata is validated first, then every candidate must carry
+    /// this owner's tag. A data file whose tag names a different owner is never
+    /// read, delivered, deleted, or dead-lettered here; it is only counted and
+    /// surfaced so operators can reconcile it.
+    fn list_replayable_spool_files(&self) -> Result<Vec<PathBuf>, String> {
+        self.validate_namespace_meta()?;
+        let mut candidates = Vec::new();
+        self.collect(&mut candidates, SpoolFileClass::Replayable)?;
+        let mine = self.owner.tag.as_ref();
+        let mut files = Vec::new();
+        for path in candidates {
+            if spool_file_owner_tag(&path).is_some_and(|tag| tag == mine) {
+                files.push(path);
+            }
+        }
+        // Refresh the exported gauge as well as the warning. A foreign file may
+        // be planted after initial prepare, and warning without updating status
+        // would hide live operational evidence until the next full prepare.
+        self.scan_unbound_records();
+        files.sort();
+        Ok(files)
+    }
+
+    /// Records inside this managed namespace whose owner tag names a different
+    /// identity. Reachable only by tampering or a hand-moved file; counted so
+    /// quota reporting stays honest, and never replayed, evicted, or deleted.
+    fn count_foreign_tagged_records(&self) -> u64 {
+        let mut candidates = Vec::new();
+        let class = SpoolFileClass::Replayable;
+        if self.collect(&mut candidates, class).is_err() {
+            return 0;
+        }
+        let mine = self.owner.tag.as_ref();
+        let mut foreign = 0u64;
+        for path in &candidates {
+            if !spool_file_owner_tag(path).is_some_and(|tag| tag == mine) {
+                foreign = foreign.saturating_add(1);
+            }
+        }
+        foreign
+    }
+
+    fn validate_namespace_meta_if_present(&self) -> Result<(), String> {
+        if self.meta_path().exists() {
+            self.validate_namespace_meta()?;
+        }
+        Ok(())
+    }
+
+    /// Atomically claim one replay candidate.
+    ///
+    /// The rename is the mutual-exclusion primitive: on a shared volume exactly
+    /// one accepted generation or process can win it. `Ok(None)` means somebody
+    /// else won, and the caller must simply move on.
+    fn claim_replay_file_locked(&self, path: &Path) -> Result<Option<SpoolClaimHandle>, String> {
+        self.assert_managed_path(path)?;
+        if !is_spool_data_file(path) {
             return Err(format!(
-                "{PLUGIN_NAME}: failed to read spool directory '{}': {error}",
-                dir.display()
+                "{PLUGIN_NAME}: refusing to claim non-replayable spool file '{}'",
+                path.display()
             ));
         }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read spool directory entry '{}': {error}",
-                dir.display()
-            )
-        })?;
-        let path = entry.path();
-        let meta = entry.metadata().map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to stat spool path '{}': {error}",
-                path.display()
-            )
-        })?;
-        if meta.is_dir() {
-            collect_spool_files(&path, files, class)?;
-        } else if spool_file_matches(&path, class) {
-            files.push(path);
+        match spool_file_owner_tag(path) {
+            Some(tag) if tag == self.owner.tag.as_ref() => {}
+            _ => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing to claim spool file '{}' owned by another identity",
+                    path.display()
+                ));
+            }
+        }
+        let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
+        let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
+        let claim_path = spool_claim_path(path, self.generation, lease_deadline)?;
+        self.assert_managed_path(&claim_path)?;
+        // Register the live lease before the rename so a concurrent prepare in
+        // this process can never see the claim as orphaned.
+        let guard = LiveSpoolPathGuard::new(claim_path.clone());
+        match fs::rename(path, &claim_path) {
+            Ok(()) => Ok(Some(SpoolClaimHandle {
+                path: claim_path,
+                _live: guard,
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to claim spool file '{}' as in-flight '{}': {error}",
+                path.display(),
+                claim_path.display()
+            )),
         }
     }
-    Ok(())
+
+    /// Extend one live claim before starting the next bounded ClickHouse
+    /// delivery attempt.
+    ///
+    /// A single spool file can contain multiple replay chunks. Renewing between
+    /// chunks prevents the aggregate file-delivery time from outliving a lease
+    /// that is intentionally derived from one bounded request/retry budget.
+    fn renew_claim_locked(&self, claim: &mut SpoolClaimHandle) -> Result<(), String> {
+        let lease_delta = self.claim_lease_secs.min(i64::MAX as u64) as i64;
+        let lease_deadline = unix_timestamp_seconds().saturating_add(lease_delta);
+        self.renew_claim_locked_at(claim, lease_deadline)
+    }
+
+    /// Renew one live claim onto an explicit lease deadline.
+    ///
+    /// Split out from [`Self::renew_claim_locked`] so the rename half of the
+    /// protocol is exercised deterministically instead of only when a chunk
+    /// boundary happens to cross a wall-clock second.
+    fn renew_claim_locked_at(
+        &self,
+        claim: &mut SpoolClaimHandle,
+        lease_deadline: i64,
+    ) -> Result<(), String> {
+        let durable = spool_claim_restore_path(claim.path())?;
+        let renewed = spool_claim_path(&durable, self.generation, lease_deadline)?;
+        if renewed == claim.path {
+            return Ok(());
+        }
+        self.assert_managed_path(claim.path())?;
+        self.assert_managed_path(&renewed)?;
+        // Register the renewed name before the atomic rename so another
+        // generation in this process cannot observe an unleased path.
+        let renewed_live = LiveSpoolPathGuard::new(renewed.clone());
+        fs::rename(claim.path(), &renewed).map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to renew in-flight spool claim '{}' as '{}': {error}",
+                claim.path().display(),
+                renewed.display()
+            )
+        })?;
+        claim.path = renewed;
+        let old_live = std::mem::replace(&mut claim._live, renewed_live);
+        drop(old_live);
+        Ok(())
+    }
+
+    /// Release a claim back to its durable replayable name after a retryable
+    /// delivery failure. `Ok(None)` means the claim was already recovered.
+    fn release_claim_locked(&self, claim: &Path) -> Result<Option<PathBuf>, String> {
+        self.assert_managed_path(claim)?;
+        self.restore_claim_path(claim)
+    }
+
+    /// Remove a claim whose rows were fully delivered.
+    fn remove_delivered_claim(&self, claim: &Path) -> Result<(), String> {
+        self.assert_managed_path(claim)?;
+        match fs::remove_file(claim) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %claim.display(),
+                    generation = self.generation,
+                    "Chargeback sink delivered a spool claim that another owner had already recovered"
+                );
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
+                claim.display()
+            )),
+        }
+    }
+
+    /// Count records under this node/plugin subtree that no accepted generation
+    /// owns: pre-namespace layouts and sibling namespaces left behind by a
+    /// destination/schema/Ferrum-namespace change. A node-id or plugin-config-id
+    /// change moves to a different parent subtree and requires explicit operator
+    /// discovery. Unbound records are never replayed, deleted, or rerouted.
+    fn scan_unbound_records(&self) {
+        let _ = self.scan_unbound_records_with_entry_limit(MAX_SPOOL_TRAVERSAL_ENTRIES);
+    }
+
+    /// Scan legacy and sibling namespaces under one aggregate entry budget.
+    ///
+    /// Giving every sibling subtree a fresh [`MAX_SPOOL_TRAVERSAL_ENTRIES`]
+    /// allowance would make a shared-volume maintenance tick unbounded in the
+    /// number of owner namespaces. A truncated scan reports the observed lower
+    /// bound and an explicit warning; it never replays or mutates an unvisited
+    /// record.
+    fn scan_unbound_records_with_entry_limit(&self, max_entries: usize) -> (u64, u64, bool) {
+        let components = match spool_namespace_components(&self.owner) {
+            Ok(components) => components,
+            Err(_) => return (0, 0, false),
+        };
+        let root = self.namespace_root.as_path();
+        let dir = self.cfg.dir.as_path();
+        let (orphaned, namespaces, truncated) =
+            count_unbound_spool_records(dir, &components, root, max_entries);
+        let files = orphaned.saturating_add(self.count_foreign_tagged_records());
+        self.metrics
+            .spool_unbound_files
+            .store(files, Ordering::Relaxed);
+        self.metrics
+            .spool_unbound_namespaces
+            .store(namespaces, Ordering::Relaxed);
+        if files > 0 || namespaces > 0 || truncated {
+            self.warn_unbound_records(files, namespaces, truncated);
+        }
+        (files, namespaces, truncated)
+    }
+
+    fn warn_unbound_records(&self, files: u64, namespaces: u64, truncated: bool) {
+        let now = unix_timestamp_seconds();
+        let last = self.last_unbound_warn_at.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < SPOOL_WARN_INTERVAL_SECS
+            || self
+                .last_unbound_warn_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = self.generation,
+            unbound_files = files,
+            unbound_namespaces = namespaces,
+            scan_truncated = truncated,
+            spool_dir = %self.cfg.dir.display(),
+            managed_namespace = %self.namespace_root.display(),
+            "Chargeback sink found spool records that are not bound to this destination identity, or reached the bounded scan limit; reported counts are lower bounds when scan_truncated=true, records are never replayed or deleted, and an operator must reconcile them (rate-limited)"
+        );
+    }
 }
 
-fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
+/// One in-flight replay claim plus the live-path lease that protects it.
+pub struct SpoolClaimHandle {
+    path: PathBuf,
+    _live: LiveSpoolPathGuard,
+}
+
+impl SpoolClaimHandle {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn claim_path_for_tests(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Default owner identity used by the simple test constructor.
+#[allow(dead_code)] // external unit tests only
+fn default_test_spool_owner_spec(node_id: &str) -> SpoolOwnerSpec<'_> {
+    SpoolOwnerSpec {
+        node_id,
+        plugin_config_id: "test-plugin",
+        ferrum_namespace: "ferrum",
+        destination_endpoint: "http://127.0.0.1:8123",
+        database: "ferrum",
+        table: "charges_raw",
+    }
+}
+
+fn spool_temp_is_stale(path: &Path, now: SystemTime, age_secs: u64) -> Result<bool, String> {
+    let meta = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to stat spool temp '{}': {error}",
+            path.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Ok(false);
+    }
+    if age_secs == 0 {
+        return Ok(true);
+    }
+    let modified = meta.modified().map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to read mtime for spool temp '{}': {error}",
+            path.display()
+        )
+    })?;
+    let elapsed = now.duration_since(modified).unwrap_or_default();
+    Ok(elapsed >= Duration::from_secs(age_secs))
+}
+
+/// Parsed generation-owned atomic-write temp marker.
+struct SpoolWriteTemp<'a> {
+    process_tag: &'a str,
+    #[allow(dead_code)] // retained for diagnostics and future lease policy
+    generation: u64,
+}
+
+/// `<data-name>.write-<process_tag>-<generation>.tmp`
+fn spool_write_temp_path(final_path: &Path, generation: u64) -> Result<PathBuf, String> {
+    let name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    Ok(final_path.with_file_name(format!(
+        "{name}{SPOOL_WRITE_MARKER}{}-{generation}{SPOOL_TMP_SUFFIX}",
+        spool_process_tag()
+    )))
+}
+
+fn parse_spool_write_temp(name: &str) -> Option<SpoolWriteTemp<'_>> {
+    let marker = name.strip_suffix(SPOOL_TMP_SUFFIX)?;
+    let (_, attribution) = marker.rsplit_once(SPOOL_WRITE_MARKER)?;
+    let (process_tag, generation) = attribution.rsplit_once('-')?;
+    if process_tag.is_empty() {
+        return None;
+    }
+    Some(SpoolWriteTemp {
+        process_tag,
+        generation: generation.parse().ok()?,
+    })
+}
+
+/// Parsed in-flight replay claim marker.
+struct SpoolClaim<'a> {
+    process_tag: &'a str,
+    #[allow(dead_code)] // retained for diagnostics and future lease policy
+    generation: u64,
+    lease_deadline_unix: i64,
+}
+
+/// `<data-name>.claim-<process_tag>-<generation>-<lease_deadline_unix>.inflight`
+fn spool_claim_path(
+    path: &Path,
+    generation: u64,
+    lease_deadline_unix: i64,
+) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let quarantine_path = path.with_file_name(format!("{name}.corrupt"));
+    Ok(path.with_file_name(format!(
+        "{name}{SPOOL_CLAIM_MARKER}{}-{generation}-{lease_deadline_unix}{SPOOL_INFLIGHT_SUFFIX}",
+        spool_process_tag()
+    )))
+}
+
+fn parse_spool_claim(name: &str) -> Option<SpoolClaim<'_>> {
+    let marker = name.strip_suffix(SPOOL_INFLIGHT_SUFFIX)?;
+    let (_, attribution) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
+    let mut parts = attribution.split('-');
+    let process_tag = parts.next()?;
+    let generation = parts.next()?.parse().ok()?;
+    let lease_deadline_unix = parts.next()?.parse().ok()?;
+    if process_tag.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(SpoolClaim {
+        process_tag,
+        generation,
+        lease_deadline_unix,
+    })
+}
+
+/// Strip a claim marker back to the durable replayable name.
+fn spool_claim_restore_path(claim: &Path) -> Result<PathBuf, String> {
+    let name = claim
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    let base = spool_claim_base_name(name).ok_or_else(|| {
+        format!(
+            "{PLUGIN_NAME}: in-flight spool path '{}' is missing a claim marker",
+            claim.display()
+        )
+    })?;
+    Ok(claim.with_file_name(base))
+}
+
+fn spool_claim_base_name(name: &str) -> Option<&str> {
+    let marker = name.strip_suffix(SPOOL_INFLIGHT_SUFFIX)?;
+    let (base, _) = marker.rsplit_once(SPOOL_CLAIM_MARKER)?;
+    Some(base)
+}
+
+/// Managed base name of any derived artifact (claim or temp).
+fn spool_artifact_base_name(name: &str) -> &str {
+    if let Some(base) = spool_claim_base_name(name) {
+        return base;
+    }
+    if let Some(marker) = name.strip_suffix(SPOOL_TMP_SUFFIX)
+        && let Some((base, _)) = marker.rsplit_once(SPOOL_WRITE_MARKER)
+    {
+        return base;
+    }
+    name
+}
+
+/// Owner tag embedded in `<ULID>.<owner_tag>.ndjson[.zst]`, including derived
+/// claim, temp, corrupt, and dead-letter artifacts of that name.
+fn spool_file_owner_tag(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    spool_owner_tag_of_name(spool_artifact_base_name(name))
+}
+
+fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
+    // Peel retained-artifact suffixes outermost-first so a dead-letter temp
+    // (`....ndjson.rejected.meta.tmp`) still resolves back to its data name.
+    let mut rest = name;
+    for suffix in [".tmp", ".rejected.meta", ".corrupt"] {
+        rest = rest.strip_suffix(suffix).unwrap_or(rest);
+    }
+    let stem = rest
+        .strip_suffix(".ndjson.zst")
+        .or_else(|| rest.strip_suffix(".ndjson"))?;
+    let (_, tag) = stem.rsplit_once('.')?;
+    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Some(tag)
+    } else {
+        None
+    }
+}
+
+/// Count spool records under this node/plugin subtree that no accepted
+/// generation owns.
+///
+/// Two shapes matter: the pre-namespace layout that wrote directly under
+/// `<spool.dir>/<node>/<day>/`, and sibling owner namespaces left behind when
+/// the ClickHouse destination, database, table, or Ferrum namespace changed.
+/// A plugin-config-id or node-id change moves to another parent subtree and is
+/// intentionally not attributed to this live instance. Discoverable records are
+/// reported, never replayed and never deleted, so an operator decides whether
+/// they still belong to the new destination.
+fn count_unbound_spool_records(
+    spool_dir: &Path,
+    components: &SpoolNamespaceComponents,
+    namespace_root: &Path,
+    max_entries: usize,
+) -> (u64, u64, bool) {
+    let node_dir = spool_dir.join(&components.node);
+    let plugin_dir = node_dir.join(&components.plugin);
+    let mut files = 0u64;
+    let mut namespaces = 0u64;
+    let mut remaining = max_entries;
+    let mut truncated = false;
+
+    // Pre-namespace layout: `<spool.dir>/<node>/<YYYYMMDD>/*.ndjson[.zst]`.
+    // Only day-shaped directories are inspected so a sibling plugin config's own
+    // managed subtree is never counted against this instance.
+    for day_dir in child_dirs_bounded(
+        &node_dir,
+        is_spool_day_component,
+        &mut remaining,
+        &mut truncated,
+    ) {
+        let (records, complete) = count_records_in_bounded(&day_dir, &mut remaining);
+        files = files.saturating_add(records);
+        if !complete {
+            truncated = true;
+            break;
+        }
+    }
+
+    // Sibling owner namespaces under this node/plugin: what a destination,
+    // database, table, ledger, or plugin-id change leaves behind.
+    if !truncated {
+        for owner_dir in child_dirs_bounded(
+            &plugin_dir,
+            |name| name.starts_with('o'),
+            &mut remaining,
+            &mut truncated,
+        ) {
+            if owner_dir == namespace_root {
+                continue;
+            }
+            let (records, complete) = count_records_in_bounded(&owner_dir, &mut remaining);
+            if records > 0 {
+                namespaces = namespaces.saturating_add(1);
+                files = files.saturating_add(records);
+            }
+            if !complete {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    (files, namespaces, truncated)
+}
+
+fn is_spool_day_component(name: &str) -> bool {
+    name.len() == 8 && name.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Non-symlink child directories of `dir` whose name passes `accept`, charged
+/// against the caller's aggregate traversal budget.
+fn child_dirs_bounded(
+    dir: &Path,
+    accept: impl Fn(&str) -> bool,
+    remaining: &mut usize,
+    truncated: &mut bool,
+) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        if *remaining == 0 {
+            *truncated = true;
+            break;
+        }
+        *remaining = (*remaining).saturating_sub(1);
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if accept(name) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+/// Count records while consuming the same global budget used to discover
+/// sibling roots. `complete=false` stops the aggregate scan immediately.
+fn count_records_in_bounded(dir: &Path, remaining: &mut usize) -> (u64, bool) {
+    if *remaining == 0 {
+        return (0, false);
+    }
+    let mut records = Vec::new();
+    let mut walk = match SpoolWalk::new_inner(dir, SpoolFileClass::AnyRecord, None, *remaining) {
+        Ok(walk) => walk,
+        Err(_) => return (0, false),
+    };
+    let complete = walk.run(dir, &mut records).is_ok();
+    *remaining = (*remaining).saturating_sub(walk.entry_count);
+    (records.len() as u64, complete)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpoolFileClass {
+    /// Active data, crash-left temps, corrupt quarantine, metadata-only
+    /// dead-letter files, and in-flight replay claims — quota/status.
+    Owned,
+    /// Durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
+    Replayable,
+    /// Interrupted atomic-write temps.
+    Temp,
+    /// Atomically claimed replay files.
+    Inflight,
+    /// Any durable record shape, whether or not it carries an owner tag; used
+    /// only by the unbound/legacy reconciliation scan.
+    AnyRecord,
+}
+
+/// Bounded, symlink-free, cycle-free walk of one managed subtree.
+struct SpoolWalk<'a> {
+    root: &'a Path,
+    class: SpoolFileClass,
+    entry_count: usize,
+    max_entries: usize,
+    visited: HashSet<DirIdentity>,
+    canonical_root: Option<PathBuf>,
+}
+
+impl<'a> SpoolWalk<'a> {
+    fn new_with_expected_root(
+        root: &'a Path,
+        class: SpoolFileClass,
+        expected_root: &Path,
+        max_entries: usize,
+    ) -> Result<Self, String> {
+        Self::new_inner(root, class, Some(expected_root), max_entries)
+    }
+
+    fn new_inner(
+        root: &'a Path,
+        class: SpoolFileClass,
+        expected_root: Option<&Path>,
+        max_entries: usize,
+    ) -> Result<Self, String> {
+        let canonical_root = match fs::symlink_metadata(root) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: refusing to walk symlinked spool root '{}'",
+                    root.display()
+                ));
+            }
+            Ok(_) => Some(fs::canonicalize(root).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to canonicalize spool walk root '{}': {error}",
+                    root.display()
+                )
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to lstat spool walk root '{}': {error}",
+                    root.display()
+                ));
+            }
+        };
+        if let (Some(expected), Some(actual)) = (expected_root, canonical_root.as_deref())
+            && actual != expected
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool walk root '{}' changed canonical target from '{}' to '{}'",
+                root.display(),
+                expected.display(),
+                actual.display()
+            ));
+        }
+        Ok(Self {
+            root,
+            class,
+            entry_count: 0,
+            max_entries,
+            visited: HashSet::new(),
+            canonical_root,
+        })
+    }
+
+    fn run(&mut self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        self.walk(dir, files, 0)
+    }
+
+    fn walk(&mut self, dir: &Path, files: &mut Vec<PathBuf>, depth: u32) -> Result<(), String> {
+        if depth > MAX_SPOOL_TRAVERSAL_DEPTH {
+            return Err(format!(
+                "{PLUGIN_NAME}: spool traversal exceeded max depth ({MAX_SPOOL_TRAVERSAL_DEPTH}) under '{}'",
+                self.root.display()
+            ));
+        }
+        ensure_path_within_root(self.root, dir)?;
+        reject_symlinked_spool_path(dir)?;
+        if let Some(canonical_root) = self.canonical_root.as_deref() {
+            directory_is_within_canonical_root(canonical_root, dir)?;
+        }
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "{PLUGIN_NAME}: failed to read spool directory '{}': {error}",
+                    dir.display()
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to read spool directory entry '{}': {error}",
+                    dir.display()
+                )
+            })?;
+            if self.entry_count >= self.max_entries {
+                return Err(format!(
+                    "{PLUGIN_NAME}: spool traversal exceeded max entry count ({}) under '{}'",
+                    self.max_entries,
+                    self.root.display()
+                ));
+            }
+            self.entry_count = self.entry_count.saturating_add(1);
+            let path = entry.path();
+            ensure_path_within_root(self.root, &path)?;
+            // Never follow symlinks for scan, replay, eviction, quarantine, or
+            // temp cleanup: the entry must be the real node we enumerated.
+            let meta = fs::symlink_metadata(&path).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: failed to lstat spool path '{}': {error}",
+                    path.display()
+                )
+            })?;
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %path.display(),
+                    "Chargeback sink ignored a symlink under the managed spool namespace"
+                );
+                continue;
+            }
+            if file_type.is_dir() {
+                if let Some(identity) = dir_identity(&meta)
+                    && !self.visited.insert(identity)
+                {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "Chargeback sink skipped a spool directory cycle"
+                    );
+                    continue;
+                }
+                self.walk(&path, files, depth + 1)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(SPOOL_META_FILENAME) {
+                continue;
+            }
+            if spool_file_matches(&path, self.class) {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn quarantine_spool_file(spool: &SpoolManager, path: &Path) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
+    // Quarantine under the durable data name so the owner tag survives.
+    let base = spool_artifact_base_name(name);
+    let quarantine_path = path.with_file_name(format!("{base}.corrupt"));
+    // Quarantine is a rename inside the managed tree, so it takes the same
+    // writer lock and containment/symlink proof as every other spool mutation.
+    let _guard = spool
+        .write_lock
+        .lock()
+        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+    spool.assert_managed_path(path)?;
+    spool.assert_managed_path(&quarantine_path)?;
     fs::rename(path, &quarantine_path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to quarantine corrupt spool file '{}' to '{}': {error}",
@@ -4541,8 +6558,11 @@ fn dead_letter_meta_paths(path: &Path) -> Result<(PathBuf, PathBuf), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?;
-    let meta_path = path.with_file_name(format!("{name}.rejected.meta"));
-    let tmp_path = path.with_file_name(format!("{name}.rejected.meta.tmp"));
+    // Name the record after the durable data file, not after the claim marker,
+    // so the dead letter keeps the owner tag and stays attributable.
+    let base = spool_artifact_base_name(name);
+    let meta_path = path.with_file_name(format!("{base}.rejected.meta"));
+    let tmp_path = path.with_file_name(format!("{base}.rejected.meta.tmp"));
     Ok((tmp_path, meta_path))
 }
 
@@ -4559,6 +6579,9 @@ fn write_dead_letter_meta(
         .write_lock
         .lock()
         .map_err(|_| format!("{PLUGIN_NAME}: spool write lock poisoned"))?;
+    spool.assert_managed_path(&meta_path)?;
+    spool.assert_managed_path(&tmp_path)?;
+    spool.assert_managed_path(source_path)?;
     match fs::remove_file(&meta_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4569,7 +6592,17 @@ fn write_dead_letter_meta(
             ));
         }
     }
-    write_private_file_atomically(&tmp_path, &meta_path, &bytes)?;
+    let _live = LiveSpoolPathGuard::new(tmp_path.clone());
+    // `<ulid>.<owner_tag>.<ext>.rejected.meta` inherits the uniqueness of the
+    // ULID-named source artifact it describes, so this final is exclusively this
+    // attempt's and a failed publish rolls it back.
+    write_private_file_atomically_with_ops(
+        &tmp_path,
+        &meta_path,
+        &bytes,
+        spool.fs_ops,
+        SpoolFinalOwnership::Unique,
+    )?;
     if let Err(error) = fs::remove_file(source_path) {
         let cleanup_error = fs::remove_file(&meta_path).err();
         return Err(format!(
@@ -4592,6 +6625,8 @@ fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
         SpoolFileClass::Owned => is_spool_owned_file(path),
         SpoolFileClass::Replayable => is_spool_data_file(path),
         SpoolFileClass::Temp => is_spool_temp_file(path),
+        SpoolFileClass::Inflight => is_spool_inflight_file(path),
+        SpoolFileClass::AnyRecord => is_spool_data_file(path),
     }
 }
 
@@ -4599,20 +6634,38 @@ fn is_spool_data_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    (name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
-        && !name.ends_with(".tmp")
-        && !name.ends_with(".corrupt")
-        && !name.ends_with(".rejected")
+    if name.ends_with(SPOOL_INFLIGHT_SUFFIX)
+        || name.ends_with(SPOOL_TMP_SUFFIX)
+        || name.ends_with(".corrupt")
+        || name.ends_with(".rejected")
+        || name.ends_with(".meta")
+    {
+        return false;
+    }
+    name.ends_with(".ndjson.zst") || name.ends_with(".ndjson")
 }
 
 fn is_spool_temp_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    name.ends_with(".ndjson.tmp")
+    if !name.ends_with(SPOOL_TMP_SUFFIX) {
+        return false;
+    }
+    // Generation/process-attributed temps written by this format, plus the
+    // pre-attribution shapes and dead-letter metadata temps that a prior
+    // release could have left behind.
+    parse_spool_write_temp(name).is_some()
+        || name.ends_with(".ndjson.tmp")
         || name.ends_with(".ndjson.zst.tmp")
-        || name.ends_with(".ndjson.rejected.meta.tmp")
-        || name.ends_with(".ndjson.zst.rejected.meta.tmp")
+        || name.ends_with(".rejected.meta.tmp")
+}
+
+fn is_spool_inflight_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with(SPOOL_INFLIGHT_SUFFIX)
 }
 
 fn is_spool_corrupt_file(path: &Path) -> bool {
@@ -4634,6 +6687,7 @@ fn is_spool_owned_file(path: &Path) -> bool {
         || is_spool_temp_file(path)
         || is_spool_corrupt_file(path)
         || is_spool_rejected_meta_file(path)
+        || is_spool_inflight_file(path)
 }
 
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
@@ -4703,32 +6757,35 @@ pub fn encode_spool_bytes_for_tests(
 }
 
 fn decode_spool_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| {
+    let file = File::open(path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
             path.display()
         )
     })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
+    let encoded_len = file
+        .metadata()
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
+                path.display()
+            )
+        })?
+        .len();
+    if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
             path.display()
-        )
-    })?;
+        ));
+    }
     let decoded = if path
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.contains(".ndjson.zst"))
     {
-        zstd::stream::decode_all(bytes.as_slice()).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to decompress spool file '{}': {error}",
-                path.display()
-            )
-        })?
+        decode_zstd_bounded(file, spool_decompression_limit(encoded_len), path)?
     } else {
-        bytes
+        read_spool_bytes_bounded(file, SPOOL_MAX_ARTIFACT_BYTES, path)?
     };
     String::from_utf8(decoded).map_err(|error| {
         format!(
@@ -4738,9 +6795,69 @@ fn decode_spool_file(path: &Path) -> Result<String, String> {
     })
 }
 
+/// Decompress one spool record, failing closed past `limit` decoded bytes.
+///
+/// The caller quarantines an undecodable record to `<data-name>.corrupt` rather
+/// than deleting it, so a rejected archive stays on disk for operator review.
+fn spool_decompression_limit(encoded_len: u64) -> u64 {
+    // `clamp` cannot panic here: both bounds are constants and
+    // `SPOOL_MIN_DECOMPRESSED_BYTES` (1 MiB) is far below
+    // `SPOOL_MAX_ARTIFACT_BYTES` (the retained-byte ceiling).
+    encoded_len
+        .saturating_mul(SPOOL_MAX_DECOMPRESSION_RATIO)
+        .clamp(SPOOL_MIN_DECOMPRESSED_BYTES, SPOOL_MAX_ARTIFACT_BYTES)
+}
+
+fn read_spool_bytes_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
+    let mut decoded = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut decoded)
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
+                path.display()
+            )
+        })?;
+    if decoded.len() as u64 > limit {
+        return Err(format!(
+            "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
+            path.display()
+        ));
+    }
+    Ok(decoded)
+}
+
+fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
+    let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
+            path.display()
+        )
+    })?;
+    read_spool_bytes_bounded(decoder, limit, path).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: spool file '{}' exceeded its decompression bound: {error}",
+            path.display()
+        )
+    })
+}
+
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
     decode_spool_file(path)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_artifact_byte_limit_for_tests() -> u64 {
+    SPOOL_MAX_ARTIFACT_BYTES
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn spool_decompression_limit_for_tests(encoded_len: u64) -> u64 {
+    spool_decompression_limit(encoded_len)
 }
 
 #[doc(hidden)]
@@ -4843,28 +6960,125 @@ pub fn write_private_file_atomically_for_tests(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    write_private_file_atomically(tmp_path, final_path, bytes)
+    let ops = SpoolFsOps::REAL;
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
-fn write_private_file_atomically(
+/// Exercise the durable-write contract with one step forced to fail.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn write_private_file_atomically_with_fault_for_tests(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    fault: SpoolFsFault,
+    ownership: SpoolFinalOwnership,
 ) -> Result<(), String> {
-    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes);
-    if result.is_err() {
-        // Keep quota accounting honest after a failed write/rename: a leftover
-        // *.tmp would otherwise consume disk while remaining invisible to replay.
-        let _ = fs::remove_file(tmp_path);
-    }
-    result
+    let ops = SpoolFsOps::with_fault(fault);
+    write_private_file_atomically_with_ops(tmp_path, final_path, bytes, ops, ownership)
 }
 
+fn write_private_file_atomically_with_ops(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+    ops: SpoolFsOps,
+    ownership: SpoolFinalOwnership,
+) -> Result<(), String> {
+    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes, ops);
+    let Err(primary_error) = result else {
+        return Ok(());
+    };
+
+    // Keep quota accounting honest and make rollback as durable as the
+    // filesystem permits after a failed write, rename, or directory sync. A
+    // second real parent-directory fsync persists successful cleanup even when
+    // the injected or first production sync failed. If cleanup itself cannot be
+    // completed, preserve that evidence in the returned error rather than
+    // claiming a guaranteed rollback.
+    let mut cleanup_errors = Vec::new();
+    // Every temp this helper is given is derived from a name only this attempt
+    // can be writing: a fresh ULID for data batches, the
+    // `*.write-<process_tag>-<generation>.tmp` attribution for the shared
+    // manifest, and the claimed source artifact's ULID for dead-letter metadata.
+    // Unlinking it can therefore only discard this attempt's own bytes.
+    match fs::remove_file(tmp_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => cleanup_errors.push(format!(
+            "failed to remove rollback path '{}': {error}",
+            tmp_path.display()
+        )),
+    }
+    // `final_path`, unlike the temp, is not always this attempt's to delete.
+    //
+    // For a [`SpoolFinalOwnership::Unique`] name — a ULID-derived data batch or
+    // its dead-letter metadata — no other writer can publish to that path, so
+    // the only entry an unlink can destroy is this attempt's own unsynced
+    // publication. Roll it back, and report a cleanup failure rather than
+    // claiming a guaranteed rollback.
+    //
+    // For a [`SpoolFinalOwnership::Shared`] name — `spool.meta.json`, one
+    // well-known path for every writer of the namespace — the unlink is skipped
+    // entirely. There is no way to make "this entry is still the file I renamed"
+    // atomic with the unlink that acts on it: a peer's `rename` can replace the
+    // name between any check and the removal, so stat-then-unlink (by inode or
+    // otherwise), content comparison, and timestamp comparison would all still
+    // permit deleting a peer's newer publication. An in-process lock does not
+    // help either, since peers are separate processes on a shared volume.
+    //
+    // Skipping it can leave a manifest whose directory entry was never fsynced,
+    // or whose bytes replaced a peer's. That is recoverable: the durability
+    // error is still returned, live storage is never marked prepared, and the
+    // next prepare validates the manifest against this sink's identity and
+    // regenerates or fails closed on it. Deleting a peer's publication is not
+    // recoverable, so the residual is deliberately pushed to the safe side.
+    if ownership == SpoolFinalOwnership::Unique {
+        match fs::remove_file(final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => cleanup_errors.push(format!(
+                "failed to remove rollback path '{}': {error}",
+                final_path.display()
+            )),
+        }
+    }
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        match File::open(parent) {
+            Ok(dir) => {
+                if let Err(error) = dir.sync_all() {
+                    cleanup_errors.push(format!(
+                        "failed to fsync rollback directory '{}': {error}",
+                        parent.display()
+                    ));
+                }
+            }
+            Err(error) => cleanup_errors.push(format!(
+                "failed to open rollback directory '{}': {error}",
+                parent.display()
+            )),
+        }
+    }
+    if cleanup_errors.is_empty() {
+        Err(primary_error)
+    } else {
+        Err(format!(
+            "{primary_error}; rollback cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))
+    }
+}
+
+/// Publish `bytes` at `final_path` durably: private temp, write, fsync, rename,
+/// parent-directory fsync. Rollback of a partial sequence is the caller's job.
 fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
+    ops: SpoolFsOps,
 ) -> Result<(), String> {
     if let Some(parent) = tmp_path.parent() {
         ensure_private_dir(parent)?;
@@ -4898,41 +7112,47 @@ fn write_private_file_atomically_inner(
             tmp_path.display()
         )
     })?;
-    file.sync_all().map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to fsync spool temp file '{}': {error}",
-            tmp_path.display()
-        )
-    })?;
+    (ops.sync_file)(&file, tmp_path)?;
     drop(file);
-    fs::rename(tmp_path, final_path).map_err(|error| {
-        format!(
-            "{PLUGIN_NAME}: failed to rename spool temp file '{}' to '{}': {error}",
-            tmp_path.display(),
-            final_path.display()
-        )
-    })?;
-    // Durably persist the rename itself: the file contents were fsynced above,
-    // but the directory entry that points at them is only guaranteed after an
-    // fsync of the containing directory. Without it a crash right after rename
-    // can lose the spooled batch on some filesystems. Directory fsync is a Unix
-    // concept and best-effort; failure here does not invalidate the written data.
+    (ops.rename)(tmp_path, final_path)?;
+    // Test-only interleaving point: production wires this to a no-op, and the
+    // fault-injection suite uses it to republish `final_path` as a peer would
+    // before the directory fsync below fails.
+    (ops.after_rename)(final_path);
+    // Durably persist the rename itself. The file contents were fsynced above,
+    // but the directory entry pointing at them is only guaranteed after an fsync
+    // of the containing directory. On Unix a parent-directory open or fsync
+    // failure is therefore a write failure: it is reported to the caller and the
+    // publish is rolled back, before any snapshot baseline can advance.
+    //
+    // Directory fsync is a Unix concept. On platforms without it (notably
+    // Windows) a successful file sync plus rename is the durability boundary
+    // this plugin can offer, and the documentation states that limit rather than
+    // claiming a guarantee the platform does not provide. Both platforms run the
+    // same fault-injection contract tests.
     #[cfg(unix)]
-    if let Some(parent) = final_path.parent()
-        && let Ok(dir) = File::open(parent)
     {
-        let _ = dir.sync_all();
+        let Some(parent) = final_path.parent() else {
+            return Ok(());
+        };
+        let dir = (ops.open_dir)(parent)?;
+        (ops.sync_dir)(&dir, parent)?;
     }
     Ok(())
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
+    // Refuse a pre-existing symlink before `create_dir_all` or chmod can follow
+    // it, then lstat again after creation to close the ordinary check/create
+    // race as far as path-based filesystem APIs permit.
+    reject_symlinked_spool_path(path)?;
     fs::create_dir_all(path).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to create spool directory '{}': {error}",
             path.display()
         )
     })?;
+    reject_symlinked_spool_path(path)?;
     #[cfg(unix)]
     {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
@@ -4942,27 +7162,49 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
             )
         })?;
     }
-    let probe = path.join(".ferrum-write-test");
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&probe)
-            .map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
-                    path.display()
-                )
-            })?;
-        file.write_all(b"ok").map_err(|error| {
+    // A fixed `create + truncate` probe lets a same-UID actor pre-plant a
+    // symlink and redirect truncation outside the managed tree. Use an
+    // unpredictable name and `create_new` so an existing path of any type is
+    // never followed.
+    let probe = path.join(format!(".ferrum-write-test-{}.tmp", new_ulid()));
+    #[cfg(unix)]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)
+        .map_err(|error| {
             format!(
-                "{PLUGIN_NAME}: spool directory '{}' write probe failed: {error}",
+                "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
                 path.display()
             )
         })?;
+    #[cfg(not(unix))]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: spool directory '{}' is not writable: {error}",
+                path.display()
+            )
+        })?;
+    if let Err(error) = file.write_all(b"ok") {
+        drop(file);
+        let _ = fs::remove_file(&probe);
+        return Err(format!(
+            "{PLUGIN_NAME}: spool directory '{}' write probe failed: {error}",
+            path.display()
+        ));
     }
-    let _ = fs::remove_file(&probe);
+    drop(file);
+    fs::remove_file(&probe).map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: failed to remove spool directory write probe '{}': {error}",
+            probe.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -4997,6 +7239,14 @@ fn start_spool_replayer(
     })
 }
 
+/// Replay one tick of this owner's durable spool files.
+///
+/// Each candidate is atomically claimed before it is read or delivered, so an
+/// overlapping accepted generation, a reloaded replacement generation, or a peer
+/// process sharing the volume can never deliver or destroy the same file. Losing
+/// the claim race is normal and simply skips that file. Quota eviction never
+/// selects a claimed file, so a retryable failure can always release the claim
+/// back to a durable name.
 async fn replay_spool_once(
     spool: &SpoolManager,
     flush_config: &ClickHouseFlushConfig,
@@ -5004,18 +7254,30 @@ async fn replay_spool_once(
 ) -> Result<(), String> {
     let files = spool.list_replayable_spool_files()?;
     for file in files {
-        let body = match decode_spool_file(&file) {
+        let mut claim = {
+            let _guard = spool
+                .write_lock
+                .lock()
+                .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+            match spool.claim_replay_file_locked(&file)? {
+                Some(claim) => claim,
+                // Another accepted generation or process won the atomic claim.
+                None => continue,
+            }
+        };
+        let inflight = claim.path().to_path_buf();
+        let body = match decode_spool_file(&inflight) {
             Ok(body) => body,
             Err(error) => {
                 spool
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
-                match quarantine_spool_file(&file) {
+                match quarantine_spool_file(spool, &inflight) {
                     Ok(quarantine_path) => {
                         warn!(
                             plugin = PLUGIN_NAME,
                             error = %error,
-                            path = %file.display(),
+                            path = %inflight.display(),
                             quarantine_path = %quarantine_path.display(),
                             "Chargeback sink quarantined an unreadable spool file and will continue replay"
                         );
@@ -5025,7 +7287,7 @@ async fn replay_spool_once(
                             plugin = PLUGIN_NAME,
                             error = %error,
                             quarantine_error = %quarantine_error,
-                            path = %file.display(),
+                            path = %inflight.display(),
                             "Chargeback sink could not quarantine an unreadable spool file; replay will continue"
                         );
                     }
@@ -5039,18 +7301,26 @@ async fn replay_spool_once(
             .map(str::to_owned)
             .collect();
         if lines.is_empty() {
-            fs::remove_file(&file).map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: failed to remove empty spool file '{}': {error}",
-                    file.display()
-                )
-            })?;
+            spool.remove_delivered_claim(claim.path())?;
             continue;
         }
 
-        match replay_spool_lines(flush_config, &lines, batch_size).await {
+        match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
             Ok(dead_letters) => {
-                finalize_replayed_spool_file(spool, &file, lines.len(), dead_letters)?;
+                if let Err(error) =
+                    finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)
+                {
+                    // Permanent rejection could not publish dead-letter metadata.
+                    // Release the claim so the original record remains
+                    // replayable: durability of the payload outranks quarantine
+                    // progress when the sidecar write fails.
+                    let _guard = spool
+                        .write_lock
+                        .lock()
+                        .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                    spool.release_claim_locked(claim.path())?;
+                    return Err(error);
+                }
                 spool
                     .metrics
                     .last_replay_at
@@ -5058,9 +7328,14 @@ async fn replay_spool_once(
                 invalidate_status_cache();
             }
             Err(error) => {
-                // Retryable delivery failure: keep this file and stop the tick so
-                // ordering is preserved across transient outages. Permanent
-                // rejection is handled inside replay_spool_lines via dead-letter.
+                // Retryable delivery failure: release the claim back to a durable
+                // replayable name and stop the tick so ordering is preserved
+                // across transient outages.
+                let _guard = spool
+                    .write_lock
+                    .lock()
+                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                spool.release_claim_locked(claim.path())?;
                 return Err(error);
             }
         }
@@ -5081,6 +7356,8 @@ struct DeadLetterChunk {
 /// Multi-row 413 splits deterministically using `batch_size` without rewriting
 /// row payloads (event_id and other fields stay byte-identical).
 async fn replay_spool_lines(
+    spool: &SpoolManager,
+    claim: &mut SpoolClaimHandle,
     flush_config: &ClickHouseFlushConfig,
     lines: &[String],
     batch_size: usize,
@@ -5090,6 +7367,13 @@ async fn replay_spool_lines(
     while let Some(chunk) = stack.pop() {
         if chunk.is_empty() {
             continue;
+        }
+        {
+            let _guard = spool
+                .write_lock
+                .lock()
+                .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+            spool.renew_claim_locked(claim)?;
         }
         let body = chunk.join("\n");
         match post_json_each_row(flush_config, body, chunk.len()).await {
@@ -5130,12 +7414,7 @@ fn finalize_replayed_spool_file(
     dead_letters: Vec<DeadLetterChunk>,
 ) -> Result<(), String> {
     if dead_letters.is_empty() {
-        fs::remove_file(file).map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to remove replayed spool file '{}': {error}",
-                file.display()
-            )
-        })?;
+        spool.remove_delivered_claim(file)?;
         return Ok(());
     }
 

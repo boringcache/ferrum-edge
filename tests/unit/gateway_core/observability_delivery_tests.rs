@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ferrum_edge::observability_delivery::{DeliverySlot, DeliveryWorkerControl};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 /// A queue worker that finishes cleanly as soon as admission closes.
 fn spawn_draining_worker(plugin_name: &'static str) -> Arc<DeliveryWorkerControl> {
@@ -254,5 +254,208 @@ async fn reinitialize_does_not_orphan_an_open_generation() {
         slot.begin_cycle(),
         generation,
         "the updated override must take effect through a fresh post-drain generation"
+    );
+}
+
+/// Issue #3028: hold the task budget open, attempt far more admissions than the
+/// cap, prove registry/permit counts stay bounded, observe rejects, then confirm
+/// permits release so later work can admit again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_budget_caps_terminal_mirror_and_deadline_cleanup_admissions() {
+    const BUDGET: usize = 8;
+    const OVERFLOW: usize = 256;
+
+    let slot = DeliverySlot::with_limits(0, BUDGET);
+    slot.begin_cycle();
+    assert_eq!(slot.max_tasks(), BUDGET);
+
+    // Counting/closable semaphores rather than `Notify`: `notify_one` permits
+    // saturate at one and `notify_waiters` only reaches waiters that already
+    // registered, so several concurrently held tasks lose wakeups and this
+    // regression would hang instead of failing.
+    let release = Arc::new(Semaphore::new(0));
+    let started = Arc::new(Semaphore::new(0));
+
+    // Fill the aggregate budget with a mix of kinds so one kind cannot bypass
+    // the shared registry cap.
+    for kind in 0..BUDGET {
+        let task_release = Arc::clone(&release);
+        let task_started = Arc::clone(&started);
+        let future = async move {
+            task_started.add_permits(1);
+            let _ = task_release.acquire().await;
+        };
+        let admitted = match kind % 3 {
+            0 => slot.spawn_terminal(future),
+            1 => slot.spawn_mirror(future),
+            _ => slot.spawn_deadline_cleanup(future),
+        };
+        assert!(admitted, "budget fill admission {kind} must succeed");
+    }
+
+    started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every held task reports started")
+        .forget();
+
+    assert_eq!(slot.active_tasks(), BUDGET);
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+
+    let rejected_before = slot.rejected_tasks();
+    let mut overflow_rejects = 0u64;
+    for i in 0..OVERFLOW {
+        let admitted = match i % 3 {
+            0 => slot.spawn_terminal(async {}),
+            1 => slot.spawn_mirror(async {}),
+            _ => slot.spawn_deadline_cleanup(async {}),
+        };
+        assert!(
+            !admitted,
+            "overflow admission {i} must reject once the budget is held open"
+        );
+        overflow_rejects += 1;
+        assert!(
+            slot.active_tasks() <= BUDGET,
+            "registry must stay within the configured budget"
+        );
+        assert!(
+            slot.admitted_tasks() <= BUDGET as u64,
+            "admission permits must stay within the configured budget"
+        );
+    }
+
+    assert_eq!(slot.active_tasks(), BUDGET);
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+    assert_eq!(
+        slot.rejected_tasks(),
+        rejected_before + overflow_rejects,
+        "capacity rejects must remain observable without spawning more deferred work"
+    );
+
+    release.close();
+
+    // Wait for held tasks to finish and release permits.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while slot.admitted_tasks() != 0 || slot.active_tasks() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "held tasks must release permits after completion"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    assert_eq!(slot.rejected_tasks(), rejected_before + overflow_rejects);
+
+    let refill_release = Arc::new(Semaphore::new(0));
+    let refill_started = Arc::new(Semaphore::new(0));
+    for i in 0..BUDGET {
+        let task_release = Arc::clone(&refill_release);
+        let task_started = Arc::clone(&refill_started);
+        assert!(
+            slot.spawn_terminal(async move {
+                task_started.add_permits(1);
+                let _ = task_release.acquire().await;
+            }),
+            "permit release must reopen admission up to the budget (slot {i})"
+        );
+    }
+    refill_started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every refilled task reports started")
+        .forget();
+    assert_eq!(slot.admitted_tasks(), BUDGET as u64);
+    assert!(
+        !slot.spawn_terminal(async {}),
+        "budget must still reject once refilled"
+    );
+    refill_release.close();
+    assert!(
+        slot.shutdown(Duration::from_secs(5)).await.complete(),
+        "bounded admission must not disturb the shutdown drain deadline"
+    );
+}
+
+/// Issue #3028 / GHSA-83h5-52mw-f33p: budget exhaustion must be distinguishable
+/// from the closed-admission rejects that happen normally at shutdown, or the
+/// aggregate reject counter cannot be alerted on for capacity at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_rejects_are_counted_separately_from_closed_admission_rejects() {
+    const BUDGET: usize = 2;
+
+    let slot = DeliverySlot::with_limits(0, BUDGET);
+    slot.begin_cycle();
+    assert_eq!(slot.capacity_rejected_tasks(), 0);
+
+    let release = Arc::new(Semaphore::new(0));
+    let started = Arc::new(Semaphore::new(0));
+    for i in 0..BUDGET {
+        let task_release = Arc::clone(&release);
+        let task_started = Arc::clone(&started);
+        assert!(
+            slot.spawn_terminal(async move {
+                task_started.add_permits(1);
+                let _ = task_release.acquire().await;
+            }),
+            "budget fill admission {i} must succeed"
+        );
+    }
+    started
+        .acquire_many(BUDGET as u32)
+        .await
+        .expect("every held task reports started")
+        .forget();
+
+    // Overflow while the budget is held: both the aggregate and the
+    // budget-specific counter advance together.
+    for _ in 0..5 {
+        assert!(!slot.spawn_mirror(async {}));
+    }
+    assert_eq!(slot.capacity_rejected_tasks(), 5);
+    assert_eq!(slot.rejected_tasks(), 5);
+
+    release.close();
+    assert!(
+        slot.shutdown(Duration::from_secs(5)).await.complete(),
+        "held tasks release on close so the drain completes"
+    );
+
+    // Post-drain admission is closed, not exhausted: the aggregate counter
+    // advances while the capacity counter stays put.
+    let capacity_after_drain = slot.capacity_rejected_tasks();
+    let rejected_after_drain = slot.rejected_tasks();
+    for _ in 0..4 {
+        assert!(!slot.spawn_terminal(async {}));
+    }
+    assert_eq!(
+        slot.capacity_rejected_tasks(),
+        capacity_after_drain,
+        "closed-admission rejects must not be attributed to the task budget"
+    );
+    assert_eq!(slot.rejected_tasks(), rejected_after_drain + 4);
+}
+
+#[tokio::test]
+async fn task_budget_override_applies_to_the_next_generation() {
+    let slot = DeliverySlot::with_limits(0, 4);
+    let first = slot.begin_cycle();
+    assert_eq!(slot.max_tasks(), 4);
+
+    slot.initialize_with_limits(0, 2);
+    assert_eq!(
+        slot.current_generation(),
+        first,
+        "open generations keep their existing budget"
+    );
+    assert_eq!(slot.max_tasks(), 4);
+
+    assert!(slot.shutdown(Duration::from_secs(5)).await.complete());
+    let second = slot.begin_cycle();
+    assert_ne!(second, first);
+    assert_eq!(
+        slot.max_tasks(),
+        2,
+        "the updated task budget must take effect on the fresh generation"
     );
 }
