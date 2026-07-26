@@ -216,6 +216,8 @@ pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accep
 /// validated plaintext before `before_proxy`. Later transforms must not decode
 /// again; the backend already receives the normalized bytes.
 pub(crate) const REQUEST_DECODED_METADATA_KEY: &str = "compression:request_decoded";
+const NOT_ACCEPTABLE_RESPONSE_BODY: &str =
+    "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}";
 
 /// Process-wide compression codec admission metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,25 +294,52 @@ fn try_acquire_response_buffer_permit() -> Result<OwnedSemaphorePermit, ()> {
     }
 }
 
-/// Restore identity response headers when a committed gateway content coding
-/// cannot be produced. Shared H1/H2/H3 buffered transform loops call this after
-/// a transform returns `None` so plaintext is never served under a coded header.
+/// Recover when a committed gateway content coding cannot be produced. Shared
+/// H1/H2/H3 buffered transform loops call this after a transform returns `None`.
+/// Identity-acceptable requests regain matching identity headers; requests that
+/// excluded identity become a terminal 406. Returns `true` for that terminal
+/// replacement so callers stop later transforms/final-body hooks.
 pub(crate) fn reconcile_aborted_gateway_response_encoding(
     ctx: &mut RequestContext,
+    response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    body_len: usize,
-) {
+    response_body: &mut Vec<u8>,
+) -> bool {
     if !ctx.take_compression_response_encode_aborted() {
-        return;
+        return false;
     }
-    response_headers.remove("content-encoding");
-    response_headers.insert("content-length".to_string(), body_len.to_string());
     ctx.metadata.remove(RESPONSE_ALGORITHM_METADATA_KEY);
     ctx.clear_gateway_response_compression();
+    let identity_unacceptable = ctx
+        .metadata
+        .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+        .is_some_and(|value| identity_coding_quality(value) == 0.0);
+    if identity_unacceptable {
+        *response_status = 406;
+        response_headers.clear();
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        ensure_vary_accept_encoding(response_headers);
+        *response_body = NOT_ACCEPTABLE_RESPONSE_BODY.as_bytes().to_vec();
+        response_headers.insert(
+            "content-length".to_string(),
+            response_body.len().to_string(),
+        );
+        warn!(
+            "compression: replaced failed gateway content coding with 406 because identity is unacceptable"
+        );
+        return true;
+    }
+    response_headers.remove("content-encoding");
+    response_headers.insert(
+        "content-length".to_string(),
+        response_body.len().to_string(),
+    );
     warn!(
         "compression: restored identity response after failed gateway content coding \
-         (body_len={body_len})"
+         (body_len={})",
+        response_body.len()
     );
+    false
 }
 
 struct CompressionConfig {
@@ -1393,7 +1422,7 @@ pub(crate) fn identity_coding_quality(accept_encoding: &str) -> f32 {
 fn not_acceptable_reject() -> PluginResult {
     PluginResult::Reject {
         status_code: 406,
-        body: "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}".to_string(),
+        body: NOT_ACCEPTABLE_RESPONSE_BODY.to_string(),
         headers: HashMap::from([
             ("content-type".to_string(), "application/json".to_string()),
             ("vary".to_string(), "Accept-Encoding".to_string()),

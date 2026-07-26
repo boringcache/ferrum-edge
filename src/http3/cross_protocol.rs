@@ -2856,11 +2856,15 @@ where
                                 &mut response_headers,
                             );
                         } else {
-                            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                                 ctx,
+                                &mut response_status,
                                 &mut response_headers,
-                                response_body.len(),
-                            );
+                                &mut response_body,
+                            ) {
+                                response_body_rejected = true;
+                                break;
+                            }
                         }
                         ctx.record_deadline_response_header_plugin(
                             plugin.as_ref(),
@@ -4944,11 +4948,15 @@ where
                         );
                         representation_rewritten = true;
                     } else {
-                        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                        if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                             ctx,
+                            &mut response_status,
                             &mut plugin_response_headers,
-                            response_body.len(),
-                        );
+                            &mut response_body,
+                        ) {
+                            response_body_rejected = true;
+                            break;
+                        }
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),

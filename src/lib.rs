@@ -148,14 +148,16 @@ pub mod _test_support {
 
     pub fn reconcile_aborted_gateway_response_encoding_for_test(
         ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        body_len: usize,
-    ) {
+        response_body: &mut Vec<u8>,
+    ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
+            response_status,
             response_headers,
-            body_len,
-        );
+            response_body,
+        )
     }
 
     pub fn validate_correlation_id_composition_for_test(

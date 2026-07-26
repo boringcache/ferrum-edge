@@ -15632,11 +15632,15 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 mandatory_replay_transform_failed = Some(plugin.name());
                 break;
             } else {
-                crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                     ctx,
+                    response_status,
                     response_headers,
-                    response_body.len(),
-                );
+                    response_body,
+                ) {
+                    terminal_body_response_selected = true;
+                    break;
+                }
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -16960,11 +16964,14 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
             );
             body_transformed = true;
         } else {
-            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
                 ctx,
+                response_status,
                 response_headers,
-                response_body.len(),
-            );
+                response_body,
+            ) {
+                return (true, true);
+            }
         }
         ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }

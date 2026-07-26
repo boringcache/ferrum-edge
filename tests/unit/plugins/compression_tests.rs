@@ -5947,7 +5947,7 @@ async fn test_response_encode_abort_restores_identity_representation() {
 
     // Simulate a missing permit / encoder abort after Content-Encoding commit.
     let _ = take_compression_response_buffer_permit_for_test(&mut ctx);
-    let identity = compressible_json_body();
+    let mut identity = compressible_json_body();
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
         .await;
@@ -5955,7 +5955,17 @@ async fn test_response_encode_abort_restores_identity_representation() {
         transformed.is_none(),
         "encode abort must not emit compressed bytes"
     );
-    reconcile_aborted_gateway_response_encoding_for_test(&mut ctx, &mut resp, identity.len());
+    let mut status = 200;
+    assert!(
+        !reconcile_aborted_gateway_response_encoding_for_test(
+            &mut ctx,
+            &mut status,
+            &mut resp,
+            &mut identity,
+        ),
+        "identity-acceptable recovery must not select a terminal rejection"
+    );
+    assert_eq!(status, 200);
     assert!(
         !resp.contains_key("content-encoding"),
         "encode abort must restore identity headers"
@@ -6001,7 +6011,7 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
                 "buffer admission is what gates the commit; codec saturation is later"
             );
 
-            let identity = compressible_json_body();
+            let mut identity = compressible_json_body();
             assert!(
                 plugin
                     .transform_response_body_with_context(
@@ -6014,11 +6024,17 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
                     .is_none(),
                 "codec saturation must abort the encode instead of emitting bytes"
             );
-            reconcile_aborted_gateway_response_encoding_for_test(
-                &mut ctx,
-                &mut resp,
-                identity.len(),
+            let mut status = 200;
+            assert!(
+                !reconcile_aborted_gateway_response_encoding_for_test(
+                    &mut ctx,
+                    &mut status,
+                    &mut resp,
+                    &mut identity,
+                ),
+                "identity-acceptable recovery must not select a terminal rejection"
             );
+            assert_eq!(status, 200);
             assert!(
                 !resp.contains_key("content-encoding"),
                 "aborted encode must restore an identity representation"
@@ -6036,6 +6052,79 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
             assert!(
                 compression_response_admission_reserved_for_test(&next),
                 "aborted encode must not strand the response-buffer permit"
+            );
+        })
+        .await;
+    })
+    .await;
+}
+
+/// A codec slot can disappear after `Content-Encoding` is committed. If the
+/// client explicitly refused identity, recovery must fail closed with 406
+/// rather than emit the plaintext representation the client excluded.
+#[tokio::test]
+async fn test_codec_saturation_with_identity_forbidden_returns_406() {
+    use ferrum_edge::_test_support::reconcile_aborted_gateway_response_encoding_for_test;
+    use ferrum_edge::plugins::compression::{
+        with_test_codec_budget, with_test_response_buffer_budget,
+    };
+
+    with_test_response_buffer_budget(1, || async {
+        with_test_codec_budget(0, || async {
+            let plugin = make_plugin(json!({"min_content_length": 10}));
+            let mut ctx = make_ctx(Some("gzip, identity;q=0"));
+            before_proxy_with_accept_encoding(
+                &plugin,
+                &mut ctx,
+                Some("gzip, identity;q=0"),
+            )
+            .await;
+
+            let mut resp = HashMap::new();
+            resp.insert("content-type".to_string(), "application/json".to_string());
+            resp.insert("content-length".to_string(), "1000".to_string());
+            assert!(matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+                PluginResult::Continue
+            ));
+
+            let mut body = compressible_json_body();
+            assert!(
+                plugin
+                    .transform_response_body_with_context(
+                        &mut ctx,
+                        &body,
+                        Some("application/json"),
+                        &resp,
+                    )
+                    .await
+                    .is_none()
+            );
+            let mut status = 200;
+            assert!(reconcile_aborted_gateway_response_encoding_for_test(
+                &mut ctx,
+                &mut status,
+                &mut resp,
+                &mut body,
+            ));
+            assert_eq!(status, 406);
+            assert_eq!(
+                resp.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(
+                resp.get("vary").map(String::as_str),
+                Some("Accept-Encoding")
+            );
+            assert!(!resp.contains_key("content-encoding"));
+            assert_eq!(
+                resp.get("content-length"),
+                Some(&body.len().to_string())
+            );
+            assert!(
+                String::from_utf8(body)
+                    .expect("406 body must be UTF-8")
+                    .contains("not acceptable")
             );
         })
         .await;
