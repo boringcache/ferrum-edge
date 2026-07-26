@@ -1858,7 +1858,9 @@ fn materialize_east_west_gateway_proxies(
             if let Some(existing) = config
                 .proxies
                 .iter_mut()
-                .find(|candidate| candidate.id == proxy.id)
+                .find(|candidate| {
+                    candidate.namespace == proxy.namespace && candidate.id == proxy.id
+                })
             {
                 *existing = proxy;
             } else {
@@ -1935,7 +1937,9 @@ fn materialize_east_west_gateway_proxies(
         if let Some(existing) = config
             .upstreams
             .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
+            .find(|candidate| {
+                candidate.namespace == upstream.namespace && candidate.id == upstream.id
+            })
         {
             *existing = upstream;
         } else {
@@ -1947,7 +1951,9 @@ fn materialize_east_west_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            })
         {
             *existing = proxy;
         } else {
@@ -3592,7 +3598,9 @@ fn materialize_sidecar_inbound_proxies(
                 // overlapping bare-name host variant still wins first-materialized,
                 // exactly as before per-port siblings existed.
                 if config.proxies.iter().any(|p| {
-                    if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+                    if (p.namespace == service.namespace && sibling_ids.contains(p.id.as_str()))
+                        || p.dispatch_kind.is_stream()
+                    {
                         return false;
                     }
                     let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3609,7 +3617,11 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 }
-                if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                if let Some(existing) = config
+                    .proxies
+                    .iter_mut()
+                    .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+                {
                     *existing = proxy;
                 } else {
                     config.proxies.push(proxy);
@@ -3854,7 +3866,10 @@ fn materialize_sidecar_ingress_listener_proxies(
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
         if config.proxies.iter().any(|p| {
-            if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+            if (p.namespace == listener.owner_namespace
+                && sibling_ids.contains(p.id.as_str()))
+                || p.dispatch_kind.is_stream()
+            {
                 return false;
             }
             let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3870,7 +3885,11 @@ fn materialize_sidecar_ingress_listener_proxies(
             );
             continue;
         }
-        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+        if let Some(existing) = config
+            .proxies
+            .iter_mut()
+            .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+        {
             *existing = proxy;
         } else {
             config.proxies.push(proxy);
@@ -4302,7 +4321,7 @@ fn materialize_mesh_outbound_proxies(
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
             if config.proxies.iter().any(|p| {
-                if p.id == proxy.id
+                if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
@@ -4341,12 +4360,20 @@ fn materialize_mesh_outbound_proxies(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4392,12 +4419,20 @@ fn materialize_mesh_outbound_proxies(
                 now,
             );
             let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4535,7 +4570,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -4630,7 +4669,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
             vec![target],
             now,
         );
-        if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+        {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -4750,7 +4793,11 @@ fn materialize_mesh_outbound_udp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -6457,7 +6504,11 @@ fn synthesize_mesh_outbound_cors_plugins(
         for service_port in service_http_family_ports(service) {
             let proxy_id =
                 mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port);
-            let Some(proxy) = config.proxies.iter_mut().find(|proxy| proxy.id == proxy_id) else {
+            let Some(proxy) = config
+                .proxies
+                .iter_mut()
+                .find(|proxy| proxy.namespace == service.namespace && proxy.id == proxy_id)
+            else {
                 // Not every declared HTTP port materializes (e.g. an
                 // unresolved named targetPort skips its sibling) — nothing to
                 // attach CORS to on a route that does not exist.
@@ -7637,7 +7688,9 @@ fn materialize_egress_gateway_proxies(
         if let Some(existing) = config
             .upstreams
             .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
+            .find(|candidate| {
+                candidate.namespace == upstream.namespace && candidate.id == upstream.id
+            })
         {
             *existing = upstream;
         } else {
@@ -7650,7 +7703,9 @@ fn materialize_egress_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            })
         {
             *existing = proxy;
         } else {
@@ -9104,7 +9159,7 @@ fn ensure_global_plugin(
     if let Some(existing) = config
         .plugin_configs
         .iter_mut()
-        .find(|plugin| plugin.id == id)
+        .find(|plugin| plugin.namespace == namespace && plugin.id == id)
     {
         *existing = mesh_plugin;
     } else if config
@@ -14923,6 +14978,58 @@ mod tests {
             target.tags.get("mesh.spiffe_id").map(String::as_str),
             Some(spiffe),
             "peer identity for SVID-mTLS verification"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_materialization_qualifies_lossy_generated_ids() {
+        let service_and_workload =
+            |namespace: &str, name: &str, address: &str| -> (MeshService, Workload) {
+                let spiffe =
+                    format!("spiffe://cluster.local/ns/{namespace}/sa/{name}");
+                let mut service = http_mesh_service(name, 8080, &spiffe);
+                service.namespace = namespace.to_string();
+
+                let mut workload = workload_with_address(name, name, address);
+                workload.spiffe_id = SpiffeId::new(&spiffe).expect("spiffe id");
+                workload.namespace = namespace.to_string();
+                workload.selector.namespace = Some(namespace.to_string());
+                (service, workload)
+            };
+        let (service_a, workload_a) = service_and_workload("a", "b-c", "10.0.0.1");
+        let (service_b, workload_b) = service_and_workload("a-b", "c", "10.0.0.2");
+        let proxy_id_a = mesh_outbound_proxy_id("a", "b-c", 8080);
+        let proxy_id_b = mesh_outbound_proxy_id("a-b", "c", 8080);
+        let upstream_id_a = mesh_outbound_upstream_id("a", "b-c", 8080);
+        let upstream_id_b = mesh_outbound_upstream_id("a-b", "c", 8080);
+        assert_eq!(proxy_id_a, proxy_id_b, "proxy id join is lossy");
+        assert_eq!(upstream_id_a, upstream_id_b, "upstream id join is lossy");
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_a, workload_b],
+            services: vec![service_a, service_b],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+
+        let proxy_namespaces: std::collections::HashSet<&str> = config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id == proxy_id_a)
+            .map(|proxy| proxy.namespace.as_str())
+            .collect();
+        let upstream_namespaces: std::collections::HashSet<&str> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.id == upstream_id_a)
+            .map(|upstream| upstream.namespace.as_str())
+            .collect();
+        assert_eq!(proxy_namespaces, std::collections::HashSet::from(["a", "a-b"]));
+        assert_eq!(
+            upstream_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
         );
     }
 

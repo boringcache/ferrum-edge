@@ -90,6 +90,7 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
     PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
@@ -7816,7 +7817,10 @@ impl ProxyState {
 
     fn mesh_stream_relay_dispatch_overrides(
         config: &GatewayConfig,
-    ) -> HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>> {
+    ) -> HashMap<
+        NamespacedResourceId,
+        Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    > {
         let Some(mesh) = config.mesh.as_deref() else {
             return HashMap::new();
         };
@@ -7839,7 +7843,7 @@ impl ProxyState {
                 );
                 if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
-                        upstream_id.clone(),
+                        NamespacedResourceId::new(&service.namespace, &upstream_id),
                         Self::projected_dispatch_overrides_for_upstream(
                             config,
                             &service.namespace,
@@ -7856,7 +7860,7 @@ impl ProxyState {
                 );
                 if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
-                        upstream_id.clone(),
+                        NamespacedResourceId::new(&service.namespace, &upstream_id),
                         Self::projected_dispatch_overrides_for_upstream(
                             config,
                             &service.namespace,
@@ -7875,7 +7879,7 @@ impl ProxyState {
             if upstream_keys.contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
             {
                 projection.insert(
-                    spec.upstream_id.clone(),
+                    NamespacedResourceId::new(&spec.service.namespace, &spec.upstream_id),
                     Self::projected_dispatch_overrides_for_upstream(
                         config,
                         &spec.service.namespace,
@@ -7912,12 +7916,18 @@ impl ProxyState {
     }
 
     fn mesh_stream_relay_dispatch_overrides_eq(
-        a: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
-        b: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
+        a: &HashMap<
+            NamespacedResourceId,
+            Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+        >,
+        b: &HashMap<
+            NamespacedResourceId,
+            Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+        >,
     ) -> bool {
         a.len() == b.len()
-            && a.iter().all(|(upstream_id, a_overrides)| {
-                b.get(upstream_id).is_some_and(|b_overrides| {
+            && a.iter().all(|(upstream_key, a_overrides)| {
+                b.get(upstream_key).is_some_and(|b_overrides| {
                     Self::route_dispatch_overrides_eq(a_overrides, b_overrides)
                 })
             })
@@ -39564,6 +39574,77 @@ mod tests {
             Some(60),
             "rebuilding the route table swaps in the synthesized TCP relay policy"
         );
+    }
+
+    #[test]
+    fn delta_routes_changed_qualifies_lossy_mesh_relay_ids_by_namespace() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let upstream_id_a =
+            crate::modes::mesh::mesh_outbound_tcp_upstream_id("a", "b-c", 3306);
+        let upstream_id_b =
+            crate::modes::mesh::mesh_outbound_tcp_upstream_id("a-b", "c", 3306);
+        assert_eq!(
+            upstream_id_a, upstream_id_b,
+            "the generated id join is intentionally lossy"
+        );
+
+        let make_upstream =
+            |namespace: &str, timeout_ms: u64, updated_at: chrono::DateTime<chrono::Utc>| {
+                let mut upstream =
+                    upstream_with_targets(&upstream_id_a, &[("10.0.0.9", 3306)]);
+                upstream.namespace = namespace.to_string();
+                upstream.created_at = updated_at;
+                upstream.updated_at = updated_at;
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(timeout_ms),
+                        ..Default::default()
+                    },
+                );
+                upstream
+            };
+        let service = |namespace: &str, name: &str, cluster_ip: &str| MeshService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ports: vec![ServicePort {
+                port: 3306,
+                protocol: AppProtocol::Tcp,
+                name: Some("mysql".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: vec![cluster_ip.to_string()],
+        };
+        let mesh = MeshConfig {
+            services: vec![
+                service("a", "b-c", "10.96.0.20"),
+                service("a-b", "c", "10.96.0.21"),
+            ],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![make_upstream("a", 30, t0), make_upstream("a-b", 90, t0)],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![make_upstream("a", 60, t1), make_upstream("a-b", 90, t0)],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+
+        assert_eq!(delta.modified_upstreams.len(), 1);
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
     }
 
     #[test]
