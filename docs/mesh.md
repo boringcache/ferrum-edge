@@ -200,7 +200,7 @@ For remote-cluster discovery specifically, `GET /mesh/remote-clusters` names eac
 
 - RED: `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms` (carry SPIFFE identity + `connection_security_policy` labels).
 - Config freshness: `ferrum_mesh_config_last_received_timestamp_seconds{namespace}`.
-- Config ordering: `ferrum_mesh_config_revision_rejections_total{reason}` (`stale_revision` / `incomparable_authority` / `missing_revision`) and `ferrum_mesh_config_revision_adoptions_total` — see [Authoritative Config Revisions And Stale-Fallback Rejection](#authoritative-config-revisions-and-stale-fallback-rejection). Fixed cardinality; the CP-supplied authority/sequence detail stays on the JWT-gated `GET /mesh/config-drift` `revision` block.
+- Config ordering: `ferrum_mesh_config_revision_rejections_total{reason}` (`stale_revision` / `incomparable_authority` / `missing_revision` / `malformed_revision`) and `ferrum_mesh_config_revision_adoptions_total` — see [Authoritative Config Revisions And Stale-Fallback Rejection](#authoritative-config-revisions-and-stale-fallback-rejection). Fixed cardinality; the CP-supplied authority/sequence detail stays on the JWT-gated `GET /mesh/config-drift` `revision` block.
 - Identity: `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_mtls_handshake_failures_total{reason}`.
 - Inbound posture: `ferrum_mesh_inbound_plaintext_allowed` — `1` when the mesh inbound listener was allowed up without enforced mTLS (dev opt-out posture; production mode refuses it), `0` otherwise.
 - Federation: `ferrum_mesh_federation_poll_failures_total`, `ferrum_mesh_federation_last_success_timestamp_seconds`, `ferrum_mesh_federation_bundle_age_seconds`.
@@ -1465,7 +1465,9 @@ The data plane records the revision of the slice it accepted and compares every 
 
 | accepted | candidate | outcome |
 |---|---|---|
-| none | anything | install (bootstrap) |
+| none | no revision (genuinely absent) | install (bootstrap) |
+| none | well-formed revision | install (bootstrap) |
+| any | present but ill-formed (blank / over-long / control-character authority) | **quarantine** (`malformed_revision`) — never silently downgraded to absent |
 | some | no revision | **quarantine** (`missing_revision`) |
 | same authority | `sequence >` accepted | install |
 | same authority | `sequence ==` accepted | install (reconnect replay / republish) |
@@ -1473,6 +1475,8 @@ The data plane records the revision of the slice it accepted and compares every 
 | other authority | any | **quarantine** (`incomparable_authority`) |
 
 Equal sequences must install: reconnecting to the same CP replays that CP's initial slice at the unchanged revision, and quarantining it would break every ordinary reconnect.
+
+A **present but ill-formed** revision is distinct from an absent one. Centralized `MeshConfigUpdate` validation refuses an embedded (or envelope) ill-formed revision before install, and `MeshRevisionGate::admit` refuses the same shape even on bootstrap — including the xDS path, which reaches the shared gate without that update validator. Filtering an ill-formed authority to "absent" would otherwise let a hostile first frame with an empty envelope stamp pass as consistently unversioned, install, and retain no watermark. Genuinely absent revisions remain valid for unsequenced authorities (K8s controller / file protocol).
 
 A quarantined candidate mutates nothing — the last-good slice keeps serving, the receive metric and `last_received_at` do not advance, and no watcher is woken. On the native stream a quarantine also **drops the stream** so multi-CP failover moves off the lagging control plane; staying attached would only let it keep serving stale generations.
 
@@ -1500,8 +1504,8 @@ Two escape hatches, both explicit:
 
 ### Observability
 
-- `/metrics` (unauthenticated tier): `ferrum_mesh_config_revision_rejections_total{reason}` with `reason` ∈ `stale_revision` / `incomparable_authority` / `missing_revision`, and `ferrum_mesh_config_revision_adoptions_total`. These process counters aggregate the local slice gate and native remote-discovery gates. Fixed cardinality — no CP-supplied authority string or sequence number reaches this surface.
-- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted and applied `(authority, sequence)` watermarks, the most recent quarantine (authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on. Every authority rendered on this surface — and in the reset response and its audit log line — is control-character-stripped and truncated to 64 characters; the raw control-plane string never leaves the gate, where exact ordering comparisons need it. An authority containing control characters is refused as malformed at the boundary and never becomes a watermark at all.
+- `/metrics` (unauthenticated tier): `ferrum_mesh_config_revision_rejections_total{reason}` with `reason` ∈ `stale_revision` / `incomparable_authority` / `missing_revision` / `malformed_revision`, and `ferrum_mesh_config_revision_adoptions_total`. These process counters aggregate the local slice gate and native remote-discovery gates. Fixed cardinality — no CP-supplied authority string or sequence number reaches this surface.
+- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted and applied `(authority, sequence)` watermarks, the most recent quarantine (authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on. Every authority rendered on this surface — and in the reset response and its audit log line — is control-character-stripped and truncated to 64 characters; the raw control-plane string never leaves the gate, where exact ordering comparisons need it. An authority that is blank, over-long, or contains control characters is refused as `malformed_revision` at the boundary and never becomes a watermark at all.
 
 ### Scope and residuals
 

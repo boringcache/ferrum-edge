@@ -26,6 +26,7 @@ use tracing::warn;
 
 use crate::grpc::dp_client::check_cp_version_compatibility;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::MeshSlice;
 
 /// Maximum characters of a control-plane-supplied value rendered into a
@@ -74,6 +75,12 @@ pub enum MeshUpdateRejectReason {
     /// The envelope `config_authority`/`config_sequence` disagree with the
     /// embedded `MeshSlice.revision` (issue #2473).
     EnvelopeRevisionMismatch,
+    /// A revision is present on the wire but ill-formed (blank / over-long /
+    /// control-character authority). Distinct from
+    /// [`Self::EnvelopeRevisionMismatch`]: both stamps can look "absent" after
+    /// a silent downgrade, which must not pass as consistently unversioned
+    /// (issue #2473).
+    MalformedRevision,
     /// The slice is scoped to a different node than the subscription.
     NodeIdMismatch,
     /// The slice is scoped to a different namespace than the subscription.
@@ -93,6 +100,7 @@ impl MeshUpdateRejectReason {
             Self::InvalidSliceJson => "invalid_slice_json",
             Self::EnvelopeVersionMismatch => "envelope_version_mismatch",
             Self::EnvelopeRevisionMismatch => "envelope_revision_mismatch",
+            Self::MalformedRevision => "malformed_revision",
             Self::NodeIdMismatch => "node_id_mismatch",
             Self::NamespaceMismatch => "namespace_mismatch",
             Self::WorkloadScopeMismatch => "workload_scope_mismatch",
@@ -125,7 +133,8 @@ impl MeshUpdateRejectReason {
             Self::UnexpectedHeartbeat
             | Self::InvalidSliceJson
             | Self::EnvelopeVersionMismatch
-            | Self::EnvelopeRevisionMismatch => false,
+            | Self::EnvelopeRevisionMismatch
+            | Self::MalformedRevision => false,
         }
     }
 }
@@ -318,6 +327,35 @@ pub fn validate_mesh_config_update(
     // the envelope carries a copy of the slice's own `(authority, sequence)`.
     // A frame whose envelope and slice disagree is internally inconsistent, so
     // it is refused rather than silently ordered by one of the two values.
+    //
+    // Present-but-ill-formed revisions are refused FIRST, before the agreement
+    // check: filtering them to "absent" would let a hostile first frame with
+    // an empty envelope stamp (`config_authority=""`, `config_sequence=0`) and
+    // a blank / over-long / control-character embedded authority pass as
+    // consistently unversioned and then bootstrap through the freshness gate
+    // with no watermark. Genuinely absent revisions (both sides) remain valid
+    // for unsequenced authorities.
+    if let Some(revision) = slice.revision.as_ref()
+        && !revision.is_well_formed()
+    {
+        // Static detail only — do not echo the hostile authority text.
+        let detail = "embedded slice revision is present but ill-formed \
+            (blank, over-long, or control-character authority)"
+            .to_string();
+        return rejected(consumer, Reason::MalformedRevision, detail);
+    }
+    if !update.config_authority.trim().is_empty() {
+        let envelope = MeshConfigRevision::new(
+            update.config_authority.as_str(),
+            update.config_sequence,
+        );
+        if !envelope.is_well_formed() {
+            let detail = "envelope config revision is present but ill-formed \
+                (over-long or control-character authority)"
+                .to_string();
+            return rejected(consumer, Reason::MalformedRevision, detail);
+        }
+    }
     if update.config_authority.trim().is_empty() && update.config_sequence != 0 {
         let detail = format!(
             "envelope config sequence {} has no config authority",
@@ -327,10 +365,11 @@ pub fn validate_mesh_config_update(
     }
     let envelope_revision = (!update.config_authority.trim().is_empty())
         .then_some((update.config_authority.as_str(), update.config_sequence));
+    // Ill-formed slice revisions were already refused above, so a remaining
+    // `Some` is well-formed and safe to compare without a silent downgrade.
     let slice_revision = slice
         .revision
         .as_ref()
-        .filter(|revision| revision.is_well_formed())
         .map(|revision| (revision.authority.as_str(), revision.sequence));
     if envelope_revision != slice_revision {
         let detail = format!(

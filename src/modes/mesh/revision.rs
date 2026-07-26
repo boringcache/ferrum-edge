@@ -32,7 +32,8 @@
 //!
 //! | accepted        | candidate       | order                       |
 //! |-----------------|-----------------|-----------------------------|
-//! | `None`          | anything        | [`MeshRevisionOrder::Bootstrap`] |
+//! | `None`          | well-formed / absent | [`MeshRevisionOrder::Bootstrap`] |
+//! | `None`          | present ill-formed | refused by [`MeshRevisionGate::admit`] (`malformed_revision`) |
 //! | `Some(_)`       | `None`          | [`MeshRevisionOrder::Unversioned`] |
 //! | same authority  | `seq >  accept` | [`MeshRevisionOrder::Newer`] |
 //! | same authority  | `seq == accept` | [`MeshRevisionOrder::Same`]  |
@@ -43,6 +44,11 @@
 //! replays that CP's initial slice at the unchanged revision, and quarantining
 //! it would break every ordinary reconnect. `Older`, `Unversioned`, and
 //! `Incomparable` are quarantined — the previously accepted slice keeps serving.
+//! A *present* ill-formed candidate is refused by [`MeshRevisionGate::admit`]
+//! (and by centralized `MeshConfigUpdate` validation) before Bootstrap can
+//! install it; [`MeshConfigRevision::compare`] still excludes ill-formed values
+//! from the ordering table so a poisoned accepted watermark cannot lock the
+//! data plane.
 //!
 //! # Candidate lifecycle (received → applied, or rolled back)
 //!
@@ -135,10 +141,18 @@ impl MeshConfigRevision {
 
     /// Whether the wire-supplied shape is usable for ordering.
     ///
-    /// A blank, over-long, or control-character-bearing authority carries no
-    /// ordering meaning and is treated as absent (fail closed) rather than
-    /// compared. Control characters are refused at the boundary — not merely
-    /// escaped downstream — because an authority that reaches the accepted
+    /// A blank, over-long, or control-character-bearing authority is
+    /// **ill-formed**, not merely unusable for comparison. Callers that admit
+    /// or install slices ([`MeshRevisionGate::admit`], centralized
+    /// `MeshConfigUpdate` validation) must refuse a *present* ill-formed
+    /// revision outright — never silently downgrade it to "absent", which
+    /// would let a hostile first frame bootstrap with no watermark.
+    ///
+    /// [`Self::compare`] still filters ill-formed values out of the ordering
+    /// table (so a poisoned accepted watermark cannot lock the data plane),
+    /// but that filtering is not an install license: admission is the
+    /// fail-closed boundary. Control characters are refused rather than merely
+    /// escaped downstream because an authority that reaches the accepted
     /// watermark is echoed into the operator reset audit log and the
     /// `/mesh/config-drift` diagnostics; a CP that could park `\n`-bearing
     /// text there would be shaping operator-facing records rather than naming
@@ -151,6 +165,11 @@ impl MeshConfigRevision {
     }
 
     /// Order `candidate` against `accepted`. See the module contract table.
+    ///
+    /// Ill-formed revisions are excluded from the ordering table (treated as
+    /// absent *for comparison only*). [`MeshRevisionGate::admit`] refuses a
+    /// present ill-formed candidate before consulting this, so Bootstrap is
+    /// never an install path for malformed wire input.
     pub fn compare(accepted: Option<&Self>, candidate: Option<&Self>) -> MeshRevisionOrder {
         let Some(accepted) = accepted.filter(|revision| revision.is_well_formed()) else {
             return MeshRevisionOrder::Bootstrap;
@@ -172,7 +191,9 @@ impl MeshConfigRevision {
 /// Result of the revision comparison contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshRevisionOrder {
-    /// No usable accepted revision yet — anything installs.
+    /// No usable accepted revision yet — a well-formed or genuinely absent
+    /// candidate installs. A *present* ill-formed candidate is refused by
+    /// [`MeshRevisionGate::admit`] before this outcome can become an install.
     Bootstrap,
     /// Candidate carries no usable revision while one is already accepted.
     Unversioned,
@@ -204,6 +225,11 @@ pub enum MeshRevisionRejectReason {
     IncomparableAuthority,
     /// No usable revision at all while a revisioned slice is accepted.
     MissingRevision,
+    /// A revision is present on the wire but ill-formed (blank / over-long /
+    /// control-character authority). Must never be silently downgraded to
+    /// "absent" and must never bootstrap — that would contradict the
+    /// fail-closed malformed-revision boundary (issue #2473).
+    MalformedRevision,
 }
 
 impl MeshRevisionRejectReason {
@@ -212,6 +238,7 @@ impl MeshRevisionRejectReason {
             Self::StaleRevision => "stale_revision",
             Self::IncomparableAuthority => "incomparable_authority",
             Self::MissingRevision => "missing_revision",
+            Self::MalformedRevision => "malformed_revision",
         }
     }
 
@@ -492,9 +519,16 @@ impl MeshRevisionGate {
     ) -> Result<MeshRevisionOrder, MeshRevisionRejection> {
         let adopt_secs = self.policy().foreign_authority_adopt_secs;
         let mut state = self.lock_state();
+        // A *present* ill-formed revision must not be silently downgraded to
+        // absent: `compare` would then classify an empty watermark as Bootstrap
+        // and install the slice while retaining no accepted revision. Refuse
+        // before any install path — including first-slice bootstrap — so xDS
+        // (which reaches this gate without `MeshConfigUpdate` validation) stays
+        // fail-closed. A genuinely absent revision (`None`) still bootstraps.
+        let malformed = candidate.is_some_and(|revision| !revision.is_well_formed());
         let order = MeshConfigRevision::compare(state.accepted.as_ref(), candidate);
 
-        if order.installs() {
+        if order.installs() && !malformed {
             state.accepted = candidate.filter(|r| r.is_well_formed()).cloned();
             state.quarantined = None;
             state.foreign_watch = None;
@@ -504,7 +538,9 @@ impl MeshRevisionGate {
         // Incomparable authority: adopt once the SAME foreign authority has been
         // observed continuously for the configured grace period. This is the
         // no-permanent-lockout path for CP state loss / deliberate source reset.
-        if order == MeshRevisionOrder::Incomparable
+        // Never adopt an ill-formed authority.
+        if !malformed
+            && order == MeshRevisionOrder::Incomparable
             && adopt_secs > 0
             && let Some(candidate) = candidate
         {
@@ -531,18 +567,23 @@ impl MeshRevisionGate {
                 );
                 return Ok(MeshRevisionOrder::Incomparable);
             }
-        } else if order != MeshRevisionOrder::Incomparable {
+        } else if order != MeshRevisionOrder::Incomparable || malformed {
             state.foreign_watch = None;
         }
 
-        let reason = match order {
-            MeshRevisionOrder::Older => MeshRevisionRejectReason::StaleRevision,
-            MeshRevisionOrder::Incomparable => MeshRevisionRejectReason::IncomparableAuthority,
-            MeshRevisionOrder::Unversioned => MeshRevisionRejectReason::MissingRevision,
-            // `installs()` returned false, so these are unreachable; mapping
-            // them to the stale reason keeps the match total without a panic.
-            MeshRevisionOrder::Bootstrap | MeshRevisionOrder::Newer | MeshRevisionOrder::Same => {
-                MeshRevisionRejectReason::StaleRevision
+        let reason = if malformed {
+            MeshRevisionRejectReason::MalformedRevision
+        } else {
+            match order {
+                MeshRevisionOrder::Older => MeshRevisionRejectReason::StaleRevision,
+                MeshRevisionOrder::Incomparable => MeshRevisionRejectReason::IncomparableAuthority,
+                MeshRevisionOrder::Unversioned => MeshRevisionRejectReason::MissingRevision,
+                // `installs()` returned false (or malformed short-circuited it),
+                // so Bootstrap/Newer/Same are unreachable here; mapping them to
+                // the stale reason keeps the match total without a panic.
+                MeshRevisionOrder::Bootstrap
+                | MeshRevisionOrder::Newer
+                | MeshRevisionOrder::Same => MeshRevisionRejectReason::StaleRevision,
             }
         };
 

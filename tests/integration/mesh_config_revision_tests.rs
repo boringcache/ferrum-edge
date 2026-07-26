@@ -187,8 +187,10 @@ fn compare_orders_within_one_authority_and_refuses_across_authorities() {
     assert!(!MeshRevisionOrder::Unversioned.installs());
 }
 
-/// A blank or over-long authority carries no ordering meaning, so it is treated
-/// as absent (fail closed) rather than compared as a domain name.
+/// A blank or over-long authority is ill-formed. `compare` still excludes it
+/// from the ordering table (so a poisoned accepted watermark cannot lock the
+/// data plane), but that is comparison-only — [`MeshRevisionGate::admit`]
+/// refuses a *present* ill-formed candidate before Bootstrap can install it.
 #[test]
 fn malformed_authorities_are_treated_as_absent() {
     let accepted = revision("db", 100);
@@ -210,6 +212,43 @@ fn malformed_authorities_are_treated_as_absent() {
         MeshConfigRevision::compare(Some(&blank), Some(&accepted)),
         MeshRevisionOrder::Bootstrap
     );
+}
+
+/// A present but ill-formed revision must never bootstrap: `compare` would
+/// classify it as Bootstrap against an empty watermark, but `admit` refuses
+/// with `malformed_revision` and installs nothing. A genuinely absent revision
+/// still bootstraps (unsequenced authorities).
+#[test]
+fn admit_refuses_present_malformed_revision_even_on_bootstrap() {
+    let gate = MeshRevisionGate::new();
+    let now = Utc::now();
+
+    assert_eq!(
+        gate.admit(None, now),
+        Ok(MeshRevisionOrder::Bootstrap),
+        "a genuinely absent revision still bootstraps"
+    );
+    assert!(gate.accepted().is_none());
+
+    for (label, forged) in [
+        ("blank", revision("   ", 1)),
+        ("overlong", revision(&"a".repeat(129), 1)),
+        (
+            "control-character",
+            revision("db\n2026-07-26 WARN forged", 1),
+        ),
+    ] {
+        let rejection = gate.admit(Some(&forged), now).unwrap_err();
+        assert_eq!(
+            rejection.reason(),
+            MeshRevisionRejectReason::MalformedRevision,
+            "{label} must be refused as malformed_revision, not bootstrapped"
+        );
+        assert!(
+            gate.accepted().is_none(),
+            "{label}: a refused malformed candidate must leave no watermark"
+        );
+    }
 }
 
 #[test]
@@ -671,6 +710,99 @@ fn envelope_revision_must_match_the_slice_revision() {
     );
 }
 
+/// Hostile smuggling shape: empty envelope revision + present but ill-formed
+/// embedded slice revision. Filtering the embedded revision to "absent" would
+/// make both sides look consistently unversioned, pass validation, and then
+/// bootstrap through the freshness gate with no watermark. Both native and
+/// remote-discovery consumers must refuse before install/import; `install_slice`
+/// must also refuse if the frame somehow reaches the shared gate (xDS).
+#[test]
+fn malformed_embedded_revision_cannot_smuggle_past_validation_or_bootstrap() {
+    let _overlay_guard = overlay_consumer_guard();
+    let request = client_config().subscribe_request(ferrum_edge::FERRUM_VERSION);
+    let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+
+    let cases = [
+        ("blank", revision("   ", 7)),
+        ("overlong", revision(&"a".repeat(129), 7)),
+        (
+            "control-character",
+            revision("db\n2026-07-26 WARN forged-by-the-control-plane", 7),
+        ),
+    ];
+
+    for (label, forged) in cases {
+        let slice = slice_at(&format!("v-{label}"), Some(forged));
+        // Empty envelope stamps — the smuggling shape from the root finding —
+        // while the embedded JSON still carries the ill-formed revision.
+        let smuggled = MeshConfigUpdate {
+            config_authority: String::new(),
+            config_sequence: 0,
+            mesh_slice_json: serde_json::to_string(&slice).expect("slice serializes"),
+            ..update_for(&slice_at(&format!("v-{label}"), None))
+        };
+
+        for consumer in [
+            MeshUpdateConsumer::Native,
+            MeshUpdateConsumer::RemoteDiscovery,
+        ] {
+            let rejection = validate_mesh_config_update(&smuggled, &expected, consumer)
+                .expect_err("present but ill-formed embedded revision must be refused");
+            assert_eq!(
+                rejection.reason(),
+                MeshUpdateRejectReason::MalformedRevision,
+                "{label}/{}: dedicated malformed_revision reason",
+                consumer.as_metric_label()
+            );
+            assert!(
+                !rejection.detail().contains('\n'),
+                "{label}: diagnostics must not echo raw hostile authority text"
+            );
+            assert!(
+                !rejection.detail().contains("forged-by-the-control-plane"),
+                "{label}: diagnostics must not echo raw hostile authority text"
+            );
+        }
+
+        // Shared gate (xDS / any installer that bypasses update validation).
+        let state = MeshRuntimeState::new();
+        let outcome = state.install_slice(slice);
+        assert!(
+            !outcome.installed(),
+            "{label}: install_slice must quarantine, not bootstrap"
+        );
+        assert_eq!(
+            outcome
+                .rejection()
+                .expect("quarantine recorded")
+                .reason(),
+            MeshRevisionRejectReason::MalformedRevision
+        );
+        assert!(
+            state.snapshot().as_ref().is_none(),
+            "{label}: no slice may become live"
+        );
+        assert!(
+            state.accepted_revision().is_none(),
+            "{label}: no watermark may be retained"
+        );
+    }
+
+    // Genuinely absent revisions remain valid for unsequenced authorities.
+    let unversioned = slice_at("v-unversioned", None);
+    validate_mesh_config_update(
+        &update_for(&unversioned),
+        &expected,
+        MeshUpdateConsumer::Native,
+    )
+    .expect("both copies absent is still consistent");
+    let state = MeshRuntimeState::new();
+    assert!(
+        state.install_slice(unversioned).installed(),
+        "a genuinely absent revision still bootstraps"
+    );
+}
+
 // ── Live two-CP MeshSubscribe stream ───────────────────────────────────────
 
 /// An in-process control plane that replays a fixed script of frames and then
@@ -1061,15 +1193,16 @@ fn control_character_authorities_are_refused_and_never_reach_a_watermark() {
         state
             .install_slice(slice_at("v-forged", Some(forged)))
             .rejection()
-            .expect("a malformed authority carries no ordering meaning")
+            .expect("a malformed authority is refused, not downgraded to absent")
             .reason(),
-        MeshRevisionRejectReason::MissingRevision
+        MeshRevisionRejectReason::MalformedRevision
     );
 
     let diagnostics = state.revision_diagnostics();
     let quarantined = diagnostics
         .quarantined
         .expect("the refusal is recorded for operators");
+    assert_eq!(quarantined.reason, "malformed_revision");
     assert!(
         !quarantined.authority.chars().any(char::is_control),
         "the echoed authority must not be able to forge a log line: {:?}",

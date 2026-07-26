@@ -3115,7 +3115,12 @@ paths:
                           reason:
                             type: string
                             enum:
-                              [stale_revision, incomparable_authority, missing_revision]
+                              [
+                                stale_revision,
+                                incomparable_authority,
+                                missing_revision,
+                                malformed_revision,
+                              ]
                           consecutive:
                             type: integer
                             format: int64
