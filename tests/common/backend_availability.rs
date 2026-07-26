@@ -52,7 +52,9 @@ pub fn continue_if_tls_fixture_available(backend: &str, available: bool, detail:
         return true;
     }
     if db_tls_required() {
-        panic!("{backend} TLS fixture is required (FERRUM_DB_TLS_REQUIRED) but unavailable: {detail}");
+        panic!(
+            "{backend} TLS fixture is required (FERRUM_DB_TLS_REQUIRED) but unavailable: {detail}"
+        );
     }
     eprintln!("SKIPPED {backend} TLS: {detail}");
     false
@@ -105,10 +107,7 @@ pub fn host_port_from_db_url(url: &str) -> String {
         .or_else(|| url.strip_prefix("mongodb+srv://"))
         .unwrap_or(url);
 
-    let authority = stripped
-        .split(['/', '?'])
-        .next()
-        .unwrap_or(stripped);
+    let authority = stripped.split(['/', '?']).next().unwrap_or(stripped);
 
     let host_port = if authority.contains('@') {
         authority.split('@').next_back().unwrap_or(authority)

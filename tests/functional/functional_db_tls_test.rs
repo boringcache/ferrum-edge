@@ -11,7 +11,7 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
-use crate::common::{continue_if_tls_fixture_available, DbType, TestGateway};
+use crate::common::{DbType, TestGateway, continue_if_tls_fixture_available};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;

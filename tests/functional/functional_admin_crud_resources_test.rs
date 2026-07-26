@@ -17,8 +17,8 @@
 //! `FERRUM_TEST_MONGO_URL` so missing backends fail closed. Local runs skip
 //! when those URLs/servers are absent.
 use crate::common::{
-    continue_if_backend_available, host_port_from_db_url, mysql_test_url, postgres_test_url,
-    tcp_endpoint_reachable, DbType, TestGateway, spawn_http_identifying,
+    DbType, TestGateway, continue_if_backend_available, host_port_from_db_url, mysql_test_url,
+    postgres_test_url, spawn_http_identifying, tcp_endpoint_reachable,
 };
 use ferrum_edge::plugins::available_plugins;
 use reqwest::{Client, StatusCode};

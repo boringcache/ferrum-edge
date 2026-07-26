@@ -34,8 +34,8 @@
 //! -- --ignored namespace`.
 
 use crate::common::{
-    continue_if_backend_available, host_port_from_db_url, mysql_test_url, postgres_test_url,
-    tcp_endpoint_reachable, DbType, TestGateway,
+    DbType, TestGateway, continue_if_backend_available, host_port_from_db_url, mysql_test_url,
+    postgres_test_url, tcp_endpoint_reachable,
 };
 use serde_json::Value;
 use std::time::{Duration, Instant};
