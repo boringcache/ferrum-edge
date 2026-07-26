@@ -1413,6 +1413,9 @@ fn default_production_policy() -> ferrum_edge::config::BackendEgressPolicy {
     .expect("valid default egress policy")
 }
 
+// tokio-tungstenite's header callback requires its concrete ErrorResponse;
+// the test cannot box that error without changing the callback contract.
+#[allow(clippy::result_large_err)]
 #[tokio::test]
 async fn ws_logging_hostname_endpoint_keeps_original_authority_over_screened_dial() {
     // The socket is opened against the screened IPv4 address, but the
