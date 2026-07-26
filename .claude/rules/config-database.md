@@ -68,6 +68,12 @@ paths:
 - SQL wraps multi-step CRUD in `sqlx::Transaction`.
 - MongoDB single-doc writes are atomic. Multi-doc atomicity requires `FERRUM_MONGO_REPLICA_SET`; otherwise flows must be idempotent with poll-cycle cleanup.
 - `FERRUM_DB_FAILOVER_URLS` uses the same `FERRUM_DB_TYPE`.
+- Admin writes fail closed while the active pool is on a failover URL unless
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` (opt-in only for synchronously
+  replicated multi-primary topologies). Polling/reads stay available. Accepted
+  opt-in failover writes fence automatic primary failback so a recovered
+  primary cannot silently republish a stale snapshot; topology/divergence
+  signals use redacted URLs only.
 - Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.
 - `FERRUM_DB_READ_REPLICA_URL` is SQL-only and may offload eligible admin-only reads; writes and runtime polling always use primary. Replica query failure must mark the replica unavailable and retry the admin read on primary.
 - MongoDB replica-set failover comes from listing members in `FERRUM_DB_URL`; Ferrum's config store forces primary reads and ignores URL read preferences.

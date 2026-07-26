@@ -43,7 +43,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -56,11 +56,11 @@ pub use crate::config::batch_atomicity::{
 };
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
-    IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
-    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
-    TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, DbFailoverTopologyState,
+    FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+    MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -487,8 +487,9 @@ pub struct DatabaseStore {
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
-    /// the unavailable primary topology.
-    primary_topology_active: Arc<AtomicBool>,
+    /// the unavailable primary topology. Also tracks failover-window admin
+    /// write admissions and the failback fence (issue #3001).
+    failover_topology: DbFailoverTopologyState,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -1569,7 +1570,7 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -1627,7 +1628,7 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -6297,6 +6298,13 @@ impl DatabaseStore {
     /// FQDN now resolves to a different set of IPs. The old pool is closed
     /// gracefully in the background — in-flight queries complete normally.
     pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
+        // DNS/TLS reconnect always targets the configured primary URL. When
+        // sticky failover has accepted admin writes, refuse this path the same
+        // way `try_failover_reconnect` does so a recovered primary cannot
+        // silently erase the failover window (issue #3001).
+        if !self.failover_topology.primary_active() {
+            self.failover_topology.ensure_primary_failback_allowed()?;
+        }
         self.reconnect_for_topology(db_url, DatabaseTopology::Primary)
             .await
     }
@@ -6321,7 +6329,7 @@ impl DatabaseStore {
         // look immediately available on failback and skip the one reconnect
         // that refreshes its connections after the topology transition.
         if topology == DatabaseTopology::Failover {
-            self.primary_topology_active.store(false, Ordering::Release);
+            self.failover_topology.mark_failover(&Self::redact_url(db_url));
             self.suppress_read_replica_pool();
         }
 
@@ -6348,7 +6356,7 @@ impl DatabaseStore {
         self.maybe_apply_deferred_migrations().await?;
 
         if topology == DatabaseTopology::Primary {
-            self.primary_topology_active.store(true, Ordering::Release);
+            self.failover_topology.mark_primary(&Self::redact_url(db_url));
         }
 
         Ok(())
@@ -6406,8 +6414,8 @@ impl DatabaseStore {
                             );
                             store.failover_urls = failover_urls.to_vec();
                             store
-                                .primary_topology_active
-                                .store(false, Ordering::Release);
+                                .failover_topology
+                                .mark_failover(&Self::redact_url(url));
                             return Ok(store);
                         }
                         Err(e) => {
@@ -6449,7 +6457,7 @@ impl DatabaseStore {
         sqlx::any::install_default_drivers();
         self.read_replica_url = Some(replica_url.to_string());
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             info!(
                 "Read replica configured but connection deferred while the database is failed over"
             );
@@ -6481,7 +6489,7 @@ impl DatabaseStore {
     /// scans, and association validation must read from the primary pool so
     /// replica lag cannot hide changes or advance cursors incorrectly.
     fn admin_read_pool(&self) -> AdminReadPool {
-        if self.primary_topology_active.load(Ordering::Acquire)
+        if self.failover_topology.primary_active()
             && self.read_replica_url.is_some()
             && let Some(replica) = self.read_replica_pool.load_full()
         {
@@ -6556,7 +6564,7 @@ impl DatabaseStore {
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             debug!("Read replica reconnect deferred while the database is failed over");
             return Ok(());
         }
@@ -6578,7 +6586,7 @@ impl DatabaseStore {
         // Failover may have started while the connection was opening. Do not
         // publish a replica pool that admin reads must suppress; closing it
         // leaves the post-failback scheduler responsible for one fresh retry.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             new_pool.close().await;
             debug!(
                 "Discarded read replica reconnect because the database failed over while it was opening"
@@ -6591,7 +6599,7 @@ impl DatabaseStore {
         // Close the remaining race between the check above and publication:
         // if failover flipped the topology and ran its first suppression just
         // before this swap, remove the newly-published pool ourselves.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             let raced_pool = self.read_replica_pool.swap(None);
             if let Some(pool) = raced_pool {
                 tokio::spawn(async move {
@@ -6627,27 +6635,42 @@ impl DatabaseStore {
     ///
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
+    ///
+    /// When admin writes were accepted on a failover URL under
+    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, primary failback is refused so a
+    /// recovered primary cannot silently republish a stale snapshot (issue
+    /// #3001). Polling and reads remain available on the failover topology.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
-        // Try primary first
-        match self
-            .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
-            .await
-        {
-            Ok(()) => {
-                info!("Reconnected to primary database");
-                return Ok(primary_url.to_string());
+        let skip_primary = match self.failover_topology.ensure_primary_failback_allowed() {
+            Ok(()) => false,
+            Err(divergence) => {
+                warn!("{divergence}");
+                true
             }
-            Err(error) if !is_transient_failover_error(&error) => {
-                return Err(mark_non_transient(
-                    error,
-                    "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
-                    &[primary_url],
-                ));
-            }
-            Err(error) => {
-                let safe_error =
-                    crate::config::db_backend::redact_error_text(&error, &[primary_url]);
-                warn!("Primary database reconnect failed transiently: {safe_error}");
+        };
+
+        // Try primary first (unless failover-window writes fence failback).
+        if !skip_primary {
+            match self
+                .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
+                .await
+            {
+                Ok(()) => {
+                    info!("Reconnected to primary database");
+                    return Ok(primary_url.to_string());
+                }
+                Err(error) if !is_transient_failover_error(&error) => {
+                    return Err(mark_non_transient(
+                        error,
+                        "Primary database reconnect returned a non-transient query, schema, data, constraint, authentication, or configuration error; failover was not attempted",
+                        &[primary_url],
+                    ));
+                }
+                Err(error) => {
+                    let safe_error =
+                        crate::config::db_backend::redact_error_text(&error, &[primary_url]);
+                    warn!("Primary database reconnect failed transiently: {safe_error}");
+                }
             }
         }
 
@@ -8796,7 +8819,7 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn read_replica_available(&self) -> bool {
-        self.primary_topology_active.load(Ordering::Acquire)
+        self.failover_topology.primary_active()
             && self
                 .read_replica_pool
                 .load_full()
@@ -8807,7 +8830,19 @@ impl DatabaseBackend for DatabaseStore {
         // A configured replica is suppressed (not broken) precisely while the
         // active write/runtime pool points at a failover URL. The scheduler
         // skips reconnects in this state; failback re-enables eligibility.
-        self.read_replica_url.is_some() && !self.primary_topology_active.load(Ordering::Acquire)
+        self.read_replica_url.is_some() && !self.failover_topology.primary_active()
+    }
+
+    fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {
+        self.failover_topology.status()
+    }
+
+    fn set_failover_allow_writes(&mut self, allow: bool) {
+        self.failover_topology.set_allow_writes(allow);
+    }
+
+    fn note_failover_admin_write(&self) {
+        self.failover_topology.note_admin_write();
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -8816,8 +8851,8 @@ impl DatabaseBackend for DatabaseStore {
         let idle = primary.num_idle() as u32;
 
         let replica = self
-            .primary_topology_active
-            .load(Ordering::Acquire)
+            .failover_topology
+            .primary_active()
             .then(|| self.read_replica_pool.load_full())
             .flatten()
             .map(|rp| {

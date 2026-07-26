@@ -3851,6 +3851,7 @@ fn test_db_failover_urls_empty_by_default() {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.db_failover_urls.is_empty());
             assert!(config.effective_db_failover_urls().unwrap().is_empty());
+            assert!(!config.db_failover_allow_writes);
         },
     );
 }
@@ -3876,6 +3877,27 @@ fn test_db_failover_urls_parsed() {
             assert_eq!(config.db_failover_urls.len(), 2);
             assert_eq!(config.db_failover_urls[0], "postgres://secondary1/ferrum");
             assert_eq!(config.db_failover_urls[1], "postgres://secondary2/ferrum");
+            assert!(!config.db_failover_allow_writes);
+        },
+    );
+}
+
+#[test]
+fn test_db_failover_allow_writes_opt_in() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
+            ("FERRUM_DB_FAILOVER_ALLOW_WRITES", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_failover_allow_writes);
         },
     );
 }

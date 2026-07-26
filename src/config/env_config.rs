@@ -1134,6 +1134,13 @@ pub struct EnvConfig {
     /// order. All URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
     pub db_failover_urls: Vec<String>,
 
+    /// When `false` (default), admin writes are rejected with 503 while the
+    /// active pool points at a `FERRUM_DB_FAILOVER_URLS` entry. Set `true` only
+    /// for synchronously replicated multi-primary topologies where failover
+    /// writes are durable on the configured primary; otherwise failback can
+    /// republish a stale primary snapshot. See issue #3001.
+    pub db_failover_allow_writes: bool,
+
     /// Connection URL for a SQL read replica database. When set, eligible
     /// admin-only reads can use this replica and fall back to primary if the
     /// replica is unreachable. Runtime config polling and Admin API writes
@@ -2397,6 +2404,7 @@ impl Default for EnvConfig {
             file_config_path: None,
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
+            db_failover_allow_writes: false,
             db_read_replica_url: None,
             db_slow_query_threshold_ms: None,
             db_full_load_page_size: 10_000,
@@ -2759,6 +2767,7 @@ impl EnvConfig {
             db_tls_watch_interval_seconds: u64 = "FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
+            db_failover_allow_writes: bool = "FERRUM_DB_FAILOVER_ALLOW_WRITES" => false;
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
             db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, clamp(100u64, 100_000u64);
@@ -3467,6 +3476,7 @@ impl EnvConfig {
             file_config_path,
             db_config_backup_path,
             db_failover_urls,
+            db_failover_allow_writes,
             db_read_replica_url,
             db_slow_query_threshold_ms,
             db_full_load_page_size,

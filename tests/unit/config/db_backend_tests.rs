@@ -1,9 +1,9 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::admin_mtls_dns_admission_drop_should_release;
 use ferrum_edge::config::db_backend::{
-    AtomicClearVerification, DeleteAllResourcesError, DeleteMode, IncrementalResult,
-    NamespaceResourceCounts, NamespacedResourceId, classify_atomic_clear_verification,
-    extract_db_hostname, extract_known_ids, redact_url,
+    AtomicClearVerification, DbFailoverTopologyState, DeleteAllResourcesError, DeleteMode,
+    IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
+    classify_atomic_clear_verification, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use std::collections::HashMap;
@@ -688,4 +688,65 @@ fn incremental_result_not_empty_with_added_consumer() {
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
+}
+
+#[test]
+fn failover_topology_state_transitions_and_failback_fence() {
+    let state = DbFailoverTopologyState::new();
+    assert!(state.primary_active());
+    assert!(state.ensure_primary_failback_allowed().is_ok());
+
+    state.mark_failover("sqlite:///tmp/failover.db");
+    let status = state.status();
+    assert!(!status.primary_active);
+    assert_eq!(
+        status.active_url_redacted.as_deref(),
+        Some("sqlite:///tmp/failover.db")
+    );
+    assert!(status.failover_since_unix_ms.is_some());
+    assert_eq!(status.failover_writes_accepted, 0);
+    assert!(state.ensure_primary_failback_allowed().is_ok());
+
+    state.set_allow_writes(true);
+    state.note_admin_write();
+    assert_eq!(state.status().failover_writes_accepted, 1);
+    let blocked = state.ensure_primary_failback_allowed().unwrap_err().to_string();
+    assert!(
+        blocked.contains("Refusing primary database failback"),
+        "expected failback fence, got: {blocked}"
+    );
+    assert!(
+        blocked.contains("sqlite:///tmp/failover.db"),
+        "divergence signal must include redacted URL"
+    );
+    assert!(
+        !blocked.contains("password") && !blocked.contains("s3cret"),
+        "divergence signal must not invent credentials"
+    );
+
+    // Switching failover URLs must preserve the write counter.
+    state.mark_failover("sqlite:///tmp/failover-2.db");
+    assert_eq!(state.status().failover_writes_accepted, 1);
+    assert!(state.ensure_primary_failback_allowed().is_err());
+}
+
+#[test]
+fn failover_topology_mark_primary_emits_clear_window() {
+    let state = DbFailoverTopologyState::new();
+    state.mark_failover("postgres://***/***/ferrum");
+    assert!(state.ensure_primary_failback_allowed().is_ok());
+    state.mark_primary("postgres://***/***/ferrum");
+    assert!(state.primary_active());
+    assert_eq!(state.status().failover_writes_accepted, 0);
+    assert!(state.status().failover_since_unix_ms.is_none());
+}
+
+#[test]
+fn redact_url_strips_userinfo_for_topology_signals() {
+    let redacted = redact_url("postgres://operator:s3cret@db.example:5432/ferrum");
+    assert!(
+        !redacted.contains("s3cret") && !redacted.contains("operator"),
+        "redacted URL leaked credentials: {redacted}"
+    );
+    assert!(redacted.contains("db.example"));
 }

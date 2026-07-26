@@ -334,8 +334,29 @@ impl AdminState {
     }
 
     /// Check whether write operations are allowed. Returns an error response
-    /// if the admin API is read-only or the database is currently unavailable.
+    /// if the admin API is read-only, the database is currently unavailable, or
+    /// the active pool is on sticky failover without
+    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`. When this gate admits a mutation while
+    /// on failover under the opt-in, it records the failover-window write so
+    /// primary failback cannot silently erase it (issue #3001).
+    ///
+    /// For observe-only callers such as `/health`, use
+    /// [`Self::admin_writes_currently_blocked`] so health probes do not inflate
+    /// the failover write counter.
     pub fn check_write_allowed(&self) -> Option<Response<Full<Bytes>>> {
+        self.evaluate_write_gate(true)
+    }
+
+    /// Whether admin mutations are currently blocked, without recording a
+    /// failover-window write admission.
+    pub fn admin_writes_currently_blocked(&self) -> bool {
+        self.evaluate_write_gate(false).is_some()
+    }
+
+    fn evaluate_write_gate(
+        &self,
+        record_failover_write: bool,
+    ) -> Option<Response<Full<Bytes>>> {
         if self.read_only {
             return Some(json_response(
                 StatusCode::FORBIDDEN,
@@ -349,6 +370,22 @@ impl AdminState {
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "Database is currently unavailable — admin API is temporarily read-only"}),
             ));
+        }
+        if let Some(ref db) = self.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active {
+                if !topology.allow_writes {
+                    return Some(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
+                        }),
+                    ));
+                }
+                if record_failover_write {
+                    db.note_failover_admin_write();
+                }
+            }
         }
         None
     }
@@ -1314,12 +1351,41 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Report whether admin writes are enabled (read_only flag + db_available)
-        let writes_blocked = state.check_write_allowed().is_some();
+        // Report whether admin writes are enabled (read_only flag + db_available
+        // + sticky failover write gate). Observe-only so /health does not record
+        // a failover-window write admission.
+        let writes_blocked = state.admin_writes_currently_blocked();
         health_status["admin_writes_enabled"] = json!(!writes_blocked);
         if writes_blocked && !state.read_only {
             // DB-driven read-only — mark as degraded if not already
             health_status["status"] = json!("degraded");
+        }
+
+        if let Some(db) = &state.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active || topology.failover_writes_accepted > 0 {
+                let mut failover = json!({
+                    "primary_active": topology.primary_active,
+                    "failover_writes_accepted": topology.failover_writes_accepted,
+                    "allow_writes": topology.allow_writes,
+                });
+                if let Some(since) = topology.failover_since_unix_ms {
+                    failover["failover_since_unix_ms"] = json!(since);
+                }
+                if let Some(redacted) = topology.active_url_redacted {
+                    failover["active_url_redacted"] = json!(redacted);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("failover_topology".to_string(), failover);
+                    }
+                    _ => {
+                        health_status["database"] = json!({
+                            "failover_topology": failover
+                        });
+                    }
+                }
+            }
         }
 
         // Acquire pairs with the Release store in each mode's startup path

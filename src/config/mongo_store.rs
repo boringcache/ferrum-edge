@@ -881,6 +881,8 @@ mod inner {
         audit_max_rows_prune_gates:
             Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
         failover_urls: Vec<String>,
+        /// Sticky failover topology / write-window state (issue #3001).
+        failover_topology: crate::config::db_backend::DbFailoverTopologyState,
         replica_set_configured: Arc<AtomicBool>,
     }
 
@@ -967,6 +969,7 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: Arc::new(DashMap::new()),
                 failover_urls: Vec::new(),
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
         }
@@ -1367,6 +1370,9 @@ mod inner {
                                     crate::config::db_backend::redact_url(url)
                                 );
                                 store.failover_urls = failover_urls.to_vec();
+                                store.failover_topology.mark_failover(
+                                    &crate::config::db_backend::redact_url(url),
+                                );
                                 return Ok(store);
                             }
                             Err(e) => {
@@ -1417,6 +1423,26 @@ mod inner {
             let _old_connection = self.connection.swap(Arc::new(new_connection));
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
+            Ok(())
+        }
+
+        /// Rebuild the client against a failover URL and mark sticky failover
+        /// topology (issue #3001). Distinct from [`DatabaseBackend::reconnect`],
+        /// which always records a primary topology transition.
+        async fn reconnect_failover(&self, db_url: &str) -> Result<(), anyhow::Error> {
+            let (new_connection, replica_set_configured) = Self::build_connection_bundle(
+                db_url,
+                &self.conn_settings,
+                self.conn_settings.tls_enabled,
+                self.conn_settings.tls_ca_cert_path.as_deref(),
+                self.conn_settings.tls_client_cert_path.as_deref(),
+                self.conn_settings.tls_client_key_path.as_deref(),
+                self.conn_settings.tls_insecure,
+            )
+            .await?;
+            self.install_reconnected_bundle(new_connection, replica_set_configured)?;
+            self.failover_topology
+                .mark_failover(&crate::config::db_backend::redact_url(db_url));
             Ok(())
         }
 
@@ -5219,6 +5245,18 @@ mod inner {
         fn has_read_replica(&self) -> bool {
             // MongoDB driver handles read preference internally via connection string
             false
+        }
+
+        fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {
+            self.failover_topology.status()
+        }
+
+        fn set_failover_allow_writes(&mut self, allow: bool) {
+            self.failover_topology.set_allow_writes(allow);
+        }
+
+        fn note_failover_admin_write(&self) {
+            self.failover_topology.note_admin_write();
         }
 
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
@@ -9638,6 +9676,9 @@ mod inner {
             // actually talk to MongoDB. On `Err` the swap is skipped and the
             // existing (possibly degraded) client stays in place — same
             // contract as `DatabaseStore::reconnect` for sqlx.
+            if !self.failover_topology.primary_active() {
+                self.failover_topology.ensure_primary_failback_allowed()?;
+            }
             let (new_connection, replica_set_configured) = Self::build_connection_bundle(
                 db_url,
                 &self.conn_settings,
@@ -9656,6 +9697,8 @@ mod inner {
             // client, so old files are deleted only after the final old bundle
             // reference is dropped.
             self.install_reconnected_bundle(new_connection, replica_set_configured)?;
+            self.failover_topology
+                .mark_primary(&crate::config::db_backend::redact_url(db_url));
 
             info!(
                 "MongoDB client reconnected to {} (replica_set={})",
@@ -9673,35 +9716,58 @@ mod inner {
         }
 
         async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
+            let skip_primary = match self.failover_topology.ensure_primary_failback_allowed() {
+                Ok(()) => false,
+                Err(divergence) => {
+                    warn!("{divergence}");
+                    true
+                }
+            };
+
             // Try primary first. `reconnect()` rebuilds the underlying
             // `Client` against the primary URL and pings it; on success
             // the swap is committed and the gateway is back on the
-            // primary.
-            if self.reconnect(primary_url).await.is_ok() {
-                info!(
-                    "Reconnected to primary MongoDB ({})",
-                    crate::config::db_backend::redact_url(primary_url)
-                );
-                return Ok(primary_url.to_string());
+            // primary. Skip when failover-window writes fence failback.
+            if !skip_primary {
+                match self.reconnect(primary_url).await {
+                    Ok(()) => {
+                        info!(
+                            "Reconnected to primary MongoDB ({})",
+                            crate::config::db_backend::redact_url(primary_url)
+                        );
+                        return Ok(primary_url.to_string());
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Primary MongoDB reconnect failed: {}",
+                            crate::config::db_backend::redact_error_text(&error, &[primary_url])
+                        );
+                    }
+                }
             }
 
             // Try failover URLs in order. The first one that successfully
             // pings wins; subsequent URLs are not tried until the next
             // failover-reconnect cycle.
             for (i, url) in self.failover_urls.iter().enumerate() {
-                if self.reconnect(url).await.is_ok() {
-                    info!(
-                        "Reconnected to failover MongoDB #{} ({})",
-                        i + 1,
-                        crate::config::db_backend::redact_url(url)
-                    );
-                    return Ok(url.clone());
+                match self.reconnect_failover(url).await {
+                    Ok(()) => {
+                        info!(
+                            "Reconnected to failover MongoDB #{} ({})",
+                            i + 1,
+                            crate::config::db_backend::redact_url(url)
+                        );
+                        return Ok(url.clone());
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failover MongoDB #{} ({}) reconnect failed: {}",
+                            i + 1,
+                            crate::config::db_backend::redact_url(url),
+                            crate::config::db_backend::redact_error_text(&error, &[url])
+                        );
+                    }
                 }
-                warn!(
-                    "Failover MongoDB #{} ({}) reconnect failed",
-                    i + 1,
-                    crate::config::db_backend::redact_url(url)
-                );
             }
 
             Err(anyhow::anyhow!(
@@ -13210,6 +13276,7 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: std::sync::Arc::new(DashMap::new()),
                 failover_urls,
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
