@@ -1,0 +1,50 @@
+{
+  "description": "Declarative #2450 mesh workload probe expectations for hosted Helm Chart CI. Captures are produced by the trusted workflow shell; this file is only read by verify_mesh_workload_probes.py.",
+  "captures": {
+    "default": "mesh-probes-default.yaml",
+    "disabled": "mesh-probes-disabled.yaml",
+    "override": "mesh-probes-override.yaml",
+    "coupled_err": "mesh-probes-coupled.err",
+    "node_agent_port0": "mesh-probes-node-agent-port0.yaml",
+    "node_waypoint": "mesh-probes-node-waypoint.yaml"
+  },
+  "workloads": [
+    {
+      "name": "ferrum-mesh-control-plane",
+      "kind": "Deployment",
+      "handler": "admin_health"
+    },
+    {
+      "name": "ferrum-mesh-injector",
+      "kind": "Deployment",
+      "handler": "tcp",
+      "tcp_port": "webhook"
+    },
+    {
+      "name": "ferrum-mesh-ca",
+      "kind": "Deployment",
+      "handler": "admin_health"
+    },
+    {
+      "name": "ferrum-mesh-east-west",
+      "kind": "Deployment",
+      "handler": "tcp",
+      "tcp_port": "tls-passthru"
+    },
+    {
+      "name": "ferrum-mesh-ambient",
+      "kind": "DaemonSet",
+      "handler": "admin_health"
+    },
+    {
+      "name": "ferrum-mesh-node-agent",
+      "kind": "DaemonSet",
+      "handler": "admin_health"
+    }
+  ],
+  "node_waypoint_ambient": {
+    "name": "ferrum-mesh-ambient",
+    "kind": "DaemonSet",
+    "admin_port": "19091"
+  }
+}
