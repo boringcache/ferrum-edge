@@ -122,4 +122,11 @@ fn cross_protocol_bridge_always_strips_forwarded_before_regeneration() {
         region.contains("| \"forwarded\""),
         "cross-protocol bridge must keep stripping client Forwarded"
     );
+    // The plain bridge builder appends via `RequestBuilder::header`, so the
+    // strip must also be ASCII case-insensitive — a mixed-case `Forwarded`
+    // that escaped it would precede the gateway-owned element.
+    assert!(
+        region.contains("eq_ignore_ascii_case"),
+        "cross-protocol bridge strip must stay ASCII case-insensitive"
+    );
 }
