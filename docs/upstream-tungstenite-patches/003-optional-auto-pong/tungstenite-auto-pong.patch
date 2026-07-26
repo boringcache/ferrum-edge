@@ -1,0 +1,131 @@
+diff --git a/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md b/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
+index 6fe2c0c0f..4e462f69f 100644
+--- a/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
++++ b/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ 
+ * Backport snapview/tungstenite-rs#556: add `WebSocket::into_inner_with_read_buffer()` and `WebSocketContext::into_read_buffer()` so callers taking over the raw stream at a frame boundary can recover buffered bytes that `into_inner()` discards.
+ * Enforce caller-supplied frame limits before payload reservation while exempting valid Close frames; all control frames remain capped at RFC 6455's 125-byte maximum before allocation. Frame-policy failures retain a distinct `CapacityError::FrameTooLong` origin so callers can distinguish them from reassembled-message limits.
++* Add `WebSocketConfig::auto_pong` (default `true`) so transparent proxies can surface Ping frames without queuing a local Pong reply. Explicit `Message::Pong` writes remain unchanged.
+ 
+ # 0.29.0
+ 
+diff --git a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs b/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
+index cc1b68a4a..f61e0a383 100644
+--- a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
++++ b/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
+@@ -91,6 +91,15 @@ pub struct WebSocketConfig {
+     /// some popular libraries that are sending unmasked frames, ignoring the RFC.
+     /// By default this option is set to `false`, i.e. according to RFC 6455.
+     pub accept_unmasked_frames: bool,
++    /// When set to `true` (the default), receiving a Ping frame automatically
++    /// queues a matching Pong that is flushed on the next read/write.
++    ///
++    /// Set to `false` for transparent proxies that forward Ping frames to a
++    /// peer and must not answer locally. Ordinary clients and servers should
++    /// leave this at the default so keepalive Ping/Pong continues to work.
++    ///
++    /// Explicit `Message::Pong` writes are unaffected.
++    pub auto_pong: bool,
+ }
+ 
+ impl Default for WebSocketConfig {
+@@ -102,6 +111,7 @@ impl Default for WebSocketConfig {
+             max_message_size: Some(64 << 20),
+             max_frame_size: Some(16 << 20),
+             accept_unmasked_frames: false,
++            auto_pong: true,
+         }
+     }
+ }
+@@ -143,6 +153,12 @@ impl WebSocketConfig {
+         self
+     }
+ 
++    /// Set [`Self::auto_pong`].
++    pub fn auto_pong(mut self, auto_pong: bool) -> Self {
++        self.auto_pong = auto_pong;
++        self
++    }
++
+     /// Panic if values are invalid.
+     pub(crate) fn assert_valid(&self) {
+         assert!(
+@@ -714,7 +730,10 @@ impl WebSocketContext {
+                     OpCtl::Ping => {
+                         let data = frame.into_payload();
+                         // No ping processing after we sent a close frame.
+-                        if self.state.is_active() {
++                        // `auto_pong` defaults to true (ordinary endpoints);
++                        // transparent proxies disable it so Ping can be
++                        // forwarded without a local reply.
++                        if self.state.is_active() && self.config.auto_pong {
+                             self.set_additional(Frame::pong(data.clone()));
+                         }
+                         Ok(Some(Message::Ping(data)))
+@@ -931,6 +950,65 @@ mod tests {
+         assert_eq!(socket.read().unwrap(), Message::Binary(vec![0x01, 0x02, 0x03].into()));
+     }
+ 
++    /// Capture written bytes while still serving a scripted read side.
++    struct CaptureIo {
++        read: Cursor<Vec<u8>>,
++        written: Vec<u8>,
++    }
++
++    impl io::Write for CaptureIo {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            self.written.extend_from_slice(buf);
++            Ok(buf.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    impl io::Read for CaptureIo {
++        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++            self.read.read(buf)
++        }
++    }
++
++    #[test]
++    fn auto_pong_default_queues_local_reply() {
++        // Unmasked Ping from the server-role peer (client-role reader).
++        let incoming = Cursor::new(vec![0x89, 0x02, 0x01, 0x02]);
++        let io = CaptureIo { read: incoming, written: Vec::new() };
++        let mut socket = WebSocket::from_raw_socket(io, Role::Client, None);
++        assert_eq!(socket.read().unwrap(), Message::Ping(vec![1, 2].into()));
++        socket.flush().unwrap();
++        let stream = socket.into_inner();
++        assert!(
++            !stream.written.is_empty(),
++            "default auto_pong must flush a local Pong"
++        );
++        assert_eq!(
++            stream.written[0] & 0x0f,
++            0x0a,
++            "auto reply must be a Pong opcode, got {:02x?}",
++            stream.written
++        );
++    }
++
++    #[test]
++    fn auto_pong_disabled_does_not_queue_local_reply() {
++        let incoming = Cursor::new(vec![0x89, 0x02, 0x01, 0x02]);
++        let io = CaptureIo { read: incoming, written: Vec::new() };
++        let config = WebSocketConfig::default().auto_pong(false);
++        let mut socket = WebSocket::from_raw_socket(io, Role::Client, Some(config));
++        assert_eq!(socket.read().unwrap(), Message::Ping(vec![1, 2].into()));
++        socket.flush().unwrap();
++        let stream = socket.into_inner();
++        assert!(
++            stream.written.is_empty(),
++            "auto_pong=false must not emit a local Pong, wrote {:02x?}",
++            stream.written
++        );
++    }
++
+     #[test]
+     fn size_limiting_text_fragmented() {
+         let incoming = Cursor::new(vec![

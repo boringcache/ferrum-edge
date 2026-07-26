@@ -11075,6 +11075,9 @@ pub(crate) async fn connect_websocket_backend(
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
+    // Transparent relay: forward Ping to the peer; do not auto-answer locally
+    // (issue #2963). Ordinary non-relay tungstenite users keep the default.
+    ws_config.auto_pong = false;
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -11312,6 +11315,9 @@ async fn connect_mesh_websocket_backend(
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_message_size_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
+    // Transparent relay: forward Ping to the peer; do not auto-answer locally
+    // (issue #2963). Ordinary non-relay tungstenite users keep the default.
+    ws_config.auto_pong = false;
 
     match egress {
         MeshWsEgress::SidecarMtls => {
@@ -12597,6 +12603,9 @@ where
     // pass `false` (RFC 6455 / RFC 8441 mandate masked client frames);
     // H3 callers pass `true`.
     ws_config.accept_unmasked_frames = accept_unmasked_client_frames;
+    // Transparent relay shared by H1/H2/H3: forward Ping without a local
+    // auto-Pong so end-to-end keepalive reflects the far side (issue #2963).
+    ws_config.auto_pong = false;
 
     // Byte-level idle activity adapter under the client-side framer, matching
     // the wrap applied beneath the backend stream at connect time: read

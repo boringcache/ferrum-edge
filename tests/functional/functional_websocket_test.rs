@@ -126,6 +126,105 @@ async fn start_ws_echo_server_with_subprotocol(
     }
 }
 
+/// Backend that never answers Ping (auto_pong disabled + ignore). Used to prove
+/// the gateway does not locally auto-Pong when forwarding client→backend Ping.
+#[allow(clippy::collapsible_match)]
+async fn start_ws_silent_ping_server(port: u16) {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind silent-ping WS server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut cfg = WebSocketConfig::default();
+                cfg.auto_pong = false;
+                let ws_stream =
+                    match tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                let (mut sink, mut source) = ws_stream.split();
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            let echo = format!("Echo: {}", text);
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Ping(_) | Message::Pong(_) => {
+                            // Intentionally ignore — far side is unresponsive to Ping.
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Backend that sends one Ping after accept and counts inbound Pongs. When
+/// `auto_pong` is false the backend itself will not answer client Pings.
+async fn start_ws_backend_ping_server(
+    port: u16,
+    auto_pong: bool,
+    ping_payload: &'static [u8],
+    pongs_received: Arc<AtomicUsize>,
+) {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind backend-ping WS server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            let pongs_received = pongs_received.clone();
+            tokio::spawn(async move {
+                let mut cfg = WebSocketConfig::default();
+                cfg.auto_pong = auto_pong;
+                let ws_stream =
+                    match tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                let (mut sink, mut source) = ws_stream.split();
+                if sink
+                    .send(Message::Ping(ping_payload.to_vec().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Pong(_) => {
+                            pongs_received.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Collect the next message, or `None` if `duration` elapses first.
+async fn next_ws_message_within(
+    ws: &mut (impl StreamExt<Item = Result<Message, WsError>> + Unpin),
+    duration: Duration,
+) -> Option<Result<Message, WsError>> {
+    match tokio::time::timeout(duration, ws.next()).await {
+        Ok(item) => item,
+        Err(_) => None,
+    }
+}
+
 /// Start a WebSocket probe backend that can report whether an oversized
 /// client-to-backend frame reached it and can deliberately emit an oversized
 /// backend-to-client frame.
@@ -3262,6 +3361,454 @@ async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
             .expect("backend close channel ended");
     assert_eq!(backend_code, CloseCode::Away);
     assert_eq!(backend_reason, "idle timeout");
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Issue #2963: client→backend Ping must not produce a local gateway Pong when
+/// the backend never answers. Shared `run_websocket_proxy` path (H1 Upgrade).
+#[ignore]
+#[tokio::test]
+async fn test_websocket_ping_unresponsive_backend_yields_no_local_pong() {
+    let backend_port = free_port().await;
+    let backend_handle = tokio::spawn(start_ws_silent_ping_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    // Prove the session is live, then Ping an unresponsive far side.
+    ws.send(Message::Text("alive".into()))
+        .await
+        .expect("send alive");
+    assert_eq!(
+        ws.next().await.expect("alive reply").expect("alive ok"),
+        Message::Text("Echo: alive".into())
+    );
+
+    let payload = vec![0x71, 0x75, 0x78];
+    ws.send(Message::Ping(payload.clone().into()))
+        .await
+        .expect("send Ping");
+
+    match next_ws_message_within(&mut ws, Duration::from_millis(750)).await {
+        None => {}
+        Some(Ok(Message::Pong(data))) => panic!(
+            "gateway must not auto-Pong when backend is silent; got Pong {data:?}"
+        ),
+        Some(other) => panic!("unexpected frame while waiting for silence: {other:?}"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+}
+
+/// Issue #2963: a responsive backend yields exactly one Pong (no local double).
+#[ignore]
+#[tokio::test]
+async fn test_websocket_ping_responsive_backend_yields_exactly_one_pong() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    let payload = vec![0x61, 0x62, 0x63];
+    ws.send(Message::Ping(payload.clone().into()))
+        .await
+        .expect("send Ping");
+
+    let first = next_ws_message_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("expected one Pong")
+        .expect("Pong read ok");
+    assert_eq!(first, Message::Pong(payload.clone().into()));
+
+    match next_ws_message_within(&mut ws, Duration::from_millis(500)).await {
+        None => {}
+        Some(Ok(Message::Pong(data))) => {
+            panic!("exactly one Pong expected; got a second Pong {data:?}")
+        }
+        Some(other) => panic!("unexpected trailing frame: {other:?}"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Issue #2963 (backend→client): unresponsive client yields no local gateway
+/// Pong toward the backend.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_ping_unresponsive_client_yields_no_local_pong() {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let backend_port = free_port().await;
+    let pongs = Arc::new(AtomicUsize::new(0));
+    let backend_handle = tokio::spawn(start_ws_backend_ping_server(
+        backend_port,
+        false,
+        b"b2c-ping",
+        pongs.clone(),
+    ));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    // Client also disables auto_pong and ignores Ping so the far side is silent.
+    let mut client_cfg = WebSocketConfig::default();
+    client_cfg.auto_pong = false;
+    let (mut ws, _response) =
+        tokio_tungstenite::connect_async_with_config(&url, Some(client_cfg), false)
+            .await
+            .expect("Failed to connect WebSocket");
+
+    let ping = next_ws_message_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("expected backend Ping")
+        .expect("Ping read ok");
+    assert_eq!(ping, Message::Ping(b"b2c-ping".to_vec().into()));
+    // Do not answer. Gateway must not invent a Pong toward the backend.
+    sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        pongs.load(Ordering::SeqCst),
+        0,
+        "gateway must not auto-Pong an unresponsive client"
+    );
+
+    let _ = ws.send(Message::Close(None)).await;
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+}
+
+/// Issue #2963 (backend→client): responsive client yields exactly one Pong.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_backend_ping_responsive_client_yields_exactly_one_pong() {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let backend_port = free_port().await;
+    let pongs = Arc::new(AtomicUsize::new(0));
+    let backend_handle = tokio::spawn(start_ws_backend_ping_server(
+        backend_port,
+        false,
+        b"b2c-ok",
+        pongs.clone(),
+    ));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    // Disable client auto_pong so we can assert exactly one explicit reply
+    // (and so a gateway-local auto-Pong would still be distinguishable as a
+    // second Pong if the bug returned).
+    let mut client_cfg = WebSocketConfig::default();
+    client_cfg.auto_pong = false;
+    let (mut ws, _response) =
+        tokio_tungstenite::connect_async_with_config(&url, Some(client_cfg), false)
+            .await
+            .expect("Failed to connect WebSocket");
+
+    let ping = next_ws_message_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("expected backend Ping")
+        .expect("Ping read ok");
+    assert_eq!(ping, Message::Ping(b"b2c-ok".to_vec().into()));
+    ws.send(Message::Pong(b"b2c-ok".to_vec().into()))
+        .await
+        .expect("send single client Pong");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pongs.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("backend did not receive client Pong");
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        pongs.load(Ordering::SeqCst),
+        1,
+        "exactly one Pong must reach the backend"
+    );
+
+    let _ = ws.send(Message::Close(None)).await;
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+}
+
+/// Same C2B transparency contract over H2 Extended CONNECT (shared relay).
+#[ignore]
+#[tokio::test]
+async fn test_h2_websocket_ping_unresponsive_backend_yields_no_local_pong() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let backend_port = free_port().await;
+    let backend_handle = tokio::spawn(start_ws_silent_ping_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", gateway_port))
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .expect("H2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws-echo", gateway_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 WebSocket CONNECT");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send H2 CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let upgraded = hyper::upgrade::on(response)
+        .await
+        .expect("H2 upgrade");
+    let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
+
+    ws.send(Message::Ping(vec![9, 6, 3].into()))
+        .await
+        .expect("send H2 Ping");
+    match next_ws_message_within(&mut ws, Duration::from_millis(750)).await {
+        None => {}
+        Some(Ok(Message::Pong(data))) => {
+            panic!("H2 path must not auto-Pong silent backend; got {data:?}")
+        }
+        Some(other) => panic!("unexpected H2 frame: {other:?}"),
+    }
+
+    drop(ws);
+    conn_task.abort();
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+}
+
+/// Same C2B responsive contract over H2 Extended CONNECT.
+#[ignore]
+#[tokio::test]
+async fn test_h2_websocket_ping_responsive_backend_yields_exactly_one_pong() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
+
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", gateway_port))
+        .await
+        .expect("connect gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+        .await
+        .expect("H2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{}/ws-echo", gateway_port))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 WebSocket CONNECT");
+    let response = sender
+        .send_request(request)
+        .await
+        .expect("send H2 CONNECT");
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let upgraded = hyper::upgrade::on(response)
+        .await
+        .expect("H2 upgrade");
+    let mut ws = WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, None).await;
+
+    let payload = vec![4, 5, 6];
+    ws.send(Message::Ping(payload.clone().into()))
+        .await
+        .expect("send H2 Ping");
+    let first = next_ws_message_within(&mut ws, Duration::from_secs(2))
+        .await
+        .expect("expected one H2 Pong")
+        .expect("H2 Pong read ok");
+    assert_eq!(first, Message::Pong(payload.into()));
+    match next_ws_message_within(&mut ws, Duration::from_millis(500)).await {
+        None => {}
+        Some(Ok(Message::Pong(data))) => panic!("second H2 Pong: {data:?}"),
+        Some(other) => panic!("unexpected trailing H2 frame: {other:?}"),
+    }
+
+    drop(ws);
+    conn_task.abort();
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Same C2B transparency contract over H3 Extended CONNECT (shared relay).
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_ping_unresponsive_backend_yields_no_local_pong() {
+    let backend_port = free_port().await;
+    let backend_handle = tokio::spawn(start_ws_silent_ping_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+
+    ws.send_fragment(0x9, &[0x68, 0x33], true)
+        .await
+        .expect("send H3 Ping");
+    match tokio::time::timeout(Duration::from_millis(750), ws.recv_frame()).await {
+        Err(_) => {}
+        Ok(Ok(H3WebSocketFrame::Pong(data))) => {
+            panic!("H3 path must not auto-Pong silent backend; got {data:?}")
+        }
+        Ok(Ok(other)) => panic!("unexpected H3 frame: {other:?}"),
+        Ok(Err(err)) => panic!("H3 recv error while expecting silence: {err}"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend_handle.abort();
+}
+
+/// Same C2B responsive contract over H3 Extended CONNECT.
+#[ignore]
+#[tokio::test]
+async fn test_h3_websocket_ping_responsive_backend_yields_exactly_one_pong() {
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
+
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://localhost:{}/ws-echo", gateway_https_port);
+    let mut ws = client
+        .websocket(&url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+
+    let payload = [0x68, 0x33, 0x70];
+    ws.send_fragment(0x9, &payload, true)
+        .await
+        .expect("send H3 Ping");
+    match tokio::time::timeout(Duration::from_secs(2), ws.recv_frame())
+        .await
+        .expect("H3 Pong timed out")
+        .expect("H3 Pong read")
+    {
+        H3WebSocketFrame::Pong(data) => assert_eq!(data, payload),
+        other => panic!("expected H3 Pong, got {other:?}"),
+    }
+    match tokio::time::timeout(Duration::from_millis(500), ws.recv_frame()).await {
+        Err(_) => {}
+        Ok(Ok(H3WebSocketFrame::Pong(data))) => panic!("second H3 Pong: {data:?}"),
+        Ok(Ok(other)) => panic!("unexpected trailing H3 frame: {other:?}"),
+        Ok(Err(err)) => panic!("H3 recv error after first Pong: {err}"),
+    }
 
     let _ = gateway.kill();
     let _ = gateway.wait();
