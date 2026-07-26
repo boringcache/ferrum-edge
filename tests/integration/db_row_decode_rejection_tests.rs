@@ -190,6 +190,19 @@ async fn admin_delete(base_url: &str, path: &str, token: &str) -> (u16, Value) {
     (status, body)
 }
 
+async fn admin_put(base_url: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}{path}"))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.json().await.unwrap_or_else(|_| json!({}));
+    (status, body)
+}
+
 async fn admin_get(base_url: &str, path: &str, token: &str) -> (reqwest::StatusCode, Value) {
     let resp = reqwest::Client::new()
         .get(format!("{base_url}{path}"))
@@ -329,6 +342,24 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
     );
     assert_eq!(body["id"], "p-good");
 
+    // POST with the same id must be 409 (row still occupies the id), not 503.
+    let (conflict_status, conflict_body) = admin_post(
+        &base_url,
+        "/consumers",
+        &token,
+        &json!({
+            "id": "c-bad",
+            "username": "user-c-bad-retry",
+            "credentials": {},
+            "acl_groups": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        conflict_status, 409,
+        "POST same id must conflict on undecodable row (got {conflict_status}): {conflict_body:?}"
+    );
+
     // In-band repair: DELETE the undecodable consumer (must not be 503).
     let (del_status, del_body) = admin_delete(&base_url, "/consumers/c-bad", &token).await;
     assert!(
@@ -363,4 +394,106 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
         repaired.consumers.iter().all(|c| c.id != "c-bad"),
         "corrupted consumer must be gone after DELETE"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_consumer_row_allows_put_overwrite_repair() {
+    let (store, _tmp) = sqlite_store().await;
+    let ns = default_namespace();
+
+    store
+        .create_consumer(&test_consumer("c-put"))
+        .await
+        .expect("create consumer");
+    let good = store
+        .load_full_config(&ns)
+        .await
+        .expect("initial full load must succeed");
+
+    sqlx::query("UPDATE consumers SET credentials = '{not json' WHERE id = ? AND namespace = ?")
+        .bind("c-put")
+        .bind(&ns)
+        .execute(&store.pool())
+        .await
+        .expect("corrupt credentials");
+
+    let load_err = store
+        .load_full_config(&ns)
+        .await
+        .expect_err("full load must reject undecodable consumer");
+    assert!(is_row_decode_rejection(&load_err));
+
+    let db_available = Arc::new(AtomicBool::new(true));
+    let config_rejected = Arc::new(AtomicBool::new(false));
+    let db_backend: Arc<dyn DatabaseBackend> = store.clone();
+    record_config_validation_rejection(
+        &db_backend,
+        &db_available,
+        &config_rejected,
+        &load_err,
+        "row-decode put repair",
+    )
+    .await;
+
+    let cached = Arc::new(ArcSwap::new(Arc::new(good)));
+    let state = AdminState {
+        db: Some(store.clone()),
+        jwt_manager: jwt_manager(),
+        metrics_auth: Default::default(),
+        cached_config: Some(cached),
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: Some(db_available),
+        config_rejected: Some(config_rejected),
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
+        cached_db_health: Arc::new(ArcSwap::new(Arc::new(None))),
+        db_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    };
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = admin_token();
+
+    // In-band repair: PUT overwrite must stay non-503 and restore decodability.
+    let (put_status, put_body) = admin_put(
+        &base_url,
+        "/consumers/c-put",
+        &token,
+        &json!({
+            "username": "user-c-put-repaired",
+            "credentials": {},
+            "acl_groups": [],
+        }),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&put_status),
+        "PUT overwrite must repair undecodable row (got {put_status}): {put_body:?}"
+    );
+
+    let repaired = store
+        .load_full_config(&ns)
+        .await
+        .expect("full load must succeed after PUT overwrite repair");
+    let consumer = repaired
+        .consumers
+        .iter()
+        .find(|c| c.id == "c-put")
+        .expect("repaired consumer must remain");
+    assert_eq!(consumer.username, "user-c-put-repaired");
 }

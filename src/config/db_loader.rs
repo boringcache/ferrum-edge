@@ -9699,11 +9699,12 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         )
     })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str.clone())).map_err(|e| {
+        serde_json::from_value(serde_json::Value::String(algo_str)).map_err(|e| {
+            // Do not embed the raw algorithm column — hostile/oversized DB
+            // values must not reach poll/startup rejection logs (issue #2997).
             anyhow::anyhow!(
-                "Upstream {}: failed to parse algorithm '{}': {}",
+                "Upstream {}: failed to parse algorithm: {}",
                 id_preview,
-                algo_str,
                 e
             )
         })?;
@@ -10176,6 +10177,15 @@ mod row_decode_rejection_classification_tests {
         assert!(
             !proxy.contains("hosts JSON '{}'"),
             "proxy hosts decode errors must not embed the raw hosts column"
+        );
+        let upstream = source
+            .split("fn row_to_upstream_inner(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("row_to_upstream_inner body");
+        assert!(
+            !upstream.contains("algorithm '{}'"),
+            "upstream algorithm decode errors must not embed the raw algorithm column"
         );
     }
 }
