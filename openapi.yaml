@@ -22208,7 +22208,11 @@ components:
             plaintext, H3 on most HTTPS backends, untagged HBONE,
             per-request HBONE CONNECT rejection) do NOT populate this
             field — only real connection / TLS-config errors and
-            in-flight live downgrades.
+            in-flight live downgrades. An H3 probe failure against a
+            target already classified `h3: supported` always populates
+            it, including when a transient DNS/connect/refused/timeout
+            class preserves that classification instead of downgrading
+            it (the record is then intentionally stale).
 
     BackendCapabilitiesResponse:
       type: object
