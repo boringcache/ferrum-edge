@@ -312,6 +312,18 @@ plugin must declare it:
 | Committed before any external operation could start (payload validation, unsupported-protocol refusal, DNS/egress denial, proven pre-wire transport failure) | `ferrum:release_dedup_inflight_on_commit`, or `serverless_function`'s pre-invocation rejection owners | token-matched release on commit, so a corrected retry proceeds immediately |
 | The short-circuit performed the protected billable/side-effecting operation | `ferrum:external_operation_completed` (`ai_federation`), or `serverless_function` terminate-mode side-effect owners | ownership is **not** released; a durable non-replayable 409 completion tombstone is published for `max(ttl_seconds, inflight_ttl_seconds)`, fenced in Redis mode |
 
+For the last row, a terminate-mode `serverless_function` response that *can* be
+retained is published as an ordinary replayable completion for `ttl_seconds`, so
+an identical retry receives the real function response instead of a conflict. The
+non-replayable tombstone is what the key falls back to whenever that response
+cannot be persisted as a replay — no safe representation exists, storage capacity
+or the Redis payload cap rejects it, or its replay provenance is unusable because
+the request straddled a response-presentation-policy publication or that policy
+is incomplete/`Dynamic`. The completion barrier is never downgraded to the bare
+in-flight lease in those cases: the same fenced ownership transition publishes the
+409 barrier for `max(ttl_seconds, inflight_ttl_seconds)`, and a capacity or Redis
+rejection stays fail-closed on the retained in-flight markers.
+
 These markers are internal (`ferrum:`-prefixed) and cannot be set from public
 request metadata or from a backend response header. A new plugin that spends
 money or mutates remote state behind a short-circuit and declares nothing will

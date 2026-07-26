@@ -41,7 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces a marker that blocked duplicates for `inflight_ttl_seconds`, so a
   deployment configured with `inflight_ttl_seconds > ttl_seconds` never becomes
   re-executable sooner than it was before. Ordinary replayable completions keep
-  `ttl_seconds`. The provenance contract is documented in
+  `ttl_seconds`. The barrier also covers the case where the committed response
+  itself cannot be retained as a replay — its request straddled a
+  response-presentation-policy publication, or that policy is incomplete or
+  `Dynamic` — instead of falling back to the bare in-flight lease. Serverless
+  responses with stable, complete policy provenance are still stored as ordinary
+  replays. The provenance contract is documented in
   `docs/plugin_execution_order.md`.
 
 ### Changed

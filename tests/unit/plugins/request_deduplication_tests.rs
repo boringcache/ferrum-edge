@@ -2215,6 +2215,277 @@ async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+/// Assert an idempotency key is still owned by a durable, non-executable
+/// completion after its in-flight lease was expired.
+///
+/// The refusal may be the fixed non-replayable barrier, or the policy-mismatch
+/// refusal a stored completion produces when the live policy moved or cannot be
+/// established. Both are 409 barriers; what must never happen is admission of a
+/// fresh execution, or handing back the externally executed response as a replay.
+fn assert_barrier_refusal(result: PluginResult, context: &str) {
+    let (status_code, body) = match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, Bytes::from(body)),
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("{context}; got {other:?}"),
+    };
+    assert_eq!(status_code, 409, "{context}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("charged-once"),
+        "{context}; the externally executed representation must not be replayed: {body}"
+    );
+    assert!(
+        !body.contains("already in progress"),
+        "{context}; the barrier must be a durable completion, not a surviving in-flight lease: \
+         {body}"
+    );
+}
+
+/// Terminate-mode serverless invocation whose committed response is refused for
+/// replay because the request straddled a response-side gate publication.
+///
+/// GHSA-8cr6-rw38-7j59: the function already ran, so giving up only the replay
+/// would leave the raw `inflight_ttl_seconds` lease as the sole protection and
+/// make the billable operation executable again the moment it expired. The
+/// committed hook must convert that exact ownership into the durable
+/// non-replayable 409 execution barrier instead.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
+async fn serverless_commit_straddling_a_policy_publication_publishes_a_durable_barrier() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "straddled-side-effect".to_string(),
+    )]);
+    // Pins this request's response-policy stamp.
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+    assert_eq!(status, 200);
+
+    // A response-side gate publication lands after the function executed and
+    // before the response is committed: the representation straddles it, so it
+    // belongs to no provable policy and cannot be retained as a replay.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.redaction.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+
+    // The barrier must not be the bounded in-flight lease.
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "straddled-side-effect".to_string(),
+    )]);
+    // A durable completion now owns the key. Whether it is refused as the fixed
+    // non-replayable barrier or as a completion stored under a policy the retry
+    // no longer shares, it is a 409 refusal rather than a fresh execution, and it
+    // never hands back the real function response.
+    assert_barrier_refusal(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        "a committed serverless side effect whose response straddled a policy publication must \
+         leave a durable execution barrier, not become executable again",
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the protected operation must not be re-executed"
+    );
+    runtime_overlay::reset_for_test();
+}
+
+/// Same barrier requirement for the other refusal shape: the effective static
+/// response-presentation policy could not be established at all (no plugin-cache
+/// view, or a `ResponsePresentationPolicy::Dynamic` plugin on the proxy), so the
+/// provenance is incomplete and the committed response is not replayable.
+#[tokio::test]
+async fn serverless_commit_without_provable_policy_publishes_a_durable_barrier() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Incomplete provenance: no effective presentation-policy digest.
+    let mut ctx = policy_bound_ctx(None);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "dynamic-policy-side-effect".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = policy_bound_ctx(None);
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "dynamic-policy-side-effect".to_string(),
+    )]);
+    assert_barrier_refusal(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        "a committed serverless side effect with unprovable replay provenance must leave a \
+         durable execution barrier",
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the protected operation must not be re-executed"
+    );
+}
+
+/// The control for the two barrier tests above: a serverless response with
+/// stable, complete policy provenance must still be published as an ordinary
+/// replayable completion. Barrier conversion is the exception, not a blanket
+/// downgrade of every externally executed response.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
+async fn serverless_commit_with_provable_policy_stays_replayable() {
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "provable-side-effect".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+
+    // No policy publication between invocation and commit.
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "provable-side-effect".to_string(),
+    )]);
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"charged-once");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("a provable serverless completion must stay replayable, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    runtime_overlay::reset_for_test();
+}
+
 #[tokio::test]
 async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
     use wiremock::matchers::method;

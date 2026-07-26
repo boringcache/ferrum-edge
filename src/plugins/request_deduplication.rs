@@ -46,7 +46,13 @@
 //!   effective presentation policy could not be established, is retained
 //!   nowhere — not in Redis and not in the local map. Its bytes belong to no
 //!   provable policy. In-flight ownership is untouched, so concurrent-duplicate
-//!   protection still holds; only the finalized replay is given up.
+//!   protection still holds; only the finalized replay is given up. When the
+//!   request already performed a protected external operation (a terminate-mode
+//!   `serverless_function` invocation, an `ai_federation` provider call), giving
+//!   up the replay is not enough: the bounded in-flight lease is replaced by the
+//!   fixed non-replayable 409 execution barrier through the same fenced
+//!   ownership transition, so the operation cannot become executable again when
+//!   `inflight_ttl_seconds` elapses (GHSA-8cr6-rw38-7j59).
 //! - **Legacy/malformed payloads**: a Redis record without complete, decodable
 //!   provenance is rejected. It can never be replayed on the strength of an
 //!   assumed policy.
@@ -1598,6 +1604,40 @@ impl RequestDeduplication {
         }
     }
 
+    /// Park the in-flight ownership `on_final_response_body` consumed back into
+    /// the request so a durable execution barrier can still be published for it.
+    ///
+    /// `on_final_response_body` takes the request state before its first await,
+    /// so a later refusal to persist a replayable representation — a straddled
+    /// response-policy publication, or provenance that is incomplete/`Dynamic` —
+    /// would otherwise leave an already-performed external operation protected by
+    /// nothing but the raw `inflight_ttl_seconds` lease. Once that lease expires
+    /// the operation becomes executable again, which is exactly the window
+    /// GHSA-8cr6-rw38-7j59 closes.
+    ///
+    /// Parking the *same* ownership (same key, fingerprint, local token and Redis
+    /// lock token) is the lifecycle signal the committed hook reads: state still
+    /// present after a publication attempt means the representation was refused,
+    /// and the fixed non-replayable 409 tombstone must take the key through the
+    /// ordinary fenced transition instead. Nothing is published here, so sibling
+    /// instances and successor-owner fencing are untouched.
+    ///
+    /// Only owners of an external operation park. An ordinary request that merely
+    /// gives up its replay is safe to retry, and holding a barrier for it would
+    /// turn unprovable provenance into a hard 409 lockout.
+    fn park_ownership_for_execution_barrier(
+        &self,
+        ctx: &mut RequestContext,
+        owns_external_operation: bool,
+        state: RequestDeduplicationRequestState,
+    ) {
+        if !owns_external_operation {
+            return;
+        }
+        ctx.request_deduplication_states
+            .insert(self.instance_id, state);
+    }
+
     /// Drop a completed entry this request published but that the distributed
     /// fence rejected, so a non-authoritative result is never replayed locally.
     fn remove_local_completed(&self, key: &str, fingerprint: &str, sequence: u64) {
@@ -3039,8 +3079,20 @@ impl Plugin for RequestDeduplication {
         if !publishing_external_tombstone && !ctx.response_policy_stamp_stable() {
             // The final representation may have straddled a policy
             // publication, so it is unsafe to persist. Keep the in-flight
-            // ownership until its bounded TTL rather than allowing a retry to
-            // repeat a possibly completed external side effect.
+            // ownership rather than allowing a retry to repeat a possibly
+            // completed external side effect. An owner of an already-performed
+            // external operation parks that ownership so the committed hook can
+            // replace the bounded lease with a durable execution barrier.
+            self.park_ownership_for_execution_barrier(
+                ctx,
+                retain_inflight_on_storage_skip,
+                RequestDeduplicationRequestState {
+                    key,
+                    fingerprint,
+                    local_inflight_owner_token,
+                    redis_lock_token,
+                },
+            );
             return PluginResult::Continue;
         }
         let response_policy = ctx.response_policy_provenance();
@@ -3055,12 +3107,24 @@ impl Plugin for RequestDeduplication {
             // unprovable policy would otherwise be served them.
             //
             // Concurrent-duplicate protection is unaffected — the in-flight
-            // marking already happened and is kept until its bounded TTL, so a
-            // retry cannot repeat a possibly completed external side effect.
-            // Only the finalized *replay* is given up.
+            // marking already happened and is kept, so a retry cannot repeat a
+            // possibly completed external side effect. Only the finalized
+            // *replay* is given up; an owner of an already-performed external
+            // operation parks its ownership so the committed hook can replace
+            // the bounded lease with a durable execution barrier.
             debug!(
                 "request_deduplication: response-side presentation policy could not be \
                  established for this request; retaining no replayable representation"
+            );
+            self.park_ownership_for_execution_barrier(
+                ctx,
+                retain_inflight_on_storage_skip,
+                RequestDeduplicationRequestState {
+                    key,
+                    fingerprint,
+                    local_inflight_owner_token,
+                    redis_lock_token,
+                },
             );
             return PluginResult::Continue;
         }
@@ -3288,6 +3352,22 @@ impl Plugin for RequestDeduplication {
             let _ = self
                 .on_final_response_body(ctx, response_status, response_headers, body)
                 .await;
+            // The publication path refuses a replayable completion when this
+            // response's policy provenance straddled a publication or could not
+            // be established at all (no plugin-cache view, or a `Dynamic`
+            // response-presentation policy). It parks this instance's exact
+            // ownership back into the request to say so
+            // (`park_ownership_for_execution_barrier`). The serverless operation
+            // already ran, so leaving only the raw in-flight lease would make it
+            // executable again once `inflight_ttl_seconds` elapsed. Transition
+            // that same ownership through the fixed non-replayable 409
+            // external-operation tombstone instead — the same fenced path, with
+            // `execution_barrier_retention()` so the barrier outlives the lease
+            // it replaces. A capacity or Redis rejection there still fails
+            // closed on the retained in-flight markers.
+            if ctx.request_deduplication_states.contains_key(&self.instance_id) {
+                self.publish_external_operation_tombstone(ctx).await;
+            }
             ctx.serverless_owned_dedup_publication = previous_publication_owner;
             if let Some(marker) = synthetic_marker {
                 ctx.metadata.insert(
