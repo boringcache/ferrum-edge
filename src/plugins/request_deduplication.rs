@@ -233,21 +233,37 @@ pub fn validate_composition(
 ) -> Result<(), Vec<String>> {
     use crate::config::types::{PluginConfig, PluginScope};
 
-    let plugin_by_id: HashMap<&str, &PluginConfig> = config
+    // Keyed by `(namespace, id)` exactly like the runtime merge's scoped-plugin
+    // map: a proxy only ever resolves associations against plugin configs in
+    // its own namespace, so an id reused across namespaces cannot cross over.
+    let plugin_by_scoped_id: HashMap<(&str, &str), &PluginConfig> = config
         .plugin_configs
         .iter()
-        .map(|plugin| (plugin.id.as_str(), plugin))
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
 
-    // A proxy/group-scoped instance replaces a same-named global for that
-    // proxy, so resolve each name the way the runtime merge does before
-    // deciding whether the pair is actually effective together.
+    // Resolve each name the way the runtime merge does before deciding whether
+    // the pair is actually effective together. Two properties of that merge are
+    // load-bearing here:
+    //
+    // - Globals are namespace-partitioned: a global instance is merged only
+    //   into proxies in its own namespace.
+    // - Shadowing is decided by the outer `enabled` flag alone. An instance
+    //   whose *inner* switch is off is still constructed and still replaces the
+    //   same-named global for that proxy, so the effective set has to be
+    //   resolved first and only then asked which members actually apply a
+    //   dynamic rewrite. Filtering by activity before shadow resolution would
+    //   fall back to a global that the runtime never merges, and reject a
+    //   composition that cannot occur.
     let effective_ids = |proxy: &crate::config::types::Proxy, name: &str| -> Vec<String> {
-        let local: Vec<String> = proxy
+        let local: Vec<&PluginConfig> = proxy
             .plugins
             .iter()
             .filter_map(|association| {
-                let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                let plugin = *plugin_by_scoped_id.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
                 let scope_applies = match plugin.scope {
                     PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
                     // Proxy-group instances are required to omit `proxy_id`;
@@ -255,24 +271,28 @@ pub fn validate_composition(
                     PluginScope::ProxyGroup => true,
                     PluginScope::Global => false,
                 };
-                (dynamic_response_presentation_is_active(plugin)
-                    && plugin.plugin_name == name
-                    && scope_applies)
-                    .then(|| plugin.id.clone())
+                (plugin.enabled && plugin.plugin_name == name && scope_applies).then_some(plugin)
             })
             .collect();
-        if !local.is_empty() {
-            return local;
-        }
-        config
-            .plugin_configs
-            .iter()
-            .filter(|plugin| {
-                dynamic_response_presentation_is_active(plugin)
-                    && plugin.scope == PluginScope::Global
-                    && plugin.plugin_name == name
+        let effective: Vec<&PluginConfig> = if local.is_empty() {
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| {
+                    plugin.enabled
+                        && plugin.namespace == proxy.namespace
+                        && plugin.scope == PluginScope::Global
+                        && plugin.plugin_name == name
+                })
+                .collect()
+        } else {
+            local
+        };
+        effective
+            .into_iter()
+            .filter_map(|plugin| {
+                dynamic_response_presentation_is_active(plugin).then(|| plugin.id.clone())
             })
-            .map(|plugin| plugin.id.clone())
             .collect()
     };
 

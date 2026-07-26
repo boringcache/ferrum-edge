@@ -37,7 +37,6 @@ use tokio::sync::Barrier;
 /// the plugin only ever compares it for equality.
 const TEST_PRESENTATION_DIGEST: Option<[u8; 32]> = Some([0x5a; 32]);
 
-
 /// RequestContext as the protocol entry paths build it when the proxy has no
 /// dynamic presentation policy: bound to a fixed stand-in digest.
 fn new_ctx(method: &str, path: &str) -> RequestContext {
@@ -45,15 +44,10 @@ fn new_ctx(method: &str, path: &str) -> RequestContext {
 }
 
 fn new_ctx_from(client_ip: &str, method: &str, path: &str) -> RequestContext {
-    let mut ctx = RequestContext::new(
-        client_ip.to_string(),
-        method.to_string(),
-        path.to_string(),
-    );
+    let mut ctx = RequestContext::new(client_ip.to_string(), method.to_string(), path.to_string());
     set_response_presentation_policy_digest_for_test(&mut ctx, TEST_PRESENTATION_DIGEST);
     ctx
 }
-
 
 struct AppendingResponseTransform;
 
@@ -4503,6 +4497,17 @@ fn test_redis_cached_response_with_malformed_policy_provenance_is_rejected() {
 
     let half_present = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"},"status_code":201,"headers":{},"body":"e30="}"#;
     assert!(!request_deduplication_redis_cached_response_payload_is_valid(half_present));
+}
+
+/// The body field accepts a JSON byte array as well as the base64 string the
+/// current serializer emits, so a peer on a different serializer version stays
+/// readable. Complete provenance is what admits the record; the body encoding
+/// is orthogonal and must not have been narrowed by the provenance guard.
+#[test]
+fn test_redis_cached_response_byte_array_body_with_provenance_is_accepted() {
+    let byte_array_body = br#"{"fingerprint":"sha256-test","response_policy":{"gate":"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff","presentation":"ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"},"status_code":201,"headers":{},"body":[123,34,111,107,34,58,116,114,117,101,125]}"#;
+
+    assert!(request_deduplication_redis_cached_response_payload_is_valid(byte_array_body));
 }
 
 #[test]

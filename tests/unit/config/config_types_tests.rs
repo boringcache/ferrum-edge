@@ -5413,3 +5413,50 @@ fn a_proxy_local_mcp_gateway_shadowing_a_global_one_is_still_rejected() {
         "the shadowed global instance is not effective on this proxy: {joined}"
     );
 }
+
+#[test]
+fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
+    // Globals are namespace-partitioned by the runtime merge (each proxy takes
+    // only the globals of its own namespace), so a global `mcp_gateway` in one
+    // tenant must not refuse deduplication in another.
+    let mut config = empty_config();
+    let mut dedup = dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1"));
+    dedup.namespace = "tenant-a".to_string();
+    let mut mcp = mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None);
+    mcp.namespace = "tenant-b".to_string();
+    config.plugin_configs = vec![dedup, mcp];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.namespace = "tenant-a".to_string();
+    associate(&mut proxy, &["dedup1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "a global mcp_gateway is never merged into a proxy in a different namespace"
+    );
+}
+
+#[test]
+fn an_internally_disabled_local_mcp_gateway_shadows_an_enabled_global_one() {
+    // The runtime decides shadowing on the outer `enabled` flag alone: the
+    // local instance is constructed and replaces the global for this proxy even
+    // though its inner switch is off. Resolving the effective set before asking
+    // which members are active is what keeps this composition admitted.
+    let mut config = empty_config();
+    let mut local = mcp_gateway_plugin_config("mcp-local", PluginScope::Proxy, Some("p1"));
+    local.config["enabled"] = serde_json::Value::Bool(false);
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp-global", PluginScope::Global, None),
+        local,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp-local"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "the effective mcp_gateway on this proxy is the internally disabled local instance, \
+         which applies no rewrite"
+    );
+}
