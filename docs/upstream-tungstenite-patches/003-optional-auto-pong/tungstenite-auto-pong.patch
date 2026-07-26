@@ -3,13 +3,13 @@ index 6fe2c0c0f..4e462f69f 100644
 --- a/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
 +++ b/vendor/tungstenite-0.29.0-ferrum-patched/CHANGELOG.md
 @@ -2,6 +2,7 @@
- 
+
  * Backport snapview/tungstenite-rs#556: add `WebSocket::into_inner_with_read_buffer()` and `WebSocketContext::into_read_buffer()` so callers taking over the raw stream at a frame boundary can recover buffered bytes that `into_inner()` discards.
  * Enforce caller-supplied frame limits before payload reservation while exempting valid Close frames; all control frames remain capped at RFC 6455's 125-byte maximum before allocation. Frame-policy failures retain a distinct `CapacityError::FrameTooLong` origin so callers can distinguish them from reassembled-message limits.
 +* Add `WebSocketConfig::auto_pong` (default `true`) so transparent proxies can surface Ping frames without queuing a local Pong reply. Explicit `Message::Pong` writes remain unchanged.
- 
+
  # 0.29.0
- 
+
 diff --git a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs b/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
 index cc1b68a4a..f61e0a383 100644
 --- a/vendor/tungstenite-0.29.0-ferrum-patched/src/protocol/mod.rs
@@ -28,7 +28,7 @@ index cc1b68a4a..f61e0a383 100644
 +    /// Explicit `Message::Pong` writes are unaffected.
 +    pub auto_pong: bool,
  }
- 
+
  impl Default for WebSocketConfig {
 @@ -102,6 +111,7 @@ impl Default for WebSocketConfig {
              max_message_size: Some(64 << 20),
@@ -41,7 +41,7 @@ index cc1b68a4a..f61e0a383 100644
 @@ -143,6 +153,12 @@ impl WebSocketConfig {
          self
      }
- 
+
 +    /// Set [`Self::auto_pong`].
 +    pub fn auto_pong(mut self, auto_pong: bool) -> Self {
 +        self.auto_pong = auto_pong;
@@ -66,7 +66,7 @@ index cc1b68a4a..f61e0a383 100644
 @@ -931,6 +950,65 @@ mod tests {
          assert_eq!(socket.read().unwrap(), Message::Binary(vec![0x01, 0x02, 0x03].into()));
      }
- 
+
 +    /// Capture written bytes while still serving a scripted read side.
 +    struct CaptureIo {
 +        read: Cursor<Vec<u8>>,

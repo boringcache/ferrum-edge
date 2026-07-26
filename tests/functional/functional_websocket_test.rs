@@ -126,6 +126,43 @@ async fn start_ws_echo_server_with_subprotocol(
     }
 }
 
+/// Backend that answers each Ping with exactly one explicit Pong (`auto_pong`
+/// disabled so tungstenite does not queue a second local reply).
+#[allow(clippy::collapsible_match)]
+async fn start_ws_ping_responsive_server(port: u16) {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to bind ping-responsive WS server");
+
+    loop {
+        if let Ok((stream, _addr)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut cfg = WebSocketConfig::default();
+                cfg.auto_pong = false;
+                let ws_stream =
+                    match tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                let (mut sink, mut source) = ws_stream.split();
+                while let Some(Ok(msg)) = source.next().await {
+                    match msg {
+                        Message::Ping(data) => {
+                            if sink.send(Message::Pong(data)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// Backend that never answers Ping (auto_pong disabled + ignore). Used to prove
 /// the gateway does not locally auto-Pong when forwarding client→backend Ping.
 #[allow(clippy::collapsible_match)]
@@ -3421,7 +3458,7 @@ async fn test_websocket_ping_unresponsive_backend_yields_no_local_pong() {
 #[tokio::test]
 async fn test_websocket_ping_responsive_backend_yields_exactly_one_pong() {
     let backend_port = free_port().await;
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    let echo_handle = tokio::spawn(start_ws_ping_responsive_server(backend_port));
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -3662,7 +3699,7 @@ async fn test_h2_websocket_ping_responsive_backend_yields_exactly_one_pong() {
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     let backend_port = free_port().await;
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    let echo_handle = tokio::spawn(start_ws_ping_responsive_server(backend_port));
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -3771,7 +3808,7 @@ async fn test_h3_websocket_ping_unresponsive_backend_yields_no_local_pong() {
 #[tokio::test]
 async fn test_h3_websocket_ping_responsive_backend_yields_exactly_one_pong() {
     let backend_port = free_port().await;
-    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    let echo_handle = tokio::spawn(start_ws_ping_responsive_server(backend_port));
     sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
