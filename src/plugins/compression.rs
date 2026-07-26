@@ -31,7 +31,10 @@
 //! with 406 only when identity is prohibited. The buffer permit is held across
 //! the encode (the collected body stays resident), while the codec permit is
 //! taken only for the `spawn_blocking` worker itself; codec saturation there
-//! aborts the encode and the shared transform loops restore identity.
+//! aborts the encode and the shared transform loops restore identity when
+//! acceptable or replace with 406 when identity was refused. When one instance
+//! declines to encode an already-admitted body it clears ownership but leaves
+//! the buffer permit on the context so a later sibling can take the same slot.
 //! Response compression is also disabled when the gateway response-body limit is
 //! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
 //! admitted to compression buffering has a hard per-response byte bound.
@@ -923,7 +926,8 @@ impl CompressionPlugin {
                 ctx.mark_compression_response_admission_declined();
                 warn!(
                     "compression: response buffer admission saturated at reservation; \
-                     response will stream identity instead of buffering for compression"
+                     response will stream identity (or 406 when identity is unacceptable) \
+                     instead of buffering for compression"
                 );
             }
         }
@@ -1121,7 +1125,7 @@ impl CompressionPlugin {
                 CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 error!(
                     "compression: encoder failure for committed Content-Encoding '{}' — \
-                     restoring identity representation: {e}",
+                     aborting encode for identity restore or 406 recovery: {e}",
                     encoding_owned
                 );
                 None
@@ -1130,7 +1134,7 @@ impl CompressionPlugin {
                 CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
                 error!(
                     "compression: encoder worker join failed for committed Content-Encoding '{}' — \
-                     restoring identity representation",
+                     aborting encode for identity restore or 406 recovery",
                     encoding_owned
                 );
                 None
@@ -1832,14 +1836,13 @@ impl Plugin for CompressionPlugin {
                     //   * a sibling still owns the reservation -> it owns the one
                     //     coding layer; do not open a second permit for the same
                     //     request;
-                    //   * otherwise acquire once. This is reachable when an
-                    //     earlier sibling reserved this request (so the body is
-                    //     already bounded/buffered) but declined to encode *this*
-                    //     representation and released its permit, leaving a later
-                    //     sibling with a broader config to compress the
-                    //     already-admitted body. The buffered population stays
-                    //     bounded because entry onto the buffered path still
-                    //     required a reservation at `before_proxy` time.
+                    //   * otherwise take an orphaned reservation left by an
+                    //     earlier sibling that declined to encode this
+                    //     representation, or acquire once. The orphaned path is
+                    //     how a later sibling with a broader config compresses an
+                    //     already-admitted body without dropping the slot between
+                    //     after_proxy hooks (which would let retained bodies
+                    //     briefly exceed the response-buffer budget).
                     let buffer_permit = if ctx.owns_compression_response_admission(self.instance_id)
                     {
                         ctx.take_compression_response_buffer_permit()
@@ -1847,6 +1850,8 @@ impl Plugin for CompressionPlugin {
                         || ctx.has_compression_response_admission_owner()
                     {
                         None
+                    } else if let Some(orphaned) = ctx.take_compression_response_buffer_permit() {
+                        Some(orphaned)
                     } else {
                         try_acquire_response_buffer_permit().ok()
                     };
@@ -1913,18 +1918,21 @@ impl Plugin for CompressionPlugin {
 
                 // Cannot produce the selected coded representation (range/delta,
                 // size / content-type eligibility, no-transform / strong ETag, or
-                // reject-path without body transforms). Release any permit this
-                // instance reserved so it does not idle while the identity body
-                // streams. If identity is also unacceptable, fail closed rather
-                // than forwarding an excluded identity body — and never partially
+                // reject-path without body transforms). If identity is also
+                // unacceptable, drop the reservation and fail closed rather than
+                // forwarding an excluded identity body — and never partially
                 // mutate compression headers. On the reject path, only
-                // `response_caching` HITs are replaced.
-                ctx.release_compression_response_admission_if_owner(self.instance_id);
+                // `response_caching` HITs are replaced. Otherwise relinquish
+                // ownership but keep the buffer permit on the context: the body
+                // was already admitted/collected, and a later sibling with a
+                // broader config may still encode it under the same slot.
                 if identity_unacceptable
                     && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                 {
+                    ctx.release_compression_response_admission_if_owner(self.instance_id);
                     return not_acceptable_reject();
                 }
+                ctx.relinquish_compression_response_admission_ownership_if_owner(self.instance_id);
                 PluginResult::Continue
             }
         }
@@ -2043,8 +2051,9 @@ impl Plugin for CompressionPlugin {
         // blocking worker, so a slow backend holding a buffer slot never pins a
         // codec permit and cannot starve request decompression. Saturation after
         // `Content-Encoding` was committed aborts the encode; shared H1/H2/H3
-        // transform loops then restore an identity representation rather than
-        // serving plaintext under a coded header.
+        // transform loops then restore identity when acceptable, or replace with
+        // 406 when the client excluded identity — never plaintext under a coded
+        // header or against `identity;q=0`.
         let Ok(permit) = try_acquire_codec_permit() else {
             drop(buffer_permit);
             warn!("compression: codec admission saturated while encoding response body");
@@ -2064,8 +2073,8 @@ impl Plugin for CompressionPlugin {
         // — far cheaper than serving a malformed response.
         //
         // Encoder / join failure marks abort so shared transform loops restore
-        // an identity representation with correct headers instead of emitting
-        // mislabeled plaintext.
+        // identity (or 406 when identity is barred) with correct headers instead
+        // of emitting mislabeled or explicitly refused plaintext.
         let compressed = self.compress_response_body(body, encoding, permit).await;
         // Release the buffer slot only once the compressed copy exists (or the
         // encode failed): from here on nothing further is retained under this

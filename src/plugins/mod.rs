@@ -2694,6 +2694,20 @@ impl RequestContext {
         }
     }
 
+    /// Clear admission ownership for `instance_id` while leaving the reserved
+    /// buffer permit on the context. Used when this instance will not encode but
+    /// the body was already admitted onto the compression buffered path: a later
+    /// sibling with a broader config can take the same slot instead of briefly
+    /// leaving a retained body unaccounted for (or racing a fresh acquire).
+    pub(crate) fn relinquish_compression_response_admission_ownership_if_owner(
+        &mut self,
+        instance_id: u64,
+    ) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+        }
+    }
+
     pub(crate) fn set_compression_response_buffer_permit(
         &mut self,
         permit: tokio::sync::OwnedSemaphorePermit,

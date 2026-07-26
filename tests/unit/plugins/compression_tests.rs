@@ -5717,19 +5717,23 @@ async fn test_after_proxy_consumes_reserved_buffer_permit_without_reacquiring() 
 }
 
 #[tokio::test]
-async fn test_reserved_admission_released_when_response_ineligible() {
-    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+async fn test_ineligible_response_keeps_buffer_slot_for_retained_body() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_reserved_for_test,
+        take_compression_response_buffer_permit_for_test,
+    };
     use ferrum_edge::plugins::compression::with_test_response_buffer_budget;
 
-    // budget=1: after release, the freed slot must be reservable again.
+    // budget=1: an ineligible response must not free the slot while the
+    // already-admitted body remains resident (a sibling may still encode it).
     with_test_response_buffer_budget(1, || async {
         let plugin = make_plugin(json!({"min_content_length": 10}));
         let mut ctx = make_ctx(Some("gzip"));
         before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
         assert!(compression_response_admission_reserved_for_test(&ctx));
 
-        // A non-compressible content type: after_proxy declines and must release
-        // the reserved permit rather than idle it while identity streams.
+        // A non-compressible content type: after_proxy declines to encode but
+        // must leave the reserved permit on the context (ownership cleared).
         let mut resp = HashMap::new();
         resp.insert("content-type".to_string(), "image/png".to_string());
         resp.insert("content-length".to_string(), "5000".to_string());
@@ -5740,15 +5744,96 @@ async fn test_reserved_admission_released_when_response_ineligible() {
         assert!(!resp.contains_key("content-encoding"));
         assert!(
             !compression_response_admission_reserved_for_test(&ctx),
-            "an ineligible response must release the reserved response-buffer admission"
+            "an ineligible instance must clear admission ownership"
         );
 
-        // The freed slot is immediately reservable by another request.
+        // Concurrent request cannot reserve while the orphaned permit remains.
+        let mut contended = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut contended, Some("gzip")).await;
+        assert!(
+            !compression_response_admission_reserved_for_test(&contended),
+            "orphaned buffer permit must still consume the only budget slot"
+        );
+
+        let held = take_compression_response_buffer_permit_for_test(&mut ctx);
+        assert!(
+            held.is_some(),
+            "the buffer slot must remain with the retained body for sibling handoff \
+             or request-end release"
+        );
+        drop(held);
+        drop(ctx);
+
         let mut ctx2 = make_ctx(Some("gzip"));
         before_proxy_with_accept_encoding(&plugin, &mut ctx2, Some("gzip")).await;
         assert!(
             compression_response_admission_reserved_for_test(&ctx2),
-            "released permit must return to the pool for the next request"
+            "returning the kept buffer permit must refill the pool"
+        );
+    })
+    .await;
+}
+
+/// Narrow then broad sibling instances: the first reserves and declines, the
+/// second must commit from the orphaned slot without needing a second budget
+/// permit (proves no unaccounted gap between after_proxy hooks).
+#[tokio::test]
+async fn test_sibling_takes_orphaned_buffer_permit_after_ineligible_owner() {
+    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+    use ferrum_edge::plugins::compression::with_test_response_buffer_budget;
+
+    with_test_response_buffer_budget(1, || async {
+        let narrow = make_plugin(json!({
+            "algorithms": ["gzip"],
+            "content_types": ["text/html"],
+            "min_content_length": 10
+        }));
+        let broad = make_plugin(json!({
+            "algorithms": ["gzip"],
+            "content_types": ["application/json"],
+            "min_content_length": 10
+        }));
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut req_headers = HashMap::new();
+        req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+        assert!(matches!(
+            narrow.before_proxy(&mut ctx, &mut req_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            broad.before_proxy(&mut ctx, &mut req_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            compression_response_admission_reserved_for_test(&ctx),
+            "first sibling must hold the only buffer slot"
+        );
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        assert!(matches!(
+            narrow.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !resp.contains_key("content-encoding"),
+            "narrow content-type whitelist must decline to commit"
+        );
+        assert!(
+            !compression_response_admission_reserved_for_test(&ctx),
+            "declining owner must clear ownership for sibling handoff"
+        );
+
+        assert!(matches!(
+            broad.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp.get("content-encoding").map(String::as_str),
+            Some("gzip"),
+            "broader sibling must commit using the orphaned buffer permit \
+             (budget=1 forbids a fresh acquire)"
         );
     })
     .await;
