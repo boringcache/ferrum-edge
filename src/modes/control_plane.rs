@@ -637,6 +637,13 @@ fn clear_namespaced_resources(config: &mut GatewayConfig) {
     config.upstreams.clear();
 }
 
+fn remove_namespace_resources(config: &mut GatewayConfig, namespace: &str) {
+    config.proxies.retain(|p| p.namespace != namespace);
+    config.consumers.retain(|c| c.namespace != namespace);
+    config.plugin_configs.retain(|pc| pc.namespace != namespace);
+    config.upstreams.retain(|u| u.namespace != namespace);
+}
+
 fn append_namespace_resources_from(
     target: &mut GatewayConfig,
     source: &GatewayConfig,
@@ -675,6 +682,19 @@ fn append_namespace_resources_from(
     }
 }
 
+/// Replace one namespace's resources in `config` with the last-known-good copy
+/// from `previous`. Used when a namespace loaded successfully but cannot be
+/// published (e.g. its change-sequence cursor is unreadable): broadcasting is
+/// skipped, so `config_arc` must not race ahead of what DPs still hold.
+fn restore_namespace_last_known_good(
+    config: &mut GatewayConfig,
+    previous: &GatewayConfig,
+    namespace: &str,
+) {
+    remove_namespace_resources(config, namespace);
+    append_namespace_resources_from(config, previous, namespace);
+}
+
 async fn load_full_config_multi_with_sequence(
     db: &dyn DatabaseBackend,
     namespaces: &[String],
@@ -692,6 +712,9 @@ async fn load_full_config_multi_with_sequence(
     // cursor read that fails demotes just that namespace out of
     // `refreshed_namespaces` (it keeps its old cursor and is not broadcast);
     // it must not `?` and abort the reload for every other tenant (#2983).
+    // The freshly loaded resources are also reverted to last-known-good so
+    // `config_arc` / mesh full broadcasts cannot diverge from DPs that still
+    // hold the prior snapshot for that tenant.
     let mut refreshed = Vec::with_capacity(outcome.refreshed_namespaces.len());
     for ns in std::mem::take(&mut outcome.refreshed_namespaces) {
         match db.latest_change_sequence(&ns).await {
@@ -704,8 +727,10 @@ async fn load_full_config_multi_with_sequence(
                     namespace = %ns,
                     error = %error,
                     "CP could not read the change-sequence cursor for namespace after a full \
-                     reload; leaving its cursor unchanged and skipping its broadcast"
+                     reload; restoring last-known-good resources, leaving its cursor unchanged, \
+                     and skipping its broadcast"
                 );
+                restore_namespace_last_known_good(&mut outcome.config, previous, &ns);
                 outcome.failed_namespaces.push(ns);
             }
         }
@@ -918,6 +943,10 @@ async fn settle_full_reload_rejection_state(
 /// concurrent K8s reconcile can neither observe a committed-but-unbroadcast
 /// snapshot nor slip its own newer full snapshot in front of this one's
 /// broadcasts.
+///
+/// When `refreshed_namespaces` is empty, nothing is committed or broadcast —
+/// callers still settle rejection/failure state from the load outcome, and
+/// subscribers keep last-known-good.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_cp_full_reload(
     publication_gate: &CpPublicationGate,
@@ -931,6 +960,9 @@ pub(crate) fn publish_cp_full_reload(
     mesh_update_tx: &tokio::sync::broadcast::Sender<crate::grpc::mesh_server::MeshConfigBroadcast>,
     mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
 ) {
+    if refreshed_namespaces.is_empty() {
+        return;
+    }
     publication_gate.publish(move || {
         let published =
             cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config);
@@ -2352,6 +2384,17 @@ pub async fn run(
                                         next_sequences,
                                     );
                                     rejected_delta_tracker.record_accepted();
+                                    // An empty incremental does not re-validate
+                                    // the whole snapshot (#2158). If a standing
+                                    // rejection remains, schedule an
+                                    // authoritative full reload so the flag can
+                                    // clear once the full snapshot is clean —
+                                    // otherwise a self-healed tenant would leave
+                                    // `config_rejected` stuck with the tracker
+                                    // reset and no escalation path.
+                                    if config_rejected_poll.load(Ordering::Relaxed) {
+                                        force_full_reload = true;
+                                    }
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
@@ -2386,6 +2429,9 @@ pub async fn run(
                                         next_sequences,
                                     );
                                     rejected_delta_tracker.record_accepted();
+                                    if config_rejected_poll.load(Ordering::Relaxed) {
+                                        force_full_reload = true;
+                                    }
                                     database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
@@ -2579,6 +2625,18 @@ pub async fn run(
                                 }
                                 if compose.rejected.is_empty() {
                                     rejected_delta_tracker.record_accepted();
+                                    // Per-tenant isolation can accept every
+                                    // changed partition via incremental after a
+                                    // prior rejection. That must not clear
+                                    // `config_rejected` by itself (#2158: only a
+                                    // full reload re-validates the whole
+                                    // snapshot), but it also resets the
+                                    // rejection tracker — so without a forced
+                                    // full reload the standing signal would
+                                    // never clear.
+                                    if config_rejected_poll.load(Ordering::Relaxed) {
+                                        force_full_reload = true;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -3400,6 +3458,54 @@ mod tests {
 
         let retained = retained_polled_namespaces(&config);
         assert_eq!(retained, vec!["tenant-a", "tenant-b"]);
+    }
+
+    #[test]
+    fn restore_namespace_last_known_good_replaces_only_that_tenant() {
+        let mut previous = GatewayConfig::default();
+        let mut old_a = make_proxy("a-old");
+        old_a.namespace = "ns-a".to_string();
+        let mut old_b = make_proxy("b-old");
+        old_b.namespace = "ns-b".to_string();
+        previous.proxies.extend([old_a, old_b]);
+
+        let mut loaded = GatewayConfig::default();
+        let mut new_a = make_proxy("a-new");
+        new_a.namespace = "ns-a".to_string();
+        let mut new_b = make_proxy("b-new");
+        new_b.namespace = "ns-b".to_string();
+        loaded.proxies.extend([new_a, new_b]);
+
+        restore_namespace_last_known_good(&mut loaded, &previous, "ns-b");
+
+        assert!(
+            loaded.proxies.iter().any(|p| p.id == "a-new"),
+            "sibling namespace must keep the freshly loaded resources"
+        );
+        assert!(
+            loaded.proxies.iter().any(|p| p.id == "b-old"),
+            "demoted namespace must revert to last-known-good"
+        );
+        assert!(
+            !loaded.proxies.iter().any(|p| p.id == "b-new"),
+            "demoted namespace must not retain the unpublished load"
+        );
+    }
+
+    #[test]
+    fn standing_rejection_forces_full_reload_after_clean_incremental() {
+        // Pin the #2158 recovery contract under per-tenant isolation: once
+        // an incremental tick accepts (or finds nothing to apply) while
+        // `config_rejected` is still set, the poll loop must schedule a full
+        // reload rather than clearing the rejection tracker and leaving the
+        // standing signal permanently stuck.
+        let source = include_str!("control_plane.rs");
+        let marker = "if config_rejected_poll.load(Ordering::Relaxed) {\n                                        force_full_reload = true;";
+        assert!(
+            source.matches(marker).count() >= 3,
+            "empty-result, empty-partition, and all-accepted incremental paths \
+             must force a full reload while config_rejected is set"
+        );
     }
 
     #[test]
