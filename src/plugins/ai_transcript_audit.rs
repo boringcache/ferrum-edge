@@ -1529,14 +1529,33 @@ impl AiTranscriptAudit {
         // iterates in `HashMap` order, so dropping mid-scan would pick a
         // different surviving subset run to run. Truncating the sorted
         // `BTreeMap` keeps the retained set stable for a given input.
+        //
+        // Only the per-instance `ai_semantic_cache.<id>.*` entries are
+        // truncated. The fixed-name producer keys (legacy `ai_cache_*` and
+        // `request_deduplication.replayed`) are a closed set of four and are
+        // not a cardinality axis, but they sort around the namespaced block —
+        // `request_deduplication.replayed` sorts after all of it — so a plain
+        // sorted truncation would discard the documented replay marker first
+        // while keeping an eleventh cache instance's status. Retaining them
+        // first keeps the cap at 32 total entries and keeps the record's
+        // per-request signals present regardless of chain width.
         if harvest.cache.len() > MAX_CACHE_TELEMETRY_ENTRIES {
+            let fixed_name_entries = harvest
+                .cache
+                .keys()
+                .filter(|key| !is_namespaced_cache_telemetry_key(key.as_str()))
+                .count();
+            let namespaced_budget = MAX_CACHE_TELEMETRY_ENTRIES.saturating_sub(fixed_name_entries);
             let boundary = harvest
                 .cache
                 .keys()
-                .nth(MAX_CACHE_TELEMETRY_ENTRIES)
+                .filter(|key| is_namespaced_cache_telemetry_key(key.as_str()))
+                .nth(namespaced_budget)
                 .cloned();
             if let Some(boundary) = boundary {
-                harvest.cache.retain(|key, _| *key < boundary);
+                harvest.cache.retain(|key, _| {
+                    !is_namespaced_cache_telemetry_key(key.as_str()) || *key < boundary
+                });
             }
         }
         // `ai_provider` wins; fall back to the federation name only when no
@@ -3036,7 +3055,10 @@ fn fired_metadata_value(value: &str) -> bool {
 /// proxy. The cap keeps a misconfigured or future many-instance chain from
 /// widening the record and the collector's key space without bound. Truncation
 /// runs after the scan against the sorted `BTreeMap`, so the surviving subset
-/// is stable rather than `HashMap`-iteration-order dependent.
+/// is stable rather than `HashMap`-iteration-order dependent, and it applies
+/// only to the per-instance axis: the four fixed-name producer keys are
+/// retained first so a wide cache chain cannot displace the record's
+/// `request_deduplication.replayed` marker.
 const MAX_CACHE_TELEMETRY_ENTRIES: usize = 32;
 
 /// Longest cache-telemetry value retained. Every admitted value is already
@@ -3098,6 +3120,14 @@ fn semantic_cache_telemetry_suffix(key: &str) -> Option<&'static str> {
         return None;
     }
     cache_telemetry_field(suffix)
+}
+
+/// True for an admitted key on the per-instance `ai_semantic_cache.<id>.*`
+/// axis — the only part of the `cache` section whose width grows with the
+/// number of configured cache instances, and therefore the only part the
+/// entry cap truncates.
+fn is_namespaced_cache_telemetry_key(key: &str) -> bool {
+    semantic_cache_telemetry_suffix(key).is_some()
 }
 
 /// Classify a metadata key as exportable cache telemetry, returning the

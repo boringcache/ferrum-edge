@@ -2993,7 +2993,11 @@ async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
 }
 
 /// Oversized multi-instance chains must truncate the `cache` section in sorted
-/// key order (not `HashMap` iteration order) so the surviving subset is stable.
+/// key order (not `HashMap` iteration order) so the surviving subset is stable,
+/// and only along the per-instance axis: the fixed-name producer keys sort
+/// around the `ai_semantic_cache.*` block — `request_deduplication.replayed`
+/// sorts after all of it — so a plain sorted cut would drop the documented
+/// replay marker before an eleventh cache instance's status.
 #[tokio::test]
 async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
     let server = mock_sink().await;
@@ -3011,16 +3015,26 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
 
-    let mut expected = std::collections::BTreeMap::new();
+    // Two fixed-name keys: one sorting before the namespaced block, one after.
+    let fixed: &[(&str, &str)] = &[
+        ("ai_cache_status", "BYPASS"),
+        ("request_deduplication.replayed", "true"),
+    ];
+    for &(key, value) in fixed {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+    // 40 instances against a 32-entry cap with 2 fixed-name keys reserved
+    // leaves a 30-entry budget on the per-instance axis.
+    let mut expected_namespaced = std::collections::BTreeMap::new();
     for instance_id in 0..40u64 {
         let key = format!("ai_semantic_cache.{instance_id}.cache_status");
         let value = if instance_id % 2 == 0 { "HIT" } else { "MISS" };
         ctx.metadata.insert(key.clone(), value.to_string());
-        expected.insert(key, value.to_string());
+        expected_namespaced.insert(key, value.to_string());
     }
-    let boundary = expected.keys().nth(32).cloned();
+    let boundary = expected_namespaced.keys().nth(30).cloned();
     if let Some(boundary) = boundary {
-        expected.retain(|key, _| *key < boundary);
+        expected_namespaced.retain(|key, _| *key < boundary);
     }
 
     plugin
@@ -3032,8 +3046,15 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
         .as_object()
         .expect("cache section is an object");
     assert_eq!(cache.len(), 32);
-    assert_eq!(expected.len(), 32);
-    for (key, value) in &expected {
+    assert_eq!(expected_namespaced.len(), 30);
+    for &(key, value) in fixed {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value),
+            "the per-instance cap displaced fixed-name producer key {key}"
+        );
+    }
+    for (key, value) in &expected_namespaced {
         assert_eq!(
             cache.get(key).and_then(|entry| entry.as_str()),
             Some(value.as_str()),
@@ -3042,7 +3063,8 @@ async fn cache_telemetry_section_caps_at_thirty_two_sorted_keys() {
     }
     for key in cache.keys() {
         assert!(
-            expected.contains_key(key),
+            expected_namespaced.contains_key(key)
+                || fixed.iter().any(|&(fixed_key, _)| fixed_key == key),
             "unsorted survivor {key} escaped the sorted cap"
         );
     }
