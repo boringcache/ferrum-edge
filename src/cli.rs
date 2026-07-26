@@ -485,7 +485,7 @@ pub fn execute_validate() -> Result<(), String> {
     // Env-level TLS/security surfaces that `run` hard-fails on must also fail
     // `validate`. Shared loaders in `modes::startup_security` are side-effect
     // free (no binds, no servers, no store mutation, no random JWT mint).
-    let security_scope = StartupSecurityScope::for_mode(env_config.mode);
+    let security_scope = StartupSecurityScope::for_mode(&env_config.mode);
     if !security_scope.is_empty() {
         load_startup_security(&env_config).map_err(|e| {
             format!("Startup security validation failed: {}", e)

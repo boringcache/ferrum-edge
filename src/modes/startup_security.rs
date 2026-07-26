@@ -11,6 +11,8 @@
 //! mint random secrets, or resolve unrelated external state beyond what
 //! startup necessarily validates (local/materialized TLS sources and env).
 
+use std::sync::Arc;
+
 use crate::admin::MetricsAuthPolicy;
 use crate::config::env_config::{EnvConfig, OperatingMode};
 use crate::proxy::client_ip::TrustedProxies;
@@ -40,7 +42,7 @@ impl StartupSecurityScope {
     /// node_agent mint a random secret on unset (a serve-time side effect),
     /// while database/cp/dp require a secret — validate covers the TLS/CIDR/
     /// metrics loaders listed in issue #2976 without changing JWT semantics.
-    pub fn for_mode(mode: OperatingMode) -> Self {
+    pub fn for_mode(mode: &OperatingMode) -> Self {
         match mode {
             OperatingMode::File | OperatingMode::Database | OperatingMode::DataPlane => Self {
                 tls_policy_and_crls: true,
@@ -104,15 +106,15 @@ pub struct StartupSecurityMaterials {
     pub crls: CrlList,
     pub admin_allowed_cidrs: Option<TrustedProxies>,
     pub metrics_auth: Option<MetricsAuthPolicy>,
-    pub frontend_tls: Option<rustls::ServerConfig>,
-    pub admin_tls: Option<rustls::ServerConfig>,
+    pub frontend_tls: Option<Arc<rustls::ServerConfig>>,
+    pub admin_tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl StartupSecurityMaterials {
     fn empty() -> Self {
         Self {
             tls_policy: None,
-            crls: std::sync::Arc::new(Vec::new()),
+            crls: Arc::new(Vec::new()),
             admin_allowed_cidrs: None,
             metrics_auth: None,
             frontend_tls: None,
@@ -127,7 +129,7 @@ impl StartupSecurityMaterials {
 pub fn load_startup_security(
     env_config: &EnvConfig,
 ) -> Result<StartupSecurityMaterials, anyhow::Error> {
-    let scope = StartupSecurityScope::for_mode(env_config.mode);
+    let scope = StartupSecurityScope::for_mode(&env_config.mode);
     load_startup_security_with_scope(env_config, scope)
 }
 
@@ -226,7 +228,7 @@ pub fn try_load_frontend_tls(
     env_config: &EnvConfig,
     tls_policy: &TlsPolicy,
     crls: &CrlList,
-) -> Result<Option<rustls::ServerConfig>, anyhow::Error> {
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
         &env_config.frontend_tls_key_path,
@@ -258,7 +260,7 @@ pub fn try_load_admin_tls(
     tls_policy: &TlsPolicy,
     crls: &CrlList,
     error_label: &str,
-) -> Result<Option<rustls::ServerConfig>, anyhow::Error> {
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     if !env_config.admin_https_listener_enabled() {
         return Ok(None);
     }
@@ -275,7 +277,7 @@ pub fn load_admin_tls_material(
     tls_policy: &TlsPolicy,
     crls: &CrlList,
     error_label: &str,
-) -> Result<rustls::ServerConfig, anyhow::Error> {
+) -> Result<Arc<rustls::ServerConfig>, anyhow::Error> {
     let (Some(admin_cert), Some(admin_key)) = (
         &env_config.admin_tls_cert_path,
         &env_config.admin_tls_key_path,
@@ -331,7 +333,7 @@ pub fn validate_dtls_material(env_config: &EnvConfig) -> Result<(), anyhow::Erro
 /// fallbacks stay on the mesh serve path (they need runtime slots).
 fn load_mesh_explicit_frontend_tls(
     env_config: &EnvConfig,
-) -> Result<Option<rustls::ServerConfig>, anyhow::Error> {
+) -> Result<Option<Arc<rustls::ServerConfig>>, anyhow::Error> {
     let (Some(cert_path), Some(key_path)) = (
         env_config.frontend_tls_cert_path.as_deref(),
         env_config.frontend_tls_key_path.as_deref(),
@@ -342,7 +344,7 @@ fn load_mesh_explicit_frontend_tls(
     // `load_mesh_server_identity` validates expiry + key match. We do not need
     // the resulting identity for validate; discard it after a successful load.
     // Returning `None` for `frontend_tls` materials keeps the field meaning
-    // "standard ServerConfig" while still failing closed on bad material.
+    // "standard Arc<ServerConfig>" while still failing closed on bad material.
     let _identity = tls::load_mesh_server_identity(
         cert_path,
         key_path,

@@ -61,7 +61,7 @@ fn scope_for_proxy_modes_includes_frontend_admin_and_dtls() {
         OperatingMode::Database,
         OperatingMode::DataPlane,
     ] {
-        let scope = StartupSecurityScope::for_mode(mode);
+        let scope = StartupSecurityScope::for_mode(&mode);
         assert!(scope.tls_policy_and_crls);
         assert!(scope.admin_cidrs_and_metrics);
         assert!(scope.frontend_tls);
@@ -72,7 +72,7 @@ fn scope_for_proxy_modes_includes_frontend_admin_and_dtls() {
 
 #[test]
 fn scope_for_cp_skips_frontend_and_dtls() {
-    let scope = StartupSecurityScope::for_mode(OperatingMode::ControlPlane);
+    let scope = StartupSecurityScope::for_mode(&OperatingMode::ControlPlane);
     assert!(scope.tls_policy_and_crls);
     assert!(scope.admin_cidrs_and_metrics);
     assert!(!scope.frontend_tls);
@@ -82,8 +82,8 @@ fn scope_for_cp_skips_frontend_and_dtls() {
 
 #[test]
 fn scope_for_migrate_and_injector_is_empty() {
-    assert!(StartupSecurityScope::for_mode(OperatingMode::Migrate).is_empty());
-    assert!(StartupSecurityScope::for_mode(OperatingMode::Injector).is_empty());
+    assert!(StartupSecurityScope::for_mode(&OperatingMode::Migrate).is_empty());
+    assert!(StartupSecurityScope::for_mode(&OperatingMode::Injector).is_empty());
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn cp_scope_ignores_frontend_tls_paths() {
     env.frontend_tls_cert_path = Some("/nonexistent/frontend.pem".to_string());
     env.frontend_tls_key_path = Some("/nonexistent/frontend-key.pem".to_string());
 
-    load_startup_security_with_scope(&env, StartupSecurityScope::for_mode(env.mode))
+    load_startup_security_with_scope(&env, StartupSecurityScope::for_mode(&env.mode))
         .expect("CP scope must skip frontend TLS paths");
 }
 
