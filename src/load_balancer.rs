@@ -363,6 +363,47 @@ fn wrr_counter_shard() -> usize {
     })
 }
 
+/// RoundRobin / Random / LeastLatency warm-up / locality-distribute selection
+/// counters. Reuses [`WRR_COUNTER_SHARDS`] and [`wrr_counter_shard`] so every
+/// hot-path ticket advance stays on a per-worker [`CachePadded`] line instead of
+/// bouncing a single shared `AtomicU64` that sat adjacent to read-per-selection
+/// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
+type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
+
+/// Odd multiplicative stride (golden-ratio fraction of 2^64) giving each
+/// selection-counter shard a distinct starting phase at construction.
+///
+/// Matches the non-zero WRR schedule seed stride in [`WrrSchedule::with_seed`]:
+/// an all-zero init would remove cache-line contention but leave every shard
+/// lockstep on the same first-wave target / random sequence / distribute bucket.
+/// The constant is odd (invertible mod 2^64); under wrapping multiplication the
+/// per-shard phases do not collapse onto one residue for the small target counts
+/// and weighted bucket totals exercised on these paths (e.g. mod 2 they alternate).
+const SELECTION_COUNTER_PHASE_STRIDE: u64 = 0x9E3779B97F4A7C15;
+
+/// Fresh selection-counter shards for a parent, port, or locality-distribute lane.
+///
+/// Each shard starts at `i × SELECTION_COUNTER_PHASE_STRIDE` so concurrent
+/// workers that begin a wave together do not all pick the same RR offset,
+/// Random hash seed, or locality-distribute bucket. Contention avoidance still
+/// comes from per-shard [`CachePadded`] ownership; long-run ratios stay even
+/// because each shard is itself a full RR / random / weighted-bucket walk.
+/// Within one shard the ticket stream remains deterministic.
+#[inline]
+fn new_selection_counters() -> SelectionCounterShards {
+    std::array::from_fn(|i| {
+        CachePadded::new(AtomicU64::new(
+            (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+        ))
+    })
+}
+
+/// Advance the calling thread's selection-counter shard and return the ticket.
+#[inline]
+fn selection_counter_ticket(counters: &SelectionCounterShards) -> u64 {
+    counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed)
+}
+
 /// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
 ///
 /// # Concurrency / distribution tradeoff
@@ -945,17 +986,59 @@ fn target_is_cross_cluster(target: &UpstreamTarget) -> bool {
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
+/// Used only when comparing among **unwarmed** candidates (bounded
+/// exploration). Warmed targets are never displaced by an unconditional
+/// biased-best preference for an unsampled peer — see
+/// `LATENCY_WARMUP_EXPLORE_PERMILLE`.
+///
 /// **Behavioral note:** any nonzero bias value (including `1`) produces the
-/// same selection outcome because `saturating_sub(N)` for any `N >= 1` makes
-/// the unsampled target strictly less than the minimum warmed EWMA when
-/// `min_known_ewma > 0`, and saturates to `0` (a tie broken by iteration
-/// order) when `min_known_ewma == 0`.
+/// same selection outcome among unwarmed peers because `saturating_sub(N)`
+/// for any `N >= 1` makes the unsampled target strictly less than the
+/// minimum warmed EWMA when `min_known_ewma > 0`, and saturates to `0` (a tie
+/// broken by iteration order) when `min_known_ewma == 0`.
 ///
 /// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
 /// the intended preference gap in human-readable latency units and makes the
 /// warm-up strategy greppable and self-documenting, replacing a bare magic
 /// literal.
+#[allow(dead_code)] // policy-anchor constant; mixed warm-up now uses bounded exploration
 const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
+
+/// Permille (‰) of mixed-warm-up selections that explore sub-threshold
+/// (unwarmed) targets via round-robin among them.
+///
+/// Bounds late-joiner / never-sampled exploration so a persistently failing
+/// unsampled target cannot pin 100% of traffic. Healthy late joiners still
+/// receive a fair share of exploration traffic to establish a baseline.
+const LATENCY_WARMUP_EXPLORE_PERMILLE: u64 = 100; // 10%
+
+/// Select an unwarmed peer slot for a mixed-warm-up ticket.
+///
+/// Uses a golden-ratio scramble of `ticket` so short observation windows
+/// still see ~`LATENCY_WARMUP_EXPLORE_PERMILLE` rate and distribute those
+/// selections across every unwarmed peer. A contiguous
+/// `ticket % 1000 < permille` test fails that contract: the first 200
+/// selections after a zeroed counter would explore 50% of the time, while
+/// deriving the peer slot from `ticket / 1000` would send that whole window to
+/// one late joiner.
+#[inline]
+fn unwarmed_explore_slot(ticket: u64, unwarmed_count: usize) -> Option<usize> {
+    if unwarmed_count == 0 {
+        return None;
+    }
+    let scrambled = golden_ratio_hash(ticket);
+    if (scrambled % 1000) >= LATENCY_WARMUP_EXPLORE_PERMILLE {
+        return None;
+    }
+    Some(((scrambled / 1000) % unwarmed_count as u64) as usize)
+}
+
+/// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
+/// attempt. Counts toward the warm-up threshold and penalizes the target so
+/// a target that fails every request exits warm-up with a poor score instead
+/// of remaining biased-best forever. 1 second is deliberately worse than
+/// typical healthy TTFB while still finite for EWMA math.
+const LATENCY_FAILURE_PENALTY_US: u64 = 1_000_000;
 
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
@@ -1654,6 +1737,15 @@ impl LoadBalancerCache {
         }
     }
 
+    /// Record a failed dispatch attempt for least-latency warm-up (see
+    /// [`LoadBalancer::record_failed_attempt`]).
+    pub fn record_failed_attempt(&self, upstream_id: &str, target: &UpstreamTarget) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
+            balancer.record_failed_attempt(target);
+        }
+    }
+
     /// Reset the latency EWMA for a target to the current minimum among healthy
     /// targets. Called when a target recovers from unhealthy status so it gets a
     /// fair chance at traffic instead of being penalized by a stale high EWMA.
@@ -1727,7 +1819,7 @@ fn build_locality_lb_state(
             enabled: false,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     }
@@ -1741,7 +1833,7 @@ fn build_locality_lb_state(
             enabled: true,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     };
@@ -1904,7 +1996,7 @@ fn build_locality_lb_state(
         enabled: true,
         distribute_weights,
         distribute_groups,
-        distribute_counter: AtomicU64::new(0),
+        distribute_counter: new_selection_counters(),
         failover_target_matches,
     })
 }
@@ -2010,8 +2102,9 @@ pub struct LoadBalancer {
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
-    /// Round-robin counter.
-    rr_counter: AtomicU64,
+    /// Round-robin / random / least-latency warm-up selection counters.
+    /// Sharded and cache-line padded; see [`SelectionCounterShards`].
+    rr_counter: SelectionCounterShards,
     /// Weighted round-robin lane state (smooth weighted round-robin).
     /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
     wrr_state: WrrLaneState,
@@ -2115,9 +2208,10 @@ struct LocalityLbState {
     /// picks one bucket by the configured locality share, then runs the
     /// upstream / port / subset algorithm inside that bucket.
     distribute_groups: Option<Vec<LocalityDistributeGroup>>,
-    /// Independent counter for weighted locality-bucket selection. This keeps
-    /// the endpoint algorithm's own counter cadence unchanged.
-    distribute_counter: AtomicU64,
+    /// Independent counters for weighted locality-bucket selection. This keeps
+    /// the endpoint algorithm's own counter cadence unchanged. Sharded and
+    /// cache-line padded; see [`SelectionCounterShards`].
+    distribute_counter: SelectionCounterShards,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
     /// `true` when the target's locality region matches the failover `to`
     /// region for this source. `None` when no `failover[]` entry matched
@@ -2137,7 +2231,7 @@ struct PortLbState {
     target_indices: Vec<usize>,
     algorithm: LoadBalancerAlgorithm,
     algorithm_overridden: bool,
-    rr_counter: AtomicU64,
+    rr_counter: SelectionCounterShards,
     wrr_state: WrrLaneState,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
@@ -2381,7 +2475,7 @@ impl LoadBalancer {
                         target_indices,
                         algorithm: effective_algorithm,
                         algorithm_overridden: override_config.algorithm.is_some(),
-                        rr_counter: AtomicU64::new(0),
+                        rr_counter: new_selection_counters(),
                         wrr_state,
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
@@ -2444,7 +2538,7 @@ impl LoadBalancer {
             target_locality_ranks,
             target_index,
             algorithm,
-            rr_counter: AtomicU64::new(0),
+            rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
                 WrrLaneState::new(targets.len())
             } else {
@@ -2531,6 +2625,16 @@ impl LoadBalancer {
         }
     }
 
+    /// Record a failed dispatch attempt for least-latency warm-up accounting.
+    ///
+    /// Failed attempts (connection errors / 5xx) never previously counted toward
+    /// `latency_sample_count`, so a persistently failing target stayed forever
+    /// in the biased warm-up state. A synthetic penalty sample both exits
+    /// warm-up and keeps the EWMA from looking artificially fast.
+    pub fn record_failed_attempt(&self, target: &UpstreamTarget) {
+        self.record_latency(target, LATENCY_FAILURE_PENALTY_US);
+    }
+
     pub fn record_connection_start(&self, target: &UpstreamTarget) {
         let key = self.find_target_key(target).unwrap_or("");
         if key.is_empty() {
@@ -2610,6 +2714,83 @@ impl LoadBalancer {
         self.wrr_state.schedule_counters()
     }
 
+    /// Snapshot parent selection-counter shard phases (init offsets + any advances).
+    ///
+    /// Crate-private test seam (routed through `_test_support`): lets coverage
+    /// assert distinct construction-time phases without depending on OS thread →
+    /// shard assignment. The library target exposes this through `_test_support`;
+    /// the binary target compiles this module without that bridge, so the helper
+    /// is intentionally unused there.
+    #[allow(dead_code)]
+    pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
+        std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
+    }
+
+    /// One RoundRobin pick driven by an explicit counter shard.
+    ///
+    /// Crate-private test seam (routed through `_test_support`): bypasses
+    /// [`wrr_counter_shard`] so first-wave correlation across shards is asserted
+    /// without barriers or scheduling. See
+    /// [`Self::selection_counter_phases_for_test`] for the bin-target dead-code note.
+    #[allow(dead_code)]
+    pub(crate) fn select_round_robin_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(
+            &self.targets[(ticket as usize) % self.targets.len()],
+        ))
+    }
+
+    /// One Random pick driven by an explicit counter shard (same golden-ratio
+    /// mapping as the production Random path).
+    ///
+    /// Crate-private test seam: see [`Self::select_round_robin_from_shard_for_test`].
+    #[allow(dead_code)]
+    pub(crate) fn select_random_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
+        let hash = golden_ratio_hash(ticket) as usize;
+        Some(Arc::clone(&self.targets[hash % self.targets.len()]))
+    }
+
+    /// First-wave locality-distribute bucket moduli across shards for `total`.
+    ///
+    /// Crate-private test seam (routed through `_test_support`): peeks each
+    /// distribute-counter phase and applies the same
+    /// `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
+    /// See [`Self::selection_counter_phases_for_test`] for the bin-target
+    /// dead-code note.
+    #[allow(dead_code)]
+    pub(crate) fn distribute_first_wave_bucket_mods_for_test(
+        &self,
+        total: u64,
+    ) -> Option<Vec<u64>> {
+        if total == 0 {
+            return None;
+        }
+        let state = self.locality_lb.as_ref()?;
+        Some(
+            (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let raw = state.distribute_counter[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(raw) % total
+                })
+                .collect(),
+        )
+    }
+
     /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
     /// Returns the internal (non-upstream-scoped) key used for active connections,
     /// latency EWMA, and hash ring lookups within this LoadBalancer instance.
@@ -2669,8 +2850,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                let ejected_at_ms = *entry;
-                passive_ejected.push((i, ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             bitset.set(i);
@@ -2721,7 +2901,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             bitset.set(i);
@@ -2779,7 +2959,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 return;
             }
             bitset.set(i);
@@ -2822,7 +3002,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             healthy.push((i, target));
@@ -2873,7 +3053,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             healthy.push((i, target));
@@ -3254,11 +3434,11 @@ impl LoadBalancer {
         ctx_key: &str,
         total: u64,
         algorithm: LoadBalancerAlgorithm,
-        distribute_counter: &AtomicU64,
+        distribute_counter: &SelectionCounterShards,
     ) -> u64 {
         let raw = match algorithm {
             LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
-            _ => distribute_counter.fetch_add(1, Ordering::Relaxed),
+            _ => selection_counter_ticket(distribute_counter),
         };
         golden_ratio_hash(raw) % total
     }
@@ -3833,7 +4013,10 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn port_subset_rr_counter<'a>(&'a self, port_state: &'a PortLbState) -> &'a AtomicU64 {
+    fn port_subset_rr_counter<'a>(
+        &'a self,
+        port_state: &'a PortLbState,
+    ) -> &'a SelectionCounterShards {
         if port_state.algorithm_overridden {
             &port_state.rr_counter
         } else {
@@ -3919,7 +4102,7 @@ impl LoadBalancer {
         ctx_key: &str,
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -3941,7 +4124,7 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the fallback after the
             // request path's orig-dst match missed; behave as round-robin.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 let target_idx = if all {
                     idx % self.targets.len()
                 } else {
@@ -3950,7 +4133,7 @@ impl LoadBalancer {
                 Some(Arc::clone(&self.targets[target_idx]))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 let target_idx = if all {
                     hash % self.targets.len()
@@ -4023,7 +4206,7 @@ impl LoadBalancer {
         ctx_key: &str,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -4044,11 +4227,11 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the round-robin
             // fallback after the request path's orig-dst match missed.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
@@ -4953,7 +5136,7 @@ impl LoadBalancer {
     fn select_least_latency_bitset(
         &self,
         healthy: &HealthBitset,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         let hcount = healthy.count();
         if hcount == 0 {
@@ -4962,6 +5145,7 @@ impl LoadBalancer {
 
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
+        let mut unwarmed_count = 0usize;
 
         for i in 0..self.targets.len() {
             if !healthy.contains(i) {
@@ -4975,6 +5159,8 @@ impl LoadBalancer {
                 .unwrap_or(0);
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
+            } else {
+                unwarmed_count += 1;
             }
             if samples > 0 {
                 any_has_data = true;
@@ -4983,33 +5169,78 @@ impl LoadBalancer {
 
         // Initial warm-up: round-robin so all targets get baseline measurements.
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let all_warmed_up = warmed_count == hcount;
+        let all_warmed_up = unwarmed_count == 0;
 
-        // Find minimum EWMA among warmed candidates (for optimistic fallback).
-        let min_known_ewma = if !all_warmed_up {
-            let mut min_val = LATENCY_UNSET;
+        // Mixed warm-up: bound exploration of sub-threshold targets so a
+        // never-sampled / persistently failing peer cannot pin all traffic.
+        // Explore with a fixed permille of selections via RR among unwarmed;
+        // otherwise pick the best warmed EWMA.
+        if !all_warmed_up {
+            let ticket = selection_counter_ticket(rr_counter);
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
+                // Round-robin among unwarmed healthy targets only.
+                for i in 0..self.targets.len() {
+                    if !healthy.contains(i) {
+                        continue;
+                    }
+                    let samples = self
+                        .latency_sample_count
+                        .get(&self.host_port_keys[i])
+                        .map(|v| v.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    if samples >= LATENCY_WARMUP_THRESHOLD {
+                        continue;
+                    }
+                    if skip == 0 {
+                        return Some(Arc::clone(&self.targets[i]));
+                    }
+                    skip -= 1;
+                }
+                // Fall through to warmed selection if unwarmed set raced empty.
+            }
+
+            let mut best_latency = u64::MAX;
+            let mut best_idx = 0;
+            let mut found = false;
             for i in 0..self.targets.len() {
                 if !healthy.contains(i) {
                     continue;
                 }
-                if let Some(v) = self.latency_ewma.get(&self.host_port_keys[i]) {
-                    let val = v.load(Ordering::Relaxed);
-                    if val != LATENCY_UNSET && val < min_val {
-                        min_val = val;
-                    }
+                let key = &self.host_port_keys[i];
+                let samples = self
+                    .latency_sample_count
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if samples < LATENCY_WARMUP_THRESHOLD {
+                    continue;
+                }
+                let latency = self
+                    .latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET);
+                if !found || latency < best_latency {
+                    best_latency = latency;
+                    best_idx = i;
+                    found = true;
                 }
             }
-            min_val
-        } else {
-            0 // unused when all warmed up
-        };
+            if found && best_latency != LATENCY_UNSET {
+                return Some(Arc::clone(&self.targets[best_idx]));
+            }
+            // No usable warmed EWMA — fall back to RR across healthy set.
+            let idx = ticket as usize;
+            let target_idx = healthy.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
 
-        // Select the candidate with the lowest EWMA.
+        // Steady-state: all healthy candidates are warmed — pick lowest EWMA.
         let mut best_latency = u64::MAX;
         let mut best_idx = 0;
         let mut found = false;
@@ -5019,21 +5250,11 @@ impl LoadBalancer {
                 continue;
             }
             let key = &self.host_port_keys[i];
-            let samples = self
-                .latency_sample_count
+            let latency = self
+                .latency_ewma
                 .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
-                self.latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET)
-            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
-            } else {
-                LATENCY_UNSET
-            };
+                .unwrap_or(LATENCY_UNSET);
             if !found || latency < best_latency {
                 best_latency = latency;
                 best_idx = i;
@@ -5042,7 +5263,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -5129,8 +5350,11 @@ impl LoadBalancer {
     /// **Warm-up phase**: At initial startup, round-robin is used until every
     /// healthy candidate has at least `LATENCY_WARMUP_THRESHOLD` samples.
     ///
-    /// **Late joiners / recovery**: Targets without data are treated as having
-    /// the current minimum EWMA (optimistic assumption).
+    /// **Late joiners / recovery**: Sub-threshold targets receive a bounded
+    /// fraction of selections (see `LATENCY_WARMUP_EXPLORE_PERMILLE`) via
+    /// round-robin among unwarmed peers — never an unconditional preference
+    /// over warmed targets. Failed attempts count toward the warm-up threshold
+    /// with a penalty EWMA sample.
     ///
     /// **Steady-state**: Selects the candidate with the lowest EWMA value.
     ///
@@ -5138,7 +5362,7 @@ impl LoadBalancer {
     fn select_least_latency_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
@@ -5146,6 +5370,7 @@ impl LoadBalancer {
 
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
+        let mut unwarmed_count = 0usize;
         for (idx, _) in candidates {
             let key = &self.host_port_keys[*idx];
             let samples = self
@@ -5155,6 +5380,8 @@ impl LoadBalancer {
                 .unwrap_or(0);
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
+            } else {
+                unwarmed_count += 1;
             }
             if samples > 0 {
                 any_has_data = true;
@@ -5162,56 +5389,80 @@ impl LoadBalancer {
         }
 
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
-        let all_warmed_up = warmed_count == candidates.len();
+        let all_warmed_up = unwarmed_count == 0;
 
-        let min_known_ewma = if !all_warmed_up {
-            candidates
-                .iter()
-                .filter_map(|(idx, _)| {
-                    let key = &self.host_port_keys[*idx];
-                    self.latency_ewma
-                        .get(key)
+        if !all_warmed_up {
+            let ticket = selection_counter_ticket(rr_counter);
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
+                for candidate in candidates {
+                    let samples = self
+                        .latency_sample_count
+                        .get(&self.host_port_keys[candidate.0])
                         .map(|v| v.load(Ordering::Relaxed))
-                        .filter(|&v| v != LATENCY_UNSET)
-                })
-                .min()
-                .unwrap_or(LATENCY_UNSET)
-        } else {
-            0
-        };
+                        .unwrap_or(0);
+                    if samples >= LATENCY_WARMUP_THRESHOLD {
+                        continue;
+                    }
+                    if skip == 0 {
+                        return Some(Arc::clone(candidate.1));
+                    }
+                    skip -= 1;
+                }
+            }
+
+            let mut best_latency = u64::MAX;
+            let mut best = candidates[0];
+            let mut found = false;
+            for candidate in candidates {
+                let key = &self.host_port_keys[candidate.0];
+                let samples = self
+                    .latency_sample_count
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if samples < LATENCY_WARMUP_THRESHOLD {
+                    continue;
+                }
+                let latency = self
+                    .latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET);
+                if !found || latency < best_latency {
+                    best_latency = latency;
+                    best = *candidate;
+                    found = true;
+                }
+            }
+            if found && best_latency != LATENCY_UNSET {
+                return Some(Arc::clone(best.1));
+            }
+            let idx = ticket as usize;
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
+        }
 
         let mut best_latency = u64::MAX;
-        let mut best = &candidates[0];
+        let mut best = candidates[0];
 
         for candidate in candidates {
             let key = &self.host_port_keys[candidate.0];
-            let samples = self
-                .latency_sample_count
+            let latency = self
+                .latency_ewma
                 .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
-                self.latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET)
-            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
-            } else {
-                LATENCY_UNSET
-            };
+                .unwrap_or(LATENCY_UNSET);
             if latency < best_latency {
                 best_latency = latency;
-                best = candidate;
+                best = *candidate;
             }
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -5347,6 +5598,52 @@ mod tests {
                 .any(|c| c.load(Ordering::Relaxed) != first),
             "zero-weight shards must be phase-distributed"
         );
+    }
+
+    #[test]
+    fn selection_counter_shards_use_golden_phase_stride() {
+        let counters = new_selection_counters();
+        for (i, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+                "shard {i} phase"
+            );
+        }
+        let first = counters[0].load(Ordering::Relaxed);
+        assert!(
+            counters.iter().any(|c| c.load(Ordering::Relaxed) != first),
+            "selection counter shards must be phase-distributed"
+        );
+    }
+
+    #[test]
+    fn selection_counter_phase_stride_avoids_small_modulo_lockstep() {
+        // Independently check RR target counts and weighted-bucket totals used
+        // on the hot path: an all-zero init collapses every shard onto residue 0.
+        let counters = new_selection_counters();
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| counters[i].load(Ordering::Relaxed) % modulus)
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
+        // Random / distribute consume golden_ratio_hash(ticket) before modulo.
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let ticket = counters[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(ticket) % modulus
+                })
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "hashed phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
     }
 
     #[test]

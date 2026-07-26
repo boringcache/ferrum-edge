@@ -43,6 +43,7 @@ use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
 use crate::grpc::mesh_server::MeshGrpcServer;
+use crate::modes::file::ListenerJoinHandle;
 use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 use crate::xds::XdsAdsServer;
@@ -573,16 +574,10 @@ impl CpRejectedDeltaTracker {
 /// Partition an `IncrementalResult` by `namespace`, returning a delta for
 /// each namespace that has at least one changed or removed resource.
 ///
-/// Resources are matched by their `namespace` field; removed IDs are
-/// partitioned via lookups built from the CP's current accepted config so
-/// deletions reach the right per-namespace channel. Consumer lookup keys are
-/// `(namespace, id)` because consumer IDs are namespace-local.
+/// Resources are matched by their `namespace` field. Removal keys carry
+/// namespace end-to-end so deletions route without a pre-delete id lookup.
 fn partition_incremental_by_namespace(
     result: IncrementalResult,
-    proxy_ns: &std::collections::HashMap<String, String>,
-    consumer_ns: &std::collections::HashMap<(String, String), String>,
-    plugin_config_ns: &std::collections::HashMap<String, String>,
-    upstream_ns: &std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, IncrementalResult> {
     use std::collections::HashMap;
 
@@ -631,81 +626,36 @@ fn partition_incremental_by_namespace(
             .added_or_modified_upstreams
             .push(u);
     }
-    for id in result.removed_proxy_ids {
-        if let Some(ns) = proxy_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_proxy_ids
-                .push(id);
-        }
+    for key in result.removed_proxy_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_proxy_ids
+            .push(key);
     }
     for key in result.removed_consumer_ids {
-        if let Some(ns) = consumer_ns.get(&(key.namespace.clone(), key.id.clone())) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_consumer_ids
-                .push(key);
-        }
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_consumer_ids
+            .push(key);
     }
-    for id in result.removed_plugin_config_ids {
-        if let Some(ns) = plugin_config_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_plugin_config_ids
-                .push(id);
-        }
+    for key in result.removed_plugin_config_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_plugin_config_ids
+            .push(key);
     }
-    for id in result.removed_upstream_ids {
-        if let Some(ns) = upstream_ns.get(&id) {
-            buckets
-                .entry(ns.clone())
-                .or_insert_with(|| make_empty(poll_timestamp))
-                .removed_upstream_ids
-                .push(id);
-        }
+    for key in result.removed_upstream_ids {
+        buckets
+            .entry(key.namespace.clone())
+            .or_insert_with(|| make_empty(poll_timestamp))
+            .removed_upstream_ids
+            .push(key);
     }
 
     buckets
-}
-
-/// Build resource-key-to-namespace lookups from a full config snapshot. Used by
-/// the multi-namespace incremental path so removal IDs (which don't carry
-/// their own namespace, except consumers) can still be routed to the right
-/// per-namespace broadcast channel. Consumer keys include namespace because
-/// consumer ids are only unique within a namespace.
-#[allow(clippy::type_complexity)]
-fn build_namespace_lookups(
-    config: &GatewayConfig,
-) -> (
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<(String, String), String>,
-    std::collections::HashMap<String, String>,
-    std::collections::HashMap<String, String>,
-) {
-    let proxy_ns = config
-        .proxies
-        .iter()
-        .map(|p| (p.id.clone(), p.namespace.clone()))
-        .collect();
-    let consumer_ns = config
-        .consumers
-        .iter()
-        .map(|c| ((c.namespace.clone(), c.id.clone()), c.namespace.clone()))
-        .collect();
-    let plugin_config_ns = config
-        .plugin_configs
-        .iter()
-        .map(|pc| (pc.id.clone(), pc.namespace.clone()))
-        .collect();
-    let upstream_ns = config
-        .upstreams
-        .iter()
-        .map(|u| (u.id.clone(), u.namespace.clone()))
-        .collect();
-    (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns)
 }
 
 pub async fn run(
@@ -1007,7 +957,7 @@ pub async fn run(
                     &admin_http_addr.to_string()
                 )
             );
-            if let Err(e) = admin::start_admin_listener_with_tls_and_signal(
+            match admin::start_admin_listener_with_tls_and_signal(
                 admin_http_addr,
                 admin_state,
                 admin_shutdown,
@@ -1017,12 +967,16 @@ pub async fn run(
             )
             .await
             {
-                crate::startup::flip_ready_off_on_listener_failure(
-                    &admin_http_startup_ready,
-                    &admin_http_serving_degraded,
-                    "CP admin HTTP listener",
-                    &e,
-                );
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    crate::startup::flip_ready_off_on_listener_failure(
+                        &admin_http_startup_ready,
+                        &admin_http_serving_degraded,
+                        "CP admin HTTP listener",
+                        &e,
+                    );
+                    Err(e.context("CP admin HTTP listener failed"))
+                }
             }
         }))
     } else {
@@ -1133,13 +1087,17 @@ pub async fn run(
                 )
                 .await
             };
-            if let Err(e) = result {
-                crate::startup::flip_ready_off_on_listener_failure(
-                    &admin_https_startup_ready,
-                    &admin_https_serving_degraded,
-                    "CP admin HTTPS listener",
-                    &e,
-                );
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    crate::startup::flip_ready_off_on_listener_failure(
+                        &admin_https_startup_ready,
+                        &admin_https_serving_degraded,
+                        "CP admin HTTPS listener",
+                        &e,
+                    );
+                    Err(e.context("CP admin HTTPS listener failed"))
+                }
             }
         }))
     } else {
@@ -1252,9 +1210,13 @@ pub async fn run(
                 .http2_max_pending_accept_reset_streams(Some(
                     grpc_http2_max_pending_accept_reset_streams,
                 ))
-                .http2_max_local_error_reset_streams(Some(
-                    grpc_http2_max_local_error_reset_streams,
-                ));
+                .http2_max_local_error_reset_streams(Some(grpc_http2_max_local_error_reset_streams))
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(
+                    crate::grpc::configsync_lifecycle::CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+                )))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(
+                    crate::grpc::configsync_lifecycle::CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS,
+                )));
             let shutdown_signal = async move {
                 while !*grpc_shutdown.borrow() {
                     if grpc_shutdown.changed().await.is_err() {
@@ -1287,20 +1249,25 @@ pub async fn run(
                     .serve_with_incoming_shutdown(incoming, shutdown_signal)
                     .await
             };
-            if let Err(e) = result {
-                // The gRPC serve future exited with an error, so this CP can no
-                // longer distribute config to data planes. Flip readiness back
-                // to not-ready so `/health` stops reporting `ready` instead of
-                // leaving a live-but-non-serving control plane. The CP listener
-                // monitor also observes this task exiting and triggers graceful
-                // shutdown; flipping readiness first keeps the probe honest
-                // during the teardown window.
-                crate::startup::flip_ready_off_on_listener_failure(
-                    &grpc_startup_ready,
-                    &grpc_serving_degraded,
-                    "CP gRPC server",
-                    &e,
-                );
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // The gRPC serve future exited with an error, so this CP can no
+                    // longer distribute config to data planes. Flip readiness back
+                    // to not-ready so `/health` stops reporting `ready` instead of
+                    // leaving a live-but-non-serving control plane. The CP listener
+                    // monitor also observes this task exiting and triggers graceful
+                    // shutdown; flipping readiness first keeps the probe honest
+                    // during the teardown window. Returning Err surfaces the failure
+                    // from control_plane::run so the process exits non-zero.
+                    crate::startup::flip_ready_off_on_listener_failure(
+                        &grpc_startup_ready,
+                        &grpc_serving_degraded,
+                        "CP gRPC server",
+                        &e,
+                    );
+                    Err(anyhow::Error::new(e).context("CP gRPC server failed"))
+                }
             }
         });
 
@@ -1488,6 +1455,15 @@ pub async fn run(
     let initial_polled_namespaces = polled_namespaces;
     let poll_auto_apply_plugin_migrations = env_config.auto_apply_plugin_migrations;
 
+    // Poll freshness + bounded rejection metrics (CP registers the same type as
+    // database mode so authenticated `/health` and `/metrics` can expose
+    // `last_poll_completed_at` — issue #2986).
+    let database_delta_poll_metrics =
+        Arc::new(crate::modes::database::DatabaseDeltaPollMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_database_delta_poll_metrics(database_delta_poll_metrics.clone());
+    let database_delta_poll_metrics_for_poll = database_delta_poll_metrics.clone();
+
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         // Match database mode: never burst catch-up full polls after a slow cycle.
@@ -1589,6 +1565,7 @@ pub async fn run(
                                 )
                                 .await
                                 {
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 // Treat pool swap as a new source snapshot.
@@ -1635,6 +1612,7 @@ pub async fn run(
                                     )
                                     .await
                                     {
+                                        database_delta_poll_metrics_for_poll.record_poll_completed();
                                         continue;
                                     }
                                     // Reachable backend, invalid snapshot: keep the
@@ -1656,6 +1634,7 @@ pub async fn run(
                                     );
                                     db_available_poll.store(false, Ordering::Relaxed);
                                 }
+                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                 continue;
                             }
                         }
@@ -1664,8 +1643,7 @@ pub async fn run(
                         // / `Set` this is the explicit list (no DB call).
                         // For `All`, authoritative namespace discovery runs
                         // once per tick — bounded cost vs. the per-resource
-                        // queries that dominate poll time. Snapshot the current
-                        // config for per-namespace deletion routing.
+                        // queries that dominate poll time.
                         let current_snapshot = config_poll.load_full();
                         let retained_namespaces = retained_polled_namespaces(&current_snapshot);
                         let nslist = resolve_polled_namespaces(
@@ -1676,12 +1654,6 @@ pub async fn run(
                             Some(&last_polled_namespaces),
                         )
                         .await;
-                        let (
-                            current_proxy_ns,
-                            current_consumer_ns,
-                            current_plugin_config_ns,
-                            current_upstream_ns,
-                        ) = build_namespace_lookups(&current_snapshot);
                         // Incremental poll — only fetch changes since last poll
                         match load_incremental_config_multi(
                             db_poll.as_ref(),
@@ -1700,6 +1672,7 @@ pub async fn run(
                                 )
                                 .await
                                 {
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 db_available_poll.store(true, Ordering::Relaxed);
@@ -1707,6 +1680,7 @@ pub async fn run(
                                 if result.is_empty() {
                                     last_change_sequences = next_change_sequences;
                                     rejected_delta_tracker.record_accepted();
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
                                 let poll_ts = result.poll_timestamp;
@@ -1818,6 +1792,7 @@ pub async fn run(
                                             "Incremental CP config update rejected by validation; leaving sequence cursors unchanged so the next poll retries the same rows"
                                         );
                                     }
+                                    database_delta_poll_metrics_for_poll.record_poll_completed();
                                     continue;
                                 }
 
@@ -1846,13 +1821,8 @@ pub async fn run(
                                 // partition (= identical to pre-T2-A
                                 // behavior). For `Set`/`All` each DP sees
                                 // only its own namespace's resources.
-                                let partitions = partition_incremental_by_namespace(
-                                    result.clone(),
-                                    &current_proxy_ns,
-                                    &current_consumer_ns,
-                                    &current_plugin_config_ns,
-                                    &current_upstream_ns,
-                                );
+                                let partitions =
+                                    partition_incremental_by_namespace(result.clone());
                                 for (ns, ns_delta) in &partitions {
                                     CpGrpcServer::broadcast_namespace_delta(
                                         poll_broadcasts.as_ref(),
@@ -1898,6 +1868,7 @@ pub async fn run(
                                         )
                                         .await
                                         {
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
                                         db_available_poll.store(true, Ordering::Relaxed);
@@ -1938,6 +1909,7 @@ pub async fn run(
                                             )
                                             .await
                                             {
+                                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                                 continue;
                                             }
                                             crate::modes::record_config_validation_rejection(
@@ -1948,6 +1920,7 @@ pub async fn run(
                                                 "full fallback reload",
                                             )
                                             .await;
+                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                             continue;
                                         }
                                         // Both incremental and full reload failed —
@@ -1967,6 +1940,7 @@ pub async fn run(
                                                         )
                                                         .await
                                                         {
+                                                            database_delta_poll_metrics_for_poll.record_poll_completed();
                                                             continue;
                                                         }
                                                         db_available_poll.store(true, Ordering::Relaxed);
@@ -2002,6 +1976,7 @@ pub async fn run(
                                                             )
                                                             .await
                                                             {
+                                                                database_delta_poll_metrics_for_poll.record_poll_completed();
                                                                 continue;
                                                             }
                                                             crate::modes::record_config_validation_rejection(
@@ -2036,6 +2011,8 @@ pub async fn run(
                         }
                     }
 
+                    // Normal fallthrough: success, empty, rejection, or handled error.
+                    database_delta_poll_metrics_for_poll.record_poll_completed();
                 }
                 _ = cp_poll_shutdown.changed() => {
                     info!("CP database polling shutting down");
@@ -2044,6 +2021,21 @@ pub async fn run(
             }
         }
     });
+
+    let db_poll_supervisor = {
+        let startup_ready = startup_ready.clone();
+        let serving_degraded = serving_degraded.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            crate::modes::db_poll_supervision::supervise_control_plane_poll_task(
+                db_poll_handle,
+                startup_ready,
+                serving_degraded,
+                shutdown_rx,
+            )
+            .await;
+        })
+    };
 
     let mesh_registry_reaper_handle = {
         let registry = mesh_registry.clone();
@@ -2089,36 +2081,35 @@ pub async fn run(
     // Wait for ALL listener handles to exit, or the shutdown signal if no
     // listeners were spawned (e.g., admin_http=0, no admin TLS, gRPC port=0).
     //
-    // Reuses `crate::modes::file::await_listener_handles` to mirror file/db
-    // mode's shutdown shape:
+    // CP listener supervision keeps a single drain budget per wake reason
+    // (listener exit vs operator SIGINT/SIGTERM) so a monitor-originated
+    // shutdown cannot be overwritten by an outer equal-timeout `Ok(())`:
     //
     // 1. On the shutdown signal, every listener observes it via its own
     //    `shutdown_tx.subscribe()` receiver and exits gracefully —
     //    `serve_with_incoming_shutdown` for gRPC (so tonic completes
     //    in-flight RPCs and `TrackedStream`'s `Drop` deregisters the DP
     //    from `DpNodeRegistry`), and the watch-driven shutdown loops for
-    //    admin HTTP/HTTPS.
-    // 2. If a listener panics, `await_listener_handles` fires the
-    //    `shutdown_on_panic` trigger so the remaining listeners observe
-    //    shutdown and exit promptly. The previous `tokio::select!`
-    //    instead detached the still-serving handles (the inner async
-    //    blocks were cancelled, dropping the moved `JoinHandle`s, which
-    //    detaches rather than aborts) — those listeners then died
-    //    abruptly when the runtime torn down at function return,
-    //    cutting in-flight DP streams without graceful drain and
-    //    yielding a partial-shutdown anomaly.
-    let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    //    admin HTTP/HTTPS. Expected Ok exits after SIGINT/SIGTERM stay clean;
+    //    a stuck sibling after operator stop still returns Ok after the
+    //    configured drain timeout.
+    // 2. If a listener returns a serve error, panics, or exits Ok without a
+    //    prior shutdown request, the monitor preserves that first unexpected
+    //    failure, fires shutdown so siblings drain under the same timeout
+    //    bound, and propagates Err from `run()` so the process exits non-zero
+    //    even when a sibling is still stuck at the deadline.
+    let mut listener_handles: Vec<(String, ListenerJoinHandle)> = Vec::new();
     if let Some(handle) = admin_http_handle {
-        listener_handles.push(handle);
+        listener_handles.push(("CP admin HTTP listener".to_string(), handle));
     }
     if let Some(handle) = grpc_handle {
-        listener_handles.push(handle);
+        listener_handles.push(("CP gRPC server".to_string(), handle));
     }
     if let Some(handle) = admin_https_handle {
-        listener_handles.push(handle);
+        listener_handles.push(("CP admin HTTPS listener".to_string(), handle));
     }
 
-    wait_for_cp_listeners_until_shutdown_or_exit(
+    let listener_result = wait_for_cp_listeners_until_shutdown_or_exit(
         listener_handles,
         shutdown_tx.clone(),
         Duration::from_secs(5),
@@ -2130,7 +2121,7 @@ pub async fn run(
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
     // allowed to wedge graceful shutdown.
     let mut background_handles = vec![
-        db_poll_handle,
+        db_poll_supervisor,
         mesh_registry_reaper_handle,
         runtime_system_handle,
         runtime_window_handle,
@@ -2140,83 +2131,211 @@ pub async fn run(
     }
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
-    Ok(())
+    listener_result
 }
 
-async fn wait_for_cp_listeners_until_shutdown_or_exit(
-    listener_handles: Vec<tokio::task::JoinHandle<()>>,
+pub(crate) async fn wait_for_cp_listeners_until_shutdown_or_exit(
+    listener_handles: Vec<(String, ListenerJoinHandle)>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     drain_timeout: Duration,
-) {
+) -> Result<(), anyhow::Error> {
     if listener_handles.is_empty() {
         wait_for_cp_shutdown(&shutdown_tx).await;
         info!("Shutdown signal received with no active listeners");
-        return;
+        return Ok(());
     }
 
-    let listener_shutdown_tx = shutdown_tx.clone();
-    let mut listener_monitor = tokio::spawn(async move {
-        monitor_cp_listener_handles_until_exit(
-            listener_handles,
-            listener_shutdown_tx,
+    // Run supervision inline (no outer select + equal drain timeout). An earlier
+    // shape raced a monitor-originated shutdown against an outer `drain_timeout`
+    // that could abort the monitor and convert a preserved listener failure into
+    // `Ok(())`. Provenance lives inside the monitor: listener-exit vs operator
+    // shutdown each own a single drain budget and return their own result.
+    monitor_cp_listener_handles_until_exit(listener_handles, shutdown_tx, drain_timeout).await
+}
+
+/// Wake reason for the first event observed while supervising CP listeners.
+enum CpListenerMonitorWake {
+    /// A listener task completed (Ok, Err, or panic/join failure).
+    ListenerExit(
+        String,
+        Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ),
+    /// Shared shutdown watch flipped before any listener exited (SIGINT/SIGTERM).
+    OperatorShutdown,
+}
+
+async fn monitor_cp_listener_handles_until_exit(
+    listener_handles: Vec<(String, ListenerJoinHandle)>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    drain_timeout: Duration,
+) -> Result<(), anyhow::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    // Dropping a JoinHandle detaches its task. Retain independent abort handles
+    // so a listener that ignores shutdown cannot outlive the bounded drain.
+    let abort_handles: Vec<tokio::task::AbortHandle> = listener_handles
+        .iter()
+        .map(|(_, handle)| handle.abort_handle())
+        .collect();
+    let mut futures: FuturesUnordered<_> = listener_handles
+        .into_iter()
+        .map(|(name, handle)| async move { (name, handle.await) })
+        .collect();
+
+    // Operator already requested stop before supervision began (e.g. SIGTERM
+    // landed while listeners were still being spawned into the wait helper).
+    if *shutdown_tx.borrow() {
+        return drain_cp_listener_futures(
+            &mut futures,
+            &abort_handles,
             drain_timeout,
+            "Timed out waiting for CP listeners to drain after shutdown",
         )
-        .await
-    });
-    tokio::select! {
-        result = &mut listener_monitor => {
-            log_cp_listener_monitor_result(result);
+        .await;
+    }
+
+    let wake = tokio::select! {
+        // Prefer a completed listener over a concurrent operator shutdown so an
+        // unsolicited/error/panic exit is classified before the drain path can
+        // treat a pre-shutdown Ok as an expected clean stop.
+        biased;
+        Some((name, join)) = futures.next() => {
+            CpListenerMonitorWake::ListenerExit(name, join)
         }
         _ = wait_for_cp_shutdown(&shutdown_tx) => {
-            match tokio::time::timeout(drain_timeout, &mut listener_monitor).await {
-                Ok(result) => {
-                    log_cp_listener_monitor_result(result);
-                }
-                Err(_) => {
-                    warn!("Timed out waiting for CP listeners to drain after shutdown");
-                    listener_monitor.abort();
-                }
+            CpListenerMonitorWake::OperatorShutdown
+        }
+    };
+
+    match wake {
+        CpListenerMonitorWake::OperatorShutdown => {
+            // Explicit SIGINT/SIGTERM: one drain budget for every still-running
+            // listener. Stuck siblings stay Ok; serve errors / panics still
+            // surface because the drain loop preserves the first failure even
+            // when the deadline expires afterward.
+            drain_cp_listener_futures(
+                &mut futures,
+                &abort_handles,
+                drain_timeout,
+                "Timed out waiting for CP listeners to drain after shutdown",
+            )
+            .await
+        }
+        CpListenerMonitorWake::ListenerExit(first_name, first_join) => {
+            let shutdown_already_requested = *shutdown_tx.borrow();
+            let first_error =
+                classify_cp_listener_exit(&first_name, first_join, shutdown_already_requested);
+
+            info!(
+                listener = %first_name,
+                "CP listener task exited; triggering control-plane shutdown"
+            );
+            let _ = shutdown_tx.send(true);
+
+            let remaining_result = drain_cp_listener_futures(
+                &mut futures,
+                &abort_handles,
+                drain_timeout,
+                "Timed out waiting for remaining CP listeners to drain after listener exit",
+            )
+            .await;
+
+            match (first_error, remaining_result) {
+                (Some(err), _) => Err(err),
+                (None, Err(err)) => Err(err),
+                (None, Ok(())) => Ok(()),
             }
         }
     }
 }
 
-async fn monitor_cp_listener_handles_until_exit(
-    listener_handles: Vec<tokio::task::JoinHandle<()>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+/// Drain remaining CP listener join futures under a single deadline.
+///
+/// Failures observed before the deadline are preserved and returned even if a
+/// sibling is still stuck when the timeout fires. On timeout, all retained
+/// abort handles are fired (completed tasks are unaffected), then remaining
+/// join futures are dropped. A prior clean operator stop stays `Ok` when no
+/// failure was collected.
+async fn drain_cp_listener_futures<Fut>(
+    futures: &mut futures_util::stream::FuturesUnordered<Fut>,
+    abort_handles: &[tokio::task::AbortHandle],
     drain_timeout: Duration,
-) -> Result<(), tokio::task::JoinError> {
-    let (first_result, _idx, remaining) = futures_util::future::select_all(listener_handles).await;
-    info!("CP listener task exited; triggering control-plane shutdown");
-    let _ = shutdown_tx.send(true);
+    timeout_message: &str,
+) -> Result<(), anyhow::Error>
+where
+    Fut: std::future::Future<
+            Output = (
+                String,
+                Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+            ),
+        >,
+{
+    use futures_util::stream::StreamExt;
 
-    let remaining_result = if remaining.is_empty() {
-        Ok(())
-    } else {
-        let shutdown_on_panic = {
-            let shutdown_tx = shutdown_tx.clone();
-            move || {
-                let _ = shutdown_tx.send(true);
+    if futures.is_empty() {
+        return Ok(());
+    }
+
+    let mut first_error: Option<anyhow::Error> = None;
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+
+    loop {
+        if futures.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, futures.next()).await {
+            Ok(Some((name, join))) => {
+                // Shutdown has been requested by this point (operator or a prior
+                // listener exit), so Ok exits are expected. Errors/panics still
+                // classify as failures.
+                if let Some(err) = classify_cp_listener_exit(&name, join, true)
+                    && first_error.is_none()
+                {
+                    first_error = Some(err);
+                }
             }
-        };
-        let mut remaining_monitor = tokio::spawn(async move {
-            crate::modes::file::await_listener_handles(remaining, shutdown_on_panic).await
-        });
-        match tokio::time::timeout(drain_timeout, &mut remaining_monitor).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(err)) => Err(err),
+            Ok(None) => break,
             Err(_) => {
-                warn!("Timed out waiting for remaining CP listeners to drain after listener exit");
-                remaining_monitor.abort();
-                Ok(())
+                warn!("{timeout_message}");
+                for abort_handle in abort_handles {
+                    abort_handle.abort();
+                }
+                // Once abort has been requested, release the remaining join
+                // futures without detaching still-running listeners.
+                *futures = futures_util::stream::FuturesUnordered::new();
+                break;
             }
         }
-    };
+    }
 
-    match (first_result, remaining_result) {
-        (Err(err), _) => Err(err),
-        (Ok(()), Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn classify_cp_listener_exit(
+    name: &str,
+    join: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    shutdown_already_requested: bool,
+) -> Option<anyhow::Error> {
+    match join {
+        Ok(Ok(())) if shutdown_already_requested => None,
+        Ok(Ok(())) => Some(anyhow::anyhow!(
+            "{name} exited unexpectedly without a shutdown request"
+        )),
+        Ok(Err(err)) => {
+            error!("CP listener task '{name}' failed: {err:#}");
+            Some(err.context(format!("{name} failed")))
+        }
+        Err(err) if err.is_panic() => {
+            error!("CP listener task '{name}' failed: {err}");
+            Some(anyhow::anyhow!("{name} panicked: {err}"))
+        }
+        Err(err) => {
+            error!("CP listener task '{name}' failed: {err}");
+            Some(anyhow::anyhow!("{name} failed to join: {err}"))
+        }
     }
 }
 
@@ -2225,20 +2344,6 @@ async fn wait_for_cp_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
     while !*wait_shutdown.borrow() {
         if wait_shutdown.changed().await.is_err() {
             break;
-        }
-    }
-}
-
-fn log_cp_listener_monitor_result(
-    result: Result<Result<(), tokio::task::JoinError>, tokio::task::JoinError>,
-) {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            error!("CP listener task failed: {}", err);
-        }
-        Err(err) => {
-            error!("CP listener monitor task failed: {}", err);
         }
     }
 }
@@ -2533,53 +2638,26 @@ mod tests {
     }
 
     #[test]
-    fn partition_incremental_routes_removed_ids_with_pre_delete_lookup() {
-        let mut proxy = make_proxy("p1");
-        proxy.namespace = "tenant-a".to_string();
-        let current = GatewayConfig {
-            proxies: vec![proxy],
-            ..Default::default()
-        };
-        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
-            build_namespace_lookups(&current);
+    fn partition_incremental_routes_removed_ids_by_namespace_key() {
         let mut result = empty_incremental();
-        result.removed_proxy_ids = vec!["p1".to_string()];
+        result.removed_proxy_ids = vec![NamespacedResourceId::new("tenant-a", "p1")];
 
-        let partitions = partition_incremental_by_namespace(
-            result,
-            &proxy_ns,
-            &consumer_ns,
-            &plugin_config_ns,
-            &upstream_ns,
-        );
+        let partitions = partition_incremental_by_namespace(result);
         let tenant_delta = partitions
             .get("tenant-a")
-            .expect("removed proxy should be routed to its previous namespace");
-        assert_eq!(tenant_delta.removed_proxy_ids, vec!["p1"]);
+            .expect("removed proxy should be routed to its namespace");
+        assert_eq!(
+            tenant_delta.removed_proxy_ids,
+            vec![NamespacedResourceId::new("tenant-a", "p1")]
+        );
     }
 
     #[test]
     fn partition_incremental_routes_duplicate_consumer_ids_by_namespace() {
-        let mut prod = make_consumer("c1");
-        prod.namespace = "prod".to_string();
-        let mut staging = make_consumer("c1");
-        staging.namespace = "staging".to_string();
-        let current = GatewayConfig {
-            consumers: vec![prod, staging],
-            ..Default::default()
-        };
-        let (proxy_ns, consumer_ns, plugin_config_ns, upstream_ns) =
-            build_namespace_lookups(&current);
         let mut result = empty_incremental();
         result.removed_consumer_ids = vec![NamespacedResourceId::new("staging", "c1")];
 
-        let partitions = partition_incremental_by_namespace(
-            result,
-            &proxy_ns,
-            &consumer_ns,
-            &plugin_config_ns,
-            &upstream_ns,
-        );
+        let partitions = partition_incremental_by_namespace(result);
 
         assert!(!partitions.contains_key("prod"));
         assert_eq!(
@@ -2661,7 +2739,7 @@ mod tests {
             ..Default::default()
         };
         let mut inc = empty_incremental();
-        inc.removed_proxy_ids = vec!["p1".to_string()];
+        inc.removed_proxy_ids = vec![NamespacedResourceId::new("ferrum", "p1")];
         apply_incremental_to_config(&mut config, inc);
         assert_eq!(config.proxies.len(), 1);
         assert_eq!(config.proxies[0].id, "p2");
@@ -2690,7 +2768,7 @@ mod tests {
             ..Default::default()
         };
         let mut inc = empty_incremental();
-        inc.removed_proxy_ids = vec!["remove".to_string()];
+        inc.removed_proxy_ids = vec![NamespacedResourceId::new("ferrum", "remove")];
         inc.added_or_modified_proxies = vec![make_proxy("added")];
         inc.removed_consumer_ids = vec![NamespacedResourceId::new("ferrum", "c1")];
         inc.added_or_modified_consumers = vec![make_consumer("c2")];
@@ -2743,6 +2821,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_incremental_keys_proxies_by_namespace_and_id() {
+        let mut prod = make_proxy("shared");
+        prod.namespace = "prod".to_string();
+        let mut staging = make_proxy("shared");
+        staging.namespace = "staging".to_string();
+        let mut updated_staging = staging.clone();
+        updated_staging.backend_port = 9999;
+        let mut config = GatewayConfig {
+            proxies: vec![prod, staging],
+            ..Default::default()
+        };
+        let mut inc = empty_incremental();
+        inc.added_or_modified_proxies = vec![updated_staging];
+
+        apply_incremental_to_config(&mut config, inc);
+
+        assert_eq!(config.proxies.len(), 2);
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "prod")
+                .expect("prod proxy must remain")
+                .backend_port,
+            8080
+        );
+        assert_eq!(
+            config
+                .proxies
+                .iter()
+                .find(|proxy| proxy.namespace == "staging")
+                .expect("staging proxy must be updated")
+                .backend_port,
+            9999
+        );
+    }
+
     // Regression: prior to this fix, CP mode used `tokio::select!` over the
     // admin/HTTPS/gRPC listener handles. The first listener to exit (panic
     // or otherwise) short-circuited the select and dropped the inner
@@ -2754,19 +2870,19 @@ mod tests {
     // the gRPC stream saw their connections cut without a graceful
     // shutdown signal.
     //
-    // The fix routes the listener handles through
-    // `crate::modes::file::await_listener_handles`, which both:
+    // The fix routes the listener handles through fallible CP supervision
+    // (and file-mode's await helpers), which both:
     //   1. Awaits ALL handles concurrently so a single exit does not
     //      strand the others; and
-    //   2. Fires `shutdown_on_panic` on the first panic so the remaining
+    //   2. Fires shutdown on the first unexpected failure so the remaining
     //      listeners observe the shared shutdown watch channel via their
     //      own subscribers and exit promptly.
     //
     // This test models that with three fake CP listeners (admin_http,
     // grpc, admin_https). One panics; the other two must still drain
-    // cleanly through the watch trigger fired by `shutdown_on_panic`.
-    // Bound the wait at 2 s — without the trigger, the remaining
-    // listeners would block forever on their watch receivers.
+    // cleanly through the watch trigger. Bound the wait at 2 s — without
+    // the trigger, the remaining listeners would block forever on their
+    // watch receivers.
     #[tokio::test]
     async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -2774,6 +2890,7 @@ mod tests {
         let mut admin_http_rx = shutdown_tx.subscribe();
         let admin_http = tokio::spawn(async move {
             let _ = admin_http_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
         });
 
         let grpc = tokio::spawn(async {
@@ -2783,43 +2900,40 @@ mod tests {
         let mut admin_https_rx = shutdown_tx.subscribe();
         let admin_https = tokio::spawn(async move {
             let _ = admin_https_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
         });
 
-        // Mirror the CP run() composition: collect Some-handles into a
-        // Vec, then drive them through await_listener_handles with a
-        // panic trigger that flips the shared shutdown watch.
-        let listener_handles: Vec<tokio::task::JoinHandle<()>> =
-            vec![admin_http, grpc, admin_https];
+        let listener_handles = vec![
+            ("CP admin HTTP listener".to_string(), admin_http),
+            ("CP gRPC server".to_string(), grpc),
+            ("CP admin HTTPS listener".to_string(), admin_https),
+        ];
 
-        let trigger_tx = shutdown_tx.clone();
         let started = Instant::now();
-        let result = crate::modes::file::await_listener_handles(listener_handles, move || {
-            let _ = trigger_tx.send(true);
-        })
+        let result = wait_for_cp_listeners_until_shutdown_or_exit(
+            listener_handles,
+            shutdown_tx,
+            Duration::from_secs(2),
+        )
         .await;
         let elapsed = started.elapsed();
 
-        // The panicking gRPC listener must surface as a JoinError…
         let err = result.expect_err("the gRPC listener panicked, helper must return Err");
+        let rendered = format!("{err:#}");
         assert!(
-            err.is_panic(),
-            "JoinError should report `is_panic()` for a panicked listener; got {err:?}",
+            rendered.contains("panicked"),
+            "error should report panic; got {rendered}",
         );
-        // …and the admin HTTP/HTTPS listeners must have observed the
-        // shutdown trigger and exited promptly. Without the trigger
-        // they would hang on their watch receivers forever.
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "remaining listeners should drain via shutdown trigger; took {elapsed:?}",
         );
     }
 
-    // Sanity: when no listener panics and the shared shutdown watch is
+    // Sanity: when no listener fails and the shared shutdown watch is
     // simply set to true (the normal SIGTERM path), every listener's
-    // own `.subscribe()` receiver fires `changed()` and the helper
-    // returns Ok without ever invoking the panic trigger. This verifies
-    // the "happy path" is preserved end-to-end through the same
-    // composition the CP mode uses.
+    // own `.subscribe()` receiver fires `changed()` and supervision
+    // returns Ok. This verifies the "happy path" is preserved end-to-end.
     #[tokio::test]
     async fn cp_shutdown_drains_all_listeners_on_signal() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -2827,18 +2941,18 @@ mod tests {
         let mut admin_http_rx = shutdown_tx.subscribe();
         let admin_http = tokio::spawn(async move {
             let _ = admin_http_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
         });
         let mut grpc_rx = shutdown_tx.subscribe();
         let grpc = tokio::spawn(async move {
             let _ = grpc_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
         });
         let mut admin_https_rx = shutdown_tx.subscribe();
         let admin_https = tokio::spawn(async move {
             let _ = admin_https_rx.changed().await;
+            Ok::<(), anyhow::Error>(())
         });
-
-        let triggered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let triggered_clone = triggered.clone();
 
         // Fire shutdown after spawning so the listeners are already
         // parked on changed() — models the SIGTERM path.
@@ -2846,18 +2960,17 @@ mod tests {
             .send(true)
             .expect("watch send must succeed with live receivers");
 
-        let result = crate::modes::file::await_listener_handles(
-            vec![admin_http, grpc, admin_https],
-            move || {
-                triggered_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            },
+        let result = wait_for_cp_listeners_until_shutdown_or_exit(
+            vec![
+                ("CP admin HTTP listener".to_string(), admin_http),
+                ("CP gRPC server".to_string(), grpc),
+                ("CP admin HTTPS listener".to_string(), admin_https),
+            ],
+            shutdown_tx,
+            Duration::from_secs(2),
         )
         .await;
-        result.expect("no listener panicked; helper must return Ok");
-        assert!(
-            !triggered.load(std::sync::atomic::Ordering::SeqCst),
-            "panic trigger must NOT fire on a clean shutdown",
-        );
+        result.expect("no listener failed; supervision must return Ok");
     }
 
     #[tokio::test]
@@ -2871,11 +2984,12 @@ mod tests {
                     break;
                 }
             }
+            Ok::<(), anyhow::Error>(())
         });
 
         let wait_shutdown_tx = shutdown_tx.clone();
         let wait = tokio::spawn(wait_for_cp_listeners_until_shutdown_or_exit(
-            vec![listener],
+            vec![("CP admin HTTP listener".to_string(), listener)],
             wait_shutdown_tx,
             Duration::from_millis(20),
         ));
@@ -2889,17 +3003,18 @@ mod tests {
         shutdown_tx
             .send(true)
             .expect("watch send must succeed with live receivers");
-        tokio::time::timeout(Duration::from_secs(1), wait)
+        let result = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("CP listener wait should complete after shutdown")
             .expect("CP listener wait task should not panic");
+        result.expect("graceful shutdown must return Ok");
     }
 
     #[tokio::test]
     async fn cp_listener_exit_triggers_shutdown_and_drains_siblings() {
         let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
 
-        let grpc = tokio::spawn(async {});
+        let grpc = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
         let mut admin_http_rx = shutdown_tx.subscribe();
         let admin_http = tokio::spawn(async move {
@@ -2908,14 +3023,24 @@ mod tests {
                     break;
                 }
             }
+            Ok::<(), anyhow::Error>(())
         });
 
-        wait_for_cp_listeners_until_shutdown_or_exit(
-            vec![admin_http, grpc],
+        let result = wait_for_cp_listeners_until_shutdown_or_exit(
+            vec![
+                ("CP admin HTTP listener".to_string(), admin_http),
+                ("CP gRPC server".to_string(), grpc),
+            ],
             shutdown_tx,
             Duration::from_secs(1),
         )
         .await;
+
+        let err = result.expect_err("unsolicited listener exit must return Err");
+        assert!(
+            format!("{err:#}").contains("exited unexpectedly"),
+            "error should report unsolicited exit; got {err:#}",
+        );
 
         observed_shutdown
             .changed()
@@ -2927,20 +3052,28 @@ mod tests {
         );
     }
 
+    // Regression for the equal-deadline race: an unsolicited listener exit
+    // must preserve `first_error` through the drain timeout even when a
+    // sibling never observes shutdown. The prior outer `select!` could see
+    // the monitor-originated shutdown, start an equal `drain_timeout`, abort
+    // the monitor, and return `Ok(())` — losing the failure.
     #[tokio::test]
     async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
 
-        let stuck = tokio::spawn(async {
-            std::future::pending::<()>().await;
-        });
-        let exited = tokio::spawn(async {});
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let stuck_abort = stuck.abort_handle();
+        let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
         let started = Instant::now();
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(1),
             wait_for_cp_listeners_until_shutdown_or_exit(
-                vec![stuck, exited],
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("exited listener".to_string(), exited),
+                ],
                 shutdown_tx,
                 Duration::from_millis(20),
             ),
@@ -2951,6 +3084,139 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "listener-triggered drain should honor the configured timeout"
+        );
+        let err =
+            result.expect_err("unsolicited exit must still surface as Err after drain timeout");
+        assert!(
+            format!("{err:#}").contains("exited unexpectedly"),
+            "preserved failure must report unsolicited exit; got {err:#}",
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stuck_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stuck listener must be aborted at the drain deadline");
+    }
+
+    #[tokio::test]
+    async fn cp_listener_error_with_stuck_sibling_returns_err_after_drain_timeout() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let failing =
+            tokio::spawn(async { Err::<(), anyhow::Error>(anyhow::anyhow!("accept loop failed")) });
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("failing listener".to_string(), failing),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("listener failure must not wait forever on stuck siblings");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "error-triggered drain should honor the configured timeout"
+        );
+        let err = result.expect_err("serve error must surface as Err after drain timeout");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("accept loop failed"),
+            "preserved failure must include serve error; got {rendered}",
+        );
+    }
+
+    #[tokio::test]
+    async fn cp_operator_shutdown_with_stuck_listener_returns_ok_after_drain_timeout() {
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let mut draining_rx = shutdown_tx.subscribe();
+        let draining = tokio::spawn(async move {
+            while !*draining_rx.borrow() {
+                if draining_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("draining listener".to_string(), draining),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("operator shutdown must not wait forever on stuck listeners");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "operator drain should honor the configured timeout"
+        );
+        result.expect("SIGINT/SIGTERM plus stuck listener must stay Ok");
+    }
+
+    #[tokio::test]
+    async fn cp_operator_shutdown_preserves_listener_error_when_sibling_stuck() {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let stuck =
+            tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
+        let failing = tokio::spawn(async {
+            Err::<(), anyhow::Error>(anyhow::anyhow!("failed during operator drain"))
+        });
+
+        shutdown_tx
+            .send(true)
+            .expect("watch send must succeed with live receivers");
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_cp_listeners_until_shutdown_or_exit(
+                vec![
+                    ("stuck listener".to_string(), stuck),
+                    ("failing listener".to_string(), failing),
+                ],
+                shutdown_tx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("operator shutdown must not wait forever on stuck listeners");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "operator drain should honor the configured timeout"
+        );
+        let err = result.expect_err(
+            "listener failure during operator shutdown must not be lost to drain timeout",
+        );
+        assert!(
+            format!("{err:#}").contains("failed during operator drain"),
+            "preserved failure must include serve error; got {err:#}",
         );
     }
 }
