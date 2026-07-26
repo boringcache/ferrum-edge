@@ -113,7 +113,7 @@ pub const REDIS_PLUGIN_CONFIG_KEYS: &[&str] = &[
 /// TLS verification uses the gateway-level settings (`FERRUM_TLS_CA_BUNDLE_PATH`,
 /// `FERRUM_TLS_NO_VERIFY`) rather than per-plugin overrides, ensuring all outbound
 /// connections share a single CA trust chain.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedisConfig {
     /// Redis connection URL (e.g., `redis://host:6379/0` or `rediss://host:6380/0` for TLS).
     pub url: String,
@@ -152,7 +152,42 @@ pub struct RedisConfig {
     pub password: Option<String>,
 }
 
+/// Manual `Debug` so a stray `{:?}` of a config (or of any struct that embeds
+/// one) cannot dump the ACL password or the URL-embedded userinfo into logs or
+/// error text. The derived impl printed both verbatim.
+impl std::fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisConfig")
+            .field("url", &self.redacted_url())
+            .field("tls", &self.tls)
+            .field("key_prefix", &self.key_prefix)
+            .field("pool_size", &self.pool_size)
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field(
+                "health_check_interval_seconds",
+                &self.health_check_interval_seconds,
+            )
+            .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
 impl RedisConfig {
+    /// Log-safe rendering of [`RedisConfig::url`].
+    ///
+    /// `redis_url` is a documented place to encode Redis ACL credentials
+    /// (`redis://user:pass@host`), so the raw string must never reach a tracing
+    /// field, an error message, or an admin projection. Scheme, host, port, and
+    /// database path are preserved because they are the diagnostics that make a
+    /// connect failure actionable; only the userinfo is replaced.
+    ///
+    /// Cold path only (connect/health-check failure logging), so the allocation
+    /// here never touches a proxy hot path.
+    pub fn redacted_url(&self) -> String {
+        redact_url_userinfo(&self.url)
+    }
+
     /// Parse Redis configuration from a plugin's JSON config.
     ///
     /// Returns `Ok(None)` if `sync_mode` is absent or `"local"`, after
@@ -347,6 +382,28 @@ impl RedisConfig {
 
         parsed.to_string()
     }
+}
+
+/// Strip userinfo from a connection URL, keeping scheme/host/port/path.
+///
+/// Fails closed to a bare marker when the value cannot be parsed: an
+/// unparseable string cannot be proven credential-free, and `redis_url` is
+/// only validated for `sync_mode: "redis"` plus explicitly supplied values, so
+/// a caller can still hold a string this function has never validated.
+pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
+    let Ok(mut parsed) = Url::parse(raw_url) else {
+        return "[REDACTED]".to_string();
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        // Return the original bytes rather than the parser's normalization, so
+        // a credential-free value is never silently rewritten in an admin
+        // projection or a log line.
+        return raw_url.to_string();
+    }
+    if parsed.set_password(None).is_err() || parsed.set_username("redacted").is_err() {
+        return "[REDACTED]".to_string();
+    }
+    parsed.to_string()
 }
 
 fn validate_redis_url(raw_url: &str) -> Result<(), String> {
@@ -970,7 +1027,7 @@ impl RedisRateLimitClient {
             Ok(c) => c,
             Err(e) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     pool_slot = idx,
                     error = %e,
                     "Failed to create Redis client for rate limiting"
@@ -985,7 +1042,7 @@ impl RedisRateLimitClient {
             Ok(manager) => {
                 self.available.store(true, Ordering::Relaxed);
                 info!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     key_prefix = %self.config.key_prefix,
                     pool_slot = idx,
                     pool_size = self.pool.len(),
@@ -997,7 +1054,7 @@ impl RedisRateLimitClient {
             }
             Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     pool_slot = idx,
                     error = %e,
                     "Failed to connect to Redis for rate limiting — falling back to local"
@@ -1008,7 +1065,7 @@ impl RedisRateLimitClient {
             }
             Err(ConnectAttemptError::Timeout) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     pool_slot = idx,
                     timeout_seconds = self.config.connect_timeout_seconds,
                     "Timed out connecting to Redis for rate limiting — falling back to local"
@@ -1048,7 +1105,7 @@ impl RedisRateLimitClient {
             Ok(client) => client,
             Err(e) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     error = %e,
                     "Failed to create dedicated Redis client"
                 );
@@ -1065,7 +1122,7 @@ impl RedisRateLimitClient {
             }
             Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     error = %e,
                     "Failed to connect dedicated Redis client"
                 );
@@ -1075,7 +1132,7 @@ impl RedisRateLimitClient {
             }
             Err(ConnectAttemptError::Timeout) => {
                 warn!(
-                    redis_url = %self.config.url,
+                    redis_url = %self.config.redacted_url(),
                     timeout_seconds = self.config.connect_timeout_seconds,
                     "Timed out connecting dedicated Redis client"
                 );

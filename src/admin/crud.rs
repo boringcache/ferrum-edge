@@ -2892,6 +2892,8 @@ fn redact_sensitive_plugin_config_fields(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 if is_sensitive_plugin_config_key(key) {
                     *child = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+                } else if is_credential_bearing_url_config_key(key) {
+                    redact_url_userinfo_in_place(child);
                 } else {
                     redact_sensitive_plugin_config_fields(child);
                 }
@@ -2913,7 +2915,11 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
 
     let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
     normalized == "key"
-        || normalized == "redis_integrity_key"
+        // HMAC signing material for Redis cache envelopes (`ai_semantic_cache`
+        // `redis_integrity_key`). Substring match so any future
+        // `*_integrity_key` signing secret is covered without another edit; the
+        // segment is only ever used for signing/authenticity keys.
+        || normalized.contains("integrity_key")
         || normalized.contains("api_key")
         || normalized.contains("apikey")
         || normalized.contains("access_key")
@@ -2923,6 +2929,47 @@ fn is_sensitive_plugin_config_key(key: &str) -> bool {
         || normalized.contains("private_key")
         || normalized.contains("service_account_json")
         || normalized.contains("webhook")
+}
+
+/// Config keys whose value is a connection URL that may carry credentials in
+/// its userinfo component.
+///
+/// These are deliberately *not* wholesale-redacted: the scheme/host/port/path
+/// are the useful diagnostics an operator needs from a Viewer/Operator read or
+/// an audit diff. Only the userinfo is replaced (see
+/// [`redact_url_userinfo_in_place`]).
+///
+/// `redis_url` is documented as an accepted place to encode Redis
+/// ACL credentials (`redis://user:pass@host`), and every Redis-backed plugin
+/// (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`,
+/// `udp_rate_limiting`, `request_deduplication`, `ai_semantic_cache`) shares
+/// that key, so the match is by key name rather than per plugin.
+fn is_credential_bearing_url_config_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized == "redis_url"
+}
+
+/// Strip URL userinfo in place, preserving scheme/host/port/path.
+///
+/// Delegates to the same helper the Redis client uses for its connect/health
+/// log fields, so a value an operator reads back from the admin API is byte
+/// identical to the one in the logs.
+///
+/// Fails closed: a non-string value is replaced wholesale with the redaction
+/// marker rather than echoed, as is an unparseable string (handled by the
+/// shared helper), because a value that cannot be parsed cannot be proven
+/// credential-free. `null` is left alone — there is nothing to disclose.
+fn redact_url_userinfo_in_place(value: &mut Value) {
+    use crate::plugins::utils::redis_rate_limiter::redact_url_userinfo;
+
+    if value.is_null() {
+        return;
+    }
+    let Some(raw) = value.as_str() else {
+        *value = json!(crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER);
+        return;
+    };
+    *value = json!(redact_url_userinfo(raw));
 }
 
 pub(crate) async fn check_port_available(

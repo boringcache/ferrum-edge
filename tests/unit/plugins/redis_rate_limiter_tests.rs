@@ -30,6 +30,60 @@ fn test_hostname_uses_url_parser_and_preserves_credentials() {
     assert_eq!(config.hostname().as_deref(), Some("redis"));
 }
 
+/// Connect/health-check failures log `redis_url`. `redis_url` is a documented
+/// place to encode Redis ACL credentials, so the logged rendering must strip
+/// userinfo while keeping scheme/host/port/db as actionable diagnostics.
+#[test]
+fn test_redacted_url_strips_userinfo_and_keeps_diagnostics() {
+    let with_both = make_config("redis://user:pass@redis.internal:6379/15", false);
+    assert_eq!(
+        with_both.redacted_url(),
+        "redis://redacted@redis.internal:6379/15"
+    );
+
+    let password_only = make_config("rediss://:hunter2@redis.internal:6380/0", false);
+    assert_eq!(
+        password_only.redacted_url(),
+        "rediss://redacted@redis.internal:6380/0"
+    );
+
+    let username_only = make_config("redis://aclUser@redis.internal:6379/1", false);
+    assert_eq!(
+        username_only.redacted_url(),
+        "redis://redacted@redis.internal:6379/1"
+    );
+
+    // No userinfo: the original bytes are returned, not the parser's
+    // normalization, so a credential-free URL is never silently rewritten.
+    let bare = make_config("redis://Redis.Internal:6379/0", false);
+    assert_eq!(bare.redacted_url(), "redis://Redis.Internal:6379/0");
+
+    // Unparseable values cannot be proven credential-free, so they fail closed.
+    let unparseable = make_config("not a url", false);
+    assert_eq!(unparseable.redacted_url(), "[REDACTED]");
+}
+
+/// `RedisConfig` used to derive `Debug`, which printed the ACL password and the
+/// URL userinfo verbatim into any `{:?}` rendering.
+#[test]
+fn test_debug_rendering_hides_credentials() {
+    let mut config = make_config("redis://user:urlpass@redis.internal:6379/2", false);
+    config.username = Some("acl-user".to_string());
+    config.password = Some("acl-password".to_string());
+
+    let rendered = format!("{config:?}");
+    assert!(
+        !rendered.contains("urlpass")
+            && !rendered.contains("acl-password")
+            && !rendered.contains("acl-user"),
+        "RedisConfig Debug leaked credentials: {rendered}"
+    );
+    assert!(
+        rendered.contains("redis.internal:6379"),
+        "RedisConfig Debug dropped useful diagnostics: {rendered}"
+    );
+}
+
 #[test]
 fn test_hostname_skips_ipv6_literals() {
     let config = make_config("redis://[2001:db8::10]:6379/0", false);

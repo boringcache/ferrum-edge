@@ -3172,7 +3172,10 @@ paths:
         redacted before it is written to the audit log. Sensitive plugin
         configuration is redacted as well; Loki endpoint paths/queries,
         authorization, and all custom-header values are never persisted in
-        the diff. Basic credential
+        the diff, Redis envelope signing keys (`redis_integrity_key` and any
+        other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
+        userinfo is stripped while its scheme/host/port/database are kept.
+        Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
 
@@ -6264,7 +6267,10 @@ components:
             their unmodeled values cannot be disclosed.
             Sensitive plugin configuration is also redacted; loki_logging
             endpoint paths/queries, authorization, and custom-header values
-            are never persisted.
+            are never persisted, `redis_integrity_key` (and any other
+            `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
+            `redis_url` userinfo is stripped while scheme/host/port/database
+            are kept.
 
     AuditEventListResponse:
       type: object

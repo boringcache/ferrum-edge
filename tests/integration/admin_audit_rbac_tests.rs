@@ -376,14 +376,12 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     let admin = token("security-admin", Some("admin"));
 
     let secret_key = "super-secret-load-test-key-0123456789!";
-    let redis_integrity_key = "redis-integrity-key-0123456789abcdef";
     let plugin = json!({
         "id": "audit-plugin-secret",
         "plugin_name": "load_testing",
         "scope": "global",
         "config": {
             "key": secret_key,
-            "redis_integrity_key": redis_integrity_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "ramp": true
@@ -403,16 +401,12 @@ async fn plugin_config_audit_diff_redacts_sensitive_config_fields() {
     .await;
     let event = &audit_body["items"].as_array().expect("audit items")[0];
     assert_eq!(event["diff"]["after"]["config"]["key"], "[REDACTED]");
-    assert_eq!(
-        event["diff"]["after"]["config"]["redis_integrity_key"],
-        "[REDACTED]"
-    );
     assert_eq!(event["diff"]["after"]["config"]["ramp"], true);
     assert_eq!(event["diff"]["after"]["config"]["concurrent_clients"], 1);
     assert_eq!(event["diff"]["after"]["config"]["duration_seconds"], 1);
     let serialized = event["diff"].to_string();
     assert!(
-        !serialized.contains(secret_key) && !serialized.contains(redis_integrity_key),
+        !serialized.contains(secret_key),
         "secret key leaked: {event:?}"
     );
 }
@@ -427,14 +421,12 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
     let operator = token("mesh-operator", Some("operator"));
 
     let secret_key = "read-secret-load-test-key-0123456789!";
-    let redis_integrity_key = "redis-integrity-key-fedcba9876543210";
     let plugin = json!({
         "id": "read-plugin-secret",
         "plugin_name": "load_testing",
         "scope": "global",
         "config": {
             "key": secret_key,
-            "redis_integrity_key": redis_integrity_key,
             "concurrent_clients": 1,
             "duration_seconds": 1,
             "ramp": true
@@ -448,12 +440,10 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
         get_json(&base, "/plugins/config/read-plugin-secret", &viewer).await;
     assert_eq!(status, 200, "viewer plugin get failed: {viewer_body:?}");
     assert_eq!(viewer_body["config"]["key"], "[REDACTED]");
-    assert_eq!(viewer_body["config"]["redis_integrity_key"], "[REDACTED]");
     assert_eq!(viewer_body["config"]["ramp"], true);
     assert_eq!(viewer_body["config"]["concurrent_clients"], 1);
     assert!(
-        !viewer_body.to_string().contains(secret_key)
-            && !viewer_body.to_string().contains(redis_integrity_key),
+        !viewer_body.to_string().contains(secret_key),
         "viewer response leaked plugin secret: {viewer_body:?}"
     );
 
@@ -461,26 +451,118 @@ async fn non_admin_plugin_config_reads_redact_sensitive_fields() {
         get_json(&base, "/plugins/config/read-plugin-secret", &operator).await;
     assert_eq!(status, 200, "operator plugin get failed: {operator_body:?}");
     assert_eq!(operator_body["config"]["key"], "[REDACTED]");
-    assert_eq!(operator_body["config"]["redis_integrity_key"], "[REDACTED]");
     assert_eq!(operator_body["config"]["ramp"], true);
 
     let (status, admin_body) = get_json(&base, "/plugins/config/read-plugin-secret", &admin).await;
     assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
     assert_eq!(admin_body["config"]["key"], secret_key);
-    assert_eq!(
-        admin_body["config"]["redis_integrity_key"],
-        redis_integrity_key
-    );
     assert_eq!(admin_body["config"]["ramp"], true);
 
     let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
     assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
     assert_eq!(list_body["data"][0]["config"]["key"], "[REDACTED]");
+    assert_eq!(list_body["data"][0]["config"]["ramp"], true);
+}
+
+/// `ai_semantic_cache` in Redis mode carries two distinct secrets that a
+/// Viewer/Operator read and every audit diff must not disclose:
+///
+/// * `redis_integrity_key` — the HMAC-SHA256 secret that authenticates Redis
+///   cache envelopes. Disclosure lets any reader forge an envelope that the
+///   gateway will replay as a cache hit, so it is redacted wholesale.
+/// * `redis_url` userinfo — Redis ACL credentials are documented as encodable
+///   in the URL (`redis://user:pass@host`). Only the userinfo is stripped;
+///   scheme/host/port/database stay visible as bounded diagnostics.
+///
+/// Full-Admin reads stay raw so rotation via read-modify-write keeps working.
+#[tokio::test]
+async fn redis_backed_plugin_secrets_are_redacted_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let integrity_key = "redis-integrity-secret-0123456789abcdef";
+    let redis_password = "redis-acl-password-0123456789";
+    let redis_url = format!("redis://cacheuser:{redis_password}@cache.internal:6379/3");
+    let plugin = json!({
+        "id": "redis-cache-secret",
+        "plugin_name": "ai_semantic_cache",
+        "scope": "global",
+        "config": {
+            "sync_mode": "redis",
+            "redis_url": &redis_url,
+            "redis_integrity_key": integrity_key,
+            "ttl_seconds": 60
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "plugin create failed: {body:?}");
+
+    let expected_url = "redis://redacted@cache.internal:6379/3";
+
+    for (role, actor) in [("viewer", &viewer), ("operator", &operator)] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/redis-cache-secret", actor).await;
+        assert_eq!(status, 200, "{role} plugin get failed: {projected:?}");
+        assert_eq!(
+            projected["config"]["redis_integrity_key"], "[REDACTED]",
+            "{role} read exposed the Redis integrity key: {projected:?}"
+        );
+        assert_eq!(
+            projected["config"]["redis_url"], expected_url,
+            "{role} read did not strip Redis URL userinfo: {projected:?}"
+        );
+        // Non-secret diagnostics survive the projection.
+        assert_eq!(projected["config"]["ttl_seconds"], 60);
+        assert_eq!(projected["config"]["sync_mode"], "redis");
+        let serialized = projected.to_string();
+        assert!(
+            !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+            "{role} response leaked Redis secret material: {projected:?}"
+        );
+    }
+
+    let (status, list_body) = get_json(&base, "/plugins/config", &viewer).await;
+    assert_eq!(status, 200, "viewer plugin list failed: {list_body:?}");
+    let serialized = list_body.to_string();
+    assert!(
+        !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+        "viewer list leaked Redis secret material: {list_body:?}"
+    );
+    assert_eq!(list_body["data"][0]["config"]["redis_url"], expected_url);
     assert_eq!(
         list_body["data"][0]["config"]["redis_integrity_key"],
         "[REDACTED]"
     );
-    assert_eq!(list_body["data"][0]["config"]["ramp"], true);
+
+    // Full Admin still sees the raw values so rotation by read-modify-write works.
+    let (status, admin_body) = get_json(&base, "/plugins/config/redis-cache-secret", &admin).await;
+    assert_eq!(status, 200, "admin plugin get failed: {admin_body:?}");
+    assert_eq!(admin_body["config"]["redis_integrity_key"], integrity_key);
+    assert_eq!(admin_body["config"]["redis_url"], redis_url);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=redis-cache-secret",
+        &admin,
+        1,
+    )
+    .await;
+    let event = &audit_body["items"].as_array().expect("audit items")[0];
+    assert_eq!(
+        event["diff"]["after"]["config"]["redis_integrity_key"],
+        "[REDACTED]"
+    );
+    assert_eq!(event["diff"]["after"]["config"]["redis_url"], expected_url);
+    let serialized = event["diff"].to_string();
+    assert!(
+        !serialized.contains(integrity_key) && !serialized.contains(redis_password),
+        "audit diff leaked Redis secret material: {event:?}"
+    );
 }
 
 #[tokio::test]
