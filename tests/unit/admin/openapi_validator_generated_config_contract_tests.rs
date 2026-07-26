@@ -339,6 +339,66 @@ fn importer_resolves_multipart_encoding_header_and_schema_refs() {
 }
 
 #[test]
+fn importer_rejects_case_equivalent_duplicate_multipart_encoding_headers() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Upload API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "upload-api",
+    "backend_host": "upload.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/upload": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": {"type": "string", "format": "binary"}
+                }
+              },
+              "encoding": {
+                "file": {
+                  "headers": {
+                    "X-Part-Token": {
+                      "required": true,
+                      "schema": {"type": "string", "minLength": 8}
+                    },
+                    "x-part-token": {
+                      "schema": {"type": "string"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}"##;
+
+    let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("case-equivalent multipart encoding headers must fail import");
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate header name"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("encoding") && message.contains("headers"),
+        "error must be path-qualified: {message}"
+    );
+}
+
+#[test]
 fn importer_rejects_unsupported_encoding_style_at_admission() {
     let spec = r##"{
   "openapi": "3.1.0",

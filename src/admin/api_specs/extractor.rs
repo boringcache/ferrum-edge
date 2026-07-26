@@ -1662,6 +1662,7 @@ fn normalize_request_body_encoding(
                 });
             }
             let mut normalized_headers = Map::new();
+            let mut seen_header_names = HashSet::new();
             for (header_name, header_value) in headers {
                 let name = header_name.trim().to_ascii_lowercase();
                 if http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
@@ -1674,6 +1675,14 @@ fn normalize_request_body_encoding(
                         which: "requestBody.content.encoding",
                         error: format!(
                             "encoding['{property}'].headers contains invalid or reserved header '{header_name}'"
+                        ),
+                    });
+                }
+                if !seen_header_names.insert(name) {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "requestBody.content['{media_type}'].encoding['{property}'].headers contains duplicate header name '{header_name}'"
                         ),
                     });
                 }

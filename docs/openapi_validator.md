@@ -190,7 +190,7 @@ The generated plugin config has this shape:
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
-| `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. |
+| `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. Case-equivalent duplicate keys are rejected at construction. |
 | `error_response.request_status_code` | `400` | Status for blocked request validation errors. |
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
 | `error_response.content_type` | `application/problem+json` | Content type for generated error bodies. |
@@ -203,7 +203,7 @@ Intentionally free-form maps stay open but are shape-validated instead of key-en
 
 - Media-type map keys (`request_body.content`, each `responses[status]` entry) must be a media type or media range: `type/subtype`, `type/*`, or `*/*` built from RFC 9110 tokens.
 - Response status keys must be a three-digit `1xx`–`5xx` status, an OpenAPI wildcard range `1XX`–`5XX`, or `default`; case variants that normalize to the same range/default are rejected as duplicates.
-- `bypass.header_present` keys are header names; encoding maps are keyed by schema property name.
+- `bypass.header_present` keys are header names; encoding maps are keyed by schema property name. Case-equivalent duplicate header names in `bypass.header_present` and in multipart Encoding Header Objects are rejected as canonical duplicates before either policy can overwrite the other.
 
 `request_body` must use exactly one of the two documented forms — `{"content": {…}}` or `{"content_type": …, "schema": …, "encoding"?: …}`. The object is never treated as its own media map, which is what previously made a misspelled fixed field indistinguishable from a media type.
 
@@ -223,7 +223,7 @@ Removed aliases: `json_schema_draft` (use `schema_draft`) and `operations[].requ
 - Request and response bodies may carry a complete HTTP `Content-Encoding` list (`gzip`, `br`, and `identity`). Supported coding chains such as `gzip, br` and `br, gzip` are decoded in reverse application order before schema validation. Empty, malformed, parameterized, or unsupported list members fail validation. `max_body_bytes` bounds the raw body and every decoded layer so chained expansion fails closed.
 - Response selection is **status-first**. The exact status wins; otherwise the narrowest matching OpenAPI wildcard range such as `4XX`; otherwise `default`. The selected response object is final: a media-type miss inside it never falls through to a range or `default` object, because those cover status codes that are *not otherwise declared*. Media entries are matched most-specific-first (exact media type, then Ferrum's `+json` / `+xml` / `text/*` family fallback, then a declared `type/*` range, then `*/*`). The importer emits declared statuses even when they carry no schema-bearing content, so an empty media map means "this status is declared to carry no body".
 - An empty response body is **not** an automatic pass. Except for statuses and methods with no body semantics (HEAD, 1xx, 204, 205, 304, which are skipped with `skip_reason = no_body_expected`), a zero-byte body is fed to the media parser for the selected schema, so an empty payload under `Content-Type: application/json` fails JSON parsing instead of silently continuing.
-- Response validation errors are redacted. Schema failures retain only bounded instance/schema locations; response conversion failures use a generic message; missing-schema errors report only whether Content-Type was present. Backend body values and raw backend Content-Type values therefore do not cross the client boundary or land in transaction logs. Request validation errors keep the full message because the instance is the caller's own submitted body.
+- Response validation errors are redacted. Schema failures retain only a fixed generic message plus the operator/schema-controlled schema location (JSON Pointer object-key segments in the instance path are backend-derived and are never emitted); response conversion failures use a generic message; missing-schema errors report only whether Content-Type was present. Backend body values, backend JSON property names, and raw backend Content-Type values therefore do not cross the client boundary or land in transaction logs. Request validation errors keep the full message because the instance is the caller's own submitted body.
 - Path templates are generated as full-match regexes. Path parameter constraints are not interpreted; `{id}` becomes `[^/]+`.
 
 ## Metadata

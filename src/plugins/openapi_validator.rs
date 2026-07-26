@@ -1901,6 +1901,11 @@ fn parse_property_encoding(
                     "encoding['{property}'].headers must not redefine '{name}'"
                 ));
             }
+            if headers.contains_key(&name) {
+                return Err(format!(
+                    "encoding['{property}'].headers contains duplicate header name '{name}'"
+                ));
+            }
             // Header Object may wrap `schema`; accept either that public OAS
             // shape or the internal bare-schema representation. Header Object
             // `required` defaults to false (OAS 3.1 §4.8.21), while the
@@ -4940,24 +4945,20 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 /// Render a schema violation for metadata and the problem body.
 ///
 /// Response-side details are redacted: the `jsonschema` message embeds the
-/// offending instance value, and a response instance is backend-controlled
-/// data that must not cross the client boundary or land in transaction logs.
-/// The instance location and the failing schema location are operator-
-/// actionable and contain no payload bytes. Request-side details keep the full
-/// message because the instance is the caller's own submitted body.
+/// offending instance value, and JSON Pointer object-key segments in the
+/// instance path are derived from backend JSON property names. Neither may
+/// cross the client boundary or land in transaction logs. Response failures
+/// therefore emit only a fixed generic message plus the operator/schema-
+/// controlled `schema_path()`. Request-side details keep the full message
+/// because the instance is the caller's own submitted body.
 fn format_schema_error(error: &jsonschema::ValidationError<'_>, side: ValidationSide) -> String {
-    let path = error.instance_path().to_string();
     if side == ValidationSide::Response {
-        let location = if path.is_empty() {
-            "<root>"
-        } else {
-            path.as_str()
-        };
         return format!(
-            "{location}: response body does not satisfy the response schema at {}",
+            "response body does not satisfy the response schema at {}",
             error.schema_path()
         );
     }
+    let path = error.instance_path().to_string();
     if path.is_empty() {
         error.to_string()
     } else {
@@ -5060,7 +5061,13 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
                             .to_string()
                     })?)
                 };
-                parsed.insert(key.to_ascii_lowercase(), expected.map(str::to_string));
+                let normalized = key.to_ascii_lowercase();
+                if parsed.contains_key(&normalized) {
+                    return Err(format!(
+                        "openapi_validator: bypass.header_present contains duplicate header name '{normalized}'"
+                    ));
+                }
+                parsed.insert(normalized, expected.map(str::to_string));
             }
             Ok(parsed)
         }

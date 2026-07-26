@@ -5931,6 +5931,103 @@ fn multipart_header_object_rejects_unknown_fields() {
 }
 
 #[test]
+fn case_equivalent_duplicate_bypass_headers_are_rejected() {
+    let error = config_error(json!({
+        "bypass": {
+            "header_present": {
+                "X-Policy": "strict-token",
+                "x-policy": null
+            }
+        },
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("bypass.header_present") && error.contains("duplicate"),
+        "case-equivalent bypass headers must fail closed: {error}"
+    );
+    assert!(
+        error.contains("x-policy"),
+        "error must name the canonical duplicate: {error}"
+    );
+}
+
+#[test]
+fn case_equivalent_duplicate_multipart_encoding_headers_are_rejected() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {
+                                        "required": true,
+                                        "schema": {"type": "string", "minLength": 8}
+                                    },
+                                    "x-part-token": {
+                                        "schema": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        error.contains("duplicate header name") && error.contains("x-part-token"),
+        "case-equivalent multipart encoding headers must fail closed: {error}"
+    );
+}
+
+#[tokio::test]
+async fn bypass_header_matching_remains_case_insensitive() {
+    let plugin = OpenapiValidator::new(&json!({
+        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    ctx.headers.insert(
+        "X-Bypass-Validator".to_string(),
+        "any-value".to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("bypass_header")
+    );
+}
+
+#[test]
 fn removed_config_aliases_are_unknown_keys() {
     for config in [
         json!({
@@ -6270,7 +6367,65 @@ async fn response_validation_errors_do_not_echo_backend_values() {
         !detail.contains("leaked-backend-secret"),
         "backend response content must not land in transaction logs: {detail}"
     );
-    assert!(detail.contains("/ok"), "unexpected detail: {detail}");
+    assert!(
+        detail.contains("response body does not satisfy the response schema at"),
+        "unexpected detail: {detail}"
+    );
+    assert!(
+        detail.contains("properties") || detail.contains("type"),
+        "schema location evidence must remain: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn response_schema_errors_do_not_echo_backend_property_names() {
+    // JSON Pointer object-key segments are derived from backend property names,
+    // so a sensitive or attacker-chosen key must never appear in the client
+    // problem body or response-error metadata.
+    const BACKEND_SECRET_PROPERTY: &str = "backend-secret-prop-r3-9f2a7c";
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"ok": {"type": "boolean"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let body_bytes = format!(r#"{{"{BACKEND_SECRET_PROPERTY}":true}}"#);
+    let mut ctx = post_ctx("/items");
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &json_headers(), body_bytes.as_bytes())
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    assert!(
+        !body.contains(BACKEND_SECRET_PROPERTY),
+        "backend JSON property names must not cross the client boundary: {body}"
+    );
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(
+        !detail.contains(BACKEND_SECRET_PROPERTY),
+        "backend JSON property names must not land in transaction logs: {detail}"
+    );
+    assert!(
+        detail.contains("response body does not satisfy the response schema at"),
+        "unexpected detail: {detail}"
+    );
+    assert!(
+        detail.contains("additionalProperties"),
+        "operator/schema location evidence must remain: {detail}"
+    );
 }
 
 #[tokio::test]

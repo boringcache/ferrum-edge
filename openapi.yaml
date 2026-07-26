@@ -17333,6 +17333,10 @@ components:
         control cannot silently fall back to a weaker default. Free-form maps
         (media types, response status keys, `bypass.header_present`, encoding
         property names) stay open but their keys are shape-validated.
+        Response schema failures emit only a fixed generic message plus the
+        operator/schema-controlled schema location; backend instance values and
+        JSON property names never appear in client problem bodies or
+        `openapi_validator.response_error` metadata.
       properties:
         enforcement_mode:
           type: string
@@ -17444,7 +17448,10 @@ components:
               additionalProperties:
                 type: [string, "null"]
               default: {}
-              description: Header-name map. Null means any value; a string requires exact value.
+              description: >-
+                Header-name map. Null means any value; a string requires exact
+                value. Keys are matched case-insensitively at runtime; case-
+                equivalent duplicate keys are rejected at construction.
         error_response:
           type: object
           additionalProperties: false
@@ -17677,7 +17684,8 @@ components:
             against their schemas; an absent header fails only when its Header Object
             sets required=true (the OpenAPI default is false). Only valid for
             multipart/form-data. Must not redefine Content-Type, Content-Disposition,
-            or Content-Transfer-Encoding.
+            or Content-Transfer-Encoding. Case-equivalent duplicate header names are
+            rejected at construction and during API-spec extraction.
 
     OpenapiValidatorEncodingHeader:
       description: >
