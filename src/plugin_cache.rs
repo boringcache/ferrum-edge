@@ -3870,7 +3870,9 @@ impl PluginCacheInner {
                     &entry.phase.initial_response_header_policy_names,
                 ),
                 response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
-                response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
+                response_presentation_policy_digest: entry
+                    .phase
+                    .response_presentation_policy_digest,
                 capabilities,
                 requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
                 requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),

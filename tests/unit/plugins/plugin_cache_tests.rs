@@ -9628,7 +9628,11 @@ fn test_initial_response_header_policy_resolves_by_namespaced_key() {
 fn presentation_digest_for_proxy(config: &GatewayConfig) -> Option<[u8; 32]> {
     PluginCache::new(config)
         .expect("plugin cache must build")
-        .request_view(ferrum_edge::config::types::DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http)
+        .request_view(
+            ferrum_edge::config::types::DEFAULT_NAMESPACE,
+            "p1",
+            ProxyProtocol::Http,
+        )
         .response_presentation_policy_digest()
 }
 
