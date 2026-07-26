@@ -22,7 +22,8 @@
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use prost_reflect::{
-    Cardinality, DescriptorPool, DynamicMessage, MessageDescriptor, Syntax, Value as ProtobufValue,
+    Cardinality, DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Syntax,
+    Value as ProtobufValue,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -742,6 +743,11 @@ fn optional_compiled_schema(
                 draft.config_value()
             )
         })
+        // A configured, non-empty, audited schema always yields a live
+        // validator here; `Ok(None)` above is reserved for "the operator did
+        // not configure this field at all", so an unconfigured surface stays
+        // unvalidated while a configured one can never degrade to `None`.
+        .map(Some)
 }
 
 /// Bounded structural audit of a configured JSON Schema.
