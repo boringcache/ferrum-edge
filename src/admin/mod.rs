@@ -1649,9 +1649,10 @@ pub async fn handle_admin_request(
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Acquire));
         // Sticky serving-degradation overrides a readiness restore (issue
-        // #2117): once a CP/DP/mesh serving task dies after startup, `/health` stays
-        // not-ready even though the mode's main task (CP) or a CP reconnect (DP)
-        // later stores `startup_ready = true`. Only CP/DP populate this flag.
+        // #2117 / #2986): once a CP/DP/mesh serving task — or the CP database
+        // config poll task — dies after startup, `/health` stays not-ready even
+        // though the mode's main task (CP) or a CP reconnect (DP) later stores
+        // `startup_ready = true`. Only CP/DP/mesh populate this flag.
         let serving_degraded = state
             .serving_degraded
             .as_ref()
@@ -1681,13 +1682,13 @@ pub async fn handle_admin_request(
             });
         }
 
-        if state.mode == "database"
+        if (state.mode == "database" || state.mode == "cp")
             && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
                 .database_delta_poll_metrics_snapshot()
         {
             if let Some(degraded) = snapshot.degraded {
                 health_status["status"] = json!("degraded");
-                health_status["database_polling"] = json!({
+                let mut polling = json!({
                     "status": "degraded",
                     "reason": degraded.reason,
                     "resource_category": degraded.resource_category,
@@ -1697,13 +1698,21 @@ pub async fn handle_admin_request(
                     "current_backoff_seconds": degraded.current_backoff_seconds,
                     "escalated": degraded.escalated,
                 });
+                if let Some(at) = snapshot.last_poll_completed_at {
+                    polling["last_poll_completed_at"] = json!(at);
+                }
+                health_status["database_polling"] = polling;
             } else {
-                health_status["database_polling"] = json!({
+                let mut polling = json!({
                     "status": "ok",
                     "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
                     "current_backoff_bucket": snapshot.current_backoff_bucket,
                     "current_backoff_seconds": snapshot.current_backoff_seconds,
                 });
+                if let Some(at) = snapshot.last_poll_completed_at {
+                    polling["last_poll_completed_at"] = json!(at);
+                }
+                health_status["database_polling"] = polling;
             }
         }
 
@@ -5650,7 +5659,7 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
 /// `gateway.config_source_status` is derived from a lock-free
 /// [`AdminState::db_available`] snapshot — never from a per-request DB probe.
 pub fn build_metrics(state: &AdminState) -> metrics::AdminMetrics {
-    let database_polling = if state.mode == "database" {
+    let database_polling = if state.mode == "database" || state.mode == "cp" {
         crate::plugins::prometheus_metrics::global_registry().database_delta_poll_metrics_snapshot()
     } else {
         None
