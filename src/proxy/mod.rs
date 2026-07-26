@@ -24789,10 +24789,19 @@ async fn handle_proxy_request_inner(
 
             // Replay the original request body on retry. On connection failures
             // the body was never sent, so replaying is correct and safe.
-            // The final retry attempt uses streaming if configured.
-            let is_last_attempt = attempt >= retry_config.max_retries;
-            let h3_retry_stream_response =
-                should_stream_h3_retry_response(should_stream, attempt, retry_config.max_retries);
+            //
+            // The caller's response-streaming decision (`should_stream`) is
+            // preserved on EVERY attempt, not only the last one (issue #2949).
+            // `retry::should_retry` consults status/`error_class`/method only —
+            // all known once the response headers arrive and before any body
+            // byte is read — so an attempt that turns out retryable simply drops
+            // its `reqwest::Response` / `H3StreamingResponse` undrained, exactly
+            // as the initial attempt (dispatched with `should_stream`) already
+            // does. Making streaming attempt-positional instead forced a healthy
+            // `text/event-stream` that succeeded before the last attempt through
+            // full-body collection: unbounded when
+            // `max_response_body_size_bytes` is `0`, and otherwise a stalled
+            // stream that 502s at the cap or the read timeout.
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
@@ -24805,7 +24814,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    h3_retry_stream_response,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -24823,7 +24832,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    should_stream && is_last_attempt,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -33827,10 +33836,6 @@ fn classify_h3_pool_error(
     classify_h3_error(e.as_ref())
 }
 
-fn should_stream_h3_retry_response(stream_response: bool, attempt: u32, max_retries: u32) -> bool {
-    stream_response && attempt >= max_retries
-}
-
 /// Build the 502 returned when an H3 backend response body exceeds
 /// `max_response_body_size_bytes`. `connection_error` stays `false` (the
 /// request demonstrably reached the backend) and the
@@ -34024,7 +34029,7 @@ async fn proxy_to_backend_http3_retry(
                 // Fast path: reject before streaming when the declared
                 // Content-Length exceeds the configured response size limit —
                 // mirrors the reqwest retry path's pre-stream reject. Without
-                // this the final streaming retry attempt would forward an
+                // this a streaming retry attempt would forward an
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
@@ -40587,23 +40592,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn h3_retry_streams_only_the_final_attempt_when_requested() {
-        assert!(
-            !super::should_stream_h3_retry_response(true, 0, 2),
-            "non-final H3 retries must stay buffered so another retry can replay"
-        );
-        assert!(
-            !super::should_stream_h3_retry_response(false, 2, 2),
-            "a buffered-response request must stay buffered even on the final retry"
-        );
-        assert!(
-            super::should_stream_h3_retry_response(true, 2, 2),
-            "the final H3 retry must preserve the original streaming response decision"
-        );
-    }
-
-    /// Guards the declared-Content-Length fast-path reject used by the final
+    /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
     /// over-limit Content-Length triggers the pre-stream 502.
     #[test]
