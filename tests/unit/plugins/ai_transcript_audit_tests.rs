@@ -4015,8 +4015,7 @@ async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
         "locally staged sampled winner must tee"
     );
     assert!(
-        peer
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        peer.response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .is_some(),
         "locally staged sampled winner must install a stream inspector"
     );
