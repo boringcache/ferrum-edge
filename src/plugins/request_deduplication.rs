@@ -479,16 +479,41 @@ enum DeduplicationEntry {
         fingerprint: String,
         owner_token: String,
     },
+    /// The protected operation completed, but no replayable response bytes can
+    /// remain in the bounded local cache.
+    ///
+    /// This state is deliberately fixed-size: the key and fingerprint are
+    /// already bounded digests, the owner token is process-generated, and no
+    /// response bytes or attacker-controlled headers are retained. It replaces
+    /// an existing owned entry in place, so publishing a barrier never adds a
+    /// second per-key allocation. Its own retention is authoritative; unlike an
+    /// `InFlight` marker it must not fall back to `inflight_ttl_seconds` after a
+    /// completion established a longer deadline.
+    ExecutionBarrier {
+        inserted_at: Instant,
+        retention: Duration,
+        fingerprint: String,
+        /// Kept solely to fence removal after a distributed publication says
+        /// this local publisher was stale. Ordinary in-flight cleanup never
+        /// matches this variant.
+        owner_token: String,
+    },
     /// Response has been cached.
     Completed {
         cached: CachedResponse,
         sequence: u64,
         fingerprint: String,
-        /// Replace this replay with a short-lived in-flight tombstone instead
-        /// of removing it when capacity pressure makes retention impossible.
-        /// This is set for externally executing terminal responses until a
-        /// distributed replay is known to be visible.
-        retain_inflight_on_eviction: bool,
+        /// Exact local publisher whose in-flight entry became this completion.
+        /// If concurrent eviction converts the completion to a barrier while a
+        /// Redis compare-and-set is awaiting, a `NotOwner` result can remove
+        /// that exact barrier without touching a successor.
+        publisher_owner_token: String,
+        /// Replace this replay with a fixed-size execution barrier carrying the
+        /// completion's original retention clock instead of removing it when
+        /// capacity pressure makes response retention impossible. This is set
+        /// for externally executing terminal responses until a distributed
+        /// replay is known to be visible.
+        retain_barrier_on_eviction: bool,
     },
 }
 
@@ -625,8 +650,8 @@ struct LocalCompletionCandidate<'a> {
     status_code: u16,
     headers: HashMap<String, String>,
     body: &'a [u8],
-    retain_inflight_on_skip: bool,
-    retain_inflight_on_eviction: bool,
+    publish_execution_barrier_on_skip: bool,
+    retain_barrier_on_eviction: bool,
     /// See [`CachedResponse::retention`].
     retention: Duration,
     response_policy: ResponsePolicyProvenance,
@@ -957,7 +982,8 @@ impl RequestDeduplication {
             .iter()
             .map(|entry| match entry.value() {
                 DeduplicationEntry::Completed { cached, .. } => cached.retained_size(),
-                DeduplicationEntry::InFlight { .. } => 0,
+                DeduplicationEntry::InFlight { .. }
+                | DeduplicationEntry::ExecutionBarrier { .. } => 0,
             })
             .sum()
     }
@@ -1006,6 +1032,25 @@ impl RequestDeduplication {
         for mut entry in self.local_cache.iter_mut() {
             if let DeduplicationEntry::InFlight { started_at, .. } = entry.value_mut() {
                 *started_at = expired_at;
+            }
+        }
+        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn expire_execution_barriers_for_tests(&self) {
+        let _guard = self.accounting_guard();
+        let now = Instant::now();
+        for mut entry in self.local_cache.iter_mut() {
+            if let DeduplicationEntry::ExecutionBarrier {
+                inserted_at,
+                retention,
+                ..
+            } = entry.value_mut()
+            {
+                *inserted_at = now
+                    .checked_sub(retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
             }
         }
         self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
@@ -1174,6 +1219,23 @@ impl RequestDeduplication {
                             );
                         }
                     }
+                    DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention,
+                        fingerprint: cached_fingerprint,
+                        ..
+                    } => {
+                        if now.duration_since(*inserted_at) < *retention {
+                            if cached_fingerprint == fingerprint {
+                                return LocalDeduplicationAction::Conflict(
+                                    DeduplicationConflict::InFlight,
+                                );
+                            }
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            );
+                        }
+                    }
                     DeduplicationEntry::InFlight {
                         started_at,
                         fingerprint: cached_fingerprint,
@@ -1198,7 +1260,7 @@ impl RequestDeduplication {
                     }
                 }
                 drop(entry);
-                self.replace_expired_completed_with_inflight(key, fingerprint, now, owner_token)
+                self.replace_expired_entry_with_inflight(key, fingerprint, now, owner_token)
             }
         }
     }
@@ -1228,7 +1290,7 @@ impl RequestDeduplication {
         })
     }
 
-    fn replace_expired_completed_with_inflight(
+    fn replace_expired_entry_with_inflight(
         &self,
         key: &str,
         fingerprint: &str,
@@ -1267,6 +1329,31 @@ impl RequestDeduplication {
                         self.sub_completed_size_locked(retained_size);
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                        entry.insert(DeduplicationEntry::InFlight {
+                            started_at: now,
+                            fingerprint: fingerprint.to_string(),
+                            owner_token: owner_token.to_string(),
+                        });
+                        LocalDeduplicationAction::Fresh
+                    }
+                }
+                DeduplicationEntry::ExecutionBarrier {
+                    inserted_at,
+                    retention,
+                    fingerprint: cached_fingerprint,
+                    ..
+                } => {
+                    if now.duration_since(*inserted_at) < *retention {
+                        if cached_fingerprint == fingerprint {
+                            LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
+                        } else {
+                            LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            )
+                        }
+                    } else {
+                        // A barrier is accounted with the in-flight/fixed-state
+                        // counter. Replacing it in place preserves cardinality.
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
                             fingerprint: fingerprint.to_string(),
@@ -1747,6 +1834,31 @@ impl RequestDeduplication {
             .map(|_| decrement_atomic(&self.inflight_count))
     }
 
+    /// Remove only the execution barrier published by this exact local owner.
+    ///
+    /// Used when Redis's compare-and-set reports that this publisher is stale.
+    /// If the barrier expired and a successor acquired the key, the successor is
+    /// an `InFlight` entry with a different token and is therefore untouched.
+    fn remove_matching_local_execution_barrier(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        owner_token: &str,
+    ) -> Option<usize> {
+        self.local_cache
+            .remove_if(key, |_, entry| {
+                matches!(
+                    entry,
+                    DeduplicationEntry::ExecutionBarrier {
+                        fingerprint: current,
+                        owner_token: current_owner_token,
+                        ..
+                    } if current == fingerprint && current_owner_token == owner_token
+                )
+            })
+            .map(|_| decrement_atomic(&self.inflight_count))
+    }
+
     /// Build the Redis payload a completed response would produce.
     ///
     /// `presentation_digest` is the effective static response-presentation
@@ -1792,8 +1904,8 @@ impl RequestDeduplication {
             status_code,
             headers,
             body,
-            retain_inflight_on_skip,
-            retain_inflight_on_eviction,
+            publish_execution_barrier_on_skip,
+            retain_barrier_on_eviction,
             retention,
             response_policy,
         } = candidate;
@@ -1814,7 +1926,13 @@ impl RequestDeduplication {
         }
 
         if entry_size > self.max_entry_size_bytes {
-            let inflight_count = if retain_inflight_on_skip {
+            let inflight_count = if publish_execution_barrier_on_skip {
+                entry.insert(DeduplicationEntry::ExecutionBarrier {
+                    inserted_at: Instant::now(),
+                    retention,
+                    fingerprint: fingerprint.to_string(),
+                    owner_token: owner_token.to_string(),
+                });
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 entry.remove();
@@ -1829,6 +1947,14 @@ impl RequestDeduplication {
 
         let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
+            if publish_execution_barrier_on_skip {
+                entry.insert(DeduplicationEntry::ExecutionBarrier {
+                    inserted_at: Instant::now(),
+                    retention,
+                    fingerprint: fingerprint.to_string(),
+                    owner_token: owner_token.to_string(),
+                });
+            }
             let redis_candidate = if self.redis_client.is_some() {
                 Some(CachedResponse {
                     status_code,
@@ -1839,16 +1965,17 @@ impl RequestDeduplication {
                     response_policy,
                 })
             } else {
-                if !retain_inflight_on_skip {
+                if !publish_execution_barrier_on_skip {
                     entry.remove();
                 }
                 None
             };
-            let inflight_count = if redis_candidate.is_some() || retain_inflight_on_skip {
-                self.inflight_count.load(Ordering::Relaxed)
-            } else {
-                decrement_atomic(&self.inflight_count)
-            };
+            let inflight_count =
+                if redis_candidate.is_some() || publish_execution_barrier_on_skip {
+                    self.inflight_count.load(Ordering::Relaxed)
+                } else {
+                    decrement_atomic(&self.inflight_count)
+                };
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::TotalCapacity {
@@ -1875,7 +2002,8 @@ impl RequestDeduplication {
             cached,
             sequence,
             fingerprint: fingerprint.to_string(),
-            retain_inflight_on_eviction,
+            publisher_owner_token: owner_token.to_string(),
+            retain_barrier_on_eviction,
         });
         self.add_completed_size_locked(entry_size);
         self.completed_order
@@ -1888,7 +2016,7 @@ impl RequestDeduplication {
         }
     }
 
-    fn set_completed_inflight_retention(
+    fn set_completed_barrier_retention(
         &self,
         key: &str,
         fingerprint: &str,
@@ -1901,13 +2029,13 @@ impl RequestDeduplication {
         if let DeduplicationEntry::Completed {
             sequence: current_sequence,
             fingerprint: current_fingerprint,
-            retain_inflight_on_eviction,
+            retain_barrier_on_eviction,
             ..
         } = entry.value_mut()
             && *current_sequence == sequence
             && current_fingerprint.as_str() == fingerprint
         {
-            *retain_inflight_on_eviction = retain;
+            *retain_barrier_on_eviction = retain;
         }
     }
 
@@ -1964,6 +2092,17 @@ impl RequestDeduplication {
                     self.mark_completed_sequence_pruned(*sequence);
                     self.sub_completed_size_locked(retained_size);
                     decrement_atomic(&self.completed_count);
+                }
+                keep
+            }
+            DeduplicationEntry::ExecutionBarrier {
+                inserted_at,
+                retention,
+                ..
+            } => {
+                let keep = now.duration_since(*inserted_at) < *retention;
+                if !keep {
+                    decrement_atomic(&self.inflight_count);
                 }
                 keep
             }
@@ -2056,8 +2195,19 @@ impl RequestDeduplication {
         while to_remove > 0 && sequence < limit {
             let current_sequence = sequence;
             match self.remove_completed_sequence_locked(sequence) {
-                CompletedSequenceRemoval::Removed | CompletedSequenceRemoval::Tombstoned => {
+                CompletedSequenceRemoval::Removed => {
                     to_remove -= 1;
+                    sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
+                }
+                CompletedSequenceRemoval::Tombstoned => {
+                    // Replacing a byte-heavy completion with a fixed-size
+                    // execution barrier releases the response-byte budget but
+                    // not a map slot. Keep trimming so a later unprotected
+                    // completion is removed and the cardinality target is met
+                    // whenever doing so does not discard live security state.
                     sequence += 1;
                     self.next_completed_evict_sequence
                         .store(sequence, Ordering::Relaxed);
@@ -2102,16 +2252,27 @@ impl RequestDeduplication {
                 return CompletedSequenceRemoval::Stale;
             }
         };
-        let (retained_size, fingerprint, retain_inflight_on_eviction) = match entry.get() {
+        let (
+            retained_size,
+            barrier_inserted_at,
+            barrier_retention,
+            fingerprint,
+            publisher_owner_token,
+            retain_barrier_on_eviction,
+        ) = match entry.get() {
             DeduplicationEntry::Completed {
                 cached,
                 sequence: current,
                 fingerprint,
-                retain_inflight_on_eviction,
+                publisher_owner_token,
+                retain_barrier_on_eviction,
             } if *current == sequence => (
                 cached.retained_size(),
+                cached.inserted_at,
+                cached.retention,
                 fingerprint.clone(),
-                *retain_inflight_on_eviction,
+                publisher_owner_token.clone(),
+                *retain_barrier_on_eviction,
             ),
             _ => {
                 drop(entry);
@@ -2122,15 +2283,16 @@ impl RequestDeduplication {
 
         self.sub_completed_size_locked(retained_size);
         decrement_atomic(&self.completed_count);
-        let result = if retain_inflight_on_eviction {
+        let result = if retain_barrier_on_eviction {
             // A distributed lock may still be the only cross-gateway guard for
             // an externally executed response. If the replay cannot remain in
             // the bounded local cache, retain a small local tombstone so Redis
             // loss cannot turn an identical retry into another side effect.
-            entry.insert(DeduplicationEntry::InFlight {
-                started_at: Instant::now(),
+            entry.insert(DeduplicationEntry::ExecutionBarrier {
+                inserted_at: barrier_inserted_at,
+                retention: barrier_retention,
                 fingerprint,
-                owner_token: self.next_local_inflight_owner_token(),
+                owner_token: publisher_owner_token,
             });
             self.inflight_count.fetch_add(1, Ordering::Relaxed);
             CompletedSequenceRemoval::Tombstoned
@@ -3027,14 +3189,13 @@ impl Plugin for RequestDeduplication {
         {
             return PluginResult::Continue;
         }
-        // Retain both in-flight locks (rather than fail open) when configured
-        // capacity is too small even to store an owned terminal response or a
-        // non-replayable external-operation tombstone. Serverless owns its
+        // Publish a fixed-size execution barrier (rather than fail open) when
+        // configured response-byte capacity is too small even to store an owned
+        // terminal response or the 409 tombstone bytes. Serverless owns its
         // publication through the typed marker above; `ai_federation` signals
         // the same intent for its committed provider call through
-        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`, so a storage skip there
-        // must keep the marker instead of letting a retry re-run the operation.
-        let retain_inflight_on_storage_skip = ctx.serverless_owned_dedup_publication
+        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`.
+        let requires_execution_barrier = ctx.serverless_owned_dedup_publication
             == Some(self.instance_id)
             || ctx
                 .metadata
@@ -3075,9 +3236,8 @@ impl Plugin for RequestDeduplication {
         // `ai_federation` provider call, which marks
         // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`): that operation has no
         // replayable response, so a same-key retry must not immediately
-        // re-execute it. Retain both in-flight locks until `inflight_ttl` in
-        // that case, mirroring the terminate-mode serverless side-effect owner
-        // handling above.
+        // re-execute it. Park the exact ownership until the committed hook can
+        // publish its authoritative completion barrier.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
@@ -3146,7 +3306,7 @@ impl Plugin for RequestDeduplication {
             // replace the bounded lease with a durable execution barrier.
             self.park_ownership_for_execution_barrier(
                 ctx,
-                retain_inflight_on_storage_skip,
+                requires_execution_barrier,
                 RequestDeduplicationRequestState {
                     key,
                     fingerprint,
@@ -3179,7 +3339,7 @@ impl Plugin for RequestDeduplication {
             );
             self.park_ownership_for_execution_barrier(
                 ctx,
-                retain_inflight_on_storage_skip,
+                requires_execution_barrier,
                 RequestDeduplicationRequestState {
                     key,
                     fingerprint,
@@ -3218,8 +3378,8 @@ impl Plugin for RequestDeduplication {
                 status_code: response_status,
                 headers: safe_headers,
                 body,
-                retain_inflight_on_skip: retain_inflight_on_storage_skip,
-                retain_inflight_on_eviction: retain_inflight_on_storage_skip
+                publish_execution_barrier_on_skip: requires_execution_barrier,
+                retain_barrier_on_eviction: requires_execution_barrier
                     || redis_lock_token.is_some(),
                 retention,
                 response_policy,
@@ -3259,11 +3419,11 @@ impl Plugin for RequestDeduplication {
                     }
                 }
                 if let Some(ownership) = redis_lock_token.as_ref() {
-                    // Nothing is retained locally, so the distributed record is
-                    // the only protection. Transition it to a completed record
-                    // through the fence: a replayable one when the payload fits,
-                    // otherwise a non-replayable tombstone. Either way peers get
-                    // a deterministic answer instead of being released to
+                    // Transition the distributed ownership through the fence: a
+                    // replayable record when the payload fits, otherwise a
+                    // non-replayable tombstone. An external operation also keeps
+                    // the fixed-size local barrier created above. Peers get a
+                    // deterministic answer instead of being released to
                     // re-execute once the raw lease expires; a record with no
                     // replay is held for `execution_barrier_retention()`, so it
                     // never expires sooner than the lease it replaced.
@@ -3277,21 +3437,35 @@ impl Plugin for RequestDeduplication {
                         )
                         .await
                     {
-                        // Published: the completed record now owns the key.
-                        // NotOwner: a successor or an already-completed record
-                        // owns it. In both cases this request's raw local marker
-                        // protects nothing and must not outlive the decision.
-                        RedisPublication::Published { .. } | RedisPublication::NotOwner => {
+                        // The completed Redis record now owns the distributed
+                        // key. Remove only a raw local in-flight marker; an
+                        // external operation's explicit local barrier survives.
+                        RedisPublication::Published { .. } => {
                             self.remove_matching_local_inflight(
                                 &key,
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
                         }
-                        // Redis could not be reached. Keep both in-flight
-                        // markers until `inflight_ttl` rather than freeing an
-                        // immediate duplicate with no replay value; the Redis
-                        // record expires on its own lease.
+                        RedisPublication::NotOwner => {
+                            // A stale publisher must discard either provisional
+                            // local state, but exact variant/token matching must
+                            // not clear a successor that acquired after expiry.
+                            self.remove_matching_local_inflight(
+                                &key,
+                                &fingerprint,
+                                &local_inflight_owner_token,
+                            );
+                            self.remove_matching_local_execution_barrier(
+                                &key,
+                                &fingerprint,
+                                &local_inflight_owner_token,
+                            );
+                        }
+                        // Redis could not be reached. Keep the provisional local
+                        // state — an ordinary in-flight lease or an external
+                        // operation's execution barrier. The Redis record
+                        // expires on its own lease.
                         RedisPublication::Unavailable => {}
                     }
                 }
@@ -3311,7 +3485,7 @@ impl Plugin for RequestDeduplication {
         // successor owns the operation, and never observe the operation as
         // unowned-and-uncompleted in between.
         let mut preserve_local_completion =
-            self.redis_client.is_none() && retain_inflight_on_storage_skip;
+            self.redis_client.is_none() && requires_execution_barrier;
         if let Some(ownership) = redis_lock_token.as_ref() {
             match self
                 .redis_publish_completed(
@@ -3326,7 +3500,7 @@ impl Plugin for RequestDeduplication {
                 RedisPublication::Published { replayable: true } => {
                     // Redis now carries the replay, so ordinary LRU eviction is
                     // safe even for an externally executing terminal response.
-                    self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
+                    self.set_completed_barrier_retention(&key, &fingerprint, sequence, false);
                 }
                 // The response fits local retention but not the Redis payload
                 // cap, so a non-replayable tombstone owns the distributed key.
@@ -3343,6 +3517,11 @@ impl Plugin for RequestDeduplication {
                     // the deployment does not recognize. Drop it and let the
                     // next request re-read the authoritative record.
                     self.remove_local_completed(&key, &fingerprint, sequence);
+                    self.remove_matching_local_execution_barrier(
+                        &key,
+                        &fingerprint,
+                        &local_inflight_owner_token,
+                    );
                     return PluginResult::Continue;
                 }
                 RedisPublication::Unavailable => {
@@ -3362,7 +3541,8 @@ impl Plugin for RequestDeduplication {
         // safety state. When no distributed replay exists, retain one completed
         // replay even if active in-flight requests temporarily push the cache
         // over max_entries; later pressure converts older protected replays to
-        // bounded-TTL in-flight tombstones rather than dropping them.
+        // fixed-size barriers with their original retention clocks rather than
+        // dropping them or restarting `inflight_ttl`.
         self.evict_completed_over_capacity(completed, inflight, preserve_local_completion);
 
         PluginResult::Continue
@@ -3455,8 +3635,8 @@ impl Plugin for RequestDeduplication {
         // the publication path runs instead of the retain-and-return synthetic
         // guard, then restored for any later hook that observes it. If capacity
         // is too small even for the tombstone, `local_publish_completed` keeps
-        // the in-flight locks (see `retain_inflight_on_storage_skip`) rather than
-        // failing open to an immediate duplicate.
+        // the fixed-size execution barrier rather than failing open to an
+        // immediate duplicate.
         if ctx
             .metadata
             .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)

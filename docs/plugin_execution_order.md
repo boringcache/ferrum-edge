@@ -321,8 +321,13 @@ or the Redis payload cap rejects it, or its replay provenance is unusable becaus
 the request straddled a response-presentation-policy publication or that policy
 is incomplete/`Dynamic`. The completion barrier is never downgraded to the bare
 in-flight lease in those cases: the same fenced ownership transition publishes the
-409 barrier for `max(ttl_seconds, inflight_ttl_seconds)`, and a capacity or Redis
-rejection stays fail-closed on the retained in-flight markers.
+409 barrier for `max(ttl_seconds, inflight_ttl_seconds)`. If response-byte
+admission fails locally, the exact owner is atomically replaced by a fixed-size
+execution barrier with that same retention. If later capacity pressure evicts a
+protected completion, its barrier inherits the completion's original insertion
+time and retention rather than starting a fresh `inflight_ttl_seconds` lease.
+Redis publication remains compare-and-set fenced, and a stale hook cannot clear
+either the barrier or a successor owner.
 
 These markers are internal (`ferrum:`-prefixed) and cannot be set from public
 request metadata or from a backend response header. A new plugin that spends

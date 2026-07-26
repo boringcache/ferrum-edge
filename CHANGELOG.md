@@ -47,9 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ttl_seconds`. The barrier also covers the case where the committed response
   itself cannot be retained as a replay — its request straddled a
   response-presentation-policy publication, or that policy is incomplete or
-  `Dynamic` — instead of falling back to the bare in-flight lease. Serverless
-  responses with stable, complete policy provenance are still stored as ordinary
-  replays. The provenance contract is documented in
+  `Dynamic` — instead of falling back to the bare in-flight lease. Local
+  response-byte admission failure and later protected-completion eviction now
+  use an explicit fixed-size execution barrier carrying the completion's own
+  authoritative retention clock; neither path can silently restart a shorter
+  `inflight_ttl_seconds` lease. Stale owner hooks cannot clear the barrier or a
+  successor because every transition remains fingerprint/token fenced.
+  Serverless responses with stable, complete policy provenance are still stored
+  as ordinary replays. The provenance contract is documented in
   `docs/plugin_execution_order.md`.
 - `response_caching` now applies RFC 9111 §3.5 shared-cache admission to the
   live request credential rather than only to a gateway-minted identity, so a

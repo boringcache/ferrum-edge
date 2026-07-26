@@ -4,6 +4,7 @@ use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
     finalized_response_replay_for_test, request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
+    request_deduplication_expire_execution_barriers_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
@@ -2209,6 +2210,271 @@ async fn external_operation_tombstone_outlives_a_shorter_ttl_than_the_inflight_l
     }
 }
 
+/// GHSA-8cr6-rw38-7j59: neither response-byte admission limit may demote a
+/// completed external operation back to an `InFlight` lease. The fixed-size
+/// fallback barrier owns the longer completion deadline and consumes no
+/// completed-response byte budget.
+#[tokio::test]
+async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets() {
+    for (label, config) in [
+        (
+            "entry",
+            json!({
+                "ttl_seconds": 60,
+                "inflight_ttl_seconds": 1,
+                "max_entry_size_bytes": 1,
+                "max_total_size_bytes": 8192
+            }),
+        ),
+        (
+            "total",
+            json!({
+                "ttl_seconds": 60,
+                "inflight_ttl_seconds": 1,
+                "max_entry_size_bytes": 8192,
+                "max_total_size_bytes": 1
+            }),
+        ),
+    ] {
+        let plugin = make_plugin(config);
+        let key = format!("tiny-{label}-barrier");
+        let mut owner_ctx = new_ctx("POST", "/api");
+        let mut owner_headers =
+            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(matches!(
+            plugin
+                .before_proxy(&mut owner_ctx, &mut owner_headers)
+                .await,
+            PluginResult::Continue
+        ));
+
+        owner_ctx.metadata.insert(
+            SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        owner_ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        assert!(matches!(
+            plugin
+                .on_final_response_body(
+                    &mut owner_ctx,
+                    200,
+                    &HashMap::new(),
+                    b"externally-executed"
+                )
+                .await,
+            PluginResult::Continue
+        ));
+        owner_ctx
+            .metadata
+            .remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        plugin
+            .on_response_committed(
+                &mut owner_ctx,
+                200,
+                &HashMap::new(),
+                b"externally-executed",
+            )
+            .await;
+
+        assert_eq!(plugin.tracked_keys_count(), Some(1));
+        assert_eq!(
+            assert_completed_size_exact(&plugin),
+            0,
+            "{label} budget must retain no response bytes"
+        );
+
+        // If admission had merely retained the old in-flight marker, this
+        // deterministic expiry would reopen the operation. It must not affect
+        // the explicit completion barrier.
+        request_deduplication_expire_inflight_entries_for_test(&plugin);
+        let mut protected_ctx = new_ctx("POST", "/api");
+        let mut protected_headers =
+            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut protected_ctx, &mut protected_headers)
+                    .await,
+                PluginResult::Reject {
+                    status_code: 409,
+                    ..
+                }
+            ),
+            "{label} budget shortened the completion barrier to inflight_ttl_seconds"
+        );
+
+        // The key becomes executable only after the barrier's own authoritative
+        // max(ttl, inflight_ttl) deadline.
+        request_deduplication_expire_execution_barriers_for_test(&plugin);
+        let mut expired_ctx = new_ctx("POST", "/api");
+        let mut expired_headers =
+            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut expired_ctx, &mut expired_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "{label} barrier did not expire at its own retention deadline"
+        );
+    }
+}
+
+/// A stale terminal hook must not publish over or clear the successor that
+/// acquired after the execution barrier's authoritative deadline.
+#[tokio::test]
+async fn expired_execution_barrier_stale_owner_cannot_touch_successor() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1,
+        "max_entry_size_bytes": 1
+    }));
+    let mut original_ctx = new_ctx("POST", "/api");
+    let mut original_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "barrier-stale-owner".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut original_ctx, &mut original_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let (logical_key, fingerprint) =
+        request_identity(&plugin, &original_ctx).expect("owner identity");
+    original_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut original_ctx, 200, &HashMap::new(), b"done")
+        .await;
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut successor_ctx = new_ctx("POST", "/api");
+    let mut successor_headers = original_headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut successor_ctx, &mut successor_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut stale_ctx = new_ctx("POST", "/api");
+    request_deduplication_set_request_state_for_test(
+        &plugin,
+        &mut stale_ctx,
+        &logical_key,
+        &fingerprint,
+        "stale-owner-token",
+        None,
+    );
+    stale_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut stale_ctx, 200, &HashMap::new(), b"stale")
+        .await;
+
+    let mut duplicate_ctx = new_ctx("POST", "/api");
+    let mut duplicate_headers = original_headers;
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut duplicate_ctx, &mut duplicate_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "stale barrier owner cleared or published over its successor"
+    );
+}
+
+/// Capacity eviction must inherit the protected completion's original
+/// retention clock. Starting a fresh in-flight clock at eviction would shorten
+/// a `ttl_seconds > inflight_ttl_seconds` completion under later pressure.
+#[tokio::test]
+async fn protected_completion_eviction_preserves_original_barrier_deadline() {
+    let plugin = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1
+    }));
+
+    let mut protected_ctx = new_ctx("POST", "/api");
+    let mut protected_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "evicted-protected-completion".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut protected_ctx, &mut protected_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    protected_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut protected_ctx, 200, &HashMap::new(), b"done")
+        .await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    // A later ordinary completion creates pressure. The protected completion
+    // becomes a fixed-size barrier; trimming continues to remove the ordinary
+    // replay because barrier conversion releases bytes but not a map slot.
+    let mut pressure_ctx = new_ctx("POST", "/pressure");
+    let mut pressure_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "ordinary-pressure".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut pressure_ctx, &mut pressure_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut pressure_ctx).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut still_protected_ctx = new_ctx("POST", "/api");
+    let mut still_protected_headers = protected_headers.clone();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut still_protected_ctx, &mut still_protected_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "capacity eviction shortened ttl_seconds to a fresh inflight_ttl_seconds lease"
+    );
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut expired_ctx = new_ctx("POST", "/api");
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut expired_ctx, &mut protected_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "evicted barrier did not expire at the protected completion deadline"
+    );
+}
+
 #[tokio::test]
 async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     use wiremock::matchers::method;
@@ -3045,8 +3311,9 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
 
     // Once the other request completes, strict capacity can no longer retain
     // both responses. Evicting the protected terminal replay must leave an
-    // in-flight tombstone, so a later Redis outage/lock expiry cannot allow the
-    // external side effect to execute again.
+    // fixed-size execution barrier with the completion's original retention,
+    // so a later Redis outage/lock expiry cannot allow the external side effect
+    // to execute again.
     complete_response(&dedup, &mut second_ctx).await;
     let mut tombstone_ctx = new_ctx("POST", "/api");
     let mut tombstone_headers =
