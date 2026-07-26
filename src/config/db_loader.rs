@@ -645,8 +645,7 @@ pub struct DatabaseStore {
     reconnect_transition: Arc<tokio::sync::Mutex<()>>,
     /// External-test hooks around [`Self::reconnect_transition`]. Empty in
     /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
-    reconnect_transition_test_hooks:
-        Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
+    reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,

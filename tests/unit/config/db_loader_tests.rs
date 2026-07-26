@@ -2563,9 +2563,10 @@ async fn delayed_failover_reconnect_cannot_race_later_primary_topology() {
     let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
     let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
 
-    let store = DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
-        .await
-        .unwrap();
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
     seed_sqlite_namespace(&primary_url, "primary-ns").await;
     seed_sqlite_namespace(&failover_url, "failover-ns").await;
     assert!(store.failover_topology_status().primary_active);
