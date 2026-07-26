@@ -1754,7 +1754,18 @@ pub struct RequestContext {
     pub direct_client_ip: String,
     canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
+    /// Canonical policy path (`crate::policy_path`). Every security decision —
+    /// routing, WAF, `openapi_validator`, `request_termination`, authorization,
+    /// cache/replay keys, rewrites, and the assembled backend request line —
+    /// must read this field so none of them can act on a different semantic
+    /// path than the backend executes (advisory `GHSA-69xf-42xm-4w4f`).
     pub path: String,
+    /// The client's request target exactly as received, retained only when
+    /// canonicalization changed it. This private field is accessible only to
+    /// the descendant `hmac_auth` module through an opaque, debug-redacted
+    /// wrapper. Its wire signature binds the literal bytes the client signed.
+    /// Never route, authorize, or log this value.
+    raw_path: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -1890,6 +1901,13 @@ pub struct RequestContext {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// Lowercase `claim_headers` destinations already sanitized for this
+    /// request. Gateway-owned destinations are stripped exactly once, by the
+    /// first plugin instance that owns them, so a later instance sharing a
+    /// destination can never erase a verified value an earlier instance already
+    /// installed. Empty (and non-allocating) unless a `claim_headers` mapping is
+    /// configured.
+    pub(crate) sanitized_claim_header_destinations: HashSet<String>,
     /// Credential header names precomputed by the plugin cache for safe
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
@@ -2435,6 +2453,7 @@ impl RequestContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
+            raw_path: None,
             request_authority: None,
             request_is_secure: false,
             frontend_listen_port: None,
@@ -2469,6 +2488,7 @@ impl RequestContext {
             ai_usage_export_cost_prefix: None,
             cors_state: cors::CorsRequestState::default(),
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: None,
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
@@ -3199,6 +3219,7 @@ impl RequestContext {
             canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
@@ -3250,6 +3271,7 @@ impl RequestContext {
             // body hooks never consume it, and copying raw claim values into a
             // compatibility clone would extend their lifetime unnecessarily.
             pending_claim_headers: HashMap::new(),
+            sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
@@ -3872,6 +3894,32 @@ impl RequestContext {
             .map(|value| value.as_bytes())
     }
 
+    /// Iterate every field-line of `name` for a trust-boundary decision,
+    /// regardless of whether headers have been materialized.
+    ///
+    /// While the pristine wire map is held this is exactly
+    /// [`Self::raw_header_value_bytes`]: every field-line, including non-UTF-8
+    /// ones, so multiplicity is observable. If a caller ever reaches this
+    /// without raw headers, it degrades to the single folded value from the
+    /// materialized map — which joins repeated field-lines with `, ` and is
+    /// therefore rejected as a comma list by the single-value contract in
+    /// `client_ip::resolve_real_ip_header_field_lines`. Both states fail closed;
+    /// neither can silently surface one of several competing values.
+    ///
+    /// Allocation-free: the returned iterator borrows in place.
+    #[inline]
+    pub fn header_field_lines<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let raw = self.raw_headers.as_ref();
+        let folded = match raw {
+            Some(_) => None,
+            None => self.headers.get(name).map(|value| value.as_bytes()),
+        };
+        raw.into_iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
+            .chain(folded)
+    }
+
     /// Whether a header name is reserved for gateway-asserted metadata and
     /// must not be trusted from client-supplied wire headers.
     #[inline]
@@ -3939,6 +3987,14 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Record the client's original request target after canonicalization
+    /// changed it. Frontends call this once, at the boundary, immediately
+    /// before overwriting [`Self::path`] with the canonical form.
+    #[inline]
+    pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
+        self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are

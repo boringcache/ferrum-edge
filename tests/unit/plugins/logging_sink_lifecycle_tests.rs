@@ -148,6 +148,30 @@ fn chargeback_snapshot_sink_config(spool_dir: &Path) -> Value {
 }
 
 fn chargeback_spool_rows(root: &Path) -> Vec<Value> {
+    /// Durable charge rows may live under a plain `.ndjson` name or under an
+    /// in-flight claim rename (`*.claim-*.inflight`) after the atomic claim/lease
+    /// protocol takes ownership for delivery. Both hold the same payload bytes.
+    fn is_readable_charge_spool(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let base = if let Some(marker) = name.strip_suffix(".inflight")
+            && let Some((base, _)) = marker.rsplit_once(".claim-")
+        {
+            base
+        } else {
+            name
+        };
+        if base.ends_with(".tmp")
+            || base.ends_with(".rejected.meta")
+            || base.ends_with(".corrupt")
+            || name.ends_with(".tmp")
+        {
+            return false;
+        }
+        base.ends_with(".ndjson")
+    }
+
     fn visit(path: &Path, rows: &mut Vec<Value>) {
         if path.is_dir() {
             let entries = std::fs::read_dir(path).expect("read spool directory");
@@ -156,7 +180,7 @@ fn chargeback_spool_rows(root: &Path) -> Vec<Value> {
             }
             return;
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("ndjson") {
+        if !is_readable_charge_spool(path) {
             return;
         }
         let body = std::fs::read_to_string(path).expect("read spool file");
