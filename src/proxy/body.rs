@@ -1520,8 +1520,18 @@ pub struct SizeLimitedIncoming {
     completion: Option<tokio::sync::oneshot::Sender<RequestBodyOutcome>>,
     /// Wakes the detached hyper H2 upload pipe when the response-side gate
     /// times out after receiving early backend headers. Returning an error from
-    /// `poll_frame` makes hyper reset the backend stream and drop the inbound
-    /// client body instead of leaving that pipe task pinned in the pool.
+    /// `poll_frame` makes hyper reset the backend stream (`on_user_err` sends
+    /// `RST_STREAM`) and drop the inbound client body instead of leaving that
+    /// pipe task pinned in the pool.
+    ///
+    /// Best-effort by construction: it is only observed when hyper actually
+    /// polls the body. `PipeToSendStream` reserves and awaits send capacity
+    /// *before* calling `poll_frame`, so while the backend's stream send window
+    /// is exhausted the pipe parks in `poll_capacity` and no body-side signal
+    /// can reach it. Teardown then waits for window credit, a backend reset, or
+    /// the connection closing. Resetting the stream directly is not reachable
+    /// from here: the `h2::SendStream` that could do it is owned by hyper's
+    /// detached task and never exposed.
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
@@ -1703,8 +1713,10 @@ pub(crate) enum UploadCancelSignal {
 ///
 /// A dropped sender is *not* a cancellation — it means the response-side gate
 /// resolved on its own — so it only disarms the channel. A pending channel
-/// stays armed and leaves `cx`'s waker registered, which is what lets a stalled
-/// upload wake up when the gate later signals.
+/// stays armed and leaves `cx`'s waker registered, which is what lets an upload
+/// parked in `poll_frame` (waiting on the *client*) wake up when the gate later
+/// signals. An upload parked on backend send capacity is not reachable this way;
+/// see the `cancel` field docs on [`SizeLimitedIncoming`].
 #[inline]
 fn poll_upload_cancel(
     cancel: &mut Option<tokio::sync::oneshot::Receiver<()>>,

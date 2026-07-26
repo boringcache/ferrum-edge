@@ -32388,7 +32388,10 @@ async fn proxy_to_backend_http2(
                 // does not stop the upload. Wake the adapter so it yields an
                 // error, resetting the backend stream and releasing the inbound
                 // client body instead of streaming it into a request whose
-                // response we have already abandoned.
+                // response we have already abandoned. Best-effort: the signal
+                // only lands the next time hyper polls the body, so a pipe
+                // parked on backend send capacity tears down later (see the
+                // `cancel` field docs on `SizeLimitedIncoming`).
                 if let Some(cancel_tx) = body_cancel_tx.take() {
                     let _ = cancel_tx.send(());
                 }
@@ -32441,6 +32444,13 @@ async fn proxy_to_backend_http2(
     // HTTP/2 is full duplex: a backend may return response headers before it
     // has consumed the upload. Do not expose that response until the request
     // body adapter has made the configured size-limit decision authoritative.
+    //
+    // The channel is installed only when `max_request_body_size_bytes > 0`, and
+    // limits-on requests reach direct-H2 only through a backend TLS SNI override
+    // (`can_dispatch_direct_http2_pool` requires a zero limit otherwise). So the
+    // gate — and the interleaving it gives up, a genuinely full-duplex non-gRPC
+    // H2 app now sees response headers withheld until its upload terminates —
+    // is scoped to SNI-override routes that have a request-size limit set.
     if let Some(body_completion_rx) = body_completion_rx {
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
@@ -32457,9 +32467,14 @@ async fn proxy_to_backend_http2(
                         // `send_request` has already yielded response headers,
                         // so hyper moved the request body into a detached H2
                         // pipe task. Dropping this handler or the response does
-                        // not cancel that upload. Wake the adapter explicitly;
-                        // its terminal error resets the backend stream and
-                        // releases the inbound client body.
+                        // not cancel that upload: the pipe task holds its own
+                        // `h2` stream reference, so the stream is not reset
+                        // while it lives. Wake the adapter explicitly; its
+                        // terminal error resets the backend stream and releases
+                        // the inbound client body. Best-effort — a pipe parked
+                        // on backend send capacity is not polling the body and
+                        // tears down only once credit, a reset, or connection
+                        // close arrives (see `SizeLimitedIncoming::cancel`).
                         if let Some(cancel_tx) = body_cancel_tx.take() {
                             let _ = cancel_tx.send(());
                         }
@@ -32488,7 +32503,13 @@ async fn proxy_to_backend_http2(
                 }
             }
             // Both bounds are disabled by configuration; preserve the existing
-            // "0 = no timeout" contract shared with the buffered upload paths.
+            // "0 = no timeout" contract shared with the buffered upload paths
+            // and with the response-header wait just above. An operator who
+            // sets `backend_read_timeout_ms = 0` and sends no RPC deadline
+            // accepts that a backend which answers early and then stops reading
+            // the upload holds this request until the client body terminates or
+            // the connection drops. Do not add a hidden floor here — that would
+            // silently break the documented contract.
             None => body_completion_rx.await.ok(),
         };
         // Normal completion: dropping the sender makes the adapter stop
