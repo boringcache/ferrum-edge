@@ -105,6 +105,13 @@ const MAX_RAW_TO_DECODED_AMPLIFICATION_RATIO: u32 = 1024;
 /// Maximum concurrent gzip/Brotli codec jobs across all compression instances.
 pub const MAX_CONCURRENT_CODEC_JOBS: usize = 32;
 
+/// Maximum concurrent response bodies admitted onto the compression buffered
+/// path. Independent of [`MAX_CONCURRENT_CODEC_JOBS`] so operators can reason
+/// about retained-body population separately from codec CPU concurrency; the
+/// values match today but must not share a single constant (changing one budget
+/// must not silently resize the other).
+pub const MAX_CONCURRENT_RESPONSE_BUFFERS: usize = 32;
+
 static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 static CODEC_BUDGET: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
@@ -112,7 +119,7 @@ static CODEC_BUDGET: LazyLock<Arc<Semaphore>> =
 // hold this permit while the backend is slow, so sharing it with CODEC_BUDGET
 // would let network latency starve unrelated request decompression.
 static RESPONSE_BUFFER_BUDGET: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONSE_BUFFERS)));
 static CODEC_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static CODEC_SATURATED: AtomicU64 = AtomicU64::new(0);
 static RESPONSE_BUFFER_ADMITTED: AtomicU64 = AtomicU64::new(0);
@@ -1851,7 +1858,7 @@ impl Plugin for CompressionPlugin {
                         // is unacceptable. Saturation already warned at the
                         // `before_proxy` reservation, so keep this at debug.
                         debug!(
-                            "compression: no reserved codec admission for negotiated coding; \
+                            "compression: no reserved response-buffer admission for negotiated coding; \
                              serving identity response"
                         );
                         if identity_unacceptable

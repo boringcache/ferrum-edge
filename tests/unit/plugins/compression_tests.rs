@@ -5503,7 +5503,7 @@ async fn test_before_proxy_reserves_admission_for_supported_coding() {
     before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
     assert!(
         compression_response_admission_reserved_for_test(&ctx),
-        "a supported coding must reserve response codec admission in before_proxy"
+        "a supported coding must reserve response-buffer admission in before_proxy"
     );
     assert!(!compression_response_admission_declined_for_test(&ctx));
 }
@@ -5525,7 +5525,7 @@ async fn test_before_proxy_does_not_reserve_for_unnegotiable_encodings() {
         before_proxy_with_accept_encoding(&plugin, &mut ctx, ae).await;
         assert!(
             !compression_response_admission_reserved_for_test(&ctx),
-            "Accept-Encoding {ae:?} must not reserve response codec admission"
+            "Accept-Encoding {ae:?} must not reserve response-buffer admission"
         );
         assert!(
             !compression_response_admission_declined_for_test(&ctx),
@@ -5740,7 +5740,7 @@ async fn test_reserved_admission_released_when_response_ineligible() {
         assert!(!resp.contains_key("content-encoding"));
         assert!(
             !compression_response_admission_reserved_for_test(&ctx),
-            "an ineligible response must release the reserved codec admission"
+            "an ineligible response must release the reserved response-buffer admission"
         );
 
         // The freed slot is immediately reservable by another request.
@@ -5772,7 +5772,7 @@ async fn test_reserved_admission_released_on_bodyless_status() {
         ));
         assert!(
             !compression_response_admission_reserved_for_test(&ctx),
-            "a 204 hard-skip must release the reserved codec admission"
+            "a 204 hard-skip must release the reserved response-buffer admission"
         );
         assert!(!resp.contains_key("content-encoding"));
     })
@@ -5795,16 +5795,16 @@ async fn test_reserved_permit_stays_on_donor_across_compat_clone() {
         assert!(compression_response_admission_reserved_for_test(&ctx));
 
         // The request-body-hook compatibility clone must NOT carry the response
-        // codec permit (it never runs the response transform), otherwise the
+        // buffer permit (it never runs the response transform), otherwise the
         // permit would be released when the short-lived clone drops.
         let mut clone = clone_for_final_request_body_hooks_for_test(&mut ctx);
         assert!(
             take_compression_response_buffer_permit_for_test(&mut clone).is_none(),
-            "compat clone must not carry the reserved response codec permit"
+            "compat clone must not carry the reserved response-buffer permit"
         );
         assert!(
             take_compression_response_buffer_permit_for_test(&mut ctx).is_some(),
-            "the live context must retain the reserved response codec permit"
+            "the live context must retain the reserved response-buffer permit"
         );
     })
     .await;
@@ -6203,6 +6203,32 @@ async fn test_response_buffer_saturation_is_metered_separately() {
     assert!(
         after.response_buffer_saturated > before.response_buffer_saturated,
         "a refused reservation must increment ferrum_compression_response_buffer_saturated_total"
+    );
+}
+
+#[test]
+fn test_response_buffer_budget_constant_is_independent_of_codec_budget() {
+    use ferrum_edge::plugins::compression::{
+        MAX_CONCURRENT_CODEC_JOBS, MAX_CONCURRENT_RESPONSE_BUFFERS,
+    };
+
+    // Values match today by design, but each semaphore must be sized from its
+    // own named constant so resizing codec CPU concurrency cannot silently
+    // resize retained-body admission (or the reverse).
+    assert_eq!(MAX_CONCURRENT_CODEC_JOBS, 32);
+    assert_eq!(MAX_CONCURRENT_RESPONSE_BUFFERS, 32);
+    let src = include_str!("../../../src/plugins/compression.rs");
+    assert!(
+        src.contains("Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)"),
+        "codec CPU semaphore must be sized from MAX_CONCURRENT_CODEC_JOBS"
+    );
+    assert!(
+        src.contains("Semaphore::new(MAX_CONCURRENT_RESPONSE_BUFFERS)"),
+        "response-buffer semaphore must be sized from MAX_CONCURRENT_RESPONSE_BUFFERS"
+    );
+    assert!(
+        !src.contains("RESPONSE_BUFFER_BUDGET: LazyLock<Arc<Semaphore>> =\n    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)))"),
+        "response-buffer budget must not share the codec concurrency constant"
     );
 }
 
