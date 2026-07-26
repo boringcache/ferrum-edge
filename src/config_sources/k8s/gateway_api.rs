@@ -12,10 +12,11 @@ use crate::plugins::utils::route_header_transform::route_header_transform_rules_
 
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
-    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
-    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
+    GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
+    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
+    RouteProxySpec, SourceKind,
     attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
     mesh_route_dispatch_plugin_from_rules, optional_port_field, optional_target_weight_field,
     port_from_u64, proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
@@ -229,9 +230,21 @@ pub(super) fn collect_gateway_listener_policy(
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
         let requires_frontend_tls = listener_is_terminating_tls(listener);
-        let materializable = listener_is_materializable(acc, object, listener);
+        let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
+            Ok(namespaces) => (namespaces, None),
+            Err(error) => {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} rejected: {}",
+                    object.metadata.namespace, object.metadata.name, listener_name, error
+                ));
+                (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
+            }
+        };
+        let materializable =
+            validation_error.is_none() && listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
-            namespaces: allowed_route_namespaces(listener),
+            namespaces,
+            validation_error,
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
             route_kinds: listener_allowed_route_kinds(listener),
@@ -499,72 +512,269 @@ fn gateway_tls_secret_ref(
     ))
 }
 
-fn allowed_route_namespaces(listener: &Value) -> GatewayApiAllowedRoutesNamespaces {
-    let Some(namespaces) = listener
-        .get("allowedRoutes")
-        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
-    else {
-        return GatewayApiAllowedRoutesNamespaces::Same;
+pub(crate) fn allowed_route_namespaces(
+    listener: &Value,
+) -> Result<GatewayApiAllowedRoutesNamespaces, GatewayApiListenerValidationError> {
+    let Some(allowed_routes) = listener.get("allowedRoutes") else {
+        return Ok(GatewayApiAllowedRoutesNamespaces::Same);
     };
-    match string_field(namespaces, "from").unwrap_or("Same") {
-        "All" => GatewayApiAllowedRoutesNamespaces::All,
-        "Selector" => GatewayApiAllowedRoutesNamespaces::Selector(namespace_selector(
-            namespaces.get("selector"),
+    let Some(allowed_routes) = allowed_routes.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes",
+            "must be an object",
+        ));
+    };
+    let Some(namespaces) = allowed_routes.get("namespaces") else {
+        return Ok(GatewayApiAllowedRoutesNamespaces::Same);
+    };
+    let Some(namespaces) = namespaces.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces",
+            "must be an object",
+        ));
+    };
+    let from = match namespaces.get("from") {
+        None => "Same",
+        Some(Value::String(from)) => from.as_str(),
+        Some(_) => {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.from",
+                "must be one of All, Same, or Selector",
+            ));
+        }
+    };
+    match from {
+        "All" => Ok(GatewayApiAllowedRoutesNamespaces::All),
+        "Same" => Ok(GatewayApiAllowedRoutesNamespaces::Same),
+        "Selector" => namespaces
+            .get("selector")
+            .ok_or_else(|| {
+                listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector",
+                    "must be an object when namespaces.from is Selector",
+                )
+            })
+            .and_then(namespace_selector)
+            .map(GatewayApiAllowedRoutesNamespaces::Selector),
+        _ => Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.from",
+            "must be one of All, Same, or Selector",
         )),
-        _ => GatewayApiAllowedRoutesNamespaces::Same,
     }
 }
 
-fn namespace_selector(selector: Option<&Value>) -> GatewayApiNamespaceSelector {
-    let match_labels = selector
-        .and_then(|selector| selector.get("matchLabels"))
-        .and_then(Value::as_object)
-        .map(|labels| {
-            labels
-                .iter()
-                .filter_map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|label_value| (key.clone(), label_value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let match_expressions = selector
-        .and_then(|selector| selector.get("matchExpressions"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(namespace_selector_expression)
-        .collect();
-    GatewayApiNamespaceSelector {
+fn namespace_selector(
+    selector: &Value,
+) -> Result<GatewayApiNamespaceSelector, GatewayApiListenerValidationError> {
+    let Some(selector) = selector.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector",
+            "must be an object when namespaces.from is Selector",
+        ));
+    };
+
+    let mut match_labels = HashMap::new();
+    if let Some(labels) = selector.get("matchLabels") {
+        let Some(labels) = labels.as_object() else {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels",
+                "must be an object",
+            ));
+        };
+        for (key, value) in labels {
+            if !valid_kubernetes_label_key(key) {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels key",
+                    "must be a valid Kubernetes label key",
+                ));
+            }
+            let Some(value) = value.as_str() else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels value",
+                    "must be a string",
+                ));
+            };
+            if !valid_kubernetes_label_value(value) {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels value",
+                    "must be a valid Kubernetes label value",
+                ));
+            }
+            match_labels.insert(key.clone(), value.to_string());
+        }
+    }
+
+    let mut match_expressions = Vec::new();
+    if let Some(expressions) = selector.get("matchExpressions") {
+        let Some(expressions) = expressions.as_array() else {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions",
+                "must be an array",
+            ));
+        };
+        match_expressions.reserve(expressions.len());
+        for expression in expressions {
+            match_expressions.push(namespace_selector_expression(expression)?);
+        }
+    }
+
+    Ok(GatewayApiNamespaceSelector {
         match_labels,
         match_expressions,
-    }
+    })
 }
 
-fn namespace_selector_expression(value: &Value) -> Option<GatewayApiNamespaceSelectorExpression> {
-    let key = string_field(value, "key")?.to_string();
-    let operator = match string_field(value, "operator")? {
+fn namespace_selector_expression(
+    value: &Value,
+) -> Result<GatewayApiNamespaceSelectorExpression, GatewayApiListenerValidationError> {
+    let Some(expression) = value.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[]",
+            "entries must be objects",
+        ));
+    };
+    let Some(key) = expression.get("key").and_then(Value::as_str) else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].key",
+            "is required and must be a string",
+        ));
+    };
+    if !valid_kubernetes_label_key(key) {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].key",
+            "must be a valid Kubernetes label key",
+        ));
+    }
+    let Some(operator) = expression.get("operator").and_then(Value::as_str) else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].operator",
+            "is required and must be one of In, NotIn, Exists, or DoesNotExist",
+        ));
+    };
+    let operator = match operator {
         "In" => GatewayApiNamespaceSelectorOperator::In,
         "NotIn" => GatewayApiNamespaceSelectorOperator::NotIn,
         "Exists" => GatewayApiNamespaceSelectorOperator::Exists,
         "DoesNotExist" => GatewayApiNamespaceSelectorOperator::DoesNotExist,
-        _ => return None,
+        _ => {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].operator",
+                "is required and must be one of In, NotIn, Exists, or DoesNotExist",
+            ));
+        }
     };
-    let values = value
-        .get("values")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect();
-    Some(GatewayApiNamespaceSelectorExpression {
-        key,
+    let values = match expression.get("values") {
+        None => Vec::new(),
+        Some(values) => {
+            let Some(values) = values.as_array() else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                    "must be an array of strings",
+                ));
+            };
+            let mut parsed = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(listener_validation_error(
+                        "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                        "must be an array of strings",
+                    ));
+                };
+                if !valid_kubernetes_label_value(value) {
+                    return Err(listener_validation_error(
+                        "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                        "must contain only valid Kubernetes label values",
+                    ));
+                }
+                parsed.push(value.to_string());
+            }
+            parsed
+        }
+    };
+    match operator {
+        GatewayApiNamespaceSelectorOperator::In
+        | GatewayApiNamespaceSelectorOperator::NotIn
+            if values.is_empty() =>
+        {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                "In and NotIn require at least one value",
+            ));
+        }
+        GatewayApiNamespaceSelectorOperator::Exists
+        | GatewayApiNamespaceSelectorOperator::DoesNotExist
+            if !values.is_empty() =>
+        {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                "Exists and DoesNotExist require no values",
+            ));
+        }
+        _ => {}
+    }
+    Ok(GatewayApiNamespaceSelectorExpression {
+        key: key.to_string(),
         operator,
         values,
     })
+}
+
+const fn listener_validation_error(
+    field: &'static str,
+    message: &'static str,
+) -> GatewayApiListenerValidationError {
+    GatewayApiListenerValidationError::new(field, message)
+}
+
+fn valid_kubernetes_label_key(value: &str) -> bool {
+    let (prefix, name) = match value.split_once('/') {
+        Some((prefix, name)) => (Some(prefix), name),
+        None => (None, value),
+    };
+    if !valid_kubernetes_label_name(name) {
+        return false;
+    }
+    prefix.is_none_or(valid_kubernetes_dns_subdomain)
+}
+
+fn valid_kubernetes_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+fn valid_kubernetes_label_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_kubernetes_label_value(value: &str) -> bool {
+    value.is_empty() || valid_kubernetes_label_name(value)
 }
 
 /// True when this Gateway is a GAMMA Waypoint Gateway (gatewayClassName is
@@ -1511,6 +1721,18 @@ fn mesh_services_from_gateway(
         .into_iter()
         .flatten()
         .try_for_each(|listener| {
+            let listener_name = string_field(listener, "name").unwrap_or("listener");
+            if acc
+                .gateway_api_listener_policies
+                .get(&GatewayApiListenerKey {
+                    namespace: object.metadata.namespace.clone(),
+                    gateway: object.metadata.name.clone(),
+                    listener: listener_name.to_string(),
+                })
+                .is_some_and(|policy| policy.validation_error.is_some())
+            {
+                return Ok(());
+            }
             if listener_is_terminating_tls(listener)
                 && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
             {
@@ -1518,7 +1740,7 @@ fn mesh_services_from_gateway(
                     "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
-                    string_field(listener, "name").unwrap_or("listener")
+                    listener_name
                 ));
                 return Ok(());
             }
@@ -1526,7 +1748,7 @@ fn mesh_services_from_gateway(
                 return Ok(());
             };
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
-            let name = string_field(listener, "name").unwrap_or("listener");
+            let name = listener_name;
             services.push(MeshService {
                 name: format!("{}-{name}", object.metadata.name),
                 namespace: object.metadata.namespace.clone(),
@@ -1713,10 +1935,11 @@ fn route_namespace_matches_policy(
             .namespace_labels
             .get(&route.metadata.namespace)
             .is_some_and(|labels| namespace_selector_matches(labels, selector)),
+        GatewayApiAllowedRoutesNamespaces::Invalid => false,
     }
 }
 
-fn namespace_selector_matches(
+pub(crate) fn namespace_selector_matches(
     labels: &HashMap<String, String>,
     selector: &GatewayApiNamespaceSelector,
 ) -> bool {

@@ -8,10 +8,12 @@ use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
-    GatewayApiMaterializedRouteParent, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
-    gateway_api_route_conflict_keys_with_context, secret_object_is_valid_tls_certificate,
-    translate_k8s_objects_with_filter,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, gateway_api_route_conflict_keys_with_context,
+    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
+    validate_gateway_listener_allowed_routes,
 };
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
@@ -773,19 +775,47 @@ fn gateway_listener_statuses(
                 .and_then(Value::as_str)
                 .unwrap_or("HTTP");
             let route_kinds = listener_route_kind_status(protocol, listener);
-            let accepted = gateway_accepted && route_kinds.protocol_supported;
+            let listener_validation_error =
+                validate_gateway_listener_allowed_routes(listener).err();
+            let accepted = gateway_accepted
+                && route_kinds.protocol_supported
+                && listener_validation_error.is_none();
             let resolved_refs = accepted && references.resolved && route_kinds.route_kinds_valid;
-            let materialized = config.is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
+            let materialized = config
+                .is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
             let programmed = resolved_refs && materialized && data_plane_ready;
-            let unresolved_reason = if !route_kinds.route_kinds_valid {
+            let unresolved_reason = if listener_validation_error.is_some() {
+                "Invalid"
+            } else if !route_kinds.route_kinds_valid {
                 "InvalidRouteKinds"
             } else {
                 references.reason
             };
-            let unresolved_message = if !route_kinds.route_kinds_valid {
+            let validation_message = listener_validation_error.map(|error| error.to_string());
+            let unresolved_message = if let Some(message) = validation_message.as_deref() {
+                message
+            } else if !route_kinds.route_kinds_valid {
                 "Listener allowedRoutes.kinds contains route kinds Ferrum does not support for this listener protocol"
             } else {
                 references.message
+            };
+            let accepted_reason = if !gateway_accepted {
+                "TranslationFailed"
+            } else if !route_kinds.protocol_supported {
+                "UnsupportedProtocol"
+            } else if listener_validation_error.is_some() {
+                "Invalid"
+            } else {
+                "Accepted"
+            };
+            let accepted_message = if !gateway_accepted {
+                "Ferrum rejected this Gateway"
+            } else if !route_kinds.protocol_supported {
+                "Ferrum does not support this listener protocol"
+            } else if let Some(message) = validation_message.as_deref() {
+                message
+            } else {
+                "Ferrum accepted this listener"
             };
             let conditions = vec![
                 condition_at(
@@ -793,16 +823,8 @@ fn gateway_listener_statuses(
                     existing_listener_conditions,
                     "Accepted",
                     accepted,
-                    if accepted {
-                        "Accepted"
-                    } else {
-                        "UnsupportedProtocol"
-                    },
-                    if accepted {
-                        "Ferrum accepted this listener"
-                    } else {
-                        "Ferrum does not support this listener protocol"
-                    },
+                    accepted_reason,
+                    accepted_message,
                 ),
                 condition_at(
                     gateway,
@@ -813,12 +835,16 @@ fn gateway_listener_statuses(
                         "ResolvedRefs"
                     } else if accepted {
                         unresolved_reason
+                    } else if listener_validation_error.is_some() {
+                        "Invalid"
                     } else {
                         "UnsupportedProtocol"
                     },
                     if resolved_refs {
                         "All listener references accepted by Ferrum"
                     } else if accepted {
+                        unresolved_message
+                    } else if listener_validation_error.is_some() {
                         unresolved_message
                     } else {
                         "Ferrum could not resolve this listener"
@@ -833,6 +859,8 @@ fn gateway_listener_statuses(
                         "Programmed"
                     } else if accepted && !resolved_refs {
                         unresolved_reason
+                    } else if listener_validation_error.is_some() {
+                        "Invalid"
                     } else if accepted && !materialized {
                         "NoListeners"
                     } else if accepted {
@@ -843,6 +871,8 @@ fn gateway_listener_statuses(
                     if programmed {
                         "Ferrum programmed this listener"
                     } else if accepted && !resolved_refs {
+                        unresolved_message
+                    } else if listener_validation_error.is_some() {
                         unresolved_message
                     } else if accepted && !materialized {
                         "Ferrum accepted this listener but found no materialized listener"
@@ -1009,83 +1039,23 @@ fn route_allowed_by_listener(
     gateway: &K8sObject,
     listener: &Value,
 ) -> bool {
-    let Some(namespaces) = listener
-        .get("allowedRoutes")
-        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
-    else {
-        return route.metadata.namespace == gateway.metadata.namespace;
-    };
-    match namespaces
-        .get("from")
-        .and_then(Value::as_str)
-        .unwrap_or("Same")
-    {
-        "All" => true,
-        "Selector" => namespace_matches_selector(objects, &route.metadata.namespace, namespaces),
-        _ => route.metadata.namespace == gateway.metadata.namespace,
-    }
-}
-
-fn namespace_matches_selector(objects: &[K8sObject], namespace: &str, namespaces: &Value) -> bool {
-    let Some(namespace_object) = objects
-        .iter()
-        .find(|object| object.kind == "Namespace" && object.metadata.name == namespace)
-    else {
+    let Ok(namespaces) = parse_gateway_listener_allowed_route_namespaces(listener) else {
         return false;
     };
-    let selector = namespaces.get("selector");
-    let match_labels = selector
-        .and_then(|selector| selector.get("matchLabels"))
-        .and_then(Value::as_object);
-    let labels_match = match_labels.into_iter().flatten().all(|(key, value)| {
-        value.as_str().is_some_and(|expected| {
-            namespace_object
-                .metadata
-                .labels
-                .get(key)
-                .is_some_and(|actual| actual == expected)
-        })
-    });
-    if !labels_match {
-        return false;
-    }
-    selector
-        .and_then(|selector| selector.get("matchExpressions"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .all(|expression| {
-            namespace_selector_expression_matches(&namespace_object.metadata.labels, expression)
-        })
-}
-
-fn namespace_selector_expression_matches(
-    labels: &HashMap<String, String>,
-    expression: &Value,
-) -> bool {
-    let Some(key) = expression.get("key").and_then(Value::as_str) else {
-        return false;
-    };
-    let Some(operator) = expression.get("operator").and_then(Value::as_str) else {
-        return false;
-    };
-    let values: Vec<&str> = expression
-        .get("values")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    match operator {
-        "In" => labels
-            .get(key)
-            .is_some_and(|actual| values.iter().any(|expected| *expected == actual)),
-        "NotIn" => labels
-            .get(key)
-            .is_none_or(|actual| !values.iter().any(|expected| *expected == actual)),
-        "Exists" => labels.contains_key(key),
-        "DoesNotExist" => !labels.contains_key(key),
-        _ => false,
+    match namespaces {
+        GatewayApiAllowedRoutesNamespaces::Same => {
+            route.metadata.namespace == gateway.metadata.namespace
+        }
+        GatewayApiAllowedRoutesNamespaces::All => true,
+        GatewayApiAllowedRoutesNamespaces::Selector(selector) => objects
+            .iter()
+            .find(|object| {
+                object.kind == "Namespace" && object.metadata.name == route.metadata.namespace
+            })
+            .is_some_and(|namespace| {
+                namespace_selector_matches(&namespace.metadata.labels, &selector)
+            }),
+        GatewayApiAllowedRoutesNamespaces::Invalid => false,
     }
 }
 

@@ -2664,6 +2664,18 @@ When `FERRUM_K8S_CONTROLLER_ENABLED=true` and Gateway API watching is enabled, t
 
 Gateway API HTTP/GRPC route conflicts are resolved deterministically before config materialization. For routes that would produce the same parent reference, hostname, and Ferrum listen path, the oldest `metadata.creationTimestamp` wins; if timestamps tie or are absent, `{namespace}/{name}` order is the tiebreaker. Losing routes are skipped during translation and receive `Accepted=False`, `Programmed=False`, and `Conflicted=True` status.
 
+Gateway listener `allowedRoutes.namespaces.selector` is an atomic security
+boundary. Ferrum validates the complete selector before attachment, including
+Kubernetes label-key/value syntax, string-only `matchLabels`, expression field
+types, the `In`/`NotIn` non-empty-values rule, and the
+`Exists`/`DoesNotExist` empty-values rule. Any malformed component invalidates
+that listener as a whole: no subset of its AND requirements is retained, no
+cross-namespace route attaches, and a valid-to-invalid update withdraws prior
+materialization. Listener status reports `Accepted=False` and
+`Programmed=False` with reason `Invalid` and a stable, value-redacted field
+path. Valid `All`, `Same`, empty-selector, and well-formed selector behavior is
+unchanged, and valid sibling listeners reconcile independently.
+
 Gateway API status writing requires `get/list/watch` on `gatewayclasses`, `gateways`, `httproutes`, and `grpcroutes`, plus `patch` on their `status` subresources. `GatewayClass` is cluster-scoped; route and Gateway watches are namespaced when `FERRUM_K8S_WATCH_NAMESPACES` is set. The Helm chart grants these verbs through `controlPlane.rbac.*`; disable unused watches there when installing a narrower controller.
 
 ## Istio CRD Status

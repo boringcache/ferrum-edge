@@ -988,6 +988,7 @@ mod tests {
     use crate::config::types::{
         FrontendTlsNamespaceSource, PluginConfig, PluginScope, Proxy, Upstream,
     };
+    use crate::config_sources::k8s::{K8sMetadata, K8sObject};
     use crate::identity::spiffe::SpiffeId;
     use crate::k8s_controller::resource_store::CrdResourceStore;
     use crate::modes::mesh::config::{
@@ -1669,6 +1670,117 @@ mod tests {
         assert!(merged.proxies.is_empty());
         assert!(merged.upstreams.is_empty());
         assert!(merged.plugin_configs.is_empty());
+    }
+
+    fn gateway_selector_reconcile_objects(selector: Value) -> Vec<K8sObject> {
+        let metadata = |name: &str, namespace: &str| K8sMetadata {
+            name: name.to_string(),
+            uid: String::new(),
+            namespace: namespace.to_string(),
+            generation: Some(1),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        };
+        let mut tenant = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+            metadata: metadata("tenant", ""),
+            spec: json!({}),
+            status: json!({}),
+        };
+        tenant
+            .metadata
+            .labels
+            .insert("team".to_string(), "payments".to_string());
+        vec![
+            tenant,
+            K8sObject {
+                api_version: "gateway.networking.k8s.io/v1".to_string(),
+                kind: "Gateway".to_string(),
+                metadata: metadata("edge", "platform"),
+                spec: json!({
+                    "gatewayClassName": "ferrum",
+                    "listeners": [{
+                        "name": "web",
+                        "port": 80,
+                        "protocol": "HTTP",
+                        "allowedRoutes": {
+                            "namespaces": {
+                                "from": "Selector",
+                                "selector": selector
+                            }
+                        }
+                    }]
+                }),
+                status: json!({}),
+            },
+            K8sObject {
+                api_version: "gateway.networking.k8s.io/v1".to_string(),
+                kind: "HTTPRoute".to_string(),
+                metadata: metadata("payments", "tenant"),
+                spec: json!({
+                    "parentRefs": [{
+                        "name": "edge",
+                        "namespace": "platform",
+                        "sectionName": "web"
+                    }],
+                    "rules": [{
+                        "backendRefs": [{"name": "payments", "port": 8080}]
+                    }]
+                }),
+                status: json!({}),
+            },
+        ]
+    }
+
+    fn gateway_selector_translation(objects: &[K8sObject]) -> K8sTranslation {
+        let options = K8sTranslationOptions::new(
+            "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        )
+        .with_source_namespaces(Vec::new());
+        translate_with_skip_retries(objects, options, &ControllerMetrics::default())
+            .expect("reconciliation translation")
+    }
+
+    #[test]
+    fn reconcile_withdraws_invalid_selector_attachment_and_recovers_without_stale_state() {
+        let valid_objects =
+            gateway_selector_reconcile_objects(json!({"matchLabels": {"team": "payments"}}));
+        let valid = gateway_selector_translation(&valid_objects);
+        let managed = BTreeSet::new();
+        let active =
+            merge_k8s_translation(&GatewayConfig::default(), &valid.config, &managed);
+        assert_eq!(active.proxies.len(), 1);
+
+        let invalid_objects = gateway_selector_reconcile_objects(json!({
+            "matchExpressions": [
+                {"key": "team", "operator": "In", "values": ["payments"]},
+                {"key": "security", "operator": "In", "values": []}
+            ]
+        }));
+        let invalid = gateway_selector_translation(&invalid_objects);
+        let withdrawn = merge_k8s_translation(&active, &invalid.config, &managed);
+        assert!(
+            withdrawn.proxies.is_empty(),
+            "valid-to-invalid reload must remove the prior attachment"
+        );
+
+        let recovered = gateway_selector_translation(&valid_objects);
+        let restored = merge_k8s_translation(&withdrawn, &recovered.config, &managed);
+        assert_eq!(restored.proxies.len(), 1);
+
+        let route_deleted = gateway_selector_translation(&valid_objects[..2]);
+        let after_route_delete =
+            merge_k8s_translation(&restored, &route_deleted.config, &managed);
+        assert!(after_route_delete.proxies.is_empty());
+
+        let gateway_deleted = gateway_selector_translation(&valid_objects[..1]);
+        let after_gateway_delete =
+            merge_k8s_translation(&restored, &gateway_deleted.config, &managed);
+        assert!(after_gateway_delete.proxies.is_empty());
     }
 
     #[test]
