@@ -166,7 +166,10 @@ Configuration is now rejected when:
   starting with `#`), a non-fragment `$id` / `id`, a `$vocabulary` declaration,
   or a `$schema` naming a draft other than the configured one. Property and
   definition names with those spellings, and literal objects under `enum`,
-  `const`, `default`, or `examples`, are not schema keywords. No external
+  `const`, `default`, or `examples`, are not schema keywords unless a supported
+  local URI-fragment JSON Pointer actually targets that object. Pointer targets
+  are audited with percent-decoding and JSON Pointer escaping before compile,
+  including targets under otherwise literal/unknown containers. No external
   reference is ever fetched: the dependency is built without HTTP or file
   retrievers.
 - the complete supplied schema value nests deeper than 32 levels or contains
@@ -181,15 +184,24 @@ Runtime behavior also tightens:
 - Standard keywords the old evaluator ignored are now enforced. `$ref`/`$defs`,
   array `type` unions, conditionals, and dependent keywords all take effect, so
   traffic a schema was always meant to reject now actually gets rejected.
+  Draft 7 treats `definitions` as its ordinary definition container; `$defs`
+  remains an unknown/literal value there unless a local pointer explicitly
+  targets it. Draft 2020-12 follows both `$defs` and the validator library's
+  compatible `definitions` map. `$dynamicRef` has reference semantics under
+  Draft 2020-12 and remains an unknown, inert keyword under Draft 7.
 - XML bodies are parsed by a real XML parser instead of a tag-balancing scan.
   Documents with multiple roots, text outside the root, invalid element or
   attribute names, unquoted or duplicated attributes, undeclared entity
-  references, or invalid characters are now rejected. `required_xml_elements`
-  matches parsed element names: a bare name matches that local name in any
-  namespace, `{uri}local` requires both, and `{}local` requires no namespace. A
-  configured entry that previously relied on a raw `prefix:local` source match
-  must be rewritten as `local` or `{uri}local`.
-- External XML entity declarations (`SYSTEM` / `PUBLIC`) are always rejected.
+  references, invalid characters, or non-XML Unicode whitespace outside the
+  document are now rejected. The original body is parsed without trimming;
+  legal XML space (`SP`, `TAB`, `CR`, `LF`) around the root remains accepted.
+  `required_xml_elements` matches parsed element names: a bare name matches that
+  local name in any namespace, `{uri}local` requires both, and `{}local`
+  requires no namespace. A configured entry that previously relied on a raw
+  `prefix:local` source match must be rewritten as `local` or `{uri}local`.
+- External XML identifiers (`SYSTEM` / `PUBLIC`) on the DOCTYPE external subset
+  or an entity declaration are always rejected. Internal DTD subsets remain
+  supported under the entity count/nesting policy.
 - Decoded gRPC protobuf messages must satisfy proto2 required-field
   initialization, recursively through present nested, repeated, map, and
   extension message values. proto3 descriptors are unaffected. Clients that

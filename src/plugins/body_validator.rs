@@ -400,33 +400,31 @@ impl BodyValidator {
     /// (GHSA-mg9q-6h9j-9mmv). That means exactly one document element, XML `Name`
     /// syntax, attribute grammar/quoting/uniqueness, character validity, entity
     /// reference validity, and text placement are all enforced by the parser's
-    /// documented contract. External entities are never retrieved.
+    /// documented contract. The exact original string is parsed without Unicode
+    /// whitespace normalization. External entities are never retrieved.
     ///
     /// Two bounded pre-parse guards still run first because they encode policy the
     /// parser has no opinion on: the configured `<!ENTITY` declaration cap /
     /// nested-entity rejection, and outright rejection of external
-    /// (`SYSTEM`/`PUBLIC`) entity declarations. The parser is then given a node
-    /// budget so a pathologically wide document cannot allocate without bound.
+    /// (`SYSTEM`/`PUBLIC`) identifiers on both the DOCTYPE and entity
+    /// declarations. The parser is then given a node budget so a pathologically
+    /// wide document cannot allocate without bound.
     fn validate_xml_body(
         body: &str,
         required_xml_elements: &[RequiredXmlElement],
         max_entities: usize,
         reject_nested: bool,
     ) -> Result<(), String> {
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
+        if body.is_empty() {
             return Err("Empty XML body".to_string());
         }
-        if !trimmed.starts_with('<') {
-            return Err("Invalid XML: must start with '<'".to_string());
-        }
 
-        // Reject entity-expansion bombs and external entity declarations at the
-        // edge (Ferrum does not expand entities, but backends do).
-        check_xml_entity_expansion(trimmed, max_entities, reject_nested)?;
+        // Reject entity-expansion bombs and external identifiers at the edge
+        // (Ferrum does not expand entities, but backends may).
+        check_xml_entity_expansion(body, max_entities, reject_nested)?;
 
         let document = roxmltree::Document::parse_with_options(
-            trimmed,
+            body,
             roxmltree::ParsingOptions {
                 // DTDs are permitted only so the configured entity policy above
                 // stays the authority on declaration count and nesting; the
@@ -780,7 +778,8 @@ struct SchemaAudit {
 /// and bad regexes. The structural pass charges every JSON value, including
 /// literal instance data and annotations. The semantic pass applies keyword
 /// policy only at actual schema positions and follows the subschema-bearing
-/// keywords supported by Draft 7 and Draft 2020-12.
+/// keywords supported by Draft 7 and Draft 2020-12, plus any schema target
+/// reached through a supported local URI-fragment JSON Pointer.
 ///
 /// Together the passes add the policy the library cannot express:
 ///
@@ -805,7 +804,8 @@ fn audit_schema(
     audit_schema_structure(schema, field, 0, &mut nodes)?;
 
     let mut audit = SchemaAudit::default();
-    audit_schema_node(schema, field, draft, &mut audit)?;
+    let mut visited = HashSet::new();
+    audit_schema_node(schema, schema, field, draft, &mut audit, &mut visited)?;
     Ok(audit)
 }
 
@@ -845,17 +845,31 @@ fn audit_schema_structure(
 
 fn audit_schema_node(
     node: &Value,
+    document: &Value,
     field: &'static str,
     draft: SchemaDraft,
     audit: &mut SchemaAudit,
+    visited: &mut HashSet<usize>,
 ) -> Result<(), String> {
+    // A JSON value cannot contain an in-memory cycle, but local references can
+    // revisit the same target indefinitely. Identity-based deduplication makes
+    // the semantic walk no larger than the already-budgeted supplied value.
+    let identity = std::ptr::from_ref(node) as usize;
+    if !visited.insert(identity) {
+        return Ok(());
+    }
+
     // Both supported drafts allow boolean schemas. Scalars and arrays reached
     // through malformed keyword shapes are left to the compiler to reject.
     let Value::Object(map) = node else {
         return Ok(());
     };
 
-    for key in ["$ref", "$dynamicRef"] {
+    let reference_keywords: &[&str] = match draft {
+        SchemaDraft::Draft7 => &["$ref"],
+        SchemaDraft::Draft202012 => &["$ref", "$dynamicRef"],
+    };
+    for &key in reference_keywords {
         if let Some(value) = map.get(key) {
             let Some(reference) = value.as_str() else {
                 return Err(format!(
@@ -868,6 +882,9 @@ fn audit_schema_node(
                      '{reference}'; only local references (starting with '#') \
                      are supported and no external reference is ever retrieved"
                 ));
+            }
+            if let Some(target) = local_json_pointer_target(document, reference, field, key)? {
+                audit_schema_node(target, document, field, draft, audit, visited)?;
             }
         }
     }
@@ -916,10 +933,26 @@ fn audit_schema_node(
 
     // These object-valued keywords contain schemas as their map values. The
     // member names are instance-property/definition names, never keywords.
-    for keyword in ["properties", "patternProperties", "$defs", "definitions"] {
+    for keyword in ["properties", "patternProperties"] {
         if let Some(subschemas) = map.get(keyword).and_then(Value::as_object) {
             for subschema in subschemas.values() {
-                audit_schema_node(subschema, field, draft, audit)?;
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
+            }
+        }
+    }
+
+    // Match referencing 0.46.5's configured-draft child maps. Draft 7 walks
+    // `definitions` only. Draft 2020-12 walks `$defs` and keeps its legacy
+    // `definitions` compatibility. A Draft 7 `$defs` value remains literal
+    // unless a local JSON Pointer explicitly reaches it above.
+    let definition_keywords: &[&str] = match draft {
+        SchemaDraft::Draft7 => &["definitions"],
+        SchemaDraft::Draft202012 => &["$defs", "definitions"],
+    };
+    for &keyword in definition_keywords {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
             }
         }
     }
@@ -931,7 +964,7 @@ fn audit_schema_node(
             if let Some(dependencies) = map.get("dependencies").and_then(Value::as_object) {
                 for dependency in dependencies.values() {
                     if dependency.is_object() || dependency.is_boolean() {
-                        audit_schema_node(dependency, field, draft, audit)?;
+                        audit_schema_node(dependency, document, field, draft, audit, visited)?;
                     }
                 }
             }
@@ -939,7 +972,7 @@ fn audit_schema_node(
         SchemaDraft::Draft202012 => {
             if let Some(subschemas) = map.get("dependentSchemas").and_then(Value::as_object) {
                 for subschema in subschemas.values() {
-                    audit_schema_node(subschema, field, draft, audit)?;
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
                 }
             }
         }
@@ -948,7 +981,7 @@ fn audit_schema_node(
     for keyword in ["allOf", "anyOf", "oneOf"] {
         if let Some(subschemas) = map.get(keyword).and_then(Value::as_array) {
             for subschema in subschemas {
-                audit_schema_node(subschema, field, draft, audit)?;
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
             }
         }
     }
@@ -957,14 +990,14 @@ fn audit_schema_node(
         SchemaDraft::Draft7 => {
             if let Some(items) = map.get("items").and_then(Value::as_array) {
                 for subschema in items {
-                    audit_schema_node(subschema, field, draft, audit)?;
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
                 }
             }
         }
         SchemaDraft::Draft202012 => {
             if let Some(subschemas) = map.get("prefixItems").and_then(Value::as_array) {
                 for subschema in subschemas {
-                    audit_schema_node(subschema, field, draft, audit)?;
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
                 }
             }
         }
@@ -980,7 +1013,7 @@ fn audit_schema_node(
         "else",
     ] {
         if let Some(subschema) = map.get(keyword) {
-            audit_schema_node(subschema, field, draft, audit)?;
+            audit_schema_node(subschema, document, field, draft, audit, visited)?;
         }
     }
 
@@ -990,7 +1023,7 @@ fn audit_schema_node(
                 if let Some(subschema) = map.get(keyword)
                     && !subschema.is_array()
                 {
-                    audit_schema_node(subschema, field, draft, audit)?;
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
                 }
             }
         }
@@ -1002,13 +1035,107 @@ fn audit_schema_node(
                 "contentSchema",
             ] {
                 if let Some(subschema) = map.get(keyword) {
-                    audit_schema_node(subschema, field, draft, audit)?;
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Resolve a supported local URI-fragment JSON Pointer exactly as
+/// `referencing` 0.46.5 does for a single schema document.
+///
+/// The fragment kind is selected before percent-decoding: `#` is the root,
+/// `#/...` is a pointer, and any other `#name` is an anchor. Pointer text after
+/// the leading slash is percent-decoded as one UTF-8 string, then object keys
+/// apply JSON Pointer `~1` / `~0` unescaping. Array segments use `usize::parse`
+/// directly, matching the library's accepted index spellings and failures.
+fn local_json_pointer_target<'a>(
+    document: &'a Value,
+    reference: &str,
+    field: &'static str,
+    keyword: &str,
+) -> Result<Option<&'a Value>, String> {
+    let fragment = reference.strip_prefix('#').ok_or_else(|| {
+        format!("body_validator: '{field}' has non-local '{keyword}' '{reference}'")
+    })?;
+    if fragment.is_empty() || !fragment.starts_with('/') {
+        // The root was already visited. Anchor resources are indexed only while
+        // the library walks actual draft-specific schema positions, which this
+        // audit also visits, so there is no hidden anchor target to discover.
+        return Ok(None);
+    }
+
+    let decoded = percent_encoding::percent_decode_str(&fragment[1..])
+        .decode_utf8()
+        .map_err(|_| {
+            format!(
+                "body_validator: '{field}' has invalid UTF-8 percent encoding \
+                 in local '{keyword}' JSON Pointer '{reference}'"
+            )
+        })?;
+    let mut target = document;
+    for raw_segment in decoded.split('/') {
+        target = match target {
+            Value::Array(items) => {
+                let index = raw_segment.parse::<usize>().map_err(|_| {
+                    format!(
+                        "body_validator: '{field}' has invalid array index in \
+                         local '{keyword}' JSON Pointer '{reference}'"
+                    )
+                })?;
+                items.get(index).ok_or_else(|| {
+                    format!(
+                        "body_validator: '{field}' has local '{keyword}' JSON \
+                         Pointer '{reference}' that resolves nowhere"
+                    )
+                })?
+            }
+            Value::Object(map) => {
+                let segment = unescape_json_pointer_segment(raw_segment);
+                map.get(segment.as_ref()).ok_or_else(|| {
+                    format!(
+                        "body_validator: '{field}' has local '{keyword}' JSON \
+                         Pointer '{reference}' that resolves nowhere"
+                    )
+                })?
+            }
+            _ => {
+                return Err(format!(
+                    "body_validator: '{field}' has local '{keyword}' JSON \
+                     Pointer '{reference}' that resolves nowhere"
+                ));
+            }
+        };
+    }
+    Ok(Some(target))
+}
+
+fn unescape_json_pointer_segment(segment: &str) -> Cow<'_, str> {
+    if !segment.contains('~') {
+        return Cow::Borrowed(segment);
+    }
+
+    let mut output = String::with_capacity(segment.len());
+    let mut chars = segment.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '~' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('0') => output.push('~'),
+            Some('1') => output.push('/'),
+            Some(next) => {
+                output.push('~');
+                output.push(next);
+            }
+            None => output.push('~'),
+        }
+    }
+    Cow::Owned(output)
 }
 
 /// Client-visible message for a compiled-schema violation.
@@ -1444,11 +1571,12 @@ fn is_grpc_content_type(content_type: &str) -> bool {
         || ascii_starts_with_ignore_case(media_type, "application/grpc+")
 }
 
-/// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
-/// laughs"). Ferrum does not expand entities; this protects backends that do.
-/// `max_entities` caps the number of `<!ENTITY` declarations; when
-/// `reject_nested` is set, any entity whose value references another
-/// general entity (the exponential-expansion signature) is rejected outright.
+/// Enforce bounded internal-entity policy and reject every external identifier.
+///
+/// Ferrum does not retrieve external resources or expand entities for business
+/// logic, but downstream parsers may. `max_entities` caps `<!ENTITY`
+/// declarations; when `reject_nested` is set, entity-expansion chains and
+/// parameter entities that generate declarations are rejected outright.
 fn check_xml_entity_expansion(
     body: &str,
     max_entities: usize,
@@ -1469,26 +1597,13 @@ fn check_xml_entity_expansion(
         if bytes[i] == b'%'
             && let Some((name, end)) = parameter_entity_reference_at(body, i)
         {
-            if let Some((_, expanded_entities)) = parameter_entities
-                .iter()
-                .find(|(entity_name, _)| entity_name == name)
-            {
-                let expanded_entities = *expanded_entities;
-                if expanded_entities > 0 {
-                    if reject_nested {
-                        return Err(
-                            "XML parameter entity expands to entity declarations (billion-laughs protection)"
-                                .to_string(),
-                        );
-                    }
-                    count = count.saturating_add(expanded_entities);
-                    if count > max_entities {
-                        return Err(format!(
-                            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
-                        ));
-                    }
-                }
-            }
+            charge_parameter_entity_reference(
+                name,
+                &parameter_entities,
+                &mut count,
+                max_entities,
+                reject_nested,
+            )?;
             i = end;
             continue;
         }
@@ -1551,11 +1666,153 @@ fn check_xml_entity_expansion(
                 parameter_entities.push((name.to_string(), entity_declaration_count(value)));
             }
             i = decl_end.saturating_add(1);
+        } else if remaining.starts_with(b"<!DOCTYPE") {
+            if doctype_declaration_is_external(&body[i..]) {
+                return Err(
+                    "XML DOCTYPE has an external SYSTEM/PUBLIC identifier, which is not permitted"
+                        .to_string(),
+                );
+            }
+            // Do not skip the complete DOCTYPE: its internal subset may contain
+            // entity declarations that the guards above must inspect.
+            i += b"<!DOCTYPE".len();
+        } else if remaining.starts_with(b"<!") {
+            // Skip other markup declarations quote-aware. This prevents text
+            // such as "<!DOCTYPE" or "<!ENTITY" inside a quoted ATTLIST value
+            // from being misclassified as a declaration of its own. Parameter
+            // entity references outside quotes still count toward policy.
+            let decl_end = find_xml_declaration_end(remaining)
+                .map(|end| i + end)
+                .unwrap_or(bytes.len());
+            charge_parameter_entity_references_in_markup(
+                body,
+                i,
+                decl_end,
+                &parameter_entities,
+                &mut count,
+                max_entities,
+                reject_nested,
+            )?;
+            i = decl_end.saturating_add(1);
         } else {
             i += 1;
         }
     }
     Ok(())
+}
+
+fn charge_parameter_entity_reference(
+    name: &str,
+    parameter_entities: &[(String, usize)],
+    count: &mut usize,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let Some((_, expanded_entities)) = parameter_entities
+        .iter()
+        .find(|(entity_name, _)| entity_name == name)
+    else {
+        return Ok(());
+    };
+    if *expanded_entities == 0 {
+        return Ok(());
+    }
+    if reject_nested {
+        return Err(
+            "XML parameter entity expands to entity declarations (billion-laughs protection)"
+                .to_string(),
+        );
+    }
+    *count = count.saturating_add(*expanded_entities);
+    if *count > max_entities {
+        return Err(format!(
+            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
+        ));
+    }
+    Ok(())
+}
+
+fn charge_parameter_entity_references_in_markup(
+    body: &str,
+    start: usize,
+    end: usize,
+    parameter_entities: &[(String, usize)],
+    count: &mut usize,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let bytes = body.as_bytes();
+    let mut quote = None;
+    let mut i = start;
+    while i < end {
+        match quote {
+            Some(current) if bytes[i] == current => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'"' | b'\'') => quote = Some(bytes[i]),
+            None if bytes[i] == b'%' => {
+                if let Some((name, reference_end)) = parameter_entity_reference_at(body, i)
+                    && reference_end <= end
+                {
+                    charge_parameter_entity_reference(
+                        name,
+                        parameter_entities,
+                        count,
+                        max_entities,
+                        reject_nested,
+                    )?;
+                    i = reference_end;
+                    continue;
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// True when the document type declaration itself carries an external subset.
+///
+/// XML's grammar places `SYSTEM` / `PUBLIC` immediately after the document
+/// name and before any internal subset, so this inspection never searches
+/// quoted literals, comments, or CDATA for keyword-looking text.
+fn doctype_declaration_is_external(decl: &str) -> bool {
+    let bytes = decl.as_bytes();
+    let needle = b"<!DOCTYPE";
+    if !bytes.starts_with(needle) {
+        return false;
+    }
+
+    let mut i = needle.len();
+    let name_separator = skip_xml_space(bytes, i);
+    if name_separator == i {
+        return false;
+    }
+    i = name_separator;
+
+    // The XML Name itself may be non-ASCII; its UTF-8 continuation bytes are
+    // all non-whitespace, so a byte scan safely finds the grammar delimiter.
+    while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n' | b'[' | b'>') {
+        i += 1;
+    }
+    let external_separator = skip_xml_space(bytes, i);
+    if external_separator == i {
+        return false;
+    }
+    i = external_separator;
+
+    for keyword in [b"SYSTEM".as_slice(), b"PUBLIC".as_slice()] {
+        if bytes
+            .get(i..i + keyword.len())
+            .is_some_and(|candidate| candidate == keyword)
+            && bytes
+                .get(i + keyword.len())
+                .is_some_and(|next| matches!(next, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {

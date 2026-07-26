@@ -17356,8 +17356,14 @@ components:
             a $schema naming another draft, or a schema exceeding the 32-level /
             20000-node budget fails construction. Reference and identifier
             policy applies only at actual schema positions; property/definition
-            names and literal annotation/instance objects are not interpreted as
-            keywords. Budgets count every JSON node in the supplied value.
+            names and unreferenced literal annotation/instance objects are not
+            interpreted as keywords. A supported local URI-fragment JSON Pointer
+            makes its object/boolean target an actual schema even under a
+            normally literal or unknown container; pointer percent-decoding,
+            escaping, root handling, and cycles match the validator library.
+            Draft 7 walks definitions but not $defs unless directly referenced;
+            Draft 2020-12 walks both. Budgets count every JSON node in the
+            supplied value.
         json_schema_draft:
           type: string
           enum: [draft2020-12, draft7]
@@ -17365,7 +17371,9 @@ components:
           description: >-
             JSON Schema dialect used to compile json_schema and
             response_json_schema. There is no auto-detect mode; a schema whose
-            $schema names a different draft is rejected.
+            $schema names a different draft is rejected. $dynamicRef has
+            reference semantics only under draft2020-12 and remains an unknown,
+            inert keyword under draft7.
         required_fields:
           type: array
           items:
@@ -17379,9 +17387,10 @@ components:
             Enable XML well-formedness validation. The body must parse as a
             single well-formed XML document (one root element, valid names,
             attribute grammar and uniqueness, valid characters, declared entity
-            references, no text outside the root). External entity declarations
-            (SYSTEM/PUBLIC) are always rejected; external entities are never
-            retrieved.
+            references, no text outside the root). The original text is parsed
+            without Unicode whitespace trimming. External SYSTEM/PUBLIC
+            identifiers on the DOCTYPE or an entity declaration are always
+            rejected; external entities are never retrieved.
         required_xml_elements:
           type: array
           items:
@@ -17435,6 +17444,10 @@ components:
         response_validate_xml:
           type: boolean
           default: false
+          description: >-
+            Enable response XML well-formedness validation with the same exact-
+            text parsing and external DOCTYPE/entity identifier rejection as
+            validate_xml.
         response_required_xml_elements:
           type: array
           items:

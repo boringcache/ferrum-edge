@@ -3510,6 +3510,262 @@ async fn json_schema_local_ref_and_defs_are_enforced() {
 }
 
 #[tokio::test]
+async fn local_pointer_into_literal_container_enables_request_unique_items_policy() {
+    let plugin = json_schema_plugin(json!({
+        "default": {
+            "hidden": {
+                "type": "array",
+                "uniqueItems": true
+            }
+        },
+        "$ref": "#/default/hidden"
+    }));
+
+    // `serde_json/preserve_order` makes these objects insertion-order-distinct.
+    // Reaching uniqueItems through the pointer must still enable construction-
+    // time canonicalization and enforce JSON's order-insensitive equality.
+    let mut ctx = make_json_ctx(r#"[{"a": 1, "b": 2}, {"b": 2, "a": 1}]"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn local_pointer_into_literal_container_enables_response_unique_items_policy() {
+    let plugin = response_schema_plugin(json!({
+        "examples": [{
+            "hidden": {
+                "type": "array",
+                "uniqueItems": true
+            }
+        }],
+        "$ref": "#/examples/0/hidden"
+    }));
+
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"[{"left": 1, "right": 2}, {"right": 2, "left": 1}]"#;
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
+
+#[test]
+fn local_pointer_targets_apply_nested_forbidden_policy_in_both_directions() {
+    let schema = json!({
+        "examples": [{
+            "hidden": {
+                "properties": {
+                    "secret": {
+                        "$ref": "https://example.com/forbidden.json"
+                    }
+                }
+            }
+        }],
+        "$ref": "#/examples/0/hidden"
+    });
+
+    for config in [
+        json!({"json_schema": schema.clone()}),
+        json!({"response_json_schema": schema.clone()}),
+    ] {
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("referenced nested external policy must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+}
+
+#[test]
+fn unreferenced_literal_containers_remain_inactive_in_both_directions() {
+    let schema = json!({
+        "type": "string",
+        "default": {
+            "hidden": {
+                "properties": {
+                    "secret": {
+                        "$ref": "https://literal.example/not-active.json"
+                    }
+                }
+            }
+        }
+    });
+    for config in [
+        json!({"json_schema": schema.clone()}),
+        json!({"response_json_schema": schema.clone()}),
+    ] {
+        BodyValidator::new(&config)
+            .expect("an unreferenced literal container must not activate schema policy");
+    }
+}
+
+#[test]
+fn local_pointer_resolution_handles_cycles_root_and_encoded_segments() {
+    let cyclic = json!({
+        "default": {
+            "a": {"$ref": "#/default/b"},
+            "b": {"$ref": "#/default/a"}
+        },
+        "$ref": "#/default/a"
+    });
+    BodyValidator::new(&json!({"json_schema": cyclic}))
+        .expect("identity deduplication must terminate on a pointer cycle");
+
+    let root_cycle = json!({
+        "default": {
+            "literal": {
+                "$ref": "https://literal.example/not-active.json"
+            }
+        },
+        "$ref": "#"
+    });
+    BodyValidator::new(&json!({"json_schema": root_cycle}))
+        .expect("root '#' must deduplicate without activating literal default data");
+
+    let encoded = json!({
+        "default": {
+            "hidden schema": {
+                "a/b~c": {"type": "integer"}
+            }
+        },
+        "$ref": "#/default/hidden%20schema/a~1b~0c"
+    });
+    BodyValidator::new(&json!({"json_schema": encoded}))
+        .expect("percent decoding and JSON Pointer unescaping must match referencing");
+
+    let invalid_encoding = json!({
+        "default": {"hidden": {"type": "string"}},
+        "$ref": "#/default/%FF"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": invalid_encoding}))
+        .err()
+        .expect("invalid UTF-8 pointer encoding must fail");
+    assert!(error.contains("invalid UTF-8 percent encoding"), "{error}");
+
+    for invalid_pointer in ["#/default/missing", "#/examples/not-an-index"] {
+        let schema = json!({
+            "default": {"hidden": {"type": "string"}},
+            "examples": [{"type": "string"}],
+            "$ref": invalid_pointer
+        });
+        let error = BodyValidator::new(&json!({"json_schema": schema}))
+            .err()
+            .expect("an invalid local pointer must fail construction");
+        assert!(
+            error.contains("resolves nowhere") || error.contains("invalid array index"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn percent_encoded_local_pointer_target_is_decisive_at_runtime() {
+    let plugin = json_schema_plugin(json!({
+        "default": {
+            "hidden schema": {
+                "a/b~c": {"type": "integer"}
+            }
+        },
+        "$ref": "#/default/hidden%20schema/a~1b~0c"
+    }));
+
+    let mut ctx = make_json_ctx("7");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_json_ctx(r#""seven""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[test]
+fn draft_specific_definition_maps_match_referencing_semantics() {
+    // referencing 0.46.5 does not walk `$defs` under Draft 7, so its contents
+    // remain literal when nothing points at them.
+    let draft7_literal = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "string",
+            "$defs": {
+                "hidden": {
+                    "$ref": "https://literal.example/not-active.json"
+                }
+            }
+        }
+    });
+    BodyValidator::new(&draft7_literal).expect("Draft 7 $defs is not a schema container");
+
+    let draft7_dynamic_ref_literal = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "string",
+            "$dynamicRef": "https://literal.example/not-active.json"
+        }
+    });
+    BodyValidator::new(&draft7_dynamic_ref_literal)
+        .expect("Draft 7 $dynamicRef is an unknown, non-reference keyword");
+
+    // A direct pointer still makes that same object an active schema target.
+    let draft7_referenced = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "$defs": {
+                "hidden": {
+                    "$ref": "https://example.com/forbidden.json"
+                }
+            },
+            "$ref": "#/$defs/hidden"
+        }
+    });
+    let error = BodyValidator::new(&draft7_referenced)
+        .err()
+        .expect("Draft 7 pointer target under $defs must be audited");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+
+    // The library's 2020-12 walker deliberately retains `definitions` as a
+    // schema-bearing compatibility map in addition to `$defs`.
+    let draft202012_definitions = json!({
+        "json_schema": {
+            "definitions": {
+                "active": {
+                    "$ref": "https://example.com/forbidden.json"
+                }
+            }
+        }
+    });
+    let error = BodyValidator::new(&draft202012_definitions)
+        .err()
+        .expect("2020-12 definitions values are schema positions");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+}
+
+#[test]
+fn anchor_targets_are_covered_by_the_ordinary_schema_position_walk() {
+    // referencing indexes anchors only at positions reached by its configured-
+    // draft child walker. `$defs/guarded` is therefore already audited without
+    // a separate anchor-target traversal.
+    let schema = json!({
+        "$defs": {
+            "guarded": {
+                "$anchor": "guarded",
+                "properties": {
+                    "secret": {
+                        "$ref": "https://example.com/forbidden.json"
+                    }
+                }
+            }
+        },
+        "$ref": "#guarded"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": schema}))
+        .err()
+        .expect("policy at an anchored schema position must be enforced");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+}
+
+#[tokio::test]
 async fn json_schema_nested_and_recursive_local_refs_are_enforced() {
     let plugin = json_schema_plugin(json!({
         "$defs": {
@@ -3967,8 +4223,45 @@ async fn well_formed_xml_edge_cases_are_accepted() {
 }
 
 #[tokio::test]
-async fn external_xml_entity_declarations_are_rejected() {
+async fn exact_xml_document_text_preserves_outer_whitespace_semantics() {
+    let legal = " \t\r\n<root/>\r\n\t ";
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx(legal);
+    let mut headers = make_xml_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, legal.as_bytes())
+            .await,
+    );
+
+    for body in ["\u{00a0}<root/>", "<root/>\u{0085}"] {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .await,
+            Some(502),
+        );
+    }
+}
+
+#[tokio::test]
+async fn external_xml_identifiers_are_rejected_for_request_and_response() {
     let bodies = [
+        r#"<!DOCTYPE r SYSTEM "https://example.com/external.dtd"><r/>"#,
+        r#"<!DOCTYPE r PUBLIC "-//Example//DTD R 1.0//EN" "https://example.com/r.dtd"><r/>"#,
         r#"<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>"#,
         r#"<!DOCTYPE r [<!ENTITY x PUBLIC "-//a//b" "http://e/x">]><r>&x;</r>"#,
         r#"<!DOCTYPE r [<!ENTITY % p SYSTEM "http://e/e.dtd">%p;]><r/>"#,
@@ -3979,6 +4272,38 @@ async fn external_xml_entity_declarations_are_rejected() {
         let mut headers = make_xml_headers();
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_reject(result, Some(400));
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+            .await;
+        assert_reject(result, Some(502));
+    }
+}
+
+#[tokio::test]
+async fn internal_dtd_and_quoted_keyword_text_remain_valid() {
+    let bodies = [
+        r#"<!DOCTYPE r [<!ENTITY safe "hello">]><r>&safe;</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY unused "<!DOCTYPE fake SYSTEM 'x'>">]><r/>"#,
+        r#"<r><!-- <!DOCTYPE fake SYSTEM "x"> --><![CDATA[<!DOCTYPE fake PUBLIC "x" "y">]]></r>"#,
+    ];
+    for body in bodies {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .await,
+        );
     }
 }
 

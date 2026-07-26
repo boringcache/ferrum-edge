@@ -16,12 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluator, so `$ref`/`$defs`, union types, conditionals, and other standard
   keywords take effect and malformed schemas, invalid type names, non-local
   references, `$vocabulary` declarations, and over-budget schemas fail
-  configuration closed; no external reference is ever retrieved. XML bodies are
-  parsed with `roxmltree` rather than scanned for balanced tags, so multiple
-  roots, text outside the root, invalid names or characters, malformed/unquoted/
-  duplicate attributes, and undeclared entity references are rejected, external
-  entity declarations are refused outright, and `required_xml_elements` matches
-  parsed namespace-expanded names. Decoded gRPC protobuf messages must satisfy
+  configuration closed; local JSON Pointer targets are policy-audited even under
+  normally literal containers, and no external reference is ever retrieved. XML
+  bodies are parsed exactly, without Unicode whitespace trimming, with
+  `roxmltree` rather than scanned for balanced tags, so multiple roots, text
+  outside the root, invalid names or characters, malformed/unquoted/duplicate
+  attributes, and undeclared entity references are rejected. External
+  `SYSTEM`/`PUBLIC` identifiers on either the DOCTYPE or an entity declaration
+  are refused outright, and `required_xml_elements` matches parsed
+  namespace-expanded names. Decoded gRPC protobuf messages must satisfy
   proto2 `required`-field initialization recursively, including inside present
   nested, repeated, map, and extension message values. Unknown top-level config
   keys and unknown keys inside a `protobuf_method_messages` entry are rejected
