@@ -1062,11 +1062,12 @@ jobs:
         # fails. Ports map to the runner's localhost exactly as the tests expect.
         if: matrix.shard == 'data-plane'
         #
-        # Two mongod instances on purpose: `POST /batch` is all-or-nothing
-        # (issue #2401), which on MongoDB needs multi-document transactions.
-        # The standalone instance covers the documented 501 refusal, and the
-        # single-node replica set covers the transactional path — neither can
-        # substitute for the other.
+        # Four mongod instances on purpose:
+        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix
+        # - replica set 27020: transactional `POST /batch` (issue #2401)
+        # - TLS 27018: verify-full + require modes (issue #2399)
+        # - mTLS 27019: client certificate authentication (issue #2399)
+        # Neither plaintext topology can substitute for the TLS fixtures.
         run: |
           set -euo pipefail
 
@@ -1092,10 +1093,12 @@ jobs:
             -p 3306:3306 \
             mysql:8
 
-          # TLS fixtures for functional_db_tls_test (ports 15432 / 13306).
+          # TLS fixtures for functional_db_tls_test (ports 15432 / 13306) and
+          # functional_mongodb_test TLS/mTLS cells (ports 27018 / 27019).
           # Invoked from the scanned automation root (.github/scripts/), not
           # tests/scripts/, so Trusted Cross policy accepts the repository command.
           .github/scripts/setup_db_tls.sh "${RUNNER_TEMP}/ferrum-db-tls-certs"
+          .github/scripts/setup_mongo_tls.sh "${RUNNER_TEMP}/ferrum-mongo-tls-certs"
 
           # The runner used to gate steps on the services' --health-cmd; reproduce
           # that readiness wait using the tools shipped inside each image.
@@ -1192,7 +1195,7 @@ jobs:
           docker exec ferrum-ci-postgres psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
             "ALTER USER ferrum WITH CREATEDB;"
 
-          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
+          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020, mongo-tls:27018, mongo-mtls:27019, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
           echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
           echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
 
@@ -1252,6 +1255,10 @@ jobs:
           FERRUM_TEST_POSTGRES_URL: ${{ matrix.shard == 'data-plane' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
           FERRUM_TEST_MYSQL_URL: ${{ matrix.shard == 'data-plane' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
           FERRUM_TEST_MONGO_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
           FERRUM_TEST_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
           FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
           FERRUM_DB_TLS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
@@ -1263,11 +1270,13 @@ jobs:
           set +e
           for name in ferrum-ci-redis ferrum-ci-mongo ferrum-ci-mongo-rs \
                       ferrum-ci-postgres ferrum-ci-mysql \
-                      ferrum-test-pg-tls ferrum-test-mysql-tls; do
+                      ferrum-test-pg-tls ferrum-test-mysql-tls \
+                      ferrum-test-mongo-tls ferrum-test-mongo-mtls; do
             docker unpause "$name" >/dev/null 2>&1
             docker rm -f "$name" >/dev/null 2>&1
           done
           .github/scripts/setup_db_tls.sh --cleanup >/dev/null 2>&1 || true
+          .github/scripts/setup_mongo_tls.sh --cleanup >/dev/null 2>&1 || true
 
       - name: Summarize functional shard
         if: always()
@@ -1283,7 +1292,7 @@ jobs:
             echo "Backends: \`sqlite,postgres,mysql,mongodb,redis\`" >> $GITHUB_STEP_SUMMARY
             echo "Behaviors: \`admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Required URLs: \`FERRUM_TEST_POSTGRES_URL\`, \`FERRUM_TEST_MYSQL_URL\`, \`FERRUM_TEST_MONGO_URL\` with \`FERRUM_DB_BACKENDS_REQUIRED=1\` / \`FERRUM_DB_TLS_REQUIRED=1\`." >> $GITHUB_STEP_SUMMARY
+            echo "Required URLs: \`FERRUM_TEST_POSTGRES_URL\`, \`FERRUM_TEST_MYSQL_URL\`, \`FERRUM_TEST_MONGO_URL\`, \`FERRUM_TEST_MONGO_TLS_URL\`, \`FERRUM_TEST_MONGO_TLS_REQUIRE_URL\`, \`FERRUM_TEST_MONGO_MTLS_URL\` with \`FERRUM_DB_BACKENDS_REQUIRED=1\` / \`FERRUM_DB_TLS_REQUIRED=1\`." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "See \`docs/functional_testing_database.md\` for the backend × behavior matrix." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
