@@ -300,11 +300,15 @@ async fn request_termination_rejects_a_prefix_that_could_never_match() {
         "/api/./admin",
         "/api\\admin",
     ] {
-        let error = RequestTermination::new(&json!({
+        // Match instead of expect_err: RequestTermination does not implement
+        // Debug, and Result::expect_err requires Debug on the Ok type.
+        let error = match RequestTermination::new(&json!({
             "status_code": 403,
             "trigger": { "path_prefix": prefix }
-        }))
-        .expect_err("non-canonical prefix must be rejected");
+        })) {
+            Err(error) => error,
+            Ok(_) => panic!("non-canonical prefix must be rejected: {prefix:?}"),
+        };
         assert!(
             error.contains("canonical policy path"),
             "unexpected error for {prefix:?}: {error}"
