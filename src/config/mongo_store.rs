@@ -1370,9 +1370,9 @@ mod inner {
                                     crate::config::db_backend::redact_url(url)
                                 );
                                 store.failover_urls = failover_urls.to_vec();
-                                store.failover_topology.mark_failover(
-                                    &crate::config::db_backend::redact_url(url),
-                                );
+                                store
+                                    .failover_topology
+                                    .mark_failover(&crate::config::db_backend::redact_url(url));
                                 return Ok(store);
                             }
                             Err(e) => {

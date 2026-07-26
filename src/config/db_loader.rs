@@ -56,8 +56,8 @@ pub use crate::config::batch_atomicity::{
 };
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, DbFailoverTopologyState,
-    FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
+    DbFailoverTopologyState, FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
     MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
     NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
     SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
@@ -6327,7 +6327,8 @@ impl DatabaseStore {
         // look immediately available on failback and skip the one reconnect
         // that refreshes its connections after the topology transition.
         if topology == DatabaseTopology::Failover {
-            self.failover_topology.mark_failover(&Self::redact_url(db_url));
+            self.failover_topology
+                .mark_failover(&Self::redact_url(db_url));
             self.suppress_read_replica_pool();
         }
 
@@ -6354,7 +6355,8 @@ impl DatabaseStore {
         self.maybe_apply_deferred_migrations().await?;
 
         if topology == DatabaseTopology::Primary {
-            self.failover_topology.mark_primary(&Self::redact_url(db_url));
+            self.failover_topology
+                .mark_primary(&Self::redact_url(db_url));
         }
 
         Ok(())

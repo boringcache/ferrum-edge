@@ -2307,7 +2307,10 @@ async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
     // Return to failover topology with opt-in enabled.
     let mut store = DatabaseStore::connect_with_failover(
         "sqlite",
-        &format!("sqlite:{}?mode=rw", temp_dir.path().join("missing-primary.db").to_string_lossy()),
+        &format!(
+            "sqlite:{}?mode=rw",
+            temp_dir.path().join("missing-primary.db").to_string_lossy()
+        ),
         std::slice::from_ref(&failover_url),
         DbPoolConfig::default(),
     )

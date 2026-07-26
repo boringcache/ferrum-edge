@@ -118,9 +118,7 @@ impl DbFailoverTopologyState {
             failover_since_unix_ms: (since > 0).then_some(since),
             active_url_redacted: (**self.active_url_redacted.load()).clone(),
             allow_writes: self.allow_writes(),
-            opt_in_writes_enabled_during_window: self
-                .opt_in_during_window
-                .load(Ordering::Acquire),
+            opt_in_writes_enabled_during_window: self.opt_in_during_window.load(Ordering::Acquire),
         }
     }
 

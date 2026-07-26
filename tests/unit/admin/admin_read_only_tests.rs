@@ -521,7 +521,10 @@ async fn test_check_write_allowed_blocks_on_failover_without_opt_in() {
     );
     let resp = state.check_write_allowed();
     assert!(resp.is_some(), "mutations must fail closed on failover");
-    assert_eq!(resp.unwrap().status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.unwrap().status(),
+        hyper::StatusCode::SERVICE_UNAVAILABLE
+    );
     // Observe-only and mutation gates must not diverge on the default fail-closed path.
     assert!(state.admin_writes_currently_blocked());
 }
