@@ -14,7 +14,8 @@ use ferrum_edge::_test_support::{
     request_deduplication_with_instance_id_for_test,
     set_response_presentation_policy_digest_for_test,
 };
-use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, Proxy};
+use ferrum_edge::config::types::Proxy;
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
 use ferrum_edge::plugins::request_deduplication::{
