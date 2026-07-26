@@ -2292,10 +2292,11 @@ fn delete_paths_set_postgres_snapshot_isolation_before_other_tx_statements() {
 }
 
 fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) {
-    let via_helper = format!("optional_utf8_text_column(row, \"{column}\")?");
-    let via_try_get = format!("try_get::<Option<String>, _>(\"{column}\")?");
+    let compact_body: String = body.split_whitespace().collect();
+    let via_helper = format!("optional_utf8_text_column(row,\"{column}\")?");
+    let via_try_get = format!("try_get::<Option<String>,_>(\"{column}\")?");
     assert!(
-        body.contains(&via_helper) || body.contains(&via_try_get),
+        compact_body.contains(&via_helper) || compact_body.contains(&via_try_get),
         "{mapper} must decode `{column}` with `{via_helper}` or `{via_try_get}` so NULL stays None and \
          non-NULL decode failures reject the load"
     );
