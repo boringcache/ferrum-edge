@@ -1573,9 +1573,13 @@ ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generati
 status with aggregate totals), and process-wide aggregate Prometheus metrics
 under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
-configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
-reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
-persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
+configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
+ownership/claim protocol, and reconciliation guidance. Each spool is partitioned
+by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,
+ClickHouse endpoint/database/table, node id), so sibling instances can never
+replay, delete, or dead-letter each other's billing records. Set
+`FERRUM_NODE_ID` for stable spool ownership on persistent storage. Ordinary HTTP
+is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
 `http_status_code`, and normalized final `grpc_status` as separate fields.
