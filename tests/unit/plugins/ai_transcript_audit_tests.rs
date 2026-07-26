@@ -7567,6 +7567,83 @@ async fn wait_for_sink_health(plugin: &AiTranscriptAudit, expected: bool) -> boo
     false
 }
 
+async fn assert_unhealthy_sink_rejects_next_candidate(plugin: &AiTranscriptAudit) {
+    let mut ctx = make_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "on_sink_error=reject must reject after the complete acknowledgement attempt fails"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected")
+    );
+}
+
+/// Serve 2xx headers advertising an acknowledgement body, then retain the
+/// incomplete connection until the test releases it. This lets hosted tests
+/// observe health after headers but before either timeout or transport EOF.
+async fn spawn_incomplete_ack_server(
+    reset_on_release: bool,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind acknowledgement server");
+    let addr = listener.local_addr().expect("acknowledgement server address");
+    let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let release_server = Arc::clone(&release);
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            if !read_http11_request_headers(&mut socket).await {
+                return;
+            }
+            if socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = headers_sent.send(());
+            release_server.notified().await;
+            // Dropping with fewer than Content-Length bytes makes the
+            // response-body stream fail without placing collector bytes in any
+            // diagnostic.
+            if reset_on_release
+                && let Ok(std_socket) = socket.into_std()
+            {
+                let reset_socket = socket2::Socket::from(std_socket);
+                let _ = reset_socket.set_linger(Some(std::time::Duration::ZERO));
+            }
+        })
+        .await;
+    });
+    (format!("http://{addr}/ingest"), headers_received, release)
+}
+
 /// A 2xx whose acknowledgement body overruns the configured bound is an
 /// ambiguous delivery: health must NOT publish from the status line, and
 /// `on_sink_error: reject` must start rejecting.
@@ -7610,27 +7687,96 @@ async fn oversized_acknowledgement_body_marks_sink_unhealthy_and_rejects() {
         "a 2xx whose acknowledgement exceeded ack_max_bytes must not publish healthy"
     );
 
-    // Fail-closed admission must observe the unhealthy sink.
-    let mut ctx = make_ctx();
-    let result = plugin
-        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
-        .await;
-    assert!(
-        matches!(
-            result,
-            PluginResult::Reject {
-                status_code: 503,
-                ..
-            }
+    assert_unhealthy_sink_rejects_next_candidate(&plugin).await;
+}
+
+/// A successful status line does not publish health while its body is stalled.
+/// Only the admitted acknowledgement timeout completes the attempt and flips
+/// fail-closed admission to unhealthy.
+#[tokio::test]
+async fn stalled_2xx_acknowledgement_marks_sink_unhealthy_and_rejects() {
+    let (endpoint, headers_received, release) = spawn_incomplete_ack_server(false).await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "ack_timeout_ms": 500,
+                    "on_sink_error": "reject"
+                }
+            }),
         ),
-        "on_sink_error=reject must reject while the acknowledgement contract is failing"
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    emit_one_record(&plugin).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), headers_received)
+        .await
+        .expect("collector should receive the batch")
+        .expect("collector should publish 2xx headers");
+    assert!(
+        plugin.status_snapshot().sink_healthy,
+        "2xx headers alone must not change sink health before acknowledgement timeout"
     );
-    assert_eq!(
-        ctx.metadata
-            .get("ai_transcript_audit.sink_status")
-            .map(String::as_str),
-        Some("rejected")
+    assert!(
+        wait_for_sink_health(&plugin, false).await,
+        "a stalled 2xx acknowledgement must become unhealthy at ack_timeout_ms"
     );
+    release.notify_one();
+    assert_unhealthy_sink_rejects_next_candidate(&plugin).await;
+}
+
+/// A 2xx acknowledgement whose declared body is cut off by transport failure
+/// is an ambiguous delivery and immediately closes fail-closed admission.
+#[tokio::test]
+async fn reset_2xx_acknowledgement_transport_marks_sink_unhealthy_and_rejects() {
+    let (endpoint, headers_received, release) = spawn_incomplete_ack_server(true).await;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "ack_timeout_ms": 1000,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    emit_one_record(&plugin).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), headers_received)
+        .await
+        .expect("collector should receive the batch")
+        .expect("collector should publish 2xx headers");
+    assert!(
+        plugin.status_snapshot().sink_healthy,
+        "2xx headers alone must not change sink health before body transport completes"
+    );
+    release.notify_one();
+    assert!(
+        wait_for_sink_health(&plugin, false).await,
+        "an incomplete 2xx acknowledgement body must publish unhealthy"
+    );
+    assert_unhealthy_sink_rejects_next_candidate(&plugin).await;
 }
 
 /// `ack_policy: json` rejects a 2xx acknowledgement that reports lost records,
@@ -7641,6 +7787,7 @@ async fn json_acknowledgement_policy_distinguishes_reported_failures_from_succes
         (r#"{"status":"ok","errors":0}"#, true),
         (r#"{"status":"ok","errors":3}"#, false),
         (r#"{"status":"partial_failure"}"#, false),
+        (r#"{"status":"partial_ok"}"#, false),
         // A present non-string status is ambiguous and must not count as success.
         (r#"{"status":true}"#, false),
         (r#"{"status":1}"#, false),
@@ -8111,7 +8258,7 @@ async fn delivered_record_releases_its_retained_bytes() {
 /// An active stream that never terminates cannot hold its staging entry and
 /// reserved commit permit forever.
 #[tokio::test]
-async fn never_ending_stream_reservation_expires_and_releases_capacity() {
+async fn active_selected_stream_without_inspector_expires_without_sweep_trigger() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -8147,21 +8294,132 @@ async fn never_ending_stream_reservation_expires_and_releases_capacity() {
     assert!(held > 0, "an active stream reservation charges bytes");
     assert_eq!(plugin.status_snapshot().stream_reservations_expired, 0);
 
-    // The stream never terminates: no terminal hook, no `on_end`.
+    // The stream never terminates: no terminal hook, no `on_end`, and no later
+    // request is allowed to trigger the repair sweep.
     tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
-
-    // Any later admission runs the amortized sweep.
-    let mut later = make_ctx();
-    plugin
-        .on_final_request_body_with_context(&mut later, &json_headers(), ai_request_body())
-        .await;
 
     let snapshot = plugin.status_snapshot();
     assert_eq!(
         snapshot.stream_reservations_expired, 1,
-        "the abandoned stream reservation must be reclaimed and counted"
+        "the staging-owned exact deadline must reclaim and count an active selection with no inspector"
+    );
+    assert_eq!(
+        snapshot.retained_bytes, 0,
+        "expiry must release staging, queue, and byte owners without a later sweep trigger"
     );
     assert_eq!(snapshot.max_stream_reservation_secs, 1);
+}
+
+/// Normal inspector completion can deliberately retain staging for the
+/// transaction-log fallback. Losing that fallback must not cancel the original
+/// reservation deadline or pin its owners indefinitely.
+#[tokio::test]
+async fn terminal_handoff_lost_before_log_fallback_still_expires_staging() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = Arc::new(
+        AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({
+                    "capture": { "streaming_response": true },
+                    "sampling": { "rate": 0.0 },
+                    "limits": { "max_stream_reservation_secs": 1 }
+                }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config"),
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+    let _ = inspector.on_end().await;
+    drop(inspector);
+    run_response_stream_termination_hooks(&plugins, &mut ctx, 200, &BodyOutcome::success(0)).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("deferred"),
+        "normal unsampled completion must retain staging for the immediate log fallback"
+    );
+    assert!(
+        plugin.status_snapshot().retained_bytes > 0,
+        "the fallback handoff still owns staged request bytes"
+    );
+
+    // Simulate cancellation/loss of transaction logging. No request or sweep
+    // trigger follows.
+    tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+    let snapshot = plugin.status_snapshot();
+    assert_eq!(snapshot.stream_reservations_expired, 1);
+    assert_eq!(
+        snapshot.retained_bytes, 0,
+        "the original selection deadline must remain armed through terminal handoff"
+    );
+}
+
+/// When the transaction-log fallback consumes retained staging normally, its
+/// cancellation owner wakes the exact deadline task promptly and the request
+/// is never later counted as expired.
+#[tokio::test]
+async fn normal_log_fallback_consumption_cancels_stream_deadline() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = Arc::new(
+        AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({
+                    "capture": { "streaming_response": true },
+                    "sampling": { "rate": 0.0 },
+                    "limits": { "max_stream_reservation_secs": 1 }
+                }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config"),
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+    let _ = inspector.on_end().await;
+    drop(inspector);
+    run_response_stream_termination_hooks(&plugins, &mut ctx, 200, &BodyOutcome::success(0)).await;
+
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    assert_eq!(
+        plugin.status_snapshot().retained_bytes,
+        0,
+        "normal fallback consumption must release staging immediately"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+    assert_eq!(
+        plugin.status_snapshot().stream_reservations_expired,
+        0,
+        "normal staging consumption must cancel rather than merely outwait the deadline task"
+    );
 }
 
 /// Expiry synchronously revokes inspector-owned bytes and HMAC work before it

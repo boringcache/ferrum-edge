@@ -30,7 +30,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
@@ -581,8 +581,9 @@ pub struct AiTranscriptAuditSnapshot {
     pub retained_byte_drops: u64,
     /// Maximum lifetime of one active stream's staging entry + commit permit.
     pub max_stream_reservation_secs: u64,
-    /// Stream reservations reclaimed by the sweeper after exceeding that
-    /// lifetime. A non-zero value means streams are outliving their bound.
+    /// Stream reservations reclaimed by the staging-owned deadline or repair
+    /// sweep after exceeding that lifetime. A non-zero value means streams are
+    /// outliving their bound.
     pub stream_reservations_expired: u64,
     /// `capped` or `full` — how much of a stream the keyed digest covers.
     pub stream_hash_scope: &'static str,
@@ -600,6 +601,76 @@ struct PrivacyConfig {
     include_client_ip: bool,
     include_raw_headers: bool,
     path_mode: PathMode,
+}
+
+const STREAM_DEADLINE_ARMED: u8 = 0;
+const STREAM_DEADLINE_FIRED: u8 = 1;
+const STREAM_DEADLINE_CANCELLED: u8 = 2;
+
+/// Single-fire state shared by one active staging entry and its exact deadline
+/// task. The staging owner, rather than an optional inspector, defines the
+/// reservation lifetime: concrete inspector decline and terminal-to-log
+/// handoff paths still retain the same staging/queue/byte capability.
+struct StreamReservationDeadlineControl {
+    state: AtomicU8,
+    cancel: Notify,
+}
+
+impl StreamReservationDeadlineControl {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(STREAM_DEADLINE_ARMED),
+            cancel: Notify::new(),
+        }
+    }
+
+    /// Claim the expiry transaction. Exactly one deadline task, repair sweep,
+    /// or inspector-side deadline check can win.
+    fn try_fire(&self) -> bool {
+        self.state
+            .compare_exchange(
+                STREAM_DEADLINE_ARMED,
+                STREAM_DEADLINE_FIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Cancel a still-armed deadline. The state transition makes cancellation
+    /// race-safe even when the sleep and notification become ready together.
+    fn cancel(&self) -> bool {
+        let cancelled = self
+            .state
+            .compare_exchange(
+                STREAM_DEADLINE_ARMED,
+                STREAM_DEADLINE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.cancel.notify_one();
+        }
+        cancelled
+    }
+
+    fn is_armed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == STREAM_DEADLINE_ARMED
+    }
+}
+
+/// Cancellation owner stored with [`AuditStaging`]. Removing a completed or
+/// discarded staging entry wakes its task promptly instead of leaving one
+/// sleeper per completed request until the full reservation age.
+struct StreamReservationDeadlineOwner {
+    control: Arc<StreamReservationDeadlineControl>,
+}
+
+impl Drop for StreamReservationDeadlineOwner {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
 }
 
 /// Per-request request-side capture, keyed by `record_id`. Never holds a full
@@ -647,6 +718,23 @@ struct AuditStaging {
     /// stream may hold this entry and its reserved permit, so a never-ending
     /// or terminal-hook-losing stream cannot pin capacity forever.
     stream_active_since: Option<Instant>,
+    /// Authoritative reservation deadline owner. Armed at the first active
+    /// response selection and retained until this staging entry is actually
+    /// consumed, discarded, or expired — including the normal terminal
+    /// non-emitting handoff to transaction logging.
+    stream_deadline: Option<StreamReservationDeadlineOwner>,
+}
+
+impl AuditStaging {
+    /// Cancel the exact deadline before a normal consumer uses this staging
+    /// capability. Returns false if expiry already claimed it, in which case
+    /// the caller must drop the entry without emitting or transferring owners.
+    fn cancel_stream_deadline(&mut self) -> bool {
+        let Some(owner) = self.stream_deadline.take() else {
+            return true;
+        };
+        owner.control.cancel()
+    }
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -753,10 +841,6 @@ struct StreamSlot {
     /// map. Production expiry/terminal claim removes the entry before releasing
     /// this permit; request-owned terminal handoffs need no global capacity.
     pending_permit: Mutex<Option<OwnedSemaphorePermit>>,
-    /// Cancels the one-shot reservation deadline task after terminal claim.
-    /// The task otherwise revokes even a completely idle stream at its exact
-    /// configured deadline, without requiring another request or chunk.
-    expiry_cancel: Arc<tokio::sync::Notify>,
 }
 
 enum ClaimedStreamCapture {
@@ -965,18 +1049,41 @@ fn publish_revoked_fallback_if_ready(
 
 fn expire_stream_reservation(
     record_id: &str,
-    slot: Option<&Arc<StreamSlot>>,
     pending_streams: &DashMap<String, Arc<StreamSlot>>,
     staging: &DashMap<String, AuditStaging>,
     stream_reservations_expired: &AtomicU64,
     max_reservation: Duration,
 ) -> bool {
-    if let Some(slot) = slot {
-        // Synchronously drop the live Vec, completed excerpt/hash, and HMAC
-        // before releasing any staging, queue, or retained-byte owner.
-        if !slot.revoke() && !slot.revoked.load(Ordering::Acquire) {
+    // Claim the staging-owned single-fire token before touching either map.
+    // Normal staging consumers race this same state to CANCELLED; whichever
+    // transition wins owns the capability and the loser must not emit,
+    // transfer, or resurrect it.
+    let deadline = {
+        let Some(entry) = staging.get(record_id) else {
+            return false;
+        };
+        if !entry.stream_active {
             return false;
         }
+        let Some(owner) = entry.stream_deadline.as_ref() else {
+            return false;
+        };
+        Arc::clone(&owner.control)
+    };
+    if !deadline.try_fire() {
+        return false;
+    }
+
+    // Resolve the slot only after winning expiry. Selection can be active
+    // without any concrete inspector, while an inspector can also be installed
+    // after selection and before this deadline fires.
+    let slot = pending_streams
+        .get(record_id)
+        .map(|entry| Arc::clone(entry.value()));
+    if let Some(slot) = slot.as_ref() {
+        // Synchronously drop the live Vec, completed excerpt/hash, and HMAC
+        // before releasing any staging, queue, or retained-byte owner.
+        let revoked = slot.revoke() || slot.revoked.load(Ordering::Acquire);
         pending_streams.remove_if(record_id, |_, current| Arc::ptr_eq(current, slot));
         if slot.uses_request_handoff {
             slot.release_pending_permit();
@@ -985,28 +1092,29 @@ fn expire_stream_reservation(
         // fail-closed streams release the equivalent staging-owned reservation
         // below. Both happen only after capture/HMAC revocation.
         drop(slot.take_record_lease());
-        slot.detached_after_revocation
-            .store(true, Ordering::Release);
-        publish_revoked_fallback_if_ready(record_id, slot, pending_streams);
+        if revoked {
+            slot.detached_after_revocation
+                .store(true, Ordering::Release);
+            publish_revoked_fallback_if_ready(record_id, slot, pending_streams);
+        }
     }
 
-    let removed = staging
-        .remove_if(record_id, |_, staging| staging.stream_active)
-        .is_some();
-    if removed {
-        let total = stream_reservations_expired
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        tracing::warn!(
-            plugin = "ai_transcript_audit",
-            expired = 1_u64,
-            total_expired = total,
-            max_reservation_secs = max_reservation.as_secs(),
-            "ai_transcript_audit: reclaimed a streaming audit reservation that exceeded \
-             limits.max_stream_reservation_secs"
-        );
-    }
-    removed
+    // If a normal terminal consumer removed the entry after expiry won the
+    // token, its cancellation attempt observes FIRED and drops the capability
+    // without emission. Either way, this expiry is counted exactly once.
+    drop(staging.remove_if(record_id, |_, staging| staging.stream_active));
+    let total = stream_reservations_expired
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    tracing::warn!(
+        plugin = "ai_transcript_audit",
+        expired = 1_u64,
+        total_expired = total,
+        max_reservation_secs = max_reservation.as_secs(),
+        "ai_transcript_audit: reclaimed a streaming audit reservation that exceeded \
+         limits.max_stream_reservation_secs"
+    );
+    true
 }
 
 /// A single exported audit record. It exists only during bounded record
@@ -1294,8 +1402,8 @@ pub struct AiTranscriptAudit {
     /// reservations, and queued records. Record-count capacity alone cannot
     /// bound attacker-shaped payload retention.
     retained_budget: Arc<ByteBudget>,
-    /// Stream reservations reclaimed by the sweeper after exceeding the
-    /// configured maximum reservation age.
+    /// Stream reservations reclaimed by the staging-owned deadline or repair
+    /// sweep after exceeding the configured maximum reservation age.
     stream_reservations_expired: Arc<AtomicU64>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
     /// Independent hard bound for inspector slots while they are reachable
@@ -1994,6 +2102,66 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
+    /// Mark the first active response selection and attach the reservation's
+    /// one authoritative exact deadline to staging. This covers non-SSE
+    /// responses and every concrete-inspector admission decline as well as
+    /// successfully installed inspectors.
+    fn arm_stream_reservation(&self, record_id: &str) {
+        let started = Instant::now();
+        let max_reservation = self.limits.max_stream_reservation;
+        let deadline_at = started.checked_add(max_reservation).unwrap_or(started);
+        let control = {
+            let Some(mut staging) = self.staging.get_mut(record_id) else {
+                return;
+            };
+            if staging.stream_active {
+                return;
+            }
+            let control = Arc::new(StreamReservationDeadlineControl::new());
+            staging.stream_active = true;
+            staging.stream_active_since = Some(started);
+            staging.stream_deadline = Some(StreamReservationDeadlineOwner {
+                control: Arc::clone(&control),
+            });
+            control
+        };
+
+        // Production stream selection runs inside a Tokio runtime. If a direct
+        // caller has no runtime, the same staging-owned token remains available
+        // to the bounded repair sweep.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let deadline_record_id = record_id.to_string();
+        let deadline_pending_streams = Arc::clone(&self.pending_streams);
+        let deadline_staging = Arc::clone(&self.staging);
+        let deadline_expired = Arc::clone(&self.stream_reservations_expired);
+        let sleep_for = deadline_at.saturating_duration_since(Instant::now());
+        let wait_control = Arc::clone(&control);
+        let _deadline_task = runtime.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {
+                    expire_stream_reservation(
+                        &deadline_record_id,
+                        &deadline_pending_streams,
+                        &deadline_staging,
+                        &deadline_expired,
+                        max_reservation,
+                    );
+                }
+                _ = wait_control.cancel.notified() => {}
+            }
+        });
+    }
+
+    /// Atomically consume staging for a normal emission/fallback path and
+    /// cancel its exact deadline before transferring any permit or byte lease.
+    /// If expiry already won, drop the removed entry and expose no capability.
+    fn take_staging_for_consumption(&self, record_id: &str) -> Option<AuditStaging> {
+        let (_, mut staging) = self.staging.remove(record_id)?;
+        staging.cancel_stream_deadline().then_some(staging)
+    }
+
     /// Reclaim staging entries whose owner will never return: orphaned
     /// candidates past `staging_ttl`, and active-stream entries that have held
     /// a reserved commit permit longer than `limits.max_stream_reservation`.
@@ -2043,13 +2211,8 @@ impl AiTranscriptAudit {
             .map(|entry| entry.key().clone())
             .collect();
         for record_id in expired_stream_ids {
-            let slot = self
-                .pending_streams
-                .get(&record_id)
-                .map(|entry| Arc::clone(entry.value()));
             expire_stream_reservation(
                 &record_id,
-                slot.as_ref(),
                 &self.pending_streams,
                 &self.staging,
                 &self.stream_reservations_expired,
@@ -2254,6 +2417,7 @@ impl AiTranscriptAudit {
                 commit_lease: None,
                 stream_active: false,
                 stream_active_since: None,
+                stream_deadline: None,
             },
         );
         PluginResult::Continue
@@ -3201,7 +3365,7 @@ impl Plugin for AiTranscriptAudit {
         // a second, staging-less record. Do not reintroduce a
         // `has_staged_candidate` pre-check: that would only re-open a
         // check-then-act window without changing the outcome.
-        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+        let Some(mut staging) = self.take_staging_for_consumption(&record_id) else {
             return;
         };
         let sample_hit = staging.sample_hit;
@@ -3303,13 +3467,7 @@ impl Plugin for AiTranscriptAudit {
         if self.stream_commit_selected(ctx, response_status, content_type)
             || self.stream_inspector_selected(ctx, response_status, content_type)
         {
-            if let Some(mut staging) = self.staging.get_mut(record_id) {
-                staging.stream_active = true;
-                // Start the reservation clock. The sweeper reclaims the entry
-                // (and its permit/leases) if this stream never terminates or
-                // loses its terminal hook.
-                staging.stream_active_since = Some(Instant::now());
-            }
+            self.arm_stream_reservation(record_id);
             return;
         }
         if let Some(mut staging) = self.staging.get_mut(record_id) {
@@ -3342,9 +3500,17 @@ impl Plugin for AiTranscriptAudit {
         // A fail-closed stream already owns the full retained-record lease in
         // staging; fail-open capture reserves the same ceiling here before its
         // inspector can retain one response byte.
-        let (sample_hit, staging_has_record_lease) = {
+        let (sample_hit, staging_has_record_lease, reservation_started, deadline_control) = {
             let staging = self.staging.get(&record_id)?;
-            (staging.sample_hit, staging.commit_lease.is_some())
+            (
+                staging.sample_hit,
+                staging.commit_lease.is_some(),
+                staging.stream_active_since,
+                staging
+                    .stream_deadline
+                    .as_ref()
+                    .map(|owner| Arc::clone(&owner.control)),
+            )
         };
         let record_lease = if staging_has_record_lease {
             None
@@ -3355,11 +3521,13 @@ impl Plugin for AiTranscriptAudit {
         let request_handoff = ctx.response_stream_handoff();
         let now = Instant::now();
         let max_reservation = self.limits.max_stream_reservation;
-        let reservation_deadline = now.checked_add(max_reservation).unwrap_or(now);
+        let reservation_deadline = reservation_started
+            .unwrap_or(now)
+            .checked_add(max_reservation)
+            .unwrap_or(now);
         let pending_permit = Arc::clone(&self.pending_stream_permits)
             .try_acquire_owned()
             .ok()?;
-        let expiry_cancel = Arc::new(tokio::sync::Notify::new());
         let slot = Arc::new(StreamSlot {
             capture: Mutex::new(StreamCaptureLifecycle::Active(StreamCaptureWork {
                 accumulated: Vec::new(),
@@ -3378,42 +3546,31 @@ impl Plugin for AiTranscriptAudit {
             fallback_published: AtomicBool::new(false),
             uses_request_handoff: request_handoff.is_some(),
             pending_permit: Mutex::new(Some(pending_permit)),
-            expiry_cancel: Arc::clone(&expiry_cancel),
         });
         // Register before the first chunk. An idle stream can expire without
         // ever producing bytes, and the sweeper must still be able to revoke
         // the inspector before it releases staging/queue accounting.
         self.pending_streams
             .insert(record_id.clone(), Arc::clone(&slot));
-        // The ordinary sweep remains a bounded repair net, but it cannot make
-        // an otherwise idle stream release promptly without another request.
-        // A cancellable one-shot task gives every admitted inspector an exact
-        // revocation owner. It holds only a Weak slot plus bounded map handles;
-        // terminal claim signals it immediately, and expiry removes itself.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let deadline_slot = Arc::downgrade(&slot);
-            let deadline_record_id = record_id.clone();
-            let deadline_pending_streams = Arc::clone(&self.pending_streams);
-            let deadline_staging = Arc::clone(&self.staging);
-            let deadline_expired = Arc::clone(&self.stream_reservations_expired);
-            let sleep_for = reservation_deadline.saturating_duration_since(Instant::now());
-            let _deadline_task = runtime.spawn(async move {
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep_for) => {
-                        if let Some(slot) = deadline_slot.upgrade() {
-                            expire_stream_reservation(
-                                &deadline_record_id,
-                                Some(&slot),
-                                &deadline_pending_streams,
-                                &deadline_staging,
-                                &deadline_expired,
-                                max_reservation,
-                            );
-                        }
-                    }
-                    _ = expiry_cancel.notified() => {}
-                }
-            });
+        // Selection may expire while this concrete factory acquires its
+        // fail-open byte lease and pending-slot permit. Never publish an
+        // inspector after the staging-owned deadline has fired or the staging
+        // capability has otherwise disappeared.
+        if let Some(control) = deadline_control {
+            let still_owned = self.staging.get(&record_id).is_some_and(|staging| {
+                staging
+                    .stream_deadline
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner.control, &control))
+            }) && control.is_armed();
+            if !still_owned {
+                slot.revoke();
+                self.pending_streams
+                    .remove_if(&record_id, |_, current| Arc::ptr_eq(current, &slot));
+                slot.release_pending_permit();
+                drop(slot.take_record_lease());
+                return None;
+            }
         }
         Some(Box::new(AuditStreamInspector {
             record_id,
@@ -3467,7 +3624,6 @@ impl Plugin for AiTranscriptAudit {
         let Some(claimed) = slot.claim_terminal() else {
             return;
         };
-        slot.expiry_cancel.notify_one();
         // A sweeper can publish the revoked handoff between the first remove
         // and the terminal claim. Clear that same-slot marker as part of the
         // claim so no lost duplicate remains in the bounded handoff map.
@@ -3475,13 +3631,11 @@ impl Plugin for AiTranscriptAudit {
             .remove_if(&record_id, |_, current| Arc::ptr_eq(current, &slot));
         slot.release_pending_permit();
         let revoked = matches!(&claimed, ClaimedStreamCapture::Revoked);
-        // The response is no longer active. Normally this hook or the immediate
-        // log fallback consumes staging; clearing the marker also ensures an
-        // unexpectedly orphaned terminal record can be reclaimed after its TTL.
-        if let Some(mut staging) = self.staging.get_mut(&record_id) {
-            staging.stream_active = false;
-            staging.stream_active_since = None;
-        }
+        // Keep the staging-owned deadline armed until this hook actually
+        // consumes staging below or the immediate transaction-log fallback
+        // does. If terminal processing or that fallback is cancelled, expiry
+        // still releases the retained permit/leases at the original selection
+        // deadline.
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let sample_hit = if revoked {
             // Revocation invalidates both sides of body evidence for this audit
@@ -3497,6 +3651,11 @@ impl Plugin for AiTranscriptAudit {
             // staging entry. Do not fall back to the shared peer-writable
             // `MD_SAMPLE_HIT` key.
             let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+                // Expiry can win after terminal slot claim but before this
+                // staging read. Released evidence must not survive into normal
+                // transaction metadata as though the claim completed.
+                ctx.metadata.remove(MD_REQUEST_HASH);
+                ctx.metadata.remove(MD_RESPONSE_HASH);
                 return;
             };
             sample_hit
@@ -3558,7 +3717,12 @@ impl Plugin for AiTranscriptAudit {
         let mut staging = if revoked {
             None
         } else {
-            let Some((_, staging)) = self.staging.remove(&record_id) else {
+            let Some(staging) = self.take_staging_for_consumption(&record_id) else {
+                // The staging-owned deadline won after slot claim. Never retain
+                // or publish the claimed response hash after its commit
+                // capability and byte owners were revoked.
+                ctx.metadata.remove(MD_REQUEST_HASH);
+                ctx.metadata.remove(MD_RESPONSE_HASH);
                 return;
             };
             Some(staging)
@@ -3605,7 +3769,7 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
         // Emit here only if no response hook already did (staging still present).
-        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+        let Some(mut staging) = self.take_staging_for_consumption(&record_id) else {
             return;
         };
 
@@ -3676,7 +3840,6 @@ impl AuditStreamInspector {
         // and later allow the log fallback to emit a duplicate.
         expire_stream_reservation(
             &self.record_id,
-            Some(&self.slot),
             &self.pending_streams,
             &self.staging,
             &self.stream_reservations_expired,
@@ -4012,7 +4175,7 @@ fn validate_ack_json(bytes: &[u8]) -> Result<(), AckFailure> {
         Some(Value::String(status))
             if matches!(
                 status.to_ascii_lowercase().as_str(),
-                "ok" | "success" | "accepted" | "created" | "partial_ok"
+                "ok" | "success" | "accepted" | "created"
             ) => {}
         // A present non-string or non-affirmative status is ambiguous and must
         // not be treated as acknowledgement success. Diagnostics stay

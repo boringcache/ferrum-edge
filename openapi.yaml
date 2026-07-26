@@ -10438,7 +10438,7 @@ components:
           format: uint64
           description: >-
             Stream reservations and inspector capture state revoked by the
-            per-stream deadline owner or repair sweep after exceeding
+            staging-lifetime deadline owner or repair sweep after exceeding
             `max_stream_reservation_secs`. Non-zero means streams are
             outliving their bound.
         stream_hash_scope:
@@ -19207,13 +19207,21 @@ components:
                 one-hour orphan TTL, so without this bound a never-ending
                 stream, or one whose terminal hook is lost, would hold a
                 staging slot, a queue permit, and its retained bytes forever
-                until all reservations were exhausted. A cancellable one-shot
-                owner revokes even an idle stream at its deadline without
-                waiting for another request or chunk; the amortized sweep
-                remains a repair net. Both paths first revoke the per-stream
-                response accumulator and keyed HMAC through narrowly scoped
-                shared state, then release the queue permit, staging slot,
-                staging lease, and worst-case queued-record lease exactly once.
+                until all reservations were exhausted. The staging entry owns
+                one cancellable single-fire deadline from first active response
+                selection until staging is actually consumed or dropped. It
+                revokes even an idle selection with no concrete inspector at
+                its deadline without waiting for another request or chunk, and
+                remains armed after normal inspector terminal claim while
+                staging is retained for the immediate transaction-log fallback.
+                Normal staging consumption wakes and cancels the task promptly;
+                the amortized sweep remains a repair net. Both paths dynamically
+                resolve and first revoke any current per-stream response
+                accumulator and keyed HMAC through narrowly scoped shared state,
+                then release the queue permit, staging slot, staging lease, and
+                worst-case queued-record lease exactly once. An atomic
+                fired/cancelled token makes deadline, sweep, terminal,
+                inspector-drop, and log-fallback races single-fire.
                 Later bytes forward unchanged without capture or hash work. No
                 global tombstone remains for the live connection: inspector
                 drop publishes a body-free request-owned handoff only when the
@@ -19289,7 +19297,7 @@ components:
               type: string
               enum: [drain, json]
               default: drain
-              description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside ok|success|accepted|created|partial_ok fails the batch. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
+              description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside the unequivocal affirmative set ok|success|accepted|created fails the batch. Ambiguous partial-delivery values such as partial_ok are unhealthy even without an explicit failure count. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
             ack_max_bytes:
               type: integer
               minimum: 64
