@@ -1196,6 +1196,14 @@ async fn test_take_then_restart_stops_probes_for_removed_target() {
         )),
         "stale unhealthy state for the removed upstream must be pruned"
     );
+    assert!(
+        !checker.active_target_states.contains_key(&format!(
+            "up-remove::{}:{}",
+            addr_remove.ip(),
+            addr_remove.port()
+        )),
+        "retired mid-flight probes must not re-insert pruned target_states keys"
+    );
 }
 
 #[tokio::test]

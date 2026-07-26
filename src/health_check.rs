@@ -567,10 +567,9 @@ impl HealthChecker {
         // in the config so the shared maps don't accumulate stale entries.
         // The replacement generation only ever writes keys that are in
         // `active_keys`, so running this after the spawn cannot drop live
-        // state. A fenced old-generation probe that already passed its
-        // generation check could still land one inert write after the prune;
-        // the entry belongs to a target that is no longer selectable and is
-        // cleared by the next reload or `remove_stale_targets` sweep.
+        // state. Active probes also defer `target_states` entry until after
+        // the post-dial generation fence, so a retired mid-flight probe
+        // cannot re-insert a just-pruned key.
         let active_keys: std::collections::HashSet<String> = new_config
             .upstreams
             .iter()
@@ -1021,11 +1020,6 @@ impl HealthChecker {
                     return;
                 }
 
-                let state = target_states
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(TargetHealth::new()))
-                    .clone();
-
                 let probe_start = std::time::Instant::now();
                 // A target whose literal IP is denied by the egress policy is
                 // never dialed; treat it as a failed probe (unhealthy) instead.
@@ -1158,11 +1152,18 @@ impl HealthChecker {
                     }
                 };
 
-                // Refuse stale mutations after reload advances the generation,
-                // even if abort has not yet torn the task down mid-probe.
+                // Refuse stale map inserts / mutations after reload advances
+                // the generation, even if abort has not yet torn the task down
+                // mid-probe. Deferring `target_states` entry until here keeps a
+                // retired probe from re-inserting a just-pruned key.
                 if task_generation.load(Ordering::Acquire) != generation {
                     return;
                 }
+
+                let state = target_states
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(TargetHealth::new()))
+                    .clone();
 
                 if probe_outcome.success {
                     state.consecutive_failures.store(0, Ordering::Relaxed);
