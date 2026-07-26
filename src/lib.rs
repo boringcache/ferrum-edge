@@ -973,8 +973,9 @@ pub mod _test_support {
         status_code: u16,
         headers: HashMap<String, String>,
         body: &[u8],
+        presentation_digest: Option<[u8; 32]>,
     ) -> Option<Vec<u8>> {
-        plugin.redis_payload_for_tests(status_code, headers, body)
+        plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────
@@ -1632,6 +1633,15 @@ pub mod _test_support {
 
     pub fn finalized_response_replay_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.finalized_response_replay
+    }
+
+    /// Stand in for the protocol entry paths, which copy this digest from the
+    /// request's plugin-cache view before any plugin runs.
+    pub fn set_response_presentation_policy_digest_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        digest: Option<[u8; 32]>,
+    ) {
+        ctx.set_response_presentation_policy_digest(digest);
     }
 
     pub fn response_caching_current_total_size_for_test(

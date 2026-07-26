@@ -1633,6 +1633,56 @@ impl HeldCodecPermit {
     }
 }
 
+/// Complete provenance of the response-side presentation policy a finalized
+/// replay (`RequestContext::finalized_response_replay`) intentionally skips.
+///
+/// A retained representation may replay only while it is provably compatible
+/// with *every* such policy, which needs two independent halves:
+///
+/// - `gate` — content digest of the published RTDS response-side gate map.
+///   Gates flip at any moment with no config reload and no new plugin instance,
+///   so nothing else can witness them. Being content-derived rather than a
+///   pointer identity, it means the same thing in every process, which is what
+///   a representation retained in a shared store has to be compared against.
+/// - `presentation` — content digest of the effective *static* rules
+///   (`response_transformer` configuration, folded in configured execution
+///   order). Static rules cannot change under one live plugin instance, but a
+///   representation persisted to Redis outlives the instance, the generation,
+///   and the process, so an unchanged gate map says nothing about whether the
+///   redaction/header/body rules still match. `None` means the effective static
+///   policy was never observed for this request; callers must treat that as
+///   unprovable and refuse to persist, never as "no policy".
+///
+/// Equality is the whole security decision: replay is admitted only when the
+/// stored value equals the live one, so a change to either half retires every
+/// representation captured under the old policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponsePolicyProvenance {
+    gate: [u8; 32],
+    presentation: Option<[u8; 32]>,
+}
+
+impl ResponsePolicyProvenance {
+    /// The two halves, or `None` when the static policy was never observed and
+    /// the provenance is therefore incomplete.
+    ///
+    /// Only a complete value may be written to a store that outlives this
+    /// process.
+    pub(crate) fn complete(&self) -> Option<([u8; 32], [u8; 32])> {
+        let presentation = self.presentation?;
+        Some((self.gate, presentation))
+    }
+
+    /// Rebuild a value from a persisted record. Both halves are required, so a
+    /// payload that carried no provenance cannot be reconstructed at all.
+    pub(crate) fn from_persisted(gate: [u8; 32], presentation: [u8; 32]) -> Self {
+        Self {
+            gate,
+            presentation: Some(presentation),
+        }
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1913,6 +1963,18 @@ pub struct RequestContext {
     /// the gates again at storage time — is what makes the stamp provenance
     /// rather than a guess. Kept private so request metadata cannot forge one.
     pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
+    /// Content digest of the effective *static* response-side presentation
+    /// policy (today: every `response_transformer` instance's accepted config,
+    /// folded in configured execution order) for this request's proxy and
+    /// protocol.
+    ///
+    /// Copied once from the request's plugin-cache view, so it describes
+    /// exactly the instances that will run on this request's response path.
+    /// `None` means no view was attached and the effective policy is therefore
+    /// unknown; a plugin that persists a representation for cross-process
+    /// replay must fail closed on `None` rather than claim provenance it cannot
+    /// substantiate. Kept private so request metadata cannot forge one.
+    pub(crate) response_presentation_policy_digest: Option<[u8; 32]>,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -2374,6 +2436,7 @@ impl RequestContext {
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
             response_policy_stamp: None,
+            response_presentation_policy_digest: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -3140,6 +3203,7 @@ impl RequestContext {
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
             response_policy_stamp: self.response_policy_stamp.clone(),
+            response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -3255,6 +3319,29 @@ impl RequestContext {
     pub(crate) fn response_policy_stamp_stable(&mut self) -> bool {
         let current = response_transformer::runtime_overlay::policy_stamp();
         self.pin_response_policy_stamp() == &current
+    }
+
+    /// Record the effective static response-presentation policy digest for this
+    /// request, taken from its plugin-cache view.
+    ///
+    /// Called once per request on the protocol entry paths, before any plugin
+    /// runs, so it always describes the same cache generation whose instances
+    /// will shape the response.
+    pub(crate) fn set_response_presentation_policy_digest(&mut self, digest: Option<[u8; 32]>) {
+        self.response_presentation_policy_digest = digest;
+    }
+
+    /// Complete replay provenance for this request's response-side presentation
+    /// policy: the pinned RTDS gate content plus the effective static rules.
+    ///
+    /// See `ResponsePolicyProvenance` for what each half proves and why both
+    /// are required.
+    pub(crate) fn response_policy_provenance(&mut self) -> ResponsePolicyProvenance {
+        let gate = self.pin_response_policy_stamp().fingerprint();
+        ResponsePolicyProvenance {
+            gate,
+            presentation: self.response_presentation_policy_digest,
+        }
     }
 
     pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
@@ -6306,6 +6393,31 @@ pub trait Plugin: Send + Sync {
         _response_status: u16,
         _response_headers: &mut HashMap<String, String>,
     ) {
+    }
+
+    /// Content-derived digest of this plugin's static, response-side
+    /// *presentation* policy — the client-facing header/body rewrites that a
+    /// finalized replay (`RequestContext::finalized_response_replay`)
+    /// deliberately skips so non-idempotent rules cannot run twice over an
+    /// already-transformed representation.
+    ///
+    /// Returning `Some` enrolls the instance in replay provenance: the plugin
+    /// cache folds every contribution, in configured execution order, into one
+    /// per-proxy digest (`PluginCacheRequestView::response_presentation_policy_digest`)
+    /// that `request_deduplication` binds into every representation it persists.
+    /// A stored representation replays only while that digest still matches, so
+    /// newly configured redaction can never be skipped by a retained replay.
+    ///
+    /// Implementations must derive the digest **only** from static
+    /// configuration — never from per-request data, pointers, timestamps, or
+    /// process-random state — so two processes loading equivalent configuration
+    /// derive the same value, and it must change whenever any rule that shapes
+    /// the client-visible representation changes. Use
+    /// `utils::policy_digest::static_config_digest` with a plugin-specific
+    /// domain separator. Return only the digest: the value is persisted outside
+    /// this process, so raw configuration must never be exposed here.
+    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
+        None
     }
 
     /// Returns `true` when this plugin defines deterministic response-header

@@ -19152,6 +19152,12 @@ async fn handle_proxy_request_inner(
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
+    // Bind this request to the same cache generation's static response-side
+    // presentation policy that the plugin list above will execute, so a plugin
+    // persisting a finalized representation can prove which rules produced it.
+    ctx.set_response_presentation_policy_digest(
+        plugin_cache_view.response_presentation_policy_digest(),
+    );
     // Establish the effective RPC budget before any request-plugin or body
     // await. The absolute instant is anchored to `timestamp_received` and is
     // carried independently of the relative header forwarded upstream.

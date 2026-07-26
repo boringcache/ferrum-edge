@@ -45,13 +45,25 @@
 //! representation could otherwise outlive the policy that produced it. This
 //! plugin does not try to detect that from the replay path: a finalized replay
 //! carries no evidence of which policy shaped it, and re-running rules on a
-//! guess would double-apply non-idempotent `add` sequences. Instead
-//! `response_caching` stamps every stored entry with the opaque identity paired
-//! atomically with the response-side gate map (pinned by
-//! `RequestContext::pin_response_policy_stamp`) and refetches from the origin
-//! when that identity no longer matches, so newly enabled redaction applies
-//! exactly once. The unconditional `finalized_response_replay` skip below
-//! therefore stays intact.
+//! guess would double-apply non-idempotent `add` sequences. Instead the
+//! plugins that retain a representation stamp it with the policy it was
+//! produced under and retire it when that policy moves, so newly enabled
+//! redaction applies exactly once and the unconditional
+//! `finalized_response_replay` skip below stays intact:
+//!
+//! - `response_caching` stores the opaque identity paired atomically with the
+//!   response-side gate map (pinned by
+//!   `RequestContext::pin_response_policy_stamp`) and refetches from the origin
+//!   when that identity no longer matches. Its entries never outlive the plugin
+//!   instance, and a config reload builds a new instance with an empty cache,
+//!   so static rules cannot change underneath them.
+//! - `request_deduplication` persists to Redis, where an entry outlives the
+//!   instance, the cache generation, and the process. A gate identity is
+//!   meaningless there, so it stores content digests instead: the gate map's
+//!   content *and* this plugin's `response_presentation_policy_digest()`, the
+//!   digest of the whole accepted static config. A rule edit that leaves
+//!   the gate map untouched therefore still retires every replay captured
+//!   before it.
 //!
 //! ## Representation metadata after a body rewrite
 //!
@@ -75,6 +87,7 @@ use tracing::debug;
 
 use super::response_representation::effective_response_media_type;
 use super::utils::body_transform::{self, BodyRule};
+use super::utils::policy_digest;
 use super::utils::route_header_transform::{
     RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
     apply_route_header_transforms_tracked,
@@ -131,7 +144,23 @@ pub struct ResponseTransformer {
     /// Fallback when [`runtime_overlay_scope`] is set but the overlay
     /// does not carry the matching key. Defaults to `true` (fail-open).
     default_enabled: bool,
+    /// Content-derived digest of this instance's whole accepted static config.
+    ///
+    /// Computed once at construction from the canonical form of the validated
+    /// configuration, so it covers every present and future static knob —
+    /// header rules, body rules, `apply_route_overrides`,
+    /// `runtime_overlay_scope`, `default_enabled` — without an enumeration that
+    /// could silently fall behind a new field. Plugins that persist a finalized
+    /// representation bind this value so a retained replay can never outlive
+    /// the rules that produced it. Only the digest is ever exposed; the source
+    /// config (which may carry operator-authored header values) is not retained.
+    static_policy_digest: [u8; 32],
 }
+
+/// Domain separator and schema version for [`ResponseTransformer`] provenance.
+/// Bumping the version invalidates every previously persisted representation
+/// rather than letting an old digest match new semantics.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
 
 impl ResponseTransformer {
     fn rules_enabled(&self) -> bool {
@@ -564,12 +593,20 @@ impl ResponseTransformer {
             .map(|rule| rule.key.clone())
             .collect::<Vec<_>>();
 
+        // Digest the accepted configuration as a whole. Every rule that shapes
+        // the client-visible representation is in here by construction, so a
+        // redaction/header/body edit that leaves the RTDS gate map untouched
+        // still changes the provenance a persisted replay is bound to.
+        let static_policy_digest =
+            policy_digest::static_config_digest(STATIC_POLICY_DIGEST_DOMAIN, config);
+
         Ok(Self {
             header_rules,
             static_update_keys,
             body_rules,
             runtime_overlay_scope,
             default_enabled,
+            static_policy_digest,
         })
     }
 }
@@ -722,6 +759,16 @@ impl Plugin for ResponseTransformer {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_GRPC_PROTOCOLS
+    }
+
+    /// This plugin *is* the presentation policy a finalized replay skips, so it
+    /// enrolls unconditionally — including when its rules are currently gated
+    /// off. Enrolling only while enabled would make an instance appear and
+    /// disappear from the per-proxy digest based on live gate state, which the
+    /// gate fingerprint already covers, and would hide the static rules of a
+    /// disabled instance from a representation stored while it was disabled.
+    fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
+        Some(self.static_policy_digest)
     }
 
     fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {

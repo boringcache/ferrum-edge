@@ -33,6 +33,7 @@ use crate::adaptive_concurrency::{
 use crate::config::types::PluginConfig;
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
 use crate::plugins::utils::jwks_cache::retain_active_requirements;
+use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
     create_plugin_with_http_client_and_config_id,
@@ -2869,6 +2870,16 @@ pub struct PluginPhaseData {
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
     pub capabilities: PluginCapabilities,
+    /// Content-derived digest of the effective static response-side
+    /// *presentation* policy for this proxy/protocol pair, folded in configured
+    /// execution order from every plugin that opted in through
+    /// `Plugin::response_presentation_policy_digest()`.
+    ///
+    /// Plugins that persist a finalized client representation for replay bind
+    /// this value, so a stored representation can be proven compatible with the
+    /// live rules in a different process and after arbitrary reloads. Computed
+    /// once per cache generation; the request path only copies 32 bytes.
+    pub response_presentation_policy_digest: [u8; 32],
 }
 
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
@@ -2883,7 +2894,14 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
     let mut response_committed = Vec::new();
+    // Ordered because response header/body rules are not commutative: the same
+    // instances in a different order produce a different client-visible
+    // representation and must not share replay provenance.
+    let mut presentation_policy_contributions: Vec<(&str, [u8; 32])> = Vec::new();
     for p in plugins {
+        if let Some(digest) = p.response_presentation_policy_digest() {
+            presentation_policy_contributions.push((p.name(), digest));
+        }
         if p.requires_grpc_deadline_preflight() {
             grpc_deadline.push(Arc::clone(p));
         }
@@ -2969,6 +2987,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
         response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
+        response_presentation_policy_digest: presentation_policy_digest(
+            presentation_policy_contributions,
+        ),
     }
 }
 
@@ -3520,6 +3541,22 @@ impl PluginCacheInner {
             .unwrap_or_default()
     }
 
+    /// Effective static response-presentation policy digest, or `None` when
+    /// this cache generation has no entry for the proxy/protocol pair.
+    ///
+    /// `None` is deliberately not folded into an "empty policy" digest here:
+    /// an absent entry means the effective policy is unknown, and callers that
+    /// persist representations must fail closed on it rather than record a
+    /// provenance claim they cannot substantiate.
+    pub(crate) fn get_response_presentation_policy_digest(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Option<[u8; 32]> {
+        self.protocol_entry(proxy_id, protocol)
+            .map(|entry| entry.phase.response_presentation_policy_digest)
+    }
+
     pub(crate) fn requires_response_body_buffering(&self, proxy_id: &str) -> bool {
         self.requires_buffering
             .get(proxy_id)
@@ -3563,6 +3600,8 @@ impl PluginCacheInner {
             initial_response_header_policy_names: self
                 .get_initial_response_header_policy_names(proxy_id, protocol),
             response_committed_plugins: self.get_response_committed_plugins(proxy_id, protocol),
+            response_presentation_policy_digest: self
+                .get_response_presentation_policy_digest(proxy_id, protocol),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -3595,6 +3634,9 @@ impl PluginCacheInner {
                 &entry.phase.initial_response_header_policy_names,
             ),
             response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
+            response_presentation_policy_digest: Some(
+                entry.phase.response_presentation_policy_digest,
+            ),
             capabilities,
             requires_response_body_buffering: self.requires_response_body_buffering(proxy_id),
             requires_request_body_buffering: self.requires_request_body_buffering(proxy_id),
@@ -3620,6 +3662,7 @@ pub struct PluginCacheRequestView {
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    response_presentation_policy_digest: Option<[u8; 32]>,
     capabilities: PluginCapabilities,
     requires_response_body_buffering: bool,
     requires_request_body_buffering: bool,
@@ -3678,6 +3721,13 @@ impl PluginCacheRequestView {
     /// Get the pre-filtered committed-response observer chain.
     pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
         self.response_committed_plugins.as_slice()
+    }
+
+    /// Effective static response-presentation policy digest for this request,
+    /// or `None` when this cache generation had no entry for the proxy and
+    /// protocol (so the policy is unknown, not empty).
+    pub fn response_presentation_policy_digest(&self) -> Option<[u8; 32]> {
+        self.response_presentation_policy_digest
     }
 
     /// Get pre-computed capability bitset from this request view.
