@@ -6543,6 +6543,30 @@ components:
 
             The combination of `(hosts, listen_path)` must be unique across all
             HTTP proxies in the same namespace.
+
+
+            **Must already be a canonical policy path.** Request paths are
+            canonicalized at the frontend boundary before route lookup:
+            percent-escapes of characters that are legal literally in a path are
+            decoded (`/%61dmin` becomes `/admin`) and every other escape is
+            rejected with `400`: encoded separators (`%2F`, `%3F`, `%23`),
+            double encodings (`%25…`), encoded control characters, invalid
+            escapes, and escapes of bytes outside that decode set (`%20`,
+            `%7B`, and any percent-encoded non-ASCII byte). Dot
+            segments and backslashes are rejected in both spellings — literal
+            (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
+            because the URL parser that builds the backend request line removes
+            dot segments and reads `\` as a separator. A `.` inside a segment
+            (`/v1.0/users`) is an ordinary path character.
+
+
+            A literal `listen_path` containing any of the above is unreachable,
+            and admission rejects it on every create, update, batch, restore,
+            and config-load path. A `~regex` `listen_path` is a pattern rather
+            than a literal path, so only the percent-escape rules apply to it:
+            `\` and `.` are regex syntax there, and `~^/v1\.0/.*` matching the
+            reachable canonical path `/v1.0/x` stays valid. See
+            `docs/request_path_canonicalization.md`.
           examples:
             - /api/v1
             - =/healthz
@@ -17807,11 +17831,25 @@ components:
             path_prefix:
               type: string
               description: >-
-                Only terminate when the request path starts with this prefix.
-                Must start with `/`, or be exactly `*` to match the
+                Only terminate when the canonical request path starts with this
+                prefix. Must start with `/`, or be exactly `*` to match the
                 asterisk-form target of a server-wide `OPTIONS *` request, and
                 contain no control characters; any other value can never match
-                a request path. Mutually exclusive with `header`.
+                a request path. The prefix must also already be a canonical
+                policy path: request paths are canonicalized at the frontend
+                boundary (percent-escapes of characters that are legal
+                literally in a path are decoded, and every other escape —
+                separators, double encodings, control characters, invalid
+                escapes, and escapes of bytes outside that decode set such as
+                `%20` or `%7B` — is rejected with `400`,
+                as are dot segments and backslashes in either spelling). No
+                percent escape, literal `\`, or literal `.`/`..` segment can
+                appear in a canonical path, so a prefix such as `/%61dmin`,
+                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, or
+                `/api\admin` is rejected at admission rather than silently
+                never matching. A `.` inside a segment is fine. See
+                `docs/request_path_canonicalization.md`. Mutually exclusive
+                with `header`.
             header:
               type: string
               description: >-
