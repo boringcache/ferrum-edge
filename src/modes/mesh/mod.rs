@@ -62,7 +62,6 @@ use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
@@ -135,7 +134,7 @@ pub enum MeshTopology {
 }
 
 impl MeshTopology {
-    fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
@@ -148,6 +147,15 @@ impl MeshTopology {
                 crate::secrets::quoted_env_value("FERRUM_MESH_TOPOLOGY", other)
             )),
         }
+    }
+
+    /// Whether this topology runs an inbound TLS-terminating listener.
+    ///
+    /// Matches [`MeshRuntimeConfig::has_inbound_tls_termination_listener`]:
+    /// EastWestGateway is SNI passthrough-only and is the sole topology that
+    /// returns `false`.
+    pub(crate) fn has_inbound_tls_termination_listener(self) -> bool {
+        !matches!(self, Self::EastWestGateway)
     }
 
     fn as_str(self) -> &'static str {
@@ -869,12 +877,7 @@ impl MeshRuntimeConfig {
     /// apply task key their "is there anything to fail closed on?" check off it,
     /// so the exempt set can never drift between the two.
     fn has_inbound_tls_termination_listener(&self) -> bool {
-        self.listener_plan().iter().any(|listener| {
-            matches!(
-                listener.kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            )
-        })
+        self.topology.has_inbound_tls_termination_listener()
     }
 
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
@@ -11809,26 +11812,17 @@ fn mesh_inbound_tls_reload_snapshot(
     mtls_mode: config::MtlsMode,
     port_modes: std::collections::BTreeMap<u16, config::MtlsMode>,
 ) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
-    let any_mode_needs_client_ca = mtls_mode != config::MtlsMode::Disable
-        || port_modes
+    let any_mode_needs_client_ca = startup_security::mesh_inbound_modes_need_client_ca(
+        mtls_mode != config::MtlsMode::Disable,
+        port_modes
             .values()
-            .any(|mode| *mode != config::MtlsMode::Disable);
+            .any(|mode| *mode != config::MtlsMode::Disable),
+    );
     let client_ca_bundle = if !any_mode_needs_client_ca {
         None
     } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
-        let source = CertSource::parse(path, MaterialKind::CaBundle);
-        let material =
-            load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
-                format!(
-                    "failed to load mesh frontend client CA bundle at {}",
-                    source.redacted_source_id()
-                )
-            })?;
-        let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
-        Some(MeshInboundClientCaBundle {
-            path: material.display_source_id,
-            pem,
-        })
+        let (path, pem) = startup_security::load_mesh_inbound_client_ca_bundle(path)?;
+        Some(MeshInboundClientCaBundle { path, pem })
     } else {
         None
     };

@@ -13,9 +13,14 @@
 
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use crate::admin::MetricsAuthPolicy;
+use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::env_config::{EnvConfig, OperatingMode};
+use crate::modes::mesh::MeshTopology;
 use crate::proxy::client_ip::TrustedProxies;
+use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::{self, CrlList, TlsPolicy};
 
 /// Which env-level security surfaces a mode hard-fails on at startup.
@@ -64,7 +69,9 @@ impl StartupSecurityScope {
                 // Mesh frontend identity is specialized (SVID fallback /
                 // `load_mesh_server_identity`). When an explicit frontend
                 // cert/key pair is set, validate that pair the same way mesh
-                // startup does; DTLS is not a mesh startup gate here.
+                // startup does; also validate a configured inbound client CA
+                // when a terminating listener + effective mTLS would consume it.
+                // DTLS is not a mesh startup gate here.
                 frontend_tls: true,
                 admin_tls: true,
                 dtls: false,
@@ -165,7 +172,16 @@ pub fn load_startup_security_with_scope(
     let tls_policy_ref = materials.tls_policy.as_ref();
     if scope.frontend_tls {
         materials.frontend_tls = match env_config.mode {
-            OperatingMode::Mesh => load_mesh_explicit_frontend_tls(env_config)?,
+            OperatingMode::Mesh => {
+                let frontend_tls = load_mesh_explicit_frontend_tls(env_config)?;
+                // Mesh run also consumes `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`
+                // via `mesh_inbound_tls_reload_snapshot_for_listener` when a
+                // terminating inbound listener and effective STRICT/PERMISSIVE
+                // mTLS mode need it. Validate that material here so validate/run
+                // cannot drift on a missing or malformed configured client CA.
+                validate_mesh_inbound_client_ca_from_env(env_config)?;
+                frontend_tls
+            }
             _ => {
                 let policy = tls_policy_ref.ok_or_else(|| {
                     anyhow::anyhow!(
@@ -353,4 +369,86 @@ fn load_mesh_explicit_frontend_tls(
         env_config.tls_cert_expiry_warning_days,
     )?;
     Ok(None)
+}
+
+/// Whether mesh inbound TLS snapshot construction would read a configured
+/// client CA. Mirrors `mesh_inbound_tls_reload_snapshot`: true when the
+/// workload-level mode or any per-port override is not DISABLE.
+#[inline]
+pub fn mesh_inbound_modes_need_client_ca(
+    default_mode_enables_mtls: bool,
+    any_port_enables_mtls: bool,
+) -> bool {
+    default_mode_enables_mtls || any_port_enables_mtls
+}
+
+/// Load mesh inbound client-CA bundle bytes.
+///
+/// Shared by mesh `run`'s `mesh_inbound_tls_reload_snapshot` and `validate` so
+/// missing/unreadable configured CA material cannot drift between the two.
+pub fn load_mesh_inbound_client_ca_bundle(
+    path: &str,
+) -> Result<(String, Arc<[u8]>), anyhow::Error> {
+    let source = CertSource::parse(path, MaterialKind::CaBundle);
+    let material =
+        load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
+            format!(
+                "failed to load mesh frontend client CA bundle at {}",
+                source.redacted_source_id()
+            )
+        })?;
+    let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
+    Ok((material.display_source_id, pem))
+}
+
+/// Validate a configured mesh inbound client CA when run would consume it.
+///
+/// Applicability mirrors `mesh_inbound_tls_reload_snapshot_for_listener`:
+/// passthrough-only topologies (`has_inbound_tls_termination_listener == false`)
+/// and fully DISABLE mTLS modes skip the CA even when the path is set.
+///
+/// When applicable and the path is set, loads the same way run does and then
+/// applies the PEM/expiry check used when those bytes feed
+/// `load_mesh_tls_config_with_identity_and_client_ca_bytes`.
+pub fn validate_mesh_inbound_client_ca_if_applicable(
+    env_config: &EnvConfig,
+    has_inbound_tls_termination_listener: bool,
+    mtls_needs_client_ca: bool,
+) -> Result<(), anyhow::Error> {
+    if !has_inbound_tls_termination_listener || !mtls_needs_client_ca {
+        return Ok(());
+    }
+    let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() else {
+        return Ok(());
+    };
+
+    let (display_path, pem) = load_mesh_inbound_client_ca_bundle(path)?;
+    tls::check_cert_expiry_from_pem_bytes(
+        pem.as_ref(),
+        "mesh client CA bundle",
+        &display_path,
+        env_config.tls_cert_expiry_warning_days,
+    )?;
+    Ok(())
+}
+
+/// Mesh validate/run startup gate for `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`.
+///
+/// Resolves topology from the process env the same way mesh run does (default
+/// `sidecar`). Without an applied mesh slice, startup uses PERMISSIVE with an
+/// empty per-port table (`resolve_inbound_mtls_mode(None)`), so a configured
+/// client CA is required to load on terminating topologies.
+fn validate_mesh_inbound_client_ca_from_env(
+    env_config: &EnvConfig,
+) -> Result<(), anyhow::Error> {
+    let topology_raw =
+        resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
+    let topology = MeshTopology::parse(&topology_raw).map_err(anyhow::Error::msg)?;
+    // No-slice startup: Permissive + empty port modes ⇒ mTLS needs client CA
+    // material when a path is configured.
+    validate_mesh_inbound_client_ca_if_applicable(
+        env_config,
+        topology.has_inbound_tls_termination_listener(),
+        mesh_inbound_modes_need_client_ca(true, false),
+    )
 }

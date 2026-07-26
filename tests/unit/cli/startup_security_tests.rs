@@ -7,7 +7,8 @@
 use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::startup_security::{
     StartupSecurityScope, load_startup_security, load_startup_security_with_scope,
-    try_load_frontend_tls, validate_dtls_material,
+    mesh_inbound_modes_need_client_ca, try_load_frontend_tls,
+    validate_dtls_material, validate_mesh_inbound_client_ca_if_applicable,
 };
 use ferrum_edge::tls::{TlsPolicy, load_crls};
 use rcgen::{CertificateParams, KeyPair};
@@ -343,6 +344,9 @@ fn cp_scope_ignores_frontend_tls_paths() {
 #[test]
 fn mesh_scope_ignores_dtls_material() {
     ensure_crypto_provider();
+    let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
+    env_guard.unset("FERRUM_MESH_TOPOLOGY");
+
     let env = EnvConfig {
         mode: OperatingMode::Mesh,
         admin_https_port: 0,
@@ -352,6 +356,124 @@ fn mesh_scope_ignores_dtls_material() {
     };
 
     load_startup_security(&env).expect("mesh startup does not gate on DTLS material");
+}
+
+#[test]
+fn mesh_terminating_missing_client_ca_fails_closed() {
+    ensure_crypto_provider();
+    let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
+    env_guard.unset("FERRUM_MESH_TOPOLOGY");
+
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some("/nonexistent/mesh-client-ca.pem".to_string()),
+        ..EnvConfig::default()
+    };
+
+    // Default topology is sidecar (terminating). No-slice startup uses
+    // PERMISSIVE, so run would load the configured client CA.
+    let err = load_startup_security(&env)
+        .err()
+        .expect("missing mesh client CA must fail on terminating topology");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("failed to load mesh frontend client CA bundle"),
+        "expected shared mesh client-CA load failure, got: {msg}"
+    );
+}
+
+#[test]
+fn mesh_terminating_malformed_client_ca_fails_closed() {
+    ensure_crypto_provider();
+    let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
+    env_guard.unset("FERRUM_MESH_TOPOLOGY");
+
+    let dir = TempDir::new().unwrap();
+    let ca_path = write_pem(&dir, "bad-client-ca.pem", "not-a-certificate\n");
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+
+    let err = load_startup_security(&env)
+        .err()
+        .expect("malformed mesh client CA must fail on terminating topology");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mesh client CA bundle"),
+        "expected mesh client CA PEM/expiry failure, got: {msg}"
+    );
+}
+
+#[test]
+fn mesh_passthrough_topology_skips_unused_client_ca() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some("/nonexistent/unused-client-ca.pem".to_string()),
+        ..EnvConfig::default()
+    };
+
+    // East-west is passthrough-only: run's listener-aware snapshot skips CA.
+    validate_mesh_inbound_client_ca_if_applicable(&env, false, true)
+        .expect("passthrough topology must not reject an unused configured client CA");
+}
+
+#[test]
+fn mesh_mtls_disabled_skips_unused_client_ca() {
+    ensure_crypto_provider();
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some("/nonexistent/unused-client-ca.pem".to_string()),
+        ..EnvConfig::default()
+    };
+
+    // Workload DISABLE with no enabling port overrides: run skips CA load.
+    let needs_ca = mesh_inbound_modes_need_client_ca(false, false);
+    assert!(!needs_ca);
+    validate_mesh_inbound_client_ca_if_applicable(&env, true, needs_ca)
+        .expect("DISABLE mTLS must not reject an unused configured client CA");
+}
+
+#[test]
+fn mesh_valid_client_ca_passes_on_terminating_topology() {
+    ensure_crypto_provider();
+    let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
+    env_guard.unset("FERRUM_MESH_TOPOLOGY");
+
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, _key_pem) = generate_self_signed_cert();
+    let ca_path = write_pem(&dir, "client-ca.pem", &cert_pem);
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some(ca_path),
+        ..EnvConfig::default()
+    };
+
+    load_startup_security(&env).expect("valid mesh client CA must pass on terminating topology");
+}
+
+#[test]
+fn mesh_east_west_env_topology_skips_client_ca_via_load_startup_security() {
+    ensure_crypto_provider();
+    let env_guard = crate::unit::env_lock::EnvGuard::new(&["FERRUM_MESH_TOPOLOGY"]);
+    env_guard.set("FERRUM_MESH_TOPOLOGY", "east_west_gateway");
+
+    let env = EnvConfig {
+        mode: OperatingMode::Mesh,
+        admin_https_port: 0,
+        frontend_tls_client_ca_bundle_path: Some("/nonexistent/unused-client-ca.pem".to_string()),
+        ..EnvConfig::default()
+    };
+
+    load_startup_security(&env)
+        .expect("east_west_gateway validate must skip unused configured client CA");
 }
 
 #[test]
