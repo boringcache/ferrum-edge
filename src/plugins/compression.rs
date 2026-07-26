@@ -216,8 +216,7 @@ pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accep
 /// validated plaintext before `before_proxy`. Later transforms must not decode
 /// again; the backend already receives the normalized bytes.
 pub(crate) const REQUEST_DECODED_METADATA_KEY: &str = "compression:request_decoded";
-const NOT_ACCEPTABLE_RESPONSE_BODY: &str =
-    "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}";
+const NOT_ACCEPTABLE_RESPONSE_BODY: &str = "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}";
 
 /// Process-wide compression codec admission metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

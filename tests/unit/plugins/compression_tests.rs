@@ -6073,12 +6073,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
         with_test_codec_budget(0, || async {
             let plugin = make_plugin(json!({"min_content_length": 10}));
             let mut ctx = make_ctx(Some("gzip, identity;q=0"));
-            before_proxy_with_accept_encoding(
-                &plugin,
-                &mut ctx,
-                Some("gzip, identity;q=0"),
-            )
-            .await;
+            before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip, identity;q=0")).await;
 
             let mut resp = HashMap::new();
             resp.insert("content-type".to_string(), "application/json".to_string());
@@ -6117,10 +6112,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
                 Some("Accept-Encoding")
             );
             assert!(!resp.contains_key("content-encoding"));
-            assert_eq!(
-                resp.get("content-length"),
-                Some(&body.len().to_string())
-            );
+            assert_eq!(resp.get("content-length"), Some(&body.len().to_string()));
             assert!(
                 String::from_utf8(body)
                     .expect("406 body must be UTF-8")
