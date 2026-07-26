@@ -3,21 +3,33 @@
 //! The configured key never leaves the token. rustls hands us the handshake
 //! message, and the token performs the hash-and-sign operation for the selected
 //! RSA signature scheme.
+//!
+//! Before any certified key is published to a rustls resolver, the selected
+//! token key is *proved* to pair with the configured leaf certificate — see
+//! `prove_leaf_pairing`. Without that proof a selector typo or a half-finished
+//! HSM/certificate rotation is accepted at config load and only fails later, on
+//! every client handshake, taking a listener or a backend mTLS identity out of
+//! service.
 
 use std::fmt;
+use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail};
 use cryptoki::context::{CInitializeArgs, CInitializeFlags, Pkcs11};
 use cryptoki::error::{Error as CryptokiError, RvError};
 use cryptoki::mechanism::rsa::{PkcsMgfType, PkcsPssParams};
 use cryptoki::mechanism::{Mechanism, MechanismType};
-use cryptoki::object::{Attribute, KeyType, ObjectClass, ObjectHandle};
+use cryptoki::object::{Attribute, AttributeType, KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::{AuthPin, Ulong};
-use rustls::pki_types::CertificateDer;
-use rustls::sign::{CertifiedKey, Signer, SigningKey};
-use rustls::{Error as RustlsError, SignatureAlgorithm, SignatureScheme};
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, alg_id};
+use rustls::sign::{CertifiedKey, Signer, SigningKey, public_key_to_spki};
+use rustls::{Error as RustlsError, InconsistentKeys, SignatureAlgorithm, SignatureScheme};
+use tracing::{debug, warn};
+use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
 use zeroize::Zeroizing;
 
 use crate::config::conf_file::resolve_ferrum_var;
@@ -25,6 +37,21 @@ use crate::tls::source::CertSourceUri;
 
 const MODULE_PATH_ENV: &str = "FERRUM_PKCS11_MODULE_PATH";
 const DEFAULT_KEY_TYPE: &str = "rsa";
+
+/// Largest RSA modulus (in bytes, leading zeros stripped) accepted when
+/// reconstructing the token public key. 8192-bit is both the largest modulus
+/// `ring` will verify on the challenge path and a bound that keeps the DER
+/// reconstruction from allocating on an implausible token attribute.
+const MAX_RSA_MODULUS_BYTES: usize = 1024;
+
+/// Largest RSA public exponent accepted when reconstructing the token public
+/// key. Real exponents are 3 bytes (65537); 16 leaves generous headroom.
+const MAX_RSA_EXPONENT_BYTES: usize = 16;
+
+/// Size of the random challenge signed by the token when the SPKI comparison
+/// is unavailable. Fresh per attempt so a captured signature from an earlier
+/// configuration cannot stand in for a live proof.
+const KEY_MATCH_CHALLENGE_BYTES: usize = 32;
 
 #[derive(Clone)]
 struct Pkcs11KeyConfig {
@@ -249,12 +276,18 @@ fn validate_var_name(value: &str, option: &str) -> anyhow::Result<()> {
 pub struct Pkcs11SigningKey {
     config: Pkcs11KeyConfig,
     pkcs11: Pkcs11,
+    /// RFC 5280 SubjectPublicKeyInfo reconstructed from the token's public RSA
+    /// attributes, when the token exposes them. `None` means the token withheld
+    /// `CKA_MODULUS`/`CKA_PUBLIC_EXPONENT`, and the pairing has to be proved by
+    /// signature challenge instead.
+    public_key_spki: Option<Arc<Vec<u8>>>,
 }
 
 impl fmt::Debug for Pkcs11SigningKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pkcs11SigningKey")
             .field("config", &self.config)
+            .field("public_key_spki_available", &self.public_key_spki.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -265,16 +298,90 @@ impl Pkcs11SigningKey {
         let pkcs11 = Pkcs11::new(&config.module_path)
             .with_context(|| format!("failed to load PKCS#11 module '{}'", config.module_path))?;
         initialize_pkcs11(&pkcs11, &config.module_path)?;
-        let signing_key = Self { config, pkcs11 };
-        signing_key.validate_key_available()?;
+        let mut signing_key = Self {
+            config,
+            pkcs11,
+            public_key_spki: None,
+        };
+        signing_key.public_key_spki = signing_key.load_public_key_spki()?.map(Arc::new);
         Ok(signing_key)
     }
 
-    fn validate_key_available(&self) -> anyhow::Result<()> {
+    /// Resolve the token key and, when the token permits it, reconstruct its
+    /// SubjectPublicKeyInfo.
+    ///
+    /// Resolving the private key keeps the pre-existing availability and
+    /// ambiguity checks: an absent or multiply-matched selector is still an
+    /// error before anything is published. Only the public-attribute read is
+    /// best effort — `Ok(None)` means "prove the pairing another way", never
+    /// "skip the proof".
+    fn load_public_key_spki(&self) -> anyhow::Result<Option<Vec<u8>>> {
         let session = self.open_session()?;
         self.login_if_configured(&session)?;
-        self.find_private_key(&session)?;
-        Ok(())
+        let private_key = self.find_private_key(&session)?;
+        if let Some(spki) = self.rsa_spki_from_object(&session, private_key) {
+            return Ok(Some(spki));
+        }
+        // Some tokens withhold the public attributes on the private key object
+        // but publish a paired CKO_PUBLIC_KEY under the same selector.
+        let Some(public_key) = self.find_public_key(&session)? else {
+            return Ok(None);
+        };
+        Ok(self.rsa_spki_from_object(&session, public_key))
+    }
+
+    /// Reconstruct the SPKI of `object` from its RSA public attributes.
+    ///
+    /// Returns `None` whenever the token does not give us usable material:
+    /// a failed read, a withheld attribute, or bytes that do not encode. Every
+    /// such case falls through to the signature challenge, which is an equally
+    /// sound proof, so a quirky token degrades in capability and never in
+    /// enforcement. Diagnostics carry only the configured selector.
+    fn rsa_spki_from_object(&self, session: &Session, object: ObjectHandle) -> Option<Vec<u8>> {
+        let attributes = match session.get_attributes(
+            object,
+            &[AttributeType::Modulus, AttributeType::PublicExponent],
+        ) {
+            Ok(attributes) => attributes,
+            Err(error) => {
+                debug!(
+                    selector = %self.config.selector(),
+                    error = %error,
+                    "PKCS#11 token did not return RSA public attributes; proving the certificate pairing by signature challenge instead"
+                );
+                return None;
+            }
+        };
+
+        let mut modulus: Option<Zeroizing<Vec<u8>>> = None;
+        let mut public_exponent: Option<Zeroizing<Vec<u8>>> = None;
+        for attribute in attributes {
+            match attribute {
+                Attribute::Modulus(value) => modulus = Some(Zeroizing::new(value)),
+                Attribute::PublicExponent(value) => public_exponent = Some(Zeroizing::new(value)),
+                _ => {}
+            }
+        }
+
+        let (Some(modulus), Some(public_exponent)) = (modulus, public_exponent) else {
+            debug!(
+                selector = %self.config.selector(),
+                "PKCS#11 token withheld the RSA public attributes; proving the certificate pairing by signature challenge instead"
+            );
+            return None;
+        };
+
+        match rsa_spki_der(&modulus, &public_exponent) {
+            Ok(spki) => Some(spki),
+            Err(error) => {
+                warn!(
+                    selector = %self.config.selector(),
+                    error = %error,
+                    "PKCS#11 token returned RSA public attributes that could not be encoded; proving the certificate pairing by signature challenge instead"
+                );
+                None
+            }
+        }
     }
 
     fn sign_with_scheme(
@@ -334,6 +441,38 @@ impl Pkcs11SigningKey {
                 self.config.selector(),
                 error
             )),
+        }
+    }
+
+    /// Locate the paired public key object, if the token publishes exactly one
+    /// under the same selector.
+    ///
+    /// Zero or several matches yield `None` rather than an error: the private
+    /// key selection above is already unambiguous, and an ambiguous *public*
+    /// object simply means this shortcut cannot be trusted, so the pairing is
+    /// proved by signature challenge instead. Guessing which public object to
+    /// believe would weaken the proof.
+    fn find_public_key(&self, session: &Session) -> anyhow::Result<Option<ObjectHandle>> {
+        let mut template = vec![
+            Attribute::Class(ObjectClass::PUBLIC_KEY),
+            Attribute::KeyType(KeyType::RSA),
+        ];
+        if let Some(id) = self.config.id.as_ref() {
+            template.push(Attribute::Id(id.clone()));
+        }
+        if let Some(label) = self.config.label.as_ref() {
+            template.push(Attribute::Label(label.as_bytes().to_vec()));
+        }
+
+        let mut matches = session.find_objects(&template).with_context(|| {
+            format!(
+                "failed to search PKCS#11 public keys for {}",
+                self.config.selector()
+            )
+        })?;
+        match matches.len() {
+            1 => Ok(Some(matches.remove(0))),
+            _ => Ok(None),
         }
     }
 
@@ -461,9 +600,211 @@ impl SigningKey for Pkcs11SigningKey {
         })
     }
 
+    /// Hand rustls the token's SubjectPublicKeyInfo when we have it, so
+    /// [`CertifiedKey::keys_match`] can compare it against the leaf
+    /// certificate. Returning `None` is what makes `keys_match` report
+    /// [`InconsistentKeys::Unknown`], which is the signal to fall back to the
+    /// signature challenge — never a reason to skip the check.
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        self.public_key_spki
+            .as_ref()
+            .map(|spki| SubjectPublicKeyInfoDer::from(spki.as_slice()))
+    }
+
     fn algorithm(&self) -> SignatureAlgorithm {
         SignatureAlgorithm::RSA
     }
+}
+
+/// Prove that the selected token key and the configured leaf certificate are a
+/// pair, before the certified key reaches any rustls resolver.
+///
+/// Preferred path is an SPKI comparison against the token's own public
+/// attributes. When the token withholds them, the token signs a fresh random
+/// challenge that must verify under the leaf certificate's public key — a
+/// bounded, single-signature proof of possession.
+fn prove_leaf_pairing(certified_key: &CertifiedKey, key: &Pkcs11SigningKey) -> anyhow::Result<()> {
+    match certified_key.keys_match() {
+        Ok(()) => {
+            debug!(
+                source = %key.config.source_id,
+                selector = %key.config.selector(),
+                "PKCS#11 token public key matches the configured leaf certificate"
+            );
+            Ok(())
+        }
+        Err(RustlsError::InconsistentKeys(InconsistentKeys::KeyMismatch)) => {
+            Err(leaf_mismatch_error(key))
+        }
+        Err(RustlsError::InconsistentKeys(InconsistentKeys::Unknown)) => {
+            let leaf = match certified_key.end_entity_cert() {
+                Ok(leaf) => leaf,
+                Err(error) => bail!(
+                    "PKCS#11 TLS key source '{}' has no leaf certificate to match the token key against: {}",
+                    key.config.source_id,
+                    error
+                ),
+            };
+            prove_leaf_pairing_by_challenge(key, leaf)
+        }
+        Err(error) => Err(anyhow!(
+            "failed to compare the PKCS#11 token key for {} against the configured leaf certificate: {}",
+            key.config.selector(),
+            error
+        )),
+    }
+}
+
+fn leaf_mismatch_error(key: &Pkcs11SigningKey) -> anyhow::Error {
+    anyhow!(
+        "PKCS#11 TLS key source '{}' selects a token key ({}) whose public key does not match the configured leaf certificate; correct the selector or the certificate before this identity can be used",
+        key.config.source_id,
+        key.config.selector()
+    )
+}
+
+/// Sign-and-verify proof of possession, used when the token will not disclose
+/// its RSA public attributes.
+///
+/// One signature over `KEY_MATCH_CHALLENGE_BYTES` of fresh randomness, verified
+/// with RSA PKCS#1 v1.5 SHA-256 under the leaf certificate's public key. The
+/// challenge and the resulting signature never reach a log or an error: a
+/// failure reports only the configured source and selector.
+fn prove_leaf_pairing_by_challenge(
+    key: &Pkcs11SigningKey,
+    leaf: &CertificateDer<'_>,
+) -> anyhow::Result<()> {
+    let leaf_public_key = match leaf_rsa_public_key_der(leaf) {
+        Ok(public_key) => public_key,
+        Err(error) => bail!(
+            "PKCS#11 TLS key source '{}' cannot be matched against the configured leaf certificate: {}",
+            key.config.source_id,
+            error
+        ),
+    };
+
+    let mut challenge = [0u8; KEY_MATCH_CHALLENGE_BYTES];
+    if SystemRandom::new().fill(&mut challenge).is_err() {
+        bail!(
+            "failed to generate a PKCS#11 certificate-pairing challenge for {}",
+            key.config.selector()
+        );
+    }
+
+    let signature = key.sign_with_scheme(Pkcs11SignatureScheme::RsaPkcs1Sha256, &challenge)?;
+
+    let verified = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &leaf_public_key)
+        .verify(&challenge, &signature)
+        .is_ok();
+    if !verified {
+        bail!(
+            "PKCS#11 TLS key source '{}' selects a token key ({}) that did not produce a signature verifiable under the configured leaf certificate; the token key and the certificate are not a pair (this proof also requires an RSA key of 2048-8192 bits)",
+            key.config.source_id,
+            key.config.selector()
+        );
+    }
+
+    debug!(
+        source = %key.config.source_id,
+        selector = %key.config.selector(),
+        "PKCS#11 token key proved possession of the configured leaf certificate public key"
+    );
+    Ok(())
+}
+
+/// Extract the DER `RSAPublicKey` bit-string contents from a leaf certificate.
+///
+/// Errors describe the certificate only in structural terms; they never echo
+/// certificate or key bytes.
+pub fn leaf_rsa_public_key_der(leaf: &CertificateDer<'_>) -> anyhow::Result<Vec<u8>> {
+    let (_, certificate) = x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|_| anyhow!("the leaf certificate is not parseable X.509 DER"))?;
+    let spki = certificate.public_key();
+    if spki.algorithm.algorithm != OID_PKCS1_RSAENCRYPTION {
+        bail!("the leaf certificate does not carry an RSA public key");
+    }
+    if spki.subject_public_key.unused_bits != 0 {
+        bail!("the leaf certificate public key bit string is malformed");
+    }
+    Ok(spki.subject_public_key.data.to_vec())
+}
+
+/// Encode an RFC 5280 SubjectPublicKeyInfo for the RSA public key described by
+/// `modulus` and `public_exponent` (unsigned big-endian, as PKCS#11 returns
+/// them).
+pub fn rsa_spki_der(modulus: &[u8], public_exponent: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let public_key = rsa_public_key_der(modulus, public_exponent)?;
+    Ok(public_key_to_spki(&alg_id::RSA_ENCRYPTION, public_key)
+        .as_ref()
+        .to_vec())
+}
+
+/// Encode the PKCS#1 `RSAPublicKey ::= SEQUENCE { modulus INTEGER,
+/// publicExponent INTEGER }` structure.
+pub fn rsa_public_key_der(modulus: &[u8], public_exponent: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if strip_leading_zeros(modulus).len() > MAX_RSA_MODULUS_BYTES {
+        bail!(
+            "RSA modulus is larger than the supported maximum of {} bytes",
+            MAX_RSA_MODULUS_BYTES
+        );
+    }
+    if strip_leading_zeros(public_exponent).len() > MAX_RSA_EXPONENT_BYTES {
+        bail!(
+            "RSA public exponent is larger than the supported maximum of {} bytes",
+            MAX_RSA_EXPONENT_BYTES
+        );
+    }
+
+    let mut contents = Vec::new();
+    der_unsigned_integer(modulus, "RSA modulus", &mut contents)?;
+    der_unsigned_integer(public_exponent, "RSA public exponent", &mut contents)?;
+
+    let mut encoded = vec![0x30];
+    der_length(contents.len(), &mut encoded)?;
+    encoded.extend_from_slice(&contents);
+    Ok(encoded)
+}
+
+fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn der_length(length: usize, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    if length < 0x80 {
+        // A length below 0x80 always fits the short form's single byte.
+        out.push(length as u8);
+        return Ok(());
+    }
+    let be = length.to_be_bytes();
+    let significant = strip_leading_zeros(&be);
+    if significant.len() > 4 {
+        bail!("DER length {} is too large to encode", length);
+    }
+    // `significant.len()` is 1..=4 here, so the long-form header byte fits.
+    out.push(0x80 | (significant.len() as u8));
+    out.extend_from_slice(significant);
+    Ok(())
+}
+
+fn der_unsigned_integer(value: &[u8], label: &str, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    let trimmed = strip_leading_zeros(value);
+    if trimmed.is_empty() {
+        bail!("{label} is empty or zero");
+    }
+    // DER INTEGERs are signed, so a high bit in the first byte needs a leading
+    // zero to keep the value positive.
+    let needs_pad = trimmed[0] & 0x80 != 0;
+    out.push(0x02);
+    der_length(trimmed.len() + usize::from(needs_pad), out)?;
+    if needs_pad {
+        out.push(0x00);
+    }
+    out.extend_from_slice(trimmed);
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -493,15 +834,21 @@ impl Signer for Pkcs11Signer {
     }
 }
 
+/// Build the certified key for `cert_chain`, refusing to return one unless the
+/// token key is proved to pair with the leaf certificate.
+///
+/// Callers publish the result to a frontend/Admin `ResolvesServerCert` or to a
+/// backend `ResolvesClientCert`, so the proof has to happen here rather than at
+/// first handshake. On failure the caller propagates the error and the
+/// surrounding reload path keeps the previous known-good material.
 pub fn certified_key_from_uri(
     cert_chain: Vec<CertificateDer<'static>>,
     uri: &CertSourceUri,
 ) -> anyhow::Result<CertifiedKey> {
-    let signing_key = Pkcs11SigningKey::from_uri(uri)?;
-    Ok(CertifiedKey::new(
-        cert_chain,
-        std::sync::Arc::new(signing_key),
-    ))
+    let signing_key = Arc::new(Pkcs11SigningKey::from_uri(uri)?);
+    let certified_key = CertifiedKey::new(cert_chain, signing_key.clone());
+    prove_leaf_pairing(&certified_key, &signing_key)?;
+    Ok(certified_key)
 }
 
 pub fn validate_key_source_uri(uri: &CertSourceUri) -> anyhow::Result<()> {
