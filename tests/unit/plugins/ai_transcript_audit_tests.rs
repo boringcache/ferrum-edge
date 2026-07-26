@@ -3901,6 +3901,127 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
     );
 }
 
+/// Stream reserve/tee gates require THIS instance's staging entry. A peer's
+/// shared `MD_CANDIDATE` / `MD_SAMPLE_HIT` metadata must not reserve stream
+/// capacity, force reqwest dispatch, or install a stream inspector on a
+/// saturated instance; `StreamingCapture::Off` never tees; a locally staged
+/// sampled winner may tee.
+#[tokio::test]
+async fn instance_ownership_gates_stream_reserve_and_sampled_tee() {
+    let saturated = AiTranscriptAudit::new(
+        &json!({
+            "capture": { "request": true, "response": false, "streaming_response": "sampled" },
+            "sampling": { "rate": 0.0, "always_capture_on_guardrail": false },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    for _ in 0..4096 {
+        let mut filler = make_ctx();
+        saturated
+            .on_final_request_body_with_context(&mut filler, &headers, ai_request_body())
+            .await;
+    }
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": "sampled" },
+                "sampling": { "rate": 1.0, "always_capture_on_guardrail": false }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    assert!(matches!(
+        peer.on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sample_hit")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    assert!(matches!(
+        saturated
+            .on_final_request_body_with_context(&mut ctx, &headers, stream_request_body())
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    ctx.metadata.insert(
+        "ai_transcript_audit.sample_hit".to_string(),
+        "true".to_string(),
+    );
+
+    // `on_response_stream_selected` -> `stream_commit_selected`: shared marker
+    // without local staging must not reserve stream capacity.
+    saturated.on_response_stream_selected(&ctx, 200, Some("text/event-stream"));
+    assert!(
+        !saturated.forces_reqwest_dispatch(&ctx),
+        "peer sample_hit must not authorize stream dispatch without local staging"
+    );
+    assert!(
+        saturated
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "peer marker must not tee on a saturated instance"
+    );
+
+    // `StreamingCapture::Off` never tees, even when this instance staged.
+    let off = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": false, "response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut off_ctx = make_ctx();
+    off.on_final_request_body_with_context(&mut off_ctx, &headers, ai_request_body())
+        .await;
+    assert!(
+        !off.forces_reqwest_dispatch(&off_ctx),
+        "streaming off must not force reqwest dispatch"
+    );
+    assert!(
+        off.response_stream_inspector(&off_ctx, 200, Some("text/event-stream"))
+            .is_none(),
+        "streaming off must not tee SSE"
+    );
+
+    // Sampled mode with an owned winning roll may tee.
+    assert!(
+        peer.forces_reqwest_dispatch(&ctx),
+        "locally staged sampled winner must tee"
+    );
+    assert!(
+        peer
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_some(),
+        "locally staged sampled winner must install a stream inspector"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Review round 3: fail-closed status, stream:true buffering, short-circuit
 // request refresh
