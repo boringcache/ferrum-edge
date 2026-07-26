@@ -1258,7 +1258,10 @@ fn default_production_policy() -> BackendEgressPolicy {
 fn kafka_bootstrap_grammar_matches_librdkafka_host_port_forms() {
     assert_eq!(parse_ok("broker:9092"), vec![entry("broker", 9092)]);
     // No port -> librdkafka's RD_KAFKA_PORT default.
-    assert_eq!(parse_ok("broker"), vec![entry("broker", KAFKA_DEFAULT_PORT)]);
+    assert_eq!(
+        parse_ok("broker"),
+        vec![entry("broker", KAFKA_DEFAULT_PORT)]
+    );
     assert_eq!(parse_ok("10.0.0.5:9093"), vec![entry("10.0.0.5", 9093)]);
     // Multiple entries, with the separator whitespace librdkafka skips.
     assert_eq!(
@@ -1306,7 +1309,10 @@ fn kafka_bootstrap_grammar_accepts_protocol_prefixes_and_strips_url_paths() {
         vec![entry("10.0.0.5", 9093)]
     );
     // Empty host after the scheme becomes localhost.
-    assert_eq!(parse_ok("plaintext://:9092"), vec![entry("localhost", 9092)]);
+    assert_eq!(
+        parse_ok("plaintext://:9092"),
+        vec![entry("localhost", 9092)]
+    );
 }
 
 #[test]
@@ -1323,7 +1329,10 @@ fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
     // drop the entry (and the rest of the list) — reject instead.
     let error = parse_kafka_bootstrap_servers("ssl://broker:9093", Some("plaintext"))
         .expect_err("protocol mismatch must be rejected");
-    assert!(error.contains("does not match security_protocol"), "{error}");
+    assert!(
+        error.contains("does not match security_protocol"),
+        "{error}"
+    );
     assert!(parse_kafka_bootstrap_servers("ssl://broker:9093", Some("ssl")).is_ok());
     // Case-insensitive, matching librdkafka's uppercase-then-compare.
     assert!(parse_kafka_bootstrap_servers("SASL_SSL://broker", Some("sasl_ssl")).is_ok());
@@ -1375,7 +1384,10 @@ fn kafka_logging_fails_closed_under_any_restrictive_egress_policy() {
             "unexpected error: {error}"
         );
         // The message must not leak credentials or endpoint userinfo.
-        assert!(!error.contains("password") && !error.contains('@'), "{error}");
+        assert!(
+            !error.contains("password") && !error.contains('@'),
+            "{error}"
+        );
     }
 }
 
@@ -1411,5 +1423,8 @@ async fn kafka_logging_warmup_hostnames_use_the_librdkafka_grammar() {
     .expect("build plugin");
     let mut hostnames = plugin.warmup_hostnames();
     hostnames.sort();
-    assert_eq!(hostnames, vec!["broker-one".to_string(), "broker-two".to_string()]);
+    assert_eq!(
+        hostnames,
+        vec!["broker-one".to_string(), "broker-two".to_string()]
+    );
 }
