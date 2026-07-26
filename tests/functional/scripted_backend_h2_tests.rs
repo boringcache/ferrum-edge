@@ -2626,34 +2626,6 @@ async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
         .step(GrpcStep::RespondStatus {
             code: 0,
             message: "",
-// ────────────────────────────────────────────────────────────────────────────
-// Issue #2954 — backend TLS SNI override must serve under default nonzero
-// body-size limits (direct-H2 in-path enforcement), not 502 all traffic.
-// ────────────────────────────────────────────────────────────────────────────
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
-async fn h2_backend_tls_sni_serves_under_default_body_limits() {
-    let ca = TestCa::new("h2-sni-default-limits").expect("ca");
-    // Cert SAN is other.test — dial host is connect.example.com, so verification
-    // only succeeds when the gateway presents backend_tls_sni=other.test.
-    let (cert, key) = ca.wrong_san().expect("leaf");
-    let temp_dir = tempfile::TempDir::new().expect("temp dir");
-    let ca_path = temp_dir.path().join("ca.pem");
-    std::fs::write(&ca_path, &ca.cert_pem).expect("write CA");
-
-    let reservation = reserve_port().await.expect("reserve port");
-    let backend_port = reservation.port;
-    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
-        .expect("h2 tls backend")
-        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
-        .step(H2Step::RespondHeaders(vec![
-            (":status", "200".into()),
-            ("content-type", "text/plain".into()),
-            ("content-length", "2".into()),
-        ]))
-        .step(H2Step::RespondData {
-            data: Bytes::from_static(b"ok"),
-            end_stream: true,
         })
         .spawn()
         .expect("spawn backend");
@@ -2754,6 +2726,40 @@ async fn h2_backend_tls_sni_serves_under_default_body_limits() {
         "retry attempt must forward duplicate x-md as two field lines; headers={:?}",
         streams[0].headers
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2954 — backend TLS SNI override must serve under default nonzero
+// body-size limits (direct-H2 in-path enforcement), not 502 all traffic.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_backend_tls_sni_serves_under_default_body_limits() {
+    let ca = TestCa::new("h2-sni-default-limits").expect("ca");
+    // Cert SAN is other.test — dial host is connect.example.com, so verification
+    // only succeeds when the gateway presents backend_tls_sni=other.test.
+    let (cert, key) = ca.wrong_san().expect("leaf");
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let ca_path = temp_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca.cert_pem).expect("write CA");
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "2".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"ok"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
     let yaml = serde_yaml::to_string(&json!({
         "version": "1",
         "proxies": [{
