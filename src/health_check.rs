@@ -689,6 +689,7 @@ impl HealthChecker {
                         if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
                             state.recent_failures.clear();
                             self.reset_latency_after_passive_recovery(
+                                namespace,
                                 &ejection.upstream_id,
                                 target,
                             );
@@ -824,8 +825,18 @@ impl HealthChecker {
         recover_due_passive_ejections_inner(&self.passive_health, self.lb_cache.as_ref());
     }
 
-    fn reset_latency_after_passive_recovery(&self, upstream_id: &str, target: &UpstreamTarget) {
-        reset_latency_after_passive_recovery_inner(self.lb_cache.as_ref(), upstream_id, target);
+    fn reset_latency_after_passive_recovery(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+    ) {
+        reset_latency_after_passive_recovery_inner(
+            self.lb_cache.as_ref(),
+            namespace,
+            upstream_id,
+            target,
+        );
     }
 
     /// Start a background scanner that restores passively-ejected targets
@@ -1892,6 +1903,7 @@ fn config_needs_passive_recovery(config: &GatewayConfig) -> bool {
 
 fn reset_latency_after_passive_recovery_inner(
     lb_cache: Option<&Arc<LoadBalancerCache>>,
+    namespace: &str,
     upstream_id: &str,
     target: &UpstreamTarget,
 ) {
@@ -1899,7 +1911,7 @@ fn reset_latency_after_passive_recovery_inner(
         return;
     }
     if let Some(cache) = lb_cache {
-        cache.reset_recovered_target_latency(upstream_id, target);
+        cache.reset_recovered_target_latency(namespace, upstream_id, target);
     }
 }
 
@@ -1917,7 +1929,14 @@ fn recover_due_passive_ejections_inner(
     }
 
     for entry in passive_health.iter() {
-        let proxy_id = entry.key();
+        let proxy_key = entry.key();
+        // Passive partitions are keyed `namespace|proxy_id`; reuse the namespace
+        // so least-latency reset cannot touch a same-id balancer in another
+        // tenant.
+        let namespace = proxy_key
+            .split_once('|')
+            .map(|(ns, _)| ns)
+            .unwrap_or(proxy_key.as_str());
         let proxy_state = entry.value();
 
         let to_recover: Vec<(String, PassiveEjection)> = proxy_state
@@ -1952,7 +1971,7 @@ fn recover_due_passive_ejections_inner(
 
             info!(
                 "Passive recovery timer: restoring target {} for proxy {} after cooldown (upstream {})",
-                hp, proxy_id, current.upstream_id
+                hp, proxy_key, current.upstream_id
             );
             if let Some(state) = proxy_state.states.get(hp) {
                 state.consecutive_failures.store(0, Ordering::Relaxed);
@@ -1971,7 +1990,12 @@ fn recover_due_passive_ejections_inner(
                 locality: None,
                 path: None,
             };
-            reset_latency_after_passive_recovery_inner(lb_cache, &current.upstream_id, &recovered);
+            reset_latency_after_passive_recovery_inner(
+                lb_cache,
+                namespace,
+                &current.upstream_id,
+                &recovered,
+            );
         }
     }
 }

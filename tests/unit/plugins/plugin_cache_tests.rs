@@ -9565,7 +9565,12 @@ fn test_initial_response_header_policy_resolves_by_namespaced_key() {
         None,
     );
     let config = make_config(
-        vec![namespaced_proxy("tenant-a", "p1", "/api", vec!["sh-scoped"])],
+        vec![namespaced_proxy(
+            "tenant-a",
+            "p1",
+            "/api",
+            vec!["sh-scoped"],
+        )],
         vec![scoped, global],
     );
     let cache = PluginCache::new(&config).unwrap();
