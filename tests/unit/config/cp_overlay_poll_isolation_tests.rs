@@ -203,11 +203,14 @@ fn overlay_slot_preserves_mesh_when_later_translate_omits_it() {
         "mesh accepted by an earlier translate must survive a later mesh-less \
          translate and the following DB full-reload re-merge"
     );
+    let service_names = published.mesh.as_ref().map(|mesh| {
+        mesh.services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect::<Vec<_>>()
+    });
     assert_eq!(
-        published
-            .mesh
-            .as_ref()
-            .map(|mesh| mesh.services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()),
+        service_names,
         Some(vec!["overlay-svc"]),
         "preserved mesh must remain the previously accepted overlay mesh"
     );
