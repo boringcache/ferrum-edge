@@ -33,6 +33,13 @@ pub const LOG_MAX_RECORD_BYTES_MAX: usize = 1_048_576;
 pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_DEFAULT: usize = 2_000;
 pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MIN: usize = 100;
 pub const LOG_SHUTDOWN_DRAIN_TIMEOUT_MS_MAX: usize = 30_000;
+/// Aggregate admitted terminal/mirror/deadline-cleanup task budget.
+///
+/// Distinct from queue byte/count limits: this caps the pre-queue Tokio task
+/// and registry layer. Overflow rejects immediately (non-blocking).
+pub const LOG_DELIVERY_MAX_TASKS_DEFAULT: usize = 4_096;
+pub const LOG_DELIVERY_MAX_TASKS_MIN: usize = 1;
+pub const LOG_DELIVERY_MAX_TASKS_MAX: usize = 1_048_576;
 
 /// Stable callback that knows how to rebuild the gateway-wide tracing
 /// filter. `directive` is a `RUST_LOG`-style filter expression

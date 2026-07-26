@@ -10,13 +10,13 @@
 //!
 //! What this file exercises:
 //! - Mixed cluster snapshots: every translated Istio kind in one snapshot
-//!   generates a status update (all nine kinds are covered).
+//!   generates a status update (all ten kinds are covered).
 //! - Resource accepted vs. rejected: rejected resources still produce a
 //!   `FerrumAccepted: False` update so operators see the failure — including
 //!   the newly-covered kinds (VirtualService, ServiceEntry,
-//!   RequestAuthentication, Sidecar, Telemetry, WorkloadEntry).
-//! - Skip behaviour: kinds the status writer does not own (e.g. the
-//!   translated-but-unwatched `ProxyConfig`) do not produce updates.
+//!   RequestAuthentication, Sidecar, Telemetry, WorkloadEntry, ProxyConfig).
+//! - Skip behaviour: kinds the status writer does not own (e.g. EnvoyFilter)
+//!   do not produce updates.
 //! - Stability: the same input always produces the same set of updates
 //!   (no nondeterminism), and `lastTransitionTime` is preserved across
 //!   no-op replans.
@@ -77,8 +77,8 @@ fn find_condition<'a>(conditions: &'a [Value], condition_type: &str) -> &'a Valu
 }
 
 /// A realistic mesh-config snapshot produces one update for every
-/// translated Istio kind (all nine are covered). A translated-but-unwatched
-/// kind (`ProxyConfig`) is silently skipped — it shows up as no update in
+/// translated Istio kind (all ten are covered). An unowned kind
+/// (`EnvoyFilter`) is silently skipped — it shows up as no update in
 /// the plan, so operators don't see a stale "Ferrum doesn't manage this"
 /// condition for a resource the status writer doesn't own.
 #[test]
@@ -138,11 +138,17 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
             "mesh-default",
             json!({ "accessLogging": [{ "disabled": false }] }),
         ),
-        // Translated but not watched / not a status-writer kind: must be skipped.
         object(
             "networking.istio.io/v1beta1",
             "ProxyConfig",
             "default-pc",
+            json!({ "concurrency": 2, "tracing": { "sampling": 5.0 } }),
+        ),
+        // Not a status-writer kind: must be skipped.
+        object(
+            "networking.istio.io/v1alpha3",
+            "EnvoyFilter",
+            "ef",
             json!({}),
         ),
     ];
@@ -150,7 +156,7 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
     let updates = plan_istio_status_updates(&objects, options());
     assert_eq!(
         updates.len(),
-        9,
+        10,
         "expected one update per translated Istio kind, got {updates:?}"
     );
     for kind in [
@@ -163,14 +169,17 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
         "WorkloadEntry",
         "Sidecar",
         "Telemetry",
+        "ProxyConfig",
     ] {
         assert!(
             updates.iter().any(|u| u.kind == kind),
             "expected an update for {kind}, got {updates:?}"
         );
     }
-    // ProxyConfig is not a status-writer kind and must not appear.
-    assert!(updates.iter().all(|u| u.kind != "ProxyConfig"));
+    assert!(
+        !updates.iter().any(|u| u.kind == "EnvoyFilter"),
+        "EnvoyFilter must not produce a status update"
+    );
 }
 
 /// Each newly-covered kind produces a `FerrumAccepted: True` condition on
