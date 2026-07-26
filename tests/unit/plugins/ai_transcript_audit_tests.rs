@@ -2887,6 +2887,99 @@ async fn harvests_guardrail_and_token_metadata() {
     );
 }
 
+/// The harvester must accept the `ai_semantic_cache.<instance_id>.*` telemetry
+/// schema exactly — including keeping each instance's id in the exported key so
+/// a multi-instance chain does not collapse into one ambiguous reading — while
+/// refusing anything outside the producer's own grammar and value domain.
+#[tokio::test]
+async fn harvests_namespaced_cache_telemetry_and_rejects_everything_else() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+
+    let admitted: &[(&str, &str)] = &[
+        // Two live instances: provenance must survive into the record.
+        ("ai_semantic_cache.7.cache_status", "HIT"),
+        ("ai_semantic_cache.7.cache_match", "semantic"),
+        ("ai_semantic_cache.7.cache_similarity", "0.950000"),
+        ("ai_semantic_cache.12.cache_status", "MISS"),
+        // Pre-namespace spelling still lands in the cache section.
+        ("ai_cache_status", "BYPASS"),
+        // Separate producer, separate key.
+        ("request_deduplication.replayed", "true"),
+    ];
+    let rejected: &[(&str, &str)] = &[
+        // The staged prompt fingerprint is not telemetry and must never ship.
+        ("ai_semantic_cache.7.cache_key", "0123456789abcdef01234567"),
+        ("ai_cache_key", "0123456789abcdef01234567"),
+        // Right namespace, invented field — must not become an export channel.
+        ("ai_semantic_cache.7.prompt", "who is the ceo of acme corp"),
+        ("ai_semantic_cache.7.cache_status.extra", "HIT"),
+        // Namespace without the instance-id component.
+        ("ai_semantic_cache.cache_status", "HIT"),
+        // Non-numeric / oversized instance ids are not producer output.
+        ("ai_semantic_cache.abc.cache_status", "HIT"),
+        ("ai_semantic_cache.999999999999999999999.cache_status", "HIT"),
+        // Prefix-without-separator collision the old predicate accepted.
+        ("ai_cache_hijack", "leaked"),
+        // Grammar matches but the value is outside the producer's domain.
+        ("ai_semantic_cache.9.cache_status", "who is the ceo of acme"),
+        ("ai_semantic_cache.9.cache_match", "arbitrary"),
+        ("ai_semantic_cache.9.cache_similarity", "not-a-number"),
+        ("ai_semantic_cache.10.cache_similarity", "12.5"),
+        // Sibling namespace under the dedup producer.
+        ("request_deduplication.cached_body", "cached response text"),
+    ];
+    for &(key, value) in admitted.iter().chain(rejected) {
+        ctx.metadata.insert(key.to_string(), value.to_string());
+    }
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let cache = records[0]["cache"]
+        .as_object()
+        .expect("cache section is an object");
+
+    for &(key, value) in admitted {
+        assert_eq!(
+            cache.get(key).and_then(|entry| entry.as_str()),
+            Some(value),
+            "producer-schema key {key} was not exported"
+        );
+    }
+    for &(key, _) in rejected {
+        assert!(
+            !cache.contains_key(key),
+            "off-schema key {key} leaked into the audit record"
+        );
+    }
+    // Nothing beyond the admitted set — no other section absorbed the rejects.
+    assert_eq!(cache.len(), admitted.len());
+    let serialized = serde_json::to_string(&records[0]).expect("record serializes");
+    assert!(
+        !serialized.contains("0123456789abcdef01234567"),
+        "the staged cache key reached the record through another field"
+    );
+    assert!(
+        !serialized.contains("who is the ceo of acme"),
+        "off-schema metadata reached the record through another field"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Review round: capture completeness, sink headers, privacy, fallbacks
 // ---------------------------------------------------------------------------

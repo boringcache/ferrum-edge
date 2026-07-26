@@ -1511,15 +1511,32 @@ impl AiTranscriptAudit {
                     harvest.tokens.insert(key.clone(), safe(value));
                 }
                 _ => {
-                    if key.starts_with("ai_cache")
-                        || key.starts_with("ai_semantic_cache.")
-                        || key.starts_with("request_deduplication.")
-                    {
-                        harvest.cache.insert(key.clone(), safe(value));
+                    if let Some(suffix) = cache_telemetry_suffix(key) {
+                        // Admit only the producer's own value domain. A key
+                        // that matches the grammar but carries an out-of-domain
+                        // value is dropped rather than exported, so the `cache`
+                        // section can never widen past the fixed schema.
+                        if cache_telemetry_value_admitted(suffix, value) {
+                            harvest.cache.insert(key.clone(), safe(value));
+                        }
                     } else if is_guardrail_key(key) {
                         harvest.guardrails.insert(key.clone(), safe(value));
                     }
                 }
+            }
+        }
+        // Cap the cache section after the scan, not during it: the source map
+        // iterates in `HashMap` order, so dropping mid-scan would pick a
+        // different surviving subset run to run. Truncating the sorted
+        // `BTreeMap` keeps the retained set stable for a given input.
+        if harvest.cache.len() > MAX_CACHE_TELEMETRY_ENTRIES {
+            let boundary = harvest
+                .cache
+                .keys()
+                .nth(MAX_CACHE_TELEMETRY_ENTRIES)
+                .cloned();
+            if let Some(boundary) = boundary {
+                harvest.cache.retain(|key, _| *key < boundary);
             }
         }
         // `ai_provider` wins; fall back to the federation name only when no
@@ -3011,6 +3028,112 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
 fn fired_metadata_value(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.eq_ignore_ascii_case("false")
+}
+
+/// Maximum number of cache-telemetry entries exported into one record's
+/// `cache` section. Every admitted key is grammar-checked, so the only
+/// remaining growth axis is the number of `ai_semantic_cache` instances on a
+/// proxy. The cap keeps a misconfigured or future many-instance chain from
+/// widening the record and the collector's key space without bound. Truncation
+/// runs after the scan against the sorted `BTreeMap`, so the surviving subset
+/// is stable rather than `HashMap`-iteration-order dependent.
+const MAX_CACHE_TELEMETRY_ENTRIES: usize = 32;
+
+/// Longest cache-telemetry value retained. Every admitted value is already
+/// constrained to a fixed enum or a bounded decimal, so this is a belt-and-braces
+/// ceiling on the numeric arm rather than a truncation path.
+const MAX_CACHE_TELEMETRY_VALUE_BYTES: usize = 32;
+
+/// The single `request_deduplication` telemetry key. Kept separate from the
+/// cache grammar: dedup replay is a different producer with a different
+/// meaning, and a bare `starts_with("request_deduplication.")` would export
+/// any future request-private staging that plugin adds under its namespace.
+const DEDUP_REPLAYED_KEY: &str = "request_deduplication.replayed";
+
+/// Decimal digits in `u64::MAX`; the producer's instance id is a plain `u64`.
+const MAX_INSTANCE_ID_DIGITS: usize = 20;
+
+/// Canonicalize one of the three cache telemetry field names.
+///
+/// `cache_key` is deliberately absent. It is not telemetry: it is the SHA-256
+/// fingerprint of the normalized prompt (plus, per config, the consumer and
+/// model identity) that `before_proxy` stages for the store hook. It survives
+/// to record-assembly time on every miss whose store is skipped (SSE,
+/// non-JSON, oversized, unparseable, synthetic short-circuit) and — because
+/// `ai_transcript_audit` (2740) runs its final-body hook before
+/// `ai_semantic_cache` (2996) clears staging — on ordinary misses too.
+/// Exporting it would ship a stable, offline-checkable fingerprint of user
+/// prompt content to the audit collector even in `hash`/`metadata` modes,
+/// which exist precisely to avoid that.
+fn cache_telemetry_field(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        "cache_status" => Some("cache_status"),
+        "cache_match" => Some("cache_match"),
+        "cache_similarity" => Some("cache_similarity"),
+        _ => None,
+    }
+}
+
+/// Match `ai_semantic_cache.<instance_id>.<suffix>` against the producer's
+/// exact key grammar and return the telemetry suffix.
+///
+/// `ai_semantic_cache` namespaces its per-request staging as
+/// `ai_semantic_cache.` + the instance's process-unique decimal `u64` id + `.`
+/// + suffix (`staging_metadata_key` in `src/plugins/ai_semantic_cache.rs`).
+/// Matching the full grammar rather than the prefix alone keeps the exported
+/// key space equal to the authoritative producer schema: an unrelated key that
+/// merely starts with the namespace cannot smuggle arbitrary metadata into an
+/// audit record, and the instance id stays in the key so multi-instance
+/// provenance is not collapsed.
+fn semantic_cache_telemetry_suffix(key: &str) -> Option<&'static str> {
+    let rest = key.strip_prefix("ai_semantic_cache.")?;
+    let (instance_id, suffix) = rest.split_once('.')?;
+    if instance_id.is_empty()
+        || instance_id.len() > MAX_INSTANCE_ID_DIGITS
+        || !instance_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    cache_telemetry_field(suffix)
+}
+
+/// Classify a metadata key as exportable cache telemetry, returning the
+/// producer-schema suffix that governs its value domain.
+fn cache_telemetry_suffix(key: &str) -> Option<&'static str> {
+    if key == DEDUP_REPLAYED_KEY {
+        return Some("replayed");
+    }
+    // Legacy `ai_cache_status` is the namespaced `cache_status` field with an
+    // `ai_` prefix, so the two spellings share one value domain.
+    if let Some(legacy) = key.strip_prefix("ai_")
+        && let Some(suffix) = cache_telemetry_field(legacy)
+    {
+        return Some(suffix);
+    }
+    semantic_cache_telemetry_suffix(key)
+}
+
+/// Reject values outside the producer's domain for a telemetry suffix.
+///
+/// The producers emit fixed tokens (`HIT` / `MISS` / `BYPASS`, `semantic`) and
+/// a `{:.6}`-formatted similarity in `[0, 1]`. Validating the value as well as
+/// the key means the `cache` section cannot carry an unbounded or
+/// attacker-shaped string even if some future writer reuses a telemetry key.
+fn cache_telemetry_value_admitted(suffix: &str, value: &str) -> bool {
+    if value.len() > MAX_CACHE_TELEMETRY_VALUE_BYTES {
+        return false;
+    }
+    match suffix {
+        "cache_status" => matches!(value, "HIT" | "MISS" | "BYPASS"),
+        // Only `semantic` is emitted today; `exact` is accepted as the natural
+        // counterpart so naming the exact-hit path later is not a silent drop.
+        "cache_match" => matches!(value, "exact" | "semantic"),
+        "cache_similarity" => value
+            .parse::<f64>()
+            .is_ok_and(|similarity| similarity.is_finite() && (0.0..=1.0).contains(&similarity)),
+        "replayed" => matches!(value, "true" | "false"),
+        _ => false,
+    }
 }
 
 fn is_guardrail_key(key: &str) -> bool {
