@@ -651,6 +651,60 @@ fn test_least_latency_cache_record_and_select() {
 }
 
 #[test]
+fn cache_record_failed_attempt_is_scoped_to_its_namespace() {
+    // Two tenants reuse the bare upstream id `u1`. Recording failed attempts
+    // through the cache must reach exactly the recording tenant's balancer:
+    // a bare-id lookup would miss the namespace-qualified map entirely (no
+    // penalty anywhere), and an unqualified match would penalize both.
+    let targets = make_targets(2);
+    let mut tenant_a = make_upstream("u1", targets.clone());
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.algorithm = LoadBalancerAlgorithm::LeastLatency;
+    let mut tenant_b = make_upstream("u1", targets.clone());
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.algorithm = LoadBalancerAlgorithm::LeastLatency;
+    let config = GatewayConfig {
+        upstreams: vec![tenant_a, tenant_b],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // Warm host0 in both tenants so host1 is the only warm-up candidate.
+    for _ in 0..5 {
+        cache.record_latency("tenant-a", "u1", &targets[0], 10_000);
+        cache.record_latency("tenant-b", "u1", &targets[0], 10_000);
+    }
+
+    // Penalize host1 in tenant-a only.
+    for _ in 0..5 {
+        cache.record_failed_attempt("tenant-a", "u1", &targets[1]);
+    }
+
+    let host1_hits = |namespace: &str| {
+        let mut hits = 0usize;
+        for _ in 0..200 {
+            let selection = cache
+                .select_target(namespace, "u1", "", None)
+                .expect("a target must be selectable");
+            if selection.target.host == "host1" {
+                hits += 1;
+            }
+        }
+        hits
+    };
+
+    assert_eq!(
+        host1_hits("tenant-a"),
+        0,
+        "the penalized tenant's failing target must lose steady-state traffic"
+    );
+    assert!(
+        host1_hits("tenant-b") > 0,
+        "the other tenant's same-id upstream must keep exploring its own host1"
+    );
+}
+
+#[test]
 fn test_least_latency_no_data_falls_back_to_round_robin() {
     // When latency_ewma has been initialized but no samples recorded (all UNSET),
     // warm-up round-robin should be used.
@@ -2858,7 +2912,11 @@ fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
 
     // Warm A; leave B unsampled, then eject+recover B via passive timer path.
     let inner = lb_cache.load();
-    let balancer = inner.balancers().get(TEST_UPSTREAM).unwrap();
+    // Balancers are keyed by the namespace-qualified runtime key, not the bare id.
+    let balancer = inner
+        .balancers()
+        .get(&format!("ferrum|{TEST_UPSTREAM}"))
+        .unwrap();
     for _ in 0..5 {
         balancer.record_latency(&targets[0], 10_000);
     }

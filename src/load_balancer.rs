@@ -1832,9 +1832,14 @@ impl LoadBalancerCache {
 
     /// Record a failed dispatch attempt for least-latency warm-up (see
     /// [`LoadBalancer::record_failed_attempt`]).
-    pub fn record_failed_attempt(&self, upstream_id: &str, target: &UpstreamTarget) {
+    pub fn record_failed_attempt(
+        &self,
+        namespace: &str,
+        upstream_id: &str,
+        target: &UpstreamTarget,
+    ) {
         let inner = self.inner.load();
-        if let Some(balancer) = inner.balancers.get(upstream_id) {
+        if let Some(balancer) = inner.balancer(namespace, upstream_id) {
             balancer.record_failed_attempt(target);
         }
     }

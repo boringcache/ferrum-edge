@@ -1197,8 +1197,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
 
     let mut targets: Vec<(String, u16)> = Vec::new();
     if let Some(ref upstream_id) = proxy.upstream_id
-        && let Some(upstream) =
-            upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
+        && let Some(upstream) = upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
     {
         for target in &upstream.targets {
             // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
@@ -5177,7 +5176,11 @@ impl ProxyState {
             let base_proxy = plugin
                 .proxy_id
                 .as_deref()
-                .and_then(|proxy_id| proxy_map.get(&(plugin.namespace.as_str(), proxy_id)).copied())
+                .and_then(|proxy_id| {
+                    proxy_map
+                        .get(&(plugin.namespace.as_str(), proxy_id))
+                        .copied()
+                })
                 .or_else(|| {
                     config
                         .proxies
@@ -6117,7 +6120,12 @@ impl ProxyState {
         let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| ((upstream.namespace.as_str(), upstream.id.as_str()), upstream))
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
             .collect();
         let proxy_map: HashMap<(&str, &str), &Proxy> = config
             .proxies
@@ -6300,8 +6308,8 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            let Some(upstream) = upstream_map
-                .get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            let Some(upstream) =
+                upstream_map.get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
             else {
                 continue;
             };
@@ -6430,8 +6438,8 @@ impl ProxyState {
                 let mut effective_proxy = (*base_proxy).clone();
                 if let Some(upstream_id) = destination.upstream_id {
                     effective_proxy.upstream_id = Some(upstream_id.clone());
-                    let Some(upstream) = upstream_map
-                        .get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
+                    let Some(upstream) =
+                        upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
                     else {
                         continue;
                     };
@@ -7243,7 +7251,12 @@ impl ProxyState {
         let upstream_map: HashMap<(&str, &str), &crate::config::types::Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| ((upstream.namespace.as_str(), upstream.id.as_str()), upstream))
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
             .collect();
 
         // Collect ALL reqwest warmup candidates upfront, partitioned by
@@ -7796,8 +7809,7 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            if upstream_keys
-                .contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            if upstream_keys.contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
             {
                 projection.insert(
                     spec.upstream_id.clone(),
@@ -41244,7 +41256,10 @@ mod tests {
             &[("a.test", 8443), ("b.test", 8443), ("c.test", 8443)],
         );
         let mut upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
-        upstreams.insert((upstream.namespace.as_str(), upstream.id.as_str()), &upstream);
+        upstreams.insert(
+            (upstream.namespace.as_str(), upstream.id.as_str()),
+            &upstream,
+        );
 
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(

@@ -3236,9 +3236,7 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     for assoc in &proxy.plugins {
         if let Some(pc) = plugin_configs
             .iter()
-            .find(|pc| {
-                pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
-            })
+            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
         {
             local_names.insert(pc.plugin_name.as_str());
             if plugin_config_forces_request_body_buffering(pc) {
@@ -3733,12 +3731,10 @@ impl GatewayConfig {
         for proxy in &mut self.proxies {
             proxy.resolved_tls = if let Some(ref uid) = proxy.upstream_id {
                 let ns = proxy.namespace.as_str();
-                let subset_override = proxy.upstream_subset.as_deref().and_then(|name| {
-                    subset_tls
-                        .get(&(ns, uid.as_str(), name))
-                        .copied()
-                        .cloned()
-                });
+                let subset_override = proxy
+                    .upstream_subset
+                    .as_deref()
+                    .and_then(|name| subset_tls.get(&(ns, uid.as_str(), name)).copied().cloned());
                 subset_override
                     .or_else(|| upstream_tls.get(&(ns, uid.as_str())).cloned())
                     .unwrap_or_else(BackendTlsConfig::default_verify)
@@ -4511,9 +4507,7 @@ impl GatewayConfig {
             if let Some(plugin) = self
                 .plugin_configs
                 .iter()
-                .find(|pc| {
-                    pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
-                })
+                .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
             {
                 if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
                     shadows_global_dispatch = true;
@@ -4523,9 +4517,7 @@ impl GatewayConfig {
         }
         if !shadows_global_dispatch {
             for plugin in &self.plugin_configs {
-                if plugin.scope == PluginScope::Global
-                    && plugin.namespace == proxy.namespace
-                {
+                if plugin.scope == PluginScope::Global && plugin.namespace == proxy.namespace {
                     collect(plugin);
                 }
             }
