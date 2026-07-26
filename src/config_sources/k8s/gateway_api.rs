@@ -571,6 +571,15 @@ fn namespace_selector(
             "must be an object when namespaces.from is Selector",
         ));
     };
+    if selector
+        .keys()
+        .any(|key| key != "matchLabels" && key != "matchExpressions")
+    {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector",
+            "may contain only matchLabels and matchExpressions",
+        ));
+    }
 
     let mut match_labels = HashMap::new();
     if let Some(labels) = selector.get("matchLabels") {
@@ -632,6 +641,15 @@ fn namespace_selector_expression(
             "entries must be objects",
         ));
     };
+    if expression
+        .keys()
+        .any(|key| key != "key" && key != "operator" && key != "values")
+    {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[]",
+            "may contain only key, operator, and values",
+        ));
+    }
     let Some(key) = expression.get("key").and_then(Value::as_str) else {
         return Err(listener_validation_error(
             "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].key",

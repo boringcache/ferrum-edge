@@ -197,6 +197,10 @@ fn parser_accepts_all_valid_namespace_modes_and_selector_operators() {
 fn parser_rejects_every_malformed_selector_shape_and_operator_cardinality_atomically() {
     let secret = "DO-NOT-ECHO-SELECTOR-VALUE";
     let invalid_selectors = vec![
+        json!({"matchLables": {"team": "payments"}}),
+        json!({"matchLabels": {"team": "payments"}, "extra": true}),
+        json!({"matchExpressions": [{"key": "team", "operator": "Exists", "extra": true}]}),
+        json!({"matchExpressions": [{"key": "team", "operater": "Exists"}]}),
         json!({"matchLabels": []}),
         json!({"matchLabels": {"team": 7}}),
         json!({"matchLabels": {"/bad": "payments"}}),
@@ -313,6 +317,62 @@ fn malformed_mixed_selector_does_not_broaden_cross_namespace_attachment() {
             .expect("status message")
             .contains("required-security-boundary")
     );
+}
+
+#[test]
+fn unknown_selector_field_does_not_broaden_cross_namespace_attachment() {
+    let secret = "DO-NOT-ECHO-SELECTOR-VALUE";
+    let invalid_gateway = gateway(json!({
+        "matchLables": {"team": secret}
+    }));
+    let objects = vec![
+        namespace("tenant", &[("team", "payments")]),
+        namespace("platform", &[("team", "platform")]),
+        invalid_gateway,
+        route(),
+    ];
+
+    let translation = translate_skipping_rejected_resources(&objects);
+    assert!(
+        translation.config.proxies.is_empty(),
+        "typoed selector fields must not authorize tenant"
+    );
+    assert!(
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .is_none_or(|mesh| mesh.services.is_empty()),
+        "an invalid listener must not be materialized"
+    );
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    let gateway_status = &updates
+        .iter()
+        .find(|update| update.kind == "Gateway")
+        .expect("Gateway status update")
+        .status;
+    assert_eq!(gateway_status["listeners"][0]["attachedRoutes"], 0);
+    let accepted = listener_condition(gateway_status, "Accepted");
+    assert_eq!(accepted["status"], "False");
+    assert_eq!(accepted["reason"], "Invalid");
+    assert_eq!(
+        accepted["message"],
+        "spec.listeners[].allowedRoutes.namespaces.selector: may contain only matchLabels and matchExpressions"
+    );
+    for condition_type in ["ResolvedRefs", "Programmed"] {
+        let condition = listener_condition(gateway_status, condition_type);
+        assert_eq!(condition["status"], "False");
+        assert_eq!(condition["reason"], "Invalid");
+        assert_eq!(condition["message"], accepted["message"]);
+    }
+    let message = accepted["message"].as_str().expect("status message");
+    for leaked in ["matchLables", "matchLabels", secret, "team", "payments"] {
+        assert!(
+            !message.contains(leaked),
+            "selector diagnostics must stay redacted: leaked {leaked}"
+        );
+    }
 }
 
 #[test]
