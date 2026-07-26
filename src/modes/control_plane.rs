@@ -1970,14 +1970,15 @@ pub async fn run(
                                 // snapshot is published (issue #2473). `max`
                                 // guards a cursor-less delta so the revision is
                                 // monotonic even then.
+                                let mesh_revision_sequence = new_config
+                                    .mesh_revision
+                                    .as_ref()
+                                    .map_or(0, |revision| revision.sequence)
+                                    .max(result.sequence_cursor);
                                 stamp_mesh_revision(
                                     &mut new_config,
                                     poll_mesh_config_authority.as_deref(),
-                                    new_config
-                                        .mesh_revision
-                                        .as_ref()
-                                        .map_or(0, |revision| revision.sequence)
-                                        .max(result.sequence_cursor),
+                                    mesh_revision_sequence,
                                 );
                                 apply_incremental_to_config(&mut new_config, result.clone());
                                 new_config.normalize_fields();
