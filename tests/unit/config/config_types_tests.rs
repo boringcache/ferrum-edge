@@ -1106,7 +1106,12 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
 }
 
 #[test]
-fn global_mtls_auth_applies_only_within_its_namespace() {
+fn global_mtls_auth_is_screened_across_namespaces() {
+    // `PluginScope::Global` is gateway-wide at runtime: `PluginCache` seeds
+    // every proxy's merged list from the single global list regardless of
+    // namespace. Compatibility screening must therefore be cross-namespace
+    // too, or a tenant-b global would install on a tenant-a plaintext stream
+    // proxy with no validation error at all.
     let mut tenant_a_proxy = stream_proxy("plain", BackendScheme::Tcp, false);
     tenant_a_proxy.namespace = "tenant-a".to_string();
     let mut tenant_b_global = mtls_plugin(
@@ -1122,9 +1127,40 @@ fn global_mtls_auth_applies_only_within_its_namespace() {
         ..empty_config()
     };
 
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert!(
+        errors.iter().any(|error| error.contains("Proxy 'plain'")),
+        "a cross-namespace global plugin still applies at runtime and must be screened: {errors:?}"
+    );
+}
+
+#[test]
+fn scoped_mtls_auth_does_not_cross_namespaces() {
+    // The namespace-local half: a tenant-b PROXY-scoped config naming proxy id
+    // "plain" must not bind to tenant-a's same-id proxy. `validate_plugin_
+    // references` reports the dangling reference; compatibility screening must
+    // not additionally screen it against the foreign proxy.
+    let mut tenant_a_proxy = stream_proxy("plain", BackendScheme::Tcp, false);
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    tenant_a_proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "mtls-scoped".to_string(),
+    }];
+    let mut tenant_b_scoped = mtls_plugin(
+        "mtls-scoped",
+        PluginScope::Proxy,
+        Some("plain"),
+        serde_json::json!({}),
+    );
+    tenant_b_scoped.namespace = "tenant-b".to_string();
+    let config = GatewayConfig {
+        proxies: vec![tenant_a_proxy],
+        plugin_configs: vec![tenant_b_scoped],
+        ..empty_config()
+    };
+
     assert!(
         config.validate_mtls_auth_compatibility().is_ok(),
-        "a tenant-b global plugin must not apply to a tenant-a proxy"
+        "a tenant-b proxy-scoped plugin must not attach to tenant-a's same-id proxy"
     );
 }
 
@@ -3290,7 +3326,7 @@ fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
 }
 
 #[test]
-fn retry_proxy_ignores_foreign_namespace_global_dispatch() {
+fn retry_proxy_still_rejects_foreign_namespace_global_dispatch() {
     let plain = make_upstream("plain-upstream");
     let mut mesh = make_upstream("mesh-upstream");
     mesh.targets[0]
@@ -3324,9 +3360,18 @@ fn retry_proxy_ignores_foreign_namespace_global_dispatch() {
     config.proxies = vec![proxy];
     config.plugin_configs = vec![foreign_dispatch];
 
+    // `PluginScope::Global` is gateway-wide at runtime — `PluginCache` merges
+    // the single global list into every proxy in every namespace — so a
+    // tenant-b global dispatch rule DOES run on this proxy and its
+    // retry/mesh-transport conflict must still be reported. Namespace
+    // qualification applies to association and proxy_id resolution, not to
+    // global-scope applicability.
+    let err = config.validate_upstream_references().unwrap_err();
     assert!(
-        config.validate_upstream_references().is_ok(),
-        "a tenant-b global dispatch rule must not affect a tenant-a proxy"
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected cross-namespace global dispatch conflict, got {err:?}"
     );
 }
 

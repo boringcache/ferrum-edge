@@ -3249,7 +3249,14 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         }
     }
     for pc in plugin_configs {
-        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
+        // NOT namespace-filtered, unlike the association lookup above.
+        // `PluginScope::Global` is gateway-wide at runtime: `PluginCache` seeds
+        // EVERY proxy's merged list from the one global list regardless of
+        // namespace, and only a same-namespace scoped instance of the same
+        // plugin name shadows it. Filtering globals by namespace here would let
+        // a global body-buffering plugin declared in another tenant install on
+        // this proxy at runtime while this validator stayed silent.
+        if pc.scope != PluginScope::Global {
             continue;
         }
         if local_names.contains(pc.plugin_name.as_str()) {
@@ -3472,11 +3479,11 @@ impl GatewayConfig {
                     })
                     .collect();
                 let effective = if local_mtls.is_empty() {
-                    global_mtls
-                        .iter()
-                        .copied()
-                        .filter(|plugin| plugin.namespace == proxy.namespace)
-                        .collect()
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup above is namespace-local.
+                    global_mtls.clone()
                 } else {
                     local_mtls
                 };
@@ -4517,7 +4524,12 @@ impl GatewayConfig {
         }
         if !shadows_global_dispatch {
             for plugin in &self.plugin_configs {
-                if plugin.scope == PluginScope::Global && plugin.namespace == proxy.namespace {
+                // Deliberately NOT namespace-filtered: the association lookup
+                // above is namespace-local, but globals run on every proxy in
+                // every namespace at runtime. Skipping other tenants' globals
+                // here would hide their override destinations from
+                // `validate_upstream_references`' mesh-transport screen.
+                if plugin.scope == PluginScope::Global {
                     collect(plugin);
                 }
             }

@@ -5181,12 +5181,18 @@ impl ProxyState {
                         .get(&(plugin.namespace.as_str(), proxy_id))
                         .copied()
                 })
+                // Representative proxy used only to supply the ambient
+                // backend-TLS context for validating the rule's own material.
+                // Prefer one in the plugin's own namespace; fall back to any
+                // proxy so a global rule declared in a namespace that owns no
+                // proxies is still validated (it runs on every proxy anyway).
                 .or_else(|| {
                     config
                         .proxies
                         .iter()
                         .find(|proxy| proxy.namespace == plugin.namespace)
-                });
+                })
+                .or_else(|| config.proxies.first());
             let Some(base_proxy) = base_proxy else {
                 continue;
             };

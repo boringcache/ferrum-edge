@@ -2217,6 +2217,22 @@ async fn handle_tcp_connection_inner(
         .proxy_by_namespaced_id(proxy_namespace, proxy_id)
         .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
 
+    if resolved_identity.is_some() {
+        // The accept loop stamped the generation from the listener's
+        // REPRESENTATIVE identity (the first SNI candidate). SNI has now
+        // selected a different `(namespace, id)`, and the disconnect summary
+        // reports that matched identity — so the generation must be re-read for
+        // it. Leaving the representative's generation attached would hand
+        // `proxy_alerts` an ownership token minted for another tenant's
+        // lifecycle row, which fails the `owns_proxy_generation` check and
+        // silently drops every alert for the matched proxy (issue #3094).
+        // Mirrors the UDP capture path, which re-reads after its own
+        // resolution. Non-SNI listeners keep the accept-loop stamp.
+        stream_ctx.proxy_lifecycle_generation = epoch
+            .plugin_cache
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    }
+
     let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();
         stream_ctx.proxy_name = proxy.name.clone();
