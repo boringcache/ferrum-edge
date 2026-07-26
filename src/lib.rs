@@ -3717,8 +3717,10 @@ pub mod _test_support {
     // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
 
     pub use crate::k8s_controller::{
-        AcceptedK8sOverlay, CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay,
-        empty_k8s_overlay_slot, merge_k8s_translation, publish_k8s_reconcile,
+        CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+    };
+    pub use crate::k8s_controller::reconciler::{
+        AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
         store_accepted_k8s_overlay, swap_merged_k8s_translation,
     };
 
