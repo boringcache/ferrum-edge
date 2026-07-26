@@ -29,9 +29,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use super::peer_identity::{
-    H3ConnectionIdentity, quic_max_early_data_size, zero_rtt_admitted,
-};
+use super::peer_identity::{H3ConnectionIdentity, quic_max_early_data_size, zero_rtt_admitted};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;

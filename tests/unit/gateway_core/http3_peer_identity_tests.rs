@@ -91,9 +91,7 @@ fn h3_early_data_uses_the_bounded_stateful_resumption_cache() {
     let source = compact_whitespace(include_str!("../../../src/http3/server.rs"));
     let conditional = source
         .find("ifserver_tls_config.max_early_data_size==0{")
-        .expect(
-            "stateless QUIC ticketer must be conditional on early data being disabled",
-        );
+        .expect("stateless QUIC ticketer must be conditional on early data being disabled");
     let cache = source[conditional..]
         .find("server_tls_config.session_storage=")
         .map(|offset| conditional + offset)
