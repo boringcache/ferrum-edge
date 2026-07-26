@@ -172,14 +172,14 @@ async fn a_rejected_reload_leaves_the_matching_identity_loadable() {
     let cert_bytes = std::fs::read(certificate_path()).expect("read test certificate");
     std::fs::write(&cert_trigger, &cert_bytes).expect("write trigger cert");
 
-    let rebuild_attempts = Arc::new(AtomicUsize::new(0));
-    let attempts_for_rebuild = rebuild_attempts.clone();
+    let completed_rebuilds = Arc::new(AtomicUsize::new(0));
+    let completed_for_rebuild = completed_rebuilds.clone();
     let mismatched_key = mismatched_key_source();
     let rebuild: FrontendTlsRebuildFn = Box::new(move || {
-        attempts_for_rebuild.fetch_add(1, Ordering::SeqCst);
         let error = load_server_config(&mismatched_key)
             .expect_err("rotating onto a mismatched key must fail the rebuild");
         assert_rejected_without_disclosure(&format!("{error:#}"));
+        completed_for_rebuild.fetch_add(1, Ordering::SeqCst);
         Err(error)
     });
 
@@ -217,9 +217,9 @@ async fn a_rejected_reload_leaves_the_matching_identity_loadable() {
     std::fs::write(&cert_trigger, &rotated).expect("mutate trigger cert");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while rebuild_attempts.load(Ordering::SeqCst) == 0 {
+    while completed_rebuilds.load(Ordering::SeqCst) == 0 {
         if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for frontend TLS reload rebuild attempt");
+            panic!("timed out waiting for rejected frontend TLS rebuild to complete");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
