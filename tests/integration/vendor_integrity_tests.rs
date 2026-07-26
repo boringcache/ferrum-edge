@@ -1,7 +1,7 @@
 //! Vendor integrity (drift) guard.
 //!
 //! Ferrum Edge carries vendored, patched copies of upstream crates under
-//! `vendor/**` (reqwest, h3, tungstenite, tokio-tungstenite — see
+//! `vendor/**` (reqwest, h3, tungstenite, tokio-tungstenite, dimpl — see
 //! `docs/dependency-policy.md` and `docs/upstream-*-patches/`). Those copies are
 //! a supply-chain surface: any byte of them ships in the binary. This test pins
 //! their contents to a committed manifest so vendored code cannot drift beyond

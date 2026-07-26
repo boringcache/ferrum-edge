@@ -234,6 +234,9 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 ### Server Certificate
 - Must be in PEM format
 - Should include the full certificate chain
+- For frontend DTLS, certificates must be leaf-first. Ferrum transmits every
+  configured certificate in order in DTLS 1.2 and 1.3 and validates the first
+  certificate against the configured ECDSA P-256/P-384 private key.
 - Common name (CN) or Subject Alternative Name (SAN) should match the gateway hostname
 - Private key must be unencrypted (or gateway must have access to decryption key)
 
@@ -532,7 +535,7 @@ plugin_configs:
 upstreams: []
 ```
 
-For an issuer pin that also works with UDP+DTLS, use an `allowed_issuers` entry with descriptive `cn`/`o`/`ou` fields and a `ca_certificate_pem` containing exactly one CA certificate. Ferrum verifies the leaf signature path to that pinned key; issuer DN text alone is never trusted. Because the DTLS frontend exposes only the leaf to plugins, this must be the immediate issuing CA for UDP+DTLS. HTTP/TCP TLS frontends can pin a higher-level root when the client presents the needed intermediate chain.
+For an issuer pin that also works with UDP+DTLS, use an `allowed_issuers` entry with descriptive `cn`/`o`/`ou` fields and a `ca_certificate_pem` containing exactly one CA certificate. Ferrum verifies the leaf signature path to that pinned key; issuer DN text alone is never trusted. DTLS exposes the complete presented chain to plugins, so this may pin a higher-level root when the client transmits the needed intermediates, matching HTTP/TCP TLS behavior.
 
 `auth_mode: multi` does not provide a fallback for TLS handshake failures. A missing or untrusted client certificate is rejected before routing when the frontend client-CA bundle is configured. Multi-auth fallback applies only after a successful certificate-bearing handshake reaches the plugin pipeline.
 

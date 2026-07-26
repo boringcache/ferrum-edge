@@ -43,24 +43,27 @@ Each row is the authoritative tracking record. Keep this table, the
 | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
 > and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
 > docs. Patches carried without an upstream PR, including the tungstenite frame
-> error-origin extension, are governed by the
-> [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
+> error-origin extension and the dimpl credential-security patch, are governed
+> by the [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla)
+> below.
 
 ### Deliberate fork policy and SLA
 
 Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
 `scripts/check_vendored_patch_status.sh` polls those and goes red when one
-merges. Two patches — **h3 002** (Extended CONNECT `:protocol=websocket`) and
-**h3 003** (`peek_recv_trailers`) — have **no upstream issue or PR filed yet**.
-They are not an untracked TODO; they are carried as a **deliberate, time-boxed
-fork** of `h3` on `jeremyjpj0916/h3` and are governed as follows:
+merges. Three patches — **h3 002** (Extended CONNECT `:protocol=websocket`),
+**h3 003** (`peek_recv_trailers`), and **dimpl 001** (DTLS certificate chains
+and private-key zeroization) — have **no upstream issue or PR filed yet**. They
+are not untracked TODOs; they are carried as **deliberate, time-boxed forks**
+and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
@@ -172,6 +175,12 @@ of the vendor copy and must keep passing after retirement:
 - The tungstenite pre-reservation frame-origin regression lives in the vendored
   crate (`protocol::frame::tests::size_limit_hit`) and runs alongside the
   raw-takeover regression in the vendored-patch job.
+- The dimpl credential regressions live in
+  `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
+  cover DTLS 1.2 and 1.3 chain transmission plus deterministic clone,
+  failed-construction, fallback, and shutdown zeroization observations. The
+  Ferrum integration suite separately verifies a root-only client completes a
+  handshake because the configured intermediate is transmitted.
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
@@ -339,5 +348,6 @@ a shell as a shortcut.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
 - `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,
-  `docs/upstream-tungstenite-patches/` — per-patch detail and retirement plans.
+  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/` —
+  per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.
