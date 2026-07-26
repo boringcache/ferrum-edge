@@ -2802,6 +2802,34 @@ fn backend_tls_sni_buffering_screen_disabled_local_does_not_shadow_enabled_globa
     assert!(global_hit && inherited, "{msg}");
 }
 
+/// An enabled local whose config does not construct must not shadow an
+/// enabled buffering global — PluginCache's construction-`Err` arm leaves the
+/// global in place, and SNI admission must keep seeing that global.
+#[test]
+fn backend_tls_sni_buffering_screen_unconstructable_local_does_not_shadow_enabled_global() {
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let global = sni_plugin_config(
+        "global-compression",
+        "compression",
+        PluginScope::Global,
+        decompress,
+    );
+    let bad = serde_json::json!({"algorithms": ["not-a-codec"]});
+    let local = sni_proxy_plugin("local-compression", "compression", bad);
+    let config = sni_config_with_plugins(vec![global, local]);
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-compression"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let local_hit = rejections.iter().any(|m| m.contains("local-compression"));
+    let msg = format!(
+        "enabled buffering global shadowed by unconstructable local: {rejections:?}"
+    );
+    assert!(global_hit && inherited && !local_hit, "{msg}");
+}
+
 /// Unknown / custom plugin names stay admitted; the runtime 502 remains the
 /// fail-closed backstop, so admission must not invent a rejection.
 #[test]

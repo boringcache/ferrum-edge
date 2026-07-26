@@ -3083,13 +3083,21 @@ pub(crate) fn mesh_transport_retry_conflict_message(
     )
 }
 
-/// Whether a plugin config forces request-body buffering for at least some
-/// requests when enabled.
+/// Outcome of screening one enabled plugin config for backend-TLS SNI
+/// request-body-buffering admission.
 ///
-/// Used by backend-TLS SNI admission: plain HTTPS SNI overrides require the
-/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
+/// `shadows_same_named_global` mirrors `PluginCache` merge rules: a disabled
+/// config never shadows; a successfully constructed local (or a
+/// custom/unknown/`Ok(None)` name) does; a built-in whose configuration fails
+/// to construct does not — the cache's `Err` arm leaves the global in place.
+struct SniBufferingScreenEffect {
+    forces_buffering: bool,
+    shadows_same_named_global: bool,
+}
+
+/// Screen one plugin config for SNI buffering admission.
 ///
-/// The answer comes from the authoritative
+/// The buffering answer comes from the authoritative
 /// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
 /// on an instance built from the SAME parsed configuration the runtime
 /// `PluginCache` builds — there is no second, config-shaped re-implementation
@@ -3102,20 +3110,29 @@ pub(crate) fn mesh_transport_retry_conflict_message(
 /// warning, preserving the documented residual: those requests still fail
 /// closed at runtime with a `502` and
 /// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
-fn plugin_config_forces_request_body_buffering(
+fn screen_plugin_config_for_sni_buffering(
     proxy_id: &str,
     pc: &PluginConfig,
     screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
-) -> bool {
+) -> SniBufferingScreenEffect {
     if !pc.enabled {
-        return false;
+        return SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: false,
+        };
     }
     // Built on first use: a proxy whose effective plugin configs are all
     // disabled (or absent) never constructs the screener's HTTP client.
     let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
     match screener.screen(&pc.plugin_name, &pc.config) {
-        crate::plugins::RequestBodyBufferingScreen::Buffers => true,
-        crate::plugins::RequestBodyBufferingScreen::Streams => false,
+        crate::plugins::RequestBodyBufferingScreen::Buffers => SniBufferingScreenEffect {
+            forces_buffering: true,
+            shadows_same_named_global: true,
+        },
+        crate::plugins::RequestBodyBufferingScreen::Streams => SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: true,
+        },
         crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
             tracing::warn!(
                 proxy_id = %proxy_id,
@@ -3127,7 +3144,19 @@ fn plugin_config_forces_request_body_buffering(
                  runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
                  plugin buffers request bodies"
             );
-            false
+            // `NotBuiltin` covers custom/unknown names and retired aliases
+            // (`Ok(None)`): PluginCache still removes the same-named global in
+            // those arms. Prefer shadowing (and the documented admit residual)
+            // over a false SNI rejection. `ConstructionFailed` mirrors the
+            // cache's `Err` arm and must not shadow.
+            let shadows_same_named_global = matches!(
+                gap,
+                crate::plugins::RequestBodyBufferingScreenGap::NotBuiltin
+            );
+            SniBufferingScreenEffect {
+                forces_buffering: false,
+                shadows_same_named_global,
+            }
         }
     }
 }
@@ -3178,7 +3207,7 @@ fn proxy_plain_https_sni_sources<'a>(
 /// The buffering leg is derived from the runtime
 /// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
 /// plugin built from the same parsed config (see
-/// [`plugin_config_forces_request_body_buffering`]), so it tracks every
+/// [`screen_plugin_config_for_sni_buffering`]), so it tracks every
 /// conditional buffering plugin exactly and needs no per-plugin maintenance.
 /// Plugin construction happens only for proxies that actually carry a plain
 /// HTTPS SNI override, and only for that proxy's effective plugin configs.
@@ -3232,12 +3261,14 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
             .iter()
             .find(|pc| pc.id == assoc.plugin_config_id)
         {
-            // Mirror PluginCache: disabled local/proxy_group configs are
-            // excluded before merge and do not shadow a same-named global.
-            if pc.enabled {
+            let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+            // Mirror PluginCache: only locals that would enter (or deliberately
+            // clear) the merge list shadow a same-named global. Disabled
+            // configs and construction failures do not.
+            if effect.shadows_same_named_global {
                 local_names.insert(pc.plugin_name.as_str());
             }
-            if plugin_config_forces_request_body_buffering(&proxy.id, pc, &screener) {
+            if effect.forces_buffering {
                 errors.push(format!(
                     "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                      request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
@@ -3253,7 +3284,8 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         if local_names.contains(pc.plugin_name.as_str()) {
             continue;
         }
-        if plugin_config_forces_request_body_buffering(&proxy.id, pc, &screener) {
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        if effect.forces_buffering {
             errors.push(format!(
                 "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                  request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
