@@ -3016,17 +3016,29 @@ paths:
                     description: |
                       Authoritative config-revision state for this DP's
                       multi-CP freshness gate. `accepted` is the
-                      `(authority, sequence)` of the slice currently serving;
+                      `(authority, sequence)` most recently admitted into the
+                      received slot; `applied` is the generation the proxy
+                      runtime actually accepted and is serving;
                       `quarantined` describes the most recent slice the gate
                       refused (a lagging fallback CP, a foreign ordering
                       domain, or a slice carrying no revision while one is
                       accepted). Always present in mesh mode.
+
+                      `accepted` briefly leads `applied` while a freshly
+                      received slice is being applied. If the proxy runtime
+                      then refuses that slice, `accepted` is rolled back to
+                      `applied` so revisions between the two stay eligible —
+                      a runtime-invalid slice at a far-future sequence can
+                      never lock the data plane out of recovery.
 
                       This block is JWT-gated on purpose: the authority string
                       and sequence numbers are control-plane-supplied, so
                       `/metrics` carries only the fixed-cardinality
                       `ferrum_mesh_config_revision_rejections_total{reason}`
                       counter and `ferrum_mesh_config_revision_adoptions_total`.
+                      Every authority rendered in this block is
+                      control-character-stripped and truncated to 64
+                      characters.
                     required:
                       - rejected_total
                       - adopted_total
@@ -3036,9 +3048,10 @@ paths:
                       accepted:
                         type: object
                         description: |
-                          Revision of the slice currently accepted. Omitted
-                          when this DP has never accepted a revisioned slice
-                          (unversioned config authority, or pre-first-slice).
+                          Revision most recently admitted into the received
+                          slot. Omitted when this DP has never accepted a
+                          revisioned slice (unversioned config authority, or
+                          pre-first-slice).
                         required: [authority, sequence]
                         properties:
                           authority:
@@ -3047,7 +3060,8 @@ paths:
                               Ordering domain
                               (`FERRUM_MESH_CONFIG_AUTHORITY_ID` on the CP).
                               Sequences are only comparable within one
-                              authority.
+                              authority. Control-character-stripped and
+                              truncated to 64 characters.
                           sequence:
                             type: integer
                             format: int64
@@ -3055,6 +3069,25 @@ paths:
                             description: |
                               Durable config-change sequence within
                               `authority`. Monotonic; never a wall clock.
+                      applied:
+                        type: object
+                        description: |
+                          Revision of the slice the proxy runtime last
+                          accepted — the last-good generation serving traffic,
+                          and the rollback target when a received candidate is
+                          refused by the runtime. Normally equal to
+                          `accepted`. Omitted when no revisioned slice has been
+                          applied yet.
+                        required: [authority, sequence]
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Sanitized exactly like `accepted.authority`.
+                          sequence:
+                            type: integer
+                            format: int64
+                            minimum: 0
                       quarantined:
                         type: object
                         description: |
@@ -3166,6 +3199,9 @@ paths:
                       accepted:
                         authority: db
                         sequence: 4821
+                      applied:
+                        authority: db
+                        sequence: 4821
                       quarantined:
                         authority: db
                         sequence: 4780
@@ -3255,11 +3291,21 @@ paths:
                     type: [object, "null"]
                     description: |
                       The revision that was cleared, or `null` when the gate
-                      held no accepted revision.
+                      held no accepted revision. Clearing also drops the
+                      last-applied watermark, so a later runtime-refused slice
+                      cannot roll the gate back onto the generation this reset
+                      just released.
                     required: [authority, sequence]
                     properties:
                       authority:
                         type: string
+                        description: |
+                          Cleared ordering domain, control-character-stripped
+                          and truncated to 64 characters (a `(truncated)`
+                          suffix marks that). The authority is
+                          control-plane-supplied, so this response and the
+                          matching audit log line carry only the sanitized
+                          rendering.
                       sequence:
                         type: integer
                         format: int64

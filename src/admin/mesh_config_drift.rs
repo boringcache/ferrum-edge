@@ -388,6 +388,7 @@ mod tests {
     fn test_revision_diagnostics() -> MeshRevisionDiagnostics {
         MeshRevisionDiagnostics {
             accepted: None,
+            applied: None,
             quarantined: None,
             rejected_total: 0,
             adopted_total: 0,

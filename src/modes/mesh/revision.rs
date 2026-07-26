@@ -44,6 +44,30 @@
 //! it would break every ordinary reconnect. `Older`, `Unversioned`, and
 //! `Incomparable` are quarantined — the previously accepted slice keeps serving.
 //!
+//! # Candidate lifecycle (received → applied, or rolled back)
+//!
+//! Passing the freshness gate only makes a slice the RECEIVED candidate. The
+//! mesh proxy runtime is a second, independent gate: slice→config preparation
+//! or `ProxyState::update_config` can still refuse it, in which case the proxy
+//! keeps serving the previously applied generation. The watermark therefore has
+//! two slots:
+//!
+//! * `accepted` — the highest revision admitted into the RECEIVED slot. This is
+//!   what [`MeshRevisionGate::admit`] compares against, so a rapid burst of
+//!   updates still orders correctly while an earlier one is mid-apply.
+//! * `applied` — the revision of the slice the proxy runtime last ACCEPTED.
+//!   This is the authoritative last-good generation and the rollback target.
+//!
+//! [`MeshRevisionGate::commit_applied`] advances `applied` when the runtime
+//! accepts a candidate (including a content-no-op replay at the same revision).
+//! [`MeshRevisionGate::rollback_rejected`] runs when the runtime REFUSES one and
+//! returns `accepted` to `applied` — but only when the refused candidate is
+//! still the accepted watermark, so a late rejection of N can never roll back an
+//! already-received N+1. Without that rollback a hostile or buggy control plane
+//! could publish one runtime-invalid slice at a far-future sequence and
+//! permanently lock out every valid revision below it, even though its slice
+//! never became the serving generation.
+//!
 //! # Intentional rollback
 //!
 //! An operator rolling configuration back writes to the config store, which
@@ -111,10 +135,19 @@ impl MeshConfigRevision {
 
     /// Whether the wire-supplied shape is usable for ordering.
     ///
-    /// A blank or over-long authority carries no ordering meaning and is
-    /// treated as absent (fail closed) rather than compared.
+    /// A blank, over-long, or control-character-bearing authority carries no
+    /// ordering meaning and is treated as absent (fail closed) rather than
+    /// compared. Control characters are refused at the boundary — not merely
+    /// escaped downstream — because an authority that reaches the accepted
+    /// watermark is echoed into the operator reset audit log and the
+    /// `/mesh/config-drift` diagnostics; a CP that could park `\n`-bearing
+    /// text there would be shaping operator-facing records rather than naming
+    /// an ordering domain. Real authority ids are opaque printable labels
+    /// (`FERRUM_MESH_CONFIG_AUTHORITY_ID`), so nothing legitimate is excluded.
     pub fn is_well_formed(&self) -> bool {
-        !self.authority.trim().is_empty() && self.authority.len() <= MAX_AUTHORITY_LEN
+        !self.authority.trim().is_empty()
+            && self.authority.len() <= MAX_AUTHORITY_LEN
+            && !self.authority.chars().any(char::is_control)
     }
 
     /// Order `candidate` against `accepted`. See the module contract table.
@@ -263,11 +296,24 @@ pub struct MeshRevisionQuarantine {
 /// Full revision block on `GET /mesh/config-drift`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MeshRevisionDiagnostics {
-    /// Revision of the slice currently accepted, or `None` when the DP has
-    /// never accepted a revisioned slice (unversioned source, or pre-first
-    /// slice).
+    /// Revision of the slice currently accepted into the RECEIVED slot, or
+    /// `None` when the DP has never accepted a revisioned slice (unversioned
+    /// source, or pre-first slice).
+    ///
+    /// The `authority` here is a SANITIZED rendering (control characters
+    /// stripped, truncated) of the CP-supplied value; the raw string is kept
+    /// only inside the gate, where exact ordering comparisons need it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted: Option<MeshConfigRevision>,
+    /// Revision of the slice the proxy runtime last ACCEPTED — the last-good
+    /// generation actually serving traffic, and the rollback target when a
+    /// received candidate is refused by the runtime.
+    ///
+    /// Normally equal to `accepted`. It lags while a freshly received
+    /// candidate is mid-apply, and stays behind when that candidate turns out
+    /// to be runtime-invalid. Sanitized like `accepted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<MeshConfigRevision>,
     /// Most recent quarantine, retained until a slice is accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantined: Option<MeshRevisionQuarantine>,
@@ -284,7 +330,12 @@ pub struct MeshRevisionDiagnostics {
 
 #[derive(Debug, Default)]
 struct GateState {
+    /// Highest revision admitted into the RECEIVED slot. Ordering baseline for
+    /// [`MeshRevisionGate::admit`]. Raw CP value — exact comparisons need it.
     accepted: Option<MeshConfigRevision>,
+    /// Revision the proxy runtime last accepted. Rollback target when a
+    /// received candidate is refused by the runtime. Raw CP value.
+    applied: Option<MeshConfigRevision>,
     quarantined: Option<MeshRevisionQuarantine>,
     /// Foreign authority under observation for adoption, with the instant it
     /// was first seen. Reset whenever a slice is accepted or a DIFFERENT
@@ -338,17 +389,99 @@ impl MeshRevisionGate {
     /// Clear the accepted revision and quarantine record.
     ///
     /// The documented operator escape hatch (`POST /mesh/config-revision/reset`)
-    /// for a source reset inside one authority. Returns the revision that was
-    /// cleared, for the audit log.
+    /// for a source reset inside one authority.
+    ///
+    /// Clears the `applied` watermark too: leaving it would let the next
+    /// runtime-rejected candidate roll `accepted` straight back to the
+    /// generation the operator just cleared, silently undoing the reset.
+    ///
+    /// Returns a SANITIZED copy of the revision that was cleared, for the audit
+    /// log and the admin response: the authority is control-plane-supplied, so
+    /// the value that leaves the gate is control-character-stripped and
+    /// length-bounded. The raw string never escapes.
     pub fn reset(&self) -> Option<MeshConfigRevision> {
         let mut state = self.lock_state();
         state.quarantined = None;
         state.foreign_watch = None;
-        state.accepted.take()
+        state.applied = None;
+        state.accepted.take().as_ref().map(sanitized_revision)
     }
 
-    /// Decide whether `candidate` may replace the accepted slice, updating the
+    /// Commit the watermark for a slice the proxy runtime ACCEPTED.
+    ///
+    /// Advances `applied` to the accepted generation — including a
+    /// content-no-op or equal-revision replay, where the runtime accepts
+    /// without a config delta and the watermark must still record that this
+    /// revision is the live one. Also raises `accepted` when it is somehow
+    /// behind (an installer that bypassed [`Self::admit`], or the first slice
+    /// applied after an operator reset), so the two slots can never disagree in
+    /// the direction that would quarantine the generation actually serving.
+    pub fn commit_applied(&self, revision: Option<&MeshConfigRevision>) {
+        let revision = revision.filter(|revision| revision.is_well_formed());
+        let mut state = self.lock_state();
+        state.applied = revision.cloned();
+        let raise_accepted = match revision {
+            Some(candidate) => matches!(
+                MeshConfigRevision::compare(state.accepted.as_ref(), Some(candidate)),
+                MeshRevisionOrder::Bootstrap | MeshRevisionOrder::Newer
+            ),
+            None => false,
+        };
+        if raise_accepted {
+            state.accepted = revision.cloned();
+        }
+    }
+
+    /// Finalize a candidate the proxy runtime REFUSED.
+    ///
+    /// Returns `accepted` to the last proxy-applied revision so a runtime-
+    /// invalid slice cannot permanently advance the authoritative watermark
+    /// and lock out every valid revision beneath it.
+    ///
+    /// Rolls back ONLY when `candidate` is still the accepted watermark, using
+    /// exact `(authority, sequence)` equality: if a newer candidate was
+    /// received while this one was mid-apply, that newer candidate owns the
+    /// watermark and a late rejection must not disturb it. Returns whether a
+    /// rollback happened.
+    pub fn rollback_rejected(&self, candidate: Option<&MeshConfigRevision>) -> bool {
+        let candidate = candidate.filter(|revision| revision.is_well_formed());
+        let mut state = self.lock_state();
+        if state.accepted.as_ref() != candidate {
+            return false;
+        }
+        if state.accepted == state.applied {
+            return false;
+        }
+        let restored = state.applied.clone();
+        let (rejected_authority, rejected_sequence) = match candidate {
+            Some(revision) => (diagnostic_value(&revision.authority), revision.sequence),
+            None => ("<absent>".to_string(), 0),
+        };
+        let (restored_authority, restored_sequence) = match restored.as_ref() {
+            Some(revision) => (diagnostic_value(&revision.authority), revision.sequence),
+            None => ("<none>".to_string(), 0),
+        };
+        state.accepted = restored;
+        drop(state);
+
+        tracing::warn!(
+            rejected_authority = %rejected_authority,
+            rejected_sequence,
+            restored_authority = %restored_authority,
+            restored_sequence,
+            "Mesh proxy runtime refused a received slice; rolled the accepted config revision \
+             back to the last applied generation so valid intermediate revisions stay eligible"
+        );
+        true
+    }
+
+    /// Decide whether `candidate` may replace the RECEIVED slice, updating the
     /// accepted revision on success and the quarantine record on refusal.
+    ///
+    /// Admission is not the end of the lifecycle: the proxy runtime still has
+    /// to accept the candidate. See [`Self::commit_applied`] /
+    /// [`Self::rollback_rejected`], which finalize the watermark once that
+    /// second gate has ruled.
     ///
     /// `now` is injected so the adoption grace period is deterministic in
     /// tests. Runs to completion BEFORE any `ArcSwap` replacement.
@@ -469,15 +602,29 @@ impl MeshRevisionGate {
         Err(MeshRevisionRejection { reason, detail })
     }
 
+    /// RAW accepted revision, for ordering comparisons only. Anything that
+    /// logs it or returns it to a caller must render it through
+    /// [`Self::diagnostics`] (or [`Self::reset`]) instead, which sanitizes the
+    /// CP-supplied authority.
     pub fn accepted(&self) -> Option<MeshConfigRevision> {
         self.lock_state().accepted.clone()
     }
 
+    /// RAW last-applied revision. Same rule as [`Self::accepted`].
+    pub fn applied(&self) -> Option<MeshConfigRevision> {
+        self.lock_state().applied.clone()
+    }
+
+    /// Operator-facing view. Every control-plane-supplied authority in the
+    /// returned value is sanitized (control characters stripped, truncated),
+    /// so no CP can forge a log line or exceed the documented bounded
+    /// diagnostic surface through it.
     pub fn diagnostics(&self) -> MeshRevisionDiagnostics {
         let policy = self.policy();
         let state = self.lock_state();
         MeshRevisionDiagnostics {
-            accepted: state.accepted.clone(),
+            accepted: state.accepted.as_ref().map(sanitized_revision),
+            applied: state.applied.as_ref().map(sanitized_revision),
             quarantine_active: state.quarantined.is_some(),
             quarantined: state.quarantined.clone(),
             rejected_total: state.rejected_total,
@@ -494,6 +641,19 @@ impl MeshRevisionGate {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+/// Copy of a revision whose CP-supplied authority is safe to log or return.
+///
+/// The sequence is a `u64` and needs no bounding; only the authority string
+/// does. The gate keeps the raw value internally so ordering comparisons stay
+/// exact — sanitizing in place would make two distinct authorities that share
+/// a 64-character prefix compare equal.
+fn sanitized_revision(revision: &MeshConfigRevision) -> MeshConfigRevision {
+    MeshConfigRevision {
+        authority: diagnostic_value(&revision.authority),
+        sequence: revision.sequence,
     }
 }
 

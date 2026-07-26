@@ -13451,6 +13451,19 @@ fn start_mesh_slice_apply_task(
                         &dns_proxy,
                     )
                     .await;
+                    // Issue #2473 lifecycle: the freshness gate advanced its
+                    // accepted watermark when this slice entered the received
+                    // slot, but the proxy runtime is a second, independent
+                    // gate. A candidate the runtime just refused never became
+                    // the serving generation, so its revision must not keep the
+                    // watermark — otherwise one runtime-invalid slice published
+                    // at a far-future sequence would quarantine every valid
+                    // revision beneath it and block recovery. Roll back to the
+                    // last APPLIED revision, keyed to this exact received
+                    // candidate so a newer one received mid-apply is untouched.
+                    if !received_accepted {
+                        mesh_state.record_rejected_slice(&snapshot);
+                    }
                     // Finding 3 (accepted-remote/federation update vs rejected
                     // received slice): the discovery + federation pollers are
                     // keyed to the ACCEPTED slice, so they can publish overlay

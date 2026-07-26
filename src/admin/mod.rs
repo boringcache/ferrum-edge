@@ -3096,6 +3096,11 @@ async fn handle_mesh_runtime_overlay_get(
 ///
 /// Returns the cleared revision so the operator can record what the gate was
 /// holding. Never logs or returns slice content.
+///
+/// The revision the gate hands back is already sanitized — the `authority` is
+/// control-plane-supplied, so `MeshRevisionGate::reset` strips control
+/// characters and truncates before the value can reach this audit log line or
+/// the JSON body. Do not swap this for a raw accessor.
 async fn handle_mesh_config_revision_reset(
     state: &AdminState,
     auth: &AuditActor,

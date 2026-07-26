@@ -1150,11 +1150,29 @@ impl XdsConfigConsumer {
     /// gate (issue #2473).
     ///
     /// Returns `true` when the slice became live. A quarantined slice is a
-    /// no-op: the previously installed slice keeps serving (make-before-break
-    /// is preserved — the ADS accumulator is untouched, so the next coherent
-    /// response from a caught-up CP still applies). The gate already recorded
-    /// the reason-labelled metric and the sanitized diagnostic, so this only
-    /// adds the xDS-side context.
+    /// no-op for the LIVE state: the previously installed slice keeps serving.
+    ///
+    /// The ADS accumulator is deliberately NOT rewound. By the time the gate
+    /// rules, the response has already been folded into the accumulator and
+    /// ACKed (`handle_ads_response` rolls the accumulator back only for a
+    /// NACK — a structurally invalid response). That is correct rather than
+    /// leaky, because the accumulator is state-of-the-world state scoped to ONE
+    /// control-plane URL: `XdsStreamState::reset_for_new_control_plane` clears
+    /// it wholesale on failover, so a quarantined CP's resources can never mix
+    /// into another CP's slice. Within one CP the retained resources are
+    /// ordinary SotW resume state, and the required-type presence/version
+    /// coherence gates still govern the next build — the freshness gate
+    /// protects the serving generation, not the subscription. Rewinding the
+    /// accumulator here would instead desynchronize it from the versions this
+    /// client has already ACKed.
+    ///
+    /// Residual: unlike the native client, a quarantine does NOT tear down the
+    /// ADS stream, so a data plane pinned to a lagging CP holds its last-good
+    /// slice until that CP catches up, the foreign-authority adopt grace
+    /// elapses, or an operator resets the gate. See `docs/mesh.md`.
+    ///
+    /// The gate already recorded the reason-labelled metric and the sanitized
+    /// diagnostic, so this only adds the xDS-side context.
     pub fn apply_slice(&self, slice: MeshSlice) -> bool {
         match self.state.install_slice(slice) {
             crate::modes::mesh::runtime::MeshSliceInstall::Installed => true,

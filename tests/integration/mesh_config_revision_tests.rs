@@ -7,7 +7,7 @@
 //! slice `version` cannot arbitrate that — it renders the serving CP's local
 //! wall clock.
 //!
-//! Three layers of coverage:
+//! Five layers of coverage:
 //!
 //! 1. The pure comparison contract (`MeshConfigRevision::compare`) and the
 //!    stateful gate (`MeshRevisionGate`), including the time-dependent
@@ -19,6 +19,13 @@
 //! 3. A live two-CP `MeshSubscribe` run: a stale primary is quarantined, the
 //!    stream is torn down, and the data plane converges on the fresher
 //!    fallback without ever serving the stale slice.
+//! 4. The candidate LIFECYCLE across the freshness gate and the proxy runtime:
+//!    admission is provisional, so a candidate the runtime later refuses must
+//!    return the watermark to the last applied generation — without a late
+//!    rejection disturbing a newer candidate received meanwhile.
+//! 5. Bounding of the control-plane-supplied `authority` on every copy that
+//!    leaves the gate (diagnostics, the operator reset, and the log lines built
+//!    from them), while ordering keeps the raw value.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -727,4 +734,332 @@ async fn live_stale_primary_is_quarantined_and_the_client_converges_on_the_fresh
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
     stale_cp.shutdown().await;
     fresh_cp.shutdown().await;
+}
+
+// ── Candidate lifecycle: received → applied, or rolled back ────────────────
+//
+// Passing the freshness gate only makes a slice the RECEIVED candidate. The
+// mesh proxy runtime is a second, independent gate: slice→config preparation
+// or `ProxyState::update_config` can still refuse it, leaving the previous
+// generation serving. These tests drive the runtime seam
+// (`install_slice` → `record_applied_slice` / `record_rejected_slice`) that the
+// mesh apply loop uses, rather than `MeshRevisionGate::admit` in isolation,
+// because the defect they cover lives in the relationship between the two
+// gates and not in the comparison contract.
+
+/// `record_applied_slice` fans the accepted slice's (here empty) runtime
+/// overlay out to process-global RTDS consumers, so every lifecycle test below
+/// serialises against `mesh_runtime_overlay_consumers_tests` through the
+/// documented process-wide guard. Integration tests share one process per
+/// shard, and an empty overlay still REPLACES those consumers' state.
+fn overlay_consumer_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
+
+/// A candidate the proxy runtime refuses must not keep the authoritative
+/// watermark. Otherwise a hostile or buggy control plane publishes ONE
+/// runtime-invalid slice at a far-future sequence and permanently quarantines
+/// every valid revision beneath it — with a slice that never served a request.
+#[test]
+fn a_runtime_rejected_candidate_rolls_the_watermark_back_and_reopens_recovery() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+
+    // The proxy is serving revision N.
+    let applied = slice_at("v-10", Some(revision("db", 10)));
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+    assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+    assert_eq!(state.applied_revision(), Some(revision("db", 10)));
+
+    // N+10 passes wire binding and freshness admission and becomes the
+    // received candidate...
+    assert!(
+        state
+            .install_slice(slice_at("v-20", Some(revision("db", 20))))
+            .installed()
+    );
+    assert_eq!(
+        state.accepted_revision(),
+        Some(revision("db", 20)),
+        "admission is provisional but still advances the received watermark"
+    );
+
+    // ...and the proxy runtime then refuses it (preparation error, or
+    // `update_config` rejecting the candidate config). The proxy keeps N.
+    assert!(
+        state.record_rejected_slice(&state.snapshot()),
+        "the refused candidate owns the watermark, so it must roll back"
+    );
+    assert_eq!(
+        state.accepted_revision(),
+        Some(revision("db", 10)),
+        "the watermark returns to the last PROXY-APPLIED revision"
+    );
+    assert_eq!(state.applied_revision(), Some(revision("db", 10)));
+
+    // Every revision the poisoned watermark would have locked out is eligible
+    // again, so a control plane can still recover the data plane.
+    let recovery = slice_at("v-11", Some(revision("db", 11)));
+    assert!(state.install_slice(recovery.clone()).installed());
+    state.record_applied_slice(&recovery);
+    assert_eq!(installed_version(&state).as_deref(), Some("v-11"));
+    assert_eq!(state.applied_revision(), Some(revision("db", 11)));
+
+    // The rollback is not a general relaxation: genuinely stale revisions are
+    // still quarantined against the restored watermark.
+    assert_eq!(
+        state
+            .install_slice(slice_at("v-9", Some(revision("db", 9))))
+            .rejection()
+            .expect("an older revision stays quarantined after a rollback")
+            .reason(),
+        MeshRevisionRejectReason::StaleRevision
+    );
+}
+
+/// A rejection that lands after a NEWER candidate has already been received
+/// must not roll that newer candidate's watermark back — the apply task and the
+/// config consumer run concurrently, so this ordering is ordinary, not
+/// exceptional.
+#[test]
+fn a_late_rejection_cannot_roll_back_a_newer_candidate() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+    let applied = slice_at("v-10", Some(revision("db", 10)));
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+
+    // The apply task picks up N+10 and starts preparing it.
+    assert!(
+        state
+            .install_slice(slice_at("v-20", Some(revision("db", 20))))
+            .installed()
+    );
+    let mid_apply = state.snapshot();
+
+    // N+11 arrives while N+10 is still mid-apply and supersedes it.
+    assert!(
+        state
+            .install_slice(slice_at("v-21", Some(revision("db", 21))))
+            .installed()
+    );
+    assert_eq!(state.accepted_revision(), Some(revision("db", 21)));
+
+    assert!(
+        !state.record_rejected_slice(&mid_apply),
+        "a superseded candidate must not finalize the watermark"
+    );
+    assert_eq!(
+        state.accepted_revision(),
+        Some(revision("db", 21)),
+        "the newer candidate keeps the watermark it legitimately advanced"
+    );
+    assert_eq!(state.applied_revision(), Some(revision("db", 10)));
+
+    // The newer candidate still finalizes normally when the runtime rules on it.
+    assert!(state.record_rejected_slice(&state.snapshot()));
+    assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+}
+
+/// A candidate refused before ANYTHING has been applied must return the gate to
+/// no baseline, not pin it to a revision the proxy never served — otherwise a
+/// single bad first slice poisons startup and every subsequent fallback.
+#[test]
+fn a_runtime_rejected_bootstrap_candidate_returns_to_no_baseline() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+
+    assert!(
+        state
+            .install_slice(slice_at("v-9000", Some(revision("db", 9000))))
+            .installed()
+    );
+    assert_eq!(state.accepted_revision(), Some(revision("db", 9000)));
+
+    assert!(state.record_rejected_slice(&state.snapshot()));
+    assert!(
+        state.accepted_revision().is_none(),
+        "nothing was ever applied, so there is no baseline to hold"
+    );
+    assert!(state.applied_revision().is_none());
+    assert!(state.revision_diagnostics().accepted.is_none());
+
+    // Bootstrap is open again — including from a lower sequence and from a
+    // different ordering domain.
+    let recovery = slice_at("v-1", Some(revision("db", 1)));
+    assert!(state.install_slice(recovery.clone()).installed());
+    state.record_applied_slice(&recovery);
+    assert_eq!(state.applied_revision(), Some(revision("db", 1)));
+}
+
+/// The commit half has to remember equal-revision replays too: a reconnect
+/// replays the CP's initial slice at the unchanged revision and the runtime
+/// accepts it with no config delta. If that did not commit, a later rollback
+/// would drop to a stale baseline (or to none at all).
+#[test]
+fn an_equal_revision_replay_commits_the_applied_watermark() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+    let first = slice_at("v-10", Some(revision("db", 10)));
+    assert!(state.install_slice(first.clone()).installed());
+    state.record_applied_slice(&first);
+
+    let replay = slice_at("v-10-replay", Some(revision("db", 10)));
+    assert!(
+        state.install_slice(replay.clone()).installed(),
+        "an equal revision MUST install — every ordinary reconnect replays one"
+    );
+    state.record_applied_slice(&replay);
+    assert_eq!(state.applied_revision(), Some(revision("db", 10)));
+    assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+
+    // A later runtime rejection rolls back to the replayed generation.
+    assert!(
+        state
+            .install_slice(slice_at("v-50", Some(revision("db", 50))))
+            .installed()
+    );
+    assert!(state.record_rejected_slice(&state.snapshot()));
+    assert_eq!(state.accepted_revision(), Some(revision("db", 10)));
+}
+
+/// The operator reset clears the APPLIED watermark as well. Leaving it would
+/// let the next runtime-refused candidate roll the gate straight back onto the
+/// generation the operator just released, silently undoing the reset.
+#[test]
+fn reset_clears_the_applied_watermark_so_a_rejection_cannot_resurrect_it() {
+    let _overlay_guard = overlay_consumer_guard();
+    let state = MeshRuntimeState::new();
+    let applied = slice_at("v-10", Some(revision("db", 10)));
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+
+    let cleared = state
+        .reset_accepted_revision()
+        .expect("the accepted revision is returned for the audit log");
+    assert_eq!(cleared, revision("db", 10));
+    assert!(state.accepted_revision().is_none());
+    assert!(state.applied_revision().is_none());
+
+    // The store was restored from backup, so the next slice rewinds to a lower
+    // sequence and installs on the cleared baseline.
+    assert!(
+        state
+            .install_slice(slice_at("v-3", Some(revision("db", 3))))
+            .installed()
+    );
+    assert!(
+        state.record_rejected_slice(&state.snapshot()),
+        "the rewound candidate owns the post-reset watermark"
+    );
+    assert!(
+        state.accepted_revision().is_none(),
+        "a rejection must not resurrect the pre-reset generation"
+    );
+}
+
+// ── Diagnostic bounding of control-plane-supplied authorities ──────────────
+
+/// A control-character-bearing authority is refused as malformed at the
+/// boundary, so it can never reach the accepted watermark, the reset audit log,
+/// or the admin surface. The quarantine record that DOES echo it is sanitized.
+#[test]
+fn control_character_authorities_are_refused_and_never_reach_a_watermark() {
+    let _overlay_guard = overlay_consumer_guard();
+    let forged = revision("db\n2026-07-26 WARN forged-by-the-control-plane", 100);
+    assert!(!forged.is_well_formed());
+    assert_eq!(
+        MeshConfigRevision::compare(Some(&revision("db", 10)), Some(&forged)),
+        MeshRevisionOrder::Unversioned
+    );
+    assert_eq!(
+        MeshConfigRevision::compare(Some(&forged), Some(&revision("db", 10))),
+        MeshRevisionOrder::Bootstrap,
+        "a malformed ACCEPTED revision cannot lock the data plane out either"
+    );
+
+    let state = MeshRuntimeState::new();
+    let applied = slice_at("v-10", Some(revision("db", 10)));
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+
+    assert_eq!(
+        state
+            .install_slice(slice_at("v-forged", Some(forged)))
+            .rejection()
+            .expect("a malformed authority carries no ordering meaning")
+            .reason(),
+        MeshRevisionRejectReason::MissingRevision
+    );
+
+    let diagnostics = state.revision_diagnostics();
+    let quarantined = diagnostics
+        .quarantined
+        .expect("the refusal is recorded for operators");
+    assert!(
+        !quarantined.authority.chars().any(char::is_control),
+        "the echoed authority must not be able to forge a log line: {:?}",
+        quarantined.authority
+    );
+    assert_eq!(diagnostics.accepted, Some(revision("db", 10)));
+    assert_eq!(diagnostics.applied, Some(revision("db", 10)));
+
+    let cleared = state
+        .reset_accepted_revision()
+        .expect("the accepted revision is returned");
+    assert!(!cleared.authority.chars().any(char::is_control));
+}
+
+/// Every copy of an authority that LEAVES the gate — diagnostics, the reset
+/// response, and the log lines built from them — is length-bounded, while the
+/// raw value stays inside for exact ordering.
+#[test]
+fn output_copies_of_the_authority_are_bounded_but_ordering_stays_exact() {
+    let _overlay_guard = overlay_consumer_guard();
+    // Well formed (within `MAX_AUTHORITY_LEN`) but longer than the 64-character
+    // diagnostic bound.
+    let long = revision(&"d".repeat(100), 7);
+    assert!(long.is_well_formed());
+    let bounded = format!("{}(truncated)", "d".repeat(64));
+
+    let state = MeshRuntimeState::new();
+    let applied = slice_at("v-7", Some(long.clone()));
+    assert!(state.install_slice(applied.clone()).installed());
+    state.record_applied_slice(&applied);
+
+    // Ordering keeps the RAW value: a different authority that shares the
+    // first 64 characters must not be mistaken for the accepted one.
+    assert_eq!(state.accepted_revision(), Some(long));
+    let sibling = revision(&format!("{}x", "d".repeat(99)), 9);
+    assert_eq!(
+        state
+            .install_slice(slice_at("v-9", Some(sibling)))
+            .rejection()
+            .expect("a distinct authority is a distinct ordering domain")
+            .reason(),
+        MeshRevisionRejectReason::IncomparableAuthority
+    );
+
+    let diagnostics = state.revision_diagnostics();
+    assert_eq!(
+        diagnostics
+            .accepted
+            .expect("accepted watermark is reported")
+            .authority,
+        bounded
+    );
+    assert_eq!(
+        diagnostics
+            .applied
+            .expect("applied watermark is reported")
+            .authority,
+        bounded
+    );
+
+    let cleared = state
+        .reset_accepted_revision()
+        .expect("the accepted revision is returned");
+    assert_eq!(cleared.authority, bounded);
+    assert_eq!(cleared.sequence, 7);
 }

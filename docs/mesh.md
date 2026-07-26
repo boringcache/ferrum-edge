@@ -1474,7 +1474,18 @@ The data plane records the revision of the slice it accepted and compares every 
 
 Equal sequences must install: reconnecting to the same CP replays that CP's initial slice at the unchanged revision, and quarantining it would break every ordinary reconnect.
 
-A quarantined candidate mutates nothing — the last-good slice keeps serving, the receive metric and `last_received_at` do not advance, and no watcher is woken. On the native stream a quarantine also **drops the stream** so multi-CP failover moves off the lagging control plane; staying attached would only let it keep serving stale generations. On the xDS path the ADS accumulator is untouched, so the next coherent response from a caught-up CP still applies (make-before-break preserved).
+A quarantined candidate mutates nothing — the last-good slice keeps serving, the receive metric and `last_received_at` do not advance, and no watcher is woken. On the native stream a quarantine also **drops the stream** so multi-CP failover moves off the lagging control plane; staying attached would only let it keep serving stale generations.
+
+On the xDS path the quarantine applies to the *slice*, not to the subscription: the ADS response was already folded into the resource accumulator and ACKed before the slice was rebuilt, and the gate does not rewind it. That is deliberate. The accumulator is state-of-the-world state scoped to a single control-plane URL and is cleared wholesale when the client fails over (`reset_for_new_control_plane`), so a quarantined CP's resources can never mix into another CP's slice; within one CP the retained resources are ordinary SotW resume state, and the required-type presence and version-coherence gates still govern the next build. Rewinding the accumulator would instead desynchronize it from the versions the client has already ACKed. Unlike the native client, an xDS quarantine does **not** drop the stream, so a data plane attached to a lagging CP keeps serving its last-good slice until that CP catches up, the foreign-authority adopt grace elapses, or an operator resets the gate.
+
+### Received versus applied (candidate lifecycle)
+
+Passing the freshness gate makes a slice the *received* candidate, not the serving one. The mesh proxy runtime is a second, independent gate: slice→config preparation or the proxy config apply can still refuse it, leaving the previous generation live. The gate therefore tracks two watermarks, both on `GET /mesh/config-drift`:
+
+- **`accepted`** — the highest revision admitted into the received slot. This is what candidate comparison runs against, so a burst of updates still orders correctly while an earlier one is mid-apply.
+- **`applied`** — the revision of the slice the proxy runtime last accepted. This is the authoritative last-good generation.
+
+When the runtime accepts a candidate, `applied` advances to it (including a content-no-op or equal-revision replay, where the runtime accepts with no config delta). When the runtime **refuses** one, `accepted` is rolled back to `applied`, so every revision between them stays eligible. Without that rollback, a single runtime-invalid slice published at a far-future sequence would advance the watermark past every valid revision beneath it and block recovery with a generation that never served a request — the exact lockout the reset endpoint exists to avoid needing. The rollback is keyed to the exact received candidate (`(authority, sequence)` equality plus received-slot identity), so a *late* rejection of N never disturbs an N+1 that arrived while N was being applied. A candidate refused before anything was ever applied returns the gate to no baseline at all, rather than poisoning startup and fallback.
 
 ### Intentional rollback
 
@@ -1490,7 +1501,7 @@ Two escape hatches, both explicit:
 ### Observability
 
 - `/metrics` (unauthenticated tier): `ferrum_mesh_config_revision_rejections_total{reason}` with `reason` ∈ `stale_revision` / `incomparable_authority` / `missing_revision`, and `ferrum_mesh_config_revision_adoptions_total`. Fixed cardinality — no CP-supplied authority string or sequence number reaches this surface.
-- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted `(authority, sequence)`, the most recent quarantine (sanitized authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on.
+- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted and applied `(authority, sequence)` watermarks, the most recent quarantine (authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on. Every authority rendered on this surface — and in the reset response and its audit log line — is control-character-stripped and truncated to 64 characters; the raw control-plane string never leaves the gate, where exact ordering comparisons need it. An authority containing control characters is refused as malformed at the boundary and never becomes a watermark at all.
 
 ### Scope and residuals
 
