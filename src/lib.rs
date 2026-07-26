@@ -102,6 +102,28 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
+    /// TCP SO_REUSEPORT accept-loop peer class (primary vs extra).
+    pub use crate::proxy::tcp_proxy::TcpAcceptLoopClass;
+
+    /// One-shot fault injected when a matching TCP accept loop starts.
+    pub use crate::proxy::tcp_proxy::TcpAcceptLoopFault;
+
+    /// Install or clear the TCP accept-loop fault seam used by lifecycle tests.
+    pub fn set_tcp_accept_loop_fault_for_test(fault: Option<TcpAcceptLoopFault>) {
+        crate::proxy::tcp_proxy::set_tcp_accept_loop_fault_for_test(fault);
+    }
+
+    /// Supervise TCP SO_REUSEPORT accept-loop peers the same way production does.
+    pub async fn supervise_tcp_accept_loop_peers_for_test(
+        peers: Vec<(
+            TcpAcceptLoopClass,
+            tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        )>,
+        cancel_siblings: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
