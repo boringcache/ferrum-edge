@@ -2090,16 +2090,26 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
 async fn test_dp_preserves_config_after_cp_shutdown() {
     // This test verifies that when the CP goes down, the DP preserves its cached config
     // and the start_dp_client_with_shutdown loop keeps running (doesn't crash).
+    //
+    // The CP must be *severable*: aborting a `start_test_cp_server` handle only
+    // drops tonic's accept loop, and the established ConfigSync stream keeps
+    // being served by a detached per-connection task. The DP would never see the
+    // CP go away, so "config is preserved after CP shutdown" would hold for the
+    // trivial reason that no shutdown ever happened.
 
     // Start CP server with initial config
     let cp_config = create_test_config(2);
-    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+    let mut cp = start_severable_test_cp_server(cp_config).await;
 
     let proxy_state = create_test_proxy_state();
-    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let cp_url = cp.url();
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
 
     // Use the DP client loop with auto-reconnect logic.
     let ps = proxy_state.clone();
+    let cs = connection_state.clone();
     let url_clone = cp_url.clone();
     let client_handle = tokio::spawn(async move {
         dp_client::start_dp_client_with_shutdown_and_startup_ready(
@@ -2112,7 +2122,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
             None,
             "ferrum".to_string(),
             0,
-            None,
+            Some(cs),
             None,
         )
         .await;
@@ -2132,10 +2142,18 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
         received.is_ok(),
         "Should receive initial config with 2 proxies"
     );
+    assert!(
+        wait_for_connected(&connection_state, Duration::from_secs(5)).await,
+        "DP should report an established ConfigSync stream before the CP is severed"
+    );
 
-    // Shut down CP server
-    server_handle.abort();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Shut down CP server — listener and every established stream.
+    cp.sever();
+    assert!(
+        wait_for_disconnected(&connection_state, Duration::from_secs(30)).await,
+        "DP must actually observe the CP going away — otherwise the preservation \
+         assertions below hold vacuously"
+    );
 
     // Verify cached config is preserved (the key behavior)
     assert_eq!(
@@ -4811,6 +4829,44 @@ fn send_delta(
     let version = delta.poll_timestamp.to_rfc3339();
     let body = serde_json::to_string(delta).unwrap();
     let _ = tx.send(delta_update(body, &version));
+}
+
+/// Wait until the DP reports an established ConfigSync stream.
+async fn wait_for_connected(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_state.load().connected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until the DP reports that its ConfigSync stream is gone.
+///
+/// Proves a "CP goes away" test actually severed the transport: with tonic's
+/// detached per-connection tasks an aborted accept loop leaves the DP happily
+/// connected, and every post-shutdown assertion becomes vacuous.
+async fn wait_for_disconnected(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !connection_state.load().connected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Wait until the DP's reported CP endpoint is `expected`.
