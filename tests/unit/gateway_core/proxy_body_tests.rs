@@ -3,7 +3,11 @@
 //! Tests: ProxyBody variants, StreamingMetrics, size hints, end-of-stream detection
 
 use bytes::Bytes;
-use ferrum_edge::proxy::body::{ProxyBody, StreamingMetrics};
+use ferrum_edge::_test_support::{
+    DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
+    poll_upload_cancel_for_test, request_body_drop_outcome_for_test,
+};
+use ferrum_edge::proxy::body::{ProxyBody, RequestBodyOutcome, StreamingMetrics};
 use http_body::Body;
 use std::sync::Arc;
 use std::time::Instant;
@@ -375,4 +379,133 @@ fn test_into_tracked_returns_metrics_independent_of_body_kind() {
     // The metrics object exists and is usable — Arc strong count = 1
     // because the no-op path doesn't share metrics with a TrackedBody.
     assert_eq!(Arc::strong_count(&metrics), 1);
+}
+
+// ── Direct-H2 request-body terminal outcomes ───────────────────────────
+//
+// `SizeLimitedIncoming` can be handed an optional completion channel so the
+// direct-H2 dispatch path can withhold a backend response until the client
+// upload's size decision is final. Two contracts back that:
+//
+//   1. Hyper's HTTP/2 client sends END_STREAM with the request headers when
+//      the body is already end-of-stream, then drops the adapter without ever
+//      polling it. That drop must report a normal completion — issue #3176's
+//      regression turned every empty direct-H2 request into a 502.
+//   2. The gate that consumes the outcome returns a deterministic 413 on
+//      overflow, forwards on every other terminal outcome (all of which imply
+//      the limit was never exceeded), and fails closed only when no terminal
+//      outcome was reported at all.
+
+#[test]
+fn test_drop_without_poll_on_end_stream_body_reports_completion() {
+    // Known-empty / already-ended upload: nothing was left to send, so the
+    // drop is a normal completion, not an abandoned upload.
+    assert_eq!(
+        request_body_drop_outcome_for_test(true),
+        RequestBodyOutcome::Completed
+    );
+}
+
+#[test]
+fn test_drop_with_outstanding_frames_reports_abandoned() {
+    // Frames were still outstanding when the adapter went away — the upload
+    // never finished and must not be treated as a success.
+    assert_eq!(
+        request_body_drop_outcome_for_test(false),
+        RequestBodyOutcome::Abandoned
+    );
+}
+
+#[test]
+fn test_upload_gate_forwards_on_clean_completion() {
+    assert_eq!(
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Completed)),
+        DirectH2UploadGateForTest::Forward
+    );
+}
+
+#[test]
+fn test_upload_gate_forwards_on_error_and_abandon() {
+    // Neither outcome can coexist with an overflow: `poll_frame` takes the
+    // completion sender when it stores `exceeded`, so an exceeded upload always
+    // reports `Exceeded`. Failing closed here would turn a backend that answers
+    // early and resets the unread upload — or a client that disconnects
+    // mid-body — into a 502 without enforcing anything extra.
+    for outcome in [RequestBodyOutcome::Errored, RequestBodyOutcome::Abandoned] {
+        assert_eq!(
+            direct_h2_upload_gate_for_test(Some(outcome)),
+            DirectH2UploadGateForTest::Forward,
+            "outcome {outcome:?} must forward the backend response"
+        );
+    }
+}
+
+#[test]
+fn test_upload_gate_maps_overflow_to_deterministic_413() {
+    // Overflow must never expose the backend's early response.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(Some(RequestBodyOutcome::Exceeded)),
+        DirectH2UploadGateForTest::RequestBodyTooLarge
+    );
+}
+
+#[test]
+fn test_upload_gate_fails_closed_on_missing_signal() {
+    // Sender dropped without reporting: unreachable through the adapter's Drop
+    // impl, but with no terminal size decision the gate must refuse to forward.
+    assert_eq!(
+        direct_h2_upload_gate_for_test(None),
+        DirectH2UploadGateForTest::FailClosed
+    );
+}
+
+#[test]
+fn test_direct_h2_upload_cancel_signal_lifecycle() {
+    // Hyper moves an H2 request body into a detached pipe task once
+    // `send_request` is called. A dispatch path that returns early must be able
+    // to wake that task; merely dropping the completion receiver leaves a
+    // stalled upload pinned. This pins the three states the body adapter acts
+    // on before every inner poll.
+
+    // Armed but unsignalled: keep forwarding, and stay armed so the gate can
+    // still cancel later.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut cancel = Some(cancel_rx);
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
+    assert!(cancel.is_some(), "a pending channel must stay armed");
+
+    // Signalled: the dispatch path timed out and wants the upload torn down.
+    cancel_tx.send(()).expect("receiver is still alive");
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Cancelled
+    );
+    assert!(cancel.is_none(), "a consumed channel must be disarmed");
+
+    // Disarmed: no second cancellation, and no re-poll of a completed receiver.
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
+
+    // Sender dropped without signalling: the dispatch path finished normally,
+    // so the upload keeps flowing and the channel is simply disarmed.
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut cancel = Some(cancel_rx);
+    drop(cancel_tx);
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
+    assert!(cancel.is_none(), "a dropped sender must disarm the channel");
+
+    // No channel at all (the reqwest / non-direct-H2 constructors): idle.
+    let mut cancel = None;
+    assert_eq!(
+        poll_upload_cancel_for_test(&mut cancel),
+        UploadCancelSignalForTest::Idle
+    );
 }

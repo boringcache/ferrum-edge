@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, PodStatus, Probe};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::watcher::{self as kube_watcher, Event};
@@ -665,6 +665,7 @@ async fn start_node_agent_admin_listeners(
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
+        admin_request_limits: crate::admin::AdminRequestLimits::from_env_config(env_config),
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     };
 
@@ -836,6 +837,18 @@ fn create_backend(
     }
 }
 
+/// Why the node-agent pod-watcher select loop stopped.
+///
+/// Explicit shutdown remains a clean `Ok` exit. Unexpected end-of-stream from
+/// the Kubernetes watcher still runs the same BPF/CNI cleanup, then returns
+/// `Err` so supervisors that restart only on nonzero exit will relaunch the
+/// agent (#2369).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodWatcherLoopExit {
+    ShutdownRequested,
+    WatcherExhausted,
+}
+
 async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
@@ -852,9 +865,6 @@ async fn run_with_backend(
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
     let mut owner = InitializedBackendOwner::new(backend);
 
-    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
-
-    let mut shutdown_rx = shutdown_tx.subscribe();
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
         Err(err) => return Err(owner.fail_with(err)),
@@ -862,7 +872,88 @@ async fn run_with_backend(
     let pods: Api<Pod> = Api::all(client.clone());
     let watcher_config =
         kube_watcher::Config::default().fields(&format!("spec.nodeName={}", config.node_name));
-    let mut pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    let pod_stream = Box::pin(kube_watcher::watcher(pods, watcher_config));
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        Some(client),
+        pod_stream,
+        std::iter::empty(),
+    )
+    .await
+}
+
+/// Test seam for [#2369](https://github.com/ferrum-edge/ferrum-edge/issues/2369):
+/// drive the node-agent watcher loop against an injected finite (or pending)
+/// pod-event stream without a live Kubernetes API. CNI is disabled; callers
+/// may seed already-attached pods to assert BPF detach/cleanup side effects.
+#[allow(dead_code)] // Library integration tests exercise this seam; the binary target does not.
+pub(crate) async fn run_with_pod_stream_for_test<S, I>(
+    backend: &mut crate::ebpf::MockEbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    initialize_backend(backend, config, metrics.as_ref())?;
+    let mut owner = InitializedBackendOwner::borrowed(backend);
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let cni_config = CniListenerConfig {
+        enabled: false,
+        socket_path: DEFAULT_NODE_AGENT_SOCKET_PATH.to_string(),
+    };
+    run_with_pod_stream(
+        &mut owner,
+        config,
+        metrics,
+        shutdown_tx,
+        startup_ready,
+        cni_config,
+        None,
+        pod_stream,
+        seed_pods,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_pod_stream<S, I>(
+    owner: &mut InitializedBackendOwner<'_>,
+    config: &NodeAgentConfig,
+    metrics: Arc<NodeAgentMetrics>,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
+    cni_config: CniListenerConfig,
+    kube_client: Option<Client>,
+    mut pod_stream: S,
+    seed_pods: I,
+) -> Result<(), anyhow::Error>
+where
+    S: Stream<Item = Result<Event<Pod>, kube_watcher::Error>> + Unpin,
+    I: IntoIterator<Item = PodAttachmentState>,
+{
+    // Caller must have already initialized the backend (`run_with_backend` or
+    // `run_with_pod_stream_for_test`) so production keeps init → kube-client
+    // ordering for cleanup-ownership compatibility with PR #3142.
+    if cni_config.enabled && kube_client.is_none() {
+        anyhow::bail!("CNI plugin listener requires a Kubernetes client for pod metadata lookups");
+    }
+
+    let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+    for state in seed_pods {
+        pod_states.insert(state.pod_uid.clone(), state);
+    }
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
     let mut init_seen: Option<HashSet<String>> = None;
 
     // Optional CNI plugin listener: when enabled, spawns a UDS server that
@@ -906,14 +997,19 @@ async fn run_with_backend(
     udp_readiness_interval.tick().await;
     let mut udp_ready_uids = HashSet::new();
 
-    loop {
+    let exit_reason = loop {
         if *shutdown_rx.borrow() {
-            break;
+            break PodWatcherLoopExit::ShutdownRequested;
         }
         tokio::select! {
+            // Prefer an operator-requested shutdown when it becomes ready in
+            // the same poll as watcher exhaustion. The None arm rechecks the
+            // watch value as well, closing the race where shutdown arrives
+            // after this arm was polled but before the stream is polled.
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    break;
+                    break PodWatcherLoopExit::ShutdownRequested;
                 }
             }
             event = pod_stream.next() => {
@@ -971,20 +1067,31 @@ async fn run_with_backend(
                         metrics.attach_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     None => {
+                        if *shutdown_rx.borrow() {
+                            break PodWatcherLoopExit::ShutdownRequested;
+                        }
                         warn!("Pod watcher ended unexpectedly");
-                        break;
+                        break PodWatcherLoopExit::WatcherExhausted;
                     }
                 }
             }
             cni_work = cni_work_rx.recv(), if cni_work_open => {
                 match cni_work {
                     Some(work) => {
+                        let Some(client) = kube_client.as_ref() else {
+                            // Unreachable when CNI is enabled (gated at entry).
+                            // Respond fail-closed so the CNI binary cannot hang.
+                            let _ = work.respond.send(CniRpcResponse::Error {
+                                reason: "node-agent Kubernetes client unavailable".to_string(),
+                            });
+                            continue;
+                        };
                         let enrolled_uid = process_cni_work_item(
                             owner.backend_mut(),
                             &pod_states,
                             config,
                             metrics.as_ref(),
-                            &client,
+                            client,
                             work,
                         ).await;
                         mark_relist_seen_from_cni_add(&mut init_seen, enrolled_uid.as_deref());
@@ -1051,9 +1158,19 @@ async fn run_with_backend(
                 );
             }
         }
-    }
+    };
+
+    // Same finally-style path for both exit reasons: stop background CNI work,
+    // detach BPF / maps, then await the listener. Watcher exhaustion must not
+    // skip this and must not hang waiting for a CNI task that never sees
+    // shutdown. Drop readiness before the potentially slow CNI join so probes
+    // do not keep reporting ready while capture is tearing down.
+    //
+    startup_ready.store(false, Ordering::Release);
+    let _ = shutdown_tx.send(true);
 
     info!(
+        exit_reason = ?exit_reason,
         pods_enrolled = metrics.pods_enrolled.load(Ordering::Relaxed),
         pods_unenrolled = metrics.pods_unenrolled.load(Ordering::Relaxed),
         attach_errors = metrics.attach_errors.load(Ordering::Relaxed),
@@ -1068,7 +1185,12 @@ async fn run_with_backend(
         warn!(error = %err, "Node agent CNI listener task panicked");
     }
 
-    Ok(())
+    match exit_reason {
+        PodWatcherLoopExit::ShutdownRequested => Ok(()),
+        PodWatcherLoopExit::WatcherExhausted => {
+            Err(anyhow::anyhow!("Pod watcher ended unexpectedly"))
+        }
+    }
 }
 
 fn watcher_init_stale_uids(
@@ -5820,18 +5942,41 @@ impl Drop for LoadedBackendRollback<'_> {
 /// shutdown, or Drop on unwind — must invoke cleanup exactly once through this
 /// type. `initialize_backend` owns rollback for pre-success failures so the
 /// two paths never double-clean.
-struct InitializedBackendOwner {
-    backend: Box<dyn EbpfBackend>,
+enum InitializedBackend<'a> {
+    Owned(Box<dyn EbpfBackend>),
+    Borrowed(&'a mut dyn EbpfBackend),
+}
+
+impl<'a> InitializedBackend<'a> {
+    fn as_mut(&mut self) -> &mut dyn EbpfBackend {
+        match self {
+            Self::Owned(backend) => backend.as_mut(),
+            Self::Borrowed(backend) => &mut **backend,
+        }
+    }
+}
+
+struct InitializedBackendOwner<'a> {
+    backend: InitializedBackend<'a>,
     /// Latched by the first cleanup so every later path (including `Drop`) is a
     /// no-op. This is the whole exactly-once mechanism; there is no second
     /// cleanup owner after `initialize_backend` returns `Ok`.
     cleaned_up: bool,
 }
 
-impl InitializedBackendOwner {
+impl InitializedBackendOwner<'static> {
     fn new(backend: Box<dyn EbpfBackend>) -> Self {
         Self {
-            backend,
+            backend: InitializedBackend::Owned(backend),
+            cleaned_up: false,
+        }
+    }
+}
+
+impl<'a> InitializedBackendOwner<'a> {
+    fn borrowed(backend: &'a mut dyn EbpfBackend) -> Self {
+        Self {
+            backend: InitializedBackend::Borrowed(backend),
             cleaned_up: false,
         }
     }
@@ -5867,7 +6012,7 @@ impl InitializedBackendOwner {
             return;
         }
         self.cleaned_up = true;
-        if let Err(cleanup_err) = self.backend.cleanup_all() {
+        if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
             warn!(
                 error = %cleanup_err,
                 context,
@@ -5881,7 +6026,7 @@ impl InitializedBackendOwner {
             return;
         }
         self.cleaned_up = true;
-        if let Err(cleanup_err) = self.backend.cleanup_all() {
+        if let Err(cleanup_err) = self.backend.as_mut().cleanup_all() {
             warn!(
                 error = %cleanup_err,
                 original_error = %original,
@@ -5892,7 +6037,7 @@ impl InitializedBackendOwner {
     }
 }
 
-impl Drop for InitializedBackendOwner {
+impl Drop for InitializedBackendOwner<'_> {
     fn drop(&mut self) {
         // Panic / early-return safety net. No-op when `shutdown_pods` or
         // `fail_with` already cleaned up.
