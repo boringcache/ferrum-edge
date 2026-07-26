@@ -10405,13 +10405,15 @@ components:
           type: integer
           format: uint64
           description: >-
-            Maximum lifetime of one active stream's staging entry and reserved
-            commit permit.
+            Maximum lifetime of one active stream's audit capture, staging
+            entry, and reserved commit permit. Expiry clears capture/hash work
+            before accounting is released.
         stream_reservations_expired:
           type: integer
           format: uint64
           description: >-
-            Stream reservations reclaimed by the sweeper after exceeding
+            Stream reservations and inspector capture state revoked by the
+            per-stream deadline owner or repair sweep after exceeding
             `max_stream_reservation_secs`. Non-zero means streams are
             outliving their bound.
         stream_hash_scope:
@@ -19072,8 +19074,15 @@ components:
                 request_body_omitted_reason / response_body_omitted_reason =
                 redaction_scan_limit with the body_truncated flag set. Hashes,
                 envelope, status, and bounded guardrail metadata still export.
-                mode=full_body caps on a UTF-8 boundary first and never scans
-                past the cap, so it is unaffected.
+                Streaming redacted capture enforces this bound while chunks
+                arrive: if it is smaller than max_stream_capture_bytes, no
+                more than max_redaction_scan_bytes is copied and crossing the
+                bound records response_body_omitted_reason =
+                redaction_scan_limit rather than exporting a raw boundary
+                fragment. The keyed digest still follows capture.stream_hash
+                until reservation expiry revokes all audit work. mode=full_body
+                caps on a UTF-8 boundary first and never scans past the cap, so
+                it is unaffected.
             max_entry_bytes:
               type: integer
               minimum: 1
@@ -19122,13 +19131,25 @@ components:
                 one-hour orphan TTL, so without this bound a never-ending
                 stream, or one whose terminal hook is lost, would hold a
                 staging slot, a queue permit, and its retained bytes forever
-                until all reservations were exhausted. The amortized sweeper
-                reclaims entries past this age (releasing permit, staging slot,
-                byte leases, and pending response evidence); a terminal callback
-                arriving after reclamation is ignored rather than resurrecting
-                stale evidence or an unbudgeted record. Reclamations are logged
-                and counted in stream_reservations_expired on authenticated
-                /health.
+                until all reservations were exhausted. A cancellable one-shot
+                owner revokes even an idle stream at its deadline without
+                waiting for another request or chunk; the amortized sweep
+                remains a repair net. Both paths first revoke the per-stream
+                response accumulator and keyed HMAC through narrowly scoped
+                shared state, then release the queue permit, staging slot,
+                staging lease, and worst-case queued-record lease exactly once.
+                Later bytes forward unchanged without capture or hash work. No
+                global tombstone remains for the live connection: inspector
+                drop publishes a body-free request-owned handoff only when the
+                stream actually terminates.
+                Normal or abnormal late termination emits at most one
+                best-effort fallback without request/response excerpts or
+                hashes and without resurrecting the released commit permit.
+                The process-global live-slot map is capped at 4096 and expiry
+                releases that capacity; the remaining stream-owned handle has
+                no capture/hash/accounting state.
+                Reclamations are logged and counted in
+                stream_reservations_expired on authenticated /health.
         sink:
           type: object
           required: [endpoint_url]

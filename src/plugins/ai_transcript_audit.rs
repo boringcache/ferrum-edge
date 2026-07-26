@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,8 +56,9 @@ use super::utils::{
     parse_http_endpoint, validate_batch_config,
 };
 use super::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
-    ResponseStreamInspector, TransactionSummary,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext,
+    ResponseStreamAction, ResponseStreamHandoff, ResponseStreamInspector, TransactionSummary,
+    allocate_response_stream_handoff_id,
 };
 use crate::proxy::{
     REJECTION_RESPONSE_METADATA_KEY, REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY,
@@ -663,6 +664,34 @@ struct StreamCaptured {
     response_hash_bytes: u64,
 }
 
+/// Mutable audit-only work for one live response stream. It lives behind the
+/// slot mutex so the reservation sweeper can synchronously take and drop both
+/// the retained bytes and keyed hasher before releasing the corresponding
+/// staging/queue accounting.
+struct StreamCaptureWork {
+    accumulated: Vec<u8>,
+    hasher: KeyedBodyHasher,
+    hashed_bytes: u64,
+    hash_capped: bool,
+    truncated: bool,
+    redaction_scan_limited: bool,
+}
+
+/// Ownership state shared by the stream task, terminal hook, and sweeper.
+///
+/// The mutex is deliberately scoped to this one stream. It is taken once per
+/// inspected chunk because prompt cross-task revocation cannot be implemented
+/// while the `Vec` and HMAC stay exclusively inspector-owned; the sweeper must
+/// be able to take and drop them even when no later chunk arrives. There is no
+/// allocation or global lock added to the chunk path, and the only contending
+/// writer is the one-shot expiry/terminal transition.
+enum StreamCaptureLifecycle {
+    Active(StreamCaptureWork),
+    Complete(Option<StreamCaptured>),
+    Revoked { hashed_bytes: u64 },
+    Claimed,
+}
+
 /// Response-side capture handed to `build_record`. Bundled so every emission
 /// path (buffered, stream-terminal, log fallback) carries the same evidence
 /// fields and cannot drift apart.
@@ -677,10 +706,7 @@ struct ResponseCapture {
 }
 
 struct StreamSlot {
-    /// `Some` once the inspector's `on_end` ran (normal completion). Stays
-    /// `None` on abnormal termination, which the terminated hook treats as a
-    /// truncated, body-omitted capture.
-    captured: Mutex<Option<StreamCaptured>>,
+    capture: Mutex<StreamCaptureLifecycle>,
     /// Set when a later stream inspector *cuts* the stream (`Terminate`) after
     /// this inspector already accumulated backend bytes. A downstream cut means
     /// the client received a truncated/blocked stream, so the prefix we captured
@@ -692,6 +718,258 @@ struct StreamSlot {
     /// complete provider stream stays a valid record even when a downstream
     /// normalizer (e.g. `ai_stream_router`) rewrites the client-visible bytes.
     downstream_terminated: AtomicBool,
+    /// True after the deadline owner or repair sweep cleared all audit
+    /// capture/hash work.
+    revoked: AtomicBool,
+    /// True only after the response inspector reaches its drop boundary.
+    inspector_dropped: AtomicBool,
+    /// Set after expiry removes the live slot from the global map. A revoked
+    /// fallback handoff may be published only after this transition, otherwise
+    /// a concurrent remove could erase the newly published marker.
+    detached_after_revocation: AtomicBool,
+    /// Single-fire guard for the tiny drop-time fallback handoff.
+    fallback_published: AtomicBool,
+    /// Production inspectors publish into request-owned completion state.
+    /// `false` exists only for external tests that call the plugin factory
+    /// directly without the core response-stream wrapper.
+    uses_request_handoff: bool,
+    /// Bounds entries while they are reachable from the process-global live
+    /// map. Production expiry/terminal claim removes the entry before releasing
+    /// this permit; request-owned terminal handoffs need no global capacity.
+    pending_permit: Mutex<Option<OwnedSemaphorePermit>>,
+    /// Cancels the one-shot reservation deadline task after terminal claim.
+    /// The task otherwise revokes even a completely idle stream at its exact
+    /// configured deadline, without requiring another request or chunk.
+    expiry_cancel: Arc<tokio::sync::Notify>,
+}
+
+enum ClaimedStreamCapture {
+    Captured(StreamCaptured),
+    Abnormal,
+    Revoked,
+}
+
+impl StreamSlot {
+    fn lock_capture(&self) -> std::sync::MutexGuard<'_, StreamCaptureLifecycle> {
+        match self.capture.lock() {
+            Ok(capture) => capture,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Revoke audit work before reservation accounting is released. Returns
+    /// false when the terminal hook already claimed the slot.
+    fn revoke(&self) -> bool {
+        let prior = {
+            let mut capture = self.lock_capture();
+            let hashed_bytes = match &*capture {
+                StreamCaptureLifecycle::Active(work) => work.hashed_bytes,
+                StreamCaptureLifecycle::Complete(Some(captured)) => captured.response_hash_bytes,
+                StreamCaptureLifecycle::Complete(None) => 0,
+                StreamCaptureLifecycle::Revoked { .. }
+                | StreamCaptureLifecycle::Claimed => return false,
+            };
+            std::mem::replace(
+                &mut *capture,
+                StreamCaptureLifecycle::Revoked { hashed_bytes },
+            )
+        };
+        // Drop the Vec, completed excerpt/hash, and keyed hasher before the
+        // caller removes staging and releases any byte/queue reservations.
+        drop(prior);
+        self.revoked.store(true, Ordering::Release);
+        true
+    }
+
+    fn finish_abnormally(&self) {
+        let prior = {
+            let mut capture = self.lock_capture();
+            if !matches!(&*capture, StreamCaptureLifecycle::Active(_)) {
+                return;
+            }
+            std::mem::replace(&mut *capture, StreamCaptureLifecycle::Complete(None))
+        };
+        drop(prior);
+    }
+
+    fn claim_terminal(&self) -> Option<ClaimedStreamCapture> {
+        let prior = {
+            let mut capture = self.lock_capture();
+            if matches!(&*capture, StreamCaptureLifecycle::Active(_))
+                && !self.inspector_dropped.load(Ordering::Acquire)
+            {
+                // Production terminal hooks wait for inspector completion.
+                // Preserve that ownership boundary for direct callers too: an
+                // inspector that is still live and never saw on_end has not
+                // produced a terminal result to claim.
+                return None;
+            }
+            if matches!(&*capture, StreamCaptureLifecycle::Claimed) {
+                return None;
+            }
+            std::mem::replace(&mut *capture, StreamCaptureLifecycle::Claimed)
+        };
+        Some(match prior {
+            StreamCaptureLifecycle::Complete(Some(captured)) => {
+                ClaimedStreamCapture::Captured(captured)
+            }
+            StreamCaptureLifecycle::Revoked { .. } => ClaimedStreamCapture::Revoked,
+            StreamCaptureLifecycle::Active(_) | StreamCaptureLifecycle::Complete(None) => {
+                ClaimedStreamCapture::Abnormal
+            }
+            StreamCaptureLifecycle::Claimed => return None,
+        })
+    }
+
+    fn mark_downstream_terminated(&self) {
+        self.downstream_terminated.store(true, Ordering::Relaxed);
+        let prior = {
+            let mut capture = self.lock_capture();
+            if matches!(
+                &*capture,
+                StreamCaptureLifecycle::Revoked { .. } | StreamCaptureLifecycle::Claimed
+            ) {
+                return;
+            }
+            std::mem::replace(&mut *capture, StreamCaptureLifecycle::Complete(None))
+        };
+        drop(prior);
+    }
+
+    fn release_pending_permit(&self) {
+        let mut permit = match self.pending_permit.lock() {
+            Ok(permit) => permit,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        permit.take();
+    }
+
+    fn capture_snapshot(&self) -> AuditStreamCaptureSnapshot {
+        let capture = self.lock_capture();
+        match &*capture {
+            StreamCaptureLifecycle::Active(work) => AuditStreamCaptureSnapshot {
+                retained_capture_bytes: work.accumulated.len() as u64,
+                hashed_bytes: work.hashed_bytes,
+                revoked: false,
+                terminal_claimed: false,
+            },
+            StreamCaptureLifecycle::Complete(Some(captured)) => AuditStreamCaptureSnapshot {
+                retained_capture_bytes: captured
+                    .response_excerpt
+                    .as_deref()
+                    .map_or(0, str::len) as u64,
+                hashed_bytes: captured.response_hash_bytes,
+                revoked: false,
+                terminal_claimed: false,
+            },
+            StreamCaptureLifecycle::Complete(None) => AuditStreamCaptureSnapshot {
+                retained_capture_bytes: 0,
+                hashed_bytes: 0,
+                revoked: false,
+                terminal_claimed: false,
+            },
+            StreamCaptureLifecycle::Revoked { hashed_bytes } => AuditStreamCaptureSnapshot {
+                retained_capture_bytes: 0,
+                hashed_bytes: *hashed_bytes,
+                revoked: true,
+                terminal_claimed: false,
+            },
+            StreamCaptureLifecycle::Claimed => AuditStreamCaptureSnapshot {
+                retained_capture_bytes: 0,
+                hashed_bytes: 0,
+                revoked: self.revoked.load(Ordering::Acquire),
+                terminal_claimed: true,
+            },
+        }
+    }
+}
+
+/// Read-only test probe for one inspector-owned capture lifecycle. It holds a
+/// weak reference so tests cannot extend the production state lifetime.
+#[doc(hidden)]
+pub struct AuditStreamCaptureProbe {
+    slot: Weak<StreamSlot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct AuditStreamCaptureSnapshot {
+    pub retained_capture_bytes: u64,
+    pub hashed_bytes: u64,
+    pub revoked: bool,
+    pub terminal_claimed: bool,
+}
+
+impl AuditStreamCaptureProbe {
+    #[doc(hidden)]
+    pub fn snapshot(&self) -> Option<AuditStreamCaptureSnapshot> {
+        self.slot.upgrade().map(|slot| slot.capture_snapshot())
+    }
+}
+
+fn publish_revoked_fallback_if_ready(
+    record_id: &str,
+    slot: &Arc<StreamSlot>,
+    pending_streams: &DashMap<String, Arc<StreamSlot>>,
+) {
+    if slot.uses_request_handoff
+        || !slot.revoked.load(Ordering::Acquire)
+        || !slot.inspector_dropped.load(Ordering::Acquire)
+        || !slot.detached_after_revocation.load(Ordering::Acquire)
+        || slot
+            .fallback_published
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    // This marker owns no transcript bytes, hash state, staging lease, or
+    // commit permit. It is published only at actual inspector drop and is
+    // consumed immediately after the completion signal. This direct-factory
+    // compatibility path retains its live-map permit until terminal claim.
+    pending_streams.insert(record_id.to_string(), Arc::clone(slot));
+}
+
+fn expire_stream_reservation(
+    record_id: &str,
+    slot: Option<&Arc<StreamSlot>>,
+    pending_streams: &DashMap<String, Arc<StreamSlot>>,
+    staging: &DashMap<String, AuditStaging>,
+    stream_reservations_expired: &AtomicU64,
+    max_reservation: Duration,
+) -> bool {
+    if let Some(slot) = slot {
+        // Synchronously drop the live Vec, completed excerpt/hash, and HMAC
+        // before releasing any staging, queue, or retained-byte owner.
+        if !slot.revoke() && !slot.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+        pending_streams.remove_if(record_id, |_, current| Arc::ptr_eq(current, slot));
+        if slot.uses_request_handoff {
+            slot.release_pending_permit();
+        }
+        slot.detached_after_revocation
+            .store(true, Ordering::Release);
+        publish_revoked_fallback_if_ready(record_id, slot, pending_streams);
+    }
+
+    let removed = staging
+        .remove_if(record_id, |_, staging| staging.stream_active)
+        .is_some();
+    if removed {
+        let total = stream_reservations_expired
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        tracing::warn!(
+            plugin = "ai_transcript_audit",
+            expired = 1_u64,
+            total_expired = total,
+            max_reservation_secs = max_reservation.as_secs(),
+            "ai_transcript_audit: reclaimed a streaming audit reservation that exceeded \
+             limits.max_stream_reservation_secs"
+        );
+    }
+    removed
 }
 
 /// A single exported audit record. It exists only during bounded record
@@ -983,6 +1261,11 @@ pub struct AiTranscriptAudit {
     /// configured maximum reservation age.
     stream_reservations_expired: Arc<AtomicU64>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
+    /// Independent hard bound for inspector slots while they are reachable
+    /// from the process-global live map. Request-owned terminal handoffs never
+    /// consume this capacity.
+    pending_stream_permits: Arc<Semaphore>,
+    stream_handoff_id: u64,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
     /// `true` when at least one capture path is enabled (validated in `new`).
@@ -1362,6 +1645,8 @@ impl AiTranscriptAudit {
             )),
             stream_reservations_expired: Arc::new(AtomicU64::new(0)),
             pending_streams: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            pending_stream_permits: Arc::new(Semaphore::new(MAX_STAGING_ENTRIES)),
+            stream_handoff_id: allocate_response_stream_handoff_id(),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
@@ -1376,6 +1661,18 @@ impl AiTranscriptAudit {
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub fn status_snapshot(&self) -> AiTranscriptAuditSnapshot {
         self.status_snapshot_for_id(self.status_id.get().copied().unwrap_or(0))
+    }
+
+    /// Obtain a weak, read-only probe for focused external lifecycle tests.
+    /// Production code never calls this and the probe cannot retain the slot.
+    #[doc(hidden)]
+    pub fn stream_capture_probe(&self, ctx: &RequestContext) -> Option<AuditStreamCaptureProbe> {
+        let record_id = ctx.metadata.get(MD_RECORD_ID)?;
+        self.pending_streams
+            .get(record_id)
+            .map(|slot| AuditStreamCaptureProbe {
+                slot: Arc::downgrade(slot.value()),
+            })
     }
 
     fn status_snapshot_for_id(&self, instance_id: u64) -> AiTranscriptAuditSnapshot {
@@ -1599,6 +1896,25 @@ impl AiTranscriptAudit {
             || self.sampling.always_on_error
     }
 
+    fn stream_inspector_selected(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> bool {
+        if !content_type.is_some_and(is_event_stream)
+            || self.capture.streaming == StreamingCapture::Off
+            || !self.has_staged_candidate(&ctx.metadata)
+            || !self.stream_tee_wanted(&ctx.metadata)
+        {
+            return false;
+        }
+        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        (200..300).contains(&response_status)
+            || (response_status >= 400
+                && (self.sampling.always_on_error || sample_hit))
+    }
+
     fn stream_fail_closed_rejection(
         &self,
         ctx: &mut RequestContext,
@@ -1672,58 +1988,41 @@ impl AiTranscriptAudit {
         let now = Instant::now();
         let ttl = self.staging_ttl;
         let max_reservation = self.limits.max_stream_reservation;
-        let mut expired_reservations: u64 = 0;
-        // Collect expired stream ids while reclaiming staging; clear the
-        // companion `pending_streams` map only AFTER this retain releases its
-        // shard guards so the two DashMaps are never mutated in an unsafe
-        // lock order.
-        let mut expired_stream_ids: Vec<String> = Vec::new();
-        self.staging.retain(|record_id, staging| {
-            if staging.stream_active && staging.commit_permit.is_some() {
-                // An active stream is exempt from the orphan TTL, but not from
-                // a lifetime of its own. `stream_active_since` is stamped by
-                // `on_response_stream_selected`; fall back to `captured_at` if
-                // an entry was somehow marked active without it, so an unset
-                // field can never mean "immortal".
-                let started = staging.stream_active_since.unwrap_or(staging.captured_at);
-                let held = now.duration_since(started);
-                if held < max_reservation {
-                    return true;
+        // First collect only ids while holding staging shard read guards. Slot
+        // revocation and map removals happen afterward, so no cross-DashMap
+        // lock order exists.
+        let expired_stream_ids: Vec<String> = self
+            .staging
+            .iter()
+            .filter(|entry| {
+                let staging = entry.value();
+                if !staging.stream_active {
+                    return false;
                 }
-                expired_reservations = expired_reservations.saturating_add(1);
-                expired_stream_ids.push(record_id.clone());
-                // Dropping the entry releases the reserved queue permit, the
-                // staging semaphore permit, and both retained-byte leases.
-                return false;
-            }
-            now.duration_since(staging.captured_at) < ttl
-        });
+                let started = staging.stream_active_since.unwrap_or(staging.captured_at);
+                now.duration_since(started) >= max_reservation
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
         for record_id in expired_stream_ids {
-            // Boundedness takes priority over a late terminal emission: reclaim
-            // any pending-stream slot (and its captured excerpt) so a lost
-            // terminal hook cannot retain response bytes unboundedly. A late
-            // `on_response_stream_terminated` then finds no pending entry and
-            // omits rather than exporting stale body evidence.
-            if let Some((_, slot)) = self.pending_streams.remove(&record_id)
-                && let Ok(mut guard) = slot.captured.lock()
-            {
-                *guard = None;
-            }
-        }
-        if expired_reservations > 0 {
-            let total = self
-                .stream_reservations_expired
-                .fetch_add(expired_reservations, Ordering::Relaxed)
-                .saturating_add(expired_reservations);
-            tracing::warn!(
-                plugin = "ai_transcript_audit",
-                expired = expired_reservations,
-                total_expired = total,
-                max_reservation_secs = max_reservation.as_secs(),
-                "ai_transcript_audit: reclaimed streaming audit reservations that exceeded \
-                 limits.max_stream_reservation_secs"
+            let slot = self
+                .pending_streams
+                .get(&record_id)
+                .map(|entry| Arc::clone(entry.value()));
+            expire_stream_reservation(
+                &record_id,
+                slot.as_ref(),
+                &self.pending_streams,
+                &self.staging,
+                &self.stream_reservations_expired,
+                max_reservation,
             );
         }
+        // Non-stream owners still use the ordinary orphan TTL. Active streams
+        // are handled only by the ordered revoke-then-release loop above.
+        self.staging.retain(|_, staging| {
+            staging.stream_active || now.duration_since(staging.captured_at) < ttl
+        });
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
@@ -2948,7 +3247,9 @@ impl Plugin for AiTranscriptAudit {
         // Retain a slot reserved by the final pre-commit stream admission; the
         // terminal hook or log fallback consumes it after the response ends.
         // Other streams still release any conservative buffered-response slot.
-        if self.stream_commit_selected(ctx, response_status, content_type) {
+        if self.stream_commit_selected(ctx, response_status, content_type)
+            || self.stream_inspector_selected(ctx, response_status, content_type)
+        {
             if let Some(mut staging) = self.staging.get_mut(record_id) {
                 staging.stream_active = true;
                 // Start the reservation clock. The sweeper reclaims the entry
@@ -2976,44 +3277,78 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
-        if !content_type.is_some_and(is_event_stream) {
-            return None;
-        }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
-        if self.capture.streaming == StreamingCapture::Off
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
-            return None;
-        }
-        // In `sampled` mode the marker alone is not enough: only tee streams
-        // that won the sampling roll or that a request-side guardrail flagged
-        // (see `stream_tee_wanted`).
-        if !self.stream_tee_wanted(&ctx.metadata) {
-            return None;
-        }
-        let sample_hit = self.staged_sample_hit(&ctx.metadata);
-        // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
-        // record will emit anyway — either `always_capture_on_error` is set, or
-        // this request won the sampling roll (`emit_decision` emits on `sampled`
-        // regardless of status). Error transactions are exactly where operators
-        // asked for response evidence, and skipping the inspector for a record
-        // that still emits would leave the `log` fallback with request-side data
-        // only. (3xx SSE stays untouched: no error trigger, not a completion.)
-        let status_eligible = (200..300).contains(&response_status)
-            || (response_status >= 400 && (self.sampling.always_on_error || sample_hit));
-        if !status_eligible {
+        // Shares the exact applicability predicate used to start the
+        // reservation clock in `on_response_stream_selected`.
+        if !self.stream_inspector_selected(ctx, response_status, content_type) {
             return None;
         }
 
+        let request_handoff = ctx.response_stream_handoff();
+        let now = Instant::now();
+        let max_reservation = self.limits.max_stream_reservation;
+        let reservation_deadline = now.checked_add(max_reservation).unwrap_or(now);
+        let pending_permit = Arc::clone(&self.pending_stream_permits)
+            .try_acquire_owned()
+            .ok()?;
+        let expiry_cancel = Arc::new(tokio::sync::Notify::new());
         let slot = Arc::new(StreamSlot {
-            captured: Mutex::new(None),
+            capture: Mutex::new(StreamCaptureLifecycle::Active(StreamCaptureWork {
+                accumulated: Vec::new(),
+                hasher: self.redactor.keyed_hasher(),
+                hashed_bytes: 0,
+                hash_capped: false,
+                truncated: false,
+                redaction_scan_limited: false,
+            })),
             downstream_terminated: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
+            inspector_dropped: AtomicBool::new(false),
+            detached_after_revocation: AtomicBool::new(false),
+            fallback_published: AtomicBool::new(false),
+            uses_request_handoff: request_handoff.is_some(),
+            pending_permit: Mutex::new(Some(pending_permit)),
+            expiry_cancel: Arc::clone(&expiry_cancel),
         });
+        // Register before the first chunk. An idle stream can expire without
+        // ever producing bytes, and the sweeper must still be able to revoke
+        // the inspector before it releases staging/queue accounting.
+        self.pending_streams
+            .insert(record_id.clone(), Arc::clone(&slot));
+        // The ordinary sweep remains a bounded repair net, but it cannot make
+        // an otherwise idle stream release promptly without another request.
+        // A cancellable one-shot task gives every admitted inspector an exact
+        // revocation owner. It holds only a Weak slot plus bounded map handles;
+        // terminal claim signals it immediately, and expiry removes itself.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let deadline_slot = Arc::downgrade(&slot);
+            let deadline_record_id = record_id.clone();
+            let deadline_pending_streams = Arc::clone(&self.pending_streams);
+            let deadline_staging = Arc::clone(&self.staging);
+            let deadline_expired = Arc::clone(&self.stream_reservations_expired);
+            let sleep_for = reservation_deadline.saturating_duration_since(Instant::now());
+            let _deadline_task = runtime.spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_for) => {
+                        if let Some(slot) = deadline_slot.upgrade() {
+                            expire_stream_reservation(
+                                &deadline_record_id,
+                                Some(&slot),
+                                &deadline_pending_streams,
+                                &deadline_staging,
+                                &deadline_expired,
+                                max_reservation,
+                            );
+                        }
+                    }
+                    _ = expiry_cancel.notified() => {}
+                }
+            });
+        }
         Some(Box::new(AuditStreamInspector {
             record_id,
             slot,
             pending_streams: Arc::clone(&self.pending_streams),
-            hasher: self.redactor.keyed_hasher(),
             redactor: Arc::clone(&self.redactor),
             mode: self.mode,
             max_bytes: self.limits.max_stream_capture_bytes,
@@ -3026,11 +3361,10 @@ impl Plugin for AiTranscriptAudit {
                 StreamHashScope::Capped => Some(self.limits.max_stream_capture_bytes),
                 StreamHashScope::Full => None,
             },
-            hashed_bytes: 0,
-            hash_capped: false,
-            accumulated: Vec::new(),
-            truncated: false,
-            registered: false,
+            request_handoff,
+            stream_handoff_id: self.stream_handoff_id,
+            reservation_deadline,
+            drop_notified: false,
         }))
     }
 
@@ -3046,9 +3380,28 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let Some((_, slot)) = self.pending_streams.remove(&record_id) else {
+        let slot = ctx
+            .response_stream_handoff()
+            .and_then(|handoff| handoff.take::<StreamSlot>(self.stream_handoff_id))
+            .or_else(|| {
+                self.pending_streams
+                    .get(&record_id)
+                    .map(|slot| Arc::clone(slot.value()))
+            });
+        let Some(slot) = slot else {
             return; // not a stream we teed
         };
+        let Some(claimed) = slot.claim_terminal() else {
+            return;
+        };
+        slot.expiry_cancel.notify_one();
+        // A sweeper can publish the revoked handoff between the first remove
+        // and the terminal claim. Clear that same-slot marker as part of the
+        // claim so no lost duplicate remains in the bounded handoff map.
+        self.pending_streams
+            .remove_if(&record_id, |_, current| Arc::ptr_eq(current, &slot));
+        slot.release_pending_permit();
+        let revoked = matches!(&claimed, ClaimedStreamCapture::Revoked);
         // The response is no longer active. Normally this hook or the immediate
         // log fallback consumes staging; clearing the marker also ensures an
         // unexpectedly orphaned terminal record can be reclaimed after its TTL.
@@ -3057,7 +3410,12 @@ impl Plugin for AiTranscriptAudit {
             staging.stream_active_since = None;
         }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
-        let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
+        if revoked {
+            // Revocation invalidates both sides of body evidence for this audit
+            // record. Keep the terminal envelope/decision only.
+            ctx.metadata.remove(MD_REQUEST_HASH);
+            ctx.metadata.remove(MD_RESPONSE_HASH);
+        }
         let sample_hit = self
             .staging
             .get(&record_id)
@@ -3065,14 +3423,14 @@ impl Plugin for AiTranscriptAudit {
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
-        let response = if downstream_terminated {
+        let response = if revoked || downstream_terminated {
             ResponseCapture {
                 truncated: true,
                 ..ResponseCapture::default()
             }
         } else {
-            match captured {
-                Some(captured) => ResponseCapture {
+            match claimed {
+                ClaimedStreamCapture::Captured(captured) => ResponseCapture {
                     excerpt: captured.response_excerpt,
                     truncated: captured.response_truncated,
                     omitted_reason: captured.response_body_omitted_reason,
@@ -3080,11 +3438,12 @@ impl Plugin for AiTranscriptAudit {
                     hash_bytes: Some(captured.response_hash_bytes),
                     hash: Some(captured.response_hash),
                 },
-                // abnormal end: on_end never ran
-                None => ResponseCapture {
+                // Abnormal end: on_end never ran.
+                ClaimedStreamCapture::Abnormal => ResponseCapture {
                     truncated: true,
                     ..ResponseCapture::default()
                 },
+                ClaimedStreamCapture::Revoked => ResponseCapture::default(),
             }
         };
         let hash = response.hash.clone();
@@ -3094,6 +3453,14 @@ impl Plugin for AiTranscriptAudit {
         }
         let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
         if !emit {
+            if revoked {
+                // Do not let the transaction-log fallback consume request-side
+                // staging after a terminal/sweeper race.
+                self.staging.remove(&record_id);
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
+                return;
+            }
             // Match the buffered path: the response evidence is finalized, but
             // no record was emitted at this hook. Keep staging for the immediate
             // log fallback to consume and mark the sink status non-terminal.
@@ -3106,17 +3473,26 @@ impl Plugin for AiTranscriptAudit {
         // admission, so stream-terminal enqueue is best-effort.
         let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
+        let record_staging = if revoked { None } else { staging.as_ref() };
         let record = self.build_record(
             &record_id,
             envelope,
             &ctx.metadata,
-            staging.as_ref(),
+            record_staging,
             response,
             sample_hit,
             reason,
             None,
         );
-        let status = match self.enqueue(record, staging.as_mut()) {
+        // Expiry already revoked the reservation contract. Drop any staging
+        // value won in a terminal/sweeper race and use ordinary best-effort
+        // admission; never resurrect or consume the released commit permit.
+        let status = match if revoked {
+            drop(staging.take());
+            self.enqueue(record, None)
+        } else {
+            self.enqueue(record, staging.as_mut())
+        } {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
@@ -3172,9 +3548,9 @@ impl Plugin for AiTranscriptAudit {
     }
 }
 
-/// Tees streaming (SSE) response bytes into a bounded accumulator while
-/// forwarding every chunk unchanged, and hashes the full stream incrementally
-/// with the redactor's keyed HMAC (same key as the buffered body hashes).
+/// Tees streaming (SSE) response bytes into a bounded, revocable accumulator
+/// while forwarding every chunk unchanged, and applies the configured capped
+/// or full keyed HMAC until reservation expiry.
 struct AuditStreamInspector {
     record_id: String,
     slot: Arc<StreamSlot>,
@@ -3186,118 +3562,171 @@ struct AuditStreamInspector {
     /// `Some(limit)` stops keyed hashing after `limit` bytes; `None` hashes the
     /// whole stream (explicit `capture.stream_hash: full` opt-in).
     hash_budget: Option<usize>,
-    /// Bytes actually fed into the keyed hasher.
-    hashed_bytes: u64,
-    /// Set once bytes were observed but deliberately not hashed.
-    hash_capped: bool,
-    accumulated: Vec<u8>,
-    hasher: KeyedBodyHasher,
-    truncated: bool,
-    registered: bool,
+    request_handoff: Option<ResponseStreamHandoff>,
+    stream_handoff_id: u64,
+    reservation_deadline: Instant,
+    drop_notified: bool,
 }
 
 impl AuditStreamInspector {
-    fn ensure_registered(&mut self) {
-        if !self.registered {
-            self.pending_streams
-                .insert(self.record_id.clone(), Arc::clone(&self.slot));
-            self.registered = true;
+    fn revoke_if_expired(&self) -> bool {
+        if Instant::now() < self.reservation_deadline {
+            return false;
         }
+        let _ = self.slot.revoke();
+        true
+    }
+
+    fn notify_drop(&mut self) {
+        if self.drop_notified {
+            return;
+        }
+        self.drop_notified = true;
+        if !self.revoke_if_expired() {
+            self.slot.finish_abnormally();
+        }
+        self.slot.inspector_dropped.store(true, Ordering::Release);
+        if let Some(handoff) = self.request_handoff.as_ref() {
+            // Keep the live-map reference until the terminal hook consumes it.
+            // If that hook is lost, the reservation sweep can still find and
+            // revoke this completed/abnormal slot before releasing accounting.
+            // An already-expired slot was detached by its deadline owner or the
+            // repair sweep and exists only in this request-owned handoff.
+            handoff.publish(self.stream_handoff_id, Arc::clone(&self.slot));
+        } else {
+            publish_revoked_fallback_if_ready(
+                &self.record_id,
+                &self.slot,
+                &self.pending_streams,
+            );
+        }
+    }
+}
+
+impl Drop for AuditStreamInspector {
+    fn drop(&mut self) {
+        self.notify_drop();
     }
 }
 
 #[async_trait]
 impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        self.ensure_registered();
-        // Bound audit CPU, not just audit memory: once the keyed digest has
-        // covered its budget, further bytes are irrelevant to the record we can
-        // emit, so stop hashing entirely rather than keeping an HMAC running
-        // for the whole connection.
-        match self.hash_budget {
-            None => {
-                self.hasher.update(chunk);
-                self.hashed_bytes = self.hashed_bytes.saturating_add(chunk.len() as u64);
-            }
-            Some(limit) => {
-                let hashed = self.hashed_bytes as usize;
-                if hashed < limit {
-                    let take = (limit - hashed).min(chunk.len());
-                    self.hasher.update(&chunk[..take]);
-                    self.hashed_bytes = self.hashed_bytes.saturating_add(take as u64);
-                    if take < chunk.len() {
-                        self.hash_capped = true;
+        if self.revoke_if_expired() {
+            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+        }
+        let mut capture = self.slot.lock_capture();
+        if let StreamCaptureLifecycle::Active(work) = &mut *capture {
+            // Bound audit CPU, not just audit memory: once the keyed digest has
+            // covered its budget, further bytes are irrelevant to the record
+            // we can emit. A revoked slot never enters this branch, including
+            // `stream_hash: full`, so expiry stops all later HMAC work.
+            match self.hash_budget {
+                None => {
+                    work.hasher.update(chunk);
+                    work.hashed_bytes =
+                        work.hashed_bytes.saturating_add(chunk.len() as u64);
+                }
+                Some(limit) => {
+                    let hashed = work.hashed_bytes as usize;
+                    if hashed < limit {
+                        let take = (limit - hashed).min(chunk.len());
+                        work.hasher.update(&chunk[..take]);
+                        work.hashed_bytes =
+                            work.hashed_bytes.saturating_add(take as u64);
+                        if take < chunk.len() {
+                            work.hash_capped = true;
+                        }
+                    } else if !chunk.is_empty() {
+                        work.hash_capped = true;
                     }
-                } else if !chunk.is_empty() {
-                    self.hash_capped = true;
+                }
+            }
+
+            // Redacted streams must stop copying at the independent scan bound,
+            // even when max_stream_capture_bytes is larger. Hashing keeps its
+            // configured capped/full semantics until lifecycle revocation.
+            let accumulation_limit = if self.mode.redacts_body() {
+                self.max_bytes.min(self.max_scan_bytes)
+            } else {
+                self.max_bytes
+            };
+            if work.accumulated.len() < accumulation_limit {
+                let remaining = accumulation_limit - work.accumulated.len();
+                let take = remaining.min(chunk.len());
+                work.accumulated.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    work.truncated = true;
+                    if self.mode.redacts_body() && self.max_scan_bytes < self.max_bytes {
+                        work.redaction_scan_limited = true;
+                    }
+                }
+            } else if !chunk.is_empty() {
+                work.truncated = true;
+                if self.mode.redacts_body() && self.max_scan_bytes < self.max_bytes {
+                    work.redaction_scan_limited = true;
                 }
             }
         }
-        if self.accumulated.len() < self.max_bytes {
-            let remaining = self.max_bytes - self.accumulated.len();
-            let take = remaining.min(chunk.len());
-            self.accumulated.extend_from_slice(&chunk[..take]);
-            if take < chunk.len() {
-                self.truncated = true;
-            }
-        } else if !chunk.is_empty() {
-            self.truncated = true;
-        }
+        drop(capture);
         // Tee: forward the bytes exactly as received, never altering the stream.
         ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
-        self.ensure_registered();
-        let mut hasher = std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher());
-        // Domain-separate a capped digest with its exact covered byte count, so
-        // a partial digest can never be presented as — or collide with — the
-        // full-stream digest of the same prefix.
-        if self.hash_capped {
-            hasher.update(PARTIAL_STREAM_HASH_DOMAIN);
-            hasher.update(&self.hashed_bytes.to_be_bytes());
+        if self.revoke_if_expired() {
+            return ResponseStreamAction::Forward(Bytes::new());
         }
-        let response_hash = hasher.finalize_hex();
-        // A cap-truncated redacted stream can cut through an unbounded secret or
-        // a custom pattern, leaving only a raw prefix that no regex can match.
-        // Omit the excerpt rather than exporting a boundary fragment. Full-body
-        // mode is the explicit raw-capture opt-in and still returns the cap.
-        let shaped = if self.truncated && self.mode.redacts_body() {
-            ShapedBody::omitted(OMIT_REASON_STREAM_TRUNCATION)
-        } else {
-            shape_bytes(
-                self.mode,
-                &self.redactor,
-                &self.accumulated,
-                self.max_bytes,
-                self.max_scan_bytes,
-            )
-        };
-        if let Ok(mut guard) = self.slot.captured.lock() {
-            *guard = Some(StreamCaptured {
-                response_excerpt: shaped.excerpt,
-                response_truncated: self.truncated,
-                response_body_omitted_reason: shaped.omitted_reason,
-                response_hash,
-                response_hash_scope: if self.hash_capped {
-                    HASH_SCOPE_PARTIAL
+        let mut capture = self.slot.lock_capture();
+        let prior = std::mem::replace(&mut *capture, StreamCaptureLifecycle::Claimed);
+        match prior {
+            StreamCaptureLifecycle::Active(mut work) => {
+                // Finalization stays under the per-stream mutex. This is a
+                // bounded, one-shot redaction pass; holding the lock ensures
+                // the sweeper cannot release accounting while the Vec is
+                // temporarily moved out for final shaping.
+                if work.hash_capped {
+                    work.hasher.update(PARTIAL_STREAM_HASH_DOMAIN);
+                    work.hasher.update(&work.hashed_bytes.to_be_bytes());
+                }
+                let response_hash = work.hasher.finalize_hex();
+                let shaped = if work.redaction_scan_limited {
+                    ShapedBody::omitted(OMIT_REASON_REDACTION_SCAN_LIMIT)
+                } else if work.truncated && self.mode.redacts_body() {
+                    ShapedBody::omitted(OMIT_REASON_STREAM_TRUNCATION)
                 } else {
-                    HASH_SCOPE_FULL
-                },
-                response_hash_bytes: self.hashed_bytes,
-            });
+                    shape_bytes(
+                        self.mode,
+                        &self.redactor,
+                        &work.accumulated,
+                        self.max_bytes,
+                        self.max_scan_bytes,
+                    )
+                };
+                *capture = StreamCaptureLifecycle::Complete(Some(StreamCaptured {
+                    response_excerpt: shaped.excerpt,
+                    response_truncated: work.truncated,
+                    response_body_omitted_reason: shaped.omitted_reason,
+                    response_hash,
+                    response_hash_scope: if work.hash_capped {
+                        HASH_SCOPE_PARTIAL
+                    } else {
+                        HASH_SCOPE_FULL
+                    },
+                    response_hash_bytes: work.hashed_bytes,
+                }));
+            }
+            other => *capture = other,
         }
         ResponseStreamAction::Forward(Bytes::new())
     }
 
     fn on_downstream_terminated(&mut self) {
-        self.ensure_registered();
-        self.slot
-            .downstream_terminated
-            .store(true, Ordering::Relaxed);
-        if let Ok(mut guard) = self.slot.captured.lock() {
-            *guard = None;
-        }
+        self.slot.mark_downstream_terminated();
+    }
+
+    fn on_before_drop(&mut self) {
+        self.notify_drop();
     }
 }
 
