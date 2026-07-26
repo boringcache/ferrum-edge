@@ -177,7 +177,9 @@ fn full_reload_with_no_refreshed_namespaces_leaves_subscribers_untouched() {
     let mut mesh_rx = harness.mesh_subscribe();
 
     let mut db_reload = GatewayConfig::default();
-    db_reload.proxies.push(make_proxy("should-not-publish", "ferrum"));
+    db_reload
+        .proxies
+        .push(make_proxy("should-not-publish", "ferrum"));
     publish_cp_full_reload_for_test(
         &harness.gate,
         harness.config_arc.as_ref(),
