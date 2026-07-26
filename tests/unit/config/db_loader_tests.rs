@@ -2265,10 +2265,7 @@ fn delete_paths_set_postgres_snapshot_isolation_before_other_tx_statements() {
     let source = include_str!("../../../src/config/db_loader.rs");
 
     for (fn_name, marker) in [
-        (
-            "delete_all_resources",
-            "pub async fn delete_all_resources(",
-        ),
+        ("delete_all_resources", "pub async fn delete_all_resources("),
         ("delete_api_spec", "pub async fn delete_api_spec("),
     ] {
         let body = source

@@ -915,9 +915,7 @@ impl DatabaseStore {
             let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
             let existing_hosts: Vec<String> =
                 serde_json::from_str(&existing_hosts_raw).map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to parse hosts JSON during uniqueness check: {error}"
-                    )
+                    anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
                 })?;
 
             if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
@@ -9223,17 +9221,14 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
 /// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
 /// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
 /// trust/routing material cannot silently become `None`.
-fn optional_utf8_text_column(
-    row: &AnyRow,
-    column: &str,
-) -> Result<Option<String>, anyhow::Error> {
+fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {
     match row.try_get::<Option<String>, _>(column) {
         Ok(value) => Ok(value),
         Err(text_error) => match row.try_get::<Option<Vec<u8>>, _>(column) {
             Ok(None) => Ok(None),
-            Ok(Some(bytes)) => String::from_utf8(bytes).map(Some).map_err(|error| {
-                anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")
-            }),
+            Ok(Some(bytes)) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")),
             Err(blob_opt_error) => {
                 // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
                 // as a bare BLOB rather than Option<BLOB>.
