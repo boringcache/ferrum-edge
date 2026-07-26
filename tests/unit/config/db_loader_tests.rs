@@ -2333,7 +2333,7 @@ async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
     let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
     let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
 
-    let mut store = DatabaseStore::connect_with_failover(
+    let store = DatabaseStore::connect_with_failover(
         "sqlite",
         &primary_rw_url,
         std::slice::from_ref(&failover_url),

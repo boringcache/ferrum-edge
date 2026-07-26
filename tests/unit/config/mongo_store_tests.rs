@@ -33,7 +33,20 @@ fn mongo_method(name: &str) -> &str {
 }
 
 fn mongo_sync_method(name: &str) -> &str {
-    mongo_fn_body(&format!("        fn {name}"))
+    // Mirror mongo_method: build the marker locally so the returned slice
+    // borrows MONGO_STORE_SOURCE ('static), not a temporary format string.
+    let marker = format!("        fn {name}");
+    let start = MONGO_STORE_SOURCE
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing method marker {marker}"));
+    let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
+    let end = tail
+        .find("\n        fn ")
+        .into_iter()
+        .chain(tail.find("\n        async fn "))
+        .min()
+        .unwrap_or(tail.len());
+    &MONGO_STORE_SOURCE[start..start + marker.len() + end]
 }
 
 /// Extract a method body stopping at the next inherent `fn` or `async fn`
