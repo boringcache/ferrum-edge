@@ -678,6 +678,30 @@ pub fn evaluate_delta_against_subscription_base(
     }
 }
 
+/// Refuse a DELTA whose committed body timestamp predates the monotonic
+/// authority watermark.
+///
+/// This check is required even after a FULL_SNAPSHOT was accepted on the
+/// current subscription. An older, content-equivalent cross-source snapshot
+/// may safely establish a base, but that must not authorize the fallback CP to
+/// replay deltas from the history between that snapshot and the applied
+/// watermark (an ABA rollback).
+pub fn evaluate_delta_authority(
+    authority: Option<&AppliedSnapshotAuthority>,
+    incoming_committed: DateTime<Utc>,
+) -> Result<(), StaleSnapshotReject> {
+    let Some(applied) = authority.and_then(|authority| authority.version) else {
+        return Ok(());
+    };
+    if incoming_committed < applied {
+        return Err(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: incoming_committed,
+        });
+    }
+    Ok(())
+}
+
 /// Why a non-empty DELTA must terminate the stream (issue #2394).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaRejectionKind {

@@ -24,8 +24,8 @@ use ferrum_edge::grpc::configsync_lifecycle::{
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches, backoff_max_secs,
     check_peer_version_compatibility, connection_error_outcome, cp_endpoints_same_source,
     delta_rejection_stream_disposition, evaluate_delta_against_subscription_base,
-    evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew, failure_backoff_sequence,
-    full_snapshot_stream_disposition, gateway_config_content_matches,
+    evaluate_delta_authority, evaluate_full_snapshot_authority, evaluate_snapshot_clock_skew,
+    failure_backoff_sequence, full_snapshot_stream_disposition, gateway_config_content_matches,
     gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
     monotonic_watermark, reconcile_snapshot_version, record_applied_gateway_trust,
     resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
@@ -369,6 +369,40 @@ fn equivalent_older_cross_source_snapshot_establishes_safe_base() {
         ),
         Err(StaleSnapshotReject::OlderThanApplied { .. })
     ));
+}
+
+#[test]
+fn equivalent_older_snapshot_does_not_authorize_aba_delta_rollback() {
+    let applied = Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
+    let snapshot = applied - chrono::Duration::hours(2);
+    let stale_delta = applied - chrono::Duration::hours(1);
+    let authority = AppliedSnapshotAuthority {
+        version: Some(applied),
+        source_cp_url: "http://cp-primary:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+
+    let watermark = evaluate_full_snapshot_authority(
+        Some(&authority),
+        snapshot,
+        "http://cp-fallback:50051",
+        true,
+    )
+    .expect("equivalent older snapshot is an admissible base");
+    let fallback_authority = AppliedSnapshotAuthority {
+        version: Some(watermark),
+        source_cp_url: "http://cp-fallback:50051".to_string(),
+        gateway_trust: GatewayTrustEquivalenceState::Absent,
+    };
+
+    assert_eq!(
+        evaluate_delta_authority(Some(&fallback_authority), stale_delta),
+        Err(StaleSnapshotReject::OlderThanApplied {
+            applied,
+            incoming: stale_delta,
+        })
+    );
+    assert!(evaluate_delta_authority(Some(&fallback_authority), applied).is_ok());
 }
 
 fn test_runtime_trust(domain: &str, ders: &[&[u8]]) -> RuntimeTrustBundleSet {

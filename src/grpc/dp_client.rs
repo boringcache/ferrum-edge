@@ -45,11 +45,12 @@ use super::configsync_lifecycle::{
     MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
     advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
     check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
-    evaluate_delta_against_subscription_base, evaluate_snapshot_clock_skew,
-    full_snapshot_stream_disposition, gateway_trust_equivalence_state,
-    grow_backoff_after_failure_sleep, heartbeat_frame_admissible, reconcile_snapshot_version,
-    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
-    resource_delta_advances_authority, silence_watchdog_armed, snapshot_failure_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_delta_authority,
+    evaluate_snapshot_clock_skew, full_snapshot_stream_disposition,
+    gateway_trust_equivalence_state, grow_backoff_after_failure_sleep, heartbeat_frame_admissible,
+    reconcile_snapshot_version, record_applied_gateway_trust,
+    resolve_authority_trust_after_snapshot, resource_delta_advances_authority,
+    silence_watchdog_armed, snapshot_failure_stream_disposition,
     snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
 };
 use super::proto::SubscribeRequest;
@@ -1999,6 +2000,21 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 poll_timestamp = %poll_timestamp,
                                 "Refusing DELTA with an implausibly-future committed timestamp \
                                  before it can poison the freshness watermark"
+                            );
+                            if !was_empty {
+                                update_state_config_diverged(connection_state, divergence_metrics);
+                            }
+                            return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                        }
+                        if let Err(reason) =
+                            evaluate_delta_authority(snapshot_authority.as_ref(), committed_delta)
+                        {
+                            warn!(
+                                ?reason,
+                                cp_url,
+                                version = %update.version,
+                                poll_timestamp = %poll_timestamp,
+                                "Refusing DELTA older than the applied authority watermark"
                             );
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
