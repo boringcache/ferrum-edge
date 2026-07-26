@@ -358,7 +358,8 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
             ])
             .output(),
         IsolatedSqlKind::Mysql => std::process::Command::new("docker")
-            .env("MYSQL_PWD", password)
+            // Borrow so failure redaction (and IsolatedSqlDatabase ownership) retain the secret.
+            .env("MYSQL_PWD", &password)
             .args([
                 "exec",
                 "-e",
