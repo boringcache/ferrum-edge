@@ -1118,8 +1118,8 @@ jobs:
 
           mysql_ok=""
           for _ in $(seq 1 90); do
-            if docker exec -e MYSQL_PWD=ferrum ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
-              && docker exec -e MYSQL_PWD=ferrum ferrum-ci-mysql mysql -h 127.0.0.1 -uferrum -D ferrum \
+            if MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
+              && MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysql -h 127.0.0.1 -uferrum -D ferrum \
                    -e "SELECT 1" >/dev/null 2>&1; then
               mysql_ok=1; break
             fi
@@ -1132,7 +1132,7 @@ jobs:
           # Functional cells provision per-cell databases via CREATE/DROP.
           # Grant those privileges (and CREATEDB on Postgres) so isolation is
           # not blocked by the default non-superuser MYSQL_USER / role caps.
-          docker exec -e MYSQL_PWD=ferrum ferrum-ci-mysql mysql -uroot -e \
+          MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysql -uroot -e \
             "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
           docker exec ferrum-ci-postgres psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
             "ALTER USER ferrum WITH CREATEDB;"

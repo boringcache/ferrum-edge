@@ -243,7 +243,7 @@ wait_for_containers() {
     local mysql_elapsed=0
     log "Waiting for $MYSQL_CONTAINER to become healthy (timeout: ${HEALTH_TIMEOUT}s) ..."
     while (( mysql_elapsed < HEALTH_TIMEOUT )); do
-        if docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" \
+        if MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
             mysqladmin ping -u root &>/dev/null; then
             log "$MYSQL_CONTAINER is ready (${mysql_elapsed}s)."
             mysql_ok=0
@@ -265,11 +265,11 @@ wait_for_containers() {
 
     # Require a real authenticated query (not only ping) and grant CREATE so
     # functional cells can isolate schema work when needed.
-    if ! docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" \
+    if ! MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
         mysql -u "$DB_USER" -D "$DB_NAME" -e "SELECT 1" >/dev/null 2>&1; then
         die "MySQL accepted ping but rejected authenticated queries against $DB_NAME."
     fi
-    docker exec -e "MYSQL_PWD=$DB_PASSWORD" "$MYSQL_CONTAINER" mysql -u root -e \
+    MYSQL_PWD="$DB_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" mysql -u root -e \
         "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO '$DB_USER'@'%'; FLUSH PRIVILEGES;" \
         >/dev/null
     # Match plaintext CI: functional cells CREATE/DROP per-cell databases.

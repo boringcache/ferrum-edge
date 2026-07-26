@@ -194,10 +194,11 @@ impl Drop for IsolatedSqlDatabase {
                     ])
                     .output(),
                 IsolatedSqlKind::Mysql => std::process::Command::new("docker")
+                    .env("MYSQL_PWD", &self.password)
                     .args([
                         "exec",
                         "-e",
-                        &format!("MYSQL_PWD={}", self.password),
+                        "MYSQL_PWD",
                         &self.container,
                         "mysql",
                         &format!("-u{}", self.user),
@@ -357,10 +358,11 @@ pub fn provision_isolated_sql_database(base_url: &str) -> (String, Option<Isolat
             ])
             .output(),
         IsolatedSqlKind::Mysql => std::process::Command::new("docker")
+            .env("MYSQL_PWD", password)
             .args([
                 "exec",
                 "-e",
-                &format!("MYSQL_PWD={password}"),
+                "MYSQL_PWD",
                 container,
                 "mysql",
                 &format!("-u{user}"),
