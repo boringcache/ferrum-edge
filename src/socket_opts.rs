@@ -2220,10 +2220,7 @@ pub mod io_uring_splice {
                 if now.saturating_sub(last) >= read_timeout_ms {
                     return Err(SpliceError::read(
                         total,
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            BACKEND_READ_TIMEOUT_MSG,
-                        ),
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, BACKEND_READ_TIMEOUT_MSG),
                     ));
                 }
             }
