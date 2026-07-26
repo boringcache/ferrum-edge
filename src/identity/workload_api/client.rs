@@ -168,7 +168,20 @@ impl WorkloadApiClient {
 
         tokio::spawn(async move {
             let mut notify_tx = Some(notify_tx);
-            while let Some(msg_result) = inbound.next().await {
+            loop {
+                // Dropping the relay consumer must also cancel the upstream
+                // Workload API stream promptly. Waiting only on `inbound.next()`
+                // leaves this task and the agent-side gRPC stream alive
+                // indefinitely when the agent is quiet after cancellation.
+                let msg_result = tokio::select! {
+                    _ = out_tx.closed() => return,
+                    next = inbound.next() => {
+                        let Some(next) = next else {
+                            return;
+                        };
+                        next
+                    }
+                };
                 let msg = match msg_result {
                     Ok(m) => m,
                     Err(e) => {
@@ -191,7 +204,6 @@ impl WorkloadApiClient {
                     let _ = notify.send(());
                 }
             }
-            // Sender drop ends the stream after any final pending value.
         });
 
         (out_rx.into_stream(), notify_rx)

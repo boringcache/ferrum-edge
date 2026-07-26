@@ -1359,6 +1359,25 @@ async fn client_relay_slow_consumer_coalesces_to_newest_bundle() {
 }
 
 #[tokio::test]
+async fn client_relay_drop_cancels_silent_upstream_stream_promptly() {
+    use ferrum_edge::identity::workload_api::client::WorkloadApiClient;
+    use ferrum_edge::identity::workload_api::proto::X509svidResponse;
+
+    let (inbound_tx, inbound_rx) =
+        tokio::sync::mpsc::channel::<Result<X509svidResponse, tonic::Status>>(1);
+    let inbound = tokio_stream::wrappers::ReceiverStream::new(inbound_rx);
+    let (stream, _ready) = WorkloadApiClient::relay_x509_svid_stream(inbound, None);
+
+    // No agent frame is ever sent. Dropping the downstream stream must wake
+    // the relay through LatestWinsSender::closed(), drop the inbound receiver,
+    // and therefore close the producer side without waiting for a rotation.
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), inbound_tx.closed())
+        .await
+        .expect("relay retained a silent upstream stream after consumer cancellation");
+}
+
+#[tokio::test]
 async fn workload_api_sources_avoid_unbounded_rotation_queues() {
     // Guard against regressing to unbounded mpsc for secret-bearing rotation
     // streams; capacity-one latest-wins + oneshot first-ready are load-bearing.
