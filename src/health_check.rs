@@ -247,6 +247,16 @@ pub struct HealthChecker {
     /// the checker has advanced, so a mid-flight stale probe cannot
     /// reintroduce removed targets or apply retired policy after replacement.
     task_generation: Arc<AtomicU64>,
+    /// Orders reload generation rollover against publication of active-probe
+    /// and passive-recovery results.
+    ///
+    /// A generation check by itself has a check-then-mutate window: reload can
+    /// advance the generation after the check but before the stale task updates
+    /// shared counters or health maps. Probe/recovery publication takes a read
+    /// guard and re-checks its generation under that guard; reload takes the
+    /// write guard before advancing either generation. This is a cold-path
+    /// lifecycle lock and is never touched by proxied requests.
+    lifecycle_publish_guard: Arc<std::sync::RwLock<()>>,
     /// Monotonic generation for the gateway-scoped passive recovery scanner.
     ///
     /// Bumped on every [`Self::start_with_shutdown`] /
@@ -316,6 +326,7 @@ impl HealthChecker {
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
             task_generation: Arc::new(AtomicU64::new(0)),
+            lifecycle_publish_guard: Arc::new(std::sync::RwLock::new(())),
             passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
@@ -365,6 +376,7 @@ impl HealthChecker {
             active_check_handles: Mutex::new(Vec::new()),
             active_check_aborts: Mutex::new(Vec::new()),
             task_generation: Arc::new(AtomicU64::new(0)),
+            lifecycle_publish_guard: Arc::new(std::sync::RwLock::new(())),
             passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
@@ -433,9 +445,22 @@ impl HealthChecker {
         config: &GatewayConfig,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
-        // Advance generation first so any in-flight stale task that races
-        // past abort refuses to dial or mutate under the retired policy.
-        let generation = self.task_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // Advance both generations while excluding result publication. A task
+        // that was already publishing finishes before rollover; a task that
+        // reaches publication afterward observes the new generation and exits
+        // without mutating shared health state.
+        let publish_guard = match self.lifecycle_publish_guard.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let generation = self
+            .task_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let recovery_generation = self
+            .passive_recovery_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
 
         // Cancel every prior generation via AbortHandles (covers drained
         // startup handles) and any JoinHandles still owned here.
@@ -460,12 +485,7 @@ impl HealthChecker {
             handle.abort();
         }
 
-        // Fence any previously taken scanners that abort() cannot reach
-        // (modes drain JoinHandles at startup via take_active_check_handles).
-        let recovery_generation = self
-            .passive_recovery_generation
-            .fetch_add(1, Ordering::AcqRel)
-            + 1;
+        drop(publish_guard);
 
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut new_aborts: Vec<AbortHandle> = Vec::new();
@@ -866,6 +886,7 @@ impl HealthChecker {
         let passive_health = self.passive_health.clone();
         let lb_cache = self.lb_cache.clone();
         let recovery_generation = Arc::clone(&self.passive_recovery_generation);
+        let lifecycle_publish_guard = Arc::clone(&self.lifecycle_publish_guard);
         // Fixed 1s tick: per-entry deadlines already encode the effective
         // healthy_after_seconds, so the scanner does not need a per-upstream
         // interval and must not outlive reload/shutdown ownership.
@@ -897,14 +918,19 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
-                if recovery_generation.load(Ordering::Acquire) != generation {
-                    info!(
-                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
-                    );
-                    return;
+                {
+                    let _publish_guard = match lifecycle_publish_guard.read() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if recovery_generation.load(Ordering::Acquire) != generation {
+                        info!(
+                            "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                        );
+                        return;
+                    }
+                    recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
                 }
-
-                recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
             }
         })
     }
@@ -973,6 +999,7 @@ impl HealthChecker {
         let unhealthy_targets = self.active_unhealthy_targets.clone();
         let target_states = self.active_target_states.clone();
         let task_generation = self.task_generation.clone();
+        let lifecycle_publish_guard = Arc::clone(&self.lifecycle_publish_guard);
 
         let probe_type = config.probe_type;
         let host = target.host.clone();
@@ -1160,9 +1187,19 @@ impl HealthChecker {
                     }
                 };
 
-                // Refuse stale map inserts / mutations after reload advances
-                // the generation, even if abort has not yet torn the task down
-                // mid-probe. Defer entry until here, and re-check generation
+                // Serialize publication against reload generation rollover,
+                // then re-check under the guard. This closes the
+                // check-then-mutate window for shared counters, maps, and the
+                // latency cache; a retired probe cannot publish after reload.
+                let _publish_guard = match lifecycle_publish_guard.read() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if task_generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+
+                // Defer entry until after the probe and re-check generation
                 // while holding the DashMap entry lock, so prune cannot race a
                 // pre-insert fence and leave a resurrected removed-target key.
                 let state = {
@@ -1266,6 +1303,7 @@ impl HealthChecker {
                         }
                     }
                 }
+                drop(_publish_guard);
             }
         })
     }
