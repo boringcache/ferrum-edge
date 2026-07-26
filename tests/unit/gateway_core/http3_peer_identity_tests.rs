@@ -17,6 +17,8 @@
 //!   5. Slots are per connection — one connection's identity cannot leak into
 //!      another's, and a connection whose handshake never completed keeps an
 //!      empty slot.
+//!   6. The 0.5-RTT accept loop snapshots ready streams before publishing
+//!      successful handshake completion.
 
 use std::sync::Arc;
 
@@ -110,6 +112,25 @@ fn h3_early_data_uses_the_bounded_stateful_resumption_cache() {
     );
 }
 
+#[test]
+fn h3_accepts_ready_early_streams_before_publishing_handshake_completion() {
+    let source = compact_whitespace(include_str!("../../../src/http3/server.rs"));
+    let selection = source
+        .find("tokio::select!{biased;accepted=h3_conn.accept()")
+        .expect("the H3 accept loop must poll request acceptance first");
+    let completion = source[selection..]
+        .find("completed=completion_rx")
+        .map(|offset| selection + offset)
+        .expect("the H3 accept loop must observe handshake completion");
+    let publication = source[completion..]
+        .find("peer_identity.publish_handshake_result(handshake_succeeded,peer_certs)")
+        .map(|offset| completion + offset)
+        .expect("successful handshake completion must publish through the identity slot");
+
+    assert!(selection < completion);
+    assert!(completion < publication);
+}
+
 // ---------------------------------------------------------------------------
 // 2 + 3. Snapshot contents
 // ---------------------------------------------------------------------------
@@ -190,7 +211,7 @@ fn slot_starts_pre_handshake_and_publishes_identity_exactly_once() {
     assert!(before.is_early_data);
     assert!(before.client_cert_der.is_none());
 
-    slot.publish_established(Some(vec![leaf(), intermediate()]));
+    slot.publish_handshake_result(true, Some(vec![leaf(), intermediate()]));
 
     let after = slot.snapshot();
     assert!(!after.is_early_data);
@@ -210,7 +231,7 @@ fn snapshot_handed_to_an_inflight_request_is_not_mutated_by_a_later_publish() {
     let slot = H3ConnectionIdentity::pre_handshake();
     let inflight = slot.snapshot();
 
-    slot.publish_established(Some(vec![leaf()]));
+    slot.publish_handshake_result(true, Some(vec![leaf()]));
 
     assert!(inflight.is_early_data);
     assert!(inflight.client_cert_der.is_none());
@@ -227,7 +248,7 @@ fn a_connection_whose_handshake_never_completed_keeps_an_empty_slot() {
     let cancelled = H3ConnectionIdentity::pre_handshake();
     let authenticated = H3ConnectionIdentity::pre_handshake();
 
-    authenticated.publish_established(Some(vec![leaf(), intermediate()]));
+    authenticated.publish_handshake_result(true, Some(vec![leaf(), intermediate()]));
 
     let cancelled_snapshot = cancelled.snapshot();
     assert!(cancelled_snapshot.is_early_data);
@@ -239,14 +260,32 @@ fn a_connection_whose_handshake_never_completed_keeps_an_empty_slot() {
 }
 
 #[test]
+fn a_failed_handshake_cannot_clear_early_data_or_publish_identity() {
+    // Quinn's ZeroRttAccepted receiver resolves to false when the connection is
+    // lost before Connected. That signal must not transition the slot: buffered
+    // 0-RTT streams remain replay-gated and cannot acquire a peer identity from
+    // a handshake that never authenticated.
+    let slot = H3ConnectionIdentity::pre_handshake();
+
+    slot.publish_handshake_result(false, Some(vec![leaf(), intermediate()]));
+
+    let snapshot = slot.snapshot();
+    assert!(snapshot.is_early_data);
+    assert!(snapshot.client_cert_der.is_none());
+    assert!(snapshot.client_cert_chain_der.is_none());
+    assert!(snapshot.mtls_auth_connection_cache.is_none());
+    assert!(snapshot.peer_spiffe_extraction_cache.is_none());
+}
+
+#[test]
 fn slots_are_per_connection_and_do_not_share_identity() {
     // Two concurrent connections presenting different certificates must keep
     // their own identities and their own connection caches; nothing is global.
     let conn_a = H3ConnectionIdentity::pre_handshake();
     let conn_b = H3ConnectionIdentity::pre_handshake();
 
-    conn_a.publish_established(Some(vec![leaf()]));
-    conn_b.publish_established(Some(vec![intermediate()]));
+    conn_a.publish_handshake_result(true, Some(vec![leaf()]));
+    conn_b.publish_handshake_result(true, Some(vec![intermediate()]));
 
     let a = conn_a.snapshot();
     let b = conn_b.snapshot();
@@ -284,10 +323,10 @@ fn a_second_publish_cannot_replace_the_established_identity_or_caches() {
     // invokes a second publisher, it must not replace the certificate beneath
     // request contexts already sharing the first identity's auth caches.
     let slot = H3ConnectionIdentity::pre_handshake();
-    slot.publish_established(Some(vec![leaf()]));
+    slot.publish_handshake_result(true, Some(vec![leaf()]));
     let first = slot.snapshot();
 
-    slot.publish_established(Some(vec![intermediate()]));
+    slot.publish_handshake_result(true, Some(vec![intermediate()]));
     let second = slot.snapshot();
 
     assert_eq!(second.client_cert_der.as_deref(), Some(&leaf()));

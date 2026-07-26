@@ -20,8 +20,9 @@
 //!    snapshot with a single `load_full()`, so `is_early_data` and the peer
 //!    certificate can never be observed out of step with each other. The slot
 //!    starts at [`H3PeerIdentity::pre_handshake`] (early data, **no** identity)
-//!    and is republished exactly once, when the handshake completion future
-//!    resolves, with the identity quinn then reports.
+//!    and is republished exactly once after a successful handshake and after
+//!    the accept loop has snapshotted every already-ready request stream, with
+//!    the identity quinn then reports.
 //!
 //! The two rules that make this fail-closed:
 //!
@@ -163,16 +164,26 @@ impl H3ConnectionIdentity {
         }
     }
 
-    /// Publish the post-handshake identity, atomically clearing the early-data
-    /// flag in the same swap.
+    /// Publish the post-handshake identity after a successful handshake,
+    /// atomically clearing the early-data flag in the same swap.
     ///
     /// Called exactly once per connection: from the accept path itself on the
     /// ordinary full-handshake branches (where the connection future only
     /// resolves after the peer's `Finished` has been processed, and before any
-    /// request stream can be accepted), or from the task awaiting quinn's
-    /// `ZeroRttAccepted` future on the 0.5-RTT branch. Never before the
-    /// handshake has actually completed.
-    pub fn publish_established(&self, peer_certs: Option<Vec<Vec<u8>>>) {
+    /// request stream can be accepted), or from the 0.5-RTT accept loop after
+    /// the task awaiting quinn's `ZeroRttAccepted` future reports success and
+    /// every already-ready request stream has been snapshotted. Quinn resolves
+    /// that future to `false` when the connection is lost before its
+    /// `Connected` event; that path must keep the pre-handshake snapshot so
+    /// buffered early data cannot lose replay gating after a failed handshake.
+    pub fn publish_handshake_result(
+        &self,
+        handshake_succeeded: bool,
+        peer_certs: Option<Vec<Vec<u8>>>,
+    ) {
+        if !handshake_succeeded {
+            return;
+        }
         let established = Arc::new(H3PeerIdentity::established(peer_certs));
         let current = self.slot.load_full();
         if !current.is_early_data {

@@ -855,12 +855,14 @@ async fn handle_h3_connection(
     // Single coherent per-connection identity slot. Requests take one lock-free
     // snapshot, so the early-data flag and the peer certificate can never be
     // observed out of step. Starts with NO identity and `is_early_data = true`;
-    // the post-handshake identity is published exactly once, when the handshake
-    // completion future resolves.
+    // the post-handshake identity is published exactly once after successful
+    // handshake completion and after already-ready early streams are accepted.
     let peer_identity = Arc::new(H3ConnectionIdentity::pre_handshake());
-    // Tracks whether the identity slot still needs to be published by this
-    // function (full-handshake paths) or is owned by the 0-RTT completion task.
-    let mut identity_published_by_task = false;
+    // On the 0.5-RTT branch the completion task reports handshake outcome back
+    // to the request accept loop. That loop polls ready request streams first,
+    // so buffered early data is snapshotted before a successful handshake can
+    // publish the established identity and clear replay gating.
+    let mut handshake_completion_rx = None;
 
     // Bound the QUIC handshake so a peer that completes the UDP path-MTU
     // probe / Initial packets but never finishes TLS 1.3 cannot hold a
@@ -879,34 +881,45 @@ async fn handle_h3_connection(
                     conn.remote_address()
                 );
                 // Spawn a task that waits for the handshake to complete, then
-                // publishes the established identity — clearing the early-data
-                // flag and installing whatever peer certificate quinn can now
-                // report in the same atomic swap. Requests dispatched after
-                // this point see `is_early_data = false` together with that
-                // identity; requests dispatched before it keep seeing the
-                // pre-handshake snapshot, which carries no identity at all.
+                // reports the outcome to the accept loop. The accept loop owns
+                // identity publication so it can drain every already-ready
+                // early request before clearing the replay flag. Requests
+                // dispatched after publication see `is_early_data = false`
+                // together with the established identity; requests dispatched
+                // before it keep seeing the pre-handshake snapshot, which
+                // carries no identity at all.
                 // The handshake bound also applies here: if the peer never
                 // completes TLS, the ZeroRttAccepted future never resolves and
                 // the connection would otherwise sit consuming a slot forever.
                 // Closing the connection on timeout fails any in-flight 0.5-RTT
                 // streams and deliberately leaves the slot pre-handshake — a
                 // failed or cancelled handshake must never expose an identity.
-                identity_published_by_task = true;
-                let identity = Arc::clone(&peer_identity);
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                handshake_completion_rx = Some(completion_rx);
                 let conn_for_close = conn.clone();
                 let remote = conn.remote_address();
                 tokio::spawn(async move {
-                    match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout).await {
-                        Ok(_accepted) => {
-                            identity.publish_established(quinn_peer_cert_chain(&conn_for_close));
-                        }
-                        Err(_elapsed) => {
-                            warn!(
-                                "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
-                                remote, handshake_timeout
-                            );
-                            conn_for_close.close(quinn::VarInt::from_u32(0), b"handshake timeout");
-                        }
+                    let handshake_succeeded =
+                        match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
+                            .await
+                        {
+                            Ok(succeeded) => succeeded,
+                            Err(_elapsed) => {
+                                warn!(
+                                    "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
+                                    remote, handshake_timeout
+                                );
+                                conn_for_close
+                                    .close(quinn::VarInt::from_u32(0), b"handshake timeout");
+                                false
+                            }
+                        };
+                    let _ = completion_tx.send(handshake_succeeded);
+                    if !handshake_succeeded {
+                        debug!(
+                            "HTTP/3 handshake did not complete from {} (0-RTT path)",
+                            remote
+                        );
                     }
                 });
                 conn
@@ -951,11 +964,10 @@ async fn handle_h3_connection(
     // handshake completion, so `peer_identity()` is meaningful now and the
     // established snapshot (identity + `is_early_data = false`) is installed
     // before the accept loop can hand a single stream to a request task. The
-    // 0-RTT branch deliberately does NOT publish here — its identity is owned
-    // by the completion task spawned above, so nothing observes an identity
-    // before the handshake actually finished.
-    if !identity_published_by_task {
-        peer_identity.publish_established(quinn_peer_cert_chain(&connection));
+    // 0-RTT branch deliberately does NOT publish here — its completion signal
+    // is consumed in the accept loop after already-ready early streams.
+    if handshake_completion_rx.is_none() {
+        peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
     }
     let frontend_sni_hostname = connection
         .handshake_data()
@@ -987,7 +999,43 @@ async fn handle_h3_connection(
     let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
-        match h3_conn.accept().await {
+        // A QUIC early-data request and the TLS Connected event can become
+        // ready in the same scheduler turn. Poll request acceptance first so a
+        // buffered replayable stream snapshots the pre-handshake state. Only
+        // after accept is Pending may successful handshake completion publish
+        // the established identity for later 1-RTT streams.
+        let (accepted, handshake_succeeded) =
+            if let Some(completion_rx) = handshake_completion_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    completed = completion_rx => {
+                        let succeeded = match completed {
+                            Ok(succeeded) => succeeded,
+                            Err(_closed) => false,
+                        };
+                        (None, Some(succeeded))
+                    }
+                }
+            } else {
+                (Some(h3_conn.accept().await), None)
+            };
+
+        if let Some(handshake_succeeded) = handshake_succeeded {
+            handshake_completion_rx = None;
+            let peer_certs = if handshake_succeeded {
+                quinn_peer_cert_chain(&quinn_conn)
+            } else {
+                None
+            };
+            peer_identity.publish_handshake_result(handshake_succeeded, peer_certs);
+            continue;
+        }
+
+        let Some(accepted) = accepted else {
+            continue;
+        };
+        match accepted {
             Ok(Some(resolver)) => {
                 // Detect QUIC connection migration: compare SocketAddr (two integer
                 // fields) — zero allocation. Only re-format the IP string when the

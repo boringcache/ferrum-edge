@@ -425,10 +425,14 @@ Peer identity and early data are published as one per-connection snapshot
 (`http3::peer_identity::H3ConnectionIdentity`, an `ArcSwap` slot read once
 per accepted request stream). The slot starts with `is_early_data = true`
 and **no** client certificate, and is republished exactly once — when the
-handshake-completion future resolves — with whatever peer certificate quinn
-can then report and `is_early_data = false`. An early-data request therefore
-can never gain an mTLS identity, and a handshake that times out or is
-cancelled leaves the slot empty. Because slots are per connection, no other
+handshake-completion future resolves successfully and after the accept loop
+has snapshotted every already-ready request stream — with whatever peer
+certificate quinn can then report and `is_early_data = false`. Accept polling
+is biased ahead of handshake publication so a buffered early-data request
+cannot be reclassified as 1-RTT merely because both events become ready in the
+same scheduler turn. An early-data request therefore can never gain an mTLS
+identity, and a handshake that fails, times out, or is cancelled leaves the
+slot empty and early-data-gated. Because slots are per connection, no other
 connection's identity can be observed through them.
 
 On a listener with a frontend client-certificate verifier the QUIC TLS

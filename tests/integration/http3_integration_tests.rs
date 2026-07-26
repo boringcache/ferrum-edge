@@ -1830,9 +1830,9 @@ async fn h3_zero_rtt_accept_has_no_peer_identity_until_the_handshake_completes()
         let at_half_rtt_chain = peer_cert_chain(&connection);
         let at_half_rtt = slot.snapshot();
 
-        zero_rtt_accepted.await;
+        let handshake_succeeded = zero_rtt_accepted.await;
         // Refresh exactly when the handshake-completion future resolves.
-        slot.publish_established(peer_cert_chain(&connection));
+        slot.publish_handshake_result(handshake_succeeded, peer_cert_chain(&connection));
         let after_handshake = slot.snapshot();
 
         (at_half_rtt_chain, at_half_rtt, after_handshake, connection)
@@ -1905,7 +1905,7 @@ async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted()
         let accepted = incoming.accept().expect("accept");
         let connection = accepted.await.expect("full handshake");
         let slot = H3ConnectionIdentity::pre_handshake();
-        slot.publish_established(peer_cert_chain(&connection));
+        slot.publish_handshake_result(true, peer_cert_chain(&connection));
         (slot.snapshot(), connection)
     });
 
