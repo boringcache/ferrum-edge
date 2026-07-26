@@ -5181,7 +5181,7 @@ impl LoadBalancer {
         // Explore with a fixed permille of selections via RR among unwarmed;
         // otherwise pick the best warmed EWMA.
         if !all_warmed_up {
-            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            let ticket = selection_counter_ticket(rr_counter);
             if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 // Round-robin among unwarmed healthy targets only.
                 for i in 0..self.targets.len() {
@@ -5396,7 +5396,7 @@ impl LoadBalancer {
         let all_warmed_up = unwarmed_count == 0;
 
         if !all_warmed_up {
-            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            let ticket = selection_counter_ticket(rr_counter);
             if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 for candidate in candidates {
                     let samples = self
