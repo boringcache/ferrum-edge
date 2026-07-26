@@ -635,6 +635,41 @@ fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), Extrac
     Ok(())
 }
 
+/// Exhaustive `x-ferrum-validate` object keys.
+///
+/// The extension is a fixed-field object: an unrecognized key used to be copied
+/// verbatim into the generated plugin config, so a typo produced a plugin that
+/// constructed successfully with the weaker default still in force
+/// (GHSA-692x-352q-6gm8). `operations` is regenerated from the document and is
+/// rejected here rather than silently ignored.
+const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
+    "mode",
+    "request",
+    "response",
+    "validate_request",
+    "validate_response",
+    "bypass",
+    "fail_on_unknown_operation",
+    "fail_on_missing_response_schema",
+    "max_body_bytes",
+    "error_response",
+    "error_truncate_chars",
+];
+const X_FERRUM_VALIDATE_SIDE_KEYS: &[&str] = &["enabled", "content_types"];
+
+fn reject_unknown_validate_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), ExtractError> {
+    crate::util::unknown_keys::reject_unknown_keys(object, path, allowed, "").map_err(|error| {
+        ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error,
+        }
+    })
+}
+
 fn apply_validate_extension(
     config: &mut Map<String, Value>,
     validate_ext: Value,
@@ -642,9 +677,9 @@ fn apply_validate_extension(
     let Value::Object(map) = validate_ext else {
         return Ok(());
     };
+    reject_unknown_validate_keys(&map, "x-ferrum-validate", X_FERRUM_VALIDATE_KEYS)?;
     for (key, value) in map {
         match key.as_str() {
-            "operations" => {}
             "mode" => {
                 config.insert("enforcement_mode".to_string(), value);
             }
@@ -658,6 +693,8 @@ fn apply_validate_extension(
                 validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
                 config.insert(key, value);
             }
+            // Enumerated above; every remaining key is a plugin config field
+            // that carries the same name.
             _ => {
                 config.insert(key, value);
             }
@@ -677,6 +714,11 @@ fn apply_validate_side_extension(
             error: format!("'{side}' must be an object"),
         });
     };
+    reject_unknown_validate_keys(
+        &map,
+        &format!("x-ferrum-validate.{side}"),
+        X_FERRUM_VALIDATE_SIDE_KEYS,
+    )?;
     for (key, value) in map {
         match key.as_str() {
             "enabled" => {
@@ -685,8 +727,11 @@ fn apply_validate_side_extension(
             "content_types" => {
                 config.insert(format!("{side}_content_types"), value);
             }
-            _ => {
-                config.insert(key, value);
+            other => {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-validate",
+                    error: format!("unknown configuration key(s): '{side}.{other}'"),
+                });
             }
         }
     }
@@ -1794,9 +1839,11 @@ fn extract_openapi_responses(
                 }
             }
         }
-        if !content_schemas.is_empty() {
-            out.insert(status.clone(), Value::Object(content_schemas));
-        }
+        // Emit declared statuses even when they carry no schema-bearing
+        // content. An exact status declaration must preclude `4XX` / `default`
+        // fallback at runtime, which the validator can only honor if the
+        // declaration survives generation (GHSA-cjqx-p554-5rx9).
+        out.insert(status.clone(), Value::Object(content_schemas));
     }
     Ok(out)
 }
@@ -1887,22 +1934,23 @@ fn extract_swagger_responses(
         let Some(response_object) = resolved.as_object() else {
             continue;
         };
-        let Some(schema) = response_object.get("schema") else {
-            continue;
-        };
-        let schema = resolve_refs(
-            root,
-            schema,
-            status,
-            MAX_SCHEMA_REF_DEPTH,
-            resolver.document_base(),
-            resolver,
-            ResolveContext::Schema,
-        )?;
-        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
         let mut content = Map::new();
-        for media_type in &produces {
-            content.insert(media_type.clone(), schema.clone());
+        // As above: a declared status with no `schema` still occupies its slot
+        // so it cannot fall through to a wildcard or `default` response.
+        if let Some(schema) = response_object.get("schema") {
+            let schema = resolve_refs(
+                root,
+                schema,
+                status,
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::Schema,
+            )?;
+            let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
+            for media_type in &produces {
+                content.insert(media_type.clone(), schema.clone());
+            }
         }
         out.insert(status.clone(), Value::Object(content));
     }
@@ -1962,6 +2010,13 @@ struct LocalSchemaResolver {
     resource_roots: Vec<SchemaResourceRoot>,
     /// OpenAPI 3.1+ uses `$anchor`; Swagger 2.0 / OAS 3.0 use Draft-7 `$id`/`id` fragments.
     use_dollar_anchor: bool,
+    /// OpenAPI 3.1+ Schema Objects inherit JSON Schema 2020-12 semantics, where
+    /// `$ref` is an applicator and adjacent keywords are independent assertions
+    /// that must *also* hold. Swagger 2.0 / OAS 3.0 Schema Objects use JSON
+    /// Reference semantics, where adjacent keywords carry no meaning at all.
+    /// Either way an adjacent keyword may never replace the referenced
+    /// assertion (GHSA-rf4j-rhmf-8whm).
+    schema_object_ref_siblings: bool,
 }
 
 struct SchemaResourceRoot {
@@ -1985,6 +2040,7 @@ impl LocalSchemaResolver {
             resources: HashSet::new(),
             resource_roots: Vec::new(),
             use_dollar_anchor,
+            schema_object_ref_siblings: use_dollar_anchor,
         };
         let document_key = resource_uri_key(&document_base);
         resolver.resources.insert(document_key.clone());
@@ -2831,6 +2887,120 @@ fn schema_child_context(key: &str, value: &Value) -> ResolveContext {
     }
 }
 
+/// Schema Object keywords that assert nothing about an instance: identifier /
+/// dialect / subschema-container keywords and pure annotations. They stay on
+/// the composition wrapper, which is the position they already occupied, so
+/// identifier and base-URI scope is unchanged.
+const SCHEMA_NON_ASSERTION_KEYWORDS: &[&str] = &[
+    "$anchor",
+    "$comment",
+    "$defs",
+    "$dynamicAnchor",
+    "$id",
+    "$schema",
+    "$vocabulary",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "example",
+    "examples",
+    "externalDocs",
+    "id",
+    "summary",
+    "title",
+    "xml",
+];
+
+/// Schema Object keywords Ferrum cannot faithfully relocate into a composition
+/// branch. `unevaluatedProperties` / `unevaluatedItems` are evaluated against
+/// annotations produced by applicators in the *same* schema object — including
+/// the adjacent `$ref` — which a separate `allOf` branch does not see, and
+/// `$dynamicRef` resolution depends on the dynamic scope. Importing either next
+/// to `$ref` would change meaning, so they fail closed instead.
+const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] =
+    &["$dynamicRef", "unevaluatedItems", "unevaluatedProperties"];
+
+/// Compose a Schema Object `$ref` with its adjacent keywords without letting an
+/// adjacent keyword overwrite a referenced assertion (GHSA-rf4j-rhmf-8whm).
+///
+/// - Identifier and annotation keywords stay on the wrapper; they assert
+///   nothing, so keeping them in place preserves both meaning and `$id` scope.
+/// - OpenAPI 3.1+ (JSON Schema 2020-12): `$ref` is an applicator and adjacent
+///   assertions are independent, so the pair becomes
+///   `{<annotations>, allOf: [<referenced schema>, {<adjacent assertions>}]}`,
+///   which is exactly "both must hold".
+/// - Swagger 2.0 / OpenAPI 3.0: Schema Object `$ref` is a JSON Reference and
+///   adjacent keywords have no defined meaning. Rather than silently dropping
+///   an operator-visible constraint or applying the 3.1 rule to a document that
+///   did not opt into it, the import fails closed and asks for an explicit
+///   `allOf`.
+fn compose_schema_ref_siblings(
+    root: &Value,
+    object: &Map<String, Value>,
+    resolved_target: Value,
+    location: &str,
+    reference: &str,
+    depth: usize,
+    child_base: &Url,
+    resolver: &LocalSchemaResolver,
+) -> Result<Value, ExtractError> {
+    let mut wrapper_fields = Map::new();
+    let mut assertions = Map::new();
+    for (key, child) in object {
+        if key == "$ref" {
+            continue;
+        }
+        if UNPRESERVABLE_REF_SIBLING_KEYWORDS.contains(&key.as_str()) {
+            return Err(schema_reference_error(format!(
+                "$ref '{reference}' at {location} has an adjacent '{key}' keyword, whose evaluation scope cannot be preserved; move the reference into an explicit allOf branch"
+            )));
+        }
+        let resolved_child = resolve_refs(
+            root,
+            child,
+            location,
+            depth - 1,
+            child_base,
+            resolver,
+            schema_child_context(key, child),
+        )?;
+        if SCHEMA_NON_ASSERTION_KEYWORDS.contains(&key.as_str()) || key.starts_with("x-") {
+            wrapper_fields.insert(key.clone(), resolved_child);
+        } else {
+            assertions.insert(key.clone(), resolved_child);
+        }
+    }
+
+    if assertions.is_empty() {
+        // No assertion is displaced, so the historical overlay is already
+        // standards-equivalent and stays byte-compatible.
+        let mut merged = resolved_target;
+        if let Some(merged_object) = merged.as_object_mut() {
+            for (key, value) in wrapper_fields {
+                merged_object.insert(key, value);
+            }
+        }
+        return Ok(merged);
+    }
+
+    if !resolver.schema_object_ref_siblings {
+        let mut keywords: Vec<&str> = assertions.keys().map(String::as_str).collect();
+        keywords.sort_unstable();
+        return Err(schema_reference_error(format!(
+            "$ref '{reference}' at {location} has adjacent assertion keyword(s) ({}); Swagger 2.0 and OpenAPI 3.0 Schema Object $ref is a JSON Reference with no defined sibling semantics, so wrap the reference in an explicit allOf instead",
+            keywords.join(", ")
+        )));
+    }
+
+    let mut wrapper = wrapper_fields;
+    wrapper.insert(
+        "allOf".to_string(),
+        Value::Array(vec![resolved_target, Value::Object(assertions)]),
+    );
+    Ok(Value::Object(wrapper))
+}
+
 fn resolve_refs(
     root: &Value,
     value: &Value,
@@ -2877,27 +3047,42 @@ fn resolve_refs(
                     resolver,
                     context,
                 )?;
-                if object.len() > 1
-                    && let Some(resolved_object) = resolved.as_object_mut()
-                {
-                    for (key, child) in object {
-                        if key != "$ref" {
-                            resolved_object.insert(
-                                key.clone(),
-                                resolve_refs(
-                                    root,
-                                    child,
-                                    location,
-                                    depth - 1,
-                                    &child_base,
-                                    resolver,
-                                    if context == ResolveContext::Schema {
-                                        schema_child_context(key, child)
-                                    } else {
-                                        ResolveContext::Opaque
-                                    },
-                                )?,
-                            );
+                if object.len() > 1 {
+                    if context == ResolveContext::Schema {
+                        // Schema Object: never merge keywords by replacement.
+                        return compose_schema_ref_siblings(
+                            root,
+                            object,
+                            resolved,
+                            location,
+                            reference,
+                            depth,
+                            &child_base,
+                            resolver,
+                        );
+                    }
+                    // Reference Object (Path Item / requestBody / response /
+                    // parameter / header positions). These are not Schema
+                    // Objects and keep Ferrum's documented deterministic
+                    // sibling overlay; OpenAPI leaves the conflict undefined
+                    // for Path Items and the referenced object is not a
+                    // constraint set.
+                    if let Some(resolved_object) = resolved.as_object_mut() {
+                        for (key, child) in object {
+                            if key != "$ref" {
+                                resolved_object.insert(
+                                    key.clone(),
+                                    resolve_refs(
+                                        root,
+                                        child,
+                                        location,
+                                        depth - 1,
+                                        &child_base,
+                                        resolver,
+                                        ResolveContext::Opaque,
+                                    )?,
+                                );
+                            }
                         }
                     }
                 }

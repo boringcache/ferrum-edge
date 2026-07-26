@@ -7,6 +7,7 @@ mod admin_read_only_tests;
 mod admin_tests;
 mod admin_validation_tests;
 mod api_specs_path_item_ref_tests;
+mod api_specs_ref_sibling_tests;
 mod api_specs_readonly_required_tests;
 mod api_specs_schema_anchor_tests;
 mod api_specs_server_base_path_tests;
