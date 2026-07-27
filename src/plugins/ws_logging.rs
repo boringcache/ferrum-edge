@@ -889,24 +889,19 @@ fn build_tls_connector(
     // Build root certificate store following the gateway's CA trust chain:
     // - Custom CA configured → empty store + only that CA (CA exclusivity)
     // - No CA configured → webpki roots as default fallback
-    let mut root_store = if ca_bundle_path.is_some() {
-        rustls::RootCertStore::empty()
-    } else {
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-    };
-
-    if let Some(ca_path) = ca_bundle_path {
+    let root_store = if let Some(ca_path) = ca_bundle_path {
         let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
         let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
             .map_err(|e| format!("ws_logging: failed to load CA bundle: {e}"))?;
-        let source_id = ca_material.display_source_id.clone();
-        let mut cursor = std::io::Cursor::new(ca_material.bytes.expose_secret());
-        for cert in rustls_pemfile::certs(&mut cursor).flatten() {
-            root_store.add(cert).map_err(|e| {
-                format!("ws_logging: failed to add CA certificate from {source_id}: {e}")
-            })?;
-        }
-    }
+        crate::tls::root_cert_store_from_pem_bundle(
+            ca_material.bytes.expose_secret(),
+            "ws_logging CA bundle",
+            &ca_material.display_source_id,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
 
     let mut client_config = if tls_no_verify {
         // No-verify path bypasses CRL checking entirely; warn below on first build.

@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, PluginHttpClient, PluginResult, WsDisconnectContext,
-    ws_logging::WsLogging,
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    WsDisconnectContext, plugin_failure_policy, ws_logging::WsLogging,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -59,6 +59,27 @@ impl<'a> MakeWriter<'a> for SharedWriter {
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn client_with_ca(ca_path: &str) -> PluginHttpClient {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_path),
+        Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    )
 }
 
 fn test_ws_disconnect_context() -> WsDisconnectContext {
@@ -134,6 +155,75 @@ async fn test_ws_logging_plugin_creation_wss() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
+}
+
+#[test]
+fn test_ws_logging_keeps_last_known_good_on_invalid_candidates() {
+    assert_eq!(
+        plugin_failure_policy("ws_logging"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("mixed-ca.pem");
+    let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+    std::fs::write(
+        &ca_path,
+        format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+    )
+    .expect("write mixed CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("a malformed later CA record must reject plugin construction");
+    assert!(error.contains("ws_logging CA bundle"), "got: {error}");
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("malformed-ca.pem");
+    std::fs::write(
+        &ca_path,
+        b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write malformed CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("an all-malformed CA bundle must reject plugin construction");
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("empty-ca.pem");
+    std::fs::write(&ca_path, b"").expect("write empty CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("an empty custom CA store must reject plugin construction");
+    assert!(error.contains("no valid PEM certificates"), "got: {error}");
 }
 
 #[tokio::test]

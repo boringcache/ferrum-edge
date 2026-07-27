@@ -2327,9 +2327,10 @@ impl ApiChargebackSink {
                     "{PLUGIN_NAME}: refusing new snapshot generation while pending finalization recovery budget is exhausted ({SNAPSHOT_FINALIZATION_RECOVERY_POLICY})"
                 ));
             }
-            let accumulator = Arc::new(SnapshotAccumulator::with_limits(
+            let accumulator = Arc::new(SnapshotAccumulator::with_limits_and_shards(
                 self.config.snapshot.max_entries,
                 self.config.snapshot.max_retained_bytes,
+                self.http_client.pool_shard_amount(),
             ));
             let emission_lock = Arc::new(Mutex::new(()));
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -5239,9 +5240,9 @@ impl SpoolManager {
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
         // Optional test seam: runs under the writer lock so injected stalls
         // model real compression/write/fsync latency without changing the
-        // request-path enqueue contract.
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::BeforeWrite);
-        let _after_hook = SpoolWriteHookAfterGuard;
+        // request-path enqueue contract. Snapshot the hook once so AfterWrite
+        // cannot observe a different (later-installed) hook than BeforeWrite.
+        let _after_hook = SpoolWriteHookAfterGuard::enter();
         self.prepare_live_storage_locked()?;
         let body = serialize_json_each_row(events)?;
         if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
@@ -6736,23 +6737,39 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     }
 }
 
-fn run_spool_write_hook_for_tests(point: SpoolWriteHookPoint) {
-    let hook = spool_write_hook_slot()
+fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
+    spool_write_hook_slot()
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
-    if let Some(hook) = hook {
-        hook(point);
-    }
+        .and_then(|slot| slot.clone())
 }
 
 /// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
-/// exit path after [`SpoolWriteHookPoint::BeforeWrite`] has been observed.
-struct SpoolWriteHookAfterGuard;
+/// exit path with the same hook instance that observed `BeforeWrite`.
+///
+/// Re-reading the process-global slot on drop would let a write that entered
+/// under hook A publish `AfterWrite` to a later-installed hook B — breaking
+/// tests that deliberately stall one generation's write while asserting that
+/// generation has not finished.
+struct SpoolWriteHookAfterGuard {
+    hook: Option<SpoolWriteHookForTests>,
+}
+
+impl SpoolWriteHookAfterGuard {
+    fn enter() -> Self {
+        let hook = snapshot_spool_write_hook_for_tests();
+        if let Some(ref hook) = hook {
+            hook(SpoolWriteHookPoint::BeforeWrite);
+        }
+        Self { hook }
+    }
+}
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::AfterWrite);
+        if let Some(hook) = self.hook.take() {
+            hook(SpoolWriteHookPoint::AfterWrite);
+        }
     }
 }
 
@@ -7672,9 +7689,28 @@ impl SnapshotAccumulator {
     }
 
     pub fn with_limits(max_entries: usize, max_retained_bytes: usize) -> Self {
+        Self::with_limits_and_shards(
+            max_entries,
+            max_retained_bytes,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    /// Build an accumulator whose hot-path maps use `shard_amount` shards.
+    ///
+    /// `shard_amount` must already be normalized (production passes
+    /// `PluginHttpClient::pool_shard_amount()`, which applies
+    /// `FERRUM_POOL_SHARD_AMOUNT` exactly once). Both maps are written from the
+    /// request path under attacker-shaped key cardinality, so they must not
+    /// keep DashMap's default shard count.
+    pub fn with_limits_and_shards(
+        max_entries: usize,
+        max_retained_bytes: usize,
+        shard_amount: usize,
+    ) -> Self {
         Self {
-            entries: DashMap::new(),
-            last_emitted: DashMap::new(),
+            entries: DashMap::with_shard_amount(shard_amount),
+            last_emitted: DashMap::with_shard_amount(shard_amount),
             next_generation: AtomicU64::new(1),
             max_entries: max_entries.max(1),
             max_retained_bytes: max_retained_bytes.max(1),
@@ -7780,11 +7816,11 @@ impl SnapshotAccumulator {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(proxy_name, MAX_FIELD_LEN),
+            proxy_id: bound_key_field(proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(proxy_name, MAX_FIELD_LEN),
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: outcome.status_code,
             http_status_code: Some(outcome.http_status_code),
@@ -7801,11 +7837,11 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(
+            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(
                 summary.proxy_name.as_deref().unwrap_or("unknown"),
                 MAX_FIELD_LEN,
             ),
@@ -7813,7 +7849,7 @@ impl SnapshotAccumulator {
             status_code: STREAM_STATUS_SENTINEL,
             http_status_code: None,
             grpc_status: None,
-            protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
+            protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
         };
         self.record(meta, charge)
     }
@@ -7825,11 +7861,11 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(
+            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(
                 summary.proxy_name.as_deref().unwrap_or("unknown"),
                 MAX_FIELD_LEN,
             ),
@@ -8601,14 +8637,14 @@ fn event_from_http_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(
+        proxy_id: bound_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
-        proxy_name: bound_string(
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8660,11 +8696,11 @@ fn event_from_stream_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-        proxy_name: bound_string(
+        proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8672,7 +8708,7 @@ fn event_from_stream_summary(
         status_code: STREAM_STATUS_SENTINEL,
         http_status_code: None,
         grpc_status: None,
-        protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
+        protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
         call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
@@ -8716,11 +8752,11 @@ fn event_from_ws_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-        proxy_name: bound_string(
+        proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8802,7 +8838,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
     {
-        return bound_string(protocol, MAX_FIELD_LEN);
+        return bound_key_field(protocol, MAX_FIELD_LEN);
     }
     if summary.response_status_code == 101 {
         "ws".to_string()
@@ -8814,7 +8850,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
 fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
-        .map(|value| bound_string(value, MAX_METADATA_FIELD_LEN))
+        .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
 }
 
@@ -8962,15 +8998,30 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
     invalidate_status_cache();
 }
 
+/// Bound a **display-only** field. Never use this for a value that
+/// participates in a snapshot key or an exported billing identity — see
+/// [`bound_key_field`].
 fn bound_string(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        return value.to_string();
-    }
-    let mut end = max_len;
-    while !value.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    value[..end].to_string()
+    crate::plugins::chargeback::bounded_display(value, max_len).to_string()
+}
+
+/// Bound a field that is part of the snapshot accumulator key or the exported
+/// billing identity.
+///
+/// Prefix truncation here would merge two distinct authenticated principals
+/// (or two distinct routes/proxies) that share a prefix into one exported row
+/// and, in snapshot mode, into one accumulator entry that combines both
+/// parties' calls, bytes, and charges (GHSA-m28c-f3v5-26qg). Oversized values
+/// therefore keep a readable prefix plus a domain-separated digest of the
+/// complete value, which is stable, collision-resistant, and still bounded.
+///
+/// Authenticated external identities are additionally capped at the
+/// authentication boundary
+/// ([`crate::plugins::utils::auth_flow::MAX_AUTHENTICATED_IDENTITY_BYTES`]), so
+/// in practice this path is reached only by long operator-configured Consumer
+/// usernames, display names, or route identifiers.
+fn bound_key_field(value: &str, max_len: usize) -> String {
+    crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {

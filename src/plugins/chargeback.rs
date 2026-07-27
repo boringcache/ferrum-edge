@@ -1,6 +1,91 @@
 //! Shared chargeback helpers used by in-memory and durable charge exporters.
 
+use std::borrow::Cow;
+
+use sha2::{Digest as _, Sha256};
+
 use super::TransactionSummary;
+
+/// Domain separator for the billing-identity digest. Keeps the digest from
+/// colliding with any other SHA-256 use in the process and pins the encoding
+/// version so a future change is a visibly different representation.
+const BILLING_IDENTITY_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/chargeback-billing-identity/v1\0";
+
+/// Marker separating the human-readable prefix from the digest.
+const BILLING_IDENTITY_DIGEST_MARKER: &str = "~sha256:";
+
+/// Hex length of a SHA-256 digest.
+const BILLING_IDENTITY_DIGEST_HEX_LEN: usize = 64;
+
+/// Total bytes a digest suffix adds: marker plus hex digest.
+pub const BILLING_IDENTITY_DIGEST_SUFFIX_BYTES: usize =
+    BILLING_IDENTITY_DIGEST_MARKER.len() + BILLING_IDENTITY_DIGEST_HEX_LEN;
+
+/// Longest UTF-8-safe prefix of `value` that fits in `max_len` bytes.
+///
+/// Shared by every chargeback field bound so the char-boundary walk has one
+/// implementation. This is a *display* bound only: never use its output as an
+/// aggregation, snapshot, or export key for an identity — use
+/// [`bounded_billing_identity`] there.
+pub fn bounded_display(value: &str, max_len: usize) -> &str {
+    if value.len() <= max_len {
+        return value;
+    }
+    let mut end = max_len;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Bound an authenticated billing identity to `max_len` bytes **without**
+/// merging distinct principals.
+///
+/// A plain prefix truncation is not usable as a billing key: two verified
+/// identities that share the first `max_len` bytes would become one exported
+/// `consumer_id` and, in snapshot mode, one accumulator entry combining both
+/// principals' calls, bytes, and charges (GHSA-m28c-f3v5-26qg).
+///
+/// Values within the bound are returned byte-for-byte, so the common case is
+/// allocation-free and fully reversible. An oversized value is replaced by a
+/// domain-separated, collision-resistant representation:
+/// `<utf8-safe prefix>~sha256:<hex digest of the complete identity>`. The
+/// digest covers the whole original value, so two identities differing
+/// anywhere still produce different representations, while the retained prefix
+/// keeps the row recognizable during reconciliation. Operators who need the
+/// original value must resolve it at the identity provider — the gateway
+/// deliberately does not retain oversized credential-derived identities.
+///
+/// The mapping is injective, which is what makes it safe as a key: a value
+/// returned verbatim never contains the digest marker, and a digest form always
+/// does, so the two classes are disjoint and two digest forms collide only on a
+/// SHA-256 collision. A within-bound identity that itself contains the marker is
+/// therefore *also* replaced by its digest form — otherwise an actor who knows a
+/// victim's long identity could present its representation as a short identity
+/// and be billed into the victim's row. Internal registry sentinels that need to
+/// stay unreachable from real principals (for example the api_chargeback
+/// cardinality-overflow row) must likewise live in the digest-form class, with a
+/// non-hex suffix so they cannot equal a genuine digest representation either.
+///
+/// `max_len` below `BILLING_IDENTITY_DIGEST_SUFFIX_BYTES` leaves no room for a
+/// prefix; the representation is then the leading bytes of the digest alone.
+pub fn bounded_billing_identity(value: &str, max_len: usize) -> Cow<'_, str> {
+    if value.len() <= max_len && !value.contains(BILLING_IDENTITY_DIGEST_MARKER) {
+        return Cow::Borrowed(value);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(BILLING_IDENTITY_DIGEST_DOMAIN);
+    hasher.update(value.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    if max_len < BILLING_IDENTITY_DIGEST_SUFFIX_BYTES {
+        // No prefix budget: emit as much of the digest as fits. `digest` is
+        // ASCII hex, so byte slicing is always on a char boundary.
+        return Cow::Owned(digest[..max_len.min(BILLING_IDENTITY_DIGEST_HEX_LEN)].to_string());
+    }
+    let prefix_budget = max_len - BILLING_IDENTITY_DIGEST_SUFFIX_BYTES;
+    let prefix = bounded_display(value, prefix_budget);
+    Cow::Owned(format!("{prefix}{BILLING_IDENTITY_DIGEST_MARKER}{digest}"))
+}
 
 /// Final status dimensions used by both chargeback implementations.
 ///

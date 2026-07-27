@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -542,31 +541,19 @@ pub fn build_root_cert_store(
     global_ca: Option<&Path>,
 ) -> Result<RootCertStore, TlsError> {
     let ca_path = proxy_ca.or(global_ca);
-    let mut root_store = if ca_path.is_some() {
-        RootCertStore::empty()
-    } else {
-        RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-    };
-
     if let Some(ca_path) = ca_path {
-        let certs = load_cert_chain(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
-        let (added, ignored) = root_store.add_parsable_certificates(certs);
-        if added == 0 {
-            return Err(TlsError::Rustls(format!(
-                "No valid CA certificates found in {}",
-                ca_path.display()
-            )));
-        }
-        if ignored > 0 {
-            tracing::warn!(
-                "Ignored {} invalid CA certificate(s) while loading {}",
-                ignored,
-                ca_path.display()
-            );
-        }
+        let material = load_backend_material(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
+        return crate::tls::root_cert_store_from_pem_bundle(
+            material.bytes.expose_secret(),
+            "backend CA bundle",
+            &material.display_source_id,
+        )
+        .map_err(|error| TlsError::Rustls(error.to_string()));
     }
 
-    Ok(root_store)
+    Ok(RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    ))
 }
 
 pub struct BackendTlsConfigBuilder<'a> {
@@ -849,21 +836,13 @@ fn load_cert_chain(
 ) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let material = load_backend_material(path, material_kind, kind)?;
     let source_id = material.display_source_id.clone();
-    let certs = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| TlsError::Pem {
-            kind,
-            path: PathBuf::from(&source_id),
-            details: format!("PEM certificates: {}", e),
-        })?;
-
-    if certs.is_empty() {
-        return Err(TlsError::Pem {
-            kind,
-            path: PathBuf::from(source_id),
-            details: "no PEM certificates found".to_string(),
-        });
-    }
+    let certs =
+        crate::tls::parse_pem_certificate_bundle(material.bytes.expose_secret(), kind, &source_id)
+            .map_err(|error| TlsError::Pem {
+                kind,
+                path: PathBuf::from(&source_id),
+                details: error.to_string(),
+            })?;
 
     Ok(certs)
 }
@@ -871,17 +850,13 @@ fn load_cert_chain(
 fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
     let material = load_backend_material(path, MaterialKind::Key, kind)?;
     let source_id = material.display_source_id.clone();
-    rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
-        .map_err(|e| TlsError::Pem {
+    crate::tls::parse_pem_private_key(material.bytes.expose_secret(), kind, &source_id).map_err(
+        |error| TlsError::Pem {
             kind,
             path: PathBuf::from(&source_id),
-            details: format!("PEM private key: {}", e),
-        })?
-        .ok_or_else(|| TlsError::Pem {
-            kind,
-            path: PathBuf::from(source_id),
-            details: "no private key found".to_string(),
-        })
+            details: error.to_string(),
+        },
+    )
 }
 
 fn load_backend_material(

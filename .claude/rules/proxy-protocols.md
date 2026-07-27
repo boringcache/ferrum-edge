@@ -59,7 +59,7 @@ paths:
 - Frontend TLS/DTLS handshakes are bounded by `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS` before HTTP header timers start.
 - Backend TLS/H2/gRPC/H3 handshakes are bounded by the per-proxy `backend_connect_timeout_ms` end-to-end connect budget.
 - TLS/DTLS-terminating frontends must complete frontend crypto/admission before backend dispatch. Frontend handshake failures and plugin rejects must not dial backends or trip backend circuit breakers.
-- HTTP/3 0-RTT is disabled by default, method-gated by `FERRUM_TLS_EARLY_DATA_METHODS`, strips client `Early-Data`, and reinjects `Early-Data: 1` outbound.
+- HTTP/3 0-RTT is disabled by default, method-gated by `FERRUM_TLS_EARLY_DATA_METHODS`, strips client `Early-Data`, and reinjects `Early-Data: 1` outbound. When enabled on a non-mTLS listener, QUIC rustls `max_early_data_size` is `u32::MAX` (quinn accepts only `0` or `2^32-1`; no finite QUIC TLS byte cap). A listener with a frontend client-cert verifier sets that TLS value to `0` and refuses the 0.5-RTT `into_0rtt()` accept path (`zero_rtt_admitted`), because 0.5-RTT materialization precedes client authentication and makes `peer_identity()` unknowable. H3 peer identity + early-data state are one per-connection `ArcSwap` snapshot (`http3::peer_identity::H3ConnectionIdentity`), read once per accepted request stream and published exactly once after a successful handshake; the 0.5-RTT accept loop drains already-ready streams before publishing. An identity-bearing snapshot is never early data, and a failed/cancelled handshake leaves the slot empty and early-data-gated.
 
 ## Protocol Paths
 
