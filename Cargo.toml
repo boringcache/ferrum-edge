@@ -68,6 +68,10 @@ tokio-stream = { version = "0.1", features = ["full"] }
 # HTTP
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
+# ACME wraps hyper-rustls around Ferrum's policy-aware connector so the
+# original hostname remains the SNI/certificate identity while only screened
+# resolved addresses are dialed.
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "ring", "rustls-platform-verifier"], optional = true }
 h2 = "0.4"
 http-body = "1"
 http-body-util = "0.1"
@@ -264,7 +268,7 @@ aya-log = { version = "0.2", optional = true }
 # builds that never use external secret providers.
 [features]
 default = []
-acme = ["dep:instant-acme"]
+acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
 secrets-vault = ["dep:vaultrs"]
