@@ -8400,6 +8400,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
     }
+    if name == "transaction_log_schema" {
+        // Shape-only: shared Admin / CP validation and the buffering screen must
+        // not stage schemas in the process-wide reload map. Graph validation and
+        // cache reloads construct explicitly inside an open reload bracket.
+        return transaction_log_schema::TransactionLogSchema::validate_config(config);
+    }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
         None => Err(format!("Unknown plugin name '{}'", name)),
