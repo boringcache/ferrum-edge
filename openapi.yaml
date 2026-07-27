@@ -1607,14 +1607,16 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
-        `proxy_name` is live display metadata for the stable `proxy_id` and is
-        not part of the registry key, so name-only reloads keep accumulated
-        counter values. Both formats resolve active IDs through the same
-        snapshot of the published configuration, so late retired-generation
-        traffic cannot restore an old name. As a Prometheus label, a rename
-        creates a controlled label transition whose new series carries the
-        existing cumulative value. Overlapping pricing generations collapse
-        under that authoritative current name.
+        Charge identity is the matched proxy's `(namespace, proxy_id)`, including
+        for gateway-wide global plugin instances. `proxy_name` is live display
+        metadata and is not part of the registry key, so name-only reloads keep
+        accumulated counter values. Both formats resolve active identities
+        through the same namespace-qualified snapshot of the published
+        configuration, so late retired-generation traffic cannot restore an old
+        name. As a Prometheus label, a rename creates a controlled label
+        transition whose new series carries the existing cumulative value.
+        Overlapping pricing generations collapse under that authoritative
+        current name.
 
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
@@ -21767,13 +21769,19 @@ components:
                 additionalProperties:
                   type: object
                   properties:
+                    proxy_id:
+                      type: string
+                      description: Stable ID of the matched proxy within `namespace`.
+                    namespace:
+                      type: string
+                      description: Namespace of the matched proxy for this charge row.
                     proxy_name:
                       type: string
                       description: |
-                        Live display name for the stable `proxy_id`. Not part of
-                        the in-memory chargeback key, so name-only reloads
+                        Live display name for the stable `(namespace, proxy_id)`.
+                        Not part of the in-memory chargeback key, so name-only reloads
                         preserve accumulated counter values. JSON and Prometheus
-                        resolve active IDs through the same snapshot of the
+                        resolve active identities through the same snapshot of the
                         published configuration; late retired-generation traffic
                         cannot restore an old name. As a Prometheus label, a
                         rename creates a controlled label transition whose new

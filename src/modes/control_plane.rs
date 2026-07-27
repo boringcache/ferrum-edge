@@ -575,7 +575,9 @@ async fn load_full_config_multi(
 
     // First namespace seeds the loaded_at / version / trust_bundles fields,
     // then we extend with the remaining namespaces' resource vectors.
-    let first = namespaces.first().expect("namespaces is non-empty");
+    let first = namespaces.first().ok_or_else(|| {
+        anyhow::anyhow!("multi-namespace full config load requires at least one namespace")
+    })?;
     let mut combined = prepare_cp_full_snapshot(
         db.load_full_config_for_purpose(first, FullConfigLoadPurpose::ControlPlane)
             .await?,

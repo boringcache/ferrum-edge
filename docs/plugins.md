@@ -1429,19 +1429,21 @@ allowed process-wide because unmatched/fallback paths retain the global chain.
 The four shared render/cleanup tunables must agree across every enabled instance
 in the process, making registry behavior independent of construction order.
 
-**`proxy_name` contract:** exported `proxy_name` is live display metadata for the
-stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
-reload preserves the accumulated counter values. After an accepted
-configuration is published, JSON and Prometheus resolve active proxy IDs through
-the same lock-free snapshot of that configuration's names. Request completion
-order cannot change the exported label, so late traffic admitted under a retired
-generation cannot restore an old name. Because `proxy_name` remains a Prometheus
-label, a rename creates a controlled label transition at the accepted reload
-boundary; the new label carries the existing cumulative counter rather than
-restarting its in-memory value. Pricing changes still create distinct
-pricing-generation entries; overlapping entries collapse under the current
-published name. Retained rows for a deleted proxy use a deterministic
-recorded-name fallback.
+**Proxy identity and `proxy_name` contract:** charge rows are keyed by the
+matched proxy's `(namespace, proxy_id)`, including when one gateway-wide global
+instance records traffic for multiple namespaces. Same-id tenant proxies
+therefore never share counters or live display metadata. Exported `proxy_name`
+is omitted from the in-memory registry key, so a name-only reload preserves the
+accumulated counter values. After an accepted configuration is published, JSON
+and Prometheus resolve active proxy names through the same namespace-qualified,
+lock-free snapshot. Request completion order cannot change the exported label,
+so late traffic admitted under a retired generation cannot restore an old name.
+Because `proxy_name` remains a Prometheus label, a rename creates a controlled
+label transition at the accepted reload boundary; the new label carries the
+existing cumulative counter rather than restarting its in-memory value. Pricing
+changes still create distinct pricing-generation entries; overlapping entries
+collapse under the current published name. Retained rows for a deleted proxy use
+a deterministic recorded-name fallback.
 
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`
@@ -5489,6 +5491,8 @@ These plugins are registered built-ins even when they are most often generated o
 Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
 
 **Strict config validation:** unknown keys are rejected at every security-relevant nesting level — top-level plugin config, each rule, match, destination, fault, rewrite, redirect, transform, route-local `retry`, nested retry backoff, and destination `backend_tls`. Misspellings such as `reject_unmtached`, `requires_node_waypoint_auth`, `retry.max_retry`, or `backend_tls.client_certpath` fail admission on native/file/admin/translated/CP-DP paths instead of silently disabling fail-closed controls. Shared gateway `RetryConfig` / `BackendTlsConfig` consumers keep their existing compatibility boundary; mesh route policy uses strict route-local wire shapes that convert into those runtime types after validation.
+
+An `upstream_id` destination resolves in the matched proxy's namespace. Scoped plugin references are validated in their resource namespace; a gateway-wide global reference must exist in every proxy namespace where that global is effective (excluding proxies that replace it with a scoped `mesh_route_dispatch` instance). A same-ID upstream in another namespace never satisfies the reference.
 
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 

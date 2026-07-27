@@ -27,6 +27,17 @@ fn scope_for(currency: &str, namespace: &str) -> InstanceScope {
     InstanceScope::new(currency, namespace)
 }
 
+fn active_proxy_names(
+    namespace: &str,
+    proxy_id: &str,
+    proxy_name: &str,
+) -> HashMap<String, HashMap<String, String>> {
+    HashMap::from([(
+        namespace.to_string(),
+        HashMap::from([(proxy_id.to_string(), proxy_name.to_string())]),
+    )])
+}
+
 fn make_summary(
     proxy_id: &str,
     proxy_name: &str,
@@ -168,11 +179,11 @@ fn make_key_with_prices(
     format!(
         "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
+        scope.namespace,
         proxy_id,
         status_code,
         protocol_family,
         scope.currency,
-        scope.namespace_label,
         call_price.to_bits(),
         bw_price_sent.to_bits(),
         bw_price_received.to_bits()
@@ -617,6 +628,60 @@ async fn test_combined_pricing_applies_both_call_and_bandwidth_charges() {
     assert!((call_charge - 0.001).abs() < 1e-12);
     assert!((bw_sent - 0.001).abs() < 1e-12); // 1_000 * 0.000001
     assert!((bw_recv - 0.004).abs() < 1e-12); // 2_000 * 0.000002
+}
+
+#[tokio::test]
+async fn test_global_plugin_qualifies_same_proxy_id_by_matched_namespace() {
+    const CONSUMER: &str = "namespace-qualified-global-consumer-3094";
+    const PROXY_ID: &str = "shared-global-proxy-3094";
+    let plugin = ApiChargeback::new(
+        &json!({
+            "currency": "USD",
+            "pricing_tiers": [
+                { "status_codes": [200], "price_per_call": 1.0 }
+            ]
+        }),
+        "plugin-owner",
+    )
+    .unwrap();
+    let mut tenant_a = make_summary(PROXY_ID, "Tenant A API", Some(CONSUMER), 200);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = make_summary(PROXY_ID, "Tenant B API", Some(CONSUMER), 200);
+    tenant_b.namespace = "tenant-b".to_string();
+
+    plugin.log(&tenant_a).await;
+    plugin.log(&tenant_b).await;
+
+    let registry = global_registry();
+    let namespace_labels: std::collections::HashSet<String> = registry
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.consumer.as_ref() == CONSUMER && entry.proxy_id.as_ref() == PROXY_ID
+        })
+        .map(|entry| entry.namespace_label.to_string())
+        .collect();
+    assert_eq!(
+        namespace_labels,
+        std::collections::HashSet::from([
+            InstanceScope::namespace_label_for("tenant-a"),
+            InstanceScope::namespace_label_for("tenant-b"),
+        ])
+    );
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let proxy_rows = rendered["consumers"][CONSUMER]["proxies"]
+        .as_object()
+        .expect("consumer proxy rows");
+    assert_eq!(proxy_rows.len(), 2);
+    assert_eq!(
+        proxy_rows
+            .values()
+            .filter_map(|row| row["namespace"].as_str())
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from(["tenant-a", "tenant-b"])
+    );
 }
 
 // --- Registry tests ---
@@ -1564,6 +1629,59 @@ fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
 }
 
 #[test]
+fn test_live_proxy_names_are_namespace_qualified() {
+    let registry = ChargebackRegistry::new();
+    let mut names = active_proxy_names("team-a", "shared", "Team A API");
+    names.extend(active_proxy_names("team-b", "shared", "Team B API"));
+    registry.set_active_proxy_names(names);
+
+    registry.record_http(
+        &scope_for("USD", "team-a"),
+        "alice",
+        "shared",
+        "stale-a",
+        200,
+        1.0,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    registry.record_http(
+        &scope_for("USD", "team-b"),
+        "alice",
+        "shared",
+        "stale-b",
+        200,
+        1.0,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+
+    let prometheus = registry.render_prometheus_uncached().unwrap();
+    let team_a = prometheus
+        .lines()
+        .find(|line| {
+            line.starts_with("ferrum_api_chargeable_calls_total{")
+                && line.contains("proxy_id=\"shared\"")
+                && line.contains("namespace=\"team-a\"")
+        })
+        .expect("team-a chargeback row");
+    let team_b = prometheus
+        .lines()
+        .find(|line| {
+            line.starts_with("ferrum_api_chargeable_calls_total{")
+                && line.contains("proxy_id=\"shared\"")
+                && line.contains("namespace=\"team-b\"")
+        })
+        .expect("team-b chargeback row");
+    assert!(team_a.contains("proxy_name=\"Team A API\""), "{team_a}");
+    assert!(team_b.contains("proxy_name=\"Team B API\""), "{team_b}");
+}
+
+#[test]
 fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
     let registry = ChargebackRegistry::new();
     let scope_usd = scope_for("USD", "team-a");
@@ -1620,12 +1738,14 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
     assert_eq!(proxies.len(), 2);
     assert!(proxies.values().any(|proxy| {
         proxy["proxy_id"] == "shared-proxy"
+            && proxy["namespace"] == "team-a"
             && proxy["currency"] == "USD"
             && proxy["by_status"]["200"]["calls"] == 1
             && proxy["by_status"]["200"]["charges"] == 1.0
     }));
     assert!(proxies.values().any(|proxy| {
         proxy["proxy_id"] == "shared-proxy"
+            && proxy["namespace"] == "team-b"
             && proxy["currency"] == "EUR"
             && proxy["by_status"]["200"]["calls"] == 1
             && proxy["by_status"]["200"]["charges"] == 2.0
@@ -2002,10 +2122,7 @@ fn assert_json_and_prometheus_proxy_name_agree(
 fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v1".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
     let s = scope();
     let price = 0.001;
 
@@ -2037,10 +2154,7 @@ fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
 
     // The accepted reload publishes the new name before new-generation
     // traffic. Continuous traffic after the reload still hits the same key.
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v2".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v2"));
     let cached_v2: serde_json::Value =
         serde_json::from_str(&registry.render_json().unwrap()).unwrap();
     assert_eq!(
@@ -2160,19 +2274,13 @@ fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
     let s = scope();
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v1".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
 
     // Old generation under the retired display name.
     record_payment(&registry, &s, "Payments v1", 0.001);
     record_payment(&registry, &s, "Payments v1", 0.001);
     // Publish the accepted rename, then record the new price generation.
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v2".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v2"));
     record_payment(&registry, &s, "Payments v2", 0.002);
     record_payment(&registry, &s, "Payments v2", 0.002);
     record_payment(&registry, &s, "Payments v2", 0.002);
@@ -2185,10 +2293,7 @@ fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500);
     let s = scope();
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v2".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v2"));
 
     // Reverse insertion order: new pricing generation first, then overlapping
     // old-generation traffic (in-flight after reload) recorded last.
@@ -2334,10 +2439,7 @@ fn test_render_cache_hits_until_proxy_metadata_generation_advances() {
     let registry = ChargebackRegistry::new();
     registry.configure(60, 3600, 500);
     let s = scope();
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v1".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
     record_payment(&registry, &s, "Payments v1", 0.001);
 
     let prom1 = registry.render_prometheus().unwrap();
@@ -2363,10 +2465,7 @@ fn test_render_cache_hits_until_proxy_metadata_generation_advances() {
         "Payments v1"
     );
 
-    registry.set_active_proxy_names(HashMap::from([(
-        "payments".to_string(),
-        "Payments v2".to_string(),
-    )]));
+    registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v2"));
     let prom3 = registry.render_prometheus().unwrap();
     assert!(
         prom3.contains("proxy_name=\"Payments v2\""),

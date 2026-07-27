@@ -652,15 +652,19 @@ fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError
 /// validation, so the contract here matches normal Proxy upstream-id
 /// validation: refuse the config, log every dangling reference once.
 ///
-/// `GatewayConfig` is already namespace-scoped by its loader/distributor
-/// before this runtime validator runs. A missing id here can therefore mean
-/// "does not exist" or "exists only in another namespace"; admin admission
-/// performs the broader DB lookup and emits the more specific cross-namespace
-/// error before the config reaches this path.
+/// References resolve in the matched proxy's namespace at dispatch time.
+/// Scoped plugins therefore validate against their resource namespace, while
+/// a gateway-wide global must resolve in every namespace containing a proxy.
+/// A same-id upstream in another namespace must never make a dangling
+/// reference pass and then fall back to the proxy's direct backend at runtime.
 pub(crate) fn validate_mesh_route_dispatch_upstream_references(
     config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
-    let upstream_ids: HashSet<&str> = config.upstreams.iter().map(|u| u.id.as_str()).collect();
+    let upstream_ids: HashSet<(&str, &str)> = config
+        .upstreams
+        .iter()
+        .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
+        .collect();
     let mut errors = Vec::new();
 
     for plugin in &config.plugin_configs {
@@ -670,15 +674,48 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
         let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
             continue;
         };
+        let target_namespaces: HashSet<&str> = if plugin.scope == PluginScope::Global {
+            config
+                .proxies
+                .iter()
+                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .filter(|proxy| {
+                    !config.plugin_configs.iter().any(|candidate| {
+                        if !candidate.enabled
+                            || candidate.plugin_name != plugin.plugin_name
+                            || candidate.namespace != proxy.namespace
+                            || candidate.scope == PluginScope::Global
+                            || !proxy.plugins.iter().any(|association| {
+                                association.plugin_config_id == candidate.id
+                            })
+                        {
+                            return false;
+                        }
+                        match candidate.scope {
+                            PluginScope::Proxy => {
+                                candidate.proxy_id.as_deref() == Some(proxy.id.as_str())
+                            }
+                            PluginScope::ProxyGroup => candidate.proxy_id.is_none(),
+                            PluginScope::Global => false,
+                        }
+                    })
+                })
+                .map(|proxy| proxy.namespace.as_str())
+                .collect()
+        } else {
+            std::iter::once(plugin.namespace.as_str()).collect()
+        };
         for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-            if let Some(upstream_id) = rule.destination.upstream_id.as_deref()
-                && !upstream_ids.contains(upstream_id)
-            {
-                let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
-                errors.push(format!(
-                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in the active GatewayConfig namespace",
-                    plugin.id, rule_idx, proxy_id, upstream_id
-                ));
+            if let Some(upstream_id) = rule.destination.upstream_id.as_deref() {
+                for namespace in &target_namespaces {
+                    if !upstream_ids.contains(&(*namespace, upstream_id)) {
+                        let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
+                        errors.push(format!(
+                            "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in namespace '{}'",
+                            plugin.id, rule_idx, proxy_id, upstream_id, namespace
+                        ));
+                    }
+                }
             }
         }
     }
@@ -798,14 +835,12 @@ fn inject_gateway_workload_metrics_if_svid(
                 && plugin.enabled
                 && plugin.scope == PluginScope::Global
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
-                && plugin.namespace == namespace
         })
         .or_else(|| {
             config.plugin_configs.iter().position(|plugin| {
                 plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                     && plugin.scope == PluginScope::Global
                     && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
-                    && plugin.namespace == namespace
             })
         });
 
@@ -816,14 +851,19 @@ fn inject_gateway_workload_metrics_if_svid(
         );
         config
             .plugin_configs
-            .retain(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID);
+            .retain(|plugin| {
+                plugin.namespace != namespace
+                    || plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            });
         return;
     }
 
     if let Some(existing) = config
         .plugin_configs
         .iter_mut()
-        .find(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
+        .find(|plugin| {
+            plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+        })
     {
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
@@ -1671,14 +1711,15 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     }
 }
 
-/// IDs of HTTP-family proxies whose effective WebSocket idle timeout resolves to
-/// `0` (disabled) — i.e. an upgraded WebSocket on them would have no idle bound.
+/// Namespace-qualified IDs of HTTP-family proxies whose effective WebSocket idle
+/// timeout resolves to `0` (disabled) — i.e. an upgraded WebSocket on them would
+/// have no idle bound.
 /// The effective timeout is the per-proxy `websocket_idle_timeout_seconds`
 /// override when set, else the global `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS`.
 fn websocket_idle_disabled_proxy_ids(
     config: &GatewayConfig,
     global_ws_idle_timeout_seconds: u64,
-) -> Vec<&str> {
+) -> Vec<String> {
     config
         .proxies
         .iter()
@@ -1688,7 +1729,7 @@ fn websocket_idle_disabled_proxy_ids(
                 DispatchKind::HttpPool | DispatchKind::HttpsPool
             ) && proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds) == 0
         })
-        .map(|proxy| proxy.id.as_str())
+        .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect()
 }
 
@@ -1699,13 +1740,13 @@ fn websocket_idle_disabled_proxy_ids(
 /// that slot indefinitely. Activity from either direction — including Ping/Pong
 /// — refreshes the timer, so the disabled state is the only exposure.
 fn emit_websocket_idle_disabled_warning(
-    disabled_proxy_ids: &[&str],
+    disabled_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
 ) {
     let sample = disabled_proxy_ids
         .iter()
         .take(3)
-        .copied()
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     warn!(
@@ -1736,13 +1777,14 @@ fn warn_if_websocket_idle_disabled(config: &GatewayConfig, global_ws_idle_timeou
 /// in `next` relative to `previous` — i.e. a proxy added with an effective `0`
 /// timeout, or one whose effective timeout changed from a bound value to `0`.
 /// Proxies already disabled in `previous` are excluded so a persistent opt-out
-/// is not reported again. The returned slices borrow from `next`.
-fn websocket_idle_newly_disabled_proxy_ids<'a>(
+/// is not reported again. Identity is `(namespace, id)`, so one tenant cannot
+/// suppress another tenant's transition warning.
+fn websocket_idle_newly_disabled_proxy_ids(
     previous: &GatewayConfig,
-    next: &'a GatewayConfig,
+    next: &GatewayConfig,
     global_ws_idle_timeout_seconds: u64,
-) -> Vec<&'a str> {
-    let previously_disabled: std::collections::HashSet<&str> =
+) -> Vec<String> {
+    let previously_disabled: std::collections::HashSet<String> =
         websocket_idle_disabled_proxy_ids(previous, global_ws_idle_timeout_seconds)
             .into_iter()
             .collect();
@@ -1778,7 +1820,7 @@ fn h3_websocket_quic_idle_mismatch_proxy_ids(
     h3_websocket_reachable: bool,
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
-) -> Vec<&str> {
+) -> Vec<String> {
     if !h3_websocket_reachable || http3_idle_timeout_seconds == 0 {
         return Vec::new();
     }
@@ -1792,19 +1834,19 @@ fn h3_websocket_quic_idle_mismatch_proxy_ids(
                 proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds);
             ws_idle == 0 || ws_idle > http3_idle_timeout_seconds
         })
-        .map(|proxy| proxy.id.as_str())
+        .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect()
 }
 
 fn emit_h3_websocket_quic_idle_mismatch_warning(
-    affected_proxy_ids: &[&str],
+    affected_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
 ) {
     let sample = affected_proxy_ids
         .iter()
         .take(3)
-        .copied()
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     warn!(
@@ -1841,14 +1883,14 @@ fn warn_if_h3_websocket_quic_idle_mismatch(
     );
 }
 
-fn h3_websocket_new_quic_idle_mismatch_proxy_ids<'a>(
+fn h3_websocket_new_quic_idle_mismatch_proxy_ids(
     previous: &GatewayConfig,
-    next: &'a GatewayConfig,
+    next: &GatewayConfig,
     h3_websocket_reachable: bool,
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
-) -> Vec<&'a str> {
-    let previous_affected: std::collections::HashSet<&str> =
+) -> Vec<String> {
+    let previous_affected: std::collections::HashSet<String> =
         h3_websocket_quic_idle_mismatch_proxy_ids(
             previous,
             h3_websocket_reachable,
@@ -41499,6 +41541,86 @@ mod tests {
     }
 
     #[test]
+    fn validate_mesh_route_dispatch_upstream_references_are_namespace_qualified() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        proxy.namespace = "tenant-a".to_string();
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut foreign_upstream =
+            upstream_with_targets("shared-id", &[("foreign.test", 8080)]);
+        foreign_upstream.namespace = "tenant-b".to_string();
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![foreign_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a foreign same-id upstream must not satisfy the reference");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-a"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_requires_each_proxy_namespace() {
+        let mut tenant_a = warmup_test_proxy("a", BackendScheme::Https, "a.test", 443);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = warmup_test_proxy("b", BackendScheme::Https, "b.test", 443);
+        tenant_b.namespace = "tenant-b".to_string();
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut tenant_a_upstream =
+            upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
+        tenant_a_upstream.namespace = "tenant-a".to_string();
+        let config = GatewayConfig {
+            proxies: vec![tenant_a, tenant_b],
+            upstreams: vec![tenant_a_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a gateway-wide global must resolve for every proxy namespace");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-b"), "{errors:?}");
+    }
+
+    #[test]
     fn validate_mesh_route_dispatch_upstream_references_skips_disabled_plugins() {
         // Disabled plugins don't execute on the hot path, so a typo in a
         // disabled instance shouldn't block config reload. This mirrors
@@ -42931,14 +43053,14 @@ mod tests {
         // Global bounded (300): only the explicit `Some(0)` override is disabled.
         assert_eq!(
             websocket_idle_disabled_proxy_ids(&config, 300),
-            vec!["disabled"]
+            vec!["ferrum/disabled"]
         );
 
         // Global disabled (0): the `Some(0)` override AND the inheriting proxy
         // are disabled; the explicit `Some(120)` override stays bounded.
         let mut ids = websocket_idle_disabled_proxy_ids(&config, 0);
         ids.sort();
-        assert_eq!(ids, vec!["disabled", "inherit"]);
+        assert_eq!(ids, vec!["ferrum/disabled", "ferrum/inherit"]);
     }
 
     #[test]
@@ -42955,13 +43077,21 @@ mod tests {
         next_b.websocket_idle_timeout_seconds = Some(0); // newly disabled
         let mut next_c = make_validation_proxy("c", "/c");
         next_c.websocket_idle_timeout_seconds = Some(0); // added, disabled
-        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
+        next_same_id_other_namespace.namespace = "tenant-b".to_string();
+        next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(0);
+        let mut next = make_validation_config(vec![
+            next_a,
+            next_b,
+            next_c,
+            next_same_id_other_namespace,
+        ]);
         next.normalize_fields();
 
         // "a" was already disabled -> excluded; only the transitions report.
         let mut newly = websocket_idle_newly_disabled_proxy_ids(&previous, &next, 300);
         newly.sort();
-        assert_eq!(newly, vec!["b", "c"]);
+        assert_eq!(newly, vec!["ferrum/b", "ferrum/c", "tenant-b/a"]);
 
         // Steady state (no new transitions) reports nothing, so a persistent
         // opt-out does not re-warn on every unrelated reload.
@@ -43009,7 +43139,10 @@ mod tests {
 
         let mut affected = h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 30);
         affected.sort();
-        assert_eq!(affected, vec!["disabled", "inherit", "long"]);
+        assert_eq!(
+            affected,
+            vec!["ferrum/disabled", "ferrum/inherit", "ferrum/long"]
+        );
 
         assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, false, 300, 30).is_empty());
         assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 0).is_empty());
@@ -43030,13 +43163,21 @@ mod tests {
         next_b.websocket_idle_timeout_seconds = Some(45); // newly affected
         let mut next_c = make_validation_proxy("c", "/c");
         next_c.websocket_idle_timeout_seconds = Some(0); // added and affected
-        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
+        next_same_id_other_namespace.namespace = "tenant-b".to_string();
+        next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(120);
+        let mut next = make_validation_config(vec![
+            next_a,
+            next_b,
+            next_c,
+            next_same_id_other_namespace,
+        ]);
         next.normalize_fields();
 
         let mut newly =
             h3_websocket_new_quic_idle_mismatch_proxy_ids(&previous, &next, true, 300, 30);
         newly.sort();
-        assert_eq!(newly, vec!["b", "c"]);
+        assert_eq!(newly, vec!["ferrum/b", "ferrum/c", "tenant-b/a"]);
 
         assert!(
             h3_websocket_new_quic_idle_mismatch_proxy_ids(&next, &next, true, 300, 30).is_empty()
@@ -43209,6 +43350,65 @@ mod tests {
                 .get("workload_spiffe_id")
                 .and_then(serde_json::Value::as_str),
             Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+    }
+
+    #[test]
+    fn gateway_workload_metrics_managed_identity_is_namespace_qualified() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let managed = |namespace: &str, spiffe_id: &str| PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+            namespace: namespace.to_string(),
+            config: json!({ "workload_spiffe_id": spiffe_id }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            managed("tenant-b", "spiffe://tenant-b.example/ns/tenant-b/sa/gateway"),
+            managed("ferrum", "spiffe://old.example/ns/ferrum/sa/old"),
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        let ferrum = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "ferrum"
+                    && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("ferrum managed plugin");
+        assert_eq!(
+            ferrum
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+        let tenant_b = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "tenant-b"
+                    && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("tenant-b managed plugin");
+        assert_eq!(
+            tenant_b
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://tenant-b.example/ns/tenant-b/sa/gateway")
         );
     }
 

@@ -4344,6 +4344,43 @@ fn test_unique_listen_paths_mesh_outbound_different_services_still_conflict() {
 }
 
 #[test]
+fn test_mesh_sibling_exemption_qualifies_lossy_ids_by_namespace() {
+    // ns `a` / service `b-c` and ns `a-b` / service `c` generate the same
+    // port-80 id. The foreign service must not overwrite the owner of only one
+    // sibling and make the valid two-port service fail uniqueness validation.
+    let mut a80 = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-80",
+        "/",
+        vec!["b-c.a.svc.cluster.local"],
+    );
+    a80.namespace = "a".to_string();
+    let mut a90 = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-90",
+        "/",
+        vec!["b-c.a.svc.cluster.local"],
+    );
+    a90.namespace = "a".to_string();
+    let mut foreign = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-80",
+        "/",
+        vec!["c.a-b.svc.cluster.local"],
+    );
+    foreign.namespace = "a-b".to_string();
+
+    let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[
+        ("a", "b-c", &[80, 90]),
+        ("a-b", "c", &[80]),
+    ]);
+    config.proxies = vec![a80, a90, foreign];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "foreign lossy-id collisions must not corrupt same-service sibling ownership"
+    );
+}
+
+#[test]
 fn test_unique_listen_paths_mesh_outbound_without_mesh_block_conflicts() {
     // Without a mesh block claiming the ids (non-mesh modes, hand-crafted
     // configs), reserved-prefix proxies get no exemption.
@@ -5726,10 +5763,9 @@ fn a_proxy_local_mcp_gateway_shadowing_a_global_one_is_still_rejected() {
 }
 
 #[test]
-fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
-    // Globals are namespace-partitioned by the runtime merge (each proxy takes
-    // only the globals of its own namespace), so a global `mcp_gateway` in one
-    // tenant must not refuse deduplication in another.
+fn a_global_mcp_gateway_in_another_namespace_blocks_dedup() {
+    // Globals are gateway-wide at runtime. Namespace qualification controls
+    // scoped associations and identity, not global applicability.
     let mut config = empty_config();
     let mut dedup = dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1"));
     dedup.namespace = "tenant-a".to_string();
@@ -5741,9 +5777,15 @@ fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
     associate(&mut proxy, &["dedup1"]);
     config.proxies = vec![proxy];
 
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("a foreign-namespace global mcp_gateway still runs on this proxy");
     assert!(
-        config.validate_plugin_references().is_ok(),
-        "a global mcp_gateway is never merged into a proxy in a different namespace"
+        errors.iter().any(|error| {
+            error.contains("request_deduplication cannot be composed with mcp_gateway")
+                && error.contains("p1")
+        }),
+        "the gateway-wide composition conflict must be reported: {errors:?}"
     );
 }
 

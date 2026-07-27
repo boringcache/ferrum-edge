@@ -7815,7 +7815,7 @@ fn test_tcp_connection_throttle_proxy_group_rejects_mixed_protocol_attachment() 
 }
 
 #[test]
-fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
+fn test_tcp_connection_throttle_global_validation_is_gateway_wide() {
     let mut tenant_a_http = make_proxy("shared-id", "/tenant-a", vec![]);
     tenant_a_http.namespace = "tenant-a".to_string();
     let mut tenant_b_tcp = make_tcp_proxy("shared-id", vec![]);
@@ -7830,10 +7830,21 @@ fn test_tcp_connection_throttle_global_validation_is_namespace_scoped() {
     tenant_a_throttle.namespace = "tenant-a".to_string();
 
     let config = make_config(vec![tenant_a_http, tenant_b_tcp], vec![tenant_a_throttle]);
-    let error = PluginCache::new(&config)
-        .err()
-        .expect("another namespace's TCP proxy must not satisfy global coverage");
-    assert!(error.contains("has no TCP/TCP+TLS proxy"), "{error}");
+    let cache =
+        PluginCache::new(&config).expect("a gateway-wide global has cross-namespace TCP coverage");
+    assert!(
+        cache
+            .get_plugins_for_protocol("tenant-a", "shared-id", ProxyProtocol::Http)
+            .is_empty(),
+        "the TCP-only global must be protocol-filtered from HTTP"
+    );
+    assert_eq!(
+        cache
+            .get_plugins_for_protocol("tenant-b", "shared-id", ProxyProtocol::Tcp)
+            .len(),
+        1,
+        "the global must protect TCP proxies in every namespace"
+    );
 }
 
 #[tokio::test]

@@ -692,7 +692,9 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/charges?format=json
 - `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` — bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`
 - `ferrum_api_bandwidth_charges_total` — bandwidth monetary charges, labelled with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`
 
-All families include a `namespace` label when the plugin instance has a namespace.
+All families include the matched proxy's `namespace` label. A gateway-wide
+global plugin still records that per-proxy namespace, so same-id tenant proxies
+remain separate.
 
 **JSON format** returns a nested breakdown:
 ```json
@@ -708,6 +710,7 @@ All families include a `namespace` label when the plugin instance has a namespac
       "bandwidth_charges": 0.029,
       "proxies": {
         "proxy-abc": {
+          "namespace": "ferrum",
           "proxy_name": "Payments API",
           "currency": "USD",
           "protocol_family": "http",
@@ -725,6 +728,7 @@ All families include a `namespace` label when the plugin instance has a namespac
           }
         },
         "tcp-edge": {
+          "namespace": "ferrum",
           "proxy_name": "TCP Edge",
           "currency": "USD",
           "protocol_family": "stream",
@@ -748,9 +752,9 @@ All families include a `namespace` label when the plugin instance has a namespac
 }
 ```
 
-Each `api_chargeback` plugin instance owns its own `currency` and `namespace` (per global/proxy/proxy_group scope). The currency and namespace are recorded per proxy, so a process hosting multiple instances with different currencies reports each proxy under its own currency rather than a single last-writer-wins value. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree — read the per-proxy `currency` field in that case.
+Each `api_chargeback` plugin instance owns its own `currency` (per global/proxy/proxy_group scope), while charge identity and the exported `namespace` label come from the matched proxy. A process hosting multiple instances with different currencies reports each proxy under its own currency rather than a single last-writer-wins value, and one global instance cannot conflate same-id proxies in different namespaces. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree — read the per-proxy `currency` field in that case.
 
-**`proxy_name` contract:** `proxy_name` is live display metadata for the stable `proxy_id` and is not part of the in-memory registry key, so a name-only reload keeps the accumulated counter values continuous. After an accepted configuration is published, both JSON and Prometheus resolve every active proxy ID through the same lock-free snapshot of that configuration's names; request completion order cannot change the exported label, so late traffic admitted under a retired generation cannot restore an old name. Because `proxy_name` is still a Prometheus label, a rename creates a controlled label transition at the accepted reload boundary; the new label carries the existing cumulative counter rather than restarting its in-memory value. Pricing changes still create distinct pricing-generation entries (price bits remain in the key), but overlapping entries collapse under the current published name. Retained rows for a deleted proxy fall back deterministically to their recorded metadata.
+**`proxy_name` contract:** `proxy_name` is live display metadata for the stable `(namespace, proxy_id)` and is not part of the in-memory registry key, so a name-only reload keeps the accumulated counter values continuous. After an accepted configuration is published, both JSON and Prometheus resolve every active proxy through the same namespace-qualified lock-free snapshot of that configuration's names; request completion order cannot change the exported label, so late traffic admitted under a retired generation cannot restore an old name. Because `proxy_name` is still a Prometheus label, a rename creates a controlled label transition at the accepted reload boundary; the new label carries the existing cumulative counter rather than restarting its in-memory value. Pricing changes still create distinct pricing-generation entries (price bits remain in the key), but overlapping entries collapse under the current published name. Retained rows for a deleted proxy fall back deterministically to their recorded metadata.
 
 **Mixed-currency consumer totals:** Monetary values are never summed across currencies. When every proxy for a consumer shares one currency, the historical flat fields (`total_charges`, `per_call_charges`, `stream_connection_charges`, `bandwidth_charges`) remain numeric and reconcilable with that consumer's proxy rows. When a single consumer spans more than one currency, those flat monetary fields are `null` and a `charges_by_currency` map is emitted instead — one partition per currency with the same component fields. `total_calls` stays numeric because it is unitless. Billing integrations must treat `null` as "not a settlement total" (do not coerce to `0`) and invoice from `charges_by_currency` and/or per-proxy rows. Within each currency, `charges_by_currency[currency].total_charges` equals the sum of `proxies[*].total_charges` for proxies carrying that currency.
 

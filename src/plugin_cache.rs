@@ -16,7 +16,7 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1690,13 +1690,12 @@ fn tcp_connection_throttle_effectively_applies_to_proxy(
     proxy: &crate::config::types::Proxy,
     config: &GatewayConfig,
 ) -> bool {
-    if !pc.enabled || proxy.namespace != pc.namespace {
+    if !pc.enabled {
         return false;
     }
     match &pc.scope {
         PluginScope::Global => !config.plugin_configs.iter().any(|candidate| {
-            candidate.namespace == pc.namespace
-                && candidate.enabled
+            candidate.enabled
                 && candidate.plugin_name == pc.plugin_name
                 && scoped_plugin_config_applies_to_proxy(candidate, proxy)
         }),
@@ -2733,7 +2732,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     validate_api_chargeback_ownership(config)?;
     validate_replay_provenance_composition(config)?;
     let mut errors = Vec::new();
-    let mut global_plugins: BTreeMap<&str, Vec<Arc<dyn Plugin>>> = BTreeMap::new();
+    let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
     let mut scoped_plugins: SecurityCompositionPluginMap<'_> = HashMap::new();
     let custom_plugin_names = crate::custom_plugins::custom_plugin_names();
     let current_adaptive_states = AdaptiveConcurrencyInstanceMap::new();
@@ -2778,10 +2777,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         };
         match created {
             Ok(Some(plugin)) if plugin_config.scope == PluginScope::Global => {
-                global_plugins
-                    .entry(plugin_config.namespace.as_str())
-                    .or_default()
-                    .push(plugin);
+                global_plugins.push(plugin);
             }
             Ok(Some(plugin)) => {
                 scoped_plugins.insert(
@@ -2795,10 +2791,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     }
 
     for proxy in &config.proxies {
-        let mut merged = global_plugins
-            .get(proxy.namespace.as_str())
-            .cloned()
-            .unwrap_or_default();
+        let mut merged = global_plugins.clone();
         let global_ptrs: HashSet<usize> = merged
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
@@ -2822,24 +2815,28 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             merged.push(Arc::clone(plugin));
         }
         if let Err(error) = validate_plugin_security_composition(&merged) {
-            errors.push(format!("proxy_id={}: {error}", proxy.id));
+            errors.push(format!(
+                "proxy={}/{}: {error}",
+                proxy.namespace, proxy.id
+            ));
         }
         if let Err(error) =
             validate_correlation_id_composition(&merged, http_client.real_ip_header())
         {
-            errors.push(format!("proxy_id={}: {error}", proxy.id));
+            errors.push(format!(
+                "proxy={}/{}: {error}",
+                proxy.namespace, proxy.id
+            ));
         }
     }
 
-    for (namespace, plugins) in &global_plugins {
-        if let Err(error) = validate_plugin_security_composition(plugins) {
-            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
-        }
-        if let Err(error) =
-            validate_correlation_id_composition(plugins, http_client.real_ip_header())
-        {
-            errors.push(format!("global plugins namespace={namespace:?}: {error}"));
-        }
+    if let Err(error) = validate_plugin_security_composition(&global_plugins) {
+        errors.push(format!("global plugins: {error}"));
+    }
+    if let Err(error) =
+        validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
+    {
+        errors.push(format!("global plugins: {error}"));
     }
 
     if errors.is_empty() {

@@ -1073,16 +1073,25 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
         return;
     }
 
-    let udp_proxy_ids: HashSet<String> = config
+    let mut udp_proxy_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for proxy in config
         .proxies
         .iter()
         .filter(|proxy| proxy.dispatch_kind.is_udp())
-        .map(|proxy| proxy.id.clone())
-        .collect();
+    {
+        udp_proxy_ids
+            .entry(proxy.namespace.clone())
+            .or_default()
+            .insert(proxy.id.clone());
+    }
     let udp_proxies: Vec<String> = config
         .proxies
         .iter()
-        .filter(|proxy| udp_proxy_ids.contains(&proxy.id))
+        .filter(|proxy| {
+            udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        })
         .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect();
     let udp_services = strip_node_waypoint_udp_dtls_mesh_service_ports(config.mesh.as_deref_mut());
@@ -1105,12 +1114,20 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
     if !udp_proxy_ids.is_empty() {
         config
             .proxies
-            .retain(|proxy| !udp_proxy_ids.contains(&proxy.id));
+            .retain(|proxy| {
+                !udp_proxy_ids
+                    .get(proxy.namespace.as_str())
+                    .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+            });
         config.plugin_configs.retain(|plugin| {
             plugin
                 .proxy_id
                 .as_deref()
-                .is_none_or(|proxy_id| !udp_proxy_ids.contains(proxy_id))
+                .is_none_or(|proxy_id| {
+                    !udp_proxy_ids
+                        .get(plugin.namespace.as_str())
+                        .is_some_and(|ids| ids.contains(proxy_id))
+                })
         });
     }
     if !udp_upstreams.is_empty() {
@@ -1420,11 +1437,12 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
 /// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
 /// onto an upstream that entered the projection with `source_locality = None`
 /// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
-/// upstream identity on `id` and detects modification by `updated_at != old`
-/// (`src/config_delta.rs`), so without reconciliation EVERY mesh upstream would
-/// look "modified" on EVERY apply — and a "modified" upstream rebuilds a fresh
-/// `LoadBalancer` (`LoadBalancerCache::build_delta_inner`), discarding its
-/// round-robin counters, latency EWMAs, hash rings, and passive-health state.
+/// upstream identity on `(namespace, id)` and detects modification by
+/// `updated_at != old` (`src/config_delta.rs`), so without reconciliation EVERY
+/// mesh upstream would look "modified" on EVERY apply — and a "modified"
+/// upstream rebuilds a fresh `LoadBalancer`
+/// (`LoadBalancerCache::build_delta_inner`), discarding its round-robin
+/// counters, latency EWMAs, hash rings, and passive-health state.
 /// That means an unrelated mesh-only update (a federation/trust-bundle overlay
 /// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
 /// LB + health for every materialized upstream.
@@ -1443,13 +1461,19 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
     if candidate.upstreams.is_empty() || previous.upstreams.is_empty() {
         return;
     }
-    let previous_by_id: HashMap<&str, &Upstream> = previous
+    let previous_by_id: HashMap<(&str, &str), &Upstream> = previous
         .upstreams
         .iter()
-        .map(|upstream| (upstream.id.as_str(), upstream))
+        .map(|upstream| {
+            (
+                (upstream.namespace.as_str(), upstream.id.as_str()),
+                upstream,
+            )
+        })
         .collect();
     for upstream in &mut candidate.upstreams {
-        if let Some(old) = previous_by_id.get(upstream.id.as_str())
+        if let Some(old) =
+            previous_by_id.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
             && upstream_content_eq(upstream, old)
         {
             // Content-identical to the last accepted projection: preserve the
@@ -2757,6 +2781,9 @@ pub(crate) fn service_http_family_ports(
 /// siblings (disambiguated by inbound orig-dst / the request authority port
 /// instead of the outbound capture's orig-dst).
 pub(crate) struct MeshOutboundServiceGroup {
+    /// Owning resource namespace. Generated sibling ids include namespace text
+    /// but the join is lossy, so every consumer must key by this field plus id.
+    pub namespace: String,
     /// How many HTTP-family ports the service DECLARES — which can exceed the
     /// materialized sibling count (e.g. an unresolved named `targetPort`
     /// produced no targets for one port). Orig-dst-less requests must fail
@@ -2782,6 +2809,7 @@ pub(crate) fn mesh_outbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2886,6 +2914,7 @@ pub(crate) fn mesh_inbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2915,9 +2944,9 @@ pub(crate) fn mesh_inbound_service_groups(
 pub(crate) fn mesh_ingress_listener_groups(
     mesh: &crate::modes::mesh::config::MeshConfig,
 ) -> Vec<MeshOutboundServiceGroup> {
-    if mesh.local_ingress_listeners.is_empty() {
+    let Some(first_listener) = mesh.local_ingress_listeners.first() else {
         return Vec::new();
-    }
+    };
     let siblings: Vec<(u16, String)> = mesh
         .local_ingress_listeners
         .iter()
@@ -2943,6 +2972,7 @@ pub(crate) fn mesh_ingress_listener_groups(
     // multi-listener group back to the single-listener no-signal pass-through.
     let declared_http_ports = mesh.declared_ingress_http_ports.max(siblings.len());
     vec![MeshOutboundServiceGroup {
+        namespace: first_listener.owner_namespace.clone(),
         declared_http_ports,
         siblings,
     }]
@@ -6568,7 +6598,7 @@ fn apply_destination_rules(
     // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
     // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
+    let mut outbound_upstream_owner_port: HashMap<String, u16> = mesh_slice
         .services
         .iter()
         .flat_map(|svc| {
@@ -6733,44 +6763,43 @@ fn apply_destination_rules(
                 // may seed those fallback slots. Sibling DR entries must not
                 // leak onto this upstream merely because their service port
                 // number appears as a fallback target's dial port.
-                let store_ports: Vec<u16> = if let Some(owning_port) =
-                    outbound_upstream_owner_port.get(&upstream.id)
-                {
-                    if port != owning_port {
-                        debug!(
+                let store_ports: Vec<u16> =
+                    if let Some(owning_port) = outbound_upstream_owner_port.get(&upstream.id) {
+                        if port != owning_port {
+                            debug!(
+                                rule = %dr.name,
+                                upstream = %upstream.id,
+                                port = port,
+                                owning_port = owning_port,
+                                "DestinationRule portLevelSettings entry belongs to a sibling per-port upstream; skipping here"
+                            );
+                            continue;
+                        }
+                        vec![*port]
+                    } else if upstream_policy_ports.contains(port) {
+                        vec![*port]
+                    } else if has_service_discovery {
+                        let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
+                            upstream_policy_ports.len() + 1
+                        } else {
+                            1
+                        });
+                        ports.push(*port);
+                        if mesh_sd_selected_port == Some(*port) {
+                            ports.extend(upstream_policy_ports.iter().copied());
+                        }
+                        ports.sort_unstable();
+                        ports.dedup();
+                        ports
+                    } else {
+                        warn!(
                             rule = %dr.name,
                             upstream = %upstream.id,
                             port = port,
-                            owning_port = owning_port,
-                            "DestinationRule portLevelSettings entry belongs to a sibling per-port upstream; skipping here"
+                            "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
                         );
                         continue;
-                    }
-                    vec![*port]
-                } else if upstream_policy_ports.contains(port) {
-                    vec![*port]
-                } else if has_service_discovery {
-                    let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
-                        upstream_policy_ports.len() + 1
-                    } else {
-                        1
-                    });
-                    ports.push(*port);
-                    if mesh_sd_selected_port == Some(*port) {
-                        ports.extend(upstream_policy_ports.iter().copied());
-                    }
-                    ports.sort_unstable();
-                    ports.dedup();
-                    ports
-                } else {
-                    warn!(
-                        rule = %dr.name,
-                        upstream = %upstream.id,
-                        port = port,
-                        "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
-                    );
-                    continue;
-                };
+                    };
                 // Resolve per-port backend TLS over the upstream base, mirroring
                 // the per-subset TLS overlay. Computed before the `override_slot`
                 // mutable borrow. Fail-closed: an unresolvable per-port TLS
@@ -8660,9 +8689,11 @@ fn inject_mesh_global_plugins(
         let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
         let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
         if outbound_listen_ports.is_empty() {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+            remove_mesh_managed_plugin(
+                config,
+                MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+                &runtime.namespace,
+            );
         } else {
             let plugin_config = serde_json::json!({
                 "registry": registry,
@@ -8680,9 +8711,11 @@ fn inject_mesh_global_plugins(
         }
     } else {
         // Remove any stale instance (e.g., operator flipped policy back).
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        remove_mesh_managed_plugin(
+            config,
+            MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+            &runtime.namespace,
+        );
     }
 
     // Merge applicable Telemetry resources (most specific scope wins per section).
@@ -8780,9 +8813,7 @@ fn inject_mesh_global_plugins(
     // injected plugins are updated in place across upgrades.
     let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
         Some(al) if !al.enabled => {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID);
+            remove_mesh_managed_plugin(config, MESH_ACCESS_LOG_PLUGIN_ID, &runtime.namespace);
             None
         }
         Some(al) => Some(match &al.filter {
@@ -8816,9 +8847,7 @@ fn inject_mesh_global_plugins(
             &runtime.namespace,
         );
     } else {
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_BPF_METRICS_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_BPF_METRICS_PLUGIN_ID, &runtime.namespace);
     }
 }
 
@@ -9036,9 +9065,7 @@ fn inject_mesh_request_auth_plugin(
     if applicable.is_empty() {
         // No applicable RequestAuthentication — remove any previously injected
         // mesh request auth plugin so it doesn't persist across config updates.
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9052,9 +9079,7 @@ fn inject_mesh_request_auth_plugin(
     }
 
     if providers.is_empty() {
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9158,6 +9183,12 @@ fn ensure_global_plugin(
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
+}
+
+fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &str) {
+    config
+        .plugin_configs
+        .retain(|plugin| plugin.namespace != namespace || plugin.id != id);
 }
 
 pub async fn run(
@@ -16422,6 +16453,50 @@ mod tests {
     }
 
     #[test]
+    fn node_waypoint_udp_fail_closed_pruning_is_namespace_qualified() {
+        let mut udp_proxy =
+            mesh_outbound_udp_relay_proxy("default", "operator-dns", 53, "operator-upstream");
+        udp_proxy.id = "shared".to_string();
+        let mut other_proxy = destination_rule_test_proxy("shared", "other-upstream");
+        other_proxy.namespace = "tenant-b".to_string();
+
+        let plugin = |id: &str, namespace: &str| PluginConfig {
+            id: id.to_string(),
+            plugin_name: "tcp_logging".to_string(),
+            namespace: namespace.to_string(),
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("shared".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut config = GatewayConfig {
+            proxies: vec![udp_proxy, other_proxy],
+            plugin_configs: vec![
+                plugin("default-shared-plugin", "default"),
+                plugin("tenant-b-shared-plugin", "tenant-b"),
+            ],
+            mesh: Some(Box::new(MeshConfig {
+                mesh_policies: vec![scoped_node_waypoint_deny_policy()],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+
+        fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, &runtime);
+
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].namespace, "tenant-b");
+        assert_eq!(config.proxies[0].id, "shared");
+        assert_eq!(config.plugin_configs.len(), 1);
+        assert_eq!(config.plugin_configs[0].namespace, "tenant-b");
+    }
+
+    #[test]
     fn node_waypoint_udp_scoped_operator_authz_override_disables_udp_service() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
@@ -21505,6 +21580,61 @@ mod tests {
     }
 
     #[test]
+    fn mesh_managed_plugin_cleanup_is_namespace_qualified() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: runtime.namespace.clone(),
+                    config: serde_json::json!({"registry": ["stale.default"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: "tenant-b".to_string(),
+                    config: serde_json::json!({"registry": ["tenant-b.example"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &slice);
+
+        assert_eq!(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+                .map(|plugin| plugin.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-b"]
+        );
+    }
+
+    #[test]
     fn inject_mesh_global_plugins_rebuilds_outbound_registry_on_slice_update() {
         let mut runtime = test_mesh_runtime_config();
         runtime.outbound_listen_addr = "127.0.0.1:15001".parse().unwrap();
@@ -22959,6 +23089,46 @@ mod tests {
             vec!["reviews"],
             "a real upstream change must be reported modified so its LB rebuilds"
         );
+    }
+
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_is_namespace_qualified() {
+        let first_now = chrono::Utc::now();
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut tenant_a = reconcile_test_upstream("shared", 8080, first_now);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = reconcile_test_upstream("shared", 9090, first_now);
+        tenant_b.namespace = "tenant-b".to_string();
+        let accepted = GatewayConfig {
+            upstreams: vec![tenant_a.clone(), tenant_b.clone()],
+            ..GatewayConfig::default()
+        };
+
+        tenant_a.created_at = second_now;
+        tenant_a.updated_at = second_now;
+        tenant_b.created_at = second_now;
+        tenant_b.updated_at = second_now;
+        let mut candidate = GatewayConfig {
+            upstreams: vec![tenant_b, tenant_a],
+            ..GatewayConfig::default()
+        };
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        let reconciled_a = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-a")
+            .expect("tenant-a upstream");
+        let reconciled_b = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-b")
+            .expect("tenant-b upstream");
+        assert_eq!(reconciled_a.updated_at, first_now);
+        assert_eq!(reconciled_b.updated_at, first_now);
+        assert_eq!(reconciled_a.targets[0].port, 8080);
+        assert_eq!(reconciled_b.targets[0].port, 9090);
     }
 
     /// #1806 codex r2 finding 3: a DR-only change to an SD upstream's top-level

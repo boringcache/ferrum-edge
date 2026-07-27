@@ -645,7 +645,7 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
 }
 
 #[test]
-fn runtime_plugin_composition_validation_scopes_global_correlation_by_namespace() {
+fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
     let global_correlation = |id: &str, namespace: &str| PluginConfig {
         id: id.to_string(),
         plugin_name: "correlation_id".to_string(),
@@ -670,8 +670,10 @@ fn runtime_plugin_composition_validation_scopes_global_correlation_by_namespace(
     let errors =
         ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
     assert!(
-        errors.is_empty(),
-        "global correlation owners in independent namespace slices must not conflict: {errors:?}"
+        errors
+            .iter()
+            .any(|error| error.contains("multiple correlation_id plugins")),
+        "global correlation owners are installed gateway-wide and must conflict: {errors:?}"
     );
 }
 

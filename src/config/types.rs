@@ -3331,44 +3331,22 @@ impl GatewayConfig {
         // `_`, so `__mesh-*` ids exist only via mesh materialization. Different
         // services' routes still conflict normally. Empty (and zero-cost)
         // outside mesh mode.
-        let mesh_sibling_owner: HashMap<String, (u8, usize)> = self
-            .mesh
-            .as_deref()
-            .map(|mesh| {
-                crate::modes::mesh::mesh_outbound_service_groups(mesh)
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(service_index, group)| {
-                        group
-                            .siblings
-                            .into_iter()
-                            .map(move |(_, id)| (id, (0u8, service_index)))
-                    })
-                    .chain(
-                        crate::modes::mesh::mesh_inbound_service_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (1u8, service_index)))
-                            }),
-                    )
-                    .chain(
-                        crate::modes::mesh::mesh_ingress_listener_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (2u8, service_index)))
-                            }),
-                    )
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut mesh_sibling_owner: HashMap<String, HashMap<String, (u8, usize)>> =
+            HashMap::new();
+        if let Some(mesh) = self.mesh.as_deref() {
+            let mut add_groups =
+                |direction, groups: Vec<crate::modes::mesh::MeshOutboundServiceGroup>| {
+                    for (service_index, group) in groups.into_iter().enumerate() {
+                        let by_id = mesh_sibling_owner.entry(group.namespace).or_default();
+                        for (_, id) in group.siblings {
+                            by_id.insert(id, (direction, service_index));
+                        }
+                    }
+                };
+            add_groups(0, crate::modes::mesh::mesh_outbound_service_groups(mesh));
+            add_groups(1, crate::modes::mesh::mesh_inbound_service_groups(mesh));
+            add_groups(2, crate::modes::mesh::mesh_ingress_listener_groups(mesh));
+        }
 
         for ((_, path), group) in &by_path {
             if group.len() < 2 {
@@ -3377,8 +3355,12 @@ impl GatewayConfig {
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
                     if let (Some(owner_a), Some(owner_b)) = (
-                        mesh_sibling_owner.get(proxy_a.id.as_str()),
-                        mesh_sibling_owner.get(proxy_b.id.as_str()),
+                        mesh_sibling_owner
+                            .get(proxy_a.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_a.id.as_str())),
+                        mesh_sibling_owner
+                            .get(proxy_b.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_b.id.as_str())),
                     ) && owner_a == owner_b
                     {
                         continue;
