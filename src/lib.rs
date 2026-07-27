@@ -1091,6 +1091,80 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
     }
 
+    /// Exact replay-state observation for deterministic external tests.
+    ///
+    /// `retained_key_bytes` counts each nonce string once. `shared_key_entries`
+    /// counts age-index entries whose `Arc<str>` points at the exact allocation
+    /// used by the lookup map, so tests can pin the no-duplicate-key contract.
+    pub struct SoapNonceReplaySnapshotForTest {
+        pub entry_count: usize,
+        pub age_index_entry_count: usize,
+        pub retained_key_bytes: usize,
+        pub recomputed_key_bytes: usize,
+        pub shared_key_entries: usize,
+        pub last_expired_removals: usize,
+        pub last_forced_candidates: usize,
+        pub max_maintenance_entries: usize,
+    }
+
+    /// Controllable-time harness for the PasswordDigest nonce replay state.
+    ///
+    /// The production plugin remains the implementation under test; this seam
+    /// only supplies explicit `Instant` values and atomic observations.
+    pub struct SoapNonceReplayHarness {
+        plugin: crate::plugins::soap_ws_security::SoapWsSecurity,
+        epoch: std::time::Instant,
+    }
+
+    impl SoapNonceReplayHarness {
+        pub fn new(config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self {
+                plugin: crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?,
+                epoch: std::time::Instant::now(),
+            })
+        }
+
+        pub fn claim(&self, nonce: &str) -> Result<(), String> {
+            self.plugin.check_nonce_replay(nonce)
+        }
+
+        pub fn claim_at(&self, nonce: &str, elapsed: std::time::Duration) -> Result<(), String> {
+            let now = self
+                .epoch
+                .checked_add(elapsed)
+                .ok_or_else(|| "soap nonce test clock overflow".to_string())?;
+            self.plugin.check_nonce_replay_at_for_tests(nonce, now)
+        }
+
+        pub fn snapshot(&self) -> Result<SoapNonceReplaySnapshotForTest, String> {
+            let snapshot = self.plugin.nonce_replay_observation_for_tests()?;
+            Ok(SoapNonceReplaySnapshotForTest {
+                entry_count: snapshot.entry_count,
+                age_index_entry_count: snapshot.age_index_entry_count,
+                retained_key_bytes: snapshot.retained_key_bytes,
+                recomputed_key_bytes: snapshot.recomputed_key_bytes,
+                shared_key_entries: snapshot.shared_key_entries,
+                last_expired_removals: snapshot.last_expired_removals,
+                last_forced_candidates: snapshot.last_forced_candidates,
+                max_maintenance_entries: snapshot.max_maintenance_entries,
+            })
+        }
+    }
+
+    /// One-shot proof that map/index drift cannot be recovered as a fresh
+    /// admission. The inconsistent plugin never escapes this helper.
+    pub fn soap_nonce_inconsistent_state_outcome_for_test(
+        config: &serde_json::Value,
+    ) -> Result<String, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        plugin.check_nonce_replay("nonce-consistency-seed")?;
+        plugin.corrupt_nonce_age_index_for_tests()?;
+        match plugin.check_nonce_replay("nonce-consistency-probe") {
+            Ok(()) => Err("soap nonce inconsistent state admitted a probe".to_string()),
+            Err(error) => Ok(error),
+        }
+    }
+
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
     /// request-time fallback computes)`. Cached nodes are filled once per
     /// registered schema during ConversionPlan compile (#3024).

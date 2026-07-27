@@ -2177,9 +2177,9 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 |---|---|---|---|
 | `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
 | `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header |
-| `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection |
+| `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection (`1`–`86400`) |
 | `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
-| `timestamp.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for timestamp validation |
+| `timestamp.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for timestamp validation (`0`–`3600`) |
 | `username_token.enabled` | bool | `false` | Enable UsernameToken authentication |
 | `username_token.password_type` | String | `PasswordDigest` | `PasswordText` or `PasswordDigest` |
 | `username_token.credentials` | Object[] | `[]` | Array of `{username, password}` credential pairs |
@@ -2193,18 +2193,40 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `saml.trusted_signing_certs` | String[] | `[]` | PEM file paths of trusted IdP signing certs, matched by SHA-256 fingerprint (required when enabled) |
 | `saml.allowed_signature_algorithms` | String[] | `["rsa-sha256"]` | Allowed SAML signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `saml.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed SAML Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_signature_algorithms` |
-| `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value |
-| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` |
-| `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection |
-| `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
+| `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
+| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
+| `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection (`1`–`86400`) |
+| `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep (`1`–`1000000`) |
+| `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
+| `nonce.max_total_cache_bytes` | u64 | `8388608` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
 
 At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
+
+#### Configuration admission is strict and fail-closed
+
+The root object and every nested fixed-shape object (`timestamp`, `username_token`, each `credentials` entry, `x509_signature`, `saml`, `nonce`) reject unknown keys and wrong-typed values **before** any default applies:
+
+- A misspelled key is an error with a path-qualified message and a spelling suggestion. There is no `nonce_replay_protection` alias — `nonce.*` is the only canonical shape, and the old documented alias is now rejected as an unknown key.
+- A wrong-typed value is an error, never a default. A string-valued `username_token.enabled` used to be read as `false` (leaving the plugin timestamp-only with credential authentication silently gone), and a non-string `saml.audience` used to become "no audience" (silently removing service binding). Explicit JSON `null` is likewise an error — omission selects the documented default, but `{"username_token":{"enabled":null}}`, `{"saml":{"audience":null}}`, `{"nonce":null}`, and similar inputs cannot silently weaken policy. This matches the OpenAPI schema, where fixed-shape properties are typed without `nullable` / `null`.
+- Malformed entries inside `credentials`, `trusted_certs`, `trusted_issuers`, `trusted_signing_certs`, and the algorithm allow-lists are rejected rather than dropped, so a partially-bad list cannot narrow the trust or credential set without an operator signal. Invalid `password_type` and algorithm-enum diagnostics identify only the field and accepted choices; they never echo the rejected value. Duplicate `credentials[].username` values are rejected because selection is first-wins.
+- Every duration and cache control must fall inside its documented inclusive range. Zero is rejected for `timestamp.max_age_seconds`, `nonce.cache_ttl_seconds`, and `nonce.max_cache_size` (each would disable the defense it configures) but permitted for the two `clock_skew_seconds` knobs, where zero is strictly stricter. The upper bounds keep every admitted value inside representable duration arithmetic, and parsed `Created` / `Expires` / `NotBefore` / `NotOnOrAfter` instants are clamped to a four-digit year, so no configuration and no hostile timestamp can overflow duration arithmetic on the request path.
+- A non-object root config yields a fixed `config must be an object` diagnostic that never interpolates the configured value (so credential-like material and unbounded JSON cannot leak into Admin/startup errors).
+
+Because construction now returns an error for these inputs, the plugin's `FailClosed` registration takes effect: file-mode startup fails, Admin validation returns HTTP `400`, and a DP/reload keeps the last known good generation instead of quietly enforcing a weaker policy.
 
 UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
 
 #### UsernameToken — PasswordDigest
 
 The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection.
+
+Replay state is bounded and only ever populated by a caller that has already proved the shared secret:
+
+- The encoded `wsse:Nonce` is length-checked against `nonce.max_encoded_length` **before** Base64 decoding, so an oversized nonce is never decoded and never retained.
+- One canonical (trimmed) form feeds both the digest input and the replay-cache key, so the two derivations cannot drift apart.
+- A nonce is inserted only *after* its PasswordDigest verifies, so an unknown user or a wrong password cannot poison or evict a victim's replay entry.
+- The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap. At either cap, the age index removes expired entries first, then selects exact-oldest live entries in O(log n) per entry. Expiry and forced eviction share an explicit 64-entry maintenance budget per request, independent of `max_cache_size`; there is no lookup-map scan or stale FIFO. Live forced candidates are committed only when the bounded batch makes room. Budget exhaustion, poisoned/inconsistent state, or checked-accounting failure rejects with HTTP `401` without discarding the staged live entries or accepting an unrecorded nonce. Entry/byte admission, eviction, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap — including same-key races, where an in-TTL hit is a replay without a new reservation.
+- Length and saturation rejections log fixed-cardinality failure classes (`nonce_too_long`, `nonce_state_saturated`) and never include the nonce value.
 
 ```yaml
 plugin_name: soap_ws_security
