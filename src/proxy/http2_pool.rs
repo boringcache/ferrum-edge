@@ -55,6 +55,17 @@ thread_local! {
 /// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`).
 pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
 
+/// Terminal protocol outcome for one DNS candidate.
+///
+/// Negotiated HTTP/1.1 is a usable backend capability result, not a failed
+/// address attempt: the dispatcher can route it through reqwest. Keeping it in
+/// the successful candidate channel prevents a later transport or handshake
+/// failure from overwriting the downgrade signal.
+enum Http2CandidateOutcome {
+    Established(Http2Sender),
+    BackendSelectedHttp1 { pool_key: String },
+}
+
 /// Run `f` against a thread-local buffer pre-populated with the direct H2
 /// pool key for `proxy` (no shard suffix). Callers can append `#<shard>`
 /// via `write_http2_shard_key_inplace` using `buf.len()` as `base_len`.
@@ -228,7 +239,7 @@ impl Http2PoolManager {
                 // Keep both phases inside the candidate attempt so a bad first
                 // address cannot suppress a healthy later DNS answer.
                 if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
-                    return Err(Http2PoolError::BackendSelectedHttp1 {
+                    return Ok(Http2CandidateOutcome::BackendSelectedHttp1 {
                         pool_key: self.pool_key_owned(proxy, svid_generation),
                     });
                 }
@@ -250,11 +261,16 @@ impl Http2PoolManager {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                Ok(sender)
+                Ok(Http2CandidateOutcome::Established(sender))
             }
         })
         .await
-        .map(|(sender, _)| sender)
+        .map(|(outcome, _)| match outcome {
+            Http2CandidateOutcome::Established(sender) => Ok(sender),
+            Http2CandidateOutcome::BackendSelectedHttp1 { pool_key } => {
+                Err(Http2PoolError::BackendSelectedHttp1 { pool_key })
+            }
+        })
         .map_err(|error| match error {
             crate::dns::CandidateConnectError::TimedOut { last_addr } => {
                 Http2PoolError::BackendTimeout {
@@ -285,7 +301,7 @@ impl Http2PoolManager {
                 }
                 source
             }
-        })
+        })?
     }
 
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {

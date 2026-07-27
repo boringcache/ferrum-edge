@@ -147,8 +147,10 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
 
 /// Start a TLS + HTTP/2 echo backend on an ephemeral port.
 /// Returns (join_handle, port).
-async fn start_h2_tls_backend()
--> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
+async fn start_h2_tls_backend() -> Result<
+    (tokio::task::JoinHandle<()>, u16),
+    Box<dyn std::error::Error>,
+> {
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
     start_h2_tls_backend_with_cert(cert_pem, key_pem).await
@@ -162,17 +164,19 @@ async fn start_h2_tls_backend_with_cert(
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let handle = start_h2_tls_backend_on(listener, cert_pem, key_pem).await?;
+    let handle =
+        start_tls_backend_on(listener, cert_pem, key_pem, vec![b"h2".to_vec()]).await?;
 
     // Give the listener task a moment to start accepting.
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok((handle, port))
 }
 
-async fn start_h2_tls_backend_on(
+async fn start_tls_backend_on(
     listener: tokio::net::TcpListener,
     cert_pem: &str,
     key_pem: &str,
+    alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let mut cert_reader = cert_pem.as_bytes();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
@@ -187,7 +191,7 @@ async fn start_h2_tls_backend_on(
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(certs, private_key)?;
-    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    tls_config.alpn_protocols = alpn_protocols;
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let handle = tokio::spawn(async move {
@@ -287,8 +291,7 @@ fn spawn_h2c_backend_on(listener: tokio::net::TcpListener) -> tokio::task::JoinH
     })
 }
 
-async fn bind_dual_loopback_listeners()
--> (
+async fn bind_dual_loopback_listeners() -> (
     tokio::net::TcpListener,
     tokio::net::TcpListener,
     Ipv4Addr,
@@ -486,10 +489,11 @@ async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
         }
     });
 
-    let _healthy_task = start_h2_tls_backend_on(
+    let _healthy_task = start_tls_backend_on(
         healthy_listener,
         include_str!("../certs/server.crt"),
         include_str!("../certs/server.key"),
+        vec![b"h2".to_vec()],
     )
     .await
     .expect("start healthy H2 backend");
@@ -521,6 +525,64 @@ async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
         failing_attempts.load(Ordering::Relaxed),
         1,
         "the TCP-successful, TLS-failing first address must be attempted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failure() {
+    let (later_failure_listener, http1_listener, http1_ip, port) =
+        bind_dual_loopback_listeners().await;
+    let later_attempts = Arc::new(AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&later_attempts);
+    let _later_failure_task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = later_failure_listener.accept().await {
+            task_attempts.fetch_add(1, Ordering::Relaxed);
+            let _ = socket.write_all(b"not a TLS server").await;
+        }
+    });
+    let _http1_task = start_tls_backend_on(
+        http1_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+    )
+    .await
+    .expect("start HTTP/1.1 TLS backend");
+    let dns = TestDnsServer::spawn(vec![
+        IpAddr::V4(http1_ip),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    ])
+    .await;
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "multi-address-http1.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+
+    match pool.get_sender(&proxy).await {
+        Err(Http2PoolError::BackendSelectedHttp1 { pool_key }) => {
+            assert!(
+                pool_key.contains("multi-address-http1.test"),
+                "downgrade signal should retain the direct-H2 pool key"
+            );
+        }
+        Err(error) => panic!(
+            "HTTP/1.1 ALPN must win over a later candidate failure, got: {}",
+            error
+        ),
+        Ok(_) => panic!("HTTP/1.1 ALPN must not produce a direct-H2 sender"),
+    }
+    assert_eq!(
+        later_attempts.load(Ordering::Relaxed),
+        0,
+        "a proven HTTP/1.1 endpoint is terminal and must not be overwritten by a later failure"
     );
 }
 
