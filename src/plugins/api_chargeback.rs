@@ -113,6 +113,8 @@ const ENTRY_FIXED_OVERHEAD_BYTES: usize = 256;
 
 /// How often, at most, an admission refusal or drop is logged.
 const ADMISSION_WARN_INTERVAL_NANOS: u64 = 60_000_000_000;
+/// Sentinel meaning no admission warning has been emitted yet.
+const NO_ADMISSION_WARN_NANOS: u64 = u64::MAX;
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
@@ -863,7 +865,7 @@ impl ChargebackRegistry {
             retained_bytes: AtomicUsize::new(0),
             identity_overflow_total: AtomicU64::new(0),
             dropped_charges_total: AtomicU64::new(0),
-            last_admission_warn_at: AtomicU64::new(0),
+            last_admission_warn_at: AtomicU64::new(NO_ADMISSION_WARN_NANOS),
         }
     }
 
@@ -1356,7 +1358,8 @@ impl ChargebackRegistry {
     fn warn_on_admission(&self, reason: &'static str) {
         let now = self.epoch.elapsed().as_nanos() as u64;
         let last = self.last_admission_warn_at.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < ADMISSION_WARN_INTERVAL_NANOS
+        if (last != NO_ADMISSION_WARN_NANOS
+            && now.saturating_sub(last) < ADMISSION_WARN_INTERVAL_NANOS)
             || self
                 .last_admission_warn_at
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
