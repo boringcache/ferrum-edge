@@ -341,6 +341,9 @@ mod audience_binding {
         NativeRemoteSource, RemoteClusterPollContext, RemoteDiscoveryConfig,
         RemoteDiscoveryTlsConfig, RemoteServiceSource,
     };
+    use ferrum_edge::modes::mesh::revision::{
+        DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate,
+    };
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -414,12 +417,14 @@ mod audience_binding {
                 poll_interval: Duration::from_millis(50),
                 request_timeout: Duration::from_secs(5),
                 max_stale_age: None,
+                revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
                 production_mode: false,
                 jwt_secret: Some(shared_secret()),
                 node_id: NODE_ID.to_string(),
                 namespace: NAMESPACE.to_string(),
                 tls_config: RemoteDiscoveryTlsConfig::default(),
             },
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         }
     }
 
