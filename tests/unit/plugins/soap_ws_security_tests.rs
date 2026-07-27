@@ -4574,7 +4574,10 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
         "batch eviction under-retained: entries {entries} < floor {min_after_batch}"
     );
     let mut refill = 0usize;
-    while plugin.nonce_replay_retained_bytes().saturating_add(NONCE_LEN) <= MAX_BYTES
+    while plugin
+        .nonce_replay_retained_bytes()
+        .saturating_add(NONCE_LEN)
+        <= MAX_BYTES
         && plugin.nonce_replay_entry_count() < BYTE_CAP_ENTRIES
     {
         let nonce = format!("rf-{:061}", refill);
