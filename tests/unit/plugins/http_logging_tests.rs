@@ -683,13 +683,15 @@ fn assert_endpoint_sentinels_absent(logs: &str, context: &str) {
 
 #[tokio::test]
 async fn endpoint_url_rejects_userinfo_credentials() {
-    let err = HttpLogging::new(
+    let err = match HttpLogging::new(
         &json!({
             "endpoint_url": format!("https://logs:{PATH_SENTINEL}@collector.example.com/ingest"),
         }),
         default_client(),
-    )
-    .expect_err("userinfo credentials must be rejected at construction");
+    ) {
+        Ok(_) => panic!("userinfo credentials must be rejected at construction"),
+        Err(err) => err,
+    };
 
     assert!(
         err.contains("must not contain user information"),
@@ -702,11 +704,13 @@ async fn endpoint_url_rejects_userinfo_credentials() {
 async fn malformed_endpoint_rejection_does_not_echo_credentials() {
     // Scheme rejection happens after parsing, so the error is built from a URL
     // that still carries both sentinels.
-    let err = HttpLogging::new(
+    let err = match HttpLogging::new(
         &json!({ "endpoint_url": sentinel_endpoint("ftp://collector.example.com") }),
         default_client(),
-    )
-    .expect_err("non-HTTP scheme must be rejected");
+    ) {
+        Ok(_) => panic!("non-HTTP scheme must be rejected"),
+        Err(err) => err,
+    };
 
     assert!(err.contains("http:// or https://"), "got: {err}");
     assert_endpoint_sentinels_absent(&err, "http_logging scheme rejection");

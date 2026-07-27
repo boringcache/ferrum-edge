@@ -9876,8 +9876,10 @@ async fn sink_endpoint_url_rejects_userinfo_credentials() {
                 format!("https://audit:{SINK_PATH_SENTINEL}@collector.example.com/ingest"),
         }
     });
-    let err = AiTranscriptAudit::new(&config, loopback_http_client())
-        .expect_err("userinfo credentials must be rejected at construction");
+    let err = match AiTranscriptAudit::new(&config, loopback_http_client()) {
+        Ok(_) => panic!("userinfo credentials must be rejected at construction"),
+        Err(err) => err,
+    };
 
     assert!(
         err.contains("must not contain user information"),
@@ -9894,8 +9896,10 @@ async fn malformed_sink_endpoint_rejection_does_not_echo_credentials() {
             "endpoint_url": sentinel_sink_endpoint("ftp://collector.example.com"),
         }
     });
-    let err = AiTranscriptAudit::new(&config, loopback_http_client())
-        .expect_err("non-HTTP scheme must be rejected");
+    let err = match AiTranscriptAudit::new(&config, loopback_http_client()) {
+        Ok(_) => panic!("non-HTTP scheme must be rejected"),
+        Err(err) => err,
+    };
 
     assert!(err.contains("http:// or https://"), "got: {err}");
     assert_sink_sentinels_absent(&err, "ai_transcript_audit scheme rejection");

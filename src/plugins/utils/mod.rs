@@ -58,8 +58,8 @@ pub use byte_budget::{
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
     BatchConfigDefaults, HttpBatchDrainOutcome, build_batch_config, drain_http_batch_response_body,
-    handle_http_batch_response, handle_http_batch_response_redacted, parse_custom_headers,
-    parse_http_endpoint, redacted_endpoint_url, redacted_endpoint_url_str, validate_batch_config,
+    handle_http_batch_response_redacted, parse_custom_headers, parse_http_endpoint,
+    redacted_endpoint_url, redacted_endpoint_url_str, validate_batch_config,
 };
 pub use summary_log_budget::{
     QueuedSummaryPayload, admit_http_summary, admit_stream_summary, assemble_json_array,
@@ -67,7 +67,10 @@ pub use summary_log_budget::{
 };
 // Re-exported for external unit tests; unused inside the binary target.
 #[allow(unused_imports)]
-pub use log_helpers::{HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT};
+pub use log_helpers::{
+    HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT,
+    handle_http_batch_response,
+};
 pub use socket_host::{parse_socket_host, socket_addr_lookup_input};
 pub use tcp_endpoint::resolve_tcp_endpoint;
 pub use udp_endpoint::{UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, resolve_udp_endpoint};
