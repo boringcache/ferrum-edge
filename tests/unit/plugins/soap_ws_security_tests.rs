@@ -4927,7 +4927,10 @@ fn test_nonce_reclaim_over_bounded_budget_rejects_then_retries_to_success() {
             }
         }
     }
-    assert!(attempts > 1, "one bounded batch must not free the whole cap");
+    assert!(
+        attempts > 1,
+        "one bounded batch must not free the whole cap"
+    );
 
     let final_snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(final_snapshot.entry_count, 1);
