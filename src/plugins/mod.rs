@@ -8050,7 +8050,9 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// - `geo_restriction` opens the configured MaxMind `.mmdb` database,
 /// - `udp_logging` opens node-local DTLS key material,
 /// - `oidc_relying_party` performs OIDC discovery / JWKS work and retains
-///   background refresh state.
+///   background refresh state,
+/// - `transaction_log_schema` registers schemas in the process-wide reload
+///   staging map when another thread owns an active reload bracket.
 ///
 /// None of them can ever require request-body buffering, so the screen answers
 /// [`RequestBodyBufferingScreen::Streams`] for them without construction. That
@@ -8060,8 +8062,12 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// new shape-only carve-out appears in
 /// [`validate_plugin_config_with_http_client`] without being classified here or
 /// in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`].
-pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] =
-    &["geo_restriction", "oidc_relying_party", "udp_logging"];
+pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
+    "geo_restriction",
+    "oidc_relying_party",
+    "transaction_log_schema",
+    "udp_logging",
+];
 
 /// Built-in plugins the screen constructs through a shape-only path instead of
 /// the ordinary factory.
@@ -8138,10 +8144,10 @@ impl RequestBodyBufferingScreen {
 ///
 /// - the plugin is dropped immediately and never enters a cache, so no
 ///   candidate state is published,
-/// - `Plugin::start_background_tasks()` is never called, which is where every
-///   built-in defers its workers, timers, spool files, and registry
+/// - `Plugin::start_background_tasks()` is never called, which is where
+///   built-ins normally defer workers, timers, spool files, and registry
 ///   publication,
-/// - the node-local / networked constructors are carved out entirely
+/// - side-effectful constructors are carved out entirely
 ///   ([`REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT`]) or routed through their
 ///   existing shape-only constructor
 ///   ([`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]),
