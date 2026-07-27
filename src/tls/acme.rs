@@ -3546,6 +3546,10 @@ mod tests {
             "https://2130706433/dir",
             "https://0177.0.0.1/dir",
             "https://127.1/dir",
+            // WHATWG URL parsing treats a final all-numeric label as an IPv4
+            // candidate. Keep this fail-closed instead of letting the HTTP and
+            // URL parser views disagree about the authority.
+            "https://example.123/dir",
             "https://0x7f.0.0.1/dir",
             "https://127.0.0x1/dir",
             "https://127.0x1/dir",
@@ -3621,7 +3625,6 @@ mod tests {
             "https://dead.cab/dir",
             "https://abc.def.1a2b/dir",
             "https://3com.example.com/dir",
-            "https://example.123/dir",
         ] {
             assert!(
                 validate_acme_directory_url_ssrf_policy(ok).is_ok(),
