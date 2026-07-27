@@ -1,13 +1,13 @@
 //! Ambient-proxy isolation for policy-governed backend reqwest clients.
 
 use chrono::Utc;
-use futures_util::FutureExt as _;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use futures_util::FutureExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::MockServer;
