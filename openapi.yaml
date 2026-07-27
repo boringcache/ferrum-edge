@@ -9169,13 +9169,16 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
-        per-connection counters under a per-plugin/gateway-instance key
-        namespace; it does not coordinate a portable frame budget across
-        gateway instances, reconnects, or plugin rebuilds. Unknown top-level keys
-        are rejected by the runtime and by this schema. Counter storage supports
-        only local memory and Redis; database-backed counters are intentionally
-        unsupported.
+        bucket. `frames_per_second` and `burst_size` must form an integer-multiple
+        refill window of at most 3600 seconds (and stay within 1–1000000) so Redis
+        two-window enforcement cannot over-admit or under-admit relative to the
+        local token bucket, including across Redis failure/recovery. Redis mode
+        (`sync_mode: "redis"`) externalizes those per-connection counters under a
+        per-plugin/gateway-instance key namespace; it does not coordinate a portable
+        frame budget across gateway instances, reconnects, or plugin rebuilds. Unknown
+        top-level keys are rejected by the runtime and by this schema. Counter
+        storage supports only local memory and Redis; database-backed counters
+        are intentionally unsupported.
       additionalProperties: false
       properties:
         frames_per_second:
@@ -9183,17 +9186,26 @@ components:
           format: uint64
           default: 100
           minimum: 1
+          maximum: 1000000
           description: >-
-            Token refill rate per second. Must be greater than zero — configs
-            with `frames_per_second: 0` are rejected at config load time.
+            Token refill rate per second. Range 1–1000000. Must be greater than
+            zero — configs with `frames_per_second: 0` are rejected at config
+            load time. Together with `burst_size`, must yield an integer-multiple
+            refill window of at most 3600 seconds so Redis and local sustained
+            rates match.
         burst_size:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 1000000
           description: >-
-            Maximum burst capacity (tokens). Defaults to the value of
-            `frames_per_second` when not explicitly set. Must be greater than
-            zero and greater than or equal to `frames_per_second`.
+            Maximum burst capacity (tokens). Range 1–1000000. Defaults to the
+            value of `frames_per_second` when not explicitly set. Must be greater
+            than zero, greater than or equal to `frames_per_second`, an integer
+            multiple of `frames_per_second`, and yield a refill window
+            (`burst_size / frames_per_second`) of at most 3600 seconds. Configs
+            that Redis cannot represent without over-admitting or under-admitting
+            relative to the local token bucket are rejected at config load time.
         close_reason:
           type: string
           default: "Frame rate exceeded"
@@ -17879,6 +17891,7 @@ components:
 
     ResponseSizeLimitingConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: response_size_limiting — Per-proxy response body size limits.
         Rejects oversized responses with HTTP 502 either via Content-Length
@@ -17888,6 +17901,8 @@ components:
         without Content-Length cannot be enforced by this plugin — the
         global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
         case via the gateway's `SizeLimitedStreamingResponse` adapter.
+        Unknown keys and non-object configs are rejected. Explicit null
+        members are rejected; omitted keys keep defaults.
       required:
         - max_bytes
       properties:

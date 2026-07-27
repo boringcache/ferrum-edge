@@ -2235,6 +2235,48 @@ fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
 }
 
 #[test]
+fn test_response_size_limiting_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "response-size-1",
+            "response_size_limiting",
+            json!({"max_bytes": 1024, "require_buffered_check": true}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid response_size_limiting cache");
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "response_size_limiting");
+    assert!(cache.requires_response_body_buffering("ferrum", "p1"));
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "response-size-1",
+            "response_size_limiting",
+            json!({"max_bytes": 1024, "require_buffered_checks": true}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown response_size_limiting key must reject cache publication");
+    assert!(error.contains("require_buffered_checks"), "got: {error}");
+
+    let after = cache.get_plugins("ferrum", "p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "failed rebuild must retain the last accepted response_size_limiting instance"
+    );
+    assert!(cache.requires_response_body_buffering("ferrum", "p1"));
+}
+
+#[test]
 fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     let valid_cfg = json!({
         "channels": {

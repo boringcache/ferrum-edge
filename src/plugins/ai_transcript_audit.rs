@@ -25,10 +25,11 @@
 //! `before_proxy` short-circuit, the reject/synthetic response hooks) over the
 //! backend-visible body, and only after cheap capture admission confirms an
 //! exportable record is still possible: the sampling roll must be able to emit
-//! (directly or via an `always_capture_on_*` override) and a finite
-//! `sampling.max_records_per_minute` window must atomically reserve budget.
-//! Concurrent candidates therefore cannot all pay capture work beyond the
-//! configured ceiling. A candidate that cannot be exported therefore costs a
+//! directly, or remain eligible for an `always_capture_on_*` override. Sampling
+//! hits atomically reserve finite `sampling.max_records_per_minute` budget;
+//! override-only candidates acquire budget only after the response proves they
+//! will emit, so a slow successful request cannot suppress a concurrent error
+//! audit. A candidate that cannot be exported therefore costs a
 //! classification pass and a staging slot, not a cryptographic pass plus a
 //! retained excerpt. The deliberate trade-off is that a candidate whose
 //! transaction ends before ANY of those hooks run (e.g. a client disconnect
@@ -2572,25 +2573,35 @@ impl AiTranscriptAudit {
     /// backend-visible body — before any hashing, redaction, excerpt shaping,
     /// or model/tool extraction.
     ///
-    /// `None` admits full capture (and, for a finite limiter, returns a
-    /// reserved slot via [`RecordsPerMinute::try_reserve`] inside
-    /// [`Self::capture_request`]). `Some(reason)` means no exportable record
-    /// can result, so the expensive work is skipped entirely:
+    /// `Ok` admits full capture. Sampling hits carry a reservation from
+    /// [`RecordsPerMinute::try_reserve`], while override-only candidates carry
+    /// no reservation and acquire only if their final outcome emits. `Err`
+    /// means no exportable record can result, so expensive work is skipped:
     /// * [`CAPTURE_SKIP_NOT_SAMPLED`] — the sampling roll lost and neither
     ///   override is configured, so [`Self::emit_decision`] can never emit.
     ///   Exact: this is the same predicate the emit decision would apply later.
     /// * [`CAPTURE_SKIP_RATE_LIMITED`] — `sampling.max_records_per_minute` had
-    ///   no reservable budget in the current window. The limiter decision moves
-    ///   from enqueue time to capture-admission time so a saturated instance
-    ///   stops paying capture CPU (and retaining excerpts) for records it will
-    ///   drop; the reservation is atomic so concurrent candidates cannot all
-    ///   pass a non-consuming peek and amplify past the ceiling.
-    fn capture_skip_reason(&self, sample_hit: bool) -> Result<RateLimitReservation, &'static str> {
+    ///   no reservable budget for a sampling hit in the current window. The
+    ///   reservation is atomic so concurrent sampled candidates cannot all pass
+    ///   a non-consuming peek and amplify past the ceiling.
+    fn capture_skip_reason(
+        &self,
+        sample_hit: bool,
+    ) -> Result<Option<RateLimitReservation>, &'static str> {
         if !self.commit_may_emit(sample_hit) {
             return Err(CAPTURE_SKIP_NOT_SAMPLED);
         }
+        // An override-only candidate does not yet know whether it will emit.
+        // Reserving now would let a slow successful request strand the window
+        // budget and permanently preclude a concurrent error/guardrail audit.
+        // Capture its request evidence, then acquire at enqueue only if the
+        // final response actually activates an override.
+        if !sample_hit {
+            return Ok(None);
+        }
         self.rate_limiter
             .try_reserve()
+            .map(Some)
             .ok_or(CAPTURE_SKIP_RATE_LIMITED)
     }
 
@@ -2656,7 +2667,7 @@ impl AiTranscriptAudit {
             model,
             tools,
             skipped: None,
-            rate_reservation: Some(reservation),
+            rate_reservation: reservation,
         }
     }
 

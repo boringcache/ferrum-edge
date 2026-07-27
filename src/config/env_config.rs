@@ -5088,6 +5088,24 @@ impl EnvConfig {
             ));
         }
 
+        // Admin and CP/DP gRPC JWTs are separate trust domains. Distinct
+        // issuer defaults do not domain-separate identical HMAC keys: a
+        // holder of a shared secret can mint a fresh admin-shaped token.
+        // Reject equality whenever both secrets are configured (CP always
+        // requires both; DP/mesh/database may also carry both).
+        if let (Some(admin_secret), Some(cp_dp_secret)) = (
+            self.admin_jwt_secret.as_deref(),
+            self.cp_dp_grpc_jwt_secret.as_deref(),
+        ) && admin_secret == cp_dp_secret
+        {
+            return Err(
+                "FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be distinct \
+                 secrets when both are configured; identical HMAC keys are rejected because \
+                 issuer claims do not domain-separate shared signing material"
+                    .into(),
+            );
+        }
+
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
             || self.http3_initial_mtu > crate::http3::config::QUIC_INITIAL_MTU_MAX
         {
