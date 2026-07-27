@@ -1595,6 +1595,12 @@ pub(crate) async fn dial_h2_connect_sender(
                     message: e.to_string(),
                 }
             })?;
+            if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+                return Err(HbonePoolError::TlsHandshake {
+                    host: target_host.to_string(),
+                    message: "peer did not negotiate ALPN h2".to_string(),
+                });
+            }
 
             let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
             let mut builder = h2::client::Builder::new();

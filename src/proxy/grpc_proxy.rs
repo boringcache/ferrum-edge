@@ -791,10 +791,11 @@ impl GrpcPoolManager {
             .and_then(|o| o.tcp_keepalive.as_ref());
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
-        // The candidate attempt includes TCP socket setup, TLS when configured,
-        // and the complete H2 handshake. A peer that accepts TCP but cannot
-        // establish the requested protocol must not pin this pool to that DNS
-        // address.
+        // The candidate attempt includes TCP socket setup, negotiated ALPN h2
+        // when TLS is configured, and the Hyper H2 handshake. Cleartext h2c
+        // additionally observes the spawned driver for an immediate protocol
+        // rejection. A peer that accepts TCP but cannot establish the requested
+        // protocol must not pin this pool to that DNS address.
         let result = if use_tls {
             let tls_config = self.get_tls_config(proxy, svid_generation)?;
             let connector = tokio_rustls::TlsConnector::from(tls_config);
@@ -996,6 +997,14 @@ impl GrpcPoolManager {
                 e,
             )
         })?;
+        if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            let message = "TLS peer did not negotiate ALPN h2".to_string();
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ));
+        }
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);

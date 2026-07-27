@@ -175,6 +175,16 @@ async fn start_tls_backend_on(
     key_pem: &str,
     alpn_protocols: Vec<Vec<u8>>,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    start_tls_backend_on_counted(listener, cert_pem, key_pem, alpn_protocols, None).await
+}
+
+async fn start_tls_backend_on_counted(
+    listener: tokio::net::TcpListener,
+    cert_pem: &str,
+    key_pem: &str,
+    alpn_protocols: Vec<Vec<u8>>,
+    attempts: Option<Arc<AtomicUsize>>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let mut cert_reader = cert_pem.as_bytes();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .filter_map(|cert| cert.ok())
@@ -193,6 +203,9 @@ async fn start_tls_backend_on(
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            if let Some(attempts) = attempts.as_ref() {
+                attempts.fetch_add(1, Ordering::Relaxed);
+            }
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(socket).await {
@@ -627,6 +640,61 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
         failing_attempts.load(Ordering::Relaxed),
         1,
         "the TCP-successful, H2-failing first address must be attempted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn() {
+    let (healthy_listener, non_h2_listener, non_h2_ip, port) =
+        bind_dual_loopback_listeners().await;
+    let non_h2_attempts = Arc::new(AtomicUsize::new(0));
+    let _non_h2_task = start_tls_backend_on_counted(
+        non_h2_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&non_h2_attempts)),
+    )
+    .await
+    .expect("start non-H2 TLS backend");
+    let _healthy_task = start_tls_backend_on(
+        healthy_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"h2".to_vec()],
+    )
+    .await
+    .expect("start healthy gRPC TLS backend");
+    let dns = TestDnsServer::spawn(vec![
+        IpAddr::V4(non_h2_ip),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    ])
+    .await;
+    let pool = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    proxy.backend_host = "multi-address-grpc-tls.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+
+    let sender = pool.get_sender(&proxy).await;
+    assert!(
+        sender.is_ok(),
+        "healthy second address should negotiate TLS ALPN h2: {:?}",
+        sender.err()
+    );
+    assert_eq!(
+        non_h2_attempts.load(Ordering::Relaxed),
+        1,
+        "a TLS peer without negotiated h2 must be rejected before accepting its sender"
     );
 }
 

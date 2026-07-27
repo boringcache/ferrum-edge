@@ -1376,6 +1376,12 @@ impl MeshMtlsConnectionPool {
                         message: e.to_string(),
                     }
                 })?;
+                if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+                    return Err(HbonePoolError::TlsHandshake {
+                        host: target_host.to_string(),
+                        message: "peer did not negotiate ALPN h2".to_string(),
+                    });
+                }
 
                 let mut builder = http2::Builder::new(TokioExecutor::new());
                 builder.timer(TokioTimer::new());
