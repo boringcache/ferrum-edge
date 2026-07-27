@@ -2683,9 +2683,9 @@ enforcement entirely. Local HTTP/GraphQL/gRPC sliding-window state uses a fixed
 ring of aggregate count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so
 per-key memory stays O(1) in the request cap; the request-cap bound is an
 operational ceiling on budgets and Redis/header arithmetic, not a timestamp-log
-size limit. The `rate_limiting`, `graphql`, `grpc_method_router`, and
-`udp_rate_limiting` roots reject unknown keys. The `ai_rate_limiter` and
-`ws_rate_limiting` roots remain intentionally open for forward-compatible
+size limit. The `rate_limiting`, `graphql`, `grpc_method_router`,
+`udp_rate_limiting`, and `ai_rate_limiter` roots reject unknown keys. The
+`ws_rate_limiting` root remains intentionally open for forward-compatible
 fields, consistently in runtime admission and OpenAPI.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
@@ -2720,11 +2720,6 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
-
-The configuration object is closed. Unknown or misspelled root properties,
-including shared Redis settings, reject the candidate configuration instead of
-silently selecting defaults. A rejected reload leaves the last-known-good
-plugin generation active.
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
@@ -5176,6 +5171,11 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
+
+The `ai_rate_limiter` configuration object is closed. Unknown or misspelled
+root properties, including shared Redis settings, reject the candidate
+configuration instead of silently selecting defaults. A rejected reload leaves
+the last-known-good plugin generation active.
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
