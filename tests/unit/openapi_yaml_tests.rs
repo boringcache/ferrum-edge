@@ -1676,9 +1676,13 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
         "global_exemptions.header_present must remain an open header-name map"
     );
 
-    let root = &spec["components"]["schemas"]["WafPluginConfig"];
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/WafPluginConfig",
+        "components": spec["components"].clone()
+    });
     let validator = jsonschema::draft202012::options()
-        .build(root)
+        .build(&root)
         .expect("WafPluginConfig schema compiles");
     assert!(
         validator

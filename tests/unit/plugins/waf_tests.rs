@@ -1337,10 +1337,6 @@ fn waf_rule_target_openapi_runtime_parity() {
         json!({ "type": "request_query" }),
         json!({ "type": "body_json_path", "path": "messages.0.content" }),
         json!({ "type": "response_headers" }),
-        // The runtime ignores unrelated target-object extension keys. The
-        // schema must constrain only the enforcement-relevant names/path
-        // fields rather than silently becoming stricter than construction.
-        json!({ "type": "query_values", "extension": true }),
     ];
     for target in &valid_targets {
         assert!(
@@ -1364,6 +1360,9 @@ fn waf_rule_target_openapi_runtime_parity() {
         json!({ "type": "body_json_path", "path": "" }),
         json!({ "type": "header_values", "path": "x" }),
         json!({ "type": "body_json_path", "path": "a.b", "names": ["x"] }),
+        // Object-form targets are a fixed-shape enforcement boundary. Runtime
+        // admission and OpenAPI must both reject unrelated extension keys.
+        json!({ "type": "query_values", "extension": true }),
     ];
     for target in &invalid_targets {
         assert!(
