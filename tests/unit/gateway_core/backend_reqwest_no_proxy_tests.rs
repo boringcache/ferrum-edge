@@ -153,7 +153,11 @@ async fn connection_pool_backend_client_ignores_ambient_proxy_environment() {
         .await;
 
     assert_eq!(
-        proxy_server.received_requests().await.unwrap_or_default().len(),
+        proxy_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .len(),
         0,
         "ambient proxy variables must not receive backend dispatch traffic"
     );

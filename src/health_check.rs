@@ -2234,8 +2234,8 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use rustls::ServerConfig;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use std::sync::Once;
     use std::sync::Mutex;
+    use std::sync::Once;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
@@ -2415,7 +2415,9 @@ mod tests {
         let proxy = MockServer::start().await;
         let pool_config = PoolConfig::default();
         let client = {
-            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
             build_health_check_client(&pool_config, None, false)
                 .expect("health-check client should build")
@@ -2440,7 +2442,9 @@ mod tests {
         let pool_config = PoolConfig::default();
         let tls_config = BackendTlsConfig::default_verify();
         let client = {
-            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
             build_health_check_client_with_tls(
                 &pool_config,
@@ -2471,7 +2475,9 @@ mod tests {
     async fn build_dns_cached_fallback_client_ignores_ambient_proxy_environment() {
         let proxy = MockServer::start().await;
         let client = {
-            let _env_lock = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _env_lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
             build_dns_cached_fallback_client(None, "test")
                 .expect("fallback health-check client should build")
@@ -2652,8 +2658,8 @@ mod tests {
 
     #[test]
     fn accept_health_check_client_preserves_built_client() {
-        let client = build_dns_cached_fallback_client(None, "test")
-            .expect("fallback client should build");
+        let client =
+            build_dns_cached_fallback_client(None, "test").expect("fallback client should build");
         assert!(
             accept_health_check_client(Ok(client), "test").is_some(),
             "successful builds must remain available to HTTP probes"
