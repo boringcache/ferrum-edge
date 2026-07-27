@@ -949,9 +949,13 @@ async fn load_full_config_multi_with_sequence(
     // harmlessly replayed by the next incremental poll, but it cannot skip a
     // write the snapshot may not contain.
     //
-    // All-scope's revision domain is store-global, so that watermark must be
-    // captured before even the per-namespace boundaries and resource loads.
-    let store_global_sequence = if mesh_authority.is_some() && matches!(scope, CpScope::All) {
+    let publishes_store_global_revision =
+        mesh_authority.is_some() && matches!(scope, CpScope::All);
+
+    // A sequenced All-scope revision domain is store-global, so that watermark
+    // must be captured before even the per-namespace boundaries and resource
+    // loads.
+    let store_global_sequence = if publishes_store_global_revision {
         db.latest_global_change_sequence().await?
     } else {
         0
@@ -977,13 +981,14 @@ async fn load_full_config_multi_with_sequence(
         }
     }
 
-    // All-scope's captured watermark covers every namespace in the store. If
-    // even one namespace cannot establish its pre-load boundary, retaining
-    // that namespace's older LKG content and stamping the combined config with
-    // the global watermark would overstate the snapshot. Keep the entire
-    // prior snapshot/cursor set instead. Explicit scopes have independent
-    // namespace boundaries and retain their per-tenant continuation below.
-    if matches!(scope, CpScope::All) && !boundary_failed_namespaces.is_empty() {
+    // A sequenced All-scope watermark covers every namespace in the store. If
+    // even one namespace cannot establish its pre-load boundary, retaining that
+    // namespace's older LKG content and stamping the combined config with the
+    // global watermark would overstate the snapshot. Keep the entire prior
+    // snapshot/cursor set instead. Explicit scopes and unsequenced All scope do
+    // not publish a global revision, so they retain per-tenant continuation
+    // below.
+    if publishes_store_global_revision && !boundary_failed_namespaces.is_empty() {
         anyhow::bail!(
             "CP All-scope full reload could not capture every namespace boundary; retaining the \
              prior snapshot and cursors"
@@ -1008,10 +1013,10 @@ async fn load_full_config_multi_with_sequence(
         load_full_config_multi(db, &load_namespaces, previous).await?
     };
 
-    // The same whole-store rule applies after resource loading. A partial
-    // `All` snapshot may contain LKG resources older than the captured global
-    // watermark, so it must not be published or advance any cursor.
-    if matches!(scope, CpScope::All) {
+    // The same whole-store rule applies after resource loading when the
+    // snapshot will publish a global revision. An unsequenced `All` snapshot
+    // preserves the per-namespace LKG continuation contract.
+    if publishes_store_global_revision {
         if !outcome.failed_namespaces.is_empty() {
             anyhow::bail!(
                 "CP All-scope full reload could not refresh every namespace; retaining the prior \

@@ -443,6 +443,70 @@ async fn all_scope_boundary_failure_retains_the_whole_prior_snapshot() {
 }
 
 #[tokio::test]
+async fn unsequenced_all_scope_boundary_failure_demotes_only_that_namespace() {
+    let previous = full_load_consumer_config("beta", "last-good", 10);
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "fresh", 20),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "must-not-load", 20),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 20), ("beta".to_string(), 30)]),
+        30,
+    )
+    .fail_sequence_for("beta");
+
+    let outcome = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string(), "beta".to_string()],
+        &previous,
+        &CpScope::All,
+        None,
+        0,
+    )
+    .await
+    .expect("healthy namespace must continue without a global mesh revision");
+
+    let consumer_ids: HashSet<&str> = outcome
+        .config
+        .consumers
+        .iter()
+        .map(|consumer| consumer.id.as_str())
+        .collect();
+    assert_eq!(
+        consumer_ids,
+        HashSet::from(["alpha-fresh", "beta-last-good"]),
+        "the failed namespace retains LKG while the healthy namespace refreshes"
+    );
+    assert!(
+        outcome.config.mesh_revision.is_none(),
+        "an unsequenced authority must not publish a mesh revision"
+    );
+    assert_eq!(
+        outcome.sequences,
+        HashMap::from([("alpha".to_string(), 20)]),
+        "only the successfully refreshed namespace may advance its cursor"
+    );
+    assert_eq!(outcome.refreshed_namespaces, vec!["alpha"]);
+    assert_eq!(outcome.failed_namespaces, vec!["beta"]);
+    assert_eq!(
+        source.events(),
+        vec![
+            "boundary:alpha",
+            "boundary:beta",
+            "load:alpha:snapshot",
+            "load:alpha:complete",
+        ],
+        "unsequenced All scope must preserve pre-load boundaries and skip the failed tenant load"
+    );
+}
+
+#[tokio::test]
 async fn explicit_scope_boundary_failure_demotes_only_that_namespace() {
     let previous = full_load_consumer_config("beta", "last-good", 10);
     let source = ScriptedFullLoadSource::new(
