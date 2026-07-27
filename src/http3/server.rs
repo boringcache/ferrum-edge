@@ -897,10 +897,10 @@ async fn handle_h3_connection(
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
-                debug!(
-                    "HTTP/3 0-RTT connection accepted from {}",
-                    conn.remote_address()
+                let remote = crate::util::client_identity::canonical_socket_addr(
+                    conn.remote_address(),
                 );
+                debug!("HTTP/3 0-RTT connection accepted from {}", remote);
                 // Spawn a task that waits for the handshake to complete, then
                 // reports the outcome to the accept loop. The accept loop owns
                 // identity publication so it can drain every already-ready
@@ -918,7 +918,6 @@ async fn handle_h3_connection(
                 let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
                 handshake_completion_rx = Some(completion_rx);
                 let conn_for_close = conn.clone();
-                let remote = conn.remote_address();
                 tokio::spawn(async move {
                     let handshake_succeeded =
                         match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
@@ -981,7 +980,10 @@ async fn handle_h3_connection(
     };
 
     let remote_addr = connection.remote_address();
-    debug!("HTTP/3 connection established from {}", remote_addr);
+    debug!(
+        "HTTP/3 connection established from {}",
+        crate::util::client_identity::canonical_socket_addr(remote_addr)
+    );
 
     // Publish the peer certificate and chain from the QUIC connection (mTLS).
     // Every branch that reaches here except the 0-RTT one has already awaited
@@ -1068,16 +1070,17 @@ async fn handle_h3_connection(
                 // address actually changes, which is rare (mobile network handoff).
                 let current_addr = quinn_conn.remote_address();
                 if current_addr != cached_addr {
-                    info!(
-                        "HTTP/3 connection migration detected: {} -> {}",
-                        cached_addr, current_addr
-                    );
+                    let previous_peer = canonical_peer;
                     cached_addr = current_addr;
                     // The post-migration address is a fresh identity boundary and is
                     // folded on the same terms as the initial one — a client that
                     // migrates onto a mapped IPv4 path keeps one per-IP budget and one
                     // GeoIP principal (GHSA-vjwj-657f-5w9g).
                     (canonical_peer, socket_ip) = h3_client_identity(current_addr);
+                    info!(
+                        "HTTP/3 connection migration detected: {} -> {}",
+                        previous_peer, canonical_peer
+                    );
                 }
 
                 let state = Arc::clone(&state);
@@ -1124,11 +1127,11 @@ async fn handle_h3_connection(
                 });
             }
             Ok(None) => {
-                debug!("HTTP/3 connection closed from {}", remote_addr);
+                debug!("HTTP/3 connection closed from {}", canonical_peer);
                 break;
             }
             Err(e) => {
-                warn!("HTTP/3 connection error from {}: {}", remote_addr, e);
+                warn!("HTTP/3 connection error from {}: {}", canonical_peer, e);
                 break;
             }
         }
