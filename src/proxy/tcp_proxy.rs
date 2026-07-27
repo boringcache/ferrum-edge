@@ -1123,7 +1123,10 @@ fn classify_tcp_accept_peer_exit(
 /// `Ok(())` and are not reported as operational failures. Subsequent peer
 /// exits after the first failure are drained without additional error logs.
 pub(crate) async fn supervise_tcp_accept_loop_peers(
-    peers: Vec<(TcpAcceptLoopClass, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+    peers: Vec<(
+        TcpAcceptLoopClass,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    )>,
     cancel_siblings: impl FnOnce(),
 ) -> Result<(), anyhow::Error> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -1132,7 +1135,10 @@ pub(crate) async fn supervise_tcp_accept_loop_peers(
         return Ok(());
     }
 
-    let abort_handles: Vec<_> = peers.iter().map(|(_, handle)| handle.abort_handle()).collect();
+    let abort_handles: Vec<_> = peers
+        .iter()
+        .map(|(_, handle)| handle.abort_handle())
+        .collect();
     let mut futures: FuturesUnordered<_> = peers
         .into_iter()
         .map(|(class, handle)| async move { (class, handle.await) })
@@ -1383,8 +1389,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         let listener = listeners
             .pop()
             .ok_or_else(|| anyhow::anyhow!("TCP listener set unexpectedly empty"))?;
-        let result =
-            run_tcp_accept_loop(listener, loop_state, shutdown, global_shutdown, 0).await;
+        let result = run_tcp_accept_loop(listener, loop_state, shutdown, global_shutdown, 0).await;
         if result.is_err() {
             started.store(false, Ordering::Release);
         }

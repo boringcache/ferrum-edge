@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ferrum_edge::_test_support::{
-    TcpAcceptLoopClass, supervise_tcp_accept_loop_peers_for_test,
-};
+use ferrum_edge::_test_support::{TcpAcceptLoopClass, supervise_tcp_accept_loop_peers_for_test};
 use tokio::sync::watch;
 
 #[tokio::test]
@@ -89,9 +87,7 @@ async fn supervise_observes_ordinary_early_error_on_extra_loop() {
         Ok(())
     });
 
-    let extra = tokio::spawn(async {
-        Err(anyhow::anyhow!("accept loop socket failed"))
-    });
+    let extra = tokio::spawn(async { Err(anyhow::anyhow!("accept loop socket failed")) });
 
     let trigger = cancel_tx.clone();
     let began = Instant::now();
@@ -126,9 +122,7 @@ async fn supervise_observes_primary_failure_and_drains_extras() {
     let (cancel_tx, _) = watch::channel(false);
     let extras_finished = Arc::new(AtomicUsize::new(0));
 
-    let primary = tokio::spawn(async {
-        Err(anyhow::anyhow!("primary accept loop failed"))
-    });
+    let primary = tokio::spawn(async { Err(anyhow::anyhow!("primary accept loop failed")) });
 
     let mut extra_a_rx = cancel_tx.subscribe();
     let extras_a = extras_finished.clone();
@@ -221,9 +215,7 @@ async fn supervise_clean_shutdown_is_not_operational_failure() {
 async fn supervise_aborts_siblings_when_cancel_signal_is_ignored() {
     // Models a lost peer-cancel: siblings never observe the watch channel.
     // Supervisor must abort rather than hang.
-    let primary = tokio::spawn(async {
-        Err(anyhow::anyhow!("primary failed"))
-    });
+    let primary = tokio::spawn(async { Err(anyhow::anyhow!("primary failed")) });
     let stuck_extra = tokio::spawn(async {
         std::future::pending::<()>().await;
         Ok(())
@@ -256,12 +248,8 @@ async fn supervise_aborts_siblings_when_cancel_signal_is_ignored() {
 #[tokio::test]
 async fn supervise_does_not_double_count_cancel_on_multiple_failures() {
     let cancel_count = Arc::new(AtomicUsize::new(0));
-    let primary = tokio::spawn(async {
-        Err(anyhow::anyhow!("primary failed"))
-    });
-    let extra = tokio::spawn(async {
-        Err(anyhow::anyhow!("extra also failed"))
-    });
+    let primary = tokio::spawn(async { Err(anyhow::anyhow!("primary failed")) });
+    let extra = tokio::spawn(async { Err(anyhow::anyhow!("extra also failed")) });
 
     let counter = cancel_count.clone();
     let err = supervise_tcp_accept_loop_peers_for_test(
