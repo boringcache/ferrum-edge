@@ -1631,9 +1631,7 @@ pub(crate) async fn dial_h2_connect_sender(
                     std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Err(
                         "H2 connection closed before peer SETTINGS".to_string(),
                     )),
-                    std::task::Poll::Ready(Err(e)) => {
-                        std::task::Poll::Ready(Err(e.to_string()))
-                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e.to_string())),
                     std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             })
