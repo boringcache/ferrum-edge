@@ -764,31 +764,6 @@ where
         }
     }
 
-    pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
-        match self {
-            Self::Local(local) => local.check(local_key, op),
-            Self::Failover(failover) => failover.check(local_key, redis_key, op).await,
-        }
-    }
-
-    pub async fn check_with_redis_key<F>(
-        &self,
-        local_key: K,
-        redis_key: F,
-        op: &A::Op,
-    ) -> RateLimitOutcome
-    where
-        F: FnOnce() -> String,
-    {
-        match self {
-            Self::Local(local) => local.check(local_key, op),
-            Self::Failover(failover) => {
-                let redis_key = redis_key();
-                failover.check(local_key, &redis_key, op).await
-            }
-        }
-    }
-
     /// Check through Redis when available, or reserve a bounded local/fallback
     /// entry slot atomically. None denies only a previously unseen local key.
     pub async fn check_with_redis_key_and_local_capacity<F>(
