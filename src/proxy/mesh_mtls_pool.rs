@@ -1428,6 +1428,11 @@ impl MeshMtlsConnectionPool {
                         std::task::Poll::Ready(Err(e)) => {
                             std::task::Poll::Ready(Err(e.to_string()))
                         }
+                        // SETTINGS can be applied during this poll; re-check
+                        // before parking or a wake may never arrive.
+                        std::task::Poll::Pending if connection.current_max_send_streams() > 0 => {
+                            std::task::Poll::Ready(Ok(()))
+                        }
                         std::task::Poll::Pending => std::task::Poll::Pending,
                     }
                 })
