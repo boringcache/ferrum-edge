@@ -491,6 +491,10 @@ impl AdminState {
     /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, so slow ACME network work cannot
     /// defer failover/failback and independent TLS stores are not gated by
     /// sticky DB failover policy.
+    // Returning the response by value keeps this synchronous gate identical to
+    // the async `admit_write` contract and lets every handler return it without
+    // an extra allocation/dereference layer on an already exceptional path.
+    #[allow(clippy::result_large_err)]
     pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
         if let Some(response) = self.evaluate_non_topology_write_gate() {
             Err(response)
