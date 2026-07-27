@@ -2444,7 +2444,7 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
         .try_failover_reconnect(&primary_rw_url)
         .await
         .expect("the fenced primary must fall through to a healthy failover");
-    assert_eq!(active, failover_rw_url);
+    assert_eq!(active, failover_url);
     assert!(
         !store.failover_topology_status().primary_active,
         "the stale primary must not replace the failover topology"
