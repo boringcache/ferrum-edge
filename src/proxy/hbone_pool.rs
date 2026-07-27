@@ -1656,15 +1656,31 @@ pub(crate) async fn dial_h2_connect_sender(
 
             // Spawn only after TLS and H2 have both succeeded. A failed or
             // timed-out candidate therefore cannot leak a driver task.
+            let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
-                if let Err(e) = connection.await {
+                let mut driver_polled_tx = Some(driver_polled_tx);
+                let result = std::future::poll_fn(|cx| {
+                    let poll =
+                        std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
+                    if let Some(tx) = driver_polled_tx.take() {
+                        let _ = tx.send(poll.is_pending());
+                    }
+                    poll
+                })
+                .await;
+                if let Err(e) = result {
                     debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
                 }
             });
             // The SETTINGS readiness poll above registered this creator task's
-            // waker on the connection. Yield once so the newly spawned driver
-            // can poll and replace it before the sender is used.
-            tokio::task::yield_now().await;
+            // waker. Do not release the sender until the spawned driver has
+            // polled the connection and installed its own waker.
+            if !matches!(driver_polled_rx.await, Ok(true)) {
+                return Err(HbonePoolError::H2Handshake {
+                    host: target_host.to_string(),
+                    message: "H2 connection closed during driver handoff".to_string(),
+                });
+            }
             Ok(sender)
         }
     })

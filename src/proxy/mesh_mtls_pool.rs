@@ -1444,18 +1444,33 @@ impl MeshMtlsConnectionPool {
 
                 // Spawn only after complete protocol establishment. Failed or
                 // timed-out candidates cannot leave driver tasks behind.
+                let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
-                    if let Err(e) = connection.await {
+                    let mut driver_polled_tx = Some(driver_polled_tx);
+                    let result = std::future::poll_fn(|cx| {
+                        let poll =
+                            std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
+                        if let Some(tx) = driver_polled_tx.take() {
+                            let _ = tx.send(poll.is_pending());
+                        }
+                        poll
+                    })
+                    .await;
+                    if let Err(e) = result {
                         debug!(
                             "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
                             e
                         );
                     }
                 });
-                // The SETTINGS readiness poll above registered this creator
-                // task's waker. Yield so the driver can install its own waker
-                // before the sender escapes this candidate attempt.
-                tokio::task::yield_now().await;
+                // Do not release the sender until the spawned driver has
+                // replaced the creator task's SETTINGS-poll waker.
+                if !matches!(driver_polled_rx.await, Ok(true)) {
+                    return Err(HbonePoolError::H2Handshake {
+                        host: target_host.to_string(),
+                        message: "H2 connection closed during driver handoff".to_string(),
+                    });
+                }
                 Ok(sender)
             }
         })

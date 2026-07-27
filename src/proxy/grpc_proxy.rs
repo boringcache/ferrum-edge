@@ -985,14 +985,29 @@ impl GrpcPoolManager {
         })?;
 
         // Spawn only after the peer completed the H2 preface exchange.
+        let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let mut driver_polled_tx = Some(driver_polled_tx);
+            let result = std::future::poll_fn(|cx| {
+                let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
+                if let Some(tx) = driver_polled_tx.take() {
+                    let _ = tx.send(poll.is_pending());
+                }
+                poll
+            })
+            .await;
+            if let Err(e) = result {
                 debug!("gRPC h2c connection closed: {}", e);
             }
         });
-        // The SETTINGS readiness poll above registered this creator task's
-        // waker. Yield so the driver can install its own waker before use.
-        tokio::task::yield_now().await;
+        if !matches!(driver_polled_rx.await, Ok(true)) {
+            let message = "gRPC h2c connection closed during driver handoff".to_string();
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message),
+            ));
+        }
 
         Ok(sender)
     }
@@ -1052,14 +1067,29 @@ impl GrpcPoolManager {
         })?;
 
         // Spawn only after the peer completed the H2 preface exchange.
+        let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let mut driver_polled_tx = Some(driver_polled_tx);
+            let result = std::future::poll_fn(|cx| {
+                let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
+                if let Some(tx) = driver_polled_tx.take() {
+                    let _ = tx.send(poll.is_pending());
+                }
+                poll
+            })
+            .await;
+            if let Err(e) = result {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
         });
-        // The SETTINGS readiness poll above registered this creator task's
-        // waker. Yield so the driver can install its own waker before use.
-        tokio::task::yield_now().await;
+        if !matches!(driver_polled_rx.await, Ok(true)) {
+            let message = "gRPC h2 TLS connection closed during driver handoff".to_string();
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2Handshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message),
+            ));
+        }
 
         Ok(sender)
     }

@@ -289,15 +289,33 @@ impl Http2PoolManager {
                 // Spawn only after the complete candidate establishment
                 // succeeds. Failed or timed-out attempts therefore cannot
                 // leave detached connection-driver tasks behind.
+                let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
-                    if let Err(e) = conn.await {
+                    let mut driver_polled_tx = Some(driver_polled_tx);
+                    let result = std::future::poll_fn(|cx| {
+                        let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
+                        if let Some(tx) = driver_polled_tx.take() {
+                            let _ = tx.send(poll.is_pending());
+                        }
+                        poll
+                    })
+                    .await;
+                    if let Err(e) = result {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                // The SETTINGS readiness poll above registered this creator
-                // task's waker. Yield so the driver can install its own waker
-                // before the sender escapes this candidate attempt.
-                tokio::task::yield_now().await;
+                // Do not release the sender until the spawned driver has
+                // replaced the creator task's SETTINGS-poll waker.
+                if !matches!(driver_polled_rx.await, Ok(true)) {
+                    let message = "h2 connection closed during driver handoff".to_string();
+                    return Err(Http2PoolError::BackendUnavailable {
+                        message: message.clone(),
+                        source: Some(BackendUnavailableSource::Io(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            message,
+                        ))),
+                    });
+                }
                 Ok(Http2CandidateOutcome::Established(sender))
             }
         })
