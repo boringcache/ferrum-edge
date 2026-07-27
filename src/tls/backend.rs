@@ -622,11 +622,6 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let client_auth = self.load_client_auth()?;
 
         let mut client_config = if self.skip_verification() {
-            if self.custom_ca_path().is_some() {
-                // No-verify disables use of the verifier, not admission of an
-                // explicitly declared CA source.
-                build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
-            }
             tracing::warn!("{}", skip_verify_warning);
             if !self.proxy.resolved_tls.san_allow_list.is_empty() {
                 tracing::warn!(
