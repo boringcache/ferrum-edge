@@ -204,7 +204,8 @@ fn ai_rate_limiter_rejects_misspelled_sync_mode_even_with_valid_token_limit() {
             "redis_url": "redis://127.0.0.1:6379/0",
         }),
     )
-    .expect_err("misspelled sync_mode must fail admission");
+    .err()
+    .expect("misspelled sync_mode must fail admission");
     assert!(error.contains("unknown configuration key(s)"), "{error}");
     assert!(error.contains("config.sync_mdoe"), "{error}");
     assert!(error.contains("sync_mode"), "suggestion missing: {error}");
@@ -226,7 +227,8 @@ fn ai_rate_limiter_rejects_misspelled_enforcement_and_redis_keys() {
         config.insert("token_limit".to_string(), json!(1000));
         config.insert(key.to_string(), json!("consumer"));
         let error = create_plugin("ai_rate_limiter", &Value::Object(config))
-            .expect_err("a misspelled root key must fail admission");
+            .err()
+            .expect("a misspelled root key must fail admission");
         assert!(error.contains(key), "{error}");
     }
 }
