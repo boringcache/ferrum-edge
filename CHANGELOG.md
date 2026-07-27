@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `host:port`-only screen. Entries whose protocol prefix disagrees with
   `security_protocol` are rejected rather than silently truncating the broker
   list the way librdkafka would.
+- Versioned standard and `-ebpf` multi-architecture images are now keylessly
+  signed in Docker Hub and GHCR and carry final-manifest SLSA provenance plus
+  per-platform SPDX SBOM attestations. A fail-closed publication gate requires
+  identity, signature, subject-digest, source-commit, provenance, and SBOM
+  verification and retracts a GitHub Release if attestation does not succeed
+  (compatible with the trusted Cross `create-release.needs` contract).
 - `ai_semantic_cache` no longer discards Redis quarantine-`DEL` failures for
   malformed, oversized, empty, or otherwise inadmissible entries. Failed deletes
   are counted with rate-limited warnings that omit keys, payloads, credentials,
