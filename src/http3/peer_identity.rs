@@ -77,6 +77,25 @@ pub fn quic_max_early_data_size(
     }
 }
 
+/// Convert quinn's server-side `ZeroRttAccepted` completion into a handshake
+/// success decision.
+///
+/// The future resolves when the handshake reaches `Connected`, but its boolean
+/// only reports whether 0-RTT data was accepted and is documented as
+/// meaningless on servers. A successful server handshake can therefore report
+/// `false` when the client sent no early data. At the instant the future
+/// resolves, an open connection proves the handshake completed; on quinn's
+/// failure path `close_reason()` is already populated before the receiver is
+/// completed. Retaining a `true` acceptance result also handles a peer closing
+/// immediately after a successful 0-RTT handshake.
+#[inline]
+pub fn server_0rtt_handshake_succeeded(
+    zero_rtt_accepted: bool,
+    connection_is_open: bool,
+) -> bool {
+    zero_rtt_accepted || connection_is_open
+}
+
 /// One coherent view of an HTTP/3 connection's peer identity, published as a
 /// unit so a request stream cannot mix an early-data flag from one point in the
 /// connection lifecycle with a certificate from another.
@@ -171,11 +190,12 @@ impl H3ConnectionIdentity {
     /// ordinary full-handshake branches (where the connection future only
     /// resolves after the peer's `Finished` has been processed, and before any
     /// request stream can be accepted), or from the 0.5-RTT accept loop after
-    /// the task awaiting quinn's `ZeroRttAccepted` future reports success and
-    /// every already-ready request stream has been snapshotted. Quinn resolves
-    /// that future to `false` when the connection is lost before its
-    /// `Connected` event; that path must keep the pre-handshake snapshot so
-    /// buffered early data cannot lose replay gating after a failed handshake.
+    /// the task awaiting quinn's `ZeroRttAccepted` future confirms the
+    /// connection reached `Connected` and every already-ready request stream
+    /// has been snapshotted. The future's boolean is not itself a server
+    /// handshake-success signal; [`server_0rtt_handshake_succeeded`] combines
+    /// it with connection state. A failed connection must keep the
+    /// pre-handshake snapshot so buffered early data cannot lose replay gating.
     pub fn publish_handshake_result(
         &self,
         handshake_succeeded: bool,

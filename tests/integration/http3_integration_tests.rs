@@ -7,7 +7,9 @@ use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Pro
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::DnsCache;
-use ferrum_edge::http3::peer_identity::H3ConnectionIdentity;
+use ferrum_edge::http3::peer_identity::{
+    H3ConnectionIdentity, server_0rtt_handshake_succeeded,
+};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
@@ -1830,7 +1832,11 @@ async fn h3_zero_rtt_accept_has_no_peer_identity_until_the_handshake_completes()
         let at_half_rtt_chain = peer_cert_chain(&connection);
         let at_half_rtt = slot.snapshot();
 
-        let handshake_succeeded = zero_rtt_accepted.await;
+        let zero_rtt_accepted = zero_rtt_accepted.await;
+        let handshake_succeeded = server_0rtt_handshake_succeeded(
+            zero_rtt_accepted,
+            connection.close_reason().is_none(),
+        );
         // Refresh exactly when the handshake-completion future resolves.
         slot.publish_handshake_result(handshake_succeeded, peer_cert_chain(&connection));
         let after_handshake = slot.snapshot();

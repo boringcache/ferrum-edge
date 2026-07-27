@@ -29,7 +29,10 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use super::peer_identity::{H3ConnectionIdentity, quic_max_early_data_size, zero_rtt_admitted};
+use super::peer_identity::{
+    H3ConnectionIdentity, quic_max_early_data_size, server_0rtt_handshake_succeeded,
+    zero_rtt_admitted,
+};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
@@ -903,7 +906,10 @@ async fn handle_h3_connection(
                         match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
                             .await
                         {
-                            Ok(succeeded) => succeeded,
+                            Ok(zero_rtt_accepted) => server_0rtt_handshake_succeeded(
+                                zero_rtt_accepted,
+                                conn_for_close.close_reason().is_none(),
+                            ),
                             Err(_elapsed) => {
                                 warn!(
                                     "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",

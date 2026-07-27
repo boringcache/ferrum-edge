@@ -23,7 +23,8 @@
 use std::sync::Arc;
 
 use ferrum_edge::http3::peer_identity::{
-    H3ConnectionIdentity, H3PeerIdentity, quic_max_early_data_size, zero_rtt_admitted,
+    H3ConnectionIdentity, H3PeerIdentity, quic_max_early_data_size,
+    server_0rtt_handshake_succeeded, zero_rtt_admitted,
 };
 
 fn leaf() -> Vec<u8> {
@@ -261,13 +262,17 @@ fn a_connection_whose_handshake_never_completed_keeps_an_empty_slot() {
 
 #[test]
 fn a_failed_handshake_cannot_clear_early_data_or_publish_identity() {
-    // Quinn's ZeroRttAccepted receiver resolves to false when the connection is
-    // lost before Connected. That signal must not transition the slot: buffered
-    // 0-RTT streams remain replay-gated and cannot acquire a peer identity from
-    // a handshake that never authenticated.
+    // A false ZeroRttAccepted value plus a closed connection means the server
+    // never reached Connected. That lifecycle result must not transition the
+    // slot: buffered 0-RTT streams remain replay-gated and cannot acquire a
+    // peer identity from a handshake that never authenticated.
     let slot = H3ConnectionIdentity::pre_handshake();
 
-    slot.publish_handshake_result(false, Some(vec![leaf(), intermediate()]));
+    let handshake_succeeded = server_0rtt_handshake_succeeded(false, false);
+    slot.publish_handshake_result(
+        handshake_succeeded,
+        Some(vec![leaf(), intermediate()]),
+    );
 
     let snapshot = slot.snapshot();
     assert!(snapshot.is_early_data);
@@ -275,6 +280,22 @@ fn a_failed_handshake_cannot_clear_early_data_or_publish_identity() {
     assert!(snapshot.client_cert_chain_der.is_none());
     assert!(snapshot.mtls_auth_connection_cache.is_none());
     assert!(snapshot.peer_spiffe_extraction_cache.is_none());
+}
+
+#[test]
+fn server_zero_rtt_completion_distinguishes_acceptance_from_handshake_success() {
+    assert!(
+        server_0rtt_handshake_succeeded(false, true),
+        "a server connection still open when completion fires reached Connected even without accepted 0-RTT data"
+    );
+    assert!(
+        server_0rtt_handshake_succeeded(true, false),
+        "accepted 0-RTT proves the handshake succeeded even if the peer closed immediately afterward"
+    );
+    assert!(
+        !server_0rtt_handshake_succeeded(false, false),
+        "a rejected/absent 0-RTT signal on an already-failed connection must remain fail closed"
+    );
 }
 
 #[test]
