@@ -84,9 +84,11 @@ mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
 mod mesh_topology_hbone_tests;
+mod policy_path_canonicalization_tests;
 mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

@@ -43,6 +43,7 @@ pub mod observability_delivery;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
+pub mod policy_path;
 pub mod pool;
 pub mod proxy;
 pub mod request_epoch;
@@ -2063,6 +2064,68 @@ pub mod _test_support {
             .redis_connection_scope_key(proxy_id, connection_id)
     }
 
+    // ── rate-limit policy isolation (GHSA-gr3x-g777-hm78) ────────────────────
+    /// Effective default Redis key prefix for one rate-limit plugin config.
+    ///
+    /// Returns `None` for local-only configs. Used to prove that two
+    /// independent plugin configs of the same type in one namespace do not
+    /// share a default Redis key space, and that two replicas of the *same*
+    /// config still do.
+    pub fn rate_limit_redis_key_prefix(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: &str,
+    ) -> Result<Option<String>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::graphql::GraphqlPlugin;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+        use crate::plugins::rate_limiting::RateLimiting;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+
+        let http = PluginHttpClient::default();
+        match plugin_name {
+            "rate_limiting" => {
+                let plugin = RateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "graphql" => {
+                let plugin = GraphqlPlugin::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "grpc_method_router" => {
+                let plugin = GrpcMethodRouter::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "udp_rate_limiting" => {
+                let plugin = UdpRateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            other => Err(format!("unsupported rate-limit plugin: {other}")),
+        }
+    }
+
+    /// Construct a rate-limit plugin through the production factory with an
+    /// explicit plugin-config id, returning only the admission result.
+    ///
+    /// Proves the factory actually threads the configured resource id into each
+    /// plugin: a blank id must fail closed rather than collapsing sibling
+    /// policies onto one shared default Redis key space.
+    pub fn create_rate_limit_plugin_with_config_id(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: Option<&str>,
+    ) -> Result<(), String> {
+        use crate::plugins::PluginHttpClient;
+
+        crate::plugins::create_plugin_with_http_client_and_config_id(
+            plugin_name,
+            config,
+            PluginHttpClient::default(),
+            config_id,
+        )
+        .map(|_| ())
+    }
+
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
     pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
@@ -3834,6 +3897,149 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    // ── CP overlay / poll isolation (#2982–#2984) ───────────────────────────
+
+    pub use crate::k8s_controller::reconciler::{
+        AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
+        store_accepted_k8s_overlay, swap_merged_k8s_translation,
+    };
+    pub use crate::k8s_controller::{
+        CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
+    };
+
+    /// Thin wrapper over the production CP full-reload publication so external
+    /// tests can drive it against real broadcast channels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_full_reload_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+        refreshed_namespaces: &[String],
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) {
+        crate::modes::control_plane::publish_cp_full_reload(
+            publication_gate,
+            config_arc,
+            overlay_slot,
+            db_config,
+            refreshed_namespaces,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+    }
+
+    /// Thin wrapper over the production CP incremental publication.
+    ///
+    /// Returns `(accepted_namespaces, rejected_namespaces)`; the composed view
+    /// itself is not exposed because it carries consumer credentials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_cp_incremental_for_test(
+        publication_gate: &CpPublicationGate,
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+        version: &str,
+        sequence_cursor: u64,
+        poll_timestamp: chrono::DateTime<chrono::Utc>,
+        broadcasts: &crate::grpc::cp_server::NamespaceBroadcasts,
+        dp_registry: &crate::grpc::cp_server::DpNodeRegistry,
+        cp_scope: &crate::grpc::cp_server::CpScope,
+        mesh_update_tx: &tokio::sync::broadcast::Sender<
+            crate::grpc::mesh_server::MeshConfigBroadcast,
+        >,
+        mesh_registry: &crate::grpc::mesh_registry::MeshNodeRegistry,
+    ) -> (Vec<String>, Vec<String>) {
+        let outcome = crate::modes::control_plane::publish_cp_incremental(
+            publication_gate,
+            config_arc,
+            partitions,
+            version,
+            sequence_cursor,
+            poll_timestamp,
+            broadcasts,
+            dp_registry,
+            cp_scope,
+            mesh_update_tx,
+            mesh_registry,
+        );
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (accepted, rejected)
+    }
+
+    pub fn cas_publish_db_snapshot_with_k8s_overlay_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        overlay_slot: &K8sOverlaySlot,
+        db_config: crate::config::types::GatewayConfig,
+    ) -> std::sync::Arc<crate::config::types::GatewayConfig> {
+        use crate::modes::control_plane::cas_publish_db_snapshot_with_k8s_overlay;
+        cas_publish_db_snapshot_with_k8s_overlay(config_arc, overlay_slot, db_config)
+    }
+
+    /// Returns `(composed_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn compose_incremental_partitions_for_test(
+        base: &crate::config::types::GatewayConfig,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        use crate::modes::control_plane::compose_incremental_partitions;
+        let outcome = compose_incremental_partitions(base, partitions);
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        (outcome.config, accepted, rejected)
+    }
+
+    /// Returns `(published_config, accepted_namespaces, rejected_namespaces)`.
+    pub fn cas_publish_incremental_partitions_for_test(
+        config_arc: &arc_swap::ArcSwap<crate::config::types::GatewayConfig>,
+        partitions: &std::collections::HashMap<
+            String,
+            crate::config::db_backend::IncrementalResult,
+        >,
+    ) -> (
+        crate::config::types::GatewayConfig,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        use crate::modes::control_plane::cas_publish_incremental_partitions;
+        let outcome = cas_publish_incremental_partitions(config_arc, partitions);
+        let published = (*config_arc.load_full()).clone();
+        let mut accepted: Vec<String> = outcome.accepted.keys().cloned().collect();
+        accepted.sort();
+        let mut rejected: Vec<String> = outcome.rejected.iter().map(|(ns, _)| ns.clone()).collect();
+        rejected.sort();
+        // When nothing was accepted the ArcSwap is unchanged; return the
+        // compose view so callers can still inspect last-known-good state.
+        let config = if accepted.is_empty() {
+            outcome.config
+        } else {
+            published
+        };
+        (config, accepted, rejected)
     }
 
     // ── modes/node_agent watcher exit (#2369) ────────────────────────────────

@@ -422,12 +422,20 @@ export FERRUM_DB_TLS_CA_CERT_PATH=/etc/ferrum/rds-combined-ca-bundle.pem
 ## Functional Testing
 
 The project includes functional tests that verify TLS database connectivity end-to-end.
+Hosted CI provisions PostgreSQL/MySQL TLS and MongoDB TLS/require/mTLS fixtures
+inline in the data-plane functional shard (`.github/workflows/ci.yml`) and sets
+`FERRUM_DB_TLS_REQUIRED=1` so a missing TLS fixture fails the job instead of
+silently skipping. Local developers keep the opt-out by leaving that flag unset
+when the containers are not running.
 
 ### Setup
 
 ```bash
-# Generate certificates and start TLS-enabled database containers
+# Generate certificates and start TLS-enabled PostgreSQL/MySQL containers
 ./tests/scripts/setup_db_tls.sh
+
+# MongoDB TLS/mTLS fixtures are owned by hosted data-plane CI. Local Mongo TLS
+# cells skip unless FERRUM_TEST_MONGO_CERT_DIR / 27018 / 27019 are already present.
 
 # Build the gateway
 cargo build
@@ -436,13 +444,18 @@ cargo build
 ### Run Tests
 
 ```bash
-# Run all database TLS tests
+# Run all database TLS tests (PostgreSQL/MySQL/SQLite)
 cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
-# Run individual tests
+# Run individual SQL TLS tests
 cargo test --test functional_tests test_postgresql_tls_verify_full -- --ignored --nocapture
 cargo test --test functional_tests test_mysql_tls_verify_identity -- --ignored --nocapture
 cargo test --test functional_tests test_sqlite_without_tls_settings -- --ignored --nocapture
+
+# Run MongoDB TLS/mTLS tests (hosted CI provisions fixtures; local skips by default)
+cargo test --test functional_tests test_mongodb_tls_connection -- --ignored --nocapture
+cargo test --test functional_tests test_mongodb_tls_require_connection -- --ignored --nocapture
+cargo test --test functional_tests test_mongodb_mtls_connection -- --ignored --nocapture
 ```
 
 ### Test Coverage
@@ -455,6 +468,9 @@ cargo test --test functional_tests test_sqlite_without_tls_settings -- --ignored
 | `test_mysql_tls_required`              | MySQL      | require         | Encrypted connection + CRUD + proxy routing     |
 | `test_sqlite_without_tls_settings`     | SQLite     | N/A             | SQLite starts with no database TLS settings     |
 | `test_health_endpoint_shows_db_status` | PostgreSQL | require         | Health endpoint works with TLS database         |
+| `test_mongodb_tls_connection`          | MongoDB    | verify-full     | Full cert verification + CRUD + proxy routing   |
+| `test_mongodb_tls_require_connection`  | MongoDB    | require         | Encrypted connection + CRUD + proxy routing     |
+| `test_mongodb_mtls_connection`         | MongoDB    | verify-full+mTLS| Client cert auth + CRUD + proxy routing         |
 
 Each test performs a complete CRUD cycle:
 1. Creates an upstream, proxy, consumer, and plugin config via the Admin API
@@ -468,7 +484,7 @@ Each test performs a complete CRUD cycle:
 ### Cleanup
 
 ```bash
-# Stop and remove the test database containers
+# Stop and remove the PostgreSQL/MySQL TLS test containers
 ./tests/scripts/setup_db_tls.sh --cleanup
 ```
 

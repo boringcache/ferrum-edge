@@ -6543,6 +6543,30 @@ components:
 
             The combination of `(hosts, listen_path)` must be unique across all
             HTTP proxies in the same namespace.
+
+
+            **Must already be a canonical policy path.** Request paths are
+            canonicalized at the frontend boundary before route lookup:
+            percent-escapes of characters that are legal literally in a path are
+            decoded (`/%61dmin` becomes `/admin`) and every other escape is
+            rejected with `400`: encoded separators (`%2F`, `%3F`, `%23`),
+            double encodings (`%25…`), encoded control characters, invalid
+            escapes, and escapes of bytes outside that decode set (`%20`,
+            `%7B`, and any percent-encoded non-ASCII byte). Dot
+            segments and backslashes are rejected in both spellings — literal
+            (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
+            because the URL parser that builds the backend request line removes
+            dot segments and reads `\` as a separator. A `.` inside a segment
+            (`/v1.0/users`) is an ordinary path character.
+
+
+            A literal `listen_path` containing any of the above is unreachable,
+            and admission rejects it on every create, update, batch, restore,
+            and config-load path. A `~regex` `listen_path` is a pattern rather
+            than a literal path, so only the percent-escape rules apply to it:
+            `\` and `.` are regex syntax there, and `~^/v1\.0/.*` matching the
+            reachable canonical path `/v1.0/x` stays valid. See
+            `docs/request_path_canonicalization.md`.
           examples:
             - /api/v1
             - =/healthz
@@ -8891,8 +8915,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ws_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -8921,9 +8951,11 @@ components:
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. Counter storage supports
+        datagrams within the same window per client IP. Unknown top-level keys
+        are rejected by the runtime and by this schema. Counter storage supports
         only local memory and Redis; database-backed counters are intentionally
         unsupported.
+      additionalProperties: false
       anyOf:
         - required: [datagrams_per_second]
         - required: [bytes_per_second]
@@ -8948,10 +8980,13 @@ components:
           format: uint64
           default: 1
           minimum: 1
+          maximum: 2678400
           description: >-
-            Window length in seconds. Defaults to 1 second. The effective
-            per-window cap is `datagrams_per_second × window_seconds` (and
-            similarly for bytes).
+            Window length in seconds. Defaults to 1 second. Capped at 2678400
+            (31 days) so the derived Redis TTL (`window_seconds + 1`) and
+            activity-retention horizon (`window_seconds × 2`) cannot wrap. The
+            effective per-window cap is `datagrams_per_second × window_seconds`
+            (and similarly for bytes).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -8966,8 +9001,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:udp_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -16685,27 +16726,39 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per second
+          maximum: 1000000
+          description: Max requests per second. Capped at 1000000 (see `max_requests`).
         requests_per_minute:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per minute
+          maximum: 1000000
+          description: Max requests per minute. Capped at 1000000 (see `max_requests`).
         requests_per_hour:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per hour
+          maximum: 1000000
+          description: Max requests per hour. Capped at 1000000 (see `max_requests`).
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`.
+          maximum: 2678400
+          description: >-
+            Custom rate-limit window length in seconds. Must be paired with
+            `max_requests`. Capped at 2678400 (31 days) so the window stays
+            representable as a monotonic duration and as a signed Redis TTL.
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests permitted within `window_seconds`.
+          maximum: 1000000
+          description: >-
+            Maximum requests permitted within `window_seconds`. Capped at
+            1000000 as an operational budget ceiling. Local sliding-window
+            memory is bounded independently by a fixed aggregate-bucket ring
+            per key, not by one timestamp per admitted request.
 
     RateLimitingConfig:
       type: object
@@ -16746,8 +16799,14 @@ components:
           description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:rate_limiting"
-          description: Key prefix for all Redis keys (namespace isolation)
+          default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -17807,11 +17866,25 @@ components:
             path_prefix:
               type: string
               description: >-
-                Only terminate when the request path starts with this prefix.
-                Must start with `/`, or be exactly `*` to match the
+                Only terminate when the canonical request path starts with this
+                prefix. Must start with `/`, or be exactly `*` to match the
                 asterisk-form target of a server-wide `OPTIONS *` request, and
                 contain no control characters; any other value can never match
-                a request path. Mutually exclusive with `header`.
+                a request path. The prefix must also already be a canonical
+                policy path: request paths are canonicalized at the frontend
+                boundary (percent-escapes of characters that are legal
+                literally in a path are decoded, and every other escape —
+                separators, double encodings, control characters, invalid
+                escapes, and escapes of bytes outside that decode set such as
+                `%20` or `%7B` — is rejected with `400`,
+                as are dot segments and backslashes in either spelling). No
+                percent escape, literal `\`, or literal `.`/`..` segment can
+                appear in a canonical path, so a prefix such as `/%61dmin`,
+                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, or
+                `/api\admin` is rejected at admission rather than silently
+                never matching. A `.` inside a segment is fine. See
+                `docs/request_path_canonicalization.md`. Mutually exclusive
+                with `header`.
             header:
               type: string
               description: >-
@@ -18398,7 +18471,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -18438,14 +18511,16 @@ components:
           items:
             type: integer
             format: uint16
-            minimum: 100
+            minimum: 200
             maximum: 599
+            not:
+              enum: [206, 304]
           default: [200, 301, 404]
-          description: Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599.
+          description: "Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. 1xx (interim), 206 (partial content — requires Range/Content-Range, strong-validator, completeness, and request-applicability tracking), and 304 (validator metadata that freshens an existing stored representation rather than a representation of its own) are rejected at admission and refused again at store time, so a caller cannot poison the shared cache with a truncated or validator-only entry. A 2xx response carrying Content-Range is likewise never stored."
         respect_cache_control:
           type: [boolean, "null"]
           default: true
-          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public)"
+          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public). Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value."
         respect_no_cache:
           type: [boolean, "null"]
           default: true
@@ -18464,7 +18539,7 @@ components:
         cache_key_include_consumer:
           type: [boolean, "null"]
           default: false
-          description: Allow caching authenticated responses under their isolated identity key even when the backend does not send Cache-Control public/s-maxage/must-revalidate; also add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag.
+          description: "Add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag. This key-partition option does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
         add_cache_status_header:
           type: [boolean, "null"]
           default: true
@@ -18589,8 +18664,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:graphql"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:graphql:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18621,13 +18702,15 @@ components:
 
     GrpcMethodRouterConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
         for gRPC services. Authorizes the backend-effective gRPC path after
         route rewrites, listen-path stripping, backend-path composition, and
         initial target selection, then populates grpc_service, grpc_method, and
         grpc_full_method metadata with that final method. At least one access or
-        rate rule is required. Rate-limit counter storage supports only local
+        rate rule is required. Unknown top-level keys are rejected by the runtime
+        and by this schema. Rate-limit counter storage supports only local
         memory and Redis; database-backed counters are intentionally unsupported.
       allOf:
         - anyOf:
@@ -18705,8 +18788,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:grpc_method_router"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18851,7 +18940,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, sampling/admission, or record emission. The local staging entry is the instance's commit capability and is consumed by atomic removal at buffered or stream-terminal commit. Orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -19035,7 +19124,7 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
@@ -19727,8 +19816,12 @@ components:
         window_seconds:
           type: integer
           minimum: 1
+          maximum: 2678400
           default: 60
-          description: Sliding window duration in seconds
+          description: >-
+            Sliding window duration in seconds. Capped at 2678400 (31 days) so
+            the window stays representable as a monotonic duration and a signed
+            Redis TTL.
         count_mode:
           type: string
           enum: [total_tokens, prompt_tokens, completion_tokens]
@@ -19778,8 +19871,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_rate_limiter"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -22262,32 +22361,46 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     RateSpec:
       type: object
+      additionalProperties: false
       description: >-
-        Rate limit specification used by grpc_method_router. Both fields are
-        required and must be positive integers. The gRPC runtime currently
-        ignores additional keys, so this shared component remains open to
-        preserve schema/runtime parity.
+        Closed rate limit specification used by grpc_method_router. Both fields
+        are required and must be positive integers; unknown keys are rejected by
+        the runtime and by this schema.
       required: [max_requests, window_seconds]
       properties:
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     # ── Cluster Status ─────────────────────────────────────────────────
 
