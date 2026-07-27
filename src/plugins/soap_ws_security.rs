@@ -64,6 +64,44 @@
 //! section. Diagnostics use fixed-cardinality failure classes and never include
 //! the nonce.
 //!
+//! ## PasswordDigest freshness, binding, and replay scope
+//!
+//! A PasswordDigest token carries two independent instants: its own
+//! `wsu:Created` (bound into `Base64(SHA-1(nonce + created + password))`) and
+//! the outer `wsu:Timestamp/wsu:Created`. Validating only the outer one leaves a
+//! captured token digest-valid forever, so an attacker who waits out the replay
+//! TTL can resubmit the unchanged UsernameToken beside a freshly minted outer
+//! Timestamp. Both are therefore validated, and they are bound to each other:
+//! the inner instant has its own bounded freshness window
+//! (`username_token.created_max_age_seconds` ± `created_clock_skew_seconds`) and
+//! must agree with the outer instant within
+//! `username_token.created_max_timestamp_divergence_seconds`. The outer
+//! Timestamp is validated on every request in which it appears — not only when
+//! `timestamp.require` is set — so the value the inner instant binds to is
+//! always an independently validated one, and with
+//! `username_token.require_timestamp_binding` (default) the outer element
+//! cannot simply be omitted to drop the binding.
+//!
+//! Replay state itself is scoped by an explicit operator declaration,
+//! `nonce.replay_scope`, which has no default because a gateway cannot observe
+//! its own replica count:
+//!
+//! - `process` registers state under a stable `{namespace}|{plugin-config-id}`
+//!   key in a process-global registry, so a reload generation inherits the
+//!   previous generation's claims instead of starting empty. It is explicitly
+//!   **not** cross-replica protection, and declaring it asserts a single-replica
+//!   deployment.
+//! - `shared` requires `sync_mode: "redis"` and claims each nonce with one
+//!   atomic Redis `SET NX EX`, so exactly one request across all replicas wins a
+//!   nonce inside its TTL. The Redis key is `SHA-256(nonce)` in hex — never the
+//!   nonce, which is a digest input bound to the shared secret and would
+//!   otherwise reach `MONITOR`, `SLOWLOG`, and the Redis client's error logs —
+//!   and the stored value is a fixed non-secret marker.
+//!
+//! A shared-backend outage fails closed exactly like local exhaustion. There is
+//! no fallback to process-local state: a per-replica fallback would silently
+//! reinstate the cross-replica bypass the shared backend exists to close.
+//!
 //! ## Request body character encoding
 //!
 //! Matching SOAP media types are buffered as raw bytes
@@ -112,7 +150,7 @@ use roxmltree::{Document, Node, NodeId, ParsingOptions};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 use tracing::{debug, warn};
 use x509_parser::prelude::*;
@@ -121,6 +159,11 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::auth_flow::constant_time_eq;
+use super::utils::cert_hash::sha256_hex_lower;
+use super::utils::http_client::PluginHttpClient;
+use super::utils::redis_rate_limiter::{
+    REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 // ── Namespace URIs ──────────────────────────────────────────────────────────
@@ -171,6 +214,48 @@ const MAX_NONCE_CACHE_TTL_SECONDS: u64 = 86_400;
 const MIN_NONCE_MAX_CACHE_SIZE: u64 = 1;
 const MAX_NONCE_MAX_CACHE_SIZE: u64 = 1_000_000;
 
+/// Bounds for the UsernameToken `wsu:Created` freshness window.
+///
+/// This is the *inner* token instant that is bound into the PasswordDigest
+/// (`Base64(SHA-1(nonce + created + password))`). It is a distinct value from
+/// the outer `wsu:Timestamp/wsu:Created`, so it needs its own bounded window:
+/// without one, a captured UsernameToken stays digest-valid forever and only
+/// the replay cache's TTL limits how long it can be resubmitted alongside a
+/// freshly generated outer Timestamp. Zero is rejected for the same reason it
+/// is rejected for the outer window — it would accept nothing or, read the
+/// other way, configure no window at all.
+const DEFAULT_UT_CREATED_MAX_AGE_SECONDS: u64 = 300;
+const MIN_UT_CREATED_MAX_AGE_SECONDS: u64 = 1;
+const MAX_UT_CREATED_MAX_AGE_SECONDS: u64 = 86_400;
+const DEFAULT_UT_CREATED_CLOCK_SKEW_SECONDS: u64 = 300;
+
+/// Maximum permitted divergence between the UsernameToken `Created` and the
+/// independently validated outer `wsu:Timestamp/wsu:Created`.
+///
+/// This is the binding that makes the two instants one coherent claim: an
+/// attacker who mints a fresh outer Timestamp for a captured UsernameToken now
+/// has to move the inner instant too, which invalidates the captured digest.
+/// Zero is permitted (strictly stricter — the two instants must be identical).
+const DEFAULT_UT_TIMESTAMP_DIVERGENCE_SECONDS: u64 = 60;
+const MIN_UT_TIMESTAMP_DIVERGENCE_SECONDS: u64 = 0;
+const MAX_UT_TIMESTAMP_DIVERGENCE_SECONDS: u64 = 3_600;
+
+/// Upper bound on distinct process-global replay scopes retained for the life of
+/// the process. Scope keys are stable `{namespace}|{plugin-config-id}` pairs, so
+/// reload generations reuse an existing scope and only genuine plugin-config
+/// churn adds one. The cap keeps an unbounded operator-driven key space from
+/// becoming a retention leak; exceeding it fails plugin admission closed rather
+/// than silently dropping replay history.
+const MAX_NONCE_REPLAY_SCOPES: usize = 1_024;
+
+/// Fixed, non-secret record written by a shared (Redis) nonce claim.
+///
+/// The value carries no credential material: the claim is proven by the key's
+/// existence, and the key itself is a SHA-256 digest of the nonce so neither the
+/// nonce nor anything derived from the shared secret can reach a Redis keyspace,
+/// a `MONITOR` stream, or the Redis client's error logging.
+const SHARED_NONCE_CLAIM_RECORD: &[u8] = b"ferrum-edge/soap-ws-security/nonce-claim/v1";
+
 /// WS-Security UsernameToken Profile nonces are short random values (16–32 raw
 /// bytes is typical). The ceiling is enforced on the *encoded* value before
 /// Base64 decoding, so an oversized nonce is never decoded or retained.
@@ -206,7 +291,7 @@ const MAX_PARSED_YEAR: i32 = 9999;
 
 // ── Allowed configuration keys (exhaustive, per fixed-shape object) ─────────
 
-const ROOT_CONFIG_KEYS: &[&str] = &[
+const OWN_ROOT_CONFIG_KEYS: &[&str] = &[
     "reject_missing_security_header",
     "timestamp",
     "username_token",
@@ -214,13 +299,34 @@ const ROOT_CONFIG_KEYS: &[&str] = &[
     "saml",
     "nonce",
 ];
+
+/// Root allowlist = this plugin's own keys ∪ the shared Redis connectivity keys.
+///
+/// `RedisConfig::from_plugin_config` deliberately does not reject unknown root
+/// keys, so a plugin that closes its own root must union these in or a
+/// misspelled `redis_ur1` would be an unknown-key rejection while a misspelled
+/// `sync_mode` would silently select process-local replay state.
+static ROOT_CONFIG_KEYS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut keys = Vec::with_capacity(OWN_ROOT_CONFIG_KEYS.len() + REDIS_PLUGIN_CONFIG_KEYS.len());
+    keys.extend_from_slice(OWN_ROOT_CONFIG_KEYS);
+    keys.extend_from_slice(REDIS_PLUGIN_CONFIG_KEYS);
+    keys
+});
 const TIMESTAMP_CONFIG_KEYS: &[&str] = &[
     "require",
     "max_age_seconds",
     "require_expires",
     "clock_skew_seconds",
 ];
-const USERNAME_TOKEN_CONFIG_KEYS: &[&str] = &["enabled", "password_type", "credentials"];
+const USERNAME_TOKEN_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "password_type",
+    "credentials",
+    "created_max_age_seconds",
+    "created_clock_skew_seconds",
+    "created_max_timestamp_divergence_seconds",
+    "require_timestamp_binding",
+];
 const CREDENTIAL_CONFIG_KEYS: &[&str] = &["username", "password"];
 const X509_CONFIG_KEYS: &[&str] = &[
     "enabled",
@@ -239,6 +345,7 @@ const SAML_CONFIG_KEYS: &[&str] = &[
     "clock_skew_seconds",
 ];
 const NONCE_CONFIG_KEYS: &[&str] = &[
+    "replay_scope",
     "cache_ttl_seconds",
     "max_cache_size",
     "max_encoded_length",
@@ -636,6 +743,99 @@ impl NonceReplayState {
     }
 }
 
+// ── Replay-state scope and backend ──────────────────────────────────────────
+
+/// Operator-declared deployment scope for PasswordDigest replay state.
+///
+/// There is no default. A gateway cannot observe how many replicas are running,
+/// so the scope is an explicit, auditable declaration: choosing `Process` is the
+/// operator asserting a single-replica deployment, and choosing `Shared` is the
+/// operator pointing replay state at a backend every replica can reach. Silently
+/// defaulting to process-local state is exactly the posture that let a captured
+/// UsernameToken be accepted once per replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceReplayScope {
+    Process,
+    Shared,
+}
+
+/// Where a PasswordDigest nonce claim is made.
+///
+/// `Process` state is registered against a stable `{namespace}|{config-id}` key
+/// so a reload generation reuses the previous generation's claims instead of
+/// starting from an empty cache. `Shared` state lives in Redis and is claimed
+/// with one atomic `SET NX EX`, so exactly one replica — and exactly one request
+/// on that replica — can win a given nonce inside its TTL.
+enum NonceReplayBackend {
+    Process(Arc<Mutex<NonceReplayState>>),
+    Shared(Arc<RedisRateLimitClient>),
+}
+
+/// Process-global replay scopes, keyed by `{namespace}|{plugin-config-id}`.
+///
+/// Held by strong reference for the life of the process: a plugin generation
+/// swap constructs the new instance *before* dropping the old one, but replay
+/// history is a security invariant that must not depend on that ordering. The
+/// key space is bounded by [`MAX_NONCE_REPLAY_SCOPES`] and admission fails
+/// closed at the cap.
+static NONCE_REPLAY_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<Mutex<NonceReplayState>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve the process-global replay state for `scope_key`.
+///
+/// `None` means "no stable identity" — configuration validation and direct/test
+/// construction. Those get private state so a validation call can neither read,
+/// mutate, nor consume a live proxy's replay history, and cannot consume a
+/// registry slot.
+fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplayState>>, String> {
+    let Some(scope_key) = scope_key else {
+        return Ok(Arc::new(Mutex::new(NonceReplayState::new())));
+    };
+    let Ok(mut registry) = NONCE_REPLAY_REGISTRY.lock() else {
+        return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
+    };
+    if let Some(existing) = registry.get(scope_key) {
+        return Ok(Arc::clone(existing));
+    }
+    if registry.len() >= MAX_NONCE_REPLAY_SCOPES {
+        // Fixed diagnostic: the scope key embeds an operator resource id, which
+        // is not secret but is also not needed to act on this.
+        return Err(format!(
+            "soap_ws_security: refusing to create more than {MAX_NONCE_REPLAY_SCOPES} distinct \
+             PasswordDigest replay scopes in one process"
+        ));
+    }
+    let state = Arc::new(Mutex::new(NonceReplayState::new()));
+    registry.insert(scope_key.to_string(), Arc::clone(&state));
+    Ok(state)
+}
+
+/// Stable process-global replay-scope identity for a plugin config.
+fn nonce_replay_scope_key(namespace: &str, plugin_config_id: &str) -> String {
+    let mut key = String::with_capacity(namespace.len() + plugin_config_id.len() + 1);
+    key.push_str(namespace);
+    key.push('|');
+    key.push_str(plugin_config_id);
+    key
+}
+
+/// Default Redis key prefix for shared replay claims:
+/// `{namespace}:soap_ws_security:{plugin-config-id}`.
+///
+/// The config-id component isolates independent PasswordDigest policies inside
+/// one namespace while every replica of the *same* policy keeps claiming against
+/// the same keyspace — which is the whole point of the shared scope. An explicit
+/// `redis_key_prefix` remains the documented opt-in for deliberately sharing a
+/// keyspace across policies.
+fn default_nonce_redis_key_prefix(namespace: &str, plugin_config_id: Option<&str>) -> String {
+    let config_id = plugin_config_id.unwrap_or("__standalone__");
+    let mut prefix = String::with_capacity(namespace.len() + config_id.len() + 20);
+    prefix.push_str(namespace);
+    prefix.push_str(":soap_ws_security:");
+    prefix.push_str(config_id);
+    prefix
+}
+
 // The binary target compiles this module without the library's `_test_support`
 // facade, so this external-test observation type is intentionally unused there.
 #[allow(dead_code)]
@@ -665,6 +865,17 @@ pub struct SoapWsSecurity {
     username_token_enabled: bool,
     password_type: PasswordType,
     credentials: Vec<Credential>,
+    /// Freshness window for the UsernameToken's own `wsu:Created`, the instant
+    /// bound into the PasswordDigest. Pre-converted at admission.
+    ut_created_max_age: chrono::Duration,
+    ut_created_max_age_seconds: u64,
+    ut_created_clock_skew: chrono::Duration,
+    /// Maximum permitted `|UsernameToken.Created - Timestamp.Created|`.
+    ut_created_max_timestamp_divergence: chrono::Duration,
+    ut_created_max_timestamp_divergence_seconds: u64,
+    /// When true (default), a PasswordDigest token must be accompanied by an
+    /// outer `wsu:Timestamp` carrying a `Created` value to bind against.
+    require_timestamp_binding: bool,
     /// Process-local padding secret used only to equalize verification work on
     /// username lookup misses. Never authenticates a principal.
     dummy_password: String,
@@ -688,11 +899,11 @@ pub struct SoapWsSecurity {
     saml_allowed_digest_algorithms: Vec<DigestAlgorithm>,
 
     // Nonce replay protection
-    /// Admission, eviction, and retained-byte accounting for PasswordDigest
-    /// replay state. See [`Self::check_nonce_replay`] for the critical-section
-    /// scope: the mutex is held only while updating the lookup map, exact age
-    /// index, and counter.
-    nonce_replay: Mutex<NonceReplayState>,
+    /// Where a verified PasswordDigest claims its nonce. Process-local state is
+    /// shared across reload generations through the process-global registry;
+    /// shared state is claimed atomically in Redis so replicas cannot each
+    /// accept the same captured token.
+    nonce_backend: NonceReplayBackend,
     nonce_cache_ttl_seconds: u64,
     max_nonce_cache_size: usize,
     /// Encoded-nonce ceiling, enforced before Base64 decoding and before any
@@ -707,7 +918,38 @@ pub struct SoapWsSecurity {
 }
 
 impl SoapWsSecurity {
+    /// Construct with no gateway HTTP client and no stable plugin-config
+    /// identity.
+    ///
+    /// Replay state is private to the returned instance, so this form cannot be
+    /// used for a production PasswordDigest deployment that needs replay history
+    /// to survive a reload. Production construction goes through
+    /// [`Self::new_with_http_client_and_config_id`].
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::build(config, None, None)
+    }
+
+    pub fn new_with_http_client_and_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::build(config, Some(&http_client), plugin_config_id)
+    }
+
+    /// `http_client` is `Option` on purpose: the plain `new()` path (Admin
+    /// config validation and direct/test construction) must not have to build a
+    /// reqwest/TLS/DNS stack it never uses, and it never reaches a shared replay
+    /// backend anyway because it has no stable plugin-config identity.
+    fn build(
+        config: &Value,
+        http_client: Option<&PluginHttpClient>,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let namespace = match http_client {
+            Some(client) => client.namespace(),
+            None => crate::config::types::DEFAULT_NAMESPACE,
+        };
         // Fixed/redacted diagnostic: never interpolate the configured value —
         // a non-object root can still carry credential-like material or be
         // unbounded in size.
@@ -719,7 +961,7 @@ impl SoapWsSecurity {
         // the documented-but-never-read `nonce_replay_protection` object and
         // every misspelling an error instead of a silently weaker policy.
         let root = Some(config_obj);
-        reject_unknown(root, "config", ROOT_CONFIG_KEYS)?;
+        reject_unknown(root, "config", &ROOT_CONFIG_KEYS)?;
 
         // ── Timestamp config ────────────────────────────────────────────
         let ts_cfg = soap_object(root, "config", "timestamp")?;
@@ -803,6 +1045,55 @@ impl SoapWsSecurity {
                 });
             }
         }
+
+        // UsernameToken `Created` freshness + outer-Timestamp binding. These are
+        // parsed unconditionally so a latent PasswordText config cannot switch
+        // to PasswordDigest later and activate an unvalidated window.
+        let ut_created_max_age_seconds = soap_u64_bounded(
+            ut_cfg,
+            "config.username_token",
+            "created_max_age_seconds",
+            DEFAULT_UT_CREATED_MAX_AGE_SECONDS,
+            MIN_UT_CREATED_MAX_AGE_SECONDS,
+            MAX_UT_CREATED_MAX_AGE_SECONDS,
+        )?;
+        let ut_created_clock_skew_seconds = soap_u64_bounded(
+            ut_cfg,
+            "config.username_token",
+            "created_clock_skew_seconds",
+            DEFAULT_UT_CREATED_CLOCK_SKEW_SECONDS,
+            MIN_CLOCK_SKEW_SECONDS,
+            MAX_CLOCK_SKEW_SECONDS,
+        )?;
+        let ut_created_max_timestamp_divergence_seconds = soap_u64_bounded(
+            ut_cfg,
+            "config.username_token",
+            "created_max_timestamp_divergence_seconds",
+            DEFAULT_UT_TIMESTAMP_DIVERGENCE_SECONDS,
+            MIN_UT_TIMESTAMP_DIVERGENCE_SECONDS,
+            MAX_UT_TIMESTAMP_DIVERGENCE_SECONDS,
+        )?;
+        let require_timestamp_binding = soap_bool(
+            ut_cfg,
+            "config.username_token",
+            "require_timestamp_binding",
+            true,
+        )?;
+        let ut_created_max_age = admitted_duration(
+            "config.username_token",
+            "created_max_age_seconds",
+            ut_created_max_age_seconds,
+        )?;
+        let ut_created_clock_skew = admitted_duration(
+            "config.username_token",
+            "created_clock_skew_seconds",
+            ut_created_clock_skew_seconds,
+        )?;
+        let ut_created_max_timestamp_divergence = admitted_duration(
+            "config.username_token",
+            "created_max_timestamp_divergence_seconds",
+            ut_created_max_timestamp_divergence_seconds,
+        )?;
 
         if username_token_enabled && credentials.is_empty() {
             return Err(
@@ -1100,6 +1391,88 @@ impl SoapWsSecurity {
         let max_nonce_encoded_length = usize_or_max(max_nonce_encoded_length);
         let max_nonce_cache_bytes = usize_or_max(max_nonce_cache_bytes);
 
+        // ── Replay scope / shared backend ───────────────────────────────
+        //
+        // `replay_scope` has no default. A gateway cannot detect how many
+        // replicas serve a proxy, so the deployment shape is an explicit
+        // operator declaration; a silent process-local default is what let one
+        // captured UsernameToken be spent once per replica and once per reload.
+        let configured_scope = soap_string(nonce_cfg, "config.nonce", "replay_scope")?;
+        let replay_scope = match configured_scope.as_deref() {
+            None => None,
+            Some("process") => Some(NonceReplayScope::Process),
+            Some("shared") => Some(NonceReplayScope::Shared),
+            // Value-redacted: the rejected string is operator input adjacent to
+            // credential material in the same object graph.
+            Some(_) => {
+                return Err(
+                    "soap_ws_security: 'config.nonce.replay_scope' must be exactly 'process' or \
+                     'shared'"
+                        .to_string(),
+                );
+            }
+        };
+
+        let digest_replay_active =
+            username_token_enabled && password_type == PasswordType::PasswordDigest;
+        if digest_replay_active && replay_scope.is_none() {
+            return Err(
+                "soap_ws_security: 'config.nonce.replay_scope' is required when \
+                 username_token.password_type is 'PasswordDigest' — use 'shared' together with \
+                 sync_mode: 'redis' for any deployment running more than one gateway replica, or \
+                 'process' to declare a single-replica deployment whose replay protection is not \
+                 cross-replica"
+                    .to_string(),
+            );
+        }
+
+        // A blank id would collapse every plugin config in a namespace onto one
+        // replay scope / keyspace; fail closed rather than merge them.
+        if plugin_config_id.is_some_and(|config_id| config_id.trim().is_empty()) {
+            return Err("soap_ws_security: plugin config id must not be blank".to_string());
+        }
+
+        // Redis fields are parsed (and range/shape-validated) whether or not
+        // they are active, matching every other Redis-backed plugin.
+        let default_prefix = default_nonce_redis_key_prefix(namespace, plugin_config_id);
+        let redis_config = RedisConfig::from_plugin_config(config, &default_prefix)?;
+        match (replay_scope, redis_config.is_some()) {
+            (Some(NonceReplayScope::Shared), false) => {
+                return Err(
+                    "soap_ws_security: 'config.nonce.replay_scope' = 'shared' requires \
+                     sync_mode: 'redis' and a 'redis_url'"
+                        .to_string(),
+                );
+            }
+            (scope, true) if scope != Some(NonceReplayScope::Shared) => {
+                return Err(
+                    "soap_ws_security: sync_mode: 'redis' is only meaningful with \
+                     'config.nonce.replay_scope' = 'shared'"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        let nonce_backend = match redis_config {
+            Some(redis_config) => {
+                let dns_cache = http_client.and_then(|client| client.dns_cache().cloned());
+                let tls_no_verify = http_client.is_some_and(|client| client.tls_no_verify());
+                let tls_ca_bundle_path = http_client.and_then(|c| c.tls_ca_bundle_path());
+                NonceReplayBackend::Shared(Arc::new(RedisRateLimitClient::new(
+                    redis_config,
+                    dns_cache,
+                    tls_no_verify,
+                    tls_ca_bundle_path,
+                )))
+            }
+            None => {
+                let scope_key = plugin_config_id
+                    .map(|config_id| nonce_replay_scope_key(namespace, config_id));
+                NonceReplayBackend::Process(process_replay_state(scope_key.as_deref())?)
+            }
+        };
+
         // ── General ─────────────────────────────────────────────────────
         let reject_missing_security_header =
             soap_bool(root, "config", "reject_missing_security_header", true)?;
@@ -1121,6 +1494,12 @@ impl SoapWsSecurity {
             username_token_enabled,
             password_type,
             credentials,
+            ut_created_max_age,
+            ut_created_max_age_seconds,
+            ut_created_clock_skew,
+            ut_created_max_timestamp_divergence,
+            ut_created_max_timestamp_divergence_seconds,
+            require_timestamp_binding,
             dummy_password,
             dummy_password_text_hash,
             x509_enabled,
@@ -1135,7 +1514,7 @@ impl SoapWsSecurity {
             saml_trusted_signing_certs,
             saml_allowed_signature_algorithms,
             saml_allowed_digest_algorithms,
-            nonce_replay: Mutex::new(NonceReplayState::new()),
+            nonce_backend,
             nonce_cache_ttl_seconds,
             max_nonce_cache_size,
             max_nonce_encoded_length,
@@ -1202,7 +1581,106 @@ impl SoapWsSecurity {
 
     // ── UsernameToken validation ────────────────────────────────────────
 
-    fn validate_username_token(&self, security_block: &str) -> Result<String, UsernameTokenError> {
+    /// Enforce the UsernameToken `Created` freshness window and bind it to the
+    /// independently validated outer `wsu:Timestamp`.
+    ///
+    /// `created_raw` is the *exact* string that was fed to the PasswordDigest
+    /// computation, so what is validated here is what the digest commits to —
+    /// there is no second parse of a different element.
+    ///
+    /// Two independent gates:
+    ///
+    /// 1. **Absolute freshness.** `Created` must not be in the future beyond
+    ///    `created_clock_skew_seconds` and must not be older than
+    ///    `created_max_age_seconds + skew`. Without this, a captured token stays
+    ///    digest-valid forever and only the replay cache's finite TTL stands
+    ///    between an attacker and a successful resubmission.
+    /// 2. **Timestamp binding.** The outer `Timestamp/Created` is resolved with
+    ///    the same element resolver `validate_timestamp` uses, so the instant
+    ///    bound here is the instant that was independently validated — the two
+    ///    cannot be made to disagree by element ordering or by a decoy
+    ///    `<Timestamp>`. The two `Created` values must agree within
+    ///    `created_max_timestamp_divergence_seconds`, and the UsernameToken
+    ///    instant must not fall past an outer `Expires`. That is what stops a
+    ///    captured UsernameToken from being paired with a freshly minted outer
+    ///    Timestamp: moving the outer instant no longer moves the inner one, and
+    ///    moving the inner one invalidates the captured digest.
+    ///
+    /// When `require_timestamp_binding` is true (default) a missing or
+    /// unparsable outer `Timestamp/Created` is a rejection, so the binding
+    /// cannot be dropped by simply omitting the element.
+    fn validate_username_token_created(
+        &self,
+        security_block: &str,
+        created_raw: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let created = parse_ws_datetime(created_raw.trim()).ok_or_else(|| {
+            // Never echo the value: it is a digest input under attacker control
+            // and is bound to the shared secret.
+            "WS-Security: UsernameToken Created is not a valid dateTime".to_string()
+        })?;
+
+        let skew = self.ut_created_clock_skew;
+        if created > now + skew {
+            return Err("WS-Security: UsernameToken Created is in the future".to_string());
+        }
+        if now - created > self.ut_created_max_age + skew {
+            return Err(format!(
+                "WS-Security: UsernameToken Created is too old (max age {}s)",
+                self.ut_created_max_age_seconds
+            ));
+        }
+
+        let outer_created = find_element_block(security_block, "Timestamp")
+            .and_then(|ts_block| {
+                let outer_created = find_element_text(&ts_block, "Created")
+                    .and_then(|value| parse_ws_datetime(value.trim()))?;
+                let outer_expires = find_element_text(&ts_block, "Expires")
+                    .and_then(|value| parse_ws_datetime(value.trim()));
+                Some((outer_created, outer_expires))
+            });
+
+        let Some((outer_created, outer_expires)) = outer_created else {
+            return if self.require_timestamp_binding {
+                Err(
+                    "WS-Security: PasswordDigest requires a Timestamp with a valid Created value \
+                     to bind the UsernameToken against"
+                        .to_string(),
+                )
+            } else {
+                Ok(())
+            };
+        };
+
+        let divergence = if created >= outer_created {
+            created - outer_created
+        } else {
+            outer_created - created
+        };
+        if divergence > self.ut_created_max_timestamp_divergence {
+            return Err(format!(
+                "WS-Security: UsernameToken Created diverges from the Timestamp Created by more \
+                 than {}s",
+                self.ut_created_max_timestamp_divergence_seconds
+            ));
+        }
+        if let Some(outer_expires) = outer_expires
+            && created > outer_expires + skew
+        {
+            return Err(
+                "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn validate_username_token(
+        &self,
+        security_block: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String, UsernameTokenError> {
         let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
             UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
         })?;
@@ -1321,6 +1799,14 @@ impl SoapWsSecurity {
                     )
                 })?;
 
+                // Freshness + outer-Timestamp binding are structural: the
+                // outcome does not depend on whether the principal exists, so
+                // running them here (before the known/unknown branch) cannot
+                // become a username oracle, and it keeps a stale token from
+                // reaching digest verification at all.
+                self.validate_username_token_created(security_block, &created, now)
+                    .map_err(UsernameTokenError::Structural)?;
+
                 // Compute expected digest: SHA-1(nonce + created + password)
                 let mut data =
                     Vec::with_capacity(nonce_bytes.len() + created.len() + password_material.len());
@@ -1342,7 +1828,8 @@ impl SoapWsSecurity {
                     // poison a victim's nonce before the legitimate request
                     // arrives. The atomic entry check also prevents two
                     // concurrent valid requests from both accepting it.
-                    self.check_nonce_replay(nonce_b64)
+                    self.claim_nonce(nonce_b64)
+                        .await
                         .map_err(UsernameTokenError::Structural)?;
                     Ok(username)
                 } else {
@@ -1359,6 +1846,76 @@ impl SoapWsSecurity {
     /// client-visible body.
     const NONCE_TOO_LONG_CLASS: &'static str = "nonce_too_long";
     const NONCE_STATE_SATURATED_CLASS: &'static str = "nonce_state_saturated";
+    const NONCE_SHARED_BACKEND_UNAVAILABLE_CLASS: &'static str = "nonce_shared_backend_unavailable";
+
+    /// Shared-backend outage is a replay-protection outage, so it fails closed
+    /// exactly like local exhaustion. There is deliberately no "degrade to
+    /// process-local" knob: a per-replica fallback would silently reinstate the
+    /// bypass the shared backend exists to close.
+    fn shared_backend_unavailable() -> String {
+        warn!(
+            failure_class = Self::NONCE_SHARED_BACKEND_UNAVAILABLE_CLASS,
+            "soap_ws_security: shared replay backend is unavailable"
+        );
+        "WS-Security: replay protection backend is unavailable".to_string()
+    }
+
+    fn nonce_too_long() -> String {
+        warn!(
+            failure_class = Self::NONCE_TOO_LONG_CLASS,
+            "soap_ws_security: Nonce exceeds the maximum permitted length"
+        );
+        "WS-Security: Nonce exceeds the maximum permitted length".to_string()
+    }
+
+    /// Claim `nonce` for exactly one authenticated request inside the configured
+    /// TTL, on whichever backend the operator declared.
+    ///
+    /// Reached only after the PasswordDigest has verified, so untrusted input
+    /// never mutates, consumes, or evicts replay state.
+    async fn claim_nonce(&self, nonce: &str) -> Result<(), String> {
+        match &self.nonce_backend {
+            NonceReplayBackend::Process(_) => self.check_nonce_replay(nonce),
+            NonceReplayBackend::Shared(client) => self.claim_nonce_shared(client, nonce).await,
+        }
+    }
+
+    /// Cross-replica claim: one atomic Redis `SET NX EX`.
+    ///
+    /// `SET key value NX EX ttl` is a single server-side operation, so among any
+    /// number of concurrent requests on any number of replicas exactly one
+    /// observes `Ok(true)` and every other observes `Ok(false)`. There is no
+    /// read-then-write window to race, and no process-local pre-check that could
+    /// answer differently from the shared truth.
+    ///
+    /// The key is `SHA-256(nonce)` in lowercase hex, never the nonce: Redis keys
+    /// appear in `MONITOR`, in `SLOWLOG`, and in this client's own error logging
+    /// (`key = %key`), and the nonce is a digest input bound to the shared
+    /// secret. The stored value is a fixed non-secret marker — the claim is
+    /// proven by the key existing, so nothing derived from credentials is
+    /// written.
+    async fn claim_nonce_shared(
+        &self,
+        client: &RedisRateLimitClient,
+        nonce: &str,
+    ) -> Result<(), String> {
+        if nonce.len() > self.max_nonce_encoded_length {
+            return Err(Self::nonce_too_long());
+        }
+        if !client.is_available() {
+            return Err(Self::shared_backend_unavailable());
+        }
+        let key = client.make_key(&[sha256_hex_lower(nonce.as_bytes()).as_str()]);
+        let ttl_seconds = self.nonce_cache_ttl_seconds;
+        let claimed = client
+            .set_bytes_nx_with_expire(&key, SHARED_NONCE_CLAIM_RECORD, ttl_seconds)
+            .await;
+        match claimed {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("WS-Security: nonce replay detected".to_string()),
+            Err(()) => Err(Self::shared_backend_unavailable()),
+        }
+    }
 
     fn nonce_state_saturated() -> String {
         warn!(
@@ -1408,6 +1965,13 @@ impl SoapWsSecurity {
     /// Lock poison, checked-arithmetic failure, or map/index drift all fail
     /// closed with the fixed saturation class and never recover through the
     /// poisoned state.
+    ///
+    /// **Scope.** This is the `nonce.replay_scope = "process"` path. The state
+    /// it consults is registered under a stable `{namespace}|{plugin-config-id}`
+    /// key, so it survives reload generations, but it is process-local by
+    /// construction and makes no cross-replica claim. A `shared`-scope instance
+    /// has no process-local state and fails closed here rather than answering
+    /// from an empty map.
     pub fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
         self.check_nonce_replay_at(nonce, Instant::now())
     }
@@ -1415,14 +1979,16 @@ impl SoapWsSecurity {
     fn check_nonce_replay_at(&self, nonce: &str, now: Instant) -> Result<(), String> {
         // Attacker-controlled length compare only — outside the admission lock.
         if nonce.len() > self.max_nonce_encoded_length {
-            warn!(
-                failure_class = Self::NONCE_TOO_LONG_CLASS,
-                "soap_ws_security: Nonce exceeds the maximum permitted length"
-            );
-            return Err("WS-Security: Nonce exceeds the maximum permitted length".to_string());
+            return Err(Self::nonce_too_long());
         }
 
-        let mut state = match self.nonce_replay.lock() {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            // A shared-scope instance has no process-local state to consult;
+            // answering from an empty local map would be a silent bypass.
+            return Err(Self::shared_backend_unavailable());
+        };
+
+        let mut state = match replay_state.lock() {
             Ok(state) => state,
             Err(_) => return Err(Self::nonce_state_saturated()),
         };
@@ -1587,8 +2153,10 @@ impl SoapWsSecurity {
     pub(crate) fn nonce_replay_observation_for_tests(
         &self,
     ) -> Result<NonceReplayObservationForTests, String> {
-        let state = self
-            .nonce_replay
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay observation is process-scope only".to_string());
+        };
+        let state = replay_state
             .lock()
             .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
         let recomputed_key_bytes = state
@@ -1627,8 +2195,10 @@ impl SoapWsSecurity {
 
     #[allow(dead_code)]
     pub(crate) fn corrupt_nonce_age_index_for_tests(&self) -> Result<(), String> {
-        let mut state = self
-            .nonce_replay
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay test state is process-scope only".to_string());
+        };
+        let mut state = replay_state
             .lock()
             .map_err(|_| "soap_ws_security: nonce replay test state unavailable".to_string())?;
         let age_key = state
@@ -2387,6 +2957,13 @@ impl Plugin for SoapWsSecurity {
             .is_some_and(|ct| Self::is_soap_content_type(ct))
     }
 
+    fn warmup_hostnames(&self) -> Vec<String> {
+        match &self.nonce_backend {
+            NonceReplayBackend::Shared(client) => client.warmup_hostname().into_iter().collect(),
+            NonceReplayBackend::Process(_) => Vec::new(),
+        }
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -2474,10 +3051,14 @@ impl Plugin for SoapWsSecurity {
 
         let now = Utc::now();
 
-        // Validate Timestamp
-        if self.require_timestamp
-            && let Err(e) = self.validate_timestamp(&security_block, now)
-        {
+        // Validate Timestamp.
+        //
+        // This runs unconditionally (the helper is a no-op for an absent
+        // Timestamp when `timestamp.require` is false) so that a *present*
+        // Timestamp is always independently validated. The UsernameToken
+        // PasswordDigest binding compares against this same element, and binding
+        // against an unvalidated instant would be no binding at all.
+        if let Err(e) = self.validate_timestamp(&security_block, now) {
             warn!("soap_ws_security: timestamp validation failed: {}", e);
             return PluginResult::Reject {
                 status_code: 401,
@@ -2496,7 +3077,7 @@ impl Plugin for SoapWsSecurity {
 
         // Validate UsernameToken
         if self.username_token_enabled {
-            match self.validate_username_token(&security_block) {
+            match self.validate_username_token(&security_block, now).await {
                 Ok(username) => {
                     authenticated_username = Some(username);
                     debug!(

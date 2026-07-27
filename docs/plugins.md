@@ -2183,13 +2183,17 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
-| `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header |
+| `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header. Controls whether the element may be *absent*; a Timestamp that **is** present is always validated |
 | `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection (`1`–`86400`) |
 | `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
 | `timestamp.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for timestamp validation (`0`–`3600`) |
 | `username_token.enabled` | bool | `false` | Enable UsernameToken authentication |
 | `username_token.password_type` | String | `PasswordDigest` | `PasswordText` or `PasswordDigest` |
 | `username_token.credentials` | Object[] | `[]` | Array of `{username, password}` credential pairs |
+| `username_token.created_max_age_seconds` | u64 | `300` | Freshness window for the UsernameToken's own `wsu:Created` — the instant bound into the PasswordDigest (`1`–`86400`) |
+| `username_token.created_clock_skew_seconds` | u64 | `300` | Clock skew tolerance for the UsernameToken `Created` window (`0`–`3600`) |
+| `username_token.created_max_timestamp_divergence_seconds` | u64 | `60` | Maximum permitted `\|UsernameToken.Created − Timestamp.Created\|` (`0`–`3600`) |
+| `username_token.require_timestamp_binding` | bool | `true` | Require an outer `wsu:Timestamp` with a valid `Created` for PasswordDigest, so the binding cannot be dropped by omitting the element |
 | `x509_signature.enabled` | bool | `false` | Enable X.509 signature verification |
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
@@ -2202,6 +2206,7 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `saml.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed SAML Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_signature_algorithms` |
 | `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
+| `nonce.replay_scope` | String | *(required for PasswordDigest)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
 | `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection (`1`–`86400`) |
 | `nonce.max_cache_size` | u64 | `10000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
@@ -2225,7 +2230,36 @@ UsernameToken credential failures (unknown username, wrong PasswordText, or wron
 
 #### UsernameToken — PasswordDigest
 
-The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection.
+The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection within the scope declared by `nonce.replay_scope`.
+
+#### PasswordDigest `Created` freshness and Timestamp binding
+
+A PasswordDigest request carries **two** independent instants: the UsernameToken's own `wsu:Created` (which is hashed into the digest) and the outer `wsu:Timestamp/wsu:Created`. Validating only the outer one leaves the token itself digest-valid forever, so an attacker who captures one valid request and waits out `nonce.cache_ttl_seconds` can resubmit the unchanged UsernameToken beside a freshly minted outer Timestamp. Both are validated, and they are bound together:
+
+- The UsernameToken `Created` must parse as an `xsd:dateTime` inside the representable four-digit-year window, must not be in the future beyond `username_token.created_clock_skew_seconds`, and must not be older than `username_token.created_max_age_seconds` + that skew. The value validated is byte-for-byte the value fed to the digest, so there is no second parse that could disagree.
+- The outer `wsu:Timestamp` is validated on **every** request in which it appears, not only when `timestamp.require: true`. `timestamp.require: false` means "a Timestamp may be absent", never "an out-of-policy Timestamp is ignored" — binding to an unvalidated instant would be no binding at all.
+- The two `Created` values must agree within `username_token.created_max_timestamp_divergence_seconds` (default 60), and the UsernameToken `Created` must not fall past an outer `Expires`. Moving the outer instant no longer moves the inner one, and moving the inner one invalidates the captured digest.
+- With `username_token.require_timestamp_binding: true` (the default) a PasswordDigest request with no outer `Timestamp/Created` is rejected, so the binding cannot be dropped by simply omitting the element.
+
+Rejections are structural HTTP `401`s and never echo the `Created` value, which is a digest input bound to the shared secret.
+
+#### PasswordDigest replay scope
+
+`nonce.replay_scope` is **required** whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, and it has no default. A gateway cannot observe how many replicas serve a proxy, so the deployment shape is an explicit operator declaration rather than a silent assumption:
+
+| Value | Guarantee | Requirements |
+|---|---|---|
+| `process` | Replay state lives in this process, registered under a stable `{namespace}:{plugin-config-id}` scope so a **reload generation inherits the previous generation's claims** instead of starting from an empty cache. **Not cross-replica.** | none — declaring it asserts a single-replica deployment |
+| `shared` | Every nonce is claimed with one atomic Redis `SET NX EX`, so exactly one request **across all replicas** wins a given nonce inside its TTL. | `sync_mode: "redis"` and a `redis_url` |
+
+Admission enforces the pairing in both directions: `replay_scope: shared` without `sync_mode: "redis"` is rejected, and `sync_mode: "redis"` without `replay_scope: shared` is rejected (a backend nothing claims against is a misconfiguration, not a no-op). The full shared Redis field set (`sync_mode`, `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password`) is the shared set documented for [`rate_limiting`](#rate_limiting) and behaves identically here; the default key prefix is `{FERRUM_NAMESPACE}:soap_ws_security:{plugin-config-id}`, which isolates independent policies while keeping every replica of one policy on the same keyspace. Redis fields are shape-validated even when inactive, and a misspelled Redis key fails admission rather than silently selecting process-local state.
+
+Shared-scope keys are `SHA-256(nonce)` in lowercase hex — never the nonce itself, which is a digest input bound to the shared secret and would otherwise appear in `MONITOR`, `SLOWLOG`, and Redis client error logs. The stored value is a fixed non-secret marker; the claim is proven by the key existing.
+
+**A shared-backend outage fails closed** (HTTP `401`, failure class `nonce_shared_backend_unavailable`), exactly like local capacity exhaustion. There is deliberately no "degrade to process-local" option: a per-replica fallback would silently reinstate the cross-replica bypass the shared backend exists to close. Size the Redis deployment for the authenticated PasswordDigest request rate accordingly.
+
+> **Multi-replica deployments must use `shared`.** With `process`, each replica and each reload generation before this release maintained its own cache, so one captured UsernameToken could be spent once per replica. `process` remains supported and is correct for a single-replica gateway, but it makes no cross-replica claim and must not be relied on for one.
+
 
 Replay state is bounded and only ever populated by a caller that has already proved the shared secret:
 
@@ -2236,7 +2270,30 @@ Replay state is bounded and only ever populated by a caller that has already pro
 - **A claimed nonce is never evicted while it is still inside `nonce.cache_ttl_seconds`.** At either cap the age index is walked from its oldest end and only entries *proven expired* are reclaimed; the walk stops at the first still-live entry, because everything newer is live too. There is no forced eviction of live entries, no lookup-map scan, and no stale FIFO. Reclamation is charged against an explicit 64-entry maintenance budget per request (independent of `max_cache_size`), which keeps per-request work constant while the two hard caps keep memory bounded.
 - **Capacity exhaustion fails closed.** When bounded expiry reclamation cannot free both entry and byte room — or the maintenance budget runs out, or state is poisoned/inconsistent, or checked accounting fails — the request is rejected with HTTP `401` and the nonce is *not* recorded. Replay protection degrades into refusal, never into silently unprotecting an already-claimed nonce. A rejected claim never removes a live entry; any expired entries already reclaimed within the bounded budget stay removed, allowing safe retries to converge after enough state has expired. Size `nonce.max_cache_size` and `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × `nonce.cache_ttl_seconds`; under-provisioning them now surfaces as `401` rejections rather than as a quiet replay window.
 - Entry/byte admission, expiry reclamation, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap and exactly one concurrent claim of the same nonce can win — including same-key races, where an in-TTL hit is a replay without a new reservation.
-- Length and saturation rejections log fixed-cardinality failure classes (`nonce_too_long`, `nonce_state_saturated`) and never include the nonce value.
+- Length, saturation, and shared-backend-outage rejections log fixed-cardinality failure classes (`nonce_too_long`, `nonce_state_saturated`, `nonce_shared_backend_unavailable`) and never include the nonce value.
+- The entry/byte caps and the bounded expiry maintenance above describe `replay_scope: process`. Under `replay_scope: shared` the caps that apply are Redis's own memory policy and the `cache_ttl_seconds` expiry on each claim key; `max_cache_size` / `max_total_cache_bytes` bound the process-local structure and are inert for shared claims. The encoded-length ceiling still applies on both paths, before any key is derived.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  username_token:
+    enabled: true
+    password_type: PasswordDigest
+    credentials:
+      - username: "service-account"
+        password: "shared-secret"
+    created_max_age_seconds: 300
+    created_max_timestamp_divergence_seconds: 60
+    require_timestamp_binding: true
+  timestamp:
+    require: true
+    max_age_seconds: 300
+  nonce:
+    # Single-replica gateway. Use the `shared` form below for more than one.
+    replay_scope: process
+```
+
+Multi-replica (or any horizontally scaled) deployment:
 
 ```yaml
 plugin_name: soap_ws_security
@@ -2250,6 +2307,11 @@ config:
   timestamp:
     require: true
     max_age_seconds: 300
+  nonce:
+    replay_scope: shared
+    cache_ttl_seconds: 300
+sync_mode: redis
+redis_url: "redis://redis.internal:6379"
 ```
 
 #### UsernameToken — PasswordText
@@ -2347,6 +2409,7 @@ config:
       - /etc/ferrum/certs/signing-ca.pem
     require_signed_timestamp: true
   nonce:
+    replay_scope: process
     cache_ttl_seconds: 600
     max_cache_size: 50000
   reject_missing_security_header: true

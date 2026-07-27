@@ -3,7 +3,9 @@ use ferrum_edge::_test_support::{
     soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -126,6 +128,9 @@ fn username_token_digest_config() -> serde_json::Value {
                 {"username": "alice", "password": "secret123"}
             ]
         },
+        // `replay_scope` has no default: a PasswordDigest policy must state
+        // which deployment shape its replay protection covers.
+        "nonce": { "replay_scope": "process" },
         "reject_missing_security_header": true
     })
 }
@@ -270,6 +275,29 @@ fn password_digest_token_with_created(
     nonce_bytes: &[u8],
     created: &str,
 ) -> String {
+    password_digest_security_block(username, password, nonce_bytes, created, Some(created))
+}
+
+/// A `wsu:Timestamp` bound to `created` (zero divergence).
+fn bound_timestamp(created: &str) -> String {
+    format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created></wsu:Timestamp>"#,
+        created
+    )
+}
+
+/// Full WS-Security content for a PasswordDigest request.
+///
+/// `timestamp_created` controls the outer instant independently of the token's
+/// own `Created`, which is what the binding tests need. `None` omits the outer
+/// Timestamp entirely.
+fn password_digest_security_block(
+    username: &str,
+    password: &str,
+    nonce_bytes: &[u8],
+    created: &str,
+    timestamp_created: Option<&str>,
+) -> String {
     let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
 
     let mut data = Vec::new();
@@ -281,15 +309,23 @@ fn password_digest_token_with_created(
     let digest_b64 =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
 
+    let timestamp = timestamp_created.map(bound_timestamp).unwrap_or_default();
+
     format!(
-        r#"<wsse:UsernameToken>
+        r#"{}<wsse:UsernameToken>
         <wsse:Username>{}</wsse:Username>
         <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
         <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
         <wsu:Created>{}</wsu:Created>
     </wsse:UsernameToken>"#,
-        username, digest_b64, nonce_b64, created
+        timestamp, username, digest_b64, nonce_b64, created
     )
+}
+
+fn fresh_created() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 // ── Constructor validation tests ────────────────────────────────────────────
@@ -1079,30 +1115,7 @@ async fn test_password_digest_valid() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
     // Compute a valid PasswordDigest: Base64(SHA-1(nonce + created + password))
-    let nonce_bytes = b"test-nonce-12345";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"test-nonce-12345");
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
@@ -1119,30 +1132,7 @@ async fn test_password_digest_valid() {
 async fn test_password_digest_valid_over_utf16le_wire_bytes() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
-    let nonce_bytes = b"utf16-nonce-bytes";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"utf16-nonce-bytes");
     let body = wrap_soap(&ut);
     let bytes = encode_utf16_le(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
@@ -1312,30 +1302,7 @@ async fn test_password_digest_missing_created_is_structural_for_known_and_unknow
 async fn test_nonce_replay_detected() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
-    let nonce_bytes = b"replay-nonce-001";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce>{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"replay-nonce-001");
     let body = wrap_soap(&ut);
 
     // First request succeeds
@@ -4411,7 +4378,7 @@ async fn test_oversized_wire_nonce_is_rejected_structurally() {
             "password_type": "PasswordDigest",
             "credentials": [{"username": "alice", "password": "secret123"}]
         },
-        "nonce": { "max_encoded_length": 64 },
+        "nonce": { "replay_scope": "process", "max_encoded_length": 64 },
         "reject_missing_security_header": true
     }))
     .unwrap();
@@ -5192,4 +5159,482 @@ fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
     );
     assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
     assert_eq!(snapshot.shared_key_entries, 1);
+}
+
+// ── GHSA-54mh-v348-j878: Created freshness, Timestamp binding, replay scope ──
+//
+// The remaining half of the advisory. PR #3353 already proved that an
+// authenticated live nonce is never evicted and that exhaustion fails closed;
+// these tests cover what was still open:
+//
+//   * the UsernameToken's own `wsu:Created` was only ever a digest input, never
+//     parsed or bounded, so a captured token stayed digest-valid forever;
+//   * nothing tied that instant to the outer `wsu:Timestamp`, so a captured
+//     token could be paired with a freshly minted outer Timestamp;
+//   * replay state was rebuilt per plugin instance, so a reload generation (and
+//     every additional replica) started from an empty cache.
+
+/// PasswordDigest policy with the outer-Timestamp binding switched off, so the
+/// inner freshness window can be observed on its own.
+fn digest_unbound_config(created_max_age_seconds: u64) -> Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "require_timestamp_binding": false,
+            "created_max_age_seconds": created_max_age_seconds,
+            "created_clock_skew_seconds": 0
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    })
+}
+
+fn offset_created(offset: chrono::Duration) -> String {
+    (chrono::Utc::now() + offset)
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+async fn digest_outcome(plugin: &SoapWsSecurity, security_block: &str) -> PluginResult {
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(security_block));
+    let mut headers = soap_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+#[tokio::test]
+async fn digest_created_that_is_too_old_is_rejected() {
+    // The digest still verifies — the token is genuine, just stale. Before this
+    // fix nothing looked at the instant, so "genuine but stale" was accepted.
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let stale = offset_created(-chrono::Duration::hours(1));
+    let block =
+        password_digest_security_block("alice", "secret123", b"stale-created-01", &stale, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "UsernameToken Created is too old", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_created_in_the_future_is_rejected() {
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let future = offset_created(chrono::Duration::hours(1));
+    let block =
+        password_digest_security_block("alice", "secret123", b"future-created-1", &future, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "UsernameToken Created is in the future", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_created_that_is_malformed_is_rejected_without_echoing_it() {
+    // The malformed value is a digest input bound to the shared secret, so the
+    // rejection must not echo it back.
+    const MALFORMED: &str = "SOAP_CREATED_CANARY_not-a-datetime";
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    for created in [MALFORMED, "99999-01-01T00:00:00Z", ""] {
+        let nonce = b"bad-created-01!!";
+        let block = password_digest_security_block("alice", "secret123", nonce, created, None);
+        let result = digest_outcome(&plugin, &block).await;
+        assert!(is_reject(&result), "malformed Created {created:?} must reject");
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            !reject_body(&result).contains(MALFORMED),
+            "the rejected Created value must never be echoed: {}",
+            reject_body(&result)
+        );
+    }
+}
+
+#[tokio::test]
+async fn digest_within_the_freshness_window_still_succeeds() {
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let recent = offset_created(-chrono::Duration::seconds(30));
+    let block =
+        password_digest_security_block("alice", "secret123", b"fresh-created-01", &recent, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a token inside its freshness window must still authenticate: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn captured_token_paired_with_a_fresh_timestamp_is_rejected() {
+    // The advisory's scenario 3, with the inner freshness window deliberately
+    // widened to 24h so it cannot be what rejects the request. The only thing
+    // standing between the attacker and a replay is the binding: the captured
+    // UsernameToken's own Created no longer matches the freshly generated outer
+    // Timestamp, and moving the inner instant would invalidate the digest.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true, "max_age_seconds": 300 },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "created_max_age_seconds": 86400,
+            "created_max_timestamp_divergence_seconds": 60
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    }))
+    .unwrap();
+
+    let captured = offset_created(-chrono::Duration::minutes(30));
+    let fresh_timestamp = offset_created(chrono::Duration::zero());
+    let block = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"captured-token-1",
+        &captured,
+        Some(&fresh_timestamp),
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "diverges from the Timestamp Created", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_without_an_outer_timestamp_is_rejected_by_default() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = fresh_created();
+    let block =
+        password_digest_security_block("alice", "secret123", b"no-timestamp-01!", &created, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "requires a Timestamp", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_created_past_the_timestamp_expires_is_rejected() {
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": false, "max_age_seconds": 3600, "clock_skew_seconds": 300 },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "created_clock_skew_seconds": 0,
+            "created_max_timestamp_divergence_seconds": 3600
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    }))
+    .unwrap();
+
+    // The outer Timestamp must itself stay in policy (Expires is 4 minutes ago
+    // against a 5-minute outer skew, so it has not "expired" on its own terms),
+    // while the UsernameToken Created sits one minute ago — after that Expires
+    // with a zero UsernameToken skew.
+    let ts_created = offset_created(-chrono::Duration::minutes(10));
+    let ts_expires = offset_created(-chrono::Duration::minutes(4));
+    let ut_created = offset_created(-chrono::Duration::minutes(1));
+
+    let nonce = b"past-expires-01!";
+    let nonce_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_slice());
+    let mut data = Vec::new();
+    data.extend_from_slice(nonce.as_slice());
+    data.extend_from_slice(ut_created.as_bytes());
+    data.extend_from_slice(b"secret123");
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    let digest_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    let block = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{ts_created}</wsu:Created><wsu:Expires>{ts_expires}</wsu:Expires></wsu:Timestamp>
+        <wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest_b64}</wsse:Password>
+        <wsse:Nonce>{nonce_b64}</wsse:Nonce>
+        <wsu:Created>{ut_created}</wsu:Created>
+    </wsse:UsernameToken>"#
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "past the Timestamp Expires", &["alice"]);
+}
+
+#[tokio::test]
+async fn a_present_timestamp_is_validated_even_when_not_required() {
+    // The binding is only meaningful if the outer instant it binds to has been
+    // validated. `timestamp.require: false` means "a Timestamp may be absent",
+    // never "an out-of-policy Timestamp is ignored".
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let stale_timestamp = offset_created(-chrono::Duration::hours(6));
+    let block = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"stale-outer-ts01",
+        &stale_timestamp,
+        Some(&stale_timestamp),
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("Timestamp Created is too old"),
+        "a present-but-stale Timestamp must be rejected on its own terms: {}",
+        reject_body(&result)
+    );
+}
+
+// ── Replay scope admission ──────────────────────────────────────────────────
+
+#[test]
+fn password_digest_requires_an_explicit_replay_scope() {
+    // A gateway cannot see its own replica count, so the deployment shape has
+    // to be declared. Defaulting to process-local state is what let one
+    // captured token be spent once per replica.
+    let config = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("PasswordDigest without a declared replay scope must fail admission");
+    assert!(err.contains("config.nonce.replay_scope"), "{err}");
+    assert!(err.contains("cross-replica"), "{err}");
+}
+
+#[test]
+fn password_text_does_not_require_a_replay_scope() {
+    // PasswordText carries no nonce, so there is no replay state to scope.
+    assert!(SoapWsSecurity::new(&username_token_config()).is_ok());
+}
+
+#[test]
+fn invalid_replay_scope_value_is_rejected() {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("cluster");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("an unknown replay scope must reject");
+    assert!(err.contains("'process' or 'shared'"), "{err}");
+    assert!(!err.contains("cluster"), "the rejected value must not be echoed: {err}");
+}
+
+#[test]
+fn shared_replay_scope_requires_a_redis_backend() {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("shared");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("shared scope without redis must fail closed at admission");
+    assert!(err.contains("sync_mode"), "{err}");
+}
+
+#[test]
+fn redis_sync_mode_requires_the_shared_replay_scope() {
+    let mut config = username_token_digest_config();
+    config["sync_mode"] = json!("redis");
+    config["redis_url"] = json!("redis://127.0.0.1:6379");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("a redis backend that nothing claims against must fail admission");
+    assert!(err.contains("replay_scope"), "{err}");
+}
+
+#[test]
+fn misspelled_redis_root_keys_still_fail_closed() {
+    let mut config = username_token_digest_config();
+    config["redis_ur1"] = json!("redis://127.0.0.1:6379");
+    assert!(
+        SoapWsSecurity::new(&config).is_err(),
+        "the root allowlist must union the shared Redis keys, not open the root"
+    );
+}
+
+#[test]
+fn zero_replay_bounds_remain_rejected_for_password_digest() {
+    for (key, value) in [("cache_ttl_seconds", 0), ("max_cache_size", 0)] {
+        let mut config = username_token_digest_config();
+        config["nonce"][key] = json!(value);
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("nonce.{key} = 0 must be rejected"));
+        assert!(err.contains(key), "{err}");
+    }
+}
+
+// ── Replay state across generations, instances, and replicas ────────────────
+
+fn digest_plugin_with_config_id(config_id: Option<&str>) -> SoapWsSecurity {
+    SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        config_id,
+    )
+    .expect("digest plugin must construct")
+}
+
+// These construct a `PluginHttpClient`, so they run on a runtime like every
+// other client-constructing plugin test.
+#[tokio::test]
+async fn replay_state_survives_a_reload_generation_swap() {
+    // A reload builds a new plugin instance from the same plugin-config
+    // resource. Before this fix that instance started from an empty cache, so
+    // replaying a captured token across a reload always succeeded.
+    let scope = "soap-reload-scope-a";
+    let generation_one = digest_plugin_with_config_id(Some(scope));
+    assert!(generation_one.check_nonce_replay("reload-scope-nonce").is_ok());
+
+    let generation_two = digest_plugin_with_config_id(Some(scope));
+    let replay = generation_two
+        .check_nonce_replay("reload-scope-nonce")
+        .expect_err("a new generation must inherit the previous generation's claims");
+    assert!(replay.contains("nonce replay detected"), "{replay}");
+
+    // Live claims stay live for the old generation too — one shared scope.
+    let replay_old = generation_one
+        .check_nonce_replay("reload-scope-nonce")
+        .expect_err("the outgoing generation shares the same state");
+    assert!(replay_old.contains("nonce replay detected"), "{replay_old}");
+}
+
+#[tokio::test]
+async fn distinct_plugin_configs_do_not_share_a_replay_scope() {
+    let a = digest_plugin_with_config_id(Some("soap-scope-b"));
+    let b = digest_plugin_with_config_id(Some("soap-scope-c"));
+    assert!(a.check_nonce_replay("independent-scope-nonce").is_ok());
+    assert!(
+        b.check_nonce_replay("independent-scope-nonce").is_ok(),
+        "an unrelated plugin config must not answer from another policy's state"
+    );
+}
+
+#[tokio::test]
+async fn identityless_construction_gets_private_replay_state() {
+    // Admin config validation constructs the plugin without a resource id. That
+    // construction must not read, mutate, or consume a live proxy's claims.
+    let live = digest_plugin_with_config_id(Some("soap-scope-d"));
+    assert!(live.check_nonce_replay("validation-probe-nonce").is_ok());
+
+    let validation_instance = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    assert!(
+        validation_instance
+            .check_nonce_replay("validation-probe-nonce")
+            .is_ok(),
+        "a validation construction must not consult live replay state"
+    );
+    assert!(
+        live.check_nonce_replay("validation-probe-nonce").is_err(),
+        "and must not have consumed the live claim either"
+    );
+}
+
+#[tokio::test]
+async fn blank_plugin_config_id_fails_closed() {
+    let err = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        Some("   "),
+    )
+    .err()
+    .expect("a blank id would collapse every policy onto one scope");
+    assert!(err.contains("must not be blank"), "{err}");
+}
+
+// ── Shared (multi-replica) backend ──────────────────────────────────────────
+
+fn shared_scope_config(redis_url: &str) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("shared");
+    config["sync_mode"] = json!("redis");
+    config["redis_url"] = json!(redis_url);
+    config["redis_connect_timeout_seconds"] = json!(1);
+    config
+}
+
+#[tokio::test]
+async fn shared_replay_scope_constructs_and_advertises_its_backend_for_dns_warmup() {
+    let plugin =
+        SoapWsSecurity::new(&shared_scope_config("redis://soap-nonce.invalid:6379")).unwrap();
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["soap-nonce.invalid".to_string()],
+        "a shared replay backend must be pre-warmed like every other Redis-backed plugin"
+    );
+}
+
+#[tokio::test]
+async fn shared_replay_scope_never_answers_from_process_local_state() {
+    // A shared-scope instance holds no local map. Answering "not seen" from an
+    // empty one would be a silent, per-replica bypass, so the process-local
+    // entry point fails closed instead.
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let err = plugin
+        .check_nonce_replay("shared-scope-local-probe")
+        .expect_err("a shared-scope instance has no process-local claim to make");
+    assert!(err.contains("backend is unavailable"), "{err}");
+}
+
+#[tokio::test]
+async fn shared_backend_outage_fails_admission_closed() {
+    // Port 1 refuses immediately, so this is a deterministic outage rather than
+    // a timing-dependent one. A replay-protection outage must reject the
+    // request; degrading to process-local state would reinstate exactly the
+    // cross-replica bypass the shared backend exists to close.
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let token = password_digest_token("alice", "secret123", b"shared-outage-01");
+    let result = digest_outcome(&plugin, &token).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("replay protection backend is unavailable"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn shared_backend_outage_rejects_before_it_can_be_treated_as_authenticated() {
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let token = password_digest_token("alice", "secret123", b"shared-outage-02");
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&token));
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        !ctx.metadata.contains_key("soap_ws_username"),
+        "an unclaimable nonce must not leave an authenticated identity behind"
+    );
+}
+
+// ── Invalid-digest flood ordering ───────────────────────────────────────────
+
+#[tokio::test]
+async fn an_invalid_digest_flood_cannot_displace_a_captured_live_nonce() {
+    // Capacity is deliberately tiny. Unauthenticated attempts must never reach
+    // replay state at all, so no number of them can make room by displacing the
+    // legitimate claim, and the legitimate nonce stays replay-protected.
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(2);
+    config["nonce"]["cache_ttl_seconds"] = json!(300);
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+
+    let victim = password_digest_token("alice", "secret123", b"victim-nonce-01!");
+    assert!(
+        matches!(digest_outcome(&plugin, &victim).await, PluginResult::Continue),
+        "the legitimate claim must be admitted first"
+    );
+
+    for index in 0..32u8 {
+        let nonce = format!("flood-nonce-{index:03}");
+        let attempt = password_digest_token("alice", "wrong-password", nonce.as_bytes());
+        let result = digest_outcome(&plugin, &attempt).await;
+        assert!(is_reject(&result), "an invalid digest must be rejected");
+        assert_eq!(
+            reject_body(&result),
+            r#"{"error":"WS-Security: invalid credentials"}"#,
+            "a failed attempt must not be reported as a replay-state outcome"
+        );
+    }
+
+    let replay = digest_outcome(&plugin, &victim).await;
+    assert!(is_reject(&replay));
+    assert!(
+        reject_body(&replay).contains("nonce replay detected"),
+        "the captured nonce must still be protected after the flood: {}",
+        reject_body(&replay)
+    );
 }
