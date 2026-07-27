@@ -44,7 +44,7 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 /// Canonical identity used at every UDP/DTLS session-admission boundary.
 pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
-    Arc::from(client_addr.ip().to_canonical().to_string())
+    crate::util::client_identity::canonical_ip_arc(client_addr.ip())
 }
 
 /// Maximum response payload allowed by the UDP amplification guard.
@@ -1046,7 +1046,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.session.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_canonical().to_string(),
+        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.session.consumer_username.clone(),
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
@@ -1126,7 +1126,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_canonical().to_string(),
+        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.consumer_username,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
@@ -2559,9 +2559,13 @@ async fn process_new_session_datagram(
             }
             Decision::Deny => {
                 enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                // Same canonical principal the session identity and rate-limit
+                // keys use, so a dropped datagram is attributable to the client
+                // those keys name (GHSA-vjwj-657f-5w9g).
+                let peer_ip = crate::util::client_identity::canonical_ip(client_addr.ip());
                 warn!(
                     proxy_id = %view.proxy.id,
-                    client = %client_addr.ip(),
+                    client = %peer_ip,
                     listen_port = listen_port,
                     backend_host = %backend_host,
                     backend_port = backend_port,
@@ -4728,7 +4732,7 @@ fn resolve_backend_target(
 }
 
 fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    ip.to_canonical().to_string()
+    crate::util::client_identity::canonical_ip_string(ip)
 }
 
 fn udp_port_lane_selection_supported(

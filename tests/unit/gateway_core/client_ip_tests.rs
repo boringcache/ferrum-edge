@@ -902,3 +902,77 @@ fn context_without_raw_headers_falls_back_to_the_folded_value_and_fails_closed()
         Some("192.0.2.9")
     );
 }
+
+// ── Mapped/native identity equivalence (advisory GHSA-vjwj-657f-5w9g) ───────
+
+/// Every trusted-forwarding shape must resolve one host to one identity string
+/// regardless of which representation the proxy asserted, and every fallback to
+/// the socket peer must do the same. Otherwise a client reaching the same
+/// gateway through a mapped-form hop gets a second per-IP budget, a second
+/// GeoIP decision, and a second log/metric label value.
+#[test]
+fn mapped_and_native_forwarding_resolve_to_one_identity() {
+    let tp = trusted("10.0.0.0/8, ::ffff:10.0.0.0/104");
+
+    // Configured single-hop real-IP header.
+    let via_header = |value: &str| forwarded_client_ip("10.0.0.1", &[value], None, &tp);
+    assert_eq!(
+        via_header("::ffff:192.0.2.10").as_deref(),
+        Some("192.0.2.10")
+    );
+    assert_eq!(via_header("::ffff:192.0.2.10"), via_header("192.0.2.10"));
+
+    // X-Forwarded-For walk, including a chain whose trusted suffix is itself
+    // written in the mapped form.
+    let via_xff = |chain: &str| forwarded_client_ip("10.0.0.1", &[], Some(chain), &tp);
+    assert_eq!(
+        via_xff("::ffff:192.0.2.10, 10.0.0.2").as_deref(),
+        Some("192.0.2.10")
+    );
+    assert_eq!(
+        via_xff("::ffff:192.0.2.10, 10.0.0.2"),
+        via_xff("192.0.2.10, 10.0.0.2")
+    );
+    assert_eq!(
+        via_xff("::ffff:192.0.2.10, ::ffff:10.0.0.2"),
+        via_xff("192.0.2.10, 10.0.0.2")
+    );
+
+    // Socket-peer fallbacks: no trust configured, an untrusted direct peer, and
+    // an all-trusted chain all land on the same canonical peer identity.
+    let untrusted = trusted("198.51.100.0/24");
+    assert_eq!(
+        resolve_client_ip("::ffff:192.0.2.10", None, &TrustedProxies::none()),
+        "192.0.2.10"
+    );
+    assert_eq!(
+        resolve_client_ip("::ffff:192.0.2.10", Some("203.0.113.9"), &untrusted),
+        "192.0.2.10"
+    );
+    assert_eq!(
+        resolve_client_ip("::ffff:10.0.0.1", Some("10.0.0.2"), &tp),
+        "10.0.0.1"
+    );
+}
+
+/// The fold must not erase a genuine IPv6 client: a real IPv6 host and the IPv4
+/// host that its low-order bits happen to encode stay distinct principals.
+#[test]
+fn forwarded_true_ipv6_identity_is_not_folded() {
+    let tp = trusted("10.0.0.0/8");
+
+    assert_eq!(
+        forwarded_client_ip("10.0.0.1", &["2001:db8::10"], None, &tp).as_deref(),
+        Some("2001:db8::10")
+    );
+    // IPv4-compatible (`::a.b.c.d`) is deprecated but is NOT the mapped range,
+    // so it must not collapse onto 192.0.2.10.
+    assert_eq!(
+        forwarded_client_ip("10.0.0.1", &["::192.0.2.10"], None, &tp).as_deref(),
+        Some("::192.0.2.10")
+    );
+    assert_ne!(
+        forwarded_client_ip("10.0.0.1", &["::192.0.2.10"], None, &tp),
+        forwarded_client_ip("10.0.0.1", &["::ffff:192.0.2.10"], None, &tp)
+    );
+}

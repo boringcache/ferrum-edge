@@ -677,3 +677,96 @@ async fn default_trait_on_udp_datagram_returns_forward() {
         UdpDatagramVerdict::Forward
     );
 }
+
+// ── Mapped/native UDP identity equivalence (GHSA-vjwj-657f-5w9g) ───────────
+
+/// The byte budget is keyed by the same canonical session identity as the
+/// datagram-count budget, so a dual-stack `[::]` listener cannot hand one
+/// source two byte allowances.
+#[tokio::test]
+async fn mapped_ipv4_shares_native_client_byte_budget() {
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1000,
+        "bytes_per_second": 150
+    }));
+
+    let native = make_ctx("192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&native).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    // 100 + 100 > 150 only if both datagrams counted against one budget.
+    let mapped = make_ctx("::ffff:192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&mapped).await,
+        UdpDatagramVerdict::Drop
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+/// Redis-configured enforcement derives its key from the same canonical session
+/// identity (`ip:{client_ip}`). With Redis unreachable the limiter falls back to
+/// its local map, which is exactly where a divergent key would show up as two
+/// tracked entries and a second free budget.
+#[tokio::test]
+async fn redis_mode_shares_one_budget_across_representations() {
+    let plugin = make_plugin(json!({
+        "datagrams_per_second": 1,
+        "bytes_per_second": 150,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:9/0",
+        "redis_health_check_interval_seconds": 1
+    }));
+
+    let native = make_ctx("192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&native).await,
+        UdpDatagramVerdict::Forward
+    );
+
+    let mapped = make_ctx("::ffff:192.0.2.10", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&mapped).await,
+        UdpDatagramVerdict::Drop,
+        "the Redis-mode key must name one principal for both representations"
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    // Non-vacuity: a genuinely different source is still admitted, so the drop
+    // above is the shared budget and not a blanket Redis-outage rejection.
+    let other = make_ctx("198.51.100.7", 100);
+    assert_eq!(
+        plugin.on_udp_datagram(&other).await,
+        UdpDatagramVerdict::Forward
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+}
+
+/// True IPv6 sources keep their own budgets — the fold must not reach beyond
+/// the `::ffff:0:0/96` mapped range.
+#[tokio::test]
+async fn true_ipv6_sources_keep_independent_budgets() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+
+    for client_ip in [
+        "192.0.2.10",
+        "::192.0.2.10",
+        "64:ff9b::c000:20a",
+        "2001:db8::10",
+    ] {
+        assert_eq!(
+            plugin.on_udp_datagram(&make_ctx(client_ip, 10)).await,
+            UdpDatagramVerdict::Forward,
+            "each distinct network identity gets its own budget: {client_ip}"
+        );
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(4));
+
+    // The mapped form is the one and only alias of the native IPv4 source.
+    assert_eq!(
+        plugin.on_udp_datagram(&make_ctx("::ffff:192.0.2.10", 10)).await,
+        UdpDatagramVerdict::Drop
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(4));
+}

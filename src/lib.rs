@@ -4649,4 +4649,29 @@ pub mod _test_support {
         )
         .await
     }
+
+    /// The exact client identity the HTTP-family accept loop installs for one
+    /// accepted connection, including node-agent source-IP restoration.
+    ///
+    /// This is the production function `run_accept_loop` calls, not a mirror of
+    /// it, so external coverage of the ingress canonicalization boundary
+    /// (GHSA-vjwj-657f-5w9g) cannot drift away from the served path.
+    pub fn accept_peer_identity_for_test(
+        accepted: std::net::SocketAddr,
+        source_ip_override: Option<std::net::IpAddr>,
+    ) -> std::net::SocketAddr {
+        crate::proxy::resolve_accept_peer_identity(accepted, source_ip_override)
+    }
+
+    /// The canonical `(typed peer, pre-formatted IP string)` pair the HTTP/3
+    /// connection loop derives for a QUIC peer, at connection start and again on
+    /// every observed connection migration.
+    ///
+    /// Production function, not a mirror — see
+    /// [`accept_peer_identity_for_test`].
+    pub fn h3_client_identity_for_test(
+        addr: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<str>) {
+        crate::http3::server::h3_client_identity(addr)
+    }
 }
