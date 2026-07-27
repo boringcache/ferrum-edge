@@ -574,6 +574,16 @@ def validate_required_scenarios(
             hard_fail(failures, "scenarios: resource_plateau invalid sample_count")
         for resource in ("rss_bytes", "fd_count", "task_count"):
             series = plateau.get(resource, [])
+            if (
+                sample_count is not None
+                and isinstance(series, list)
+                and len(series) != sample_count
+            ):
+                hard_fail(
+                    failures,
+                    f"scenarios: resource_plateau {resource} length {len(series)} "
+                    f"does not match sample_count {sample_count}",
+                )
             problem = resource_series_structurally_valid(
                 series, min_samples=min_resource_samples
             )
@@ -590,16 +600,6 @@ def validate_required_scenarios(
                 hard_fail(
                     failures,
                     f"scenarios: resource_plateau {resource} {problem}",
-                )
-            if (
-                sample_count is not None
-                and isinstance(series, list)
-                and len(series) != sample_count
-            ):
-                hard_fail(
-                    failures,
-                    f"scenarios: resource_plateau {resource} length {len(series)} "
-                    f"does not match sample_count {sample_count}",
                 )
 
 
@@ -1212,6 +1212,12 @@ def self_test() -> int:
         failures.append("insufficient resource sampling should hard-fail")
     if not any("insufficient rss_bytes" in msg for msg in evaluation["failures"]):
         failures.append("insufficient RSS sampling should be reported")
+
+    mismatched_sample_count = json.loads(json.dumps(results))
+    mismatched_sample_count["scenarios"]["resource_plateau"]["sample_count"] = 4
+    evaluation = evaluate(mismatched_sample_count, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("resource sample_count mismatch should hard-fail")
 
     nan_plateau = json.loads(json.dumps(results))
     nan_plateau["scenarios"]["resource_plateau"]["rss_bytes"] = [100, float("nan"), 120]
