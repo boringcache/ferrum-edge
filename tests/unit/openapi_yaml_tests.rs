@@ -1908,12 +1908,14 @@ fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     }
 }
 
-/// GHSA-q3p3-94cj-8wh6 / GHSA-jjjw-rqjm-fvf3: the remaining rate-limiter
-/// components must expose closed root objects and bounded numeric ranges that
-/// match the runtime allowlists, so a typo or an extreme value is rejected by
-/// schema-driven authoring tools and by admission alike.
+/// GHSA-q3p3-94cj-8wh6 / GHSA-q97w-jvf6-q254 /
+/// GHSA-5h4h-3qcv-f3rw / GHSA-jjjw-rqjm-fvf3: rate-limiter components must
+/// expose closed root objects and bounded numeric ranges that match the runtime
+/// allowlists, so a typo or an extreme value is rejected by schema-driven
+/// authoring tools and admission.
 #[test]
 fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_rate_limiter::AI_RATE_LIMITER_CONFIG_KEYS;
     use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
     use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
@@ -1929,6 +1931,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
         ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
         ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("AiRateLimiterConfig", AI_RATE_LIMITER_CONFIG_KEYS),
         ("WsRateLimitingConfig", WS_RATE_LIMITING_CONFIG_KEYS),
     ] {
         let schema = spec
@@ -1951,19 +1954,6 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
             "{schema_name} OpenAPI/runtime key drift"
         );
     }
-
-    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
-    // limiter roots. AI remains intentionally open in runtime admission, so
-    // OpenAPI must not close it.
-    let ai_schema = spec
-        .pointer("/components/schemas/AiRateLimiterConfig")
-        .expect("AiRateLimiterConfig component exists");
-    assert!(
-        ai_schema
-            .get("additionalProperties")
-            .is_none_or(|value| value == &json!(true)),
-        "AiRateLimiterConfig must remain open in parity with runtime admission"
-    );
 
     let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
     let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);

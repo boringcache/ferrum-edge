@@ -20758,6 +20758,7 @@ components:
 
     AiRateLimiterConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
