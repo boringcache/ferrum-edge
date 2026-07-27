@@ -1487,8 +1487,8 @@ impl DtlsServer {
                                 // against the configured client CA.
                                 verified_peer_cert = true;
                             }
-                            peer_cert_chain_der = (chain.len() > 1)
-                                .then(|| Arc::new(chain[1..].to_vec()));
+                            peer_cert_chain_der =
+                                (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
                         }
                         Output::ApplicationData(data)
                             if app_out_tx.send(data.to_vec()).await.is_err() =>
@@ -1598,9 +1598,7 @@ impl ZeroizingDtlsKeyDer {
         };
         let Some(encoding) = encoding else {
             key.zeroize();
-            return Err(anyhow::anyhow!(
-                "Unsupported DTLS private key DER encoding"
-            ));
+            return Err(anyhow::anyhow!("Unsupported DTLS private key DER encoding"));
         };
         let bytes = key.secret_der().to_vec();
         // rustls-pki-types does not clear on Drop; wipe the PEM-parsed owner now
@@ -1716,15 +1714,14 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     // `clone_key()` into `CertifiedKey::from_der`, which would create another
     // owned DER allocation that ring drops without clearing.
     let borrowed_key = key_der.private_key_der();
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(
-        |error| {
+    let signing_key =
+        rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(|error| {
             anyhow::anyhow!(
                 "DTLS certificate {} and private key {} do not form a valid pair: {error}",
                 cert_material.display_source_id,
                 key_material.display_source_id
             )
-        },
-    )?;
+        })?;
     let certified_key = rustls::sign::CertifiedKey::new(certificate_chain.clone(), signing_key);
     match certified_key.keys_match() {
         // Preserve rustls `CertifiedKey::from_der` semantics: Unknown is not fatal.

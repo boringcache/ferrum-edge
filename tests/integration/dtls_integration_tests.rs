@@ -738,12 +738,13 @@ fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
                 .push(zeroized.to_vec());
         }
     };
-    let loaded = ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
-        &cert_path,
-        &key_path,
-        success_hook,
-    )
-    .expect("successful load must still admit a matching leaf/key pair");
+    let loaded =
+        ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+            &cert_path,
+            &key_path,
+            success_hook,
+        )
+        .expect("successful load must still admit a matching leaf/key pair");
     assert_eq!(loaded.certificates().len(), 1);
     {
         let observations = success_observations
@@ -772,12 +773,13 @@ fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
                 .push(zeroized.to_vec());
         }
     };
-    let error = ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
-        &cert_path,
-        &mismatched_key_path,
-        mismatch_hook,
-    )
-    .expect_err("mismatched leaf/key pair must fail closed");
+    let error =
+        ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+            &cert_path,
+            &mismatched_key_path,
+            mismatch_hook,
+        )
+        .expect_err("mismatched leaf/key pair must fail closed");
     assert!(
         error.to_string().contains("do not form a valid pair"),
         "unexpected mismatch error: {error}"
