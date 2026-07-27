@@ -5600,8 +5600,8 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
-| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
+| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Range 1–1000000. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Range 1–1000000. Must be greater than or equal to `frames_per_second`, an integer multiple of `frames_per_second`, and yield a refill window (`burst_size / frames_per_second`) of at most 3600 seconds so local token-bucket and Redis two-window enforcement share the same sustained rate. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
@@ -5615,7 +5615,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Redis approximates the local token bucket as `burst_size` admissions over a window of `burst_size / frames_per_second` seconds; construction rejects non-integral ratios and refill windows longer than 3600 seconds so Redis cannot over-admit (or unexpectedly under-admit) relative to the local sustained rate, including across Redis failure/recovery. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
 
 **Memory protection:** Local (and Redis-fallback) connection state is capped at 50,000 keys. Sampled periodic sweeps (every 100,000 frame hooks, cooldown-gated to at most once per second) prune idle connections below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted immediately without the sample/cooldown gate.
 
@@ -5623,7 +5623,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 plugin_name: ws_rate_limiting
 config:
   frames_per_second: 50
-  burst_size: 75
+  burst_size: 100
   close_reason: "Rate limit exceeded"
   sync_mode: redis
   redis_url: "redis://redis-host:6379/2"

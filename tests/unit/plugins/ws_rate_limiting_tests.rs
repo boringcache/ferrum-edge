@@ -510,6 +510,86 @@ fn test_burst_size_smaller_than_fps_returns_error() {
 }
 
 #[test]
+fn test_nonintegral_burst_fps_ratio_returns_error() {
+    // GHSA-cjcm-546w-696v: ceil(burst/fps) windows under-admit non-integral
+    // ratios on Redis (e.g. 75/50 → 37.5 fps). Reject them so accepted
+    // configs keep local/Redis sustained-rate parity.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 50, "burst_size": 75}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("integer multiple"),
+        "expected integer-multiple rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_overlong_refill_window_returns_error() {
+    // GHSA-cjcm-546w-696v: clamping window to 3600s while retaining burst as
+    // the limit over-admits (e.g. 3601 / 3600 ≈ 1.0003 fps vs configured 1,
+    // or historically 10_000_000 / 3600 ≈ 2778 fps). Keep burst within the
+    // operational ceiling so this asserts the window-parity gate specifically.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 3601}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("Redis-representable maximum"),
+        "expected overlong-window rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_pathological_advisory_burst_is_rejected() {
+    // Advisory reproduction values exceed both the operational burst ceiling
+    // and the Redis-representable refill window; either gate is fail-closed.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 10_000_000}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("burst_size") || err.contains("Redis-representable"),
+        "expected fail-closed rejection of advisory reproduction, got: {err}"
+    );
+}
+
+#[test]
+fn test_integral_ratio_at_max_window_is_accepted() {
+    let plugin = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 3600}),
+        PluginHttpClient::default(),
+    );
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+}
+
+#[test]
+fn test_fps_and_burst_upper_bounds_are_enforced() {
+    let over = 1_000_001u64;
+    let err = WsRateLimiting::new(
+        &json!({"frames_per_second": over}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("fps above operational ceiling must be rejected");
+    assert!(err.contains("frames_per_second"), "{err}");
+
+    let err = WsRateLimiting::new(
+        &json!({"frames_per_second": 100, "burst_size": over}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("burst above operational ceiling must be rejected");
+    assert!(err.contains("burst_size"), "{err}");
+}
+
+#[test]
 fn test_non_object_config_returns_error() {
     let result = WsRateLimiting::new(&json!("bad"), PluginHttpClient::default());
     assert!(result.is_err());
