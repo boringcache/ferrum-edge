@@ -2112,7 +2112,7 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
         plugin_client_with_ca(ca_path.to_str().expect("utf8 path")),
     )
     .expect("valid ws_logging must admit");
-    let before = cache.get_plugins("p1");
+    let before = cache.get_plugins("ferrum", "p1");
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].name(), "ws_logging");
 
@@ -2129,7 +2129,7 @@ async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
         .expect_err("malformed replacement CA must reject cache publication");
     assert!(error.contains("record #2"), "got: {error}");
 
-    let after = cache.get_plugins("p1");
+    let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
     assert!(
         Arc::ptr_eq(&before[0], &after[0]),
