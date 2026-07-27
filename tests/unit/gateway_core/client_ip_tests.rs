@@ -966,10 +966,11 @@ fn forwarded_true_ipv6_identity_is_not_folded() {
         Some("2001:db8::10")
     );
     // IPv4-compatible (`::a.b.c.d`) is deprecated but is NOT the mapped range,
-    // so it must not collapse onto 192.0.2.10.
+    // so it must not collapse onto 192.0.2.10. Rust serializes this genuine
+    // IPv6 address in canonical hexadecimal form.
     assert_eq!(
         forwarded_client_ip("10.0.0.1", &["::192.0.2.10"], None, &tp).as_deref(),
-        Some("::192.0.2.10")
+        Some("::c000:20a")
     );
     assert_ne!(
         forwarded_client_ip("10.0.0.1", &["::192.0.2.10"], None, &tp),
