@@ -3071,14 +3071,11 @@ pub mod client {
             client: &PolicyAcmeHttpClient,
             endpoint: &str,
         ) -> Result<BytesResponse, instant_acme::Error> {
-            HttpClient::request(
-                client,
-                Request::builder()
-                    .uri(endpoint)
-                    .body(BodyWrapper::default())
-                    .expect("request"),
-            )
-            .await
+            let request = Request::builder()
+                .uri(endpoint)
+                .body(BodyWrapper::default())
+                .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
+            HttpClient::request(client, request).await
         }
 
         #[test]
@@ -3104,7 +3101,7 @@ pub mod client {
                 serde_json::json!({
                     "id": "https://acme.example/account/1",
                     "key_pkcs8": "not-reached",
-                    "directory": "https://other.example/directory"
+                    "directory": "https://acme.example/other-directory"
                 })
                 .to_string(),
             );
