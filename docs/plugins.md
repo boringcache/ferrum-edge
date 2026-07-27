@@ -2203,7 +2203,7 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
 | `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection (`1`–`86400`) |
-| `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep (`1`–`1000000`) |
+| `nonce.max_cache_size` | u64 | `10000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `8388608` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
 
@@ -2232,7 +2232,10 @@ Replay state is bounded and only ever populated by a caller that has already pro
 - The encoded `wsse:Nonce` is length-checked against `nonce.max_encoded_length` **before** Base64 decoding, so an oversized nonce is never decoded and never retained.
 - One canonical (trimmed) form feeds both the digest input and the replay-cache key, so the two derivations cannot drift apart.
 - A nonce is inserted only *after* its PasswordDigest verifies, so an unknown user or a wrong password cannot poison or evict a victim's replay entry.
-- The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap. At either cap, the age index removes expired entries first, then selects exact-oldest live entries in O(log n) per entry. Expiry and forced eviction share an explicit 64-entry maintenance budget per request, independent of `max_cache_size`; there is no lookup-map scan or stale FIFO. Live forced candidates are committed only when the bounded batch makes room. Budget exhaustion, poisoned/inconsistent state, or checked-accounting failure rejects with HTTP `401` without discarding the staged live entries or accepting an unrecorded nonce. Entry/byte admission, eviction, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap — including same-key races, where an in-TTL hit is a replay without a new reservation.
+- The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap.
+- **A claimed nonce is never evicted while it is still inside `nonce.cache_ttl_seconds`.** At either cap the age index is walked from its oldest end and only entries *proven expired* are reclaimed; the walk stops at the first still-live entry, because everything newer is live too. There is no forced eviction of live entries, no lookup-map scan, and no stale FIFO. Reclamation is charged against an explicit 64-entry maintenance budget per request (independent of `max_cache_size`), which keeps per-request work constant while the two hard caps keep memory bounded.
+- **Capacity exhaustion fails closed.** When bounded expiry reclamation cannot free both entry and byte room — or the maintenance budget runs out, or state is poisoned/inconsistent, or checked accounting fails — the request is rejected with HTTP `401` and the nonce is *not* recorded. Replay protection degrades into refusal, never into silently unprotecting an already-claimed nonce. A rejected claim never removes a live entry; any expired entries already reclaimed within the bounded budget stay removed, allowing safe retries to converge after enough state has expired. Size `nonce.max_cache_size` and `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × `nonce.cache_ttl_seconds`; under-provisioning them now surfaces as `401` rejections rather than as a quiet replay window.
+- Entry/byte admission, expiry reclamation, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap and exactly one concurrent claim of the same nonce can win — including same-key races, where an in-TTL hit is a replay without a new reservation.
 - Length and saturation rejections log fixed-cardinality failure classes (`nonce_too_long`, `nonce_state_saturated`) and never include the nonce value.
 
 ```yaml
@@ -2683,10 +2686,9 @@ enforcement entirely. Local HTTP/GraphQL/gRPC sliding-window state uses a fixed
 ring of aggregate count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so
 per-key memory stays O(1) in the request cap; the request-cap bound is an
 operational ceiling on budgets and Redis/header arithmetic, not a timestamp-log
-size limit. The `rate_limiting`, `graphql`, `grpc_method_router`, and
-`udp_rate_limiting` roots reject unknown keys. The `ai_rate_limiter` and
-`ws_rate_limiting` roots remain intentionally open for forward-compatible
-fields, consistently in runtime admission and OpenAPI.
+size limit. The `rate_limiting`, `graphql`, `grpc_method_router`,
+`udp_rate_limiting`, `ws_rate_limiting`, and `ai_rate_limiter` roots reject
+unknown keys, consistently in runtime admission and OpenAPI.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
 
@@ -3564,6 +3566,16 @@ set individual `rule_modes` or custom rule `action` values to `enforce` when a
 rule should block. Invalid WAF configuration is security-fatal at
 startup/reload, so the gateway does not silently serve without the intended
 inspection.
+
+**Admission.** Fixed-shape objects reject unknown keys with path-qualified
+diagnostics and spelling suggestions before defaults apply (top-level config,
+`scoring`, custom rules, object-form targets, conditions, global exemptions,
+stream config/signatures, and rule-override values). Intentionally open maps
+remain open: `rule_modes` and `rule_overrides` (rule-id keys; override values
+are closed), `conditions.headers`, and `global_exemptions.header_present`.
+Registration policy is `FailClosed`: an invalid enabled config rejects
+publication so the gateway retains the last-known-good instance instead of
+admitting a typo'd weaker policy.
 
 Request metadata inspection (path, query, headers, cookies, and method) runs
 in the `authorize` phase after authentication and earlier authorization
@@ -4928,7 +4940,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `cache_multimodal` | String | `"exact_only"` | Multimodal request caching mode for non-text content parts: `reject` bypasses cache lookup/store, `exact_only` uses hashed fingerprints for exact matches and disables semantic hits, and `include_fingerprints` also includes those fingerprints in semantic scope keys. Values are trimmed and case-insensitive; `_` and `-` aliases are accepted. |
 | `semantic_similarity_enabled` | bool | `false` | Enable embedding-based semantic lookup after exact Redis/local misses. Exact matching remains active either way. |
 | `semantic_embedding_provider` | String | `"openai"` | Embedding request/response format. Supports `openai`, `azure_openai`, `mistral`, `voyage` (`anthropic`/`claude` aliases), `cohere`, `google_gemini`, `google_vertex`, `bedrock_titan`, and `bedrock_cohere`; compatibility aliases accepted by the plugin are also listed in `openapi.yaml`. |
-| `semantic_embedding_endpoint` | String (optional) | -- | Embedding endpoint URL. Required when `semantic_similarity_enabled: true`. OpenAI-compatible endpoints use `{"input": "...", "model": "..."}`; other provider values send native provider JSON. |
+| `semantic_embedding_endpoint` | String (optional) | -- | Embedding endpoint URL. Required when `semantic_similarity_enabled: true`. Must not include URL userinfo; use `semantic_embedding_api_key` for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus `/...`). OpenAI-compatible endpoints use `{"input": "...", "model": "..."}`; other provider values send native provider JSON. |
 | `semantic_embedding_model` | String (optional) | -- | Model name sent in the embedding request body. Omit for local endpoints that do not require a model field. |
 | `semantic_embedding_input_type` | String (optional) | -- | Provider-specific input/task type. Used by Voyage (`query`/`document`), Cohere/Bedrock Cohere (`search_query`, `search_document`, `classification`, `clustering`), Gemini (`SEMANTIC_SIMILARITY`, etc.), and Vertex (`task_type`). |
 | `semantic_embedding_output_dimension` | u64 (optional) | -- | Provider-specific reduced embedding dimension when supported (`dimensions`, `output_dimension`, or `outputDimensionality`). |
@@ -5173,6 +5185,11 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
+
+The `ai_rate_limiter` configuration object is closed. Unknown or misspelled
+root properties, including shared Redis settings, reject the candidate
+configuration instead of silently selecting defaults. A rejected reload leaves
+the last-known-good plugin generation active.
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
@@ -5594,7 +5611,7 @@ parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
 
 **Priority:** 2910
 
@@ -5602,8 +5619,8 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
-| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
+| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Range 1–1000000. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Range 1–1000000. Must be greater than or equal to `frames_per_second`, an integer multiple of `frames_per_second`, and yield a refill window (`burst_size / frames_per_second`) of at most 3600 seconds so local token-bucket and Redis two-window enforcement share the same sustained rate. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
@@ -5617,7 +5634,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Redis approximates the local token bucket as `burst_size` admissions over a window of `burst_size / frames_per_second` seconds; construction rejects non-integral ratios and refill windows longer than 3600 seconds so Redis cannot over-admit (or unexpectedly under-admit) relative to the local sustained rate, including across Redis failure/recovery. Uses Redis-native counters (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Database-backed frame counters are intentionally unsupported.
 
 **Memory protection:** Local (and Redis-fallback) connection state is capped at 50,000 keys. Sampled periodic sweeps (every 100,000 frame hooks, cooldown-gated to at most once per second) prune idle connections below that hard cap; when active state still exceeds the cap after prune, remaining keys are force-evicted immediately without the sample/cooldown gate.
 
@@ -5625,7 +5642,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 plugin_name: ws_rate_limiting
 config:
   frames_per_second: 50
-  burst_size: 75
+  burst_size: 100
   close_reason: "Rate limit exceeded"
   sync_mode: redis
   redis_url: "redis://redis-host:6379/2"

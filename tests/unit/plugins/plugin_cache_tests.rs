@@ -2047,6 +2047,114 @@ fn test_response_caching_unknown_key_reload_keeps_last_known_good() {
     );
 }
 
+#[test]
+fn test_ai_rate_limiter_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["ai-rl-1"])],
+        vec![make_plugin_config_with_json(
+            "ai-rl-1",
+            "ai_rate_limiter",
+            json!({
+                "token_limit": 1_000,
+                "on_unmetered_response": "reject"
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid ai_rate_limiter must admit");
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "ai_rate_limiter");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec!["ai-rl-1"])],
+        vec![make_plugin_config_with_json(
+            "ai-rl-1",
+            "ai_rate_limiter",
+            json!({
+                "token_limit": 1_000,
+                "on_unmetered_responce": "reject"
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown ai_rate_limiter key must reject reload");
+    assert!(
+        error.contains("unknown configuration key")
+            && error.contains("config.on_unmetered_responce"),
+        "unexpected reload error: {error}"
+    );
+
+    let after = cache.get_plugins("ferrum", "p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "ai_rate_limiter");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "rejected candidate must retain the last-known-good ai_rate_limiter instance"
+    );
+}
+
+#[test]
+fn test_ws_rate_limiting_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["ws-rl-1"])],
+        vec![make_plugin_config_with_json(
+            "ws-rl-1",
+            "ws_rate_limiting",
+            json!({"frames_per_second": 10, "burst_size": 20}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid ws_rate_limiting must admit");
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "ws_rate_limiting");
+
+    let malformed = make_config(
+        vec![make_proxy("p1", "/api", vec!["ws-rl-1"])],
+        vec![make_plugin_config_with_json(
+            "ws-rl-1",
+            "ws_rate_limiting",
+            json!({
+                "frames_per_secod": 1,
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "redis_tsl": true,
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let error = cache
+        .rebuild(&malformed)
+        .expect_err("unknown ws_rate_limiting keys must reject reload");
+    assert!(
+        error.contains("unknown configuration key"),
+        "unexpected reload error: {error}"
+    );
+    assert!(
+        error.contains("'config.frames_per_secod'"),
+        "reload error must path-qualify FPS typo: {error}"
+    );
+    assert!(
+        error.contains("'config.redis_tsl'"),
+        "reload error must path-qualify TLS typo: {error}"
+    );
+
+    let after = cache.get_plugins("ferrum", "p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "ws_rate_limiting");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted ws_rate_limiting instance"
+    );
+}
+
 #[tokio::test]
 async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
     let valid = make_config(

@@ -1616,6 +1616,101 @@ fn waf_scoring_weights_reject_unknown_severities() {
 }
 
 #[test]
+fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for schema in [
+        "WafPluginConfig",
+        "WafStreamConfig",
+        "WafStreamSignature",
+        "WafRule",
+        "WafExemptions",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][schema]["additionalProperties"],
+            json!(false),
+            "{schema} must reject unknown properties"
+        );
+    }
+
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["scoring"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["additionalProperties"],
+        json!(false)
+    );
+
+    // Intentionally open operator-defined maps.
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_modes"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "rule_modes must remain an open rule-id map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
+            .get("additionalProperties")
+            .is_some_and(|v| v.is_object()),
+        "rule_overrides must remain an open rule-id map of closed objects"
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]["additionalProperties"]
+            ["additionalProperties"],
+        json!(false),
+        "rule_overrides values must be closed"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["properties"]
+            ["headers"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "conditions.headers must remain an open header-name map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafExemptions"]["properties"]["header_present"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "global_exemptions.header_present must remain an open header-name map"
+    );
+
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/WafPluginConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&root)
+        .expect("WafPluginConfig schema compiles");
+    assert!(
+        validator
+            .validate(&json!({
+                "mode": "enforce",
+                "default_rule_action": "enforce",
+                "rule_modes": { "FE-XSS-001": "enforce" },
+                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+            }))
+            .is_ok()
+    );
+    assert!(
+        validator
+            .validate(&json!({ "default_rule_actoin": "enforce" }))
+            .is_err(),
+        "schema must reject top-level enforcement typo"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "stream": { "tcp_require_tsl": true }
+            }))
+            .is_err(),
+        "schema must reject stream guard typo"
+    );
+}
+
+#[test]
 fn access_control_schema_matches_runtime_validation() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1813,18 +1908,21 @@ fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     }
 }
 
-/// GHSA-q3p3-94cj-8wh6 / GHSA-jjjw-rqjm-fvf3: the remaining rate-limiter
-/// components must expose closed root objects and bounded numeric ranges that
-/// match the runtime allowlists, so a typo or an extreme value is rejected by
-/// schema-driven authoring tools and by admission alike.
+/// GHSA-q3p3-94cj-8wh6 / GHSA-q97w-jvf6-q254 /
+/// GHSA-5h4h-3qcv-f3rw / GHSA-jjjw-rqjm-fvf3: rate-limiter components must
+/// expose closed root objects and bounded numeric ranges that match the runtime
+/// allowlists, so a typo or an extreme value is rejected by schema-driven
+/// authoring tools and admission.
 #[test]
 fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_rate_limiter::AI_RATE_LIMITER_CONFIG_KEYS;
     use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
     use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::utils::rate_limit::{
         MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
     };
+    use ferrum_edge::plugins::ws_rate_limiting::WS_RATE_LIMITING_CONFIG_KEYS;
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1833,6 +1931,8 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
         ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
         ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("AiRateLimiterConfig", AI_RATE_LIMITER_CONFIG_KEYS),
+        ("WsRateLimitingConfig", WS_RATE_LIMITING_CONFIG_KEYS),
     ] {
         let schema = spec
             .pointer(&format!("/components/schemas/{schema_name}"))
@@ -1852,21 +1952,6 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         assert_eq!(
             schema_fields, runtime_fields,
             "{schema_name} OpenAPI/runtime key drift"
-        );
-    }
-
-    // The typo advisory's affected-component list is limited to ordinary HTTP,
-    // GraphQL, and gRPC-method limiter roots. AI and WebSocket remain
-    // intentionally open in runtime admission, so OpenAPI must not close them.
-    for schema_name in ["AiRateLimiterConfig", "WsRateLimitingConfig"] {
-        let schema = spec
-            .pointer(&format!("/components/schemas/{schema_name}"))
-            .unwrap_or_else(|| panic!("{schema_name} component exists"));
-        assert!(
-            schema
-                .get("additionalProperties")
-                .is_none_or(|value| value == &json!(true)),
-            "{schema_name} must remain open in parity with runtime admission"
         );
     }
 
@@ -6040,6 +6125,7 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
         "primary_active": false,
         "allow_writes": false,
         "opt_in_writes_enabled_during_window": false,
+        "primary_failback_fenced": false,
         "failover_since_unix_ms": 1_700_000_000_000u64,
         "active_url_redacted": "sqlite:///tmp/failover.db"
     });
@@ -6081,8 +6167,8 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
         "topology schema must document opt-in divergence-risk contract"
     );
     assert!(
-        !topology_desc.contains("fence") || topology_desc.contains("not a durable fence"),
-        "must not claim a durable failback fence"
+        topology_desc.contains("fences") && topology_desc.contains("restarted after operator"),
+        "topology schema must document the process-local failback fence"
     );
 }
 

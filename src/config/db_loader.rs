@@ -6635,6 +6635,10 @@ impl DatabaseStore {
         // (shared reads) and serializes concurrent reconnect publishers.
         let _transition_guard = self.reconnect_transition.write().await;
 
+        if topology == DatabaseTopology::Primary {
+            self.failover_topology.ensure_primary_failback_allowed()?;
+        }
+
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
         // look immediately available on failback and skip the one reconnect
@@ -6960,11 +6964,8 @@ impl DatabaseStore {
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
     ///
-    /// Primary failback is always attempted when the primary answers (issue
-    /// #3001 opt-in contract B). When `FERRUM_DB_FAILOVER_ALLOW_WRITES` was
-    /// enabled during the failover window, [`DbFailoverTopologyState::mark_primary`]
-    /// emits one bounded divergence-risk marker; Ferrum does not fence failback.
-    /// Polling and reads remain available on whichever topology reconnects.
+    /// Primary failback is refused after an Admin write was admitted on the
+    /// failover topology, preventing a stale primary snapshot from replacing it.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
         // Try primary first.
         match self
@@ -6974,6 +6975,11 @@ impl DatabaseStore {
             Ok(()) => {
                 info!("Reconnected to primary database");
                 return Ok(primary_url.to_string());
+            }
+            Err(error) if crate::config::db_backend::primary_failback_fenced(&error) => {
+                warn!(
+                    "Primary database failback remains fenced after an admitted failover-window Admin write; retrying configured failover URLs"
+                );
             }
             Err(error) if !is_transient_failover_error(&error) => {
                 return Err(mark_non_transient(
@@ -8197,6 +8203,12 @@ impl DatabaseStore {
             );
         }
 
+        // Every selected spec-owned upstream id must decode. Silently dropping
+        // a row on try_get failure shrinks the protected set and can make an
+        // all-failed selection look empty, skipping the mesh_route_dispatch
+        // scan and allowing replace/delete to commit with dangling external
+        // references (issue #3210). The empty-set fast path is only for a
+        // query that truly returned no rows.
         let upstream_rows: Vec<AnyRow> = sqlx::query(
             &self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"),
         )
@@ -8204,12 +8216,19 @@ impl DatabaseStore {
         .bind(spec_id)
         .fetch_all(&mut **tx)
         .await?;
-        let spec_upstream_ids: HashSet<String> = upstream_rows
-            .iter()
-            .filter_map(|row| row.try_get::<String, _>("id").ok())
-            .collect();
-        if spec_upstream_ids.is_empty() {
+        if upstream_rows.is_empty() {
             return Ok(());
+        }
+        let mut spec_upstream_ids = HashSet::with_capacity(upstream_rows.len());
+        for row in &upstream_rows {
+            let id = row.try_get::<String, _>("id").map_err(|e| {
+                anyhow::Error::from(e).context(format!(
+                    "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     failed to decode spec-owned upstream id required for external reference checks"
+                ))
+            })?;
+            spec_upstream_ids.insert(id);
         }
 
         let plugin_rows: Vec<AnyRow> = sqlx::query(
@@ -9153,6 +9172,10 @@ impl DatabaseBackend for DatabaseStore {
 
     fn set_failover_allow_writes(&mut self, allow: bool) {
         self.failover_topology.set_allow_writes(allow);
+    }
+
+    fn note_failover_admin_write(&self) {
+        self.failover_topology.note_admin_write();
     }
 
     async fn acquire_write_topology_permit(

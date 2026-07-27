@@ -9169,29 +9169,43 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
-        per-connection counters under a per-plugin/gateway-instance key
-        namespace; it does not coordinate a portable frame budget across
-        gateway instances, reconnects, or plugin rebuilds. Counter storage
-        supports only local memory and Redis; database-backed counters are
-        intentionally unsupported.
+        bucket. `frames_per_second` and `burst_size` must form an integer-multiple
+        refill window of at most 3600 seconds (and stay within 1–1000000) so Redis
+        two-window enforcement cannot over-admit or under-admit relative to the
+        local token bucket, including across Redis failure/recovery. Redis mode
+        (`sync_mode: "redis"`) externalizes those per-connection counters under a
+        per-plugin/gateway-instance key namespace; it does not coordinate a portable
+        frame budget across gateway instances, reconnects, or plugin rebuilds. Unknown
+        top-level keys are rejected by the runtime and by this schema. Counter
+        storage supports only local memory and Redis; database-backed counters
+        are intentionally unsupported.
+      additionalProperties: false
       properties:
         frames_per_second:
           type: integer
           format: uint64
           default: 100
           minimum: 1
+          maximum: 1000000
           description: >-
-            Token refill rate per second. Must be greater than zero — configs
-            with `frames_per_second: 0` are rejected at config load time.
+            Token refill rate per second. Range 1–1000000. Must be greater than
+            zero — configs with `frames_per_second: 0` are rejected at config
+            load time. Together with `burst_size`, must yield an integer-multiple
+            refill window of at most 3600 seconds so Redis and local sustained
+            rates match.
         burst_size:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 1000000
           description: >-
-            Maximum burst capacity (tokens). Defaults to the value of
-            `frames_per_second` when not explicitly set. Must be greater than
-            zero and greater than or equal to `frames_per_second`.
+            Maximum burst capacity (tokens). Range 1–1000000. Defaults to the
+            value of `frames_per_second` when not explicitly set. Must be greater
+            than zero, greater than or equal to `frames_per_second`, an integer
+            multiple of `frames_per_second`, and yield a refill window
+            (`burst_size / frames_per_second`) of at most 3600 seconds. Configs
+            that Redis cannot represent without over-admitting or under-admitting
+            relative to the local token bucket are rejected at config load time.
         close_reason:
           type: string
           default: "Frame rate exceeded"
@@ -9239,10 +9253,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 
@@ -11358,12 +11374,15 @@ components:
         (no userinfo). When `allow_writes` is false (default), config-database
         admin mutations return 503 and `admin_writes_enabled` is false. When
         `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, those writes are permitted under
-        the operator's synchronously replicated multi-primary assertion; Ferrum
-        allows automatic primary failback and emits one bounded process-local
-        divergence-risk log for the window (not a durable fence; cleared by
-        restart). Managed TLS/ACME stores are independent and are not gated by
-        this topology. This object does not claim per-request mutation success.
-      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
+        the operator's synchronously replicated multi-primary assertion; this
+        opt-in divergence-risk contract records each admitted failover-window
+        mutation conservatively and process-locally fences automatic primary
+        failback until the process is restarted after operator reconciliation
+        or confirmed replication catch-up. The fence is not coordinated across
+        gateway replicas. Managed TLS/ACME stores are independent and are not
+        gated by this topology. This object does not claim per-request mutation
+        success.
+      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window, primary_failback_fenced]
       properties:
         primary_active:
           type: boolean
@@ -11382,6 +11401,13 @@ components:
             Sticky process-local marker: opt-in writes were enabled at any point
             during the current failover window. Conservative risk signal only;
             does not count admitted, rejected, or successful mutations.
+        primary_failback_fenced:
+          type: boolean
+          description: |
+            `true` after this gateway process admits an Admin mutation on the
+            failover topology. While true, this process will not publish a
+            recovered primary and will continue trying configured failover URLs.
+            This is not a durable or cross-replica coordination marker.
         failover_since_unix_ms:
           type: integer
           format: uint64
@@ -16008,12 +16034,14 @@ components:
             bounded on three independent axes: per-nonce encoded length,
             retained entries, and retained key UTF-8 payload bytes counted once
             per shared immutable key allocation. An exact ordered age index
-            provides O(log n) expiry/oldest operations without a lookup-map
-            scan or stale queue. One request examines at most 64 indexed
-            entries; if that bounded work cannot make room the request fails
-            closed (HTTP 401) rather than accepting a nonce whose replay window
-            cannot be recorded. This is the only canonical shape; there is no
-            `nonce_replay_protection` alias.
+            provides O(log n) expiry operations without a lookup-map scan or
+            stale queue. Capacity maintenance reclaims only entries already
+            past cache_ttl_seconds and at most 64 of them per request; a nonce
+            inside its TTL is never evicted. If that bounded reclamation cannot
+            make room the request fails closed (HTTP 401) rather than accepting
+            a nonce whose replay window cannot be recorded or unprotecting one
+            that was already claimed. This is the only canonical shape; there
+            is no `nonce_replay_protection` alias.
           additionalProperties: false
           properties:
             cache_ttl_seconds:
@@ -16029,7 +16057,7 @@ components:
               default: 10000
               minimum: 1
               maximum: 1000000
-              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Expiry and exact-oldest eviction use an ordered age index and examine at most 64 entries per request.
+              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past cache_ttl_seconds. A nonce inside its TTL is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce.
             max_encoded_length:
               type: integer
               format: uint64
@@ -16043,7 +16071,7 @@ components:
               default: 8388608
               minimum: 4096
               maximum: 1073741824
-              description: Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length.
+              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside cache_ttl_seconds."
 
     CorsExactOrigin:
       oneOf:
@@ -17430,7 +17458,12 @@ components:
 
     WafPluginConfig:
       type: object
-      description: "Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family requests and optional responses."
+      additionalProperties: false
+      description: >-
+        Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family
+        requests and optional responses. Fixed-shape objects reject unknown keys;
+        intentionally open maps are rule_modes / rule_overrides (rule-id keys),
+        conditions.headers, and global_exemptions.header_present.
       properties:
         mode:
           type: string
@@ -17528,6 +17561,7 @@ components:
                   type: string
               conditions:
                 type: object
+                additionalProperties: false
                 properties:
                   paths:
                     type: array
@@ -17557,6 +17591,7 @@ components:
           default: []
         scoring:
           type: object
+          additionalProperties: false
           description: >-
             Anomaly scoring. When enabled, every matched rule contributes its
             severity weight (or per-rule score) to this WAF instance's cumulative
@@ -17640,6 +17675,7 @@ components:
 
     WafStreamConfig:
       type: object
+      additionalProperties: false
       description: >
         Optional raw TCP/UDP inspection. When present the WAF also attaches to
         stream proxies. L7 signature scanning runs over plaintext application
@@ -17673,6 +17709,7 @@ components:
 
     WafStreamSignature:
       type: object
+      additionalProperties: false
       required: [id, pattern]
       properties:
         id:
@@ -17692,6 +17729,7 @@ components:
 
     WafRule:
       type: object
+      additionalProperties: false
       required: [id, category, target]
       properties:
         id:
@@ -17736,6 +17774,7 @@ components:
                 - response_headers
                 - response_body
             - type: object
+              additionalProperties: false
               required: [type]
               not:
                 required: [path]
@@ -17753,6 +17792,7 @@ components:
                     type: string
                     minLength: 1
             - type: object
+              additionalProperties: false
               required: [type, path]
               not:
                 required: [names]
@@ -17765,6 +17805,7 @@ components:
                   description: >-
                     Required dotted JSON path for body_json_path targets.
             - type: object
+              additionalProperties: false
               required: [type]
               not:
                 anyOf:
@@ -17815,6 +17856,7 @@ components:
           description: Anomaly-score contribution when scoring is enabled; defaults to the per-severity weight.
         conditions:
           type: object
+          additionalProperties: false
           properties:
             paths:
               type: array
@@ -17840,6 +17882,7 @@ components:
 
     WafExemptions:
       type: object
+      additionalProperties: false
       properties:
         paths:
           type: array
@@ -20452,7 +20495,7 @@ components:
         semantic_embedding_endpoint:
           type: string
           format: uri
-          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
           description: Model name sent in the embedding request body. Omit for local endpoints that do not require a model field.
@@ -20715,6 +20758,7 @@ components:
 
     AiRateLimiterConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
