@@ -2451,6 +2451,81 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_classifies_response_trailer_policy_by_capability() {
+    // Auth/logging-only chain: nothing about it can be re-opened by a backend
+    // trailer, so it declares no names and does not fail closed (issue #2941).
+    let logging = make_plugin_config_with_json(
+        "log",
+        "stdout_logging",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["log"])], vec![logging]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(view.response_trailer_policy_names().is_empty());
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `security_headers` enumerates the fields it sets or removes, so the
+    // trailer reconciliation is name-scoped rather than wholesale.
+    let security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["x-powered-by"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `response_transformer` also applies route overrides published at request
+    // time, so its governed field set is not enumerable and it fails closed.
+    let transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+}
+
 #[test]
 fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     let mut deadline = make_plugin_config_with_json(

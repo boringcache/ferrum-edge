@@ -11,6 +11,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Buffering policy](#buffering-policy)
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
+- [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
@@ -263,6 +264,45 @@ stays terminal. If the gate instead synthesizes an `INTERNAL` rejection, that
 new status/message is snapshotted as authoritative before split finalization;
 the stale backend terminal status cannot return and the synthesized status is
 not duplicated between initial and terminal metadata.
+
+## Backend trailers and response header policy
+
+Plain (non-gRPC) buffered native-H3 responses forward the backend's trailers
+after the DATA frames (issue #1630). Every response-header phase on that path —
+`after_proxy`, sticky-cookie injection, committed hooks — sees only the
+**initial** header map, so a backend trailer repeating a governed field name
+would arrive after the policy boundary and undo it. Before the trailers are
+written, Ferrum reconciles them against the response-header policy actually in
+force for the request:
+
+- **Declared policy names.** Plugins classify their reach with
+  `Plugin::response_trailer_policy()`, and the plugin cache unions the names once
+  per reload so the request path reads a precomputed list instead of scanning the
+  chain. `security_headers` declares every name it sets or removes. This is the
+  only signal that can bind a **removal that was a no-op on the initial map**,
+  because the backend sent the field only as a trailer.
+- **Observed mutation.** Independently, the path witnesses the backend's
+  pre-policy value for each field name the trailer section carries and drops any
+  trailer whose header counterpart the chain added, changed, or removed. This
+  covers plugins that declare nothing at all, including custom plugins and
+  transforms published at request time.
+- **Fail-closed arm.** A plugin whose governed field set is not enumerable at
+  config time declares `ResponseTrailerPolicy::Unbounded` and the whole trailer
+  section is dropped. `response_transformer` is in this class: its `after_proxy`
+  also applies `mesh_route_dispatch` route overrides, whose field names do not
+  exist until the request runs.
+- **gRPC control trailers are exempt** in every arm. `grpc-status`,
+  `grpc-message`, and `grpc-status-details-bin` are protocol status, not header
+  policy; gRPC-specific trailer policy has its own boundary (see
+  [gRPC trailers over H3](#grpc-trailers-over-h3)).
+
+An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, rate limits —
+declares no names and mutates no response headers, so its backend trailers are
+forwarded untouched (issue #2941). Chain **presence** is deliberately not the
+gate: that would strip valid trailers from every proxy that merely authenticates.
+A response-body plugin phase that actually processes the response body still
+clears the trailers wholesale, because those hooks cannot inspect or transform a
+trailer at all.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

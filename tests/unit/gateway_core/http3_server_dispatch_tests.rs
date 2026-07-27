@@ -1520,19 +1520,31 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
 }
 
 #[test]
-fn buffered_h3_trailers_cannot_bypass_after_proxy_policy() {
+fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     let src = include_str!("../../../src/http3/server.rs");
-    let after_proxy = src
+
+    // The witness must be captured BEFORE the first response-header phase,
+    // otherwise the "did the chain change this field?" comparison is against a
+    // map the chain already rewrote and every mutation reads as a no-op.
+    let capture = src
         .split("        // after_proxy hooks")
         .nth(1)
         .expect("buffered after_proxy phase")
         .split("// Sticky session cookie injection.")
         .next()
-        .expect("bounded after_proxy trailer gate");
+        .expect("bounded after_proxy trailer region");
+    let before_capture = src
+        .split("        // after_proxy hooks")
+        .next()
+        .expect("pre-after_proxy region");
     assert!(
-        after_proxy.contains("if !plugins.is_empty()")
-            && after_proxy.contains("response_trailers = None;"),
-        "buffered H3 must suppress backend trailers when after_proxy policies cannot inspect them"
+        before_capture.contains("ResponseTrailerPolicyWitness::capture(")
+            && before_capture.contains("ResponseTrailerPolicyWitness::EMPTY"),
+        "buffered H3 must witness the backend's pre-policy header values before after_proxy runs"
+    );
+    assert!(
+        !capture.contains("if !plugins.is_empty()"),
+        "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
     );
 
     let gate = src
@@ -1545,16 +1557,40 @@ fn buffered_h3_trailers_cannot_bypass_after_proxy_policy() {
     assert!(
         gate.contains("crate::proxy::response_body_plugins_process_body(&plugins, &ctx)")
             && gate.contains("response_trailers = None;"),
-        "buffered H3 must also drop trailers when a response-body plugin phase \
+        "buffered H3 must drop trailers exactly when a response-body plugin phase \
          processes this response"
+    );
+    assert!(
+        !gate.contains("if !plugins.is_empty()"),
+        "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
+    );
+
+    // Reconciliation runs after the LAST header phase and before the response
+    // is built, so sticky-cookie injection and committed hooks are covered too.
+    let reconcile = src
+        .split("        // Final hop-by-hop strip after after_proxy / committed hooks")
+        .nth(1)
+        .expect("buffered final header strip")
+        .split("// Build and send buffered response")
+        .next()
+        .expect("bounded reconciliation region");
+    assert!(
+        reconcile.contains("reconcile_backend_trailers_with_response_policy(")
+            && reconcile.contains("plugin_cache_view.response_trailer_policy_names()")
+            && reconcile.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+        "buffered H3 must reconcile surviving trailers against the precomputed \
+         response-header policy names and the fail-closed unbounded capability"
     );
 
     let send = src
-        .split("// Backend trailers survive to here only when there was no plugin chain")
+        .split("// Backend trailers survive to here only when no response-body plugin")
         .nth(1)
         .expect("buffered trailer retention comment")
         .split("// Forward backend response trailers, if any (issue #1630).")
         .next()
         .expect("bounded trailer forward comment");
-    assert!(send.contains("no mutation / reject / normalize arm"));
+    assert!(
+        send.contains("Auth/logging-only plugins must not"),
+        "retention rationale for auth/logging-only plugins must remain documented"
+    );
 }

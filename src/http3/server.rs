@@ -46,8 +46,9 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, strip_client_response_hop_by_hop_headers,
+    ResponseTrailerPolicyWitness, apply_response_headers, is_backend_request_strip_header,
+    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
+    reconcile_backend_trailers_with_response_policy, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
@@ -6727,6 +6728,18 @@ async fn handle_h3_request(
         // rewrite a representation it must preserve.
         stamp_h3_original_response_metadata(&mut ctx, response_status, &response_headers);
 
+        // Witness the backend's pre-policy value for exactly the field names it
+        // also sent as trailers, before the first response-header phase can
+        // rewrite them. Allocated only when the backend actually sent trailers,
+        // and sized by the trailer count — never by the header count. A response
+        // with no trailers gets the empty witness and never reaches the
+        // reconciliation below; that value proves nothing, so any future caller
+        // that does reach it fails closed.
+        let trailer_policy_witness = match response_trailers.as_ref() {
+            Some(trailers) => ResponseTrailerPolicyWitness::capture(trailers, &response_headers),
+            None => ResponseTrailerPolicyWitness::EMPTY,
+        };
+
         // after_proxy hooks
         let mut after_proxy_rejected = false;
         {
@@ -6748,16 +6761,6 @@ async fn handle_h3_request(
                 response_trailers = None;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-        }
-
-        // `after_proxy` hooks only receive the initial response headers. Until
-        // trailers participate in that policy boundary too, do not let backend
-        // trailer fields bypass a configured response policy (for example a
-        // security_headers removal). This deliberately uses chain presence
-        // rather than observed header mutation: a removal can be a no-op on the
-        // initial map while still needing to suppress the same trailer name.
-        if !plugins.is_empty() {
-            response_trailers = None;
         }
 
         // Sticky session cookie injection. The buffered variant also records the
@@ -6783,8 +6786,13 @@ async fn handle_h3_request(
 
         // Response-body plugins cannot inspect or transform trailers today, so
         // a chain that actually processes this response body must not forward
-        // backend-controlled trailer fields it never saw. Body-mutating phases
-        // below additionally clear the trailers when they replace the bytes.
+        // backend-controlled trailer fields it never saw. The gate is the same
+        // two-tier response-body-buffering predicate that chose this path — NOT
+        // chain-emptiness: an auth/logging-only proxy never reads the body and
+        // keeps the backend's trailers (issue #2941). Body-mutating phases
+        // below additionally clear the trailers when they replace the bytes,
+        // and surviving trailers are still reconciled field-by-field against
+        // the response-header policy before they reach the wire.
         if crate::proxy::response_body_plugins_process_body(&plugins, &ctx) {
             response_trailers = None;
         }
@@ -6991,6 +6999,33 @@ async fn handle_h3_request(
         // Final hop-by-hop strip after after_proxy / committed hooks (RFC 9114 §4.2).
         strip_client_response_hop_by_hop_headers(&mut response_headers);
 
+        // Reconcile surviving backend trailers with the response-header policy
+        // this path already applied. Every response-header phase — `after_proxy`,
+        // sticky-cookie injection, committed hooks — sees only the INITIAL header
+        // map, so a backend trailer repeating a governed field name would land on
+        // the wire after the policy boundary and undo it. Runs once, after the
+        // last header phase, against the precomputed per-proxy policy-name union;
+        // an auth/logging-only chain contributes no names and mutates no headers,
+        // so its trailers pass through untouched.
+        let unbounded_trailer_policy = capabilities
+            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+        if let Some(trailers) = response_trailers.as_mut() {
+            let removed = reconcile_backend_trailers_with_response_policy(
+                trailers,
+                &response_headers,
+                &trailer_policy_witness,
+                plugin_cache_view.response_trailer_policy_names(),
+                unbounded_trailer_policy,
+            );
+            if removed > 0 {
+                debug!(
+                    proxy_id = %proxy.id,
+                    removed,
+                    "buffered H3: dropped backend trailer fields governed by response header policy"
+                );
+            }
+        }
+
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_builder =
@@ -7052,8 +7087,12 @@ async fn handle_h3_request(
             bytes_received = response_body_bytes;
         }
 
-        // Backend trailers survive to here only when there was no plugin chain
-        // and no mutation / reject / normalize arm replaced the bytes.
+        // Backend trailers survive to here only when no response-body plugin
+        // phase processed this response (gate above), no mutation / reject /
+        // normalize arm replaced the bytes, and the response-policy
+        // reconciliation above kept the remaining fields. Auth/logging-only
+        // plugins must not wipe trailers merely because the plugin chain is
+        // nonempty (#2941).
 
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
@@ -10759,8 +10798,11 @@ struct H3BufferedDispatchResult {
     /// native-H3 send path forwards them only when no response-body plugin
     /// phase processed the response and no phase replaced the bytes
     /// (auth/logging-only plugins keep trailers; body-inspecting, mutating,
-    /// rejecting, and normalizing phases drop them). Surviving trailers get
-    /// response-direction hop-by-hop names stripped before forwarding. `None` on every
+    /// rejecting, and normalizing phases drop them). Surviving trailers are
+    /// reconciled field-by-field against the response-header policy in force
+    /// (`reconcile_backend_trailers_with_response_policy`) so a trailer cannot
+    /// reintroduce a field that policy removed, then get response-direction
+    /// hop-by-hop names stripped before forwarding. `None` on every
     /// gateway-synthesized error/reject below (no backend trailers to forward),
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,

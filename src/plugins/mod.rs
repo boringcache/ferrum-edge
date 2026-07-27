@@ -1145,6 +1145,37 @@ impl BufferedInitialResponseHeaderPolicyState {
     }
 }
 
+/// How far a plugin's response-header policy binds the response TRAILER
+/// section.
+///
+/// `after_proxy` and every buffered response-header phase see only the INITIAL
+/// header map. On protocol paths that forward backend trailers after those
+/// phases (buffered native HTTP/3), a backend trailer carrying a governed field
+/// name re-opens the policy those phases applied — the classic case is a
+/// `security_headers` removal that was a no-op on the initial map because the
+/// backend only ever sent the field as a trailer, so no observed-mutation diff
+/// can see it.
+///
+/// This is a config-time declaration: the plugin cache unions it once per
+/// reload so the request path reads a precomputed name list instead of scanning
+/// the chain.
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseTrailerPolicy<'a> {
+    /// This plugin applies no response-header policy a backend trailer could
+    /// re-open. Correct for observers (logging), authentication, and
+    /// authorization plugins — and the default, because realized response-header
+    /// mutations are reconciled per request regardless of this declaration.
+    None,
+    /// Policy is limited to these canonical lowercase field names. Backend
+    /// trailers carrying one of them are dropped; every other trailer field is
+    /// forwarded unchanged.
+    Names(&'a [String]),
+    /// The governed field set is not enumerable at config time (for example
+    /// rules published at request time by another plugin). Buffered paths fail
+    /// closed and drop the whole backend trailer section.
+    Unbounded,
+}
+
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginFailurePolicy {
@@ -6722,6 +6753,23 @@ pub trait Plugin: Send + Sync {
     /// track only relevant fields and never scan the plugin chain per request.
     fn initial_response_header_policy_names(&self) -> &[String] {
         &[]
+    }
+
+    /// Declare how far this plugin's response-header policy binds the response
+    /// TRAILER section.
+    ///
+    /// Buffered protocol paths that forward backend trailers after the
+    /// response-header phases (buffered native HTTP/3) reconcile the trailer
+    /// section against the union of these declarations. Override this only when
+    /// the policy can be a NO-OP on the initial header map while still needing
+    /// to bind the trailer channel — a conditional removal, or a rejection
+    /// gated on a field the backend supplied only as a trailer. Mutations that
+    /// actually land on the initial headers are reconciled per request without
+    /// any declaration, so observers, authentication, and authorization plugins
+    /// correctly keep the [`ResponseTrailerPolicy::None`] default and preserve
+    /// backend trailers.
+    fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
+        ResponseTrailerPolicy::None
     }
 
     /// Returns `true` when this plugin may change the response `Content-Type`

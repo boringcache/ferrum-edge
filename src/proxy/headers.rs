@@ -645,6 +645,141 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// gRPC control trailers. These are protocol status carried only on the
+/// trailer channel, so dropping one strands the client without a `grpc-status`
+/// (a hung or `Unknown` RPC). They are exempt from the two INFERRED governance
+/// signals — the fail-closed unbounded arm and observed header mutation —
+/// because neither expresses intent about RPC status. An operator who names one
+/// of them explicitly in a response-header policy still wins: that is a
+/// deliberate declaration, and it is how the buffered gRPC-Web trailer boundary
+/// (`Plugin::requires_buffered_grpc_web_trailer_policy`) already behaves.
+const GRPC_CONTROL_TRAILER_NAMES: &[&str] =
+    &["grpc-status", "grpc-message", "grpc-status-details-bin"];
+
+/// Backend values, captured before any response-header phase ran, for exactly
+/// the field names a backend trailer section also carries.
+///
+/// Bounded by the TRAILER count rather than the header count: the reconciliation
+/// only has to answer "did the response-header phases change THIS name?", so a
+/// response without trailers allocates nothing at all.
+pub(crate) struct ResponseTrailerPolicyWitness {
+    /// `(trailer field name, backend header value before the response-header
+    /// phases ran)`.
+    observed: Vec<(http::HeaderName, Option<String>)>,
+}
+
+impl ResponseTrailerPolicyWitness {
+    /// A witness that proves nothing. Every trailer name is treated as mutated,
+    /// so callers that could not capture one still fail closed instead of
+    /// forwarding an unreconciled trailer section.
+    pub(crate) const EMPTY: Self = Self {
+        observed: Vec::new(),
+    };
+
+    /// Capture the pre-policy backend header value for every field name the
+    /// backend also sent as a trailer. Call this before the first response-header
+    /// phase (`after_proxy`) runs.
+    pub(crate) fn capture(
+        trailers: &http::HeaderMap,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let mut observed = Vec::with_capacity(trailers.keys_len());
+        for name in trailers.keys() {
+            observed.push((
+                name.clone(),
+                find_header_value_ci(response_headers, name.as_str()).cloned(),
+            ));
+        }
+        Self { observed }
+    }
+
+    /// Whether the response-header phases changed this field between capture
+    /// and the client boundary.
+    ///
+    /// A name absent from the witness fails closed: the only way that happens is
+    /// a trailer field the capture never saw, which means the reconciliation
+    /// cannot prove the chain left it alone.
+    fn was_mutated(
+        &self,
+        name: &http::HeaderName,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        match self.observed.iter().find(|(known, _)| known == name) {
+            Some((_, before)) => {
+                find_header_value_ci(response_headers, name.as_str()) != before.as_ref()
+            }
+            None => true,
+        }
+    }
+}
+
+/// Case-insensitive lookup into a plugin-facing header map. Plugins may
+/// synthesize mixed-case keys, so the trailer reconciliation cannot rely on the
+/// map being normalized.
+fn find_header_value_ci<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+/// Drop backend trailer fields that would re-open the response-header policy a
+/// buffered path already applied, and report how many were dropped.
+///
+/// `after_proxy` and every later buffered response-header phase see only the
+/// INITIAL header map. A backend trailer carrying a governed field name arrives
+/// after that boundary, so without this reconciliation it reintroduces exactly
+/// what the policy removed — or contradicts what the policy set — on the wire.
+///
+/// Two independent signals decide "governed", because neither alone is
+/// sufficient:
+///
+/// * `policy_names` — the config-time union of `Plugin::response_trailer_policy()`
+///   declarations. This is the only signal that can catch a policy REMOVAL which
+///   was a NO-OP on the initial header map because the backend sent the field
+///   only as a trailer.
+/// * `witness` — the observed per-request mutation. This catches every realized
+///   header change, including plugins that declare nothing (custom plugins, and
+///   transforms published at request time).
+///
+/// `unbounded_policy` is the fail-closed arm for a chain containing a plugin
+/// whose governed field set is not enumerable at config time: every field is
+/// treated as governed. gRPC control trailers are exempt from that arm and from
+/// the observed-mutation signal — neither expresses intent about RPC status —
+/// but an explicit `policy_names` entry still removes them.
+///
+/// Removal is loop-until-absent so a trailer name repeated across several field
+/// lines cannot leave a surviving duplicate behind.
+pub(crate) fn reconcile_backend_trailers_with_response_policy(
+    trailers: &mut http::HeaderMap,
+    response_headers: &std::collections::HashMap<String, String>,
+    witness: &ResponseTrailerPolicyWitness,
+    policy_names: &[String],
+    unbounded_policy: bool,
+) -> usize {
+    let mut to_remove: Vec<http::HeaderName> = Vec::new();
+    for name in trailers.keys() {
+        let explicitly_named = policy_names
+            .iter()
+            .any(|policy| policy.eq_ignore_ascii_case(name.as_str()));
+        if !explicitly_named && GRPC_CONTROL_TRAILER_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        let governed =
+            explicitly_named || unbounded_policy || witness.was_mutated(name, response_headers);
+        if governed {
+            to_remove.push(name.clone());
+        }
+    }
+    for name in &to_remove {
+        while trailers.remove(name).is_some() {}
+    }
+    to_remove.len()
+}
+
 /// Strip response-direction hop-by-hop names from a plugin header map.
 ///
 /// Used as a final sanitation pass on HTTP/3 client-facing responses after

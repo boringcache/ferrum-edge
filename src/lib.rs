@@ -2974,6 +2974,45 @@ pub mod _test_support {
         );
     }
 
+    /// Run the buffered-path backend-trailer / response-header-policy
+    /// reconciliation over plain data.
+    ///
+    /// `pre_policy_headers` are the backend's headers as the buffered path saw
+    /// them before any response-header phase ran; `final_headers` are the
+    /// headers about to go on the wire. Returns the surviving trailer field
+    /// lines in iteration-stable `(name, value)` form.
+    pub fn reconcile_backend_trailers_with_response_policy_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in trailers {
+            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("trailer name");
+            let value = http::HeaderValue::from_str(value).expect("trailer value");
+            map.append(name, value);
+        }
+        let witness =
+            crate::proxy::headers::ResponseTrailerPolicyWitness::capture(&map, pre_policy_headers);
+        crate::proxy::headers::reconcile_backend_trailers_with_response_policy(
+            &mut map,
+            final_headers,
+            &witness,
+            policy_names,
+            unbounded_policy,
+        );
+        let mut surviving = Vec::new();
+        for (name, value) in &map {
+            surviving.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+        surviving
+    }
+
     pub fn record_buffered_initial_response_header_plugin_for_test(
         ctx: &mut crate::plugins::RequestContext,
         plugin: &dyn crate::plugins::Plugin,

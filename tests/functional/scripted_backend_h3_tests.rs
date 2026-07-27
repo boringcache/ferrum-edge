@@ -3942,3 +3942,224 @@ async fn h3_buffered_auth_logging_plugins_preserve_backend_trailers() {
     );
     assert_eq!(resp.trailer("x-request-id"), Some("trail-auth-1"));
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// A response-header policy binds the TRAILER section too. `after_proxy` only
+// ever sees the initial header map, so a backend trailer repeating a governed
+// field name would otherwise reintroduce exactly what the policy removed —
+// while ungoverned trailer fields must still reach the client untouched.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_security_headers_policy_strips_only_governed_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-buffered-trailers-policy", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "buffer",
+                    "plugins": [{"plugin_config_id": "trail-security-headers"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-security-headers",
+                    "plugin_name": "security_headers",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    // The backend never sends `x-powered-by` as a HEADER, so
+                    // this removal is a no-op on the initial map. Only the
+                    // config-time policy declaration can bind the trailer copy.
+                    "config": {"remove": ["x-powered-by"]},
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 buffered trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "buffered security_headers path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("x-powered-by"),
+        None,
+        "a backend trailer must not reintroduce a field the response header \
+         policy removes; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        Some("true"),
+        "ungoverned backend trailers must survive a response header policy; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
+// A plugin whose governed field set is not enumerable at config time fails
+// closed: `response_transformer` also applies per-request route overrides
+// published by `mesh_route_dispatch`, so the whole trailer section is dropped
+// rather than reconciled field by field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_unbounded_response_policy_drops_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-buffered-trailers-unbounded", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "buffer",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 buffered trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "buffered response_transformer path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-note")
+            .and_then(|value| value.to_str().ok()),
+        Some("transformed")
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        None,
+        "a non-enumerable response header policy must fail closed on the trailer \
+         section; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("x-powered-by"), None);
+}
+
+/// Spawn an H3 harness whose scripted backend answers `/api/trailers` with a
+/// buffered body plus two trailer fields — one that a response-header policy
+/// may govern (`x-powered-by`) and one that no policy names
+/// (`x-backend-finished`).
+///
+/// Returned as a tuple so the scripted TLS/H3 backends stay alive for the whole
+/// test; dropping them would tear the listeners down mid-request.
+async fn spawn_h3_trailer_policy_harness(
+    ca_name: &str,
+    build_config: impl FnOnce(u16) -> serde_json::Value,
+) -> (GatewayHarness, u16, (ScriptedTlsBackend, ScriptedH3Backend)) {
+    let ca = TestCa::new(ca_name).expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let body = bytes::Bytes::from_static(b"trailer-body");
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", body.len().to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(body.clone()))
+        .step(H3Step::RespondTrailers(vec![
+            ("x-powered-by", "backend/1.2".to_string()),
+            ("x-backend-finished", "true".to_string()),
+        ]))
+        .step(H3Step::StallFor(Duration::from_millis(100)))
+        .spawn()
+        .expect("spawn h3");
+
+    let yaml = serde_yaml::to_string(&build_config(backend_port)).expect("yaml");
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(pre["plain_http"]["h3"].as_str(), Some("supported"));
+
+    (harness, https_port, (tcp_backend, h3_backend))
+}

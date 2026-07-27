@@ -607,6 +607,9 @@ impl Plugin for PriorityOverridePlugin {
     fn initial_response_header_policy_names(&self) -> &[String] {
         self.inner.initial_response_header_policy_names()
     }
+    fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
+        self.inner.response_trailer_policy()
+    }
     fn may_modify_response_content_type(
         &self,
         ctx: &RequestContext,
@@ -2923,6 +2926,10 @@ impl PluginCapabilities {
     pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
     pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
     pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`, so
+    /// buffered paths that forward backend trailers must fail closed and drop
+    /// the whole trailer section rather than reconcile field by field.
+    pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u16 = 1 << 15;
 
     #[inline(always)]
     pub fn has(self, flag: u16) -> bool {
@@ -2951,6 +2958,11 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Unique canonical field names touched by initial-response policy.
     pub initial_response_header_policy_names: Arc<Vec<String>>,
+    /// Unique canonical field names whose response-header policy also binds the
+    /// TRAILER section, unioned from `Plugin::response_trailer_policy()`.
+    /// Buffered paths that forward backend trailers drop exactly these names,
+    /// so an auth/logging-only chain contributes nothing and keeps its trailers.
+    pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Capability bitset for fast boolean checks.
@@ -2985,6 +2997,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut request_headers_to_redact = Vec::new();
     let mut initial_response_header_policy_plugins = Vec::new();
     let mut initial_response_header_policy_names = Vec::new();
+    let mut response_trailer_policy_names: Vec<String> = Vec::new();
     let mut response_committed = Vec::new();
     // Ordered because response header/body rules are not commutative: the same
     // instances in a different order produce a different client-visible
@@ -3029,6 +3042,22 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 if !initial_response_header_policy_names.contains(name) {
                     initial_response_header_policy_names.push(name.clone());
                 }
+            }
+        }
+        match p.response_trailer_policy() {
+            crate::plugins::ResponseTrailerPolicy::None => {}
+            crate::plugins::ResponseTrailerPolicy::Names(names) => {
+                for name in names {
+                    if !response_trailer_policy_names
+                        .iter()
+                        .any(|known: &String| known.eq_ignore_ascii_case(name))
+                    {
+                        response_trailer_policy_names.push(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            crate::plugins::ResponseTrailerPolicy::Unbounded => {
+                caps |= PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY;
             }
         }
         for header in p.request_headers_to_redact() {
@@ -3086,6 +3115,7 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         request_headers_to_redact: Arc::new(request_headers_to_redact),
         initial_response_header_policy_plugins: Arc::new(initial_response_header_policy_plugins),
         initial_response_header_policy_names: Arc::new(initial_response_header_policy_names),
+        response_trailer_policy_names: Arc::new(response_trailer_policy_names),
         response_committed_plugins: Arc::new(response_committed),
         capabilities: PluginCapabilities(caps),
         response_presentation_policy_digest: (!presentation_policy_unprovable)
@@ -3725,6 +3755,21 @@ impl PluginCacheInner {
             .unwrap_or_else(|| Arc::new(Vec::new()))
     }
 
+    /// Response-header policy names that also bind the trailer section, for a
+    /// composed `proxy_key` + protocol.
+    ///
+    /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
+    /// proxy ID — see [`Self::protocol_entry`].
+    pub(crate) fn get_response_trailer_policy_names(
+        &self,
+        proxy_key: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<String>> {
+        self.protocol_entry(proxy_key, protocol)
+            .map(|entry| Arc::clone(&entry.phase.response_trailer_policy_names))
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     /// Response-committed hook plugins for a composed `proxy_key` + protocol.
     ///
     /// `proxy_key` is the composed `namespace|proxy_id` runtime key, not a raw
@@ -3856,6 +3901,8 @@ impl PluginCacheInner {
                     .get_initial_response_header_policy_plugins(proxy_key, protocol),
                 initial_response_header_policy_names: self
                     .get_initial_response_header_policy_names(proxy_key, protocol),
+                response_trailer_policy_names: self
+                    .get_response_trailer_policy_names(proxy_key, protocol),
                 response_committed_plugins: self
                     .get_response_committed_plugins(proxy_key, protocol),
                 response_presentation_policy_digest: self
@@ -3900,6 +3947,9 @@ impl PluginCacheInner {
                 initial_response_header_policy_names: Arc::clone(
                     &entry.phase.initial_response_header_policy_names,
                 ),
+                response_trailer_policy_names: Arc::clone(
+                    &entry.phase.response_trailer_policy_names,
+                ),
                 response_committed_plugins: Arc::clone(&entry.phase.response_committed_plugins),
                 response_presentation_policy_digest: entry
                     .phase
@@ -3929,6 +3979,7 @@ pub struct PluginCacheRequestView {
     request_headers_to_redact: Arc<Vec<String>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_names: Arc<Vec<String>>,
+    response_trailer_policy_names: Arc<Vec<String>>,
     response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     response_presentation_policy_digest: Option<[u8; 32]>,
     capabilities: PluginCapabilities,
@@ -3984,6 +4035,13 @@ impl PluginCacheRequestView {
     /// Get canonical field names touched by initial-response policy.
     pub fn initial_response_header_policy_names(&self) -> Arc<Vec<String>> {
         Arc::clone(&self.initial_response_header_policy_names)
+    }
+
+    /// Canonical field names whose response-header policy also binds the
+    /// trailer section. Empty for chains that only observe, authenticate, or
+    /// authorize, so those chains forward backend trailers untouched.
+    pub fn response_trailer_policy_names(&self) -> &[String] {
+        self.response_trailer_policy_names.as_slice()
     }
 
     /// Get the pre-filtered committed-response observer chain.
