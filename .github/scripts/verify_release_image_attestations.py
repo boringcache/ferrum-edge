@@ -18,6 +18,12 @@ SYFT_IMAGE = (
     "anchore/syft@sha256:"
     "9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b"
 )
+TRUSTED_CREATE_RELEASE_NEEDS = {
+    "build-release-binaries",
+    "build-release-arm64-cross",
+    "docker-manifest",
+    "docker-ebpf-manifest",
+}
 
 
 def extract_job(workflow: str, job: str) -> str:
@@ -63,6 +69,7 @@ def validate_release_workflow(workflow: str) -> list[str]:
     try:
         attest_job = extract_job(workflow, "attest-release-images")
         create_release = extract_job(workflow, "create-release")
+        gate_job = extract_job(workflow, "release-attestation-gate")
     except RuntimeError as error:
         return [*errors, str(error)]
 
@@ -73,11 +80,31 @@ def validate_release_workflow(workflow: str) -> list[str]:
         )
 
     create_needs = extract_needs(create_release)
-    if "attest-release-images" not in create_needs:
+    if create_needs != TRUSTED_CREATE_RELEASE_NEEDS:
         errors.append(
-            "jobs.create-release must wait for successful image attestation "
-            "and verification"
+            "jobs.create-release must keep the trusted ARM64 publication "
+            "dependency contract and must not gain an attestation needs edge"
         )
+
+    if extract_needs(gate_job) != {"create-release", "attest-release-images"}:
+        errors.append(
+            "jobs.release-attestation-gate must depend exactly on create-release "
+            "and attest-release-images"
+        )
+    if not re.search(r"(?m)^    if: always\(\)$", gate_job):
+        errors.append(
+            "jobs.release-attestation-gate must use if: always() so attestation "
+            "failure cannot skip the fail-closed publication gate"
+        )
+    for token in (
+        'if [ "$ATTEST_RESULT" != "success" ]; then',
+        "gh release delete",
+        "release publication is blocked until attest-release-images succeeds",
+    ):
+        if token not in gate_job:
+            errors.append(
+                f"jobs.release-attestation-gate is missing fail-closed token {token!r}"
+            )
 
     id_token_grants = re.findall(r"(?m)^\s+id-token:\s*write\s*$", workflow)
     if len(id_token_grants) != 1:
@@ -120,6 +147,10 @@ def validate_release_workflow(workflow: str) -> list[str]:
         'generate_sboms \\\n            standard ghcr "$STANDARD_GHCR_REF"',
         'generate_sboms \\\n            ebpf docker "$EBPF_DOCKER_REF"',
         'generate_sboms \\\n            ebpf ghcr "$EBPF_GHCR_REF"',
+        'jq -e -f "$work/require_manifest.jq"',
+        'jq -n \\',
+        '--arg build_type',
+        '-f "$work/create_provenance.jq"',
     )
     for token in required_tokens:
         if token not in attest_job:
@@ -150,8 +181,6 @@ def validate_release_workflow(workflow: str) -> list[str]:
     if PIPE_TO_SHELL.search(workflow):
         errors.append("release.yml contains a pipe-to-shell download")
     for checksum_token in (
-        '$expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"',
-        "$actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip)",
         '$expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"',
         "$actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip)",
     ):
@@ -190,8 +219,24 @@ def run_self_test(workflow: str) -> list[str]:
             ),
         ),
         (
-            "GitHub Release dependency",
-            workflow.replace(", attest-release-images]", "]", 1),
+            "trusted create-release needs",
+            workflow.replace(
+                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest]",
+                "    needs: [build-release-binaries, build-release-arm64-cross, docker-manifest, docker-ebpf-manifest, attest-release-images]",
+                1,
+            ),
+        ),
+        (
+            "release attestation gate",
+            workflow.replace(
+                "    needs: [create-release, attest-release-images]",
+                "    needs: [create-release]",
+                1,
+            ),
+        ),
+        (
+            "gate rollback delete",
+            workflow.replace("gh release delete", "gh release view", 1),
         ),
     )
     for label, mutated in mutations:
@@ -208,7 +253,8 @@ def main() -> int:
     if not errors:
         print(
             "Release image attestation contract covers two image families, "
-            "two registries, immutable subjects, and least-privilege OIDC."
+            "two registries, immutable subjects, least-privilege OIDC, and a "
+            "fail-closed publication gate compatible with trusted Cross policy."
         )
         return 0
     for error in errors:

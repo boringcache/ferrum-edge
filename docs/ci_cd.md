@@ -94,11 +94,13 @@ Push tag v* (e.g., v0.2.0)
                 macos-aarch64 / windows-x86_64) + isolated linux-aarch64 Cross job
                     └─► Push versioned Docker images to Docker Hub and GHCR
                             └─► Create Docker manifest tags
-                                    └─► Sign and attest final manifest digests
-                                            └─► Verify signatures, subjects,
-                                                provenance, and SPDX SBOMs
-                                                    └─► Create GitHub Release
-                                                        with binaries and checksums
+                                    ├─► Sign and attest final manifest digests,
+                                    │   then verify signatures, subjects,
+                                    │   provenance, and SPDX SBOMs
+                                    └─► Create GitHub Release with binaries
+                                            └─► Fail-closed publication gate
+                                                requires attestation success
+                                                (retracts an unverified release)
 ```
 
 ## CI Pipeline (ci.yml)
@@ -818,11 +820,19 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the CI publishers' success conditions are protected too. Only those direct
   publication-control fields are frozen, so unrelated implementation changes
   inside the publishing jobs remain permitted.
-- The release image attestation job's dependencies and exact permission block
-  are protected alongside `create-release`'s dependency on that job. This keeps
-  `id-token: write` isolated to the job that signs and attests already-assembled
-  immutable manifests. The required-CI static attestation contract separately
-  validates the complete signing, SBOM, provenance, and verification flow.
+- Trusted Cross also freezes Cross-sensitive release jobs by whole-job digest
+  under opaque-shell comparison, so `create-release.needs` cannot gain an
+  attestation edge from an ordinary pull request. Release image attestation
+  therefore stays a dedicated post-manifest job, and
+  `release-attestation-gate` joins `create-release` with
+  `attest-release-images` so the workflow cannot succeed unless verification
+  succeeded. If a GitHub Release is created before attestation finishes and
+  attestation then fails, the gate deletes that release. The attestation job's
+  dependencies and exact `id-token`/`packages` permission block remain part of
+  the required-CI static contract.
+- The required-CI static attestation contract separately validates the complete
+  signing, SBOM, provenance, verification, and fail-closed publication-gate
+  flow.
 - The Docker jobs never name the ARM64 artifact literally; they select it
   through matrix values. Their `strategy` block and the two steps that consume
   it — `Download Linux binary` (`name: binary-${{ matrix.binary_target }}` /
@@ -1101,13 +1111,15 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 
 ### Create Release Job
 
-**Depends On**: Release Build Job, Docker Manifest Job, Docker eBPF Manifest
-Job, and the verified image-attestation job
+**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest
+Job
 
-Creates a GitHub Release with all binaries and checksums only after the
-versioned Docker manifests have been pushed, signed, attested, and verified. A
-Docker Hub or GHCR manifest, signature, provenance, subject, or SBOM failure
-blocks GitHub Release creation.
+Creates a GitHub Release with all binaries and checksums after the versioned
+Docker manifests have been pushed. Durable release publication still fails
+closed on attestation: `release-attestation-gate` requires
+`attest-release-images` to succeed and deletes the GitHub Release if
+attestation verification fails. Trusted Cross freezes `create-release.needs`,
+so attestation cannot be added there directly.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)
@@ -1457,7 +1469,14 @@ existing `docker buildx imagetools create` assembly contract. The dedicated
    both platform SBOMs with Cosign; and
 6. verifies the Fulcio identity and GitHub OIDC claims, transparency-log-backed
    signature, provenance type and source commit, attestation subject digest,
-   and at least two non-empty SPDX predicates before release creation can run.
+   and at least two non-empty SPDX predicates.
+
+Because trusted Cross freezes `create-release.needs`, GitHub Release creation
+cannot gain a direct attestation dependency from this pull request. The
+`release-attestation-gate` job therefore joins `create-release` with
+`attest-release-images` under `if: always()`: the release workflow cannot
+succeed unless attestation verification succeeded, and a GitHub Release created
+before attestation finishes is deleted when attestation fails.
 
 The signatures and attestations are stored beside the immutable subject in each
 registry; neither registry is treated as a mutable pointer or as a fallback for
