@@ -1569,6 +1569,8 @@ enum DtlsKeyDerEncoding {
     Pkcs8,
 }
 
+type DtlsKeyDropHook = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// Ferrum-owned DTLS private-key DER that is cleared before its allocation is
 /// released.
 ///
@@ -1580,13 +1582,13 @@ enum DtlsKeyDerEncoding {
 struct ZeroizingDtlsKeyDer {
     bytes: Vec<u8>,
     encoding: DtlsKeyDerEncoding,
-    drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    drop_hook: Option<DtlsKeyDropHook>,
 }
 
 impl ZeroizingDtlsKeyDer {
     fn adopt(
         mut key: rustls::pki_types::PrivateKeyDer<'static>,
-        drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+        drop_hook: Option<DtlsKeyDropHook>,
     ) -> anyhow::Result<Self> {
         use zeroize::Zeroize;
 
@@ -1660,7 +1662,7 @@ pub fn load_dtls_certificate(
 pub(crate) fn load_dtls_certificate_with_key_drop_hook(
     cert_path: &str,
     key_path: &str,
-    drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    drop_hook: Option<DtlsKeyDropHook>,
 ) -> Result<DtlsCertificateChain, anyhow::Error> {
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
