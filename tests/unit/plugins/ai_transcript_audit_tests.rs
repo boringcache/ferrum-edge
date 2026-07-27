@@ -1143,6 +1143,10 @@ async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behav
 /// SHARED metadata (`stream_request`, `request_hash`) that drives the peer's
 /// buffer-vs-stream decision and its exported record, so it must stay gated on
 /// the local staging entry rather than on the borrowed marker.
+///
+/// Staging in `before_proxy` is classification-only: the stream marker is
+/// published immediately, but `request_hash` appears only when the *owning*
+/// instance runs capture (reject-path `after_proxy` or the final-body hook).
 #[tokio::test]
 async fn saturated_instance_must_not_refresh_a_peer_instances_staged_request() {
     let plugin = AiTranscriptAudit::new(
@@ -1177,16 +1181,37 @@ async fn saturated_instance_must_not_refresh_a_peer_instances_staged_request() {
         String::from_utf8(stream_request_body().to_vec()).unwrap(),
     );
     peer.before_proxy(&mut ctx, &mut proxy_headers).await;
-    let peer_request_hash = ctx
-        .metadata
-        .get("ai_transcript_audit.request_hash")
-        .cloned()
-        .expect("the peer stages the candidate and publishes its request hash");
     assert_eq!(
         ctx.metadata
             .get("ai_transcript_audit.stream_request")
             .map(String::as_str),
         Some("true")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.request_hash"),
+        "provisional before_proxy staging must not publish a request hash"
+    );
+
+    // Peer owns the short-circuit/reject-path capture: hash + stream decision
+    // are published from the still-streaming body before any terminator rewrite.
+    let mut peer_response_headers = HashMap::new();
+    assert!(matches!(
+        peer.after_proxy(&mut ctx, 200, &mut peer_response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let peer_request_hash = ctx
+        .metadata
+        .get("ai_transcript_audit.request_hash")
+        .cloned()
+        .expect("the owning peer publishes its request hash on reject-path capture");
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true"),
+        "peer reject-path capture must keep the streamed request marker"
     );
 
     // The saturated instance sees the peer's shared marker but wins no permit.
@@ -1203,6 +1228,11 @@ async fn saturated_instance_must_not_refresh_a_peer_instances_staged_request() {
             .map(String::as_str),
         Some("true"),
         "a saturated instance must not erase a peer instance's staged candidate"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.request_hash"),
+        Some(&peer_request_hash),
+        "a saturated before_proxy reject must not strip a peer's request hash"
     );
 
     // A request-phase terminator rewrites the body and drops `stream`. Only an
