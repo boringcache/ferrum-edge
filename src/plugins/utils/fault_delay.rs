@@ -55,7 +55,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -186,6 +186,7 @@ pub static FAULT_DELAY_ADMISSION: FaultDelayAdmission =
     FaultDelayAdmission::new(DEFAULT_MAX_CONCURRENT_FAULT_DELAYS);
 
 static FAULT_DELAY_SHUTDOWN: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
+static FAULT_DELAY_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Process-wide token cancelled when the gateway begins its shutdown drain.
 ///
@@ -202,6 +203,24 @@ pub fn fault_delay_shutdown() -> &'static CancellationToken {
 /// Apply the operator-configured delayed-work budget. Called once at startup.
 pub fn init_fault_delay_admission(max_concurrent_fault_delays: usize) {
     FAULT_DELAY_ADMISSION.set_capacity(max_concurrent_fault_delays);
+    // Published only after the configured capacity is visible. Serving-mode
+    // shutdown may then cancel the one-shot process token. Unit tests that
+    // exercise mode drain helpers without starting a gateway must not poison
+    // unrelated plugin tests in the same process.
+    FAULT_DELAY_RUNTIME_INITIALIZED.store(true, Ordering::Release);
+}
+
+/// Cancel production fault delays when a fully initialized gateway drains.
+///
+/// `begin_shutdown_drain` is also exercised by unit tests that never run
+/// [`init_fault_delay_admission`]. Gating cancellation on runtime
+/// initialization keeps those tests from permanently cancelling the
+/// process-wide one-shot token while preserving the production startup/shutdown
+/// contract: initialization occurs before any listener accepts traffic.
+pub fn cancel_fault_delays_for_shutdown() {
+    if FAULT_DELAY_RUNTIME_INITIALIZED.load(Ordering::Acquire) {
+        fault_delay_shutdown().cancel();
+    }
 }
 
 /// Run an injected fault delay against the process-wide budget and shutdown

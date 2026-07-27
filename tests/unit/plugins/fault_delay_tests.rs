@@ -349,7 +349,7 @@ fn serving_mode_shutdown_cancels_outstanding_fault_delays() {
         "shutdown drain must still set the drain/reject flags"
     );
     assert!(
-        body.contains("fault_delay::fault_delay_shutdown().cancel()"),
+        body.contains("fault_delay::cancel_fault_delays_for_shutdown()"),
         "shutdown drain must cancel outstanding injected fault delays"
     );
 
