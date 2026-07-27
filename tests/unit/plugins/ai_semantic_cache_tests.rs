@@ -41,9 +41,11 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -52,6 +54,59 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct SharedWriterGuard {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedWriter {
+    type Writer = SharedWriterGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedWriterGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+fn semantic_request_body() -> Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "What embedding diagnostics are redacted?"}]
+    })
+}
+
+fn semantic_endpoint_config(endpoint: String) -> serde_json::Value {
+    json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": endpoint,
+        "semantic_embedding_model": "test-embedding-model",
+        "semantic_similarity_threshold": 0.95,
+        "semantic_embedding_timeout_ms": 500
+    })
+}
 
 struct SingleflightWaitOverrideGuard<'a> {
     plugin: &'a AiSemanticCache,
@@ -534,6 +589,180 @@ fn test_semantic_endpoint_allows_literal_ips_permitted_by_backend_policy() {
         "semantic_embedding_endpoint": "http://127.0.0.1:12345/embeddings",
     });
     assert!(AiSemanticCache::new(&private_endpoint, private_client).is_ok());
+}
+
+#[test]
+fn test_semantic_embedding_endpoint_rejects_userinfo_without_echoing_credentials() {
+    let secret = "userinfo-secret-canary";
+    let result = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": format!(
+                "https://operator:{secret}@embeddings.example.com/v1/embeddings"
+            ),
+        }),
+        PluginHttpClient::default(),
+    );
+    let error = result.err().expect("URL userinfo must be rejected");
+    assert!(
+        error.contains("must not include username or password"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !error.contains(secret),
+        "config error leaked URL credential: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_semantic_embedding_signed_query_endpoint_still_reaches_provider() {
+    let mock_server = MockServer::start().await;
+    let query_secret = "signed-query-secret-canary";
+    let path_secret = "path-secret-canary";
+    Mock::given(method("POST"))
+        .and(path(format!("/{path_secret}/embeddings")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [1.0, 0.0, 0.0]}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "{}/{path_secret}/embeddings?api_key={query_secret}",
+            mock_server.uri()
+        )),
+        PluginHttpClient::default(),
+    )
+    .expect("signed query endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let (_, result) = run_before_proxy(&plugin, &body, None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "embedding call must fall through as a miss when no semantic hit exists"
+    );
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        1,
+        "signed query/path endpoint must still reach the provider"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_embedding_transport_diagnostics_redact_endpoint_secrets() {
+    use tokio::net::TcpListener;
+
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let path_secret = "path-token-secret-canary";
+    let query_secret = "query-token-secret-canary";
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "http://{addr}/{path_secret}/embeddings?token={query_secret}"
+        )),
+        PluginHttpClient::default(),
+    )
+    .expect("credential-bearing endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let _ = run_before_proxy(&plugin, &body, None).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !writer.contents().contains("semantic embedding unavailable")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(guard);
+
+    let logs = writer.contents();
+    for secret in [path_secret, query_secret] {
+        assert!(
+            !logs.contains(secret),
+            "transport diagnostic leaked {secret}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains("/..."),
+        "expected canonical redacted endpoint form in diagnostics: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let mock_server = MockServer::start().await;
+    let path_secret = "path-token-secret-canary";
+    let query_secret = "query-token-secret-canary";
+    Mock::given(method("POST"))
+        .and(path(format!("/{path_secret}/embeddings")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({
+                    "data": [{"embedding": [1.0, 0.0, 0.0]}]
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let http_client = PluginHttpClient::from_pool_config_with_threshold(
+        &PoolConfig::default(),
+        50,
+    );
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "{}/{path_secret}/embeddings?token={query_secret}",
+            mock_server.uri()
+        )),
+        http_client,
+    )
+    .expect("credential-bearing endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let _ = run_before_proxy(&plugin, &body, None).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !writer.contents().contains("Slow plugin HTTP call")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(guard);
+
+    let logs = writer.contents();
+    assert!(logs.contains("Slow plugin HTTP call"), "expected slow-call log: {logs}");
+    for secret in [path_secret, query_secret] {
+        assert!(
+            !logs.contains(secret),
+            "slow-call diagnostic leaked {secret}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains("/..."),
+        "expected canonical redacted endpoint form in slow-call diagnostics: {logs}"
+    );
 }
 
 #[test]

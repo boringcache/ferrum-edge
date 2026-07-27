@@ -60,7 +60,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
-use url::Host;
+use url::{Host, Url};
 
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
@@ -387,6 +387,11 @@ struct CachedResponse {
 struct SemanticConfig {
     provider: EmbeddingProvider,
     endpoint: String,
+    /// Canonical diagnostic URL with path/query/fragment stripped for logs and
+    /// sanitized transport/build errors. The outbound request still uses
+    /// [`Self::endpoint`], including signed query parameters or credential-
+    /// bearing path tokens required by the provider.
+    redacted_endpoint: String,
     /// Lowercased domain hostname used for DNS pre-warming, or `None` when
     /// the endpoint uses a literal IP and requires no DNS lookup.
     warmup_hostname: Option<String>,
@@ -1526,7 +1531,11 @@ impl AiSemanticCache {
 
         let response = self
             .http_client
-            .execute(request, "ai_semantic_cache_embedding")
+            .execute_redacted(
+                request,
+                "ai_semantic_cache_embedding",
+                &semantic.redacted_endpoint,
+            )
             .await
             .map_err(|err| format!("embedding request failed: {err}"))?;
 
@@ -5224,12 +5233,13 @@ fn parse_semantic_config(
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    let warmup_hostname = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let validated_endpoint = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
         endpoint,
-        warmup_hostname,
+        redacted_endpoint: validated_endpoint.redacted,
+        warmup_hostname: validated_endpoint.warmup_hostname,
         model,
         api_key,
         auth_header,
@@ -5242,15 +5252,26 @@ fn parse_semantic_config(
     }))
 }
 
+struct ValidatedSemanticEmbeddingEndpoint {
+    redacted: String,
+    warmup_hostname: Option<String>,
+}
+
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<Option<String>, String> {
-    let parsed_endpoint = url::Url::parse(endpoint)
+) -> Result<ValidatedSemanticEmbeddingEndpoint, String> {
+    let parsed_endpoint = Url::parse(endpoint)
         .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
         return Err(
             "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+        );
+    }
+    if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
+        return Err(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' must not include username or password; use semantic_embedding_api_key for credentials"
+                .to_string(),
         );
     }
 
@@ -5272,7 +5293,18 @@ fn validate_semantic_embedding_endpoint(
         ));
     }
 
-    Ok(warmup_hostname)
+    Ok(ValidatedSemanticEmbeddingEndpoint {
+        redacted: redacted_semantic_embedding_endpoint(&parsed_endpoint),
+        warmup_hostname,
+    })
+}
+
+fn redacted_semantic_embedding_endpoint(parsed: &Url) -> String {
+    let mut redacted = parsed.clone();
+    redacted.set_path("/...");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
@@ -5319,6 +5351,19 @@ mod tests {
     fn force_cleanup(plugin: &AiSemanticCache) {
         plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
         plugin.cleanup_expired();
+    }
+
+    #[test]
+    fn redacted_semantic_embedding_endpoint_strips_credential_path_and_query() {
+        let parsed = Url::parse(
+            "https://embeddings.example/private/signed-secret?code=query-secret#frag",
+        )
+        .expect("test URL must parse");
+        let redacted = redacted_semantic_embedding_endpoint(&parsed);
+        assert_eq!(redacted, "https://embeddings.example/...");
+        assert!(!redacted.contains("signed-secret"));
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains('#'));
     }
 
     #[test]
