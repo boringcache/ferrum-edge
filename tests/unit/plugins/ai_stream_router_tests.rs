@@ -3,7 +3,10 @@
 use super::plugin_utils::{create_test_proxy, normalize_compressed_request_for_plugin_test};
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
-use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+use ferrum_edge::plugins::ai_stream_router::{
+    AiStreamRouter, MAX_SSE_EVENT_BYTES, MAX_SSE_EVENT_JSON_DEPTH, MAX_SSE_EVENTS,
+    MAX_SSE_NORMALIZED_BODY_BYTES,
+};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -1446,19 +1449,48 @@ async fn test_backend_tls_default_and_inherit() {
 }
 
 // ---------------------------------------------------------------------------
-// Normalizer carry bound
+// Normalizer resource bounds (GHSA-7c68-39j4-mjg9)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_normalizer_terminates_on_oversized_sse_event() {
+async fn claimed_anthropic_inspector() -> (
+    AiStreamRouter,
+    RequestContext,
+    Box<dyn ResponseStreamInspector>,
+) {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
     let mut ctx = post_ctx(&claude);
     let mut headers = json_headers();
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+    let inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .unwrap();
+        .expect("anthropic normalizer");
+    (plugin, ctx, inspector)
+}
+
+fn assert_bound_termination(text: &str, needle: &str) {
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(text.contains(needle), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    // Stable diagnostics must not echo raw provider payload bytes.
+    assert!(!text.contains("aaaaaaaa"), "{text}");
+}
+
+fn oversized_complete_event(event_bytes: usize) -> Vec<u8> {
+    // `data: ` (6) + filler + `\n\n` (2) == event_bytes.
+    assert!(event_bytes >= 8, "event frame too small");
+    let filler_len = event_bytes - 8;
+    let mut event = Vec::with_capacity(event_bytes);
+    event.extend_from_slice(b"data: ");
+    event.resize(event.len() + filler_len, b'a');
+    event.extend_from_slice(b"\n\n");
+    assert_eq!(event.len(), event_bytes);
+    event
+}
+
+#[tokio::test]
+async fn test_normalizer_terminates_on_oversized_sse_event() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
 
     // One giant never-terminated event: no blank-line boundary ever arrives.
     let filler = vec![b'a'; 64 * 1024];
@@ -1482,9 +1514,7 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
         .expect("oversized unterminated SSE event must terminate the stream")
         .expect("termination must carry a client-facing SSE error payload");
     let text = String::from_utf8(final_bytes.to_vec()).unwrap();
-    assert!(text.contains("upstream_error"), "{text}");
-    assert!(text.contains("oversized"), "{text}");
-    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert_bound_termination(&text, "oversized");
 
     // After termination the inspector keeps the stream closed without
     // emitting the terminal payload a second time.
@@ -1494,6 +1524,327 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
         ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
         ResponseStreamAction::Forward(_) => panic!("terminated inspector must remain closed"),
     }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_complete_event_at_exact_boundary_plus_one() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    let action = inspector.on_chunk(&event).await;
+    match action {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("boundary+1 complete event must terminate before parse: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_accepts_complete_event_at_exact_per_event_boundary() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Exact-cap frame that is not valid Anthropic JSON: the size gate must
+    // admit it so malformed-JSON rejection (not oversized) is what fires.
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES);
+    let action = inspector.on_chunk(&event).await;
+    match action {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("upstream_error"), "{text}");
+            assert!(
+                text.contains("malformed") || text.contains("JSON"),
+                "exact-cap event must reach parse/framing checks, not the oversized gate: {text}"
+            );
+            assert!(!text.contains("oversized"), "{text}");
+        }
+        ResponseStreamAction::Forward(bytes) => {
+            // Ignored non-JSON data frames may forward empty/partial output.
+            assert!(
+                bytes.is_empty()
+                    || String::from_utf8_lossy(&bytes).contains("chat.completion.chunk"),
+                "unexpected forward payload"
+            );
+        }
+        other => panic!("exact-cap event must not be treated as oversized: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_split_oversized_event_before_boundary() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let half = MAX_SSE_EVENT_BYTES / 2 + 1;
+    let first = vec![b'x'; half];
+    match inspector.on_chunk(&first).await {
+        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+        other => panic!("first half under the cap must not terminate: {other:?}"),
+    }
+    let second = vec![b'y'; half];
+    match inspector.on_chunk(&second).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("split oversized partial must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_when_boundary_arrives_with_final_oversized_bytes() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Fill exactly to the cap with no delimiter, then deliver the blank line
+    // that would complete an oversized frame.
+    let prefix = vec![b'z'; MAX_SSE_EVENT_BYTES];
+    match inspector.on_chunk(&prefix).await {
+        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+        other => panic!("exact-cap partial must wait for more bytes: {other:?}"),
+    }
+    match inspector.on_chunk(b"\n\n").await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("delimiter completing an oversized event must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Many tiny complete frames in one chunk: cursor design must finish
+    // without terminating and without requiring giant allocations.
+    let event = b"data: {\"type\":\"ping\"}\n\n";
+    let count = 2_048usize;
+    let mut body = Vec::with_capacity(count * event.len());
+    for _ in 0..count {
+        body.extend_from_slice(event);
+    }
+    match inspector.on_chunk(&body).await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert!(
+                bytes.is_empty(),
+                "ping frames produce no OpenAI output: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        other => panic!("many small in-limit events must not terminate: {other:?}"),
+    }
+    // Structural companion: library-inline `sse_buffer_tests` asserts cursor
+    // compaction keeps capacity O(partial). Here we only prove the public
+    // streaming path stays healthy under a many-event burst.
+}
+
+#[tokio::test]
+async fn test_normalizer_cumulative_body_exhaustion() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let event = b"data: {\"type\":\"ping\"}\n\n";
+    let mut sent = 0usize;
+    loop {
+        if sent.saturating_add(event.len()) > MAX_SSE_NORMALIZED_BODY_BYTES {
+            match inspector.on_chunk(event).await {
+                ResponseStreamAction::Terminate(Some(bytes)) => {
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert_bound_termination(&text, "cumulative size limit");
+                    break;
+                }
+                other => panic!("crossing cumulative body cap must terminate: {other:?}"),
+            }
+        }
+        match inspector.on_chunk(event).await {
+            ResponseStreamAction::Forward(_) => sent += event.len(),
+            ResponseStreamAction::Terminate(Some(bytes)) => {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                // Event-count may trip first depending on constants; either
+                // bound is a valid fail-closed outcome under the body flood.
+                assert!(
+                    text.contains("cumulative size limit") || text.contains("event count limit"),
+                    "{text}"
+                );
+                assert_bound_termination(
+                    &text,
+                    if text.contains("event count") {
+                        "event count limit"
+                    } else {
+                        "cumulative size limit"
+                    },
+                );
+                break;
+            }
+            other => panic!("unexpected action under body flood: {other:?}"),
+        }
+        assert!(
+            sent <= MAX_SSE_NORMALIZED_BODY_BYTES,
+            "test must not allocate past the documented body ceiling"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_event_count_exhaustion() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let event = b"data: {\"type\":\"ping\"}\n\n";
+    // Stay under the cumulative byte cap while exhausting the event counter.
+    assert!(
+        (MAX_SSE_EVENTS + 1) * event.len() <= MAX_SSE_NORMALIZED_BODY_BYTES,
+        "event-count fixture must fit under the body byte cap"
+    );
+    let batch = 1_024usize;
+    let mut seen = 0usize;
+    let mut terminated = None;
+    while seen < MAX_SSE_EVENTS + 1 {
+        let n = batch.min(MAX_SSE_EVENTS + 1 - seen);
+        let mut chunk = Vec::with_capacity(n * event.len());
+        for _ in 0..n {
+            chunk.extend_from_slice(event);
+        }
+        match inspector.on_chunk(&chunk).await {
+            ResponseStreamAction::Forward(_) => seen += n,
+            ResponseStreamAction::Terminate(bytes) => {
+                terminated = Some(bytes);
+                break;
+            }
+        }
+    }
+    let final_bytes = terminated
+        .expect("event-count exhaustion must terminate")
+        .expect("termination payload required");
+    let text = String::from_utf8(final_bytes.to_vec()).unwrap();
+    assert_bound_termination(&text, "event count limit");
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_excessive_json_depth() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let depth = MAX_SSE_EVENT_JSON_DEPTH + 1;
+    let mut payload = String::new();
+    for _ in 0..depth {
+        payload.push('{');
+        payload.push_str("\"k\":");
+    }
+    payload.push('1');
+    for _ in 0..depth {
+        payload.push('}');
+    }
+    let frame = format!("data: {payload}\n\n");
+    match inspector.on_chunk(frame.as_bytes()).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "excessive JSON nesting");
+        }
+        other => panic!("over-deep JSON must fail closed before parse: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_buffered_path_enforces_complete_event_size() {
+    let (plugin, mut ctx, _inspector) = claimed_anthropic_inspector().await;
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    let out = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &event,
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered normalize must return a body");
+    let text = String::from_utf8(out).unwrap();
+    assert_bound_termination(&text, "oversized");
+}
+
+#[tokio::test]
+async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Single chunk containing the entire oversized event and blank-line
+    // boundary — the original advisory reproduction.
+    let mut chunk = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    chunk.extend_from_slice(b"data: {\"type\":\"ping\"}\n\n");
+    match inspector.on_chunk(&chunk).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("single-chunk oversized complete event must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_malformed_utf8_fails_closed() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let frame = b"data: \xff\xfe not utf8\n\n";
+    match inspector.on_chunk(frame).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("upstream_error"), "{text}");
+            assert!(text.contains("malformed"), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        }
+        other => panic!("malformed UTF-8 must fail closed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_independent_normalizers() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let plugin = build(openai_and_anthropic_config());
+        let mut ctx = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        handles.push(tokio::spawn(async move {
+            let mut inspector = plugin
+                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                .expect("inspector");
+            if i % 2 == 0 {
+                let bad = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+                match inspector.on_chunk(&bad).await {
+                    ResponseStreamAction::Terminate(Some(bytes)) => {
+                        let text = String::from_utf8(bytes.to_vec()).unwrap();
+                        assert!(text.contains("oversized"), "{text}");
+                    }
+                    other => panic!("concurrent oversized path failed: {other:?}"),
+                }
+            } else {
+                let ok = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                let mut out = Vec::new();
+                match inspector.on_chunk(ok.as_bytes()).await {
+                    ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+                        out.extend_from_slice(&b);
+                    }
+                    ResponseStreamAction::Terminate(None) => {}
+                }
+                if !String::from_utf8_lossy(&out).contains("[DONE]") {
+                    match inspector.on_end().await {
+                        ResponseStreamAction::Forward(b)
+                        | ResponseStreamAction::Terminate(Some(b)) => {
+                            out.extend_from_slice(&b);
+                        }
+                        ResponseStreamAction::Terminate(None) => {}
+                    }
+                }
+                let text = String::from_utf8(out).unwrap();
+                assert!(text.contains("\"content\":\"ok\""), "{text}");
+                assert!(text.contains("data: [DONE]"), "{text}");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("normalizer task");
+    }
+    // Keep the outer plugin alive so the test clearly owns independent instances.
+    let _ = plugin.name();
 }
 
 // ---------------------------------------------------------------------------
