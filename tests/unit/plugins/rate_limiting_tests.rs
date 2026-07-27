@@ -1721,7 +1721,8 @@ fn redis_failure_policy_is_validated_in_local_mode_and_rejects_unknown_values() 
         "redis_failure_policy": "nonsense"
     }));
     RateLimiting::new(&latent, PluginHttpClient::default())
-        .expect_err("latent redis_failure_policy must be validated in local mode");
+        .err()
+        .expect("latent redis_failure_policy must be validated in local mode");
 }
 
 /// Every affected consumer must accept the key, so an operator can express the

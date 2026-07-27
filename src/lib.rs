@@ -2420,12 +2420,10 @@ pub mod _test_support {
         config_id: &str,
     ) -> Result<Option<String>, String> {
         use crate::plugins::PluginHttpClient;
-        use crate::plugins::ai_rate_limiter::AiRateLimiter;
         use crate::plugins::graphql::GraphqlPlugin;
         use crate::plugins::grpc_method_router::GrpcMethodRouter;
         use crate::plugins::rate_limiting::RateLimiting;
         use crate::plugins::udp_rate_limiting::UdpRateLimiting;
-        use crate::plugins::ws_rate_limiting::WsRateLimiting;
 
         let http = PluginHttpClient::default();
         match plugin_name {
