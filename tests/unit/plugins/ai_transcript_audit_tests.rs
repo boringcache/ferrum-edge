@@ -8086,16 +8086,16 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
         .await;
     // Drain any queued record and inspect omission reason when present.
     let records = wait_for_records(&server).await;
-    if let Some(record) = records.first() {
-        if record.get("request_body").is_none() {
-            assert_eq!(
-                record
-                    .get("request_body_omitted_reason")
-                    .and_then(|v| v.as_str()),
-                Some("retained_byte_budget"),
-                "withheld excerpt must use the compiled-in retained-byte reason"
-            );
-        }
+    if let Some(record) = records.first()
+        && record.get("request_body").is_none()
+    {
+        assert_eq!(
+            record
+                .get("request_body_omitted_reason")
+                .and_then(|v| v.as_str()),
+            Some("retained_byte_budget"),
+            "withheld excerpt must use the compiled-in retained-byte reason"
+        );
     }
     let final_snap = plugin.status_snapshot();
     assert!(
