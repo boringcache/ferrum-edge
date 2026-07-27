@@ -1116,6 +1116,18 @@ impl RemoteDiscoveryManager {
             self.revision_gates.clear();
             return;
         };
+        // Ordering state belongs to the declared remote-cluster identity, not
+        // to its current eligibility. Preserve a still-declared cluster's gate
+        // across temporary trust loss, URL validation failure, or credential
+        // rotation so restoring eligibility cannot admit an older generation.
+        // Prune only identities that were actually removed from config.
+        let declared_names: std::collections::HashSet<&str> = multi_cluster
+            .remote_clusters
+            .iter()
+            .map(|remote| remote.name.as_str())
+            .collect();
+        self.revision_gates
+            .retain(|name, _| declared_names.contains(name.as_str()));
         let targets = poll_targets_for_multi_cluster_with_posture(
             multi_cluster,
             &trust_bundle_domains,
@@ -1123,7 +1135,6 @@ impl RemoteDiscoveryManager {
         );
         if targets.is_empty() {
             self.stop_all(true);
-            self.revision_gates.clear();
             debug!("No remote clusters eligible for endpoint discovery; pollers stopped");
             return;
         }
@@ -3377,6 +3388,11 @@ mod tests {
 
         manager.reconcile(Some(&mc), trusted);
         assert_eq!(manager.running_cluster_names(), vec!["west"]);
+        let revision_gate = manager
+            .revision_gates
+            .get("west")
+            .expect("eligible cluster has an ordering gate")
+            .clone();
         store.install_for_test(RemoteClusterEntry {
             cluster_name: "west".to_string(),
             trust_domain: td("remote.local"),
@@ -3401,6 +3417,29 @@ mod tests {
         assert!(
             store.snapshot().is_empty(),
             "trust withdrawal removes stale remote endpoints"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &revision_gate,
+                manager
+                    .revision_gates
+                    .get("west")
+                    .expect("a still-declared cluster retains its ordering gate"),
+            ),
+            "temporary trust loss must not reset the remote revision watermark"
+        );
+        let mut restored_trust = std::collections::HashSet::new();
+        restored_trust.insert(td("remote.local"));
+        manager.reconcile(Some(&mc), restored_trust);
+        assert!(
+            Arc::ptr_eq(
+                &revision_gate,
+                manager
+                    .revision_gates
+                    .get("west")
+                    .expect("restored eligibility reuses the ordering gate"),
+            ),
+            "restoring trust must not admit a stale remote generation as bootstrap"
         );
         manager.shutdown();
     }
