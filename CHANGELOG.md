@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Versioned standard and `-ebpf` multi-architecture images are now keylessly
+  signed in Docker Hub and GHCR and carry final-manifest SLSA provenance plus
+  per-platform SPDX SBOM attestations. Release publication waits for identity,
+  signature, subject-digest, source-commit, provenance, and SBOM verification.
 - `response_caching` now applies RFC 9111 §3.5 shared-cache admission to the
   live request credential rather than only to a gateway-minted identity, so a
   gateway that forwards `Authorization` to a backend that validates it no longer

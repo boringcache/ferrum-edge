@@ -15,6 +15,12 @@ from live_suite_path_filter import (
     exact_path_patterns,
 )
 from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_test
+from verify_release_image_attestations import (
+    run_self_test as release_attestation_self_test,
+)
+from verify_release_image_attestations import (
+    validate_release_workflow,
+)
 
 
 REQUIRED_JOBS = {
@@ -451,6 +457,9 @@ def main() -> int:
     except AssertionError as error:
         planner_errors.append(f"Markdown link-check self-test failed: {error}")
     planner_errors.extend(error.format() for error in check_repository())
+    release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+    planner_errors.extend(validate_release_workflow(release_yml))
+    planner_errors.extend(release_attestation_self_test(release_yml))
 
     node_waypoint_yml = Path(
         ".github/workflows/node-waypoint-ebpf-live.yml"
