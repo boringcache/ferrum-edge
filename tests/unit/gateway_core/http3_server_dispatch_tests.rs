@@ -1526,17 +1526,20 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     // The witness must be captured BEFORE the first response-header phase,
     // otherwise the "did the chain change this field?" comparison is against a
     // map the chain already rewrote and every mutation reads as a no-op.
-    let capture = src
-        .split("        // after_proxy hooks")
+    let buffered_response_region = src
+        .split("        // Capture original response invariants before `after_proxy`")
         .nth(1)
-        .expect("buffered after_proxy phase")
+        .expect("buffered native-H3 response region")
+        .split("// Build and send buffered response")
+        .next()
+        .expect("bounded buffered native-H3 response region");
+    let (before_capture, after_capture) = buffered_response_region
+        .split_once("        // after_proxy hooks")
+        .expect("buffered after_proxy phase");
+    let capture = after_capture
         .split("// Sticky session cookie injection.")
         .next()
         .expect("bounded after_proxy trailer region");
-    let before_capture = src
-        .split("        // after_proxy hooks")
-        .next()
-        .expect("pre-after_proxy region");
     assert!(
         before_capture.contains("ResponseTrailerPolicyWitness::capture(")
             && before_capture.contains("ResponseTrailerPolicyWitness::Unproven"),
