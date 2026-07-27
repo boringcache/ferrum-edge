@@ -1015,20 +1015,9 @@ PUBLISH_CONTROL_CONTRACTS = {
         "create-release": {
             "needs": (
                 "    needs: [build-release-binaries, build-release-arm64-cross, "
-                "docker-manifest, docker-ebpf-manifest, "
-                "attest-release-images]\n"
+                "docker-manifest, docker-ebpf-manifest]\n"
             ),
             "steps": RELEASE_CREATE_RELEASE_STEPS,
-        },
-        "attest-release-images": {
-            "needs": (
-                "    needs: [docker-manifest, docker-ebpf-manifest]\n"
-            ),
-            "permissions": (
-                "    permissions:\n"
-                "      id-token: write\n"
-                "      packages: write\n"
-            ),
         },
         "docker": {
             "needs": (
