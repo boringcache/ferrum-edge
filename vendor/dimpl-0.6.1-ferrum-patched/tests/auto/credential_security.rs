@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dimpl::certificate::generate_self_signed_certificate;
-use dimpl::{Config, Dtls, DtlsCertificateChain, DtlsPrivateKey, ProtocolVersion};
+use dimpl::{Config, Dtls, DtlsCertificate, DtlsCertificateChain, DtlsPrivateKey, ProtocolVersion};
+use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 
 use crate::common::{default_config, deliver_packets, drain_outputs};
 
@@ -111,13 +112,14 @@ fn auto_server_fallback_zeroizes_transferred_private_key_owner() {
     );
 }
 
-fn assert_server_chain_transmitted(version: ProtocolVersion) {
+fn assert_server_chain_transmitted_with_identity(
+    version: ProtocolVersion,
+    mut server_identity: DtlsCertificate,
+    intermediates: Vec<Vec<u8>>,
+) {
     let client_identity = generate_self_signed_certificate().expect("client identity");
-    let mut server_identity = generate_self_signed_certificate().expect("server identity");
-    let expected_chain = vec![
-        server_identity.certificate.clone(),
-        vec![0x30, 0x03, 0x02, 0x01, 0x01],
-    ];
+    let mut expected_chain = vec![server_identity.certificate.clone()];
+    expected_chain.extend(intermediates);
     let server_chain = DtlsCertificateChain::new(
         expected_chain.clone(),
         std::mem::take(&mut server_identity.private_key),
@@ -163,6 +165,34 @@ fn assert_server_chain_transmitted(version: ProtocolVersion) {
     assert_eq!(received_chain, Some(expected_chain));
 }
 
+fn assert_server_chain_transmitted(version: ProtocolVersion) {
+    assert_server_chain_transmitted_with_identity(
+        version,
+        generate_self_signed_certificate().expect("server identity"),
+        vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]],
+    );
+}
+
+fn large_server_identity() -> DtlsCertificate {
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("large identity key");
+    let names: Vec<String> = (0..128)
+        .map(|index| format!("dtls-{index:03}.certificate-buffer-regression.example.test"))
+        .collect();
+    let params = CertificateParams::new(names).expect("large identity params");
+    let certificate = params
+        .self_signed(&key_pair)
+        .expect("large self-signed identity");
+    let identity = DtlsCertificate {
+        certificate: certificate.der().to_vec(),
+        private_key: key_pair.serialize_der(),
+    };
+    assert!(
+        identity.certificate.len() > 2048,
+        "fixture must exceed drain_outputs' poll buffer"
+    );
+    identity
+}
+
 #[test]
 fn dtls12_transmits_full_certificate_chain_in_configured_order() {
     assert_server_chain_transmitted(ProtocolVersion::DTLS1_2);
@@ -171,4 +201,22 @@ fn dtls12_transmits_full_certificate_chain_in_configured_order() {
 #[test]
 fn dtls13_transmits_full_certificate_chain_in_configured_order() {
     assert_server_chain_transmitted(ProtocolVersion::DTLS1_3);
+}
+
+#[test]
+fn dtls12_peer_leaf_output_is_not_limited_by_poll_buffer() {
+    assert_server_chain_transmitted_with_identity(
+        ProtocolVersion::DTLS1_2,
+        large_server_identity(),
+        Vec::new(),
+    );
+}
+
+#[test]
+fn dtls13_peer_leaf_output_is_not_limited_by_poll_buffer() {
+    assert_server_chain_transmitted_with_identity(
+        ProtocolVersion::DTLS1_3,
+        large_server_identity(),
+        Vec::new(),
+    );
 }

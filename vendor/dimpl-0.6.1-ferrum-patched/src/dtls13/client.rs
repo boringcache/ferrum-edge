@@ -1521,17 +1521,9 @@ fn parse_certificate_request(cr_data: &[u8], base_offset: usize) -> Result<Optio
 // =========================================================================
 
 impl LocalEvent {
-    pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
+    pub fn into_output<'a>(self, _buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
         match self {
-            LocalEvent::PeerCert => {
-                let l = peer_certs[0].len();
-                assert!(
-                    l <= buf.len(),
-                    "Output buffer too small for peer certificate"
-                );
-                buf[..l].copy_from_slice(&peer_certs[0]);
-                Output::PeerCert(&buf[..l])
-            }
+            LocalEvent::PeerCert => Output::PeerCert(peer_certs[0].as_ref().to_vec().into()),
             LocalEvent::PeerCertChain => Output::PeerCertChain(
                 peer_certs
                     .iter()

@@ -50,7 +50,7 @@ d0fe812e201979bec0d19bd94e94e23e57f9479b35bb868eebec7fda820ce613  vendor/dimpl-0
 d7dedd56959d7877d036d48d6608fc7e1b8a6117930f44c2a065032727ab2945  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_cert.der
 f896474855c143dfe61b81b5999acfa8f606deb25780228ebb2e0bffefe6e263  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_sha384_sig.der
 40d999c96444045249999be2b82f0ee7111b10e42f84d503a611c0ca12231ace  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/test_data.bin
-85ebc28592c77bde6802dac6026d1802d8b605e64b6d0a6f50ec30e21727dd32  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/client.rs
+95b71b83aa90361fcdb445790cdfec121fa081f9fa47d25814097acda781a44f  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/client.rs
 4e59dc8b02abcac664a55e72bfcca866b4eb077c8a31e96f2d91916ef4a5ab98  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/context.rs
 ff767c63e4550fef7c15098d2e8b42f92520f73f716da9aba32954f306e0b545  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/engine.rs
 b6434e2aa403252419577b7fef735e28667132df56861e40456493a3f594eae5  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/incoming.rs
@@ -80,7 +80,7 @@ d35118493f2a72e59e65efc81e1161dc1ee455c2d5d17d64fbcce3a972cb561a  vendor/dimpl-0
 1d498d8a4e5e315963bb55b1b24a35adaadfc91b3c4617a04c81471d5e216163  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/mod.rs
 02b0b9d877aeb0f7389d6f7abf03c1343108f94dc32b127422269af4a53d3d29  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/queue.rs
 1cc511c9303fa8e739170d1e549812eb97f092f1358e2a5ee4f7d1e2c9466127  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/server.rs
-64db568f5dbd75184dbe63efea4acbe371a002e7e02941237368bebb10322df7  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/client.rs
+466a200b651afda252950146f4f38c3e76b8216915faff633ea5972f8035fbb2  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/client.rs
 c4c44affd5a19187a221c3de7a486d2a2fad5efd8557d448e511962a7b3fcf5a  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/engine.rs
 c45f12ba16d300e224ccda4c310c7a9c5f8231727d9e22b4e277c1a16674a8e9  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/incoming.rs
 99b7ecc4e53290a9bffc2a6e3f7f10614a001396727b3067877323da629bd647  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/message/certificate.rs
@@ -106,7 +106,7 @@ bd4d5e738169c73253e4cc1522b1bb06048af71cf4f715d3eb006cc47190e9ae  vendor/dimpl-0
 8f80a4c75fcb6d559c212dbcef8c1019b5fe873b58a4849f0df133805da38073  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/queue.rs
 f974a3dcb851f4f23e5b83135d00af3d86136f6f4c4f36a970868baf8f2d3d74  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/server.rs
 86baeacfb53745cee38cbc156c688ba6a85b06811c78fc8b8c6e382e43bb972d  vendor/dimpl-0.6.1-ferrum-patched/src/error.rs
-5e766c6d3ad45ad22141876f71692181224b4b2af990180c0a42175f9efa4a7a  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
+23be6c11531b5db868d3b93bfe9a878bf928695d2d593e186cbc57c0430f5797  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
 fae07477be7a08625fc6bdc9d949b08b744ce8d7d0119f3616f56e80ad5ad1d1  vendor/dimpl-0.6.1-ferrum-patched/src/rng.rs
 49caabfeb201e65a21a4f0cb1ef76020030ca985997d4ba063322f0d2889ceba  vendor/dimpl-0.6.1-ferrum-patched/src/time_tricks.rs
 f134d1fb91dc327fed41cf9667be7e44a4413658aff2846d3fb61bfc77e0f5e6  vendor/dimpl-0.6.1-ferrum-patched/src/timer.rs
@@ -114,7 +114,7 @@ f134d1fb91dc327fed41cf9667be7e44a4413658aff2846d3fb61bfc77e0f5e6  vendor/dimpl-0
 2d9c4e675f4ecf9ce7990e568485f77c55477891f0b674f31afb4055c229387d  vendor/dimpl-0.6.1-ferrum-patched/src/util.rs
 ec48ef4c0f4ae8316d12da55659c60097deb6916ca6ca95b6fc00ccc37be3592  vendor/dimpl-0.6.1-ferrum-patched/src/window.rs
 6400a32ff10d50ae67610c758e66311c85e6d911fb9ade54085b9c3023c7dfbf  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/common.rs
-4d94b490604a1037e63850227710451d714aac5fa41847dc099ee7a4f8c0e3cf  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs
+09e7bc55ff38fd55ac0e8de0d400356357be4e85e1fdddad697600615da0bdbf  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs
 da6f21a9834e18db2c2179844d881b3b50af36564b10942123294b665353d5ac  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/cross_matrix.rs
 5e82af344984b77082d34361d4f13da85d1591a60ea7f07271e4188a46bfdeb9  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/handshake.rs
 caa1219b32084cde9432ad6be257806f1309742df9d120c4464d8ce4662ceb60  vendor/dimpl-0.6.1-ferrum-patched/tests/auto/main.rs

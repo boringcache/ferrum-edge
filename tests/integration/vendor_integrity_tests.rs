@@ -45,8 +45,7 @@ const VENDOR_REL: &str = "vendor";
 /// crates do not cause false drift failures. Prefer extending this allowlist
 /// over parent-name heuristics when a new vendor lockfile is intentionally
 /// committed.
-const GOVERNED_VENDOR_LOCKFILES: &[&str] =
-    &["vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock"];
+const GOVERNED_VENDOR_LOCKFILES: &[&str] = &["vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock"];
 
 fn repo_root() -> PathBuf {
     // Runtime lookup (not `env!`) so this resolves correctly when the test runs

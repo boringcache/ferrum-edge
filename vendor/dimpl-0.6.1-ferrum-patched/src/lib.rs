@@ -69,7 +69,7 @@
 //! - `Packet(&[u8])`: send on your UDP socket
 //! - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 //! - `Connected`: handshake complete
-//! - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
+//! - `PeerCert(Arc<[u8]>)`: peer leaf certificate (DER) — validate in your app
 //! - `PeerCertChain(Arc<[Vec<u8>]>)`: complete peer chain, leaf first
 //! - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
 //! - `ApplicationData(&[u8])`: plaintext received from peer
@@ -1082,7 +1082,7 @@ pub enum Output<'a> {
     ///
     /// Applications must validate this certificate independently (chain,
     /// name/EKU checks, pinning, etc.).
-    PeerCert(&'a [u8]),
+    PeerCert(Arc<[u8]>),
     /// The complete peer certificate chain in leaf-first DER order.
     ///
     /// This event follows [`Self::PeerCert`] so existing leaf fingerprint

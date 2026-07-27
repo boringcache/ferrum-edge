@@ -1,3 +1,11 @@
+diff --git a/.cargo-ok b/.cargo-ok
+new file mode 100644
+index 0000000..5f8b795
+--- /dev/null
++++ b/.cargo-ok
+@@ -0,0 +1 @@
++{"v":1}
+\ No newline at end of file
 diff --git a/Cargo.lock b/Cargo.lock
 index 4cc380f..258913c 100644
 --- a/Cargo.lock
@@ -156,7 +164,7 @@ index 42f01f1..9bbcac5 100644
                  }
              }
 diff --git a/src/dtls12/client.rs b/src/dtls12/client.rs
-index 9357a7e..49df8c4 100644
+index 9357a7e..564bedd 100644
 --- a/src/dtls12/client.rs
 +++ b/src/dtls12/client.rs
 @@ -29,7 +29,7 @@ use crate::dtls12::message::{CompressionMethod, ContentType, Cookie};
@@ -230,10 +238,23 @@ index 9357a7e..49df8c4 100644
  }
  
  fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
-@@ -1380,6 +1384,13 @@ impl LocalEvent {
-                 buf[..l].copy_from_slice(&peer_certs[0]);
-                 Output::PeerCert(&buf[..l])
-             }
+@@ -1369,17 +1373,16 @@ fn handshake_create_certificate_verify(body: &mut Buf, engine: &mut Engine) -> R
+ }
+ 
+ impl LocalEvent {
+-    pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
++    pub fn into_output<'a>(self, _buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
+         match self {
+-            LocalEvent::PeerCert => {
+-                let l = peer_certs[0].len();
+-                assert!(
+-                    l <= buf.len(),
+-                    "Output buffer too small for peer certificate"
+-                );
+-                buf[..l].copy_from_slice(&peer_certs[0]);
+-                Output::PeerCert(&buf[..l])
+-            }
++            LocalEvent::PeerCert => Output::PeerCert(peer_certs[0].as_ref().to_vec().into()),
 +            LocalEvent::PeerCertChain => Output::PeerCertChain(
 +                peer_certs
 +                    .iter()
@@ -402,7 +423,7 @@ index 8d3d335..3410450 100644
  
  fn handshake_create_server_hello(
 diff --git a/src/dtls13/client.rs b/src/dtls13/client.rs
-index b18408d..912b23a 100644
+index b18408d..1a9489d 100644
 --- a/src/dtls13/client.rs
 +++ b/src/dtls13/client.rs
 @@ -129,6 +129,7 @@ pub struct Client {
@@ -468,10 +489,23 @@ index b18408d..912b23a 100644
  
      let certificate = Certificate {
          context_range: context_start..context_end,
-@@ -1525,6 +1532,13 @@ impl LocalEvent {
-                 buf[..l].copy_from_slice(&peer_certs[0]);
-                 Output::PeerCert(&buf[..l])
-             }
+@@ -1514,17 +1521,16 @@ fn parse_certificate_request(cr_data: &[u8], base_offset: usize) -> Result<Optio
+ // =========================================================================
+ 
+ impl LocalEvent {
+-    pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
++    pub fn into_output<'a>(self, _buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
+         match self {
+-            LocalEvent::PeerCert => {
+-                let l = peer_certs[0].len();
+-                assert!(
+-                    l <= buf.len(),
+-                    "Output buffer too small for peer certificate"
+-                );
+-                buf[..l].copy_from_slice(&peer_certs[0]);
+-                Output::PeerCert(&buf[..l])
+-            }
++            LocalEvent::PeerCert => Output::PeerCert(peer_certs[0].as_ref().to_vec().into()),
 +            LocalEvent::PeerCertChain => Output::PeerCertChain(
 +                peer_certs
 +                    .iter()
@@ -628,7 +662,7 @@ index 71f3dfd..9f98b57 100644
  
          // Client's Certificate means our flight was received; stop retransmitting
 diff --git a/src/lib.rs b/src/lib.rs
-index 1777e2f..9f3bd2f 100644
+index 1777e2f..5024618 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -48,8 +48,9 @@
@@ -646,7 +680,8 @@ index 1777e2f..9f3bd2f 100644
 @@ -69,6 +70,7 @@
  //! - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
  //! - `Connected`: handshake complete
- //! - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
+-//! - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
++//! - `PeerCert(Arc<[u8]>)`: peer leaf certificate (DER) — validate in your app
 +//! - `PeerCertChain(Arc<[Vec<u8>]>)`: complete peer chain, leaf first
  //! - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
  //! - `ApplicationData(&[u8])`: plaintext received from peer
@@ -955,7 +990,8 @@ index 1777e2f..9f3bd2f 100644
 @@ -851,6 +1083,11 @@ pub enum Output<'a> {
      /// Applications must validate this certificate independently (chain,
      /// name/EKU checks, pinning, etc.).
-     PeerCert(&'a [u8]),
+-    PeerCert(&'a [u8]),
++    PeerCert(Arc<[u8]>),
 +    /// The complete peer certificate chain in leaf-first DER order.
 +    ///
 +    /// This event follows [`Self::PeerCert`] so existing leaf fingerprint
@@ -1019,15 +1055,16 @@ index ef9babe..919a551 100644
              }
 diff --git a/tests/auto/credential_security.rs b/tests/auto/credential_security.rs
 new file mode 100644
-index 0000000..e90deff
+index 0000000..5955e70
 --- /dev/null
 +++ b/tests/auto/credential_security.rs
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,222 @@
 +use std::sync::{Arc, Mutex};
 +use std::time::{Duration, Instant};
 +
 +use dimpl::certificate::generate_self_signed_certificate;
-+use dimpl::{Config, Dtls, DtlsCertificateChain, DtlsPrivateKey, ProtocolVersion};
++use dimpl::{Config, Dtls, DtlsCertificate, DtlsCertificateChain, DtlsPrivateKey, ProtocolVersion};
++use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 +
 +use crate::common::{default_config, deliver_packets, drain_outputs};
 +
@@ -1136,13 +1173,14 @@ index 0000000..e90deff
 +    );
 +}
 +
-+fn assert_server_chain_transmitted(version: ProtocolVersion) {
++fn assert_server_chain_transmitted_with_identity(
++    version: ProtocolVersion,
++    mut server_identity: DtlsCertificate,
++    intermediates: Vec<Vec<u8>>,
++) {
 +    let client_identity = generate_self_signed_certificate().expect("client identity");
-+    let mut server_identity = generate_self_signed_certificate().expect("server identity");
-+    let expected_chain = vec![
-+        server_identity.certificate.clone(),
-+        vec![0x30, 0x03, 0x02, 0x01, 0x01],
-+    ];
++    let mut expected_chain = vec![server_identity.certificate.clone()];
++    expected_chain.extend(intermediates);
 +    let server_chain = DtlsCertificateChain::new(
 +        expected_chain.clone(),
 +        std::mem::take(&mut server_identity.private_key),
@@ -1188,6 +1226,34 @@ index 0000000..e90deff
 +    assert_eq!(received_chain, Some(expected_chain));
 +}
 +
++fn assert_server_chain_transmitted(version: ProtocolVersion) {
++    assert_server_chain_transmitted_with_identity(
++        version,
++        generate_self_signed_certificate().expect("server identity"),
++        vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]],
++    );
++}
++
++fn large_server_identity() -> DtlsCertificate {
++    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("large identity key");
++    let names: Vec<String> = (0..128)
++        .map(|index| format!("dtls-{index:03}.certificate-buffer-regression.example.test"))
++        .collect();
++    let params = CertificateParams::new(names).expect("large identity params");
++    let certificate = params
++        .self_signed(&key_pair)
++        .expect("large self-signed identity");
++    let identity = DtlsCertificate {
++        certificate: certificate.der().to_vec(),
++        private_key: key_pair.serialize_der(),
++    };
++    assert!(
++        identity.certificate.len() > 2048,
++        "fixture must exceed drain_outputs' poll buffer"
++    );
++    identity
++}
++
 +#[test]
 +fn dtls12_transmits_full_certificate_chain_in_configured_order() {
 +    assert_server_chain_transmitted(ProtocolVersion::DTLS1_2);
@@ -1196,6 +1262,24 @@ index 0000000..e90deff
 +#[test]
 +fn dtls13_transmits_full_certificate_chain_in_configured_order() {
 +    assert_server_chain_transmitted(ProtocolVersion::DTLS1_3);
++}
++
++#[test]
++fn dtls12_peer_leaf_output_is_not_limited_by_poll_buffer() {
++    assert_server_chain_transmitted_with_identity(
++        ProtocolVersion::DTLS1_2,
++        large_server_identity(),
++        Vec::new(),
++    );
++}
++
++#[test]
++fn dtls13_peer_leaf_output_is_not_limited_by_poll_buffer() {
++    assert_server_chain_transmitted_with_identity(
++        ProtocolVersion::DTLS1_3,
++        large_server_identity(),
++        Vec::new(),
++    );
 +}
 diff --git a/tests/auto/main.rs b/tests/auto/main.rs
 index 195d12b..f6e1b3c 100644
