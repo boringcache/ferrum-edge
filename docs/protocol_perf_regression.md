@@ -42,8 +42,13 @@ Additional scenarios from
 Versioned budgets live in
 `tests/performance/multi_protocol/protocol_perf_budgets.json`.
 
-- `enforcement` starts as `alert` (warnings only; job stays green on soft
-  budget breaches) so shared-runner variance does not block the schedule.
+- `enforcement` starts as `alert` (warnings only for **measured** budget
+  breaches; soft product regressions stay green) so shared-runner variance
+  does not block the schedule.
+- **Harness / data-completeness failures are always hard failures**, even
+  while `enforcement` is `alert`: missing expected protocol samples,
+  zero-total/invalid metrics, missing required scenario output, and
+  insufficient RSS/FD/task sampling all fail the job.
 - Absolute `min_gateway_rps` / `max_p*_us` floors are intentionally `null`
   until operators measure variance on `ubuntu-latest` + `ci-release` and fill
   them in. Do not invent floors from unexecuted local runs.

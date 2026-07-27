@@ -3,8 +3,9 @@
 
 Validates that `.github/workflows/protocol-perf-regression.yml` keeps the
 scheduled + manual contract, pinned external actions, approved tool setup
-paths, alert-only budget enforcement wiring, and artifact/runner-health
-signals required by issue #2460. Does not execute benchmarks.
+paths, alert-only budget enforcement wiring, harness data-completeness gates,
+and artifact/runner-health signals required by issue #2460. Does not execute
+benchmarks.
 """
 
 from __future__ import annotations
@@ -54,6 +55,13 @@ APPROVED_SETUP = (
     "./.github/actions/setup-sccache",
     "./.github/actions/setup-fast-linker",
 )
+
+# Bench JSON redirects that must not be silenced with `|| true`.
+BENCH_JSON_SWALLOWED = re.compile(
+    r"--json\s*>\s*\"\$\{OUTPUT_DIR\}/(?:connection_churn|soak|reload_under_load)\.json\""
+    r"[^\n]*\|\|\s*true",
+)
+WAIT_BENCH_SWALLOWED = re.compile(r"wait\s+\"\$\{BENCH_PID\}\"\s*\|\|\s*true")
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,6 +150,75 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         )
 
 
+def validate_evaluator_contract(text: str, failures: list[str]) -> None:
+    require(
+        "resolve_expected_protocols" in text,
+        "evaluator must resolve expected protocols for all vs subset selection",
+        failures,
+    )
+    require(
+        "missing expected gateway measurement" in text,
+        "evaluator must hard-fail when an expected protocol sample is missing",
+        failures,
+    )
+    require(
+        "invalid/zero-total" in text or "zero-total" in text,
+        "evaluator must reject zero-total/invalid metric samples",
+        failures,
+    )
+    require(
+        "validate_required_scenarios" in text,
+        "evaluator must validate required scenario output",
+        failures,
+    )
+    require(
+        "hard_fail" in text,
+        "evaluator must hard-fail data-completeness independently of enforcement",
+        failures,
+    )
+    require(
+        "insufficient" in text and "resource_plateau" in text,
+        "evaluator must hard-fail insufficient RSS/FD/task sampling",
+        failures,
+    )
+    for needle, label in (
+        ("missing expected protocol should hard-fail", "missing-protocol self-test"),
+        ("zero-total gateway sample should hard-fail", "zero-total self-test"),
+        ("missing scenarios should hard-fail", "missing-scenario self-test"),
+        ("http1 subset should not require HTTP/2", "subset self-test"),
+        ("measured regression must not hard-fail under alert enforcement", "alert-only self-test"),
+    ):
+        require(needle in text, f"evaluator self-test missing coverage: {label}", failures)
+
+
+def validate_scenarios_contract(text: str, failures: list[str]) -> None:
+    require(
+        not BENCH_JSON_SWALLOWED.search(text),
+        "scenarios harness must not swallow churn/soak/reload bench failures with || true",
+        failures,
+    )
+    require(
+        not WAIT_BENCH_SWALLOWED.search(text),
+        "scenarios harness must not swallow reload wait failures with || true",
+        failures,
+    )
+    require(
+        "missing usable measurement sample" in text,
+        "scenarios harness must validate usable measurement samples",
+        failures,
+    )
+    require(
+        "insufficient" in text and "resource_plateau" in text,
+        "scenarios harness must fail on insufficient resource sampling",
+        failures,
+    )
+    require(
+        "CHURN_RC" in text and "SOAK_RC" in text and "RELOAD_RC" in text,
+        "scenarios harness must capture churn/soak/reload exit codes",
+        failures,
+    )
+
+
 def validate_repository_contract(failures: list[str]) -> None:
     require(WORKFLOW_PATH.is_file(), f"missing workflow: {WORKFLOW_PATH}", failures)
     require(BUDGETS_PATH.is_file(), f"missing budgets file: {BUDGETS_PATH}", failures)
@@ -152,6 +229,12 @@ def validate_repository_contract(failures: list[str]) -> None:
 
     if WORKFLOW_PATH.is_file():
         validate_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"), failures)
+
+    if EVALUATOR_PATH.is_file():
+        validate_evaluator_contract(EVALUATOR_PATH.read_text(encoding="utf-8"), failures)
+
+    if SCENARIOS_PATH.is_file():
+        validate_scenarios_contract(SCENARIOS_PATH.read_text(encoding="utf-8"), failures)
 
     if BUDGETS_PATH.is_file():
         import json
@@ -170,6 +253,12 @@ def validate_repository_contract(failures: list[str]) -> None:
         require(
             budgets.get("build_profile") == "ci-release",
             "budgets must document ci-release build profile",
+            failures,
+        )
+        global_cfg = budgets.get("global", {})
+        require(
+            int(global_cfg.get("min_resource_samples", 0)) >= 2,
+            "budgets must require a minimum resource sample count",
             failures,
         )
         protocols = budgets.get("protocols", {})
@@ -205,6 +294,12 @@ def validate_repository_contract(failures: list[str]) -> None:
         require(
             "alert" in runbook.lower(),
             "runbook must document alert/non-block budgets",
+            failures,
+        )
+        require(
+            "hard" in runbook.lower()
+            and ("completeness" in runbook.lower() or "harness" in runbook.lower()),
+            "runbook must document hard harness/data-completeness failures",
             failures,
         )
         require(
@@ -251,6 +346,30 @@ jobs:
         failures.append("self-test expected missing schedule detection")
     if not any("mutable" in item for item in bad_failures):
         failures.append("self-test expected mutable action detection")
+
+    swallow_failures: list[str] = []
+    swallowed = """
+proto_bench http1 --json > "${OUTPUT_DIR}/connection_churn.json" 2>"${OUTPUT_DIR}/connection_churn.log" || true
+wait "${BENCH_PID}" || true
+"""
+    validate_scenarios_contract(swallowed, swallow_failures)
+    if not any("swallow" in item for item in swallow_failures):
+        failures.append("self-test expected || true swallow detection for scenario benches")
+
+    good_scenarios = """
+CHURN_RC=0
+SOAK_RC=0
+RELOAD_RC=0
+# no || true after json redirects
+missing usable measurement sample
+resource_plateau insufficient rss_bytes sampling
+"""
+    good_scenario_failures: list[str] = []
+    validate_scenarios_contract(good_scenarios, good_scenario_failures)
+    if good_scenario_failures:
+        failures.append(
+            f"self-test unexpectedly rejected good scenarios snippet: {good_scenario_failures}"
+        )
 
     if failures:
         for failure in failures:

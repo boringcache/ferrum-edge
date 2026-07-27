@@ -156,18 +156,29 @@ PY
 echo "== protocol regression scenarios =="
 start_backend
 
+# Capture bench exit codes without swallowing them via `|| true`. Logs and
+# partial JSON are still retained under OUTPUT_DIR for artifacts; missing or
+# invalid required output fails hard at the end (infrastructure/data-quality).
+CHURN_RC=0
+SOAK_RC=0
+RELOAD_RC=0
+MIN_RESOURCE_SAMPLES="${MIN_RESOURCE_SAMPLES:-3}"
+
 # ── Connection churn: force pool/idle churn with max idle disabled ───────────
 echo "-- connection churn"
 start_gateway \
   "${SCRIPT_DIR}/configs/http1_perf.yaml" \
   FERRUM_POOL_MAX_IDLE_PER_HOST=0 \
   FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=false
+set +e
 "${SCRIPT_DIR}/target/release/proto_bench" http1 \
   --target "http://127.0.0.1:${GATEWAY_HTTP_PORT}/echo" \
   --duration 8 \
   --concurrency 80 \
   --payload-size 1024 \
-  --json > "${OUTPUT_DIR}/connection_churn.json" 2>"${OUTPUT_DIR}/connection_churn.log" || true
+  --json > "${OUTPUT_DIR}/connection_churn.json" 2>"${OUTPUT_DIR}/connection_churn.log"
+CHURN_RC=$?
+set -e
 stop_gateway
 
 # ── Long-lived soak + resource plateau sampling ──────────────────────────────
@@ -177,6 +188,7 @@ start_gateway \
   FERRUM_POOL_MAX_IDLE_PER_HOST=200
 sample_resources "${GATEWAY_PID}" "${OUTPUT_DIR}/resource_samples.txt" 1 &
 SAMPLER_PID=$!
+set +e
 "${SCRIPT_DIR}/target/release/proto_bench" saturate \
   --target "https://127.0.0.1:${GATEWAY_HTTPS_PORT}/echo" \
   --connections 200 \
@@ -184,7 +196,9 @@ SAMPLER_PID=$!
   --hold-seconds 20 \
   --heartbeat-interval-ms 1000 \
   --payload-size 64 \
-  --json > "${OUTPUT_DIR}/soak.json" 2>"${OUTPUT_DIR}/soak.log" || true
+  --json > "${OUTPUT_DIR}/soak.json" 2>"${OUTPUT_DIR}/soak.log"
+SOAK_RC=$?
+set -e
 kill "${SAMPLER_PID}" 2>/dev/null || true
 wait "${SAMPLER_PID}" 2>/dev/null || true
 SAMPLER_PID=""
@@ -207,16 +221,23 @@ if kill -0 "${GATEWAY_PID}" 2>/dev/null; then
   kill -HUP "${GATEWAY_PID}" || true
   echo "sent SIGHUP to gateway pid=${GATEWAY_PID}"
 fi
-wait "${BENCH_PID}" || true
+set +e
+wait "${BENCH_PID}"
+RELOAD_RC=$?
+set -e
 BENCH_PID=""
 stop_gateway
 
-python3 - "${OUTPUT_DIR}" <<'PY'
+python3 - "${OUTPUT_DIR}" "${CHURN_RC}" "${SOAK_RC}" "${RELOAD_RC}" "${MIN_RESOURCE_SAMPLES}" <<'PY'
 import json
 import pathlib
 import sys
 
 out = pathlib.Path(sys.argv[1])
+churn_rc = int(sys.argv[2])
+soak_rc = int(sys.argv[3])
+reload_rc = int(sys.argv[4])
+min_resource_samples = int(sys.argv[5])
 
 def load_bench(name: str):
     path = out / name
@@ -233,10 +254,22 @@ def load_bench(name: str):
             idx = raw.find("{", idx + 1)
     return None
 
+def sample_total(sample):
+    return int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+
+def sample_usable(sample):
+    if not isinstance(sample, dict):
+        return False
+    if sample_total(sample) > 0:
+        return True
+    if "heartbeat_success_rate" in sample or "connect_success_rate" in sample:
+        return True
+    return False
+
 def error_rate(sample):
     if not sample:
         return 1.0
-    total = int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+    total = sample_total(sample)
     if total <= 0:
         # saturate reports connect/heartbeat rates instead of request totals
         if "heartbeat_success_rate" in sample:
@@ -264,13 +297,16 @@ scenarios = {
     "connection_churn": {
         "error_rate": error_rate(churn),
         "sample": churn,
+        "bench_exit_code": churn_rc,
     },
     "reload_under_load": {
         "error_rate": error_rate(reload_sample),
         "sample": reload_sample,
+        "bench_exit_code": reload_rc,
     },
     "soak": {
         "sample": soak,
+        "bench_exit_code": soak_rc,
     },
     "resource_plateau": {
         "rss_bytes": rss,
@@ -280,7 +316,46 @@ scenarios = {
     },
 }
 (out / "scenarios.json").write_text(json.dumps(scenarios, indent=2) + "\n", encoding="utf-8")
-print(json.dumps({"scenarios_written": str(out / "scenarios.json"), "sample_count": len(rss)}))
+
+# Infrastructure / data-quality gate: preserve artifacts above, then fail hard
+# when required scenario measurements are missing or invalid. Measured product
+# regressions (high error/growth) are evaluated separately as alert-only.
+errors = []
+if churn_rc != 0:
+    errors.append(f"connection_churn proto_bench exited {churn_rc}")
+if soak_rc != 0:
+    errors.append(f"soak proto_bench exited {soak_rc}")
+if reload_rc != 0:
+    errors.append(f"reload_under_load proto_bench exited {reload_rc}")
+if not sample_usable(churn):
+    errors.append("connection_churn missing usable measurement sample")
+if not sample_usable(reload_sample):
+    errors.append("reload_under_load missing usable measurement sample")
+if not sample_usable(soak):
+    errors.append("soak missing usable measurement sample")
+for name, series in (("rss_bytes", rss), ("fd_count", fds), ("task_count", tasks)):
+    if len(series) < min_resource_samples:
+        errors.append(
+            f"resource_plateau insufficient {name} sampling "
+            f"(need >= {min_resource_samples}, got {len(series)})"
+        )
+
+print(
+    json.dumps(
+        {
+            "scenarios_written": str(out / "scenarios.json"),
+            "sample_count": len(rss),
+            "churn_rc": churn_rc,
+            "soak_rc": soak_rc,
+            "reload_rc": reload_rc,
+            "errors": errors,
+        }
+    )
+)
+if errors:
+    for err in errors:
+        print(f"::error::scenario harness: {err}", file=sys.stderr)
+    raise SystemExit(1)
 PY
 
 echo "scenarios complete"

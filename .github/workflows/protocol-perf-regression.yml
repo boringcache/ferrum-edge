@@ -308,8 +308,8 @@ jobs:
           (root / "combined_results.json").write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
           PY
 
-          # Alert/non-block: evaluator returns 0 while enforcement=alert even
-          # when soft budgets fire warnings. Gate mode would fail the step.
+          # Alert/non-block: measured budget regressions return 0 while
+          # enforcement=alert. Harness/data-completeness failures still exit 1.
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py \
             --results protocol-perf-results/combined_results.json \
             --budgets tests/performance/multi_protocol/protocol_perf_budgets.json \
@@ -342,6 +342,11 @@ jobs:
                       f"| {sample.get('p50_us', 0):.0f}µs | {sample.get('p95_us', 0):.0f}µs "
                       f"| {sample.get('p99_us', 0):.0f}µs |"
                   )
+              if report.get("failures"):
+                  lines.append("")
+                  lines.append("### Failures (harness / data-completeness)")
+                  for failure in report["failures"]:
+                      lines.append(f"- {failure}")
               if report.get("alerts"):
                   lines.append("")
                   lines.append("### Alerts (non-blocking while enforcement=alert)")

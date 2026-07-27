@@ -5,8 +5,10 @@ Publishes machine-readable trends and compares the current run against:
   * explicit per-protocol budgets in protocol_perf_budgets.json
   * a rolling median ± MAD baseline when prior trend samples are present
 
-Enforcement defaults to alert-only so shared-runner variance does not fail the
-scheduled job until absolute floors are filled in after measured variance.
+Enforcement defaults to alert-only for measured product regressions so
+shared-runner variance does not fail the scheduled job until absolute floors
+are filled in. Data-completeness / harness failures are always hard failures
+independent of enforcement mode.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -21,6 +24,30 @@ from typing import Any
 
 
 GATEWAY_PORT_MARKERS = (":8000", ":8443", ":5010", ":5001", ":5003", ":5004")
+
+# CLI / workflow_dispatch aliases -> budget protocol names emitted by proto_bench.
+PROTOCOL_ALIASES: dict[str, str] = {
+    "http1": "HTTP/1.1",
+    "http1-tls": "HTTP/1.1+TLS",
+    "http2": "HTTP/2",
+    "http3": "HTTP/3",
+    "ws": "WebSocket",
+    "websocket": "WebSocket",
+    "grpc": "gRPC",
+    "tcp": "TCP",
+    "tcp-tls": "TCP+TLS",
+    "udp": "UDP",
+    "udp-dtls": "UDP+DTLS",
+}
+
+REQUIRED_SCENARIOS = (
+    "connection_churn",
+    "reload_under_load",
+    "soak",
+    "resource_plateau",
+)
+
+DEFAULT_MIN_RESOURCE_SAMPLES = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,15 +73,80 @@ def is_gateway_target(target: str) -> bool:
     return any(marker in target for marker in GATEWAY_PORT_MARKERS)
 
 
-def error_rate(sample: dict[str, Any]) -> float:
-    total = int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+def sample_total(sample: dict[str, Any]) -> int:
+    return int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+
+
+def error_rate(sample: dict[str, Any]) -> float | None:
+    """Return error rate, or None when the sample has zero total activity."""
+    total = sample_total(sample)
     if total <= 0:
-        return 0.0
+        return None
     return float(sample.get("total_errors", 0)) / float(total)
 
 
 def normalize_protocol_name(name: str) -> str:
     return name.strip()
+
+
+def resolve_protocol_token(token: str, budget_protocols: set[str]) -> str:
+    raw = token.strip()
+    if not raw:
+        raise ValueError("empty protocol token")
+    lowered = raw.lower()
+    if lowered in PROTOCOL_ALIASES:
+        return PROTOCOL_ALIASES[lowered]
+    if raw in budget_protocols:
+        return raw
+    # Case-insensitive match against budget keys.
+    for name in budget_protocols:
+        if name.lower() == lowered:
+            return name
+    raise ValueError(f"unknown protocol selection {raw!r}")
+
+
+def resolve_expected_protocols(
+    requested: str | None, budget_protocols: dict[str, Any]
+) -> list[str]:
+    """Map workflow selection (`all` or subset) to budget protocol names."""
+    names = set(budget_protocols.keys())
+    selection = (requested or "all").strip()
+    if not selection or selection.lower() == "all":
+        return sorted(names)
+
+    tokens = [tok for tok in re.split(r"[,;\s]+", selection) if tok]
+    if not tokens:
+        return sorted(names)
+
+    expected: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        resolved = resolve_protocol_token(token, names)
+        if resolved not in seen:
+            expected.append(resolved)
+            seen.add(resolved)
+    return expected
+
+
+def is_valid_gateway_sample(sample: dict[str, Any]) -> bool:
+    """Reject zero-total and structurally invalid metric samples."""
+    if not isinstance(sample, dict):
+        return False
+    if not is_gateway_target(str(sample.get("target", ""))):
+        return False
+    if not str(sample.get("protocol", "")).strip():
+        return False
+    if sample_total(sample) <= 0:
+        return False
+    if sample.get("rps") is None:
+        return False
+    try:
+        float(sample.get("rps"))
+        float(sample.get("p50_us", 0))
+        float(sample.get("p99_us", 0))
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def extract_gateway_samples(results: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -138,6 +230,77 @@ def history_metric(
     return values
 
 
+def hard_fail(failures: list[str], message: str) -> None:
+    """Data-completeness / harness errors always fail the job."""
+    failures.append(message)
+
+
+def scenario_request_sample_usable(sample: Any) -> bool:
+    if not isinstance(sample, dict):
+        return False
+    if sample_total(sample) > 0:
+        return True
+    # Saturate reports connect/heartbeat rates instead of request totals.
+    if "heartbeat_success_rate" in sample or "connect_success_rate" in sample:
+        try:
+            float(sample.get("heartbeat_success_rate", sample.get("connect_success_rate")))
+        except (TypeError, ValueError):
+            return False
+        return True
+    return False
+
+
+def validate_required_scenarios(
+    scenarios: Any,
+    *,
+    min_resource_samples: int,
+    failures: list[str],
+) -> None:
+    if not isinstance(scenarios, dict) or not scenarios:
+        hard_fail(
+            failures,
+            "scenarios: missing required scenario output "
+            f"(expected {', '.join(REQUIRED_SCENARIOS)})",
+        )
+        return
+
+    for key in REQUIRED_SCENARIOS:
+        if key not in scenarios or not isinstance(scenarios.get(key), dict):
+            hard_fail(failures, f"scenarios: missing required scenario {key}")
+
+    for key in ("connection_churn", "reload_under_load"):
+        block = scenarios.get(key)
+        if not isinstance(block, dict):
+            continue
+        sample = block.get("sample")
+        if not scenario_request_sample_usable(sample):
+            hard_fail(
+                failures,
+                f"scenarios: {key} missing usable measurement sample "
+                "(zero-total/invalid harness output)",
+            )
+
+    soak = scenarios.get("soak")
+    if isinstance(soak, dict) and not scenario_request_sample_usable(soak.get("sample")):
+        hard_fail(
+            failures,
+            "scenarios: soak missing usable measurement sample "
+            "(zero-total/invalid harness output)",
+        )
+
+    plateau = scenarios.get("resource_plateau")
+    if isinstance(plateau, dict):
+        for resource in ("rss_bytes", "fd_count", "task_count"):
+            series = plateau.get(resource, [])
+            if not isinstance(series, list) or len(series) < min_resource_samples:
+                hard_fail(
+                    failures,
+                    f"scenarios: resource_plateau insufficient {resource} sampling "
+                    f"(need >= {min_resource_samples}, got "
+                    f"{len(series) if isinstance(series, list) else 0})",
+                )
+
+
 def evaluate(
     results: dict[str, Any],
     budgets: dict[str, Any],
@@ -149,18 +312,56 @@ def evaluate(
     mad_multiplier = float(rolling_cfg.get("mad_multiplier", 5.0))
     min_samples = int(rolling_cfg.get("min_samples", 3))
     window = int(rolling_cfg.get("window", 8))
+    min_resource_samples = int(
+        global_cfg.get("min_resource_samples", DEFAULT_MIN_RESOURCE_SAMPLES)
+    )
 
-    gateway = extract_gateway_samples(results)
+    budget_protocols = budgets.get("protocols", {})
+    if not isinstance(budget_protocols, dict):
+        budget_protocols = {}
+
     alerts: list[str] = []
     failures: list[str] = []
     protocol_summary: dict[str, Any] = {}
 
     def note(message: str) -> None:
+        """Measured budget regressions: alert-only unless enforcement=gate."""
         alerts.append(message)
         if enforcement == "gate":
             failures.append(message)
 
+    try:
+        expected = resolve_expected_protocols(
+            results.get("protocols") if isinstance(results.get("protocols"), str) else None,
+            budget_protocols,
+        )
+    except ValueError as exc:
+        hard_fail(failures, f"protocols: invalid selection: {exc}")
+        expected = []
+
+    gateway = extract_gateway_samples(results)
+
+    # Surface invalid/zero-total gateway samples as harness failures even when
+    # a sibling valid sample for the same protocol exists.
     for proto, samples in sorted(gateway.items()):
+        invalid = [s for s in samples if not is_valid_gateway_sample(s)]
+        if invalid:
+            hard_fail(
+                failures,
+                f"{proto}: {len(invalid)} invalid/zero-total gateway sample(s) "
+                "(harness data-quality failure)",
+            )
+
+    for proto in expected:
+        samples = [s for s in gateway.get(proto, []) if is_valid_gateway_sample(s)]
+        if not samples:
+            hard_fail(
+                failures,
+                f"{proto}: missing expected gateway measurement "
+                "(require at least one valid sample)",
+            )
+            continue
+
         rps_vals = [float(s.get("rps", 0.0)) for s in samples]
         p50_vals = [float(s.get("p50_us", 0)) for s in samples]
         p95_vals = [
@@ -168,7 +369,7 @@ def evaluate(
             for s in samples
         ]
         p99_vals = [float(s.get("p99_us", 0)) for s in samples]
-        err_vals = [error_rate(s) for s in samples]
+        err_vals = [rate for rate in (error_rate(s) for s in samples) if rate is not None]
 
         summary = {
             "samples": len(samples),
@@ -180,7 +381,7 @@ def evaluate(
         }
         protocol_summary[proto] = summary
 
-        proto_budget = budgets.get("protocols", {}).get(proto, {})
+        proto_budget = budget_protocols.get(proto, {})
         max_error = proto_budget.get("max_error_rate", global_cfg.get("max_error_rate"))
         if max_error is not None and summary["error_rate"] > float(max_error):
             note(
@@ -221,6 +422,12 @@ def evaluate(
                 note(f"{proto}: rolling {metric} regression: {breach}")
 
     scenarios = results.get("scenarios", {})
+    validate_required_scenarios(
+        scenarios,
+        min_resource_samples=min_resource_samples,
+        failures=failures,
+    )
+
     if isinstance(scenarios, dict):
         plateau = scenarios.get("resource_plateau", {})
         if isinstance(plateau, dict) and plateau:
@@ -230,7 +437,7 @@ def evaluate(
                 ("task_count", "max_task_growth_ratio"),
             ):
                 series = plateau.get(resource, [])
-                if len(series) < 2:
+                if not isinstance(series, list) or len(series) < 2:
                     continue
                 start = float(series[0])
                 end = float(series[-1])
@@ -245,14 +452,14 @@ def evaluate(
                     )
 
         reload = scenarios.get("reload_under_load", {})
-        if isinstance(reload, dict) and reload:
+        if isinstance(reload, dict) and reload.get("sample") is not None:
             rate = float(reload.get("error_rate", 0.0))
             limit = float(global_cfg.get("reload_max_error_rate", 0.15))
             if rate > limit:
                 note(f"reload_under_load: error_rate {rate:.4f} exceeds {limit:.4f}")
 
         churn = scenarios.get("connection_churn", {})
-        if isinstance(churn, dict) and churn:
+        if isinstance(churn, dict) and churn.get("sample") is not None:
             rate = float(churn.get("error_rate", 0.0))
             limit = float(global_cfg.get("max_error_rate", 0.05))
             if rate > limit:
@@ -265,6 +472,7 @@ def evaluate(
         "status": status,
         "alerts": alerts,
         "failures": failures,
+        "expected_protocols": expected,
         "protocols": protocol_summary,
         "scenarios": scenarios if isinstance(scenarios, dict) else {},
         "runner_health": results.get("runner_health", {}),
@@ -304,31 +512,9 @@ def merge_history(
     }
 
 
-def self_test() -> int:
-    failures: list[str] = []
-
-    budgets = {
-        "budget_version": "test",
-        "enforcement": "alert",
-        "rolling": {"window": 8, "mad_multiplier": 5.0, "min_samples": 3},
-        "global": {
-            "max_error_rate": 0.05,
-            "max_rss_growth_ratio": 2.0,
-            "max_fd_growth_ratio": 2.0,
-            "max_task_growth_ratio": 2.0,
-            "reload_max_error_rate": 0.1,
-        },
-        "protocols": {
-            "HTTP/1.1": {
-                "min_gateway_rps": None,
-                "max_p50_us": None,
-                "max_p95_us": None,
-                "max_p99_us": None,
-                "max_error_rate": 0.05,
-            }
-        },
-    }
-    results = {
+def _clean_results_fixture() -> dict[str, Any]:
+    return {
+        "protocols": "http1",
         "runs": {
             "run_1": [
                 {
@@ -348,23 +534,149 @@ def self_test() -> int:
                 "rss_bytes": [100, 110, 120],
                 "fd_count": [20, 21, 22],
                 "task_count": [10, 10, 11],
+                "sample_count": 3,
             },
-            "reload_under_load": {"error_rate": 0.01},
-            "connection_churn": {"error_rate": 0.01},
+            "reload_under_load": {
+                "error_rate": 0.01,
+                "sample": {
+                    "total_requests": 100,
+                    "total_errors": 1,
+                    "rps": 10.0,
+                },
+            },
+            "connection_churn": {
+                "error_rate": 0.01,
+                "sample": {
+                    "total_requests": 100,
+                    "total_errors": 1,
+                    "rps": 10.0,
+                },
+            },
+            "soak": {
+                "sample": {
+                    "heartbeat_success_rate": 0.99,
+                    "connect_success_rate": 0.99,
+                },
+            },
         },
     }
+
+
+def self_test() -> int:
+    failures: list[str] = []
+
+    budgets = {
+        "budget_version": "test",
+        "enforcement": "alert",
+        "rolling": {"window": 8, "mad_multiplier": 5.0, "min_samples": 3},
+        "global": {
+            "max_error_rate": 0.05,
+            "max_rss_growth_ratio": 2.0,
+            "max_fd_growth_ratio": 2.0,
+            "max_task_growth_ratio": 2.0,
+            "reload_max_error_rate": 0.1,
+            "min_resource_samples": 3,
+        },
+        "protocols": {
+            "HTTP/1.1": {
+                "min_gateway_rps": None,
+                "max_p50_us": None,
+                "max_p95_us": None,
+                "max_p99_us": None,
+                "max_error_rate": 0.05,
+            },
+            "HTTP/2": {
+                "min_gateway_rps": None,
+                "max_p50_us": None,
+                "max_p95_us": None,
+                "max_p99_us": None,
+                "max_error_rate": 0.05,
+            },
+        },
+    }
+    results = _clean_results_fixture()
     evaluation = evaluate(results, budgets, None)
     if evaluation["status"] != "ok":
-        failures.append(f"clean run expected ok, got {evaluation['status']}: {evaluation['alerts']}")
+        failures.append(
+            f"clean run expected ok, got {evaluation['status']}: "
+            f"alerts={evaluation['alerts']} failures={evaluation['failures']}"
+        )
 
+    # Missing expected protocol (selection=all) must hard-fail.
+    missing = json.loads(json.dumps(results))
+    missing["protocols"] = "all"
+    evaluation = evaluate(missing, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("missing expected protocol should hard-fail")
+    if not any("HTTP/2" in msg and "missing expected" in msg for msg in evaluation["failures"]):
+        failures.append("missing HTTP/2 should be reported as hard failure")
+
+    # Subset selection must not require unselected protocols.
+    subset = json.loads(json.dumps(results))
+    subset["protocols"] = "http1"
+    evaluation = evaluate(subset, budgets, None)
+    if evaluation["status"] != "ok":
+        failures.append(
+            f"http1 subset should not require HTTP/2, got {evaluation['status']}: "
+            f"{evaluation['failures']}"
+        )
+    if evaluation.get("expected_protocols") != ["HTTP/1.1"]:
+        failures.append(
+            f"http1 subset expected_protocols mismatch: {evaluation.get('expected_protocols')}"
+        )
+
+    # Zero-total / invalid metrics must hard-fail.
+    zero_total = json.loads(json.dumps(results))
+    zero_total["runs"]["run_1"][0]["total_requests"] = 0
+    zero_total["runs"]["run_1"][0]["total_errors"] = 0
+    evaluation = evaluate(zero_total, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("zero-total gateway sample should hard-fail")
+    if not any("invalid/zero-total" in msg or "missing expected" in msg for msg in evaluation["failures"]):
+        failures.append("zero-total should produce data-quality failure text")
+
+    if error_rate({"total_requests": 0, "total_errors": 0}) is not None:
+        failures.append("error_rate must return None for zero-total samples")
+
+    # Required scenario absence / invalid sample must hard-fail.
+    no_scenarios = json.loads(json.dumps(results))
+    no_scenarios["scenarios"] = {}
+    evaluation = evaluate(no_scenarios, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("missing scenarios should hard-fail")
+    if not any("missing required scenario" in msg for msg in evaluation["failures"]):
+        failures.append("missing scenarios should mention required scenario output")
+
+    bad_churn = json.loads(json.dumps(results))
+    bad_churn["scenarios"]["connection_churn"]["sample"] = None
+    evaluation = evaluate(bad_churn, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("null connection_churn sample should hard-fail")
+
+    thin_plateau = json.loads(json.dumps(results))
+    thin_plateau["scenarios"]["resource_plateau"]["rss_bytes"] = [100]
+    thin_plateau["scenarios"]["resource_plateau"]["fd_count"] = [20]
+    thin_plateau["scenarios"]["resource_plateau"]["task_count"] = [10]
+    evaluation = evaluate(thin_plateau, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("insufficient resource sampling should hard-fail")
+    if not any("insufficient rss_bytes" in msg for msg in evaluation["failures"]):
+        failures.append("insufficient RSS sampling should be reported")
+
+    # Complete measured regression remains alert-only under enforcement=alert.
     noisy = json.loads(json.dumps(results))
     noisy["runs"]["run_1"][0]["total_errors"] = 200
     noisy["runs"]["run_1"][0]["total_requests"] = 800
     evaluation = evaluate(noisy, budgets, None)
     if evaluation["status"] != "alert":
-        failures.append("high error rate should alert under alert enforcement")
+        failures.append(
+            f"high error rate should alert under alert enforcement, got {evaluation['status']}: "
+            f"{evaluation['failures']}"
+        )
     if not evaluation["alerts"]:
         failures.append("high error rate should produce alerts")
+    if evaluation["failures"]:
+        failures.append("measured regression must not hard-fail under alert enforcement")
 
     gate_budgets = json.loads(json.dumps(budgets))
     gate_budgets["enforcement"] = "gate"
@@ -382,12 +694,16 @@ def self_test() -> int:
     collapsed = json.loads(json.dumps(results))
     collapsed["runs"]["run_1"][0]["rps"] = 100.0
     evaluation = evaluate(collapsed, budgets, history)
+    if evaluation["status"] != "alert":
+        failures.append("collapsed RPS should remain alert-only under alert enforcement")
     if not any("rolling rps regression" in alert for alert in evaluation["alerts"]):
         failures.append("collapsed RPS should trip rolling baseline alert")
 
     leaky = json.loads(json.dumps(results))
-    leaky["scenarios"]["resource_plateau"]["rss_bytes"] = [100, 400]
+    leaky["scenarios"]["resource_plateau"]["rss_bytes"] = [100, 400, 500]
     evaluation = evaluate(leaky, budgets, None)
+    if evaluation["status"] != "alert":
+        failures.append("RSS growth should alert-only under alert enforcement")
     if not any("rss_bytes" in alert for alert in evaluation["alerts"]):
         failures.append("RSS plateau growth should alert")
 
@@ -396,6 +712,12 @@ def self_test() -> int:
 
     if not math.isclose(mad([1.0, 2.0, 3.0], 2.0), 1.0):
         failures.append("MAD calculation mismatch")
+
+    if resolve_expected_protocols("http1,http2", budgets["protocols"]) != [
+        "HTTP/1.1",
+        "HTTP/2",
+    ]:
+        failures.append("resolve_expected_protocols comma-subset mismatch")
 
     if failures:
         for failure in failures:
