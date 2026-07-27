@@ -73,9 +73,7 @@ impl TransactionLogSchema {
         Ok(Self { schemas })
     }
 
-    fn validate_and_compile_entries(
-        config: &Value,
-    ) -> Result<Vec<CompiledSchemaEntry>, String> {
+    fn validate_and_compile_entries(config: &Value) -> Result<Vec<CompiledSchemaEntry>, String> {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing 'schemas'".to_string()
         })?;
