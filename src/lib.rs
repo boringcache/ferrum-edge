@@ -4416,6 +4416,66 @@ pub mod _test_support {
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
 
+    // ── K8s controller shutdown supervision (#3220) ─────────────────────────
+
+    pub use crate::k8s_controller::{
+        K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
+    };
+
+    /// Test-only view of the crate-private controller task registry.
+    ///
+    /// External tests register synthetic tasks through the **production**
+    /// `spawn_named` — the same lifecycle wrapper that records the shutdown
+    /// watch at each task's own completion boundary, and the same
+    /// close-on-shutdown ownership transfer the CRD reprobe loop races — rather
+    /// than through a parallel mock classifier. A regression in either would
+    /// therefore fail them.
+    #[derive(Clone)]
+    pub struct K8sControllerRegistryForTest(Arc<crate::k8s_controller::ControllerTaskRegistry>);
+
+    impl K8sControllerRegistryForTest {
+        /// Register a synthetic controller task exactly as the CRD watchers,
+        /// the reconciler, and the CRD reprobe loop do. The resulting task name
+        /// is `{label}#{registration sequence}`.
+        ///
+        /// Returns `false` when shutdown has already closed the registry, in
+        /// which case the future is dropped and never spawned. Must be called
+        /// from within a tokio runtime.
+        pub fn spawn<F>(
+            &self,
+            label: &str,
+            shutdown: tokio::sync::watch::Receiver<bool>,
+            fut: F,
+        ) -> bool
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            self.0.spawn_named(label, fut, shutdown)
+        }
+
+        /// `true` once a `shutdown()` has taken ownership of the task set.
+        pub fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+
+        /// The handle control-plane mode owns, over this exact registry, so
+        /// tasks registered after this call are still drained by `shutdown()`.
+        pub fn handle(&self) -> K8sControllerHandle {
+            K8sControllerHandle::new(
+                Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+                self.0.clone(),
+            )
+        }
+    }
+
+    /// Fresh controller task registry for external shutdown-supervision tests
+    /// (delayed exit, panic propagation, grace-period abort, early exit,
+    /// dynamic registration) without a live Kubernetes API server and without
+    /// making the task set a production-public field.
+    pub fn k8s_controller_registry_for_test() -> K8sControllerRegistryForTest {
+        K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
+    }
+
     /// Thin wrapper over the production CP full-reload publication so external
     /// tests can drive it against real broadcast channels.
     #[allow(clippy::too_many_arguments)]
