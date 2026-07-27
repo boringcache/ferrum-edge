@@ -555,6 +555,14 @@ Stream proxy connections track:
 - Connection duration
 - Connection errors
 
+## TCP SO_REUSEPORT Accept-Loop Supervision
+
+When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds multiple sockets on the same address via `SO_REUSEPORT` and runs one accept loop per socket. Those loops are peer components of a single listener:
+
+- Unexpected exit of any loop (ordinary error, panic, or unexpected cancellation) is observed immediately while the listener is live.
+- Failure policy is atomic: sibling loops are cancelled (and aborted if they ignore cancel), `started` is cleared, and the listener task returns a failure to `StreamListenerManager` so reconcile/readiness owners see the outage via the existing async bind-failure path rather than silently reduced accept capacity.
+- Operator or per-listener shutdown completion remains a clean success and is not reported as an operational failure.
+
 ## Limitations
 
 - **No protocol inspection**: Stream proxies forward raw bytes — no HTTP header manipulation, path routing, or content transformation

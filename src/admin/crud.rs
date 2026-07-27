@@ -3219,6 +3219,12 @@ impl AdminResource for Upstream {
     const RESOURCE_LABEL: &'static str = "Upstream";
     const VALIDATION_ERROR_LABEL: &'static str = "upstream fields";
     const NOT_FOUND_MESSAGE: &'static str = "Upstream not found";
+    // Serialize same-namespace upstream creates/updates/deletes through the
+    // durable namespace config admission lease (local mutex + DB lease) so the
+    // name precheck is authoritative across admin instances. The SQL/Mongo
+    // unique `(namespace, name)` indexes remain the cross-process persistence
+    // backstop when a writer bypasses this path.
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id

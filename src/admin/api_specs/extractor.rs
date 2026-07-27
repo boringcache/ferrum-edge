@@ -126,6 +126,8 @@ pub enum ExtractError {
     SchemaReference(String),
     #[error("schema reference depth exceeded while resolving '{location}'")]
     SchemaTooDeep { location: String },
+    #[error("resolved schema exceeds the expansion limit while resolving '{location}'")]
+    SchemaTooLarge { location: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +637,42 @@ fn validate_openapi_validator_config_budget(config: &Value) -> Result<(), Extrac
     Ok(())
 }
 
+/// Exhaustive `x-ferrum-validate` object keys.
+///
+/// The extension is a fixed-field object: an unrecognized key used to be copied
+/// verbatim into the generated plugin config, so a typo produced a plugin that
+/// constructed successfully with the weaker default still in force
+/// (GHSA-692x-352q-6gm8). `operations` is regenerated from the document and is
+/// rejected here rather than silently ignored.
+const X_FERRUM_VALIDATE_KEYS: &[&str] = &[
+    "mode",
+    "request",
+    "response",
+    "validate_request",
+    "validate_response",
+    "bypass",
+    "fail_on_unknown_operation",
+    "fail_on_missing_response_schema",
+    "max_body_bytes",
+    "error_response",
+    "error_truncate_chars",
+];
+const X_FERRUM_VALIDATE_SIDE_KEYS: &[&str] = &["enabled", "content_types"];
+const OPENAPI_VALIDATOR_BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
+
+fn reject_unknown_validate_keys(
+    object: &Map<String, Value>,
+    path: &str,
+    allowed: &[&str],
+) -> Result<(), ExtractError> {
+    crate::util::unknown_keys::reject_unknown_keys(object, path, allowed, "").map_err(|error| {
+        ExtractError::MalformedExtension {
+            which: "x-ferrum-validate",
+            error,
+        }
+    })
+}
+
 fn apply_validate_extension(
     config: &mut Map<String, Value>,
     validate_ext: Value,
@@ -642,9 +680,9 @@ fn apply_validate_extension(
     let Value::Object(map) = validate_ext else {
         return Ok(());
     };
+    reject_unknown_validate_keys(&map, "x-ferrum-validate", X_FERRUM_VALIDATE_KEYS)?;
     for (key, value) in map {
         match key.as_str() {
-            "operations" => {}
             "mode" => {
                 config.insert("enforcement_mode".to_string(), value);
             }
@@ -658,6 +696,8 @@ fn apply_validate_extension(
                 validate_openapi_validator_bypass("x-ferrum-validate", &value)?;
                 config.insert(key, value);
             }
+            // Enumerated above; every remaining key is a plugin config field
+            // that carries the same name.
             _ => {
                 config.insert(key, value);
             }
@@ -677,6 +717,11 @@ fn apply_validate_side_extension(
             error: format!("'{side}' must be an object"),
         });
     };
+    reject_unknown_validate_keys(
+        &map,
+        &format!("x-ferrum-validate.{side}"),
+        X_FERRUM_VALIDATE_SIDE_KEYS,
+    )?;
     for (key, value) in map {
         match key.as_str() {
             "enabled" => {
@@ -685,8 +730,11 @@ fn apply_validate_side_extension(
             "content_types" => {
                 config.insert(format!("{side}_content_types"), value);
             }
-            _ => {
-                config.insert(key, value);
+            other => {
+                return Err(ExtractError::MalformedExtension {
+                    which: "x-ferrum-validate",
+                    error: format!("unknown configuration key(s): '{side}.{other}'"),
+                });
             }
         }
     }
@@ -703,6 +751,13 @@ fn validate_openapi_validator_bypass(
             which,
             error: "openapi_validator bypass config must be an object".to_string(),
         })?;
+    crate::util::unknown_keys::reject_unknown_keys(
+        object,
+        &format!("{which}.bypass"),
+        OPENAPI_VALIDATOR_BYPASS_KEYS,
+        "",
+    )
+    .map_err(|error| ExtractError::MalformedExtension { which, error })?;
     for key in ["paths", "methods", "consumers"] {
         if let Some(value) = object.get(key)
             && !value.is_array()
@@ -847,6 +902,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         }
     };
     let mut operations = Vec::new();
+    let mut generated_operation_bytes = 0usize;
     // Draft selection is emitted once on the top-level openapi_validator config
     // (`schema_draft`). Runtime compiles every operation with that selector;
     // per-operation copies are not part of the published Admin schema.
@@ -879,6 +935,9 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             let Some(operation) = path_object.get(*method).and_then(Value::as_object) else {
                 continue;
             };
+            let mut operation_budget = GeneratedOperationBudget {
+                remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+            };
             let effective_bases = if version == "2.0" {
                 root_server_bases.clone()
             } else {
@@ -895,14 +954,40 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 }
             };
             let request_body = if version == "2.0" {
-                extract_swagger_request_body(root, path_object, operation, version, &resolver)?
+                extract_swagger_request_body(
+                    root,
+                    path_object,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             } else {
-                extract_openapi_request_body(root, operation, version, &resolver)?
+                extract_openapi_request_body(
+                    root,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             };
             let responses = if version == "2.0" {
-                extract_swagger_responses(root, path_object, operation, version, &resolver)?
+                extract_swagger_responses(
+                    root,
+                    path_object,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             } else {
-                extract_openapi_responses(root, operation, version, &resolver)?
+                extract_openapi_responses(
+                    root,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             };
 
             // One matcher per distinct effective pathname. Equivalent server
@@ -936,7 +1021,26 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 if !responses.is_empty() {
                     entry.insert("responses".to_string(), Value::Object(responses.clone()));
                 }
-                operations.push(Value::Object(entry));
+                let entry = Value::Object(entry);
+                let entry_bytes = serde_json::to_vec(&entry)
+                    .map_err(|error| ExtractError::MalformedExtension {
+                        which: "x-ferrum-validate",
+                        error: format!(
+                            "generated openapi_validator operation could not be serialized: {error}"
+                        ),
+                    })?
+                    .len();
+                generated_operation_bytes = generated_operation_bytes
+                    .checked_add(entry_bytes)
+                    .ok_or_else(|| ExtractError::SchemaTooLarge {
+                        location: effective_template.clone(),
+                    })?;
+                if generated_operation_bytes > MAX_OPENAPI_VALIDATOR_CONFIG_SIZE {
+                    return Err(ExtractError::SchemaTooLarge {
+                        location: effective_template,
+                    });
+                }
+                operations.push(entry);
             }
         }
     }
@@ -1319,6 +1423,7 @@ fn extract_openapi_request_body(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let Some(request_body) = operation.get("requestBody") else {
         return Ok(None);
@@ -1361,15 +1466,23 @@ fn extract_openapi_request_body(
             let encoding = match media_object.get("encoding") {
                 None | Some(Value::Null) => None,
                 Some(encoding) => Some(normalize_request_body_encoding(
-                    root, media_type, encoding, &schema, version, resolver,
+                    root, media_type, encoding, &schema, version, resolver, budget,
                 )?),
             };
             let media_value = match encoding {
-                Some(encoding) => json!({
-                    "schema": schema,
-                    "encoding": encoding,
-                }),
-                None => schema,
+                Some(encoding) => {
+                    budget.consume_key(media_type, media_type)?;
+                    budget.consume_map_entry("schema", &schema, media_type)?;
+                    budget.consume_key("encoding", media_type)?;
+                    json!({
+                        "schema": schema,
+                        "encoding": encoding,
+                    })
+                }
+                None => {
+                    budget.consume_map_entry(media_type, &schema, media_type)?;
+                    schema
+                }
             };
             content_schemas.insert(media_type.clone(), media_value);
         }
@@ -1392,7 +1505,21 @@ fn normalize_request_body_encoding(
     schema: &Value,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Value, ExtractError> {
+    const HEADER_OBJECT_KEYS: &[&str] = &[
+        "description",
+        "required",
+        "deprecated",
+        "allowEmptyValue",
+        "style",
+        "explode",
+        "allowReserved",
+        "schema",
+        "content",
+        "example",
+        "examples",
+    ];
     let base = media_type
         .split(';')
         .next()
@@ -1419,6 +1546,9 @@ fn normalize_request_body_encoding(
 
     let mut out = Map::new();
     for (property, value) in object {
+        let property_location =
+            format!("requestBody.content['{media_type}'].encoding['{property}']");
+        budget.consume_key(property, &property_location)?;
         let property_schema = request_body_property_schema(schema, property).ok_or_else(|| {
             ExtractError::MalformedExtension {
                 which: "requestBody.content.encoding",
@@ -1444,6 +1574,11 @@ fn normalize_request_body_encoding(
                     which: "requestBody.content.encoding",
                     error: format!("encoding['{property}'] contains unsupported field '{key}'"),
                 });
+            }
+        }
+        for key in ["style", "explode", "allowReserved", "contentType"] {
+            if let Some(value) = property_object.get(key) {
+                budget.consume_map_entry(key, value, &property_location)?;
             }
         }
 
@@ -1552,6 +1687,7 @@ fn normalize_request_body_encoding(
             }
         }
         if let Some(headers) = property_object.get("headers") {
+            budget.consume_key("headers", &property_location)?;
             if base != "multipart/form-data" {
                 return Err(ExtractError::MalformedExtension {
                     which: "requestBody.content.encoding",
@@ -1573,6 +1709,7 @@ fn normalize_request_body_encoding(
                 });
             }
             let mut normalized_headers = Map::new();
+            let mut seen_header_names = HashSet::new();
             for (header_name, header_value) in headers {
                 let name = header_name.trim().to_ascii_lowercase();
                 if http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
@@ -1585,6 +1722,14 @@ fn normalize_request_body_encoding(
                         which: "requestBody.content.encoding",
                         error: format!(
                             "encoding['{property}'].headers contains invalid or reserved header '{header_name}'"
+                        ),
+                    });
+                }
+                if !seen_header_names.insert(name) {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "requestBody.content['{media_type}'].encoding['{property}'].headers contains duplicate header name '{header_name}'"
                         ),
                     });
                 }
@@ -1608,6 +1753,49 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 };
+                for key in header_object.keys() {
+                    if !HEADER_OBJECT_KEYS.contains(&key.as_str()) {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'] contains unsupported field '{key}'"
+                            ),
+                        });
+                    }
+                }
+                if let Some(description) = header_object.get("description")
+                    && !description.is_null()
+                    && !description.is_string()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].description must be a string"
+                        ),
+                    });
+                }
+                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
+                    if let Some(value) = header_object.get(key)
+                        && !value.is_boolean()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
+                            ),
+                        });
+                    }
+                }
+                if let Some(examples) = header_object.get("examples")
+                    && !examples.is_object()
+                {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                        ),
+                    });
+                }
                 if header_object.contains_key("content") {
                     return Err(ExtractError::MalformedExtension {
                         which: "requestBody.content.encoding",
@@ -1672,7 +1860,9 @@ fn normalize_request_body_encoding(
                         SchemaDirection::Request,
                     ),
                 );
-                normalized_headers.insert(header_name.clone(), Value::Object(normalized_header));
+                let normalized_header = Value::Object(normalized_header);
+                budget.consume_map_entry(header_name, &normalized_header, &location)?;
+                normalized_headers.insert(header_name.clone(), normalized_header);
             }
             property_object.insert("headers".to_string(), Value::Object(normalized_headers));
         }
@@ -1756,12 +1946,14 @@ fn extract_openapi_responses(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
         return Ok(out);
     };
     for (status, response) in responses {
+        budget.consume_key(status, status)?;
         let resolved = resolve_refs(
             root,
             response,
@@ -1787,16 +1979,18 @@ fn extract_openapi_responses(
                         resolver,
                         ResolveContext::Schema,
                     )?;
-                    content_schemas.insert(
-                        media_type.clone(),
-                        normalize_schema_for_openapi(schema, version, SchemaDirection::Response),
-                    );
+                    let schema =
+                        normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
+                    budget.consume_map_entry(media_type, &schema, status)?;
+                    content_schemas.insert(media_type.clone(), schema);
                 }
             }
         }
-        if !content_schemas.is_empty() {
-            out.insert(status.clone(), Value::Object(content_schemas));
-        }
+        // Emit declared statuses even when they carry no schema-bearing
+        // content. An exact status declaration must preclude `4XX` / `default`
+        // fallback at runtime, which the validator can only honor if the
+        // declaration survives generation (GHSA-cjqx-p554-5rx9).
+        out.insert(status.clone(), Value::Object(content_schemas));
     }
     Ok(out)
 }
@@ -1807,6 +2001,7 @@ fn extract_swagger_request_body(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let parameters = operation
         .get("parameters")
@@ -1855,6 +2050,7 @@ fn extract_swagger_request_body(
             .unwrap_or(false);
         let mut content = Map::new();
         for media_type in swagger_media_types(root, path_item, operation, "consumes") {
+            budget.consume_map_entry(&media_type, &schema, "body")?;
             content.insert(media_type, schema.clone());
         }
         return Ok(Some((required, content)));
@@ -1868,6 +2064,7 @@ fn extract_swagger_responses(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
@@ -1875,6 +2072,7 @@ fn extract_swagger_responses(
     };
     let produces = swagger_media_types(root, path_item, operation, "produces");
     for (status, response) in responses {
+        budget.consume_key(status, status)?;
         let resolved = resolve_refs(
             root,
             response,
@@ -1887,22 +2085,24 @@ fn extract_swagger_responses(
         let Some(response_object) = resolved.as_object() else {
             continue;
         };
-        let Some(schema) = response_object.get("schema") else {
-            continue;
-        };
-        let schema = resolve_refs(
-            root,
-            schema,
-            status,
-            MAX_SCHEMA_REF_DEPTH,
-            resolver.document_base(),
-            resolver,
-            ResolveContext::Schema,
-        )?;
-        let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
         let mut content = Map::new();
-        for media_type in &produces {
-            content.insert(media_type.clone(), schema.clone());
+        // As above: a declared status with no `schema` still occupies its slot
+        // so it cannot fall through to a wildcard or `default` response.
+        if let Some(schema) = response_object.get("schema") {
+            let schema = resolve_refs(
+                root,
+                schema,
+                status,
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::Schema,
+            )?;
+            let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
+            for media_type in &produces {
+                budget.consume_map_entry(media_type, &schema, status)?;
+                content.insert(media_type.clone(), schema.clone());
+            }
         }
         out.insert(status.clone(), Value::Object(content));
     }
@@ -1932,6 +2132,11 @@ fn swagger_media_types(
 }
 
 const MAX_SCHEMA_REF_DEPTH: usize = 32;
+/// Maximum number of values materialized by one schema/reference expansion.
+///
+/// A shallow schema can otherwise use repeated local `$ref` branches to grow
+/// exponentially before the generated-config byte limit is checked.
+const MAX_RESOLVED_SCHEMA_NODES: usize = 500_000;
 const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// Path Item recursion grows several YAML/JSON container levels per callback.
 /// Keep its explicit resolver budget below the parsers' own recursion ceiling
@@ -1941,6 +2146,51 @@ const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
 /// Synthetic document base for local-only URI resolution. Never fetched.
 const LOCAL_SCHEMA_DOCUMENT_BASE: &str = "https://ferrum.invalid/local-schema";
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
+
+/// Incremental cap for all materialized request/response entries in one
+/// generated operation.
+///
+/// Each individual `$ref` expansion has its own resolver budget, but a hostile
+/// operation can repeat the same bounded expansion under many media types or
+/// statuses. Charge every emitted map entry before retaining it so those
+/// individually valid expansions cannot accumulate far beyond the generated
+/// config ceiling before the final serialized-entry check runs.
+struct GeneratedOperationBudget {
+    remaining_bytes: usize,
+}
+
+impl GeneratedOperationBudget {
+    fn consume_key(&mut self, key: &str, location: &str) -> Result<(), ExtractError> {
+        // Quoted key plus `:` / `,` structural bytes. The trailing comma is a
+        // one-byte overestimate for the final entry and therefore fail-safe.
+        self.consume_bytes(json_string_serialized_len(key).saturating_add(2), location)
+    }
+
+    fn consume_map_entry(
+        &mut self,
+        key: &str,
+        value: &Value,
+        location: &str,
+    ) -> Result<(), ExtractError> {
+        let (_, value_bytes) = opaque_value_weight(value);
+        self.consume_bytes(
+            json_string_serialized_len(key)
+                .saturating_add(2)
+                .saturating_add(value_bytes),
+            location,
+        )
+    }
+
+    fn consume_bytes(&mut self, bytes: usize, location: &str) -> Result<(), ExtractError> {
+        let Some(remaining) = self.remaining_bytes.checked_sub(bytes) else {
+            return Err(ExtractError::SchemaTooLarge {
+                location: location.to_string(),
+            });
+        };
+        self.remaining_bytes = remaining;
+        Ok(())
+    }
+}
 
 /// Indexes local schema resources and plain-name anchors for `$ref` resolution.
 ///
@@ -1962,6 +2212,13 @@ struct LocalSchemaResolver {
     resource_roots: Vec<SchemaResourceRoot>,
     /// OpenAPI 3.1+ uses `$anchor`; Swagger 2.0 / OAS 3.0 use Draft-7 `$id`/`id` fragments.
     use_dollar_anchor: bool,
+    /// OpenAPI 3.1+ Schema Objects inherit JSON Schema 2020-12 semantics, where
+    /// `$ref` is an applicator and adjacent keywords are independent assertions
+    /// that must *also* hold. Swagger 2.0 / OAS 3.0 Schema Objects use JSON
+    /// Reference semantics, where adjacent keywords carry no meaning at all.
+    /// Either way an adjacent keyword may never replace the referenced
+    /// assertion (GHSA-rf4j-rhmf-8whm).
+    schema_object_ref_siblings: bool,
 }
 
 struct SchemaResourceRoot {
@@ -1985,6 +2242,7 @@ impl LocalSchemaResolver {
             resources: HashSet::new(),
             resource_roots: Vec::new(),
             use_dollar_anchor,
+            schema_object_ref_siblings: use_dollar_anchor,
         };
         let document_key = resource_uri_key(&document_base);
         resolver.resources.insert(document_key.clone());
@@ -2598,7 +2856,11 @@ impl LocalSchemaResolver {
                 root
             } else {
                 root.pointer(resource_root_pointer).ok_or_else(|| {
-                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
+                    schema_reference_error(unresolved_internal_ref_message(
+                        reference,
+                        &resource_key,
+                        resource_root_pointer,
+                    ))
                 })?
             };
             // Empty fragment = schema resource root. The OpenAPI document root
@@ -2613,7 +2875,11 @@ impl LocalSchemaResolver {
                 resource_root
             } else {
                 resource_root.pointer(&decoded_fragment).ok_or_else(|| {
-                    schema_reference_error(format!("unresolved internal $ref '{reference}'"))
+                    schema_reference_error(unresolved_internal_ref_message(
+                        reference,
+                        &resource_key,
+                        resource_root_pointer,
+                    ))
                 })?
             };
             let absolute_pointer = if decoded_fragment.is_empty() {
@@ -2685,6 +2951,26 @@ impl LocalSchemaResolver {
         resource.set_fragment(None);
         Ok(resource)
     }
+}
+
+/// A JSON-pointer fragment resolves *inside* the schema resource in force at the
+/// reference, not against the OpenAPI document root. When an enclosing or
+/// adjacent `$id` rebased that resource, a pointer such as
+/// `#/components/schemas/Order` silently stops addressing the document, so name
+/// the resource that was searched instead of reporting a bare "unresolved".
+/// Both interpolated values come from the submitted spec and are already the
+/// same trust class as `reference`; no resolver-internal state is disclosed.
+fn unresolved_internal_ref_message(
+    reference: &str,
+    resource_key: &str,
+    resource_root_pointer: &str,
+) -> String {
+    if resource_root_pointer.is_empty() {
+        return format!("unresolved internal $ref '{reference}'");
+    }
+    format!(
+        "unresolved internal $ref '{reference}': the fragment is resolved inside the schema resource '{resource_key}' (rooted at '{resource_root_pointer}' by its $id), not against the OpenAPI document root; use an absolute $ref or move the $id"
+    )
 }
 
 fn resource_uri_key(url: &Url) -> String {
@@ -2831,6 +3117,149 @@ fn schema_child_context(key: &str, value: &Value) -> ResolveContext {
     }
 }
 
+/// Schema Object keywords that assert nothing about an instance: identifier /
+/// dialect / subschema-container keywords and pure annotations. They stay on
+/// the composition wrapper, which is the position they already occupied, so
+/// identifier and base-URI scope is unchanged.
+const SCHEMA_NON_ASSERTION_KEYWORDS: &[&str] = &[
+    "$anchor",
+    "$comment",
+    "$defs",
+    "$dynamicAnchor",
+    "$id",
+    "$schema",
+    "$vocabulary",
+    "default",
+    "definitions",
+    "deprecated",
+    "description",
+    "discriminator",
+    "example",
+    "examples",
+    "externalDocs",
+    "format",
+    "id",
+    "readOnly",
+    "summary",
+    "title",
+    "writeOnly",
+    "xml",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "$recursiveAnchor",
+];
+
+/// Schema Object keywords Ferrum cannot faithfully relocate into a composition
+/// branch. `unevaluatedProperties` / `unevaluatedItems` are evaluated against
+/// annotations produced by applicators in the *same* schema object — including
+/// the adjacent `$ref` — which a separate `allOf` branch does not see, and
+/// `$dynamicRef` resolution depends on the dynamic scope. Importing either next
+/// to `$ref` would change meaning, so they fail closed instead.
+const UNPRESERVABLE_REF_SIBLING_KEYWORDS: &[&str] = &[
+    "$dynamicRef",
+    "$recursiveRef",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// Resolution context for one Schema Object `$ref`-with-siblings composition:
+/// the document root, the reporting location, the reference being composed, the
+/// remaining recursion budget, the base URI in force inside the referring object
+/// (after its own `$id`), and the shared resolver.
+struct RefComposition<'a, 'b> {
+    root: &'a Value,
+    location: &'a str,
+    reference: &'a str,
+    depth: usize,
+    child_base: &'a Url,
+    resolver: &'a LocalSchemaResolver,
+    budget: &'b mut ResolutionBudget,
+}
+
+/// Compose a Schema Object `$ref` with its adjacent keywords without letting an
+/// adjacent keyword overwrite a referenced assertion (GHSA-rf4j-rhmf-8whm).
+///
+/// - Identifier and annotation keywords stay on the wrapper; they assert
+///   nothing, so keeping them in place preserves both meaning and `$id` scope.
+/// - OpenAPI 3.1+ (JSON Schema 2020-12): `$ref` is an applicator and adjacent
+///   assertions are independent, so the pair becomes
+///   `{<annotations>, allOf: [<referenced schema>, {<adjacent assertions>}]}`,
+///   which is exactly "both must hold".
+/// - Swagger 2.0 / OpenAPI 3.0: Schema Object `$ref` is a JSON Reference and
+///   adjacent keywords have no defined meaning. Rather than silently dropping
+///   an operator-visible constraint or applying the 3.1 rule to a document that
+///   did not opt into it, the import fails closed and asks for an explicit
+///   `allOf`.
+fn compose_schema_ref_siblings(
+    ctx: RefComposition<'_, '_>,
+    object: &Map<String, Value>,
+    resolved_target: Value,
+) -> Result<Value, ExtractError> {
+    let RefComposition {
+        root,
+        location,
+        reference,
+        depth,
+        child_base,
+        resolver,
+        budget,
+    } = ctx;
+    let mut wrapper_fields = Map::new();
+    let mut assertions = Map::new();
+    for (key, child) in object {
+        if key == "$ref" {
+            continue;
+        }
+        if UNPRESERVABLE_REF_SIBLING_KEYWORDS.contains(&key.as_str()) {
+            return Err(schema_reference_error(format!(
+                "$ref '{reference}' at {location} has an adjacent '{key}' keyword, whose evaluation scope cannot be preserved; move the reference into an explicit allOf branch"
+            )));
+        }
+        let resolved_child = resolve_refs_bounded(
+            root,
+            child,
+            location,
+            depth - 1,
+            child_base,
+            resolver,
+            schema_child_context(key, child),
+            budget,
+        )?;
+        if SCHEMA_NON_ASSERTION_KEYWORDS.contains(&key.as_str())
+            || key.starts_with("x-")
+            || (resolver.schema_object_ref_siblings && key == "nullable")
+        {
+            wrapper_fields.insert(key.clone(), resolved_child);
+        } else {
+            assertions.insert(key.clone(), resolved_child);
+        }
+    }
+
+    if !assertions.is_empty() && !resolver.schema_object_ref_siblings {
+        let mut keywords: Vec<&str> = assertions.keys().map(String::as_str).collect();
+        keywords.sort_unstable();
+        return Err(schema_reference_error(format!(
+            "$ref '{reference}' at {location} has adjacent assertion keyword(s) ({}); Swagger 2.0 and OpenAPI 3.0 Schema Object $ref is a JSON Reference with no defined sibling semantics, so wrap the reference in an explicit allOf instead",
+            keywords.join(", ")
+        )));
+    }
+
+    if wrapper_fields.is_empty() && assertions.is_empty() {
+        return Ok(resolved_target);
+    }
+
+    consume_resolution_budget(budget, location, 1, 2)?;
+    let mut wrapper = wrapper_fields;
+    let mut branches = vec![resolved_target];
+    if !assertions.is_empty() {
+        consume_resolution_budget(budget, location, 1, 2)?;
+        branches.push(Value::Object(assertions));
+    }
+    wrapper.insert("allOf".to_string(), Value::Array(branches));
+    Ok(Value::Object(wrapper))
+}
+
 fn resolve_refs(
     root: &Value,
     value: &Value,
@@ -2840,7 +3269,125 @@ fn resolve_refs(
     resolver: &LocalSchemaResolver,
     context: ResolveContext,
 ) -> Result<Value, ExtractError> {
+    let mut budget = ResolutionBudget {
+        remaining_nodes: MAX_RESOLVED_SCHEMA_NODES,
+        remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+    };
+    resolve_refs_bounded(
+        root,
+        value,
+        location,
+        depth,
+        current_base,
+        resolver,
+        context,
+        &mut budget,
+    )
+}
+
+struct ResolutionBudget {
+    remaining_nodes: usize,
+    remaining_bytes: usize,
+}
+
+fn consume_resolution_budget(
+    budget: &mut ResolutionBudget,
+    location: &str,
+    nodes: usize,
+    bytes: usize,
+) -> Result<(), ExtractError> {
+    let Some(remaining_nodes) = budget.remaining_nodes.checked_sub(nodes) else {
+        return Err(ExtractError::SchemaTooLarge {
+            location: location.to_string(),
+        });
+    };
+    let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(bytes) else {
+        return Err(ExtractError::SchemaTooLarge {
+            location: location.to_string(),
+        });
+    };
+    budget.remaining_nodes = remaining_nodes;
+    budget.remaining_bytes = remaining_bytes;
+    Ok(())
+}
+
+fn opaque_value_weight(value: &Value) -> (usize, usize) {
+    match value {
+        Value::Null => (1, 4),
+        Value::Bool(true) => (1, 4),
+        Value::Bool(false) => (1, 5),
+        Value::Number(number) => (1, number.to_string().len()),
+        Value::String(value) => (1, json_string_serialized_len(value)),
+        Value::Array(values) => values.iter().fold((1usize, 2usize), |weight, child| {
+            let child = opaque_value_weight(child);
+            (
+                weight.0.saturating_add(child.0),
+                weight.1.saturating_add(child.1).saturating_add(1),
+            )
+        }),
+        Value::Object(object) => object
+            .iter()
+            .fold((1usize, 2usize), |weight, (key, child)| {
+                let child = opaque_value_weight(child);
+                (
+                    weight.0.saturating_add(child.0),
+                    weight
+                        .1
+                        .saturating_add(json_string_serialized_len(key))
+                        .saturating_add(child.1)
+                        .saturating_add(2),
+                )
+            }),
+    }
+}
+
+/// Exact byte length of a string after `serde_json` quoting/escaping.
+///
+/// Resolver and operation budgets must count the representation that will
+/// actually be serialized. Counting decoded UTF-8 bytes alone underestimates
+/// attacker-controlled quotes, backslashes, and control characters by up to
+/// six bytes each.
+fn json_string_serialized_len(value: &str) -> usize {
+    value.chars().fold(2usize, |bytes, character| {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        bytes.saturating_add(encoded)
+    })
+}
+
+fn shallow_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(value) => json_string_serialized_len(value),
+        Value::Array(values) => values.len().saturating_add(2),
+        Value::Object(object) => object.keys().fold(2usize, |bytes, key| {
+            bytes
+                .saturating_add(json_string_serialized_len(key))
+                .saturating_add(2)
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_refs_bounded(
+    root: &Value,
+    value: &Value,
+    location: &str,
+    depth: usize,
+    current_base: &Url,
+    resolver: &LocalSchemaResolver,
+    context: ResolveContext,
+    budget: &mut ResolutionBudget,
+) -> Result<Value, ExtractError> {
     if context == ResolveContext::Opaque {
+        let (nodes, bytes) = opaque_value_weight(value);
+        consume_resolution_budget(budget, location, nodes, bytes)?;
         return Ok(value.clone());
     }
     if depth == 0 {
@@ -2848,6 +3395,7 @@ fn resolve_refs(
             location: location.to_string(),
         });
     }
+    consume_resolution_budget(budget, location, 1, shallow_value_bytes(value))?;
     match value {
         Value::Object(object) => {
             let child_base = if context == ResolveContext::Schema {
@@ -2868,7 +3416,7 @@ fn resolve_refs(
                 // are rejected inside `resolve_reference` as UnsupportedExternalRef.
                 let (target, target_base) =
                     resolver.resolve_reference(root, reference, &child_base)?;
-                let mut resolved = resolve_refs(
+                let mut resolved = resolve_refs_bounded(
                     root,
                     target,
                     reference,
@@ -2876,28 +3424,48 @@ fn resolve_refs(
                     &target_base,
                     resolver,
                     context,
+                    budget,
                 )?;
-                if object.len() > 1
-                    && let Some(resolved_object) = resolved.as_object_mut()
-                {
-                    for (key, child) in object {
-                        if key != "$ref" {
-                            resolved_object.insert(
-                                key.clone(),
-                                resolve_refs(
-                                    root,
-                                    child,
-                                    location,
-                                    depth - 1,
-                                    &child_base,
-                                    resolver,
-                                    if context == ResolveContext::Schema {
-                                        schema_child_context(key, child)
-                                    } else {
-                                        ResolveContext::Opaque
-                                    },
-                                )?,
-                            );
+                if object.len() > 1 {
+                    if context == ResolveContext::Schema {
+                        // Schema Object: never merge keywords by replacement.
+                        return compose_schema_ref_siblings(
+                            RefComposition {
+                                root,
+                                location,
+                                reference,
+                                depth,
+                                child_base: &child_base,
+                                resolver,
+                                budget,
+                            },
+                            object,
+                            resolved,
+                        );
+                    }
+                    // Reference Object (Path Item / requestBody / response /
+                    // parameter / header positions). These are not Schema
+                    // Objects and keep Ferrum's documented deterministic
+                    // sibling overlay; OpenAPI leaves the conflict undefined
+                    // for Path Items and the referenced object is not a
+                    // constraint set.
+                    if let Some(resolved_object) = resolved.as_object_mut() {
+                        for (key, child) in object {
+                            if key != "$ref" {
+                                resolved_object.insert(
+                                    key.clone(),
+                                    resolve_refs_bounded(
+                                        root,
+                                        child,
+                                        location,
+                                        depth - 1,
+                                        &child_base,
+                                        resolver,
+                                        ResolveContext::Opaque,
+                                        budget,
+                                    )?,
+                                );
+                            }
                         }
                     }
                 }
@@ -2915,7 +3483,7 @@ fn resolve_refs(
                 };
                 resolved.insert(
                     key.clone(),
-                    resolve_refs(
+                    resolve_refs_bounded(
                         root,
                         child,
                         location,
@@ -2923,6 +3491,7 @@ fn resolve_refs(
                         &child_base,
                         resolver,
                         child_context,
+                        budget,
                     )?,
                 );
             }
@@ -2931,7 +3500,7 @@ fn resolve_refs(
         Value::Array(values) if context == ResolveContext::SchemaArray => values
             .iter()
             .map(|child| {
-                resolve_refs(
+                resolve_refs_bounded(
                     root,
                     child,
                     location,
@@ -2939,6 +3508,7 @@ fn resolve_refs(
                     current_base,
                     resolver,
                     ResolveContext::Schema,
+                    budget,
                 )
             })
             .collect::<Result<Vec<_>, _>>()

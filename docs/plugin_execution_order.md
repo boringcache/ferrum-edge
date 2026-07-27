@@ -175,7 +175,7 @@ Any plugin can short-circuit the pipeline by returning a `Reject` result. For ex
 route/header-shaping `before_proxy` hooks and load balancing, but before
 circuit-breaker or backend dispatch. The gateway assembles the same path
 segments used by the backend URL builder, including regex/exact/prefix match
-length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
+length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
 backend wire. The selected target remains pinned across deferred external hooks,
@@ -237,6 +237,8 @@ health accounting without allowing it to bypass backend-effective gRPC method
 policy.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
+
+Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
 
 ### Buffered response representation gate
 

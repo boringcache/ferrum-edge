@@ -2243,9 +2243,10 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
 }
 
 /// Source-level drift guard for issue #3000: trust/routing nullable columns in
-/// `row_to_proxy` / `row_to_upstream` must use `try_get::<Option<_>>(...)?`
-/// so a non-NULL decode failure rejects the candidate load instead of silently
-/// becoming `None` (trust downgrade, mTLS disable, or upstream detach).
+/// `row_to_proxy` / `row_to_upstream` must fail closed on non-NULL decode
+/// failures (via `optional_utf8_text_column` / `try_get::<Option<_>>(...)?`)
+/// so a corrupt value rejects the candidate load instead of silently becoming
+/// `None` (trust downgrade, mTLS disable, or upstream detach).
 #[test]
 fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     let source = include_str!("../../../src/config/db_loader.rs");
@@ -2253,7 +2254,9 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     let row_to_proxy = source
         .split("fn row_to_proxy_inner(")
         .nth(1)
-        .and_then(|rest| rest.split("fn row_to_consumer(").next())
+        // Bound at the UTF-8 helpers that sit between proxy_inner and consumer
+        // so the drift assertions inspect only the mapper body.
+        .and_then(|rest| rest.split("fn required_utf8_text_column(").next())
         .expect("row_to_proxy_inner body");
     let row_to_upstream = source
         .split("fn row_to_upstream_inner(")
@@ -2266,8 +2269,9 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
 
     // Already-hardened contrast cases that established this contract.
     assert!(
-        row_to_proxy.contains("try_get::<Option<String>, _>(\"listen_path\")?"),
-        "listen_path must keep the strict Option decode that motivated this fix"
+        row_to_proxy.contains("optional_utf8_text_column(row, \"listen_path\")?")
+            || row_to_proxy.contains("try_get::<Option<String>, _>(\"listen_path\")?"),
+        "listen_path must keep a strict Option decode that motivated this fix"
     );
     assert!(
         row_to_proxy.contains("try_get::<Option<i32>, _>(\"stream_proxy_protocol\")?"),
@@ -2295,6 +2299,15 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
         assert_strict_nullable_string_decode(row_to_upstream, "row_to_upstream", column);
     }
 
+    assert!(
+        row_to_upstream.contains("required_utf8_text_column(row, \"targets\")"),
+        "row_to_upstream must decode MySQL MEDIUMTEXT targets via required_utf8_text_column"
+    );
+    assert!(
+        row_to_upstream.contains("optional_utf8_text_column(row, \"backend_tls_san_allow_list\")"),
+        "row_to_upstream must decode nullable MEDIUMTEXT san allow-list via optional_utf8_text_column"
+    );
+
     // SNI was already fail-closed; keep that contract pinned.
     assert!(
         row_to_upstream.contains("backend_tls_sni")
@@ -2303,11 +2316,50 @@ fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
     );
 }
 
+#[test]
+fn delete_paths_set_postgres_snapshot_isolation_before_other_tx_statements() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+
+    for (fn_name, marker) in [
+        ("delete_all_resources", "pub async fn delete_all_resources("),
+        ("delete_api_spec", "pub async fn delete_api_spec("),
+    ] {
+        let body = source
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn ").next())
+            .unwrap_or_else(|| panic!("{fn_name} body"));
+        let begin = body
+            .find("self.pool().begin()")
+            .unwrap_or_else(|| panic!("{fn_name} must begin a transaction"));
+        let set_iso = body
+            .find("use_delete_capture_snapshot_tx")
+            .unwrap_or_else(|| panic!("{fn_name} must call use_delete_capture_snapshot_tx"));
+        let lock = body
+            .find("lock_mtls_dns_admission")
+            .unwrap_or_else(|| panic!("{fn_name} must lock mTLS DNS admission"));
+        assert!(
+            begin < set_iso && set_iso < lock,
+            "{fn_name} must SET TRANSACTION (via use_delete_capture_snapshot_tx) \
+             immediately after begin and before lock_mtls_dns_admission*; \
+             Postgres rejects SET TRANSACTION after other statements"
+        );
+    }
+}
+
 fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) {
-    let strict = format!("try_get::<Option<String>, _>(\"{column}\")?");
+    // Long column names push the call past rustfmt's width, so it wraps the
+    // arguments and appends a trailing comma:
+    //   optional_utf8_text_column(\n row,\n "backend_tls_client_cert_path",\n )?
+    // Collapse whitespace *and* that trailing comma so the guard matches the
+    // wrapped and single-line forms identically.
+    let collapsed: String = body.split_whitespace().collect();
+    let compact_body = collapsed.replace(",)", ")");
+    let via_helper = format!("optional_utf8_text_column(row,\"{column}\")?");
+    let via_try_get = format!("try_get::<Option<String>,_>(\"{column}\")?");
     assert!(
-        body.contains(&strict),
-        "{mapper} must decode `{column}` with `{strict}` so NULL stays None and \
+        compact_body.contains(&via_helper) || compact_body.contains(&via_try_get),
+        "{mapper} must decode `{column}` with `{via_helper}` or `{via_try_get}` so NULL stays None and \
          non-NULL decode failures reject the load"
     );
     // Reject the historical silent-downgrade shapes.
