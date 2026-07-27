@@ -47,6 +47,14 @@ pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
     crate::util::client_identity::canonical_ip_arc(client_addr.ip())
 }
 
+/// Canonical client endpoint for diagnostics. Transport paths retain the raw
+/// socket address for reply routing and DTLS demux, but log fields must not
+/// split one IPv4 client across native and mapped-IPv6 representations.
+#[inline]
+fn udp_client_log_addr(client_addr: SocketAddr) -> SocketAddr {
+    crate::util::client_identity::canonical_socket_addr(client_addr)
+}
+
 /// Maximum response payload allowed by the UDP amplification guard.
 ///
 /// A zero-length request receives an explicit one-byte reply allowance so the
@@ -500,7 +508,7 @@ fn spawn_session_hook_ingress_worker(
             if let Err(e) = forward_client_datagram_to_backend(&session, &data).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = session.listen_port,
                     error = %e,
                     "UDP hook-ingress forward error"
@@ -1268,7 +1276,7 @@ async fn direct_send_reply_or_drop(
 ) {
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         size = data.len(),
         reason,
         "UDP reply using direct-send escape hatch"
@@ -1277,7 +1285,7 @@ async fn direct_send_reply_or_drop(
         send_drops.record_datagram(data.len());
         warn!(
             proxy_id = %proxy_id,
-            client = %client_addr,
+            client = %udp_client_log_addr(client_addr),
             size = data.len(),
             error = %e,
             "UDP fallback direct-send failed; datagram lost"
@@ -1450,7 +1458,7 @@ async fn try_gso_send_or_fallback(
             // GSO sendmsg itself failed — abandon GSO for this session.
             debug!(
                 proxy_id = %proxy_id,
-                client = %client_addr,
+                client = %udp_client_log_addr(client_addr),
                 "GSO send failed ({}), falling back to sendmmsg",
                 e
             );
@@ -1996,7 +2004,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 )
                 .await;
                 if let Err(e) = result {
-                    debug!(proxy_id = %proxy_id, client = %client_addr, "UDP forward error: {}", e);
+                    debug!(
+                        proxy_id = %proxy_id,
+                        client = %udp_client_log_addr(client_addr),
+                        "UDP forward error: {}",
+                        e
+                    );
                 }
 
                 // Drain additional pending datagrams without yielding to the runtime.
@@ -2439,7 +2452,7 @@ fn spawn_new_session_datagram(
             if is_client_or_policy_udp_setup_drop(&e) {
                 debug!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = listen_port,
                     error = %e,
                     "UDP session setup dropped client datagram"
@@ -2447,7 +2460,7 @@ fn spawn_new_session_datagram(
             } else {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = listen_port,
                     error = %e,
                     "UDP session setup or initial forward failed"
@@ -2653,7 +2666,7 @@ async fn process_new_session_datagram(
             if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = session.listen_port,
                     error = %e,
                     "UDP pending datagram forward error"
@@ -2909,7 +2922,7 @@ async fn start_dtls_frontend_listener(
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     warn!(
                         proxy_id = %proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         "DTLS session limit reached ({}), rejecting connection",
                         max_sessions
                     );
@@ -3013,7 +3026,7 @@ async fn start_dtls_frontend_listener(
                         {
                             debug!(
                                 proxy_id = %handler_proxy_id,
-                                client = %client_addr,
+                                client = %udp_client_log_addr(client_addr),
                                 "DTLS connection rejected by plugin"
                             );
                             client_conn.close().await;
@@ -3028,7 +3041,7 @@ async fn start_dtls_frontend_listener(
 
                     debug!(
                         proxy_id = %handler_proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         "DTLS frontend connection accepted"
                     );
 
@@ -3091,7 +3104,7 @@ async fn start_dtls_frontend_listener(
                             Err(e) => {
                                 debug!(
                                     proxy_id = %resolved_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "DTLS client session ended: {}",
                                     e
                                 );
@@ -3447,7 +3460,7 @@ async fn handle_dtls_client_inner(
             Err(_) => {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "DTLS session rejected: circuit breaker open"
                 );
                 return Err(StreamSetupError::new(
@@ -3548,7 +3561,7 @@ async fn handle_dtls_client_inner(
 
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         backend = %backend_addr,
         dtls_backend = backend_dtls.is_some(),
         "DTLS frontend session established"
@@ -3871,7 +3884,7 @@ async fn create_session(
             Err(_) => {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "UDP session rejected: circuit breaker open"
                 );
                 return Err(StreamSetupError::new(
@@ -4053,7 +4066,7 @@ async fn create_session(
 
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         backend = %backend_addr,
         "New UDP session created"
     );
@@ -4147,7 +4160,7 @@ async fn create_session(
                     Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "UDP backend DTLS recv error: {}",
                             e
                         );
@@ -4184,7 +4197,7 @@ async fn create_session(
                     Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "UDP backend recv error: {}",
                             e
                         );
@@ -4220,7 +4233,7 @@ async fn create_session(
                 if len as u64 > max_response {
                     warn!(
                         proxy_id = %reply_proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         response_size = len,
                         request_size = req_size,
                         factor = factor,
@@ -4312,7 +4325,7 @@ async fn create_session(
             } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
                 debug!(
                     proxy_id = %reply_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "UDP send to client failed: {}",
                     e
                 );
@@ -4416,7 +4429,7 @@ async fn create_session(
                             {
                                 debug!(
                                     proxy_id = %reply_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "UDP send to client failed: {}",
                                     e
                                 );
@@ -4503,7 +4516,7 @@ async fn create_session(
                     if let Err(e) = flush_result {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "GSO flush failed ({}), falling back to sendmmsg",
                             e
                         );
@@ -4534,7 +4547,7 @@ async fn create_session(
                             Err(e) => {
                                 debug!(
                                     proxy_id = %reply_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "UDP sendmmsg to client failed: {}",
                                     e
                                 );
