@@ -434,8 +434,7 @@ fn mesh_malformed_client_ca_rejected_with_explicit_frontend_identity() {
 
     assert!(mesh_inbound_server_identity_configured(&env).unwrap());
     let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
-        .err()
-        .expect("malformed CA must PEM-fail when explicit frontend identity is configured");
+        .expect_err("malformed CA must PEM-fail when explicit frontend identity is configured");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("mesh client CA bundle"),
@@ -459,8 +458,7 @@ fn mesh_malformed_client_ca_rejected_with_gateway_svid_identity() {
 
     assert!(mesh_inbound_server_identity_configured(&env).unwrap());
     let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
-        .err()
-        .expect("malformed CA must PEM-fail when gateway SVID identity is configured");
+        .expect_err("malformed CA must PEM-fail when gateway SVID identity is configured");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("mesh client CA bundle"),
@@ -483,8 +481,7 @@ fn mesh_malformed_client_ca_rejected_with_mesh_ca_backend_identity() {
 
     assert!(mesh_inbound_server_identity_configured(&env).unwrap());
     let err = validate_mesh_inbound_client_ca_if_applicable(&env, true, true)
-        .err()
-        .expect("malformed CA must PEM-fail when mesh CA backend identity is configured");
+        .expect_err("malformed CA must PEM-fail when mesh CA backend identity is configured");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("mesh client CA bundle"),
