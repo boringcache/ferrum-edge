@@ -297,9 +297,7 @@ fn type_error(path: &str, key: &str, expected: &str) -> String {
 }
 
 fn null_error(path: &str, key: &str) -> String {
-    format!(
-        "soap_ws_security: '{path}.{key}' must not be null; omit the field to use the default"
-    )
+    format!("soap_ws_security: '{path}.{key}' must not be null; omit the field to use the default")
 }
 
 fn range_error(path: &str, key: &str, min: u64, max: u64) -> String {
@@ -559,7 +557,12 @@ impl NonceReplayState {
         }
     }
 
-    fn capacity_reached(&self, incoming_bytes: usize, max_entries: usize, max_bytes: usize) -> bool {
+    fn capacity_reached(
+        &self,
+        incoming_bytes: usize,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> bool {
         if self.cache.len() >= max_entries {
             return true;
         }
@@ -1367,7 +1370,9 @@ impl SoapWsSecurity {
             return Err("WS-Security: replay protection state is at capacity".to_string());
         }
 
-        state.cache.insert(nonce.to_string(), NonceEntry { inserted_at: now });
+        state
+            .cache
+            .insert(nonce.to_string(), NonceEntry { inserted_at: now });
         state.add_bytes(incoming_bytes);
         Ok(())
     }

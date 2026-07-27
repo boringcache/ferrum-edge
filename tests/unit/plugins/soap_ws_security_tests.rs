@@ -305,11 +305,9 @@ fn test_non_object_config_error_is_redacted_and_bounded() {
     // A non-object root can still carry credential-like material or be
     // unbounded. The diagnostic must stay fixed/redacted.
     let secret = "super-secret-password-material-do-not-echo";
-    let err = SoapWsSecurity::new(&Value::String(format!(
-        "username=alice&password={secret}"
-    )))
-    .err()
-    .expect("non-object must reject");
+    let err = SoapWsSecurity::new(&Value::String(format!("username=alice&password={secret}")))
+        .err()
+        .expect("non-object must reject");
     assert_eq!(err, "soap_ws_security: config must be an object");
     assert!(!err.contains(secret));
     assert!(!err.contains("alice"));
@@ -4529,12 +4527,18 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
 
     let entries = plugin.nonce_replay_entry_count();
     let bytes = plugin.nonce_replay_retained_bytes();
-    assert!(entries <= MAX_ENTRIES, "final entry count {entries} > {MAX_ENTRIES}");
+    assert!(
+        entries <= MAX_ENTRIES,
+        "final entry count {entries} > {MAX_ENTRIES}"
+    );
     assert!(
         entries <= BYTE_CAP_ENTRIES,
         "final entry count {entries} > byte cap {BYTE_CAP_ENTRIES}"
     );
-    assert!(bytes <= MAX_BYTES, "final retained bytes {bytes} > {MAX_BYTES}");
+    assert!(
+        bytes <= MAX_BYTES,
+        "final retained bytes {bytes} > {MAX_BYTES}"
+    );
     assert_eq!(
         bytes,
         entries.saturating_mul(NONCE_LEN),
