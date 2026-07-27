@@ -874,7 +874,7 @@ impl RedisQuarantineSuppressor {
 fn redis_quarantine_fingerprint_content(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"ai_semantic_cache.redis_quarantine.content.v1\0");
-    hasher.update(&(data.len() as u64).to_le_bytes());
+    hasher.update((data.len() as u64).to_le_bytes());
     hasher.update(data);
     hasher.finalize().into()
 }
@@ -882,7 +882,7 @@ fn redis_quarantine_fingerprint_content(data: &[u8]) -> [u8; 32] {
 fn redis_quarantine_fingerprint_oversized(length: usize) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"ai_semantic_cache.redis_quarantine.oversized.v1\0");
-    hasher.update(&(length as u64).to_le_bytes());
+    hasher.update((length as u64).to_le_bytes());
     hasher.finalize().into()
 }
 
@@ -2310,10 +2310,10 @@ impl AiSemanticCache {
     #[allow(dead_code)]
     pub(crate) fn redis_quarantine_suppressed_for_tests(&self, cache_key: &str) -> bool {
         // Read-only probe: do not bump the suppression counter.
-        match self.redis_quarantine.entries.get(cache_key) {
-            Some(entry) if entry.expires_at > Instant::now() => true,
-            _ => false,
-        }
+        matches!(
+            self.redis_quarantine.entries.get(cache_key),
+            Some(entry) if entry.expires_at > Instant::now()
+        )
     }
 
     /// Force-expire a quarantine marker so TTL recovery can be tested without sleep.
@@ -4959,17 +4959,14 @@ impl Plugin for AiSemanticCache {
                 && let Ok(data) = serde_json::to_vec(&serializable)
             {
                 let ttl_seconds = self.ttl.as_secs().max(1);
-                match redis
+                if let Ok(()) = redis
                     .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
                     .await
                 {
-                    Ok(()) => {
-                        // A successful repair/replacement must be visible on the
-                        // next Redis lookup without waiting out a prior
-                        // quarantine-delete suppressor.
-                        self.redis_quarantine.clear(&cache_key);
-                    }
-                    Err(()) => {}
+                    // A successful repair/replacement must be visible on the
+                    // next Redis lookup without waiting out a prior
+                    // quarantine-delete suppressor.
+                    self.redis_quarantine.clear(&cache_key);
                 }
             }
         }
