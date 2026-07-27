@@ -24,6 +24,7 @@ from typing import Any
 
 
 GATEWAY_PORT_MARKERS = (":8000", ":8443", ":5010", ":5001", ":5003", ":5004")
+MAX_METRIC_COUNT = (1 << 63) - 1
 
 # CLI / workflow_dispatch aliases -> budget protocol names emitted by proto_bench.
 PROTOCOL_ALIASES: dict[str, str] = {
@@ -77,8 +78,13 @@ def parse_finite_number(value: Any) -> float | None:
     """Parse a finite float, or None when missing/malformed/non-finite."""
     if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        number = float(value)
+    if isinstance(value, int):
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+    elif isinstance(value, float):
+        number = value
     elif isinstance(value, str):
         text = value.strip()
         if not text:
@@ -103,10 +109,33 @@ def parse_nonnegative_number(value: Any) -> float | None:
 
 def parse_nonnegative_int(value: Any) -> int | None:
     """Parse a nonnegative integral count without raising on malformed input."""
-    number = parse_nonnegative_number(value)
-    if number is None or not float(number).is_integer():
+    if value is None or isinstance(value, bool):
         return None
-    return int(number)
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = int(text, 10)
+        except ValueError:
+            try:
+                parsed = float(text)
+            except (ValueError, OverflowError):
+                return None
+            if not math.isfinite(parsed) or not parsed.is_integer():
+                return None
+            number = int(parsed)
+    else:
+        return None
+    if number < 0 or number > MAX_METRIC_COUNT:
+        return None
+    return number
 
 
 def parse_unit_rate(value: Any) -> float | None:
@@ -293,11 +322,12 @@ def hard_fail(failures: list[str], message: str) -> None:
 def scenario_request_sample_usable(sample: Any) -> bool:
     if not isinstance(sample, dict):
         return False
+    for key in ("rps", "p50_us", "p90_us", "p95_us", "p99_us"):
+        if key in sample and sample.get(key) is not None:
+            if parse_nonnegative_number(sample.get(key)) is None:
+                return False
     total = sample_total(sample)
     if total is not None and total > 0:
-        if "rps" in sample and sample.get("rps") is not None:
-            if parse_nonnegative_number(sample.get("rps")) is None:
-                return False
         return True
     # Malformed request/error counts are never usable.
     if total is None and (
@@ -828,6 +858,9 @@ def self_test() -> int:
 
     if sample_total({"total_requests": "bad", "total_errors": 1}) is not None:
         failures.append("sample_total must return None for malformed counts")
+    oversized_sample = {"total_requests": 10**1000, "total_errors": 1}
+    if sample_total(oversized_sample) is not None:
+        failures.append("sample_total must reject adversarially large counts")
     if parse_finite_number(float("nan")) is not None:
         failures.append("parse_finite_number must reject NaN")
     if parse_unit_rate(1.5) is not None:
@@ -885,6 +918,18 @@ def self_test() -> int:
         failures.append("NaN heartbeat_success_rate should hard-fail")
     if not any("soak" in msg and "usable" in msg for msg in evaluation["failures"]):
         failures.append("NaN heartbeat should report soak sample usability failure")
+
+    nan_saturate_rps = json.loads(json.dumps(results))
+    nan_saturate_rps["scenarios"]["soak"]["sample"] = {
+        "rps": float("nan"),
+        "heartbeat_success_rate": 0.99,
+        "connect_success_rate": 0.99,
+    }
+    evaluation = evaluate(nan_saturate_rps, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("NaN saturate rps should hard-fail")
+    if not any("soak" in msg and "usable" in msg for msg in evaluation["failures"]):
+        failures.append("NaN saturate rps should report soak sample usability failure")
 
     nan_error_rate = json.loads(json.dumps(results))
     nan_error_rate["scenarios"]["connection_churn"]["error_rate"] = float("nan")

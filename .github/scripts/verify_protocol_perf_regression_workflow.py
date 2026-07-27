@@ -200,7 +200,12 @@ def validate_evaluator_contract(text: str, failures: list[str]) -> None:
         ("measured regression must not hard-fail under alert enforcement", "alert-only self-test"),
         ("NaN rps should hard-fail", "non-finite rps self-test"),
         ("malformed total_requests should hard-fail", "malformed counts self-test"),
+        (
+            "sample_total must reject adversarially large counts",
+            "oversized counts self-test",
+        ),
         ("NaN heartbeat_success_rate should hard-fail", "non-finite heartbeat self-test"),
+        ("NaN saturate rps should hard-fail", "non-finite saturate rps self-test"),
         ("non-finite resource plateau values should hard-fail", "non-finite plateau self-test"),
         ("finite zero-RPS should alert-only under alert enforcement", "zero-RPS alert-only self-test"),
     ):

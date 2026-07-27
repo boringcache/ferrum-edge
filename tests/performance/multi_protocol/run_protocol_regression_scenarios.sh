@@ -255,6 +255,7 @@ def load_bench(name: str):
     return None
 
 def sample_total(sample):
+    max_metric_count = (1 << 63) - 1
     try:
         req = sample.get("total_requests", 0)
         err = sample.get("total_errors", 0)
@@ -264,7 +265,12 @@ def sample_total(sample):
         err_i = int(err)
     except (TypeError, ValueError, OverflowError):
         return None
-    if req_i < 0 or err_i < 0:
+    if (
+        req_i < 0
+        or err_i < 0
+        or req_i > max_metric_count
+        or err_i > max_metric_count
+    ):
         return None
     return req_i + err_i
 
