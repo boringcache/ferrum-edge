@@ -13,6 +13,109 @@ use tracing::{info, warn};
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 
+/// Root config keys every Redis-backed rate-limit plugin accepts.
+///
+/// This is [`super::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS`] plus
+/// `redis_failure_policy`, which is meaningful only for enforcement plugins
+/// (`request_deduplication` expresses the same choice as `on_redis_unavailable`,
+/// and a cache has no enforcement decision to fail closed on). Plugins with a
+/// closed root key set must union this — not the shared Redis list — with their
+/// own policy keys, or a supplied `redis_failure_policy` would be rejected.
+///
+/// Parity with the shared list is asserted by
+/// [`debug_assert_rate_limit_redis_keys`].
+pub const RATE_LIMIT_REDIS_CONFIG_KEYS: &[&str] = &[
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+    "redis_failure_policy",
+];
+
+/// HTTP status for a refusal caused by unavailable centralized enforcement.
+///
+/// Deliberately not `429`: the caller is not over its budget, the budget simply
+/// cannot be evaluated. `503` also keeps rate-limit dashboards from counting an
+/// infrastructure outage as client abuse.
+pub const ENFORCEMENT_UNAVAILABLE_STATUS: u16 = 503;
+
+/// Client-facing message for [`ENFORCEMENT_UNAVAILABLE_STATUS`]. Names no
+/// endpoint, key, credential, or backend detail — an unauthenticated caller
+/// must not learn that a Redis endpoint exists, let alone its state.
+pub const ENFORCEMENT_UNAVAILABLE_MESSAGE: &str =
+    "Rate limit enforcement is temporarily unavailable";
+
+/// JSON body paired with [`ENFORCEMENT_UNAVAILABLE_STATUS`].
+pub const ENFORCEMENT_UNAVAILABLE_BODY: &str =
+    r#"{"error":"Rate limit enforcement is temporarily unavailable"}"#;
+
+/// Config value of `redis_failure_policy`, i.e. what a Redis-backed rate-limit
+/// policy does when the centralized store cannot be consulted — an outage, an
+/// egress/DNS screen failure, or an endpoint rejected as an unsupported
+/// topology (Redis Cluster).
+///
+/// The default is [`RedisFailurePolicy::FailClosed`]. `sync_mode: "redis"` is
+/// chosen precisely because a budget must hold *across* gateway processes;
+/// silently continuing on per-process counters turns one distributed budget into
+/// N independent ones, so a client can multiply the configured limit by the
+/// number of data planes it can reach. Preserving availability through an
+/// outage remains supported, but only as an explicit operator decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisFailurePolicy {
+    /// Deny while centralized enforcement is unavailable. Default.
+    FailClosed,
+    /// Explicitly accept per-process budgets during an outage: fall back to the
+    /// in-memory limiter, which enforces the configured limit once per gateway.
+    LocalFallback,
+}
+
+/// Parse `redis_failure_policy` from a plugin's root config object.
+///
+/// Validated even when `sync_mode` is not `"redis"` (same rationale as the
+/// shared Redis field parser): toggling sync mode later must not suddenly
+/// activate a value admission never checked.
+pub fn parse_redis_failure_policy(config: &Value) -> Result<RedisFailurePolicy, String> {
+    let Some(raw) = config.get("redis_failure_policy") else {
+        return Ok(RedisFailurePolicy::FailClosed);
+    };
+    let Some(raw) = raw.as_str() else {
+        return Err(
+            "rate limiting: 'redis_failure_policy' must be a string ('fail_closed' or \
+             'local_fallback')"
+                .to_string(),
+        );
+    };
+    match raw {
+        "fail_closed" => Ok(RedisFailurePolicy::FailClosed),
+        "local_fallback" => Ok(RedisFailurePolicy::LocalFallback),
+        // Value-redacted diagnostics: the root object can carry redis_url /
+        // redis_password, so name the accepted shape without echoing input.
+        _ => Err(
+            "rate limiting: 'redis_failure_policy' must be exactly 'fail_closed' or \
+             'local_fallback'"
+                .to_string(),
+        ),
+    }
+}
+
+/// Debug-only parity check that [`RATE_LIMIT_REDIS_CONFIG_KEYS`] is exactly the
+/// shared Redis keys plus `redis_failure_policy`.
+pub fn debug_assert_rate_limit_redis_keys() {
+    debug_assert!(
+        super::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS
+            .iter()
+            .all(|key| RATE_LIMIT_REDIS_CONFIG_KEYS.contains(key))
+            && RATE_LIMIT_REDIS_CONFIG_KEYS.contains(&"redis_failure_policy")
+            && RATE_LIMIT_REDIS_CONFIG_KEYS.len()
+                == super::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS.len() + 1
+    );
+}
+
 /// Placeholder plugin-config identity for constructions that have no stable
 /// resource id (config validation, direct/test construction).
 ///
@@ -165,6 +268,11 @@ pub struct RateLimitOutcome {
     /// per-entry timestamp already pins the correction to the right window) and
     /// for every other algorithm/op.
     pub reserved_window_index: Option<u64>,
+    /// The decision was a refusal because centralized enforcement could not be
+    /// consulted (`redis_failure_policy: "fail_closed"`), not because the
+    /// configured budget was exhausted. Consumers surface it as `503` rather
+    /// than `429` — the client is not over its limit, the limit is unprovable.
+    pub enforcement_unavailable: bool,
 }
 
 impl RateLimitOutcome {
@@ -178,6 +286,18 @@ impl RateLimitOutcome {
     pub fn deny() -> Self {
         Self {
             allowed: false,
+            ..Self::default()
+        }
+    }
+
+    /// Refusal because the centralized store could not be consulted under a
+    /// fail-closed policy. Carries no remaining/limit/usage: this gateway has no
+    /// authoritative view of the budget, and reporting a locally-derived number
+    /// would advertise a budget nothing is enforcing.
+    pub fn deny_enforcement_unavailable() -> Self {
+        Self {
+            allowed: false,
+            enforcement_unavailable: true,
             ..Self::default()
         }
     }
@@ -508,6 +628,13 @@ impl<A: RateLimitAlgorithm> RedisLimiter<A> {
         self.redis_client.is_available()
     }
 
+    /// Whether the configured endpoint was rejected as an unsupported topology
+    /// (Redis Cluster). Surfaced in degradation diagnostics so an operator can
+    /// tell a misconfiguration apart from an outage.
+    fn is_topology_unsupported(&self) -> bool {
+        self.redis_client.is_topology_unsupported()
+    }
+
     fn health_check_interval(&self) -> Duration {
         self.health_check_interval
     }
@@ -521,6 +648,12 @@ where
     plugin_name: &'static str,
     primary: RedisLimiter<A>,
     fallback: LocalLimiter<K, A>,
+    /// What happens when the centralized store cannot be consulted. Under the
+    /// default [`RedisFailurePolicy::FailClosed`] the `fallback` limiter is
+    /// retained but never consulted for admission — the plugin's cleanup and
+    /// capacity helpers still operate on it, and a policy change rebuilds the
+    /// instance.
+    failure_policy: RedisFailurePolicy,
     redis_healthy: Arc<AtomicBool>,
     fallback_warned: Arc<AtomicBool>,
     /// Abort handle for the failover health observer; aborted on Drop.
@@ -536,6 +669,7 @@ where
         plugin_name: &'static str,
         primary: RedisLimiter<A>,
         fallback: LocalLimiter<K, A>,
+        failure_policy: RedisFailurePolicy,
     ) -> Self {
         let redis_healthy = Arc::new(AtomicBool::new(true));
         let fallback_warned = Arc::new(AtomicBool::new(false));
@@ -544,12 +678,44 @@ where
             plugin_name,
             primary,
             fallback,
+            failure_policy,
             redis_healthy,
             fallback_warned,
             health_observer_abort: None,
         };
         limiter.spawn_health_observer();
         limiter
+    }
+
+    /// Log the degradation once per outage and report whether admission may
+    /// continue on per-process state.
+    fn degraded_allows_local(&self) -> bool {
+        let first = !self.fallback_warned.swap(true, Ordering::Relaxed);
+        match self.failure_policy {
+            RedisFailurePolicy::FailClosed => {
+                if first {
+                    warn!(
+                        plugin = self.plugin_name,
+                        topology_unsupported = self.primary.is_topology_unsupported(),
+                        "Redis rate limiting unavailable — denying under \
+                         redis_failure_policy='fail_closed'"
+                    );
+                }
+                false
+            }
+            RedisFailurePolicy::LocalFallback => {
+                if first {
+                    warn!(
+                        plugin = self.plugin_name,
+                        topology_unsupported = self.primary.is_topology_unsupported(),
+                        "Redis rate limiting unavailable — falling back to local in-memory state \
+                         under redis_failure_policy='local_fallback'; the configured budget is \
+                         now enforced once per gateway process"
+                    );
+                }
+                true
+            }
+        }
     }
 
     pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
@@ -566,11 +732,8 @@ where
             }
         }
 
-        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
-            warn!(
-                plugin = self.plugin_name,
-                "Redis rate limiting unavailable — falling back to local in-memory state"
-            );
+        if !self.degraded_allows_local() {
+            return RateLimitOutcome::deny_enforcement_unavailable();
         }
 
         self.fallback.check(local_key, op)
@@ -598,11 +761,8 @@ where
             }
         }
 
-        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
-            warn!(
-                plugin = self.plugin_name,
-                "Redis rate limiting unavailable — falling back to local in-memory state"
-            );
+        if !self.degraded_allows_local() {
+            return Some(RateLimitOutcome::deny_enforcement_unavailable());
         }
 
         self.fallback
@@ -741,6 +901,9 @@ where
         // Normalize once via PluginHttpClient so local-only and Redis-fallback
         // maps share the same effective FERRUM_POOL_SHARD_AMOUNT.
         let shard_amount = http_client.pool_shard_amount();
+        // Validated regardless of sync_mode so a later toggle cannot activate an
+        // unchecked value.
+        let failure_policy = parse_redis_failure_policy(config)?;
         let local = LocalLimiter::new(algorithm.clone(), shard_amount);
         match RedisLimiter::new_with_config_id(
             plugin_name,
@@ -753,9 +916,22 @@ where
                 plugin_name,
                 redis,
                 local,
+                failure_policy,
             ))),
             Ok(None) => Ok(Self::Local(local)),
             Err(err) => Err(err),
+        }
+    }
+
+    /// Effective `redis_failure_policy`, or `None` when this backend is
+    /// local-only (no centralized store to lose).
+    ///
+    /// Exposed so external coverage can prove the default is fail-closed and
+    /// that `local_fallback` is only reached by explicit configuration.
+    pub fn redis_failure_policy(&self) -> Option<RedisFailurePolicy> {
+        match self {
+            Self::Local(_) => None,
+            Self::Failover(failover) => Some(failover.failure_policy),
         }
     }
 
@@ -1392,8 +1568,8 @@ async fn check_http_windows_redis(
         let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
         let elapsed_fraction = progress.elapsed_fraction;
-        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+        let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
+        let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
         let ttl = two_window_ttl_seconds(window.window_seconds);
 
         let (prev_count, curr_count) = redis
@@ -1947,8 +2123,8 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
                 let elapsed_fraction = progress.elapsed_fraction;
-                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+                let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
+                let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let (prev_count, curr_count) = redis.get_two_counters(&prev_key, &curr_key).await?;
                 let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
                 let usage = weighted as u64;
@@ -1969,8 +2145,8 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
                 let elapsed_fraction = progress.elapsed_fraction;
-                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+                let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
+                let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let ttl = two_window_ttl_seconds(self.window_seconds);
                 let increment = u64_to_i64_saturating(tokens);
                 let new_curr_count = redis.incrby_with_expire(&curr_key, increment, ttl).await?;
@@ -2033,8 +2209,8 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                 let curr_idx = progress.index;
                 let prev_idx = curr_idx.saturating_sub(1);
                 let elapsed_fraction = progress.elapsed_fraction;
-                let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-                let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+                let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
+                let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
                 let (mut prev_count, mut curr_count) =
                     redis.get_two_counters(&prev_key, &curr_key).await?;
                 let ttl = two_window_ttl_seconds(self.window_seconds);
@@ -2072,7 +2248,7 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                     // reservation with no markers), fall back to the current
                     // window — the floor below still prevents a budget-bypass.
                     let target_idx = reserved_window_index.unwrap_or(curr_idx);
-                    let redis_key = redis.make_key(&[key, &target_idx.to_string()]);
+                    let redis_key = redis.make_slot_key(key, &[&target_idx.to_string()]);
                     // Floor the per-window counter at zero. Reconciliation
                     // deltas are usually negative (reserved ≫ actual; non-2xx
                     // releases the full reservation); a raw INCRBY could drive
@@ -2199,8 +2375,8 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
         let elapsed_fraction = progress.elapsed_fraction;
-        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
-        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+        let curr_key = redis.make_slot_key(key, &[&curr_idx.to_string()]);
+        let prev_key = redis.make_slot_key(key, &[&prev_idx.to_string()]);
         let ttl = two_window_ttl_seconds(window_seconds);
 
         let (prev_count, curr_count) = redis
@@ -2355,8 +2531,9 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
 
         match self.datagrams_per_window {
             Some(max_datagrams) if self.bytes_per_window.is_some() => {
-                let datagram_key = redis.make_key(&[key, "datagrams", &window_idx.to_string()]);
-                let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
+                let datagram_key =
+                    redis.make_slot_key(key, &["datagrams", &window_idx.to_string()]);
+                let bytes_key = redis.make_slot_key(key, &["bytes", &window_idx.to_string()]);
                 let (count, bytes) = redis
                     .incr_and_incrby_with_expire(
                         &datagram_key,
@@ -2383,7 +2560,8 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
                 }
             }
             Some(max_datagrams) => {
-                let datagram_key = redis.make_key(&[key, "datagrams", &window_idx.to_string()]);
+                let datagram_key =
+                    redis.make_slot_key(key, &["datagrams", &window_idx.to_string()]);
                 let count = redis.incr_with_expire(&datagram_key, ttl).await?;
                 if count as u64 > max_datagrams {
                     return Ok(RateLimitOutcome::deny()
@@ -2395,7 +2573,7 @@ impl RateLimitAlgorithm for UdpRateLimitAlgorithm {
             }
             None => {
                 if let Some(max_bytes) = self.bytes_per_window {
-                    let bytes_key = redis.make_key(&[key, "bytes", &window_idx.to_string()]);
+                    let bytes_key = redis.make_slot_key(key, &["bytes", &window_idx.to_string()]);
                     let bytes = redis
                         .incrby_with_expire(
                             &bytes_key,
@@ -3351,7 +3529,12 @@ mod tests {
         };
         let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
         let redis = test_redis_limiter(&http_client, algorithm);
-        let limiter = FailoverLimiter::new("rate_limiting", redis, local);
+        let limiter = FailoverLimiter::new(
+            "rate_limiting",
+            redis,
+            local,
+            RedisFailurePolicy::LocalFallback,
+        );
         let op = TestOp;
         let t0 = Instant::now();
 
@@ -3397,7 +3580,12 @@ mod tests {
             LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
         let redis = test_redis_limiter(&http_client, algorithm);
 
-        let _limiter = FailoverLimiter::new("rate_limiting", redis, local);
+        let _limiter = FailoverLimiter::new(
+            "rate_limiting",
+            redis,
+            local,
+            RedisFailurePolicy::LocalFallback,
+        );
     }
 
     #[tokio::test]
@@ -3409,7 +3597,12 @@ mod tests {
         };
         let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
         let redis = test_redis_limiter(&http_client, algorithm);
-        let limiter = FailoverLimiter::new("rate_limiting", redis, local);
+        let limiter = FailoverLimiter::new(
+            "rate_limiting",
+            redis,
+            local,
+            RedisFailurePolicy::LocalFallback,
+        );
         let op = TestOp;
 
         let primary = limiter.check("local".to_string(), "redis", &op).await;

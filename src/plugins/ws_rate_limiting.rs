@@ -309,12 +309,16 @@ impl Plugin for WsRateLimiting {
             WebSocketFrameDirection::ClientToBackend => "client->backend",
             WebSocketFrameDirection::BackendToClient => "backend->client",
         };
+        // A fail-closed refusal (centralized enforcement unavailable under
+        // `redis_failure_policy: "fail_closed"`) closes the connection just like
+        // an exceeded budget — a frame stream has no other refusal channel.
         warn!(
             plugin = "ws_rate_limiting",
             proxy_id = %proxy_id,
             connection_id,
             direction = dir_label,
-            "WebSocket frame rate exceeded, closing connection"
+            enforcement_unavailable = outcome.enforcement_unavailable,
+            "WebSocket frame rate limit refused, closing connection"
         );
         Some(Message::Close(Some(CloseFrame {
             code: CloseCode::Policy,

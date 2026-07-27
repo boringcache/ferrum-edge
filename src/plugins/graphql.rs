@@ -38,11 +38,12 @@ use tracing::{debug, warn};
 
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
-    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
-    validate_max_requests, validate_window_seconds,
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
+    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    apply_rate_limit_cleanup, debug_assert_rate_limit_redis_keys, validate_max_requests,
+    validate_window_seconds,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -69,7 +70,7 @@ const GRAPHQL_POLICY_CONFIG_KEYS: &[&str] = &[
 
 /// Closed top-level key set for `graphql` plugin config.
 ///
-/// Must stay aligned with OpenAPI `GraphqlConfig`, `REDIS_PLUGIN_CONFIG_KEYS`,
+/// Must stay aligned with OpenAPI `GraphqlConfig`, `RATE_LIMIT_REDIS_CONFIG_KEYS`,
 /// and `docs/plugins.md`. Unknown root keys fail closed so typos cannot silently
 /// replace introspection, identity, rate-map, or Redis synchronization policy.
 pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
@@ -80,7 +81,7 @@ pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
     "limit_by",
     "type_rate_limits",
     "operation_rate_limits",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
     "redis_tls",
@@ -90,6 +91,7 @@ pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
@@ -155,13 +157,14 @@ impl GraphqlPlugin {
             .ok_or_else(|| "graphql: config must be an object".to_string())?;
         // Debug assertion keeps the documented key groups aligned with the
         // closed root allowlist used for admission and OpenAPI parity.
+        debug_assert_rate_limit_redis_keys();
         debug_assert!(
             GRAPHQL_POLICY_CONFIG_KEYS
                 .iter()
-                .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+                .chain(RATE_LIMIT_REDIS_CONFIG_KEYS.iter())
                 .all(|key| GRAPHQL_CONFIG_KEYS.contains(key))
                 && GRAPHQL_CONFIG_KEYS.len()
-                    == GRAPHQL_POLICY_CONFIG_KEYS.len() + REDIS_PLUGIN_CONFIG_KEYS.len()
+                    == GRAPHQL_POLICY_CONFIG_KEYS.len() + RATE_LIMIT_REDIS_CONFIG_KEYS.len()
         );
         reject_unknown_keys(object, "config", GRAPHQL_CONFIG_KEYS, "graphql: ")?;
 
@@ -246,6 +249,16 @@ impl GraphqlPlugin {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective `redis_failure_policy` for advisory coverage: `None` for a
+    /// local-only config, `FailClosed` unless the operator opted into
+    /// `local_fallback`. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
     }
 
     /// Effective Redis key prefix for policy-isolation coverage. Not a
@@ -1584,8 +1597,19 @@ impl Plugin for GraphqlPlugin {
                 warn!(
                     op_type = %op.op_type,
                     plugin = "graphql",
-                    "GraphQL operation type rate limit exceeded"
+                    enforcement_unavailable = outcome.enforcement_unavailable,
+                    "GraphQL operation type rate limit refused"
                 );
+                // Centralized enforcement could not be consulted under
+                // `redis_failure_policy: "fail_closed"`: refuse without
+                // advertising a budget this gateway is not enforcing.
+                if outcome.enforcement_unavailable {
+                    return PluginResult::Reject {
+                        status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+                        body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+                        headers: json_content_type_header(),
+                    };
+                }
                 let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(
@@ -1614,8 +1638,17 @@ impl Plugin for GraphqlPlugin {
                 warn!(
                     operation = %op_name,
                     plugin = "graphql",
-                    "GraphQL named operation rate limit exceeded"
+                    enforcement_unavailable = outcome.enforcement_unavailable,
+                    "GraphQL named operation rate limit refused"
                 );
+                // See the operation-type arm above.
+                if outcome.enforcement_unavailable {
+                    return PluginResult::Reject {
+                        status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+                        body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+                        headers: json_content_type_header(),
+                    };
+                }
                 let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(

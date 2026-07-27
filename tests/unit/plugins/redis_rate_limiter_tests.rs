@@ -1302,3 +1302,230 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         );
     }
 }
+
+// ── Redis topology screening (GHSA-87rq-v4hx-8rcq) ────────────────────────
+//
+// The shared client is not Cluster-aware. Pointing an enforcement plugin at a
+// Redis Cluster endpoint used to surface only as "Redis is down", which silently
+// turned one distributed budget into one budget per gateway process. These
+// prove the endpoint is screened proactively (INFO CLUSTER) and reactively
+// (Cluster-only error codes), and that the rejection is terminal.
+
+#[test]
+fn parse_cluster_enabled_recognizes_only_a_reported_value() {
+    use ferrum_edge::_test_support::parse_cluster_enabled;
+
+    assert_eq!(
+        parse_cluster_enabled("# Cluster\r\ncluster_enabled:1\r\n"),
+        Some(true)
+    );
+    assert_eq!(
+        parse_cluster_enabled("# Cluster\r\ncluster_enabled:0\r\n"),
+        Some(false)
+    );
+    // Any non-zero value counts as enabled.
+    assert_eq!(parse_cluster_enabled("cluster_enabled:2"), Some(true));
+    // Absent / unparseable stays unknown so RESP-compatible servers that do not
+    // report the field are never rejected by the proactive screen.
+    assert_eq!(parse_cluster_enabled("# Server\r\nredis_version:7.2.4"), None);
+    assert_eq!(parse_cluster_enabled(""), None);
+    assert_eq!(parse_cluster_enabled("cluster_enabled:"), None);
+    assert_eq!(parse_cluster_enabled("cluster_enabled_extra:1"), None);
+}
+
+#[test]
+fn cluster_topology_codes_are_terminal_but_outage_codes_are_not() {
+    use ferrum_edge::_test_support::is_cluster_topology_code;
+
+    for code in ["MOVED", "ASK", "CROSSSLOT", "CLUSTERDOWN", "TRYAGAIN"] {
+        assert!(
+            is_cluster_topology_code(Some(code)),
+            "{code} proves an unsupported Cluster topology"
+        );
+    }
+    // MASTERDOWN/LOADING are ordinary replication/availability failures and must
+    // stay recoverable; None is a transport error, not a topology verdict.
+    for code in ["MASTERDOWN", "LOADING", "ERR", "NOAUTH", "WRONGTYPE"] {
+        assert!(
+            !is_cluster_topology_code(Some(code)),
+            "{code} must not permanently disable the endpoint"
+        );
+    }
+    assert!(!is_cluster_topology_code(None));
+}
+
+#[test]
+fn slot_keys_of_one_rate_key_share_a_hash_tag() {
+    use ferrum_edge::_test_support::redis_slot_key;
+
+    let config = || make_config("redis://127.0.0.1:6379/0", false);
+    let prev = redis_slot_key(config(), "ip:1.2.3.4", &["41"]);
+    let curr = redis_slot_key(config(), "ip:1.2.3.4", &["42"]);
+    assert_eq!(prev, "{ferrum:test:ip:1.2.3.4}:41");
+    assert_eq!(curr, "{ferrum:test:ip:1.2.3.4}:42");
+
+    fn hash_tag(key: &str) -> &str {
+        let open = key.find('{').expect("hash tag opens");
+        let close = key[open + 1..].find('}').expect("hash tag closes") + open + 1;
+        &key[open + 1..close]
+    }
+    assert_eq!(
+        hash_tag(&prev),
+        hash_tag(&curr),
+        "previous and current window buckets must land in one slot"
+    );
+
+    // The UDP datagram/byte pair of one client shares a slot too.
+    let datagrams = redis_slot_key(config(), "udp:1.2.3.4", &["datagrams", "7"]);
+    let bytes = redis_slot_key(config(), "udp:1.2.3.4", &["bytes", "7"]);
+    assert_eq!(hash_tag(&datagrams), hash_tag(&bytes));
+
+    // Distinct rate keys still spread across slots — the tag must not collapse
+    // an entire policy onto one hot slot.
+    let other = redis_slot_key(config(), "ip:5.6.7.8", &["42"]);
+    assert_ne!(hash_tag(&curr), hash_tag(&other));
+}
+
+/// Minimal RESP server: replies `+OK` to every command except `INFO`, which gets
+/// `info_payload` as a bulk string. Once `after_info_reply` is set, every later
+/// command receives that raw reply instead of `+OK`. Counts accepted TCP
+/// connections and observed `INCR` payloads.
+async fn spawn_topology_redis_server(
+    info_payload: &'static str,
+    after_info_reply: Option<&'static str>,
+) -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let incrs = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let incrs_task = Arc::clone(&incrs);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let incrs = Arc::clone(&incrs_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        let mut info_seen = false;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let chunk = &buf[..n];
+                            if chunk
+                                .windows(b"$4\r\nINCR\r\n".len())
+                                .any(|w| w == b"$4\r\nINCR\r\n")
+                            {
+                                incrs.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let commands = chunk.iter().filter(|&&b| b == b'*').count().max(1);
+                            let mut reply = Vec::new();
+                            if chunk
+                                .windows(b"$4\r\nINFO\r\n".len())
+                                .any(|w| w == b"$4\r\nINFO\r\n")
+                            {
+                                info_seen = true;
+                                reply.extend_from_slice(
+                                    format!("${}\r\n{info_payload}\r\n", info_payload.len())
+                                        .as_bytes(),
+                                );
+                            } else if info_seen && let Some(raw) = after_info_reply {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(raw.as_bytes());
+                                }
+                            } else {
+                                for _ in 0..commands {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx, accepts, incrs)
+}
+
+/// A Cluster endpoint must be refused at connect, before it can serve a single
+/// policy operation, and must never be redialed by the recovery checker.
+#[tokio::test]
+async fn cluster_enabled_endpoint_is_refused_before_serving_policy_operations() {
+    let (port, shutdown, accepts, incrs) =
+        spawn_topology_redis_server("# Cluster\r\ncluster_enabled:1\r\n", None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let first = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(first.is_err(), "a Cluster endpoint must not serve counters");
+    assert!(
+        client.is_topology_unsupported(),
+        "cluster_enabled:1 must be recorded as an unsupported topology"
+    );
+    assert!(!client.is_available(), "topology rejection is terminal");
+    assert_eq!(
+        incrs.load(Ordering::Relaxed),
+        0,
+        "no counter command may reach a Cluster endpoint"
+    );
+
+    let dials_after_first = accepts.load(Ordering::Relaxed);
+    let second = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(second.is_err());
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials_after_first,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// A server that hides its topology from `INFO` is still caught the first time
+/// it answers with a Cluster-only redirection.
+#[tokio::test]
+async fn cluster_redirection_error_permanently_disables_the_endpoint() {
+    let (port, shutdown, accepts, _incrs) = spawn_topology_redis_server(
+        "# Cluster\r\ncluster_enabled:0\r\n",
+        Some("-MOVED 1234 127.0.0.1:7001\r\n"),
+    )
+    .await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let first = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(first.is_err(), "a MOVED redirection must fail the operation");
+    assert!(
+        client.is_topology_unsupported(),
+        "MOVED proves the endpoint is a Cluster this client cannot enforce against"
+    );
+    assert!(!client.is_available());
+
+    let dials = accepts.load(Ordering::Relaxed);
+    let second = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(second.is_err());
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials,
+        "topology rejection must stop reconnection attempts"
+    );
+
+    let _ = shutdown.send(());
+}

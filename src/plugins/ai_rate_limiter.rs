@@ -12,7 +12,8 @@ use super::utils::ai_providers::{
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
-    AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
+    AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
+    ENFORCEMENT_UNAVAILABLE_STATUS, RateLimitBackend, RateLimitOutcome, ReservationBackend,
     STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, validate_window_seconds,
 };
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -391,6 +392,13 @@ impl AiRateLimiter {
 
     fn store_metadata(&self, ctx: &mut RequestContext, outcome: &RateLimitOutcome) {
         if !self.expose_headers {
+            return;
+        }
+        // A fail-closed reconciliation outcome carries no authoritative counter
+        // (centralized enforcement could not be consulted). Publishing its empty
+        // remaining/usage would advertise `0 used` for a budget this gateway
+        // cannot see; leave the previously stored values in place instead.
+        if outcome.enforcement_unavailable {
             return;
         }
 
@@ -1570,8 +1578,19 @@ impl Plugin for AiRateLimiter {
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",
-                "AI token rate limit exceeded"
+                enforcement_unavailable = outcome.enforcement_unavailable,
+                "AI token rate limit refused"
             );
+            // Centralized token budgets could not be consulted under
+            // `redis_failure_policy: "fail_closed"`. Refuse without reporting a
+            // usage/limit this gateway has no authoritative view of.
+            if outcome.enforcement_unavailable {
+                return PluginResult::Reject {
+                    status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+                    body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
             return self.reject(usage);
         }
 

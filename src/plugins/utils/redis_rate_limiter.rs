@@ -7,7 +7,38 @@
 //! # Redis protocol compatibility
 //!
 //! Uses the standard Redis protocol (RESP), so it works with Redis, Valkey,
-//! DragonflyDB, KeyDB, Garnet, or any RESP-compatible server.
+//! DragonflyDB, KeyDB, Garnet, or any RESP-compatible server running in
+//! **single-endpoint (non-Cluster) topology**.
+//!
+//! # Topology: Redis Cluster is NOT supported
+//!
+//! This client builds a plain single-node [`redis::Client`]; the crate's
+//! Cluster features are deliberately not enabled, so it cannot follow `MOVED` /
+//! `ASK` redirections. Pointing a Redis-backed policy at a Cluster endpoint
+//! would make every misdirected command fail, and an enforcement plugin that
+//! silently treats those failures as "Redis is down" degrades a distributed
+//! security policy into one independent budget per gateway process.
+//!
+//! The client therefore screens topology instead of hoping for the best:
+//!
+//! 1. **Proactively**, right after each connection is established, it issues
+//!    `INFO CLUSTER` and refuses the connection when the server reports
+//!    `cluster_enabled:1` ([`parse_cluster_enabled`]). Servers that do not
+//!    implement `INFO` (or omit the field) are not rejected — they fall through
+//!    to the reactive screen so ordinary RESP-compatible servers keep working.
+//! 2. **Reactively**, any command answered with a Cluster-only error code
+//!    (`MOVED`, `ASK`, `CROSSSLOT`, `CLUSTERDOWN`, `TRYAGAIN` — see
+//!    [`is_cluster_topology_code`]) marks the endpoint permanently unusable.
+//!
+//! Topology rejection is **terminal for the life of the client**: unlike an
+//! outage it is not something a `PING` can clear (a Cluster node answers `PING`
+//! happily while still redirecting every key), so the recovery checker never
+//! restores availability. A configuration change rebuilds the client.
+//!
+//! Every key that one atomic operation touches is additionally placed in a
+//! shared hash slot via [`RedisRateLimitClient::make_slot_key`], so the
+//! multi-key sliding-window and datagram/byte transactions are slot-stable if
+//! they are ever run against a sharded deployment.
 //!
 //! # Algorithm
 //!
@@ -45,11 +76,18 @@
 //!
 //! # Resilience
 //!
-//! If Redis becomes unreachable, the client marks itself unavailable and the
-//! plugin falls back to local in-memory rate limiting. A background task
-//! periodically pings Redis to detect recovery. That task is owned by this
-//! client: dropping the client aborts it so retired plugin generations do not
-//! retain connections or keep pinging obsolete endpoints.
+//! If Redis becomes unreachable, the client marks itself unavailable. A
+//! background task periodically pings Redis to detect recovery. That task is
+//! owned by this client: dropping the client aborts it so retired plugin
+//! generations do not retain connections or keep pinging obsolete endpoints.
+//!
+//! What a *consumer* does while the client is unavailable is the consumer's
+//! policy, not this client's: rate-limit plugins choose between failing closed
+//! and local fallback through `redis_failure_policy` (see
+//! [`crate::plugins::utils::rate_limit::RedisFailurePolicy`]), and
+//! `request_deduplication` through `on_redis_unavailable`. Local fallback means
+//! one independent enforcement domain per gateway process, so it is an explicit
+//! opt-in rather than the default.
 //!
 //! # Connection pool
 //!
@@ -559,6 +597,45 @@ enum ConnectAttemptError {
     Timeout,
 }
 
+/// Redis error codes that only a Cluster-mode server ever returns.
+///
+/// This client is not Cluster-aware (see the module-level topology notes), so
+/// any of these proves the configured endpoint is a topology it cannot enforce
+/// against — not a transient outage. Matching on the wire code rather than a
+/// `redis::ErrorKind` variant keeps the check stable across crate versions and
+/// also catches RESP-compatible servers that return the code as an extension
+/// error.
+///
+/// `MASTERDOWN` is deliberately excluded: plain replication returns it too, and
+/// it is a genuine (recoverable) availability failure.
+pub fn is_cluster_topology_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("MOVED" | "ASK" | "CROSSSLOT" | "CLUSTERDOWN" | "TRYAGAIN")
+    )
+}
+
+/// Read `cluster_enabled` out of an `INFO CLUSTER` reply.
+///
+/// Returns `None` when the field is absent — the server may be a
+/// RESP-compatible implementation that does not report it, and an absent field
+/// must never be treated as proof of either topology. `Some(true)` is the only
+/// value that rejects an endpoint, so the "unknown" case stays compatible.
+pub fn parse_cluster_enabled(info: &str) -> Option<bool> {
+    for line in info.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("cluster_enabled:") else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        return Some(value != "0");
+    }
+    None
+}
+
 /// Screen + resolve the Redis endpoint through the gateway DNS cache, NEVER
 /// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
 /// AND the background recovery checker so neither can hand an unscreened host to
@@ -609,6 +686,22 @@ async fn screen_redis_endpoint(
         return RedisEndpoint::EgressDenied;
     }
     RedisEndpoint::Url(config.effective_url())
+}
+
+/// Ask a freshly established connection whether it belongs to a Cluster-mode
+/// server, returning `true` only when the endpoint is provably unusable.
+///
+/// A server that rejects or does not implement `INFO` (restricted ACL, minimal
+/// RESP implementation) yields `false`: the endpoint is not *proven* to be a
+/// Cluster, and the reactive per-command screen still catches redirections. An
+/// `INFO` answered with a Cluster-only error code is itself proof.
+async fn connection_reports_cluster_topology(conn: &mut impl redis::aio::ConnectionLike) -> bool {
+    let info: Result<String, redis::RedisError> =
+        redis::cmd("INFO").arg("CLUSTER").query_async(conn).await;
+    match info {
+        Ok(text) => parse_cluster_enabled(&text).unwrap_or(false),
+        Err(e) => is_cluster_topology_code(e.code()),
+    }
 }
 
 /// One lazily-established multiplexed ConnectionManager slot in the pool.
@@ -678,6 +771,11 @@ pub struct RedisRateLimitClient {
     dns_cache: Option<DnsCache>,
     /// Whether Redis is currently reachable.
     available: Arc<AtomicBool>,
+    /// Whether the configured endpoint was proven to be an unsupported topology
+    /// (Redis Cluster). Terminal for the life of the client: a Cluster node
+    /// answers `PING` while still redirecting every key, so recovery pings must
+    /// never clear it. See the module-level topology notes.
+    topology_unsupported: Arc<AtomicBool>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
     /// Abort handle for the background recovery checker (set once on start).
@@ -763,6 +861,7 @@ impl RedisRateLimitClient {
             config,
             dns_cache,
             available: Arc::new(AtomicBool::new(true)),
+            topology_unsupported: Arc::new(AtomicBool::new(false)),
             health_checker_started: AtomicBool::new(false),
             health_checker_abort: Mutex::new(None),
             tls_no_verify,
@@ -772,9 +871,16 @@ impl RedisRateLimitClient {
 
     /// Whether Redis is currently available.
     ///
-    /// This is an O(1) atomic load — safe to call on every request.
+    /// This is an O(1) atomic load — safe to call on every request. An endpoint
+    /// proven to be an unsupported topology is never available again, so a
+    /// consumer's failure policy applies for the life of the client.
     pub fn is_available(&self) -> bool {
-        self.available.load(Ordering::Relaxed)
+        !self.topology_unsupported.load(Ordering::Relaxed) && self.available.load(Ordering::Relaxed)
+    }
+
+    /// Whether the configured endpoint was rejected as an unsupported topology.
+    pub fn is_topology_unsupported(&self) -> bool {
+        self.topology_unsupported.load(Ordering::Relaxed)
     }
 
     /// Shared availability flag for failover observers that must not retain the
@@ -1072,6 +1178,11 @@ impl RedisRateLimitClient {
 
     /// Establish (or reuse) the ConnectionManager for a specific pool slot.
     async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::ConnectionManager> {
+        // A rejected topology is terminal: never redial it, so no command can
+        // succeed against an endpoint this client cannot enforce against.
+        if self.is_topology_unsupported() {
+            return None;
+        }
         let slot = &self.pool[idx];
 
         // Fast path: lock-free read via ArcSwap
@@ -1124,7 +1235,12 @@ impl RedisRateLimitClient {
         };
 
         match self.connect_manager(client).await {
-            Ok(manager) => {
+            Ok(mut manager) => {
+                // Screen topology before the connection is published to the hot
+                // path: a Cluster endpoint must never serve a policy operation.
+                if !self.screen_topology(&mut manager).await {
+                    return None;
+                }
                 self.available.store(true, Ordering::Relaxed);
                 info!(
                     redis_url = %self.config.redacted_url(),
@@ -1142,9 +1258,9 @@ impl RedisRateLimitClient {
                     redis_url = %self.config.redacted_url(),
                     pool_slot = idx,
                     error = %e,
-                    "Failed to connect to Redis for rate limiting — falling back to local"
+                    "Failed to connect to Redis for rate limiting"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 self.start_health_checker_if_needed();
                 None
             }
@@ -1153,7 +1269,7 @@ impl RedisRateLimitClient {
                     redis_url = %self.config.redacted_url(),
                     pool_slot = idx,
                     timeout_seconds = self.config.connect_timeout_seconds,
-                    "Timed out connecting to Redis for rate limiting — falling back to local"
+                    "Timed out connecting to Redis for rate limiting"
                 );
                 self.mark_unavailable();
                 self.start_health_checker_if_needed();
@@ -1183,6 +1299,11 @@ impl RedisRateLimitClient {
     /// transaction, and must fail closed on any I/O error rather than retrying
     /// a partial transaction on a new connection.
     async fn get_dedicated_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+        // A rejected topology is terminal: never redial it (see
+        // `get_or_connect_slot`).
+        if self.is_topology_unsupported() {
+            return None;
+        }
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
             RedisEndpoint::EgressDenied => {
@@ -1215,7 +1336,11 @@ impl RedisRateLimitClient {
         };
 
         match self.connect_multiplexed(client).await {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                // Screen topology before any WATCH/MULTI sequence runs on it.
+                if !self.screen_topology(&mut conn).await {
+                    return None;
+                }
                 self.available.store(true, Ordering::Relaxed);
                 Some(conn)
             }
@@ -1225,7 +1350,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Failed to connect dedicated Redis client"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 self.start_health_checker_if_needed();
                 None
             }
@@ -1256,6 +1381,47 @@ impl RedisRateLimitClient {
         self.clear_connection();
     }
 
+    /// Permanently reject the configured endpoint as an unsupported topology.
+    ///
+    /// Distinct from [`Self::mark_unavailable`] on purpose: this is a
+    /// configuration fault, not an outage, so no amount of recovery pinging can
+    /// make the next policy operation correct. Every later
+    /// [`Self::is_available`] load stays false and the consumer's configured
+    /// failure policy governs from here on.
+    fn mark_topology_unsupported(&self, reason: &str) {
+        let already = self.topology_unsupported.swap(true, Ordering::Relaxed);
+        self.mark_unavailable();
+        if !already {
+            warn!(
+                redis_url = %self.config.redacted_url(),
+                key_prefix = %self.config.key_prefix,
+                reason,
+                "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
+                 — centralized enforcement is disabled for this configuration until it is changed"
+            );
+        }
+    }
+
+    /// Classify a failed Redis command: an unsupported topology is terminal,
+    /// anything else is an ordinary (recoverable) availability failure.
+    fn note_command_failure(&self, error: &redis::RedisError) {
+        if is_cluster_topology_code(error.code()) {
+            self.mark_topology_unsupported("cluster redirection or cross-slot error");
+        } else {
+            self.mark_unavailable();
+        }
+    }
+
+    /// Reject a freshly established connection whose server reports Cluster
+    /// topology. Returns `true` when the connection may be used.
+    async fn screen_topology(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
+        if connection_reports_cluster_topology(conn).await {
+            self.mark_topology_unsupported("server reported cluster_enabled");
+            return false;
+        }
+        true
+    }
+
     /// Start a background task that periodically pings Redis to detect recovery.
     ///
     /// The task is aborted when this client is dropped so retired plugin
@@ -1266,6 +1432,7 @@ impl RedisRateLimitClient {
         }
 
         let available = self.available.clone();
+        let topology_unsupported = self.topology_unsupported.clone();
         let config = self.config.clone();
         let dns_cache = self.dns_cache.clone();
         let interval = Duration::from_secs(self.config.health_check_interval_seconds);
@@ -1276,6 +1443,13 @@ impl RedisRateLimitClient {
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
+
+                // A rejected topology is a configuration fault, not an outage:
+                // a Cluster node answers PING while still redirecting every
+                // key, so recovery must never be reported for one.
+                if topology_unsupported.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 // Screen + resolve through the shared DNS cache, fail-closed: the
                 // recovery checker must NOT hand an unscreened host to the Redis
@@ -1344,6 +1518,15 @@ impl RedisRateLimitClient {
                         }
                     };
                     redis::cmd("PING").query_async::<String>(&mut conn).await?;
+                    // A PING alone proves nothing about topology, so screen the
+                    // recovered endpoint before ever reporting it healthy.
+                    if connection_reports_cluster_topology(&mut conn).await {
+                        topology_unsupported.store(true, Ordering::Relaxed);
+                        return Err(redis::RedisError::from((
+                            redis::ErrorKind::InvalidClientConfig,
+                            "Redis endpoint reports an unsupported topology (Redis Cluster)",
+                        )));
+                    }
                     Ok::<(), redis::RedisError>(())
                 }
                 .await;
@@ -1361,7 +1544,7 @@ impl RedisRateLimitClient {
                     Err(_) => {
                         if was_available {
                             warn!(
-                                "Redis rate limiting health check failed — falling back to local"
+                                "Redis rate limiting health check failed — centralized enforcement unavailable"
                             );
                         }
                         available.store(false, Ordering::Relaxed);
@@ -1403,9 +1586,9 @@ impl RedisRateLimitClient {
                 warn!(
                     key = %key,
                     error = %e,
-                    "Redis INCR+EXPIRE failed — falling back to local rate limiting"
+                    "Redis INCR+EXPIRE failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1448,9 +1631,9 @@ impl RedisRateLimitClient {
                     previous_key = %previous_key,
                     current_key = %current_key,
                     error = %e,
-                    "Redis sliding-window GET+INCR+EXPIRE transaction failed — falling back to local rate limiting"
+                    "Redis sliding-window GET+INCR+EXPIRE transaction failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1490,9 +1673,9 @@ impl RedisRateLimitClient {
                 warn!(
                     key = %key,
                     error = %e,
-                    "Redis INCRBY+EXPIRE failed — falling back to local rate limiting"
+                    "Redis INCRBY+EXPIRE failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1555,7 +1738,7 @@ impl RedisRateLimitClient {
                 warn!(
                     key = %key,
                     "Redis floor compensation failed after negative INCRBY accepted; \
-                     window counter left negative until TTL — falling back to local rate limiting"
+                     window counter left negative until TTL — centralized enforcement unavailable"
                 );
                 Err(())
             }
@@ -1601,9 +1784,9 @@ impl RedisRateLimitClient {
                     count_key = %count_key,
                     total_key = %total_key,
                     error = %e,
-                    "Redis INCR+INCRBY+EXPIRE pipeline failed — falling back to local rate limiting"
+                    "Redis INCR+INCRBY+EXPIRE pipeline failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1632,9 +1815,9 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     error = %e,
-                    "Redis GET+GET pipeline failed — falling back to local rate limiting"
+                    "Redis GET+GET pipeline failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1661,7 +1844,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis GET failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1753,7 +1936,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis EXISTS+STRLEN+GETRANGE failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1778,7 +1961,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis DEL failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1820,7 +2003,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis SET+EXPIRE failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1858,7 +2041,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis SET NX EX failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -1887,7 +2070,7 @@ impl RedisRateLimitClient {
                 error = %e,
                 "Redis WATCH failed"
             );
-            self.mark_unavailable();
+            self.note_command_failure(&e);
             return Err(());
         }
 
@@ -1904,7 +2087,7 @@ impl RedisRateLimitClient {
                         error = %e,
                         "Redis UNWATCH failed"
                     );
-                    self.mark_unavailable();
+                    self.note_command_failure(&e);
                     return Err(());
                 }
                 self.available.store(true, Ordering::Relaxed);
@@ -1927,7 +2110,7 @@ impl RedisRateLimitClient {
                         "Redis UNWATCH failed"
                     );
                 }
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 return Err(());
             }
         }
@@ -1954,7 +2137,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis compare-delete transaction failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
@@ -2002,7 +2185,7 @@ impl RedisRateLimitClient {
                 error = %e,
                 "Redis WATCH failed"
             );
-            self.mark_unavailable();
+            self.note_command_failure(&e);
             return Err(());
         }
 
@@ -2019,7 +2202,7 @@ impl RedisRateLimitClient {
                         error = %e,
                         "Redis UNWATCH failed"
                     );
-                    self.mark_unavailable();
+                    self.note_command_failure(&e);
                     return Err(());
                 }
                 self.available.store(true, Ordering::Relaxed);
@@ -2042,7 +2225,7 @@ impl RedisRateLimitClient {
                         "Redis UNWATCH failed"
                     );
                 }
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 return Err(());
             }
         }
@@ -2075,13 +2258,48 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis compare-and-set transaction failed"
                 );
-                self.mark_unavailable();
+                self.note_command_failure(&e);
                 Err(())
             }
         }
     }
 
+    /// Build a full Redis key whose prefix + logical rate key share one Redis
+    /// Cluster hash slot: `{prefix:rate_key}:suffix…`.
+    ///
+    /// Redis hashes only the bytes between the first `{` and the following `}`,
+    /// so every key produced for one `rate_key` — the previous and current
+    /// sliding-window buckets, the datagram and byte counters — lands in the
+    /// same slot and one multi-key transaction over them can never be a
+    /// `CROSSSLOT` error. Different rate keys still spread across slots, so no
+    /// single slot becomes the whole policy's hot spot.
+    ///
+    /// A `rate_key` containing braces of its own only truncates the tag; the
+    /// truncation is deterministic per rate key, so its buckets still co-locate.
+    ///
+    /// This client refuses Cluster endpoints outright (see the module-level
+    /// topology notes); the tag exists so the key layout is already correct if
+    /// that ever changes, and it is inert on single-endpoint servers.
+    pub fn make_slot_key(&self, rate_key: &str, suffix: &[&str]) -> String {
+        let suffix_len: usize = suffix.iter().map(|component| component.len() + 1).sum();
+        let mut key =
+            String::with_capacity(self.config.key_prefix.len() + rate_key.len() + suffix_len + 3);
+        key.push('{');
+        key.push_str(&self.config.key_prefix);
+        key.push(':');
+        key.push_str(rate_key);
+        key.push('}');
+        for component in suffix {
+            key.push(':');
+            key.push_str(component);
+        }
+        key
+    }
+
     /// Build a full Redis key with the configured prefix.
+    ///
+    /// For keys that participate in a multi-key atomic operation use
+    /// [`Self::make_slot_key`] instead so they share a hash slot.
     pub fn make_key(&self, components: &[&str]) -> String {
         let mut key = self.config.key_prefix.clone();
         for component in components {

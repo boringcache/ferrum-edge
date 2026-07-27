@@ -1041,8 +1041,14 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
 // Test: rate_limiting Redis fallback to local when Redis URL is unreachable
 // ============================================================================
 
-/// Verify that when Redis is configured but unreachable (bad port), the plugin
-/// gracefully falls back to local in-memory rate limiting.
+/// Verify that when Redis is configured but unreachable (bad port), the
+/// explicit `redis_failure_policy: "local_fallback"` opt-in gracefully degrades
+/// to local in-memory rate limiting.
+///
+/// GHSA-87rq-v4hx-8rcq: this is no longer the default. Per-process budgets let a
+/// client multiply the configured limit by the number of reachable data planes,
+/// so the fallback must be asked for; the companion test below proves the
+/// default refuses instead.
 #[tokio::test]
 #[ignore]
 async fn test_rate_limiting_redis_fallback_to_local() {
@@ -1076,6 +1082,7 @@ async fn test_rate_limiting_redis_fallback_to_local() {
                 "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
                 "sync_mode": "redis",
                 "redis_url": "redis://127.0.0.1:19999/0",
+                "redis_failure_policy": "local_fallback",
                 "redis_key_prefix": "ferrum:test:fallback"
             }
         })],
@@ -1114,6 +1121,85 @@ async fn test_rate_limiting_redis_fallback_to_local() {
     );
 
     println!("test_rate_limiting_redis_fallback_to_local PASSED");
+}
+
+/// GHSA-87rq-v4hx-8rcq: with the default `redis_failure_policy`, an
+/// unreachable centralized store must refuse rather than admit on a budget only
+/// this process can see. `503` (not `429`) because the caller is not over its
+/// limit — the limit cannot be evaluated — and no rate-limit headers are
+/// advertised for a budget nothing is enforcing.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_unavailable_fails_closed_by_default() {
+    let harness = RedisRateLimitHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-redis-fc",
+        "/redis-fail-closed",
+        backend_port,
+        "http",
+        vec![json!({
+            "id": "plugin-redis-fc",
+            "plugin_name": "rate_limiting",
+            "scope": "proxy",
+            "proxy_id": "proxy-redis-fc",
+            "enabled": true,
+            "config": {
+                "expose_headers": true,
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 3}],
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:19999/0",
+                "redis_key_prefix": "ferrum:test:failclosed"
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    // The very first request already refuses: no per-process budget is granted.
+    let resp = client
+        .get(format!("{}/redis-fail-closed/test", harness.proxy_base_url))
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "an unprovable centralized budget must fail closed, not admit locally"
+    );
+    assert!(
+        resp.headers().get("x-ratelimit-limit").is_none(),
+        "a fail-closed refusal must not advertise a budget nothing is enforcing"
+    );
+    assert!(
+        resp.headers().get("x-ratelimit-remaining").is_none(),
+        "a fail-closed refusal must not advertise a budget nothing is enforcing"
+    );
+
+    // It stays refused: a per-process counter never accumulates admissions.
+    for _ in 0..3 {
+        let resp = client
+            .get(format!("{}/redis-fail-closed/test", harness.proxy_base_url))
+            .send()
+            .await
+            .expect("Request failed");
+        assert_eq!(resp.status().as_u16(), 503);
+    }
+
+    println!("test_rate_limiting_redis_unavailable_fails_closed_by_default PASSED");
 }
 
 // ============================================================================

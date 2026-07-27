@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
-    debug_assert_closed_root_keys, validate_max_requests, validate_window_seconds,
+    DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, ENFORCEMENT_UNAVAILABLE_BODY,
+    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS,
+    RateLimitBackend, RateLimitOutcome, RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
+    validate_max_requests, validate_window_seconds,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -30,7 +31,7 @@ const RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] = &["limit_by", "expose_headers"
 /// Closed top-level key set for `rate_limiting` plugin config.
 ///
 /// Must stay aligned with OpenAPI `RateLimitingConfig` (which already declares
-/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `additionalProperties: false`), [`RATE_LIMIT_REDIS_CONFIG_KEYS`], and
 /// `docs/plugins.md`. Unknown root keys fail closed: a misspelled `sync_mdoe`,
 /// `limit_byy`, `redis_tls`, or `redis_key_prefix` previously passed admission
 /// whenever a valid `limits` rule let construction succeed, silently replacing
@@ -40,7 +41,7 @@ pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "limit_by",
     "expose_headers",
     "limits",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
     "redis_tls",
@@ -50,6 +51,7 @@ pub const RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,10 +95,11 @@ impl RateLimiting {
         reject_legacy_window_fields(object)?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
+        debug_assert_rate_limit_redis_keys();
         debug_assert_closed_root_keys(
             RATE_LIMITING_CONFIG_KEYS,
             RATE_LIMITING_POLICY_CONFIG_KEYS,
-            REDIS_PLUGIN_CONFIG_KEYS,
+            RATE_LIMIT_REDIS_CONFIG_KEYS,
         );
         reject_unknown_keys(
             object,
@@ -139,6 +142,45 @@ impl RateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective `redis_failure_policy` for advisory coverage: `None` for a
+    /// local-only config, `FailClosed` unless the operator opted into
+    /// `local_fallback`. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
+    }
+
+    /// Mark the centralized store unavailable, run one admission against the
+    /// default limit, and report the refusal this plugin would emit — `None`
+    /// when the request was still allowed (i.e. it degraded to local state).
+    ///
+    /// Exercises the production [`Self::reject`] mapping so the fail-closed
+    /// status/body cannot drift from the outage path. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) async fn refusal_under_redis_outage_for_test(
+        &self,
+        key: &str,
+    ) -> Option<(u16, String)> {
+        if let Some(client) = self.limiter.redis_client_arc_for_test() {
+            client.mark_unavailable_for_test();
+        }
+        let outcome = self
+            .limiter
+            .check(key.to_string(), key, &self.default_limit)
+            .await;
+        if outcome.allowed {
+            return None;
+        }
+        match self.reject(&outcome) {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => Some((status_code, body)),
+            _ => None,
+        }
     }
 
     /// Effective Redis key prefix for policy-isolation coverage. Not a
@@ -308,6 +350,17 @@ impl RateLimiting {
         // the peer workload SVID — information the client did not necessarily
         // supply in that form. Only the standard, non-sensitive
         // limit/remaining/window headers are exposed.
+        // A fail-closed refusal is not a budget verdict: this gateway has no
+        // authoritative counter to report, so no rate-limit headers are set and
+        // the status distinguishes "cannot enforce" from "over limit".
+        if outcome.enforcement_unavailable {
+            return PluginResult::Reject {
+                status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+                body: ENFORCEMENT_UNAVAILABLE_BODY.into(),
+                headers: HashMap::new(),
+            };
+        }
+
         let mut headers = HashMap::with_capacity(3);
         if self.expose_headers {
             if let Some(limit) = outcome.limit {
@@ -358,7 +411,12 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
+            warn!(
+                rate_limit_key = %key,
+                plugin = "rate_limiting",
+                enforcement_unavailable = outcome.enforcement_unavailable,
+                "Rate limit request refused"
+            );
             return self.reject(&outcome);
         }
 
@@ -371,7 +429,12 @@ impl RateLimiting {
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
+            warn!(
+                rate_limit_key = %key,
+                plugin = "rate_limiting",
+                enforcement_unavailable = outcome.enforcement_unavailable,
+                "Rate limit stream connection refused"
+            );
             return self.reject(&outcome);
         }
 

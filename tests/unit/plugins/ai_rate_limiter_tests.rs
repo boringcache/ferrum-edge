@@ -4034,6 +4034,9 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_redis_fallback() {
     // back to the local window. AdjustUsage still returns post-reconcile
     // usage/remaining, and the same before_proxy → after_proxy → on_response_body
     // ordering must refresh client-visible headers.
+    //
+    // GHSA-87rq-v4hx-8rcq: per-process fallback is now an explicit opt-in
+    // (`redis_failure_policy: "local_fallback"`); the default refuses instead.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -4042,6 +4045,7 @@ async fn expose_headers_lifecycle_reflects_reconciled_usage_redis_fallback() {
             "expose_headers": true,
             "sync_mode": "redis",
             "redis_url": "redis://127.0.0.1:1/0",
+            "redis_failure_policy": "local_fallback",
             "redis_connect_timeout_seconds": 1,
             "redis_health_check_interval_seconds": 60,
             "redis_key_prefix": "ferrum:ai_rate_limiter:issue2261"

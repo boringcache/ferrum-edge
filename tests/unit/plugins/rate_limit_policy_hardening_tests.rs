@@ -100,6 +100,7 @@ fn rate_limiting_accepts_every_documented_root_key() {
         "redis_health_check_interval_seconds": 5,
         "redis_username": "user",
         "redis_password": "pass",
+        "redis_failure_policy": "local_fallback",
     }))
     .expect("the documented root key set must remain accepted");
 }
@@ -147,6 +148,7 @@ fn grpc_method_router_accepts_every_documented_root_key() {
         "redis_health_check_interval_seconds": 5,
         "redis_username": "user",
         "redis_password": "pass",
+        "redis_failure_policy": "local_fallback",
     }))
     .expect("the documented root key set must remain accepted");
 }
@@ -176,6 +178,7 @@ fn udp_rate_limiting_accepts_every_documented_root_key() {
         "redis_health_check_interval_seconds": 5,
         "redis_username": "user",
         "redis_password": "pass",
+        "redis_failure_policy": "local_fallback",
     }))
     .expect("the documented root key set must remain accepted");
 }
