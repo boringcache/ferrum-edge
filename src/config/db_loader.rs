@@ -1031,36 +1031,30 @@ impl DatabaseStore {
         listen_path: Option<&str>,
         hosts: &[String],
         rows: &[AnyRow],
-    ) -> bool {
+    ) -> Result<bool, anyhow::Error> {
         if listen_path.is_none() && hosts.is_empty() {
-            return false;
+            return Ok(false);
         }
         if rows.is_empty() {
-            return true;
+            return Ok(true);
         }
         if listen_path.is_some() && hosts.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         for row in rows {
-            let existing_hosts: Vec<String> = row
-                .try_get::<String, _>("hosts")
-                .ok()
-                .and_then(|s| match serde_json::from_str(&s) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
+            let existing_hosts: Vec<String> =
+                serde_json::from_str(&existing_hosts_raw).map_err(|error| {
+                    anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
+                })?;
 
             if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
-                return false;
+                return Ok(false);
             }
         }
 
-        true
+        Ok(true)
     }
 
     async fn lock_proxy_route_bucket_tx(
@@ -1555,7 +1549,7 @@ impl DatabaseStore {
         let rows = self
             .listen_path_candidate_rows_tx(tx, &proxy.namespace, listen_path, exclude_id)
             .await?;
-        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows) {
+        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows)? {
             anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
         }
 
@@ -4504,7 +4498,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query.fetch_all(&self.pool()).await?;
 
         self.check_slow_query("check_listen_path_unique", start);
-        Ok(Self::listen_path_rows_are_unique(listen_path, hosts, &rows))
+        Self::listen_path_rows_are_unique(listen_path, hosts, &rows)
     }
 
     /// Check if a proxy name is unique (when present).
@@ -4737,7 +4731,7 @@ impl DatabaseStore {
                     last_id = Some(consumer_id);
                     continue;
                 }
-                let credentials_json: String = row.try_get("credentials")?;
+                let credentials_json = required_utf8_text_column(&row, "credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&credentials_json).map_err(|error| {
                         anyhow::anyhow!(
@@ -5359,6 +5353,8 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         // PostgreSQL defaults to READ COMMITTED, where a namespace-wide DELETE
         // can see rows committed after the pre-scan used for change logging.
+        // Callers must invoke this immediately after `begin()` — Postgres
+        // rejects SET TRANSACTION after any other statement in the transaction.
         if self.db_type == "postgres" {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut **tx)
@@ -6387,9 +6383,11 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        // PostgreSQL requires SET TRANSACTION before any other statement in the
+        // transaction (including the mTLS DNS admission lock queries below).
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
             .await?;
-        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         let proxy_ids = self
             .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
             .await?;
@@ -8367,11 +8365,13 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        // PostgreSQL requires SET TRANSACTION before any other statement in the
+        // transaction (including the mTLS DNS admission lock queries below).
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let prior_mtls_dns_conflicts = self
             .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
             .await?;
-        self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
         let row: Option<AnyRow> =
@@ -9633,9 +9633,9 @@ fn row_to_proxy_inner(
         .try_get("auth_mode")
         .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
 
-    let hosts_str: String = row
-        .try_get::<String, _>("hosts")
-        .unwrap_or_else(|_| "[]".into());
+    let hosts_str = required_utf8_text_column(row, "hosts").map_err(|error| {
+        anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
+    })?;
     let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
         // Do not embed the raw hosts column — poll/startup rejection logs
         // surface this message (issue #2997 redaction).
@@ -9651,7 +9651,7 @@ fn row_to_proxy_inner(
         // malformed listen_path into a host-only proxy and change routing
         // behavior. `Option<String>` already represents SQL NULL, so `?` is
         // safe for the expected nullable case and fails fast on real errors.
-        listen_path: row.try_get::<Option<String>, _>("listen_path")?,
+        listen_path: optional_utf8_text_column(row, "listen_path")?,
         backend_scheme: Some(backend_scheme),
         // `dispatch_kind` is populated by `GatewayConfig::normalize_fields()`
         // once the full config is loaded. Seed it here from the row values so
@@ -9663,7 +9663,7 @@ fn row_to_proxy_inner(
             .try_get::<i32, _>("backend_port")
             .map(|v| v.clamp(0, 65535) as u16)
             .unwrap_or(80),
-        backend_path: row.try_get("backend_path").ok(),
+        backend_path: optional_utf8_text_column(row, "backend_path")?,
         strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
         preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
         backend_connect_timeout_ms: row
@@ -9681,20 +9681,24 @@ fn row_to_proxy_inner(
         // Propagate decode errors — silently defaulting to None would disable
         // backend mTLS (client cert/key) or swap the trust anchor from a custom
         // CA to the global bundle/webpki. `Option<String>` already represents
-        // SQL NULL, so `?` is safe for the expected nullable case.
-        backend_tls_client_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
-        backend_tls_client_key_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
+        // SQL NULL; optional_utf8_text_column keeps that contract while decoding
+        // MySQL MEDIUMTEXT via sqlx-Any's BLOB mapping.
+        backend_tls_client_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_client_cert_path",
+        )?,
+        backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        backend_tls_server_ca_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_server_ca_cert_path",
+        )?,
         // DNS override redirects egress; silently dropping it can send traffic
         // to an unintended resolved address.
-        dns_override: row.try_get::<Option<String>, _>("dns_override")?,
+        dns_override: optional_utf8_text_column(row, "dns_override")?,
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
             .ok()
@@ -9704,20 +9708,20 @@ fn row_to_proxy_inner(
         // Propagate decode errors — silently defaulting to None would detach
         // the proxy from its load-balanced upstream and fall back to
         // `backend_host`, changing routing behavior.
-        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
-        circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
-            Ok(s) => Some(
+        upstream_id: optional_utf8_text_column(row, "upstream_id")?,
+        circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
+            Some(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
                     anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
                 })?,
             ),
-            Err(_) => None,
+            None => None,
         },
-        retry: match row.try_get::<String, _>("retry") {
-            Ok(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
+        retry: match optional_utf8_text_column(row, "retry")? {
+            Some(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
             })?),
-            Err(_) => None,
+            None => None,
         },
         response_body_mode: row
             .try_get::<String, _>("response_body_mode")
@@ -9789,7 +9793,7 @@ fn row_to_proxy_inner(
         pool_http1_max_pending_requests: None,
         // Subset selection is routing-sensitive; silently mapping a decode
         // failure to None would broaden traffic across all upstream targets.
-        upstream_subset: row.try_get::<Option<String>, _>("upstream_subset")?,
+        upstream_subset: optional_utf8_text_column(row, "upstream_subset")?,
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -9808,21 +9812,21 @@ fn row_to_proxy_inner(
             .try_get::<i64, _>("websocket_idle_timeout_seconds")
             .ok()
             .map(|v| v.max(0) as u64),
-        allowed_methods: match row.try_get::<String, _>("allowed_methods") {
-            Ok(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
+            Some(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
             })?),
-            Err(_) => None,
+            None => None,
         },
-        allowed_ws_origins: match row.try_get::<String, _>("allowed_ws_origins") {
-            Ok(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
+            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
                     pid,
                     e
                 )
             })?,
-            Err(_) => Vec::new(),
+            None => Vec::new(),
         },
         udp_max_response_amplification_factor: row
             .try_get::<f64, _>("udp_max_response_amplification_factor")
@@ -9857,7 +9861,8 @@ fn row_to_proxy_inner(
     })
 }
 
-/// Parse a consumer row into a Consumer struct.
+/// Decode a required TEXT/MEDIUMTEXT column, including MySQL's sqlx-Any BLOB
+/// wire form. Reject invalid UTF-8 instead of inventing a default.
 fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyhow::Error> {
     match row.try_get::<String, _>(column) {
         Ok(value) => Ok(value),
@@ -9875,6 +9880,35 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
             String::from_utf8(bytes)
                 .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
         }
+    }
+}
+
+/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
+/// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
+/// trust/routing material cannot silently become `None`.
+fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(text_error) => match row.try_get::<Option<Vec<u8>>, _>(column) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")),
+            Err(blob_opt_error) => {
+                // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
+                // as a bare BLOB rather than Option<BLOB>.
+                let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
+                    anyhow::anyhow!(
+                        "column '{column}' could not be decoded as optional SQL text \
+                         ({text_error}), optional bytes ({blob_opt_error}), or bytes \
+                         ({blob_error})"
+                    )
+                })?;
+                String::from_utf8(bytes).map(Some).map_err(|error| {
+                    anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")
+                })
+            }
+        },
     }
 }
 
@@ -9948,7 +9982,7 @@ fn row_to_plugin_config_inner(
     row: &AnyRow,
     id_preview: &str,
 ) -> Result<PluginConfig, anyhow::Error> {
-    let config_str: String = row.try_get("config").map_err(|e| {
+    let config_str = required_utf8_text_column(row, "config").map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to read config column: {}",
             id_preview,
@@ -10011,7 +10045,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 }
 
 fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
-    let targets_str: String = row.try_get("targets").map_err(|e| {
+    let targets_str = required_utf8_text_column(row, "targets").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read targets column: {}",
             id_preview,
@@ -10026,7 +10060,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         )
     })?;
 
-    let algo_str: String = row.try_get("algorithm").map_err(|e| {
+    let algo_str = required_utf8_text_column(row, "algorithm").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read algorithm column: {}",
             id_preview,
@@ -10041,39 +10075,40 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
             anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
         })?;
 
-    let health_checks: Option<HealthCheckConfig> = match row.try_get::<String, _>("health_checks") {
-        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!(
-                "Upstream {}: failed to parse health_checks JSON: {}",
-                id_preview,
-                e
-            )
-        })?),
-        Err(_) => None,
-    };
+    let health_checks: Option<HealthCheckConfig> =
+        match optional_utf8_text_column(row, "health_checks")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse health_checks JSON: {}",
+                    id_preview,
+                    e
+                )
+            })?),
+            None => None,
+        };
 
     let service_discovery: Option<ServiceDiscoveryConfig> =
-        match row.try_get::<String, _>("service_discovery") {
-            Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "service_discovery")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse service_discovery JSON: {}",
                     id_preview,
                     e
                 )
             })?),
-            Err(_) => None,
+            None => None,
         };
 
     let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
-        match row.try_get::<Option<String>, _>("hash_on_cookie_config") {
-            Ok(Some(s)) => Some(serde_json::from_str(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "hash_on_cookie_config")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
                     id_preview,
                     e
                 )
             })?),
-            Ok(None) | Err(_) => None,
+            None => None,
         };
 
     // Parse backend TLS fields
@@ -10082,30 +10117,29 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         .map(|v| v != 0)
         .unwrap_or(true);
 
-    let subsets = match row.try_get::<String, _>("subsets") {
-        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+    let subsets = match optional_utf8_text_column(row, "subsets")? {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
             anyhow::anyhow!(
                 "Upstream {}: failed to parse subsets JSON: {}",
                 id_preview,
                 e
             )
         })?),
-        Err(_) => None,
+        None => None,
     };
 
     let backend_tls_san_allow_list =
-        match row.try_get::<Option<String>, _>("backend_tls_san_allow_list") {
-            Ok(Some(s)) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "backend_tls_san_allow_list")? {
+            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
                     id_preview,
                     e
                 )
             })?,
-            Ok(None) => Vec::new(),
-            Err(e) => return Err(e.into()),
+            None => Vec::new(),
         };
-    let backend_tls_sni: Option<String> = row.try_get("backend_tls_sni")?;
+    let backend_tls_sni = optional_utf8_text_column(row, "backend_tls_sni")?;
 
     Ok(Upstream {
         id: row.try_get("id")?,
@@ -10113,7 +10147,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         name: row.try_get("name").ok(),
         targets,
         algorithm,
-        hash_on: row.try_get("hash_on").ok(),
+        hash_on: optional_utf8_text_column(row, "hash_on")?,
         hash_on_cookie_config,
         health_checks,
         service_discovery,
@@ -10134,13 +10168,18 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         locality_lb_setting: None,
         // Same trust/mTLS contract as `row_to_proxy`: reject non-NULL decode
         // failures instead of silently disabling custom CA / client identity.
-        backend_tls_client_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
-        backend_tls_client_key_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
+        // MySQL MEDIUMTEXT NULL/BLOB values go through optional_utf8_text_column
+        // so sqlx-Any BLOB mapping cannot fake a missing row.
+        backend_tls_client_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_client_cert_path",
+        )?,
+        backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        backend_tls_server_ca_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_server_ca_cert_path",
+        )?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh
@@ -10219,16 +10258,12 @@ fn row_to_api_spec_with_content(
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 
     // Wave 5: parse JSON-text arrays for tags / server_urls.
-    let tags: Vec<String> = row
-        .try_get::<String, _>("tags")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let server_urls: Vec<String> = row
-        .try_get::<String, _>("server_urls")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let tags_raw = required_utf8_text_column(row, "tags")?;
+    let tags: Vec<String> = serde_json::from_str(&tags_raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse api_specs.tags JSON: {error}"))?;
+    let server_urls_raw = required_utf8_text_column(row, "server_urls")?;
+    let server_urls: Vec<String> = serde_json::from_str(&server_urls_raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse api_specs.server_urls JSON: {error}"))?;
     let operation_count: u32 = row
         .try_get::<i64, _>("operation_count")
         .map(|v| v.clamp(0, u32::MAX as i64) as u32)
@@ -10249,13 +10284,13 @@ fn row_to_api_spec_with_content(
             .unwrap_or_else(|_| "gzip".to_string()),
         uncompressed_size: uncompressed_size.max(0) as u64,
         content_hash: row.try_get("content_hash")?,
-        title: row.try_get("title").ok().flatten(),
+        title: optional_utf8_text_column(row, "title")?,
         info_version: row.try_get("info_version").ok().flatten(),
-        description: row.try_get("description").ok().flatten(),
-        contact_name: row.try_get("contact_name").ok().flatten(),
-        contact_email: row.try_get("contact_email").ok().flatten(),
-        license_name: row.try_get("license_name").ok().flatten(),
-        license_identifier: row.try_get("license_identifier").ok().flatten(),
+        description: optional_utf8_text_column(row, "description")?,
+        contact_name: optional_utf8_text_column(row, "contact_name")?,
+        contact_email: optional_utf8_text_column(row, "contact_email")?,
+        license_name: optional_utf8_text_column(row, "license_name")?,
+        license_identifier: optional_utf8_text_column(row, "license_identifier")?,
         tags,
         server_urls,
         operation_count,
@@ -10267,7 +10302,7 @@ fn row_to_api_spec_with_content(
 
 fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
     let id: String = row.try_get("id")?;
-    let diff_raw: String = row.try_get("diff")?;
+    let diff_raw = required_utf8_text_column(row, "diff")?;
     let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
         warn!(
             audit_event_id = %id,

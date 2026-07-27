@@ -11,7 +11,10 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
-use crate::common::{DbType, TestGateway};
+use crate::common::{
+    DbType, TestGateway, continue_if_tls_fixture_available, ensure_shared_sql_containers_resumed,
+    provision_isolated_sql_database,
+};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
@@ -480,10 +483,13 @@ async fn run_crud_and_proxy_tests(
 #[ignore]
 async fn test_postgresql_tls_verify_full() {
     println!("\n=== PostgreSQL TLS (verify-full via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -493,6 +499,10 @@ async fn test_postgresql_tls_verify_full() {
         "CA cert not found at {}/ca.crt",
         certs
     );
+
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
 
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
@@ -506,10 +516,8 @@ async fn test_postgresql_tls_verify_full() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &certs, "verify-full")
+        .start_gateway(&db_url, &certs, "verify-full")
         .await
         .expect("Failed to start gateway with PostgreSQL TLS (verify-full)");
 
@@ -532,12 +540,19 @@ async fn test_postgresql_tls_verify_full() {
 #[ignore]
 async fn test_postgresql_tls_require() {
     println!("\n=== PostgreSQL TLS (require — encrypted, no cert verification) ===\n");
+    ensure_shared_sql_containers_resumed();
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
+
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
 
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
@@ -550,10 +565,8 @@ async fn test_postgresql_tls_require() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway with PostgreSQL TLS (require)");
 
@@ -580,10 +593,13 @@ async fn test_postgresql_tls_require() {
 #[ignore]
 async fn test_mysql_tls_verify_identity() {
     println!("\n=== MySQL TLS (verify-full -> VERIFY_IDENTITY via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
-    if !is_container_running("ferrum-test-mysql-tls") {
-        println!("SKIPPED: ferrum-test-mysql-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "mysql",
+        is_container_running("ferrum-test-mysql-tls"),
+        "ferrum-test-mysql-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
 
@@ -592,6 +608,10 @@ async fn test_mysql_tls_verify_identity() {
         std::path::Path::new(&format!("{}/ca.crt", certs)).exists(),
         "CA cert not found"
     );
+
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("mysql://ferrum:test-password@localhost:13306/ferrum");
 
     let mut harness = DbTlsTestHarness::new("mysql")
         .await
@@ -604,11 +624,8 @@ async fn test_mysql_tls_verify_identity() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    // sqlx MySQL URL format
-    let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
-
     harness
-        .start_gateway(db_url, &certs, "verify-full")
+        .start_gateway(&db_url, &certs, "verify-full")
         .await
         .expect("Failed to start gateway with MySQL TLS (verify-full)");
 
@@ -631,12 +648,19 @@ async fn test_mysql_tls_verify_identity() {
 #[ignore]
 async fn test_mysql_tls_required() {
     println!("\n=== MySQL TLS (require -> REQUIRED via FERRUM_DB_TLS_MODE) ===\n");
+    ensure_shared_sql_containers_resumed();
 
-    if !is_container_running("ferrum-test-mysql-tls") {
-        println!("SKIPPED: ferrum-test-mysql-tls container not running.");
-        println!("Run: tests/scripts/setup_db_tls.sh");
+    if !continue_if_tls_fixture_available(
+        "mysql",
+        is_container_running("ferrum-test-mysql-tls"),
+        "ferrum-test-mysql-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
+
+    // Provision before the harness so Drop order kills the gateway first.
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("mysql://ferrum:test-password@localhost:13306/ferrum");
 
     let mut harness = DbTlsTestHarness::new("mysql")
         .await
@@ -649,10 +673,8 @@ async fn test_mysql_tls_required() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "mysql://ferrum:test-password@localhost:13306/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway with MySQL TLS (require)");
 
@@ -723,11 +745,20 @@ async fn test_sqlite_without_tls_settings() {
 #[ignore]
 async fn test_health_endpoint_shows_db_status() {
     println!("\n=== Health Endpoint with TLS DB ===\n");
+    ensure_shared_sql_containers_resumed();
 
-    if !is_container_running("ferrum-test-pg-tls") {
-        println!("SKIPPED: ferrum-test-pg-tls container not running.");
+    if !continue_if_tls_fixture_available(
+        "postgres",
+        is_container_running("ferrum-test-pg-tls"),
+        "ferrum-test-pg-tls container not running; run tests/scripts/setup_db_tls.sh",
+    ) {
         return;
     }
+
+    // Provision before the harness so Drop order kills the gateway first —
+    // same isolation contract as the other TLS cells (no shared `ferrum` DB).
+    let (db_url, _isolated_db) =
+        provision_isolated_sql_database("postgres://ferrum:test-password@localhost:15432/ferrum");
 
     let mut harness = DbTlsTestHarness::new("postgres")
         .await
@@ -740,10 +771,8 @@ async fn test_health_endpoint_shows_db_status() {
     drop(backend_listener);
     let _backend = start_echo_backend(backend_port).await.unwrap();
 
-    let db_url = "postgres://ferrum:test-password@localhost:15432/ferrum";
-
     harness
-        .start_gateway(db_url, &cert_dir(), "require")
+        .start_gateway(&db_url, &cert_dir(), "require")
         .await
         .expect("Failed to start gateway");
 

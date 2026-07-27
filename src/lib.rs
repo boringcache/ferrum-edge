@@ -2064,6 +2064,68 @@ pub mod _test_support {
             .redis_connection_scope_key(proxy_id, connection_id)
     }
 
+    // ── rate-limit policy isolation (GHSA-gr3x-g777-hm78) ────────────────────
+    /// Effective default Redis key prefix for one rate-limit plugin config.
+    ///
+    /// Returns `None` for local-only configs. Used to prove that two
+    /// independent plugin configs of the same type in one namespace do not
+    /// share a default Redis key space, and that two replicas of the *same*
+    /// config still do.
+    pub fn rate_limit_redis_key_prefix(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: &str,
+    ) -> Result<Option<String>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::graphql::GraphqlPlugin;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+        use crate::plugins::rate_limiting::RateLimiting;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+
+        let http = PluginHttpClient::default();
+        match plugin_name {
+            "rate_limiting" => {
+                let plugin = RateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "graphql" => {
+                let plugin = GraphqlPlugin::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "grpc_method_router" => {
+                let plugin = GrpcMethodRouter::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "udp_rate_limiting" => {
+                let plugin = UdpRateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            other => Err(format!("unsupported rate-limit plugin: {other}")),
+        }
+    }
+
+    /// Construct a rate-limit plugin through the production factory with an
+    /// explicit plugin-config id, returning only the admission result.
+    ///
+    /// Proves the factory actually threads the configured resource id into each
+    /// plugin: a blank id must fail closed rather than collapsing sibling
+    /// policies onto one shared default Redis key space.
+    pub fn create_rate_limit_plugin_with_config_id(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: Option<&str>,
+    ) -> Result<(), String> {
+        use crate::plugins::PluginHttpClient;
+
+        crate::plugins::create_plugin_with_http_client_and_config_id(
+            plugin_name,
+            config,
+            PluginHttpClient::default(),
+            config_id,
+        )
+        .map(|_| ())
+    }
+
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
     pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
