@@ -3579,7 +3579,7 @@ config:
 
 Validates JSON, XML, and gRPC protobuf request and response bodies against schemas.
 
-**Fail-closed configuration:** unknown top-level keys, and unknown keys inside a `protobuf_method_messages` entry, are rejected before any default is applied. `body_validator` is registered `FailClosed`, so a rejected configuration keeps the last known-good plugin generation on every admission path (Admin API 400, file-mode startup/reload failure, DB warning, CP rejection, DP snapshot retention). A misspelled `response_json_scheam` or `respones` can no longer be ignored while another valid rule lets construction succeed.
+**Fail-closed configuration:** unknown top-level keys, and unknown keys inside a `protobuf_method_messages` entry, are rejected before any default is applied. `body_validator` is registered `FailClosed`, so a rejected configuration keeps the last known-good plugin generation on every admission path (Admin API 400, file-mode startup/reload failure, DB warning, CP rejection, DP snapshot retention). A misspelled `response_json_scheam` or `respones` can no longer be ignored while another valid rule lets construction succeed. Configuration errors identify only fixed fields, keyword categories, supported draft names, and safe structural indexes; they never echo supplied keys, paths, URIs, schema values, XML entries, or compiler diagnostics into admission or logging surfaces.
 
 Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
 

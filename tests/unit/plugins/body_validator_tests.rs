@@ -2,7 +2,9 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
-use ferrum_edge::plugins::body_validator::{BODY_VALIDATOR_CONFIG_KEYS, BodyValidator};
+use ferrum_edge::plugins::body_validator::{
+    BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS, BodyValidator,
+};
 use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
@@ -2781,32 +2783,38 @@ async fn test_protobuf_missing_descriptor_only_rejects_configured_method_targets
 
 #[test]
 fn test_protobuf_invalid_message_type_degrades_gracefully() {
+    const MESSAGE_TYPE: &str = "nonexistent.BODY_VALIDATOR_CONFIG_CANARY_TYPE";
     let result = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": test_descriptor_path(),
-        "protobuf_request_type": "nonexistent.MessageType"
+        "protobuf_request_type": MESSAGE_TYPE
     }));
     let err = result
         .err()
         .expect("expected error for invalid message type");
     assert!(
-        err.contains("protobuf_request_type 'nonexistent.MessageType' not found"),
+        err.contains("configured 'protobuf_request_type' was not found in the descriptor"),
         "got: {err}"
     );
+    assert!(!err.contains(MESSAGE_TYPE), "got: {err}");
 }
 
 #[test]
 fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("invalid.pb");
+    let path = dir
+        .path()
+        .join("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH.pb");
     std::fs::write(&path, b"not-a-file-descriptor-set").unwrap();
+    let path_text = path.to_string_lossy().into_owned();
     let config = json!({
-        "protobuf_descriptor_path": path.to_string_lossy(),
+        "protobuf_descriptor_path": path_text,
         "protobuf_request_type": "test.HelloRequest"
     });
     let error = BodyValidator::new(&config)
         .err()
         .expect("a readable malformed descriptor must reject the runtime candidate");
     assert!(error.contains("failed to parse protobuf descriptor"));
+    assert!(!error.contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 
     let gateway = GatewayConfig {
         plugin_configs: vec![body_validator_plugin_config("body-validator", true, config)],
@@ -2815,11 +2823,12 @@ fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
     let errors = gateway.validate_plugin_file_dependencies();
     assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
     assert!(errors[0].contains("failed to parse protobuf descriptor"));
+    assert!(!errors[0].contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 }
 
 #[test]
 fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
-    let missing = "/nonexistent/path/shared-descriptor.bin";
+    let missing = "/nonexistent/BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH/shared.bin";
     let gateway = GatewayConfig {
         plugin_configs: vec![
             body_validator_plugin_config(
@@ -2848,24 +2857,52 @@ fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
         "shared descriptor paths must be read and reported once: {errors:?}"
     );
     assert!(errors[0].contains("failed to read protobuf descriptor file"));
+    assert!(!errors[0].contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 }
 
 #[test]
 fn test_protobuf_descriptor_file_dependency_validates_message_references() {
+    const MESSAGE_TYPE: &str = "missing.BODY_VALIDATOR_CONFIG_CANARY_TYPE";
     let gateway = GatewayConfig {
         plugin_configs: vec![body_validator_plugin_config(
             "body-validator",
             true,
             json!({
                 "protobuf_descriptor_path": test_descriptor_path(),
-                "protobuf_request_type": "missing.Request"
+                "protobuf_request_type": MESSAGE_TYPE
             }),
         )],
         ..Default::default()
     };
     let errors = gateway.validate_plugin_file_dependencies();
     assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
-    assert!(errors[0].contains("protobuf_request_type 'missing.Request' not found"));
+    assert!(
+        errors[0].contains("configured 'protobuf_request_type' was not found in the descriptor")
+    );
+    assert!(!errors[0].contains(MESSAGE_TYPE));
+}
+
+#[test]
+fn protobuf_method_resolution_errors_redact_method_path_and_type() {
+    const METHOD_PATH: &str = "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call";
+    const MESSAGE_TYPE: &str = "missing.BODY_VALIDATOR_CONFIG_CANARY_METHOD_TYPE";
+    let config = json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call": {
+                "request": MESSAGE_TYPE
+            }
+        }
+    });
+    let error = BodyValidator::new(&config)
+        .err()
+        .expect("missing per-method type must reject configuration");
+    assert_eq!(
+        error,
+        "body_validator: a 'protobuf_method_messages' request type was not found in the descriptor"
+    );
+    assert!(!error.contains(METHOD_PATH), "{error}");
+    assert!(!error.contains(MESSAGE_TYPE), "{error}");
 }
 
 #[test]
@@ -3525,7 +3562,121 @@ fn unknown_protobuf_method_keys_are_rejected() {
     });
     let result = BodyValidator::new(&config);
     let error = result.err().expect("misspelled direction must be rejected");
-    assert!(error.contains("unknown key 'respones'"), "{error}");
+    assert!(error.contains("has an unknown key"), "{error}");
+}
+
+fn assert_redacted_configuration_error(
+    config: serde_json::Value,
+    expected_message: &str,
+    forbidden: &[&str],
+) {
+    let runtime_error = BodyValidator::new(&config)
+        .err()
+        .expect("runtime construction must reject the invalid configuration");
+    let shape_error = BodyValidator::validate_config(&config)
+        .expect_err("shape-only admission must reject the invalid configuration");
+
+    for (surface, error) in [("runtime", runtime_error), ("shape-only", shape_error)] {
+        assert_eq!(
+            error, expected_message,
+            "{surface} rejection must use the stable categorical message"
+        );
+        for supplied in forbidden {
+            assert!(
+                !error.contains(*supplied),
+                "{surface} rejection must redact supplied text {supplied:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configuration_errors_redact_supplied_schema_and_shape_text() {
+    const DRAFT: &str = "draft-BODY_VALIDATOR_CONFIG_CANARY";
+    const EXTERNAL_REF: &str =
+        "https://ref-user:BODY_VALIDATOR_CONFIG_CANARY_REF@example.com/schema";
+    const LOCAL_REF: &str = "#/$defs/BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF";
+    const ID_URI: &str =
+        "https://id-user:BODY_VALIDATOR_CONFIG_CANARY_ID@example.com/schema";
+    const SCHEMA_URI: &str =
+        "https://schema-user:BODY_VALIDATOR_CONFIG_CANARY_SCHEMA@example.com/draft";
+    const PATTERN: &str = "(?P<BODY_VALIDATOR_CONFIG_CANARY_PATTERN>[";
+    const UNKNOWN_KEY: &str = "unknown_BODY_VALIDATOR_CONFIG_CANARY_KEY";
+    const XML_ENTRY: &str = "{https://BODY_VALIDATOR_CONFIG_CANARY_XML@example.com/ns";
+    const METHOD_PATH: &str = "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call";
+    const METHOD_KEY: &str = "BODY_VALIDATOR_CONFIG_CANARY_METHOD_KEY";
+
+    assert_redacted_configuration_error(
+        json!({"json_schema_draft": DRAFT}),
+        "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'",
+        &[DRAFT],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$ref": EXTERNAL_REF}}),
+        "body_validator: 'json_schema' has a non-local '$ref'; only local references \
+         (starting with '#') are supported and no external reference is ever retrieved",
+        &[EXTERNAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_REF"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$ref": LOCAL_REF}}),
+        "body_validator: 'json_schema' has a local '$ref' JSON Pointer that resolves nowhere",
+        &[LOCAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$id": ID_URI, "type": "object"}}),
+        "body_validator: 'json_schema' has a non-fragment '$id'; a base URI would allow \
+         external reference resolution",
+        &[ID_URI, "BODY_VALIDATOR_CONFIG_CANARY_ID"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$schema": SCHEMA_URI, "type": "object"}}),
+        "body_validator: 'json_schema' declares an unsupported '$schema'; configured draft is \
+         'draft2020-12'",
+        &[SCHEMA_URI, "BODY_VALIDATOR_CONFIG_CANARY_SCHEMA"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"type": "string", "pattern": PATTERN}}),
+        "body_validator: 'json_schema' is not a valid draft2020-12 JSON Schema",
+        &[PATTERN, "BODY_VALIDATOR_CONFIG_CANARY_PATTERN"],
+    );
+    assert_redacted_configuration_error(
+        json!({
+            "required_fields": ["tenant"],
+            "unknown_BODY_VALIDATOR_CONFIG_CANARY_KEY": true
+        }),
+        &format!(
+            "body_validator: unknown configuration key; allowed keys: {}",
+            BODY_VALIDATOR_CONFIG_KEYS.join(", ")
+        ),
+        &[UNKNOWN_KEY, "BODY_VALIDATOR_CONFIG_CANARY_KEY"],
+    );
+    assert_redacted_configuration_error(
+        json!({"required_xml_elements": [XML_ENTRY]}),
+        "body_validator: 'required_xml_elements' entry at index 0 opens Clark notation with '{' \
+         but never closes it with '}'",
+        &[XML_ENTRY, "BODY_VALIDATOR_CONFIG_CANARY_XML"],
+    );
+    assert_redacted_configuration_error(
+        json!({
+            "protobuf_descriptor_path": test_descriptor_path(),
+            "protobuf_method_messages": {
+                "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call": {
+                    "request": "test.HelloRequest",
+                    "BODY_VALIDATOR_CONFIG_CANARY_METHOD_KEY": true
+                }
+            }
+        }),
+        &format!(
+            "body_validator: a 'protobuf_method_messages' entry has an unknown key; allowed \
+             keys: {}",
+            BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
+        ),
+        &[
+            METHOD_PATH,
+            METHOD_KEY,
+            "BODY_VALIDATOR_CONFIG_CANARY_METHOD",
+        ],
+    );
 }
 
 #[test]

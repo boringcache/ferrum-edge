@@ -17447,7 +17447,9 @@ components:
         generation. Configured JSON Schemas are compiled once at construction
         under an explicit draft, XML bodies are parsed by a real XML parser, and
         decoded protobuf messages must satisfy proto2 required-field
-        initialization.
+        initialization. Configuration errors use value-free field and category
+        messages; supplied keys, paths, URIs, schema values, XML entries, and
+        compiler diagnostics are not reproduced.
       properties:
         json_schema:
           type: object

@@ -253,12 +253,12 @@ impl BodyValidator {
 
         // Fail closed on unknown keys before any default is applied so a typo
         // can never replace a working policy with a weaker one.
-        if let Some(unknown) = object
+        if object
             .keys()
-            .find(|key| !BODY_VALIDATOR_CONFIG_KEYS.contains(&key.as_str()))
+            .any(|key| !BODY_VALIDATOR_CONFIG_KEYS.contains(&key.as_str()))
         {
             return Err(format!(
-                "body_validator: unknown configuration key '{unknown}'; allowed keys: {}",
+                "body_validator: unknown configuration key; allowed keys: {}",
                 BODY_VALIDATOR_CONFIG_KEYS.join(", ")
             ));
         }
@@ -722,9 +722,9 @@ fn parse_schema_draft(raw: Option<&str>) -> Result<SchemaDraft, String> {
         None => Ok(SchemaDraft::Draft202012),
         Some("draft2020-12") => Ok(SchemaDraft::Draft202012),
         Some("draft7") => Ok(SchemaDraft::Draft7),
-        Some(other) => Err(format!(
-            "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7', got '{other}'"
-        )),
+        Some(_) => Err(
+            "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'".to_string(),
+        ),
     }
 }
 
@@ -764,9 +764,9 @@ fn optional_compiled_schema(
         // remain advisory per the specification.
         .should_validate_formats(true)
         .build(value)
-        .map_err(|error| {
+        .map_err(|_| {
             format!(
-                "body_validator: '{field}' is not a valid {} JSON Schema: {error}",
+                "body_validator: '{field}' is not a valid {} JSON Schema",
                 draft.config_value()
             )
         })
@@ -893,8 +893,8 @@ fn audit_schema_node(
             };
             if !reference.starts_with('#') {
                 return Err(format!(
-                    "body_validator: '{field}' has non-local '{key}' \
-                     '{reference}'; only local references (starting with '#') \
+                    "body_validator: '{field}' has a non-local '{key}'; \
+                     only local references (starting with '#') \
                      are supported and no external reference is ever retrieved"
                 ));
             }
@@ -913,7 +913,7 @@ fn audit_schema_node(
             };
             if !id.starts_with('#') {
                 return Err(format!(
-                    "body_validator: '{field}' has non-fragment '{key}' '{id}'; \
+                    "body_validator: '{field}' has a non-fragment '{key}'; \
                      a base URI would allow external reference resolution"
                 ));
             }
@@ -935,8 +935,8 @@ fn audit_schema_node(
         };
         if !draft.schema_uris().contains(&uri) {
             return Err(format!(
-                "body_validator: '{field}' declares unsupported '$schema' \
-                 '{uri}'; configured draft is '{}'",
+                "body_validator: '{field}' declares an unsupported '$schema'; \
+                 configured draft is '{}'",
                 draft.config_value()
             ));
         }
@@ -1074,7 +1074,7 @@ fn local_json_pointer_target<'a>(
     keyword: &str,
 ) -> Result<Option<&'a Value>, String> {
     let fragment = reference.strip_prefix('#').ok_or_else(|| {
-        format!("body_validator: '{field}' has non-local '{keyword}' '{reference}'")
+        format!("body_validator: '{field}' has a non-local '{keyword}'")
     })?;
     if fragment.is_empty() || !fragment.starts_with('/') {
         // The root was already visited. Anchor resources are indexed only while
@@ -1088,7 +1088,7 @@ fn local_json_pointer_target<'a>(
         .map_err(|_| {
             format!(
                 "body_validator: '{field}' has invalid UTF-8 percent encoding \
-                 in local '{keyword}' JSON Pointer '{reference}'"
+                 in a local '{keyword}' JSON Pointer"
             )
         })?;
     let mut target = document;
@@ -1098,13 +1098,13 @@ fn local_json_pointer_target<'a>(
                 let index = raw_segment.parse::<usize>().map_err(|_| {
                     format!(
                         "body_validator: '{field}' has invalid array index in \
-                         local '{keyword}' JSON Pointer '{reference}'"
+                         a local '{keyword}' JSON Pointer"
                     )
                 })?;
                 items.get(index).ok_or_else(|| {
                     format!(
-                        "body_validator: '{field}' has local '{keyword}' JSON \
-                         Pointer '{reference}' that resolves nowhere"
+                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                         Pointer that resolves nowhere"
                     )
                 })?
             }
@@ -1112,15 +1112,15 @@ fn local_json_pointer_target<'a>(
                 let segment = unescape_json_pointer_segment(raw_segment);
                 map.get(segment.as_ref()).ok_or_else(|| {
                     format!(
-                        "body_validator: '{field}' has local '{keyword}' JSON \
-                         Pointer '{reference}' that resolves nowhere"
+                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                         Pointer that resolves nowhere"
                     )
                 })?
             }
             _ => {
                 return Err(format!(
-                    "body_validator: '{field}' has local '{keyword}' JSON \
-                     Pointer '{reference}' that resolves nowhere"
+                    "body_validator: '{field}' has a local '{keyword}' JSON \
+                     Pointer that resolves nowhere"
                 ));
             }
         };
@@ -1217,13 +1217,13 @@ fn parse_required_xml_elements(
     field: &'static str,
 ) -> Result<Vec<RequiredXmlElement>, String> {
     let mut parsed = Vec::with_capacity(raw.len());
-    for entry in raw {
+    for (index, entry) in raw.into_iter().enumerate() {
         let (namespace, local) = match entry.strip_prefix('{') {
             Some(rest) => match rest.split_once('}') {
                 Some((namespace, local)) => (Some(namespace.to_string()), local.to_string()),
                 None => {
                     return Err(format!(
-                        "body_validator: '{field}' entry '{entry}' opens Clark notation \
+                        "body_validator: '{field}' entry at index {index} opens Clark notation \
                          with '{{' but never closes it with '}}'"
                     ));
                 }
@@ -1232,12 +1232,12 @@ fn parse_required_xml_elements(
         };
         if local.is_empty() {
             return Err(format!(
-                "body_validator: '{field}' entry '{entry}' has an empty local element name"
+                "body_validator: '{field}' entry at index {index} has an empty local element name"
             ));
         }
         if local.contains('{') || local.contains('}') {
             return Err(format!(
-                "body_validator: '{field}' entry '{entry}' has an invalid local element name"
+                "body_validator: '{field}' entry at index {index} has an invalid local element name"
             ));
         }
         parsed.push(RequiredXmlElement {
@@ -2151,29 +2151,32 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
                 );
             }
             let Some(method_object) = method_config.as_object() else {
-                return Err(format!(
-                    "body_validator: protobuf_method_messages['{method_path}'] must be an object"
-                ));
+                return Err(
+                    "body_validator: a 'protobuf_method_messages' entry must be an object"
+                        .to_string(),
+                );
             };
             // Reject unknown per-method keys before defaults so a misspelled
             // direction cannot leave that direction unvalidated while the other
             // direction keeps admission succeeding (GHSA-w7x7-ppx9-5v74).
-            if let Some(unknown) = method_object
+            if method_object
                 .keys()
-                .find(|key| !BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.contains(&key.as_str()))
+                .any(|key| !BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.contains(&key.as_str()))
             {
                 return Err(format!(
-                    "body_validator: protobuf_method_messages['{method_path}'] has unknown key \
-                     '{unknown}'; allowed keys: {}",
+                    "body_validator: a 'protobuf_method_messages' entry has an unknown key; \
+                     allowed keys: {}",
                     BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
                 ));
             }
             let request = optional_string(method_config, "request")?.map(str::to_string);
             let response = optional_string(method_config, "response")?.map(str::to_string);
             if request.is_none() && response.is_none() {
-                return Err(format!(
-                    "body_validator: protobuf_method_messages['{method_path}'] must configure 'request' or 'response'"
-                ));
+                return Err(
+                    "body_validator: a 'protobuf_method_messages' entry must configure 'request' \
+                     or 'response'"
+                        .to_string(),
+                );
             }
             if request.is_some() {
                 targets.method_requests.insert(method_path.clone());
@@ -2217,15 +2220,15 @@ impl ProtobufDescriptorLoadError {
 fn load_protobuf_descriptor_pool_inner(
     descriptor_path: &str,
 ) -> Result<DescriptorPool, ProtobufDescriptorLoadError> {
-    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|error| {
-        ProtobufDescriptorLoadError::Unavailable(format!(
-            "body_validator: failed to read protobuf descriptor file '{descriptor_path}': {error}"
-        ))
+    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|_| {
+        ProtobufDescriptorLoadError::Unavailable(
+            "body_validator: failed to read protobuf descriptor file".to_string(),
+        )
     })?;
-    DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|error| {
-        ProtobufDescriptorLoadError::Invalid(format!(
-            "body_validator: failed to parse protobuf descriptor '{descriptor_path}': {error}"
-        ))
+    DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|_| {
+        ProtobufDescriptorLoadError::Invalid(
+            "body_validator: failed to parse protobuf descriptor".to_string(),
+        )
     })
 }
 
@@ -2245,7 +2248,8 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_request_type '{name}' not found in descriptor")
+                "body_validator: configured 'protobuf_request_type' was not found in the descriptor"
+                    .to_string()
             })
         })
         .transpose()?;
@@ -2254,7 +2258,8 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_response_type '{name}' not found in descriptor")
+                "body_validator: configured 'protobuf_response_type' was not found in the descriptor"
+                    .to_string()
             })
         })
         .transpose()?;
@@ -2265,9 +2270,9 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    format!(
-                        "body_validator: method '{method_path}' request type '{name}' not found in descriptor"
-                    )
+                    "body_validator: a 'protobuf_method_messages' request type was not found in \
+                     the descriptor"
+                        .to_string()
                 })
             })
             .transpose()?;
@@ -2276,9 +2281,9 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    format!(
-                        "body_validator: method '{method_path}' response type '{name}' not found in descriptor"
-                    )
+                    "body_validator: a 'protobuf_method_messages' response type was not found in \
+                     the descriptor"
+                        .to_string()
                 })
             })
             .transpose()?;
@@ -2333,11 +2338,9 @@ fn load_protobuf_config(
 
     let pool = match load_protobuf_descriptor_pool_inner(descriptor_path) {
         Ok(pool) => pool,
-        Err(ProtobufDescriptorLoadError::Unavailable(error)) => {
+        Err(ProtobufDescriptorLoadError::Unavailable(_)) => {
             warn!(
                 plugin = "body_validator",
-                path = descriptor_path,
-                error = %error,
                 "Protobuf descriptor dependency is unavailable; applicable gRPC validation will fail closed"
             );
             return Ok(ProtobufConfig {
