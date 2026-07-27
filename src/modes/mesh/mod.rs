@@ -36,13 +36,15 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
-    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
-    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
-    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
+    LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, PassiveHealthCheck, PluginAssociation,
+    PluginConfig, PluginScope, Proxy, ResolvedSubsetTrafficPolicy, ResponseBodyMode,
+    SubsetDefinition, SubsetTrafficPolicy, UPSTREAM_TARGET_SERVICE_NAME_TAG,
+    UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -85,6 +87,73 @@ pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
+
+/// Exact identities created by one trusted mesh-materialization pass.
+///
+/// The constructor is private to this module: callers outside the
+/// materialization boundary can inspect an allowlist during runtime
+/// validation, but cannot bless arbitrary reserved-prefix IDs. The input
+/// snapshot is validated with the ordinary operator grammar before any mesh
+/// resources are injected, so every reserved identity collected afterward was
+/// created by the materializers in this module.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedMeshGeneratedResourceIds {
+    proxies: HashMap<String, HashSet<String>>,
+    plugin_configs: HashMap<String, HashSet<String>>,
+    upstreams: HashMap<String, HashSet<String>>,
+}
+
+impl TrustedMeshGeneratedResourceIds {
+    fn from_materialized_config(config: &GatewayConfig) -> Self {
+        let mut trusted = Self::default();
+        for proxy in &config.proxies {
+            if proxy.id.starts_with("__mesh") {
+                trusted
+                    .proxies
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        for plugin in &config.plugin_configs {
+            if plugin.id.starts_with("__mesh") {
+                trusted
+                    .plugin_configs
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert(plugin.id.clone());
+            }
+        }
+        for upstream in &config.upstreams {
+            if upstream.id.starts_with("__mesh") {
+                trusted
+                    .upstreams
+                    .entry(upstream.namespace.clone())
+                    .or_default()
+                    .insert(upstream.id.clone());
+            }
+        }
+        trusted
+    }
+
+    pub(crate) fn allows_proxy(&self, namespace: &str, id: &str) -> bool {
+        self.proxies
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_plugin_config(&self, namespace: &str, id: &str) -> bool {
+        self.plugin_configs
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_upstream(&self, namespace: &str, id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
@@ -952,6 +1021,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
+    // here exactly like every other leading-underscore ID. Only after this
+    // strict gate succeeds may the trusted materializers below create reserved
+    // resources and record their exact `(kind, namespace, id)` identities for
+    // the post-materialization runtime swap check.
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+
     let mesh_errors = config.validate_mesh_fields();
     if !mesh_errors.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1078,16 +1159,25 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
         return;
     }
 
-    let udp_proxy_ids: HashSet<String> = config
+    let mut udp_proxy_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for proxy in config
         .proxies
         .iter()
         .filter(|proxy| proxy.dispatch_kind.is_udp())
-        .map(|proxy| proxy.id.clone())
-        .collect();
+    {
+        udp_proxy_ids
+            .entry(proxy.namespace.clone())
+            .or_default()
+            .insert(proxy.id.clone());
+    }
     let udp_proxies: Vec<String> = config
         .proxies
         .iter()
-        .filter(|proxy| udp_proxy_ids.contains(&proxy.id))
+        .filter(|proxy| {
+            udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        })
         .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect();
     let udp_services = strip_node_waypoint_udp_dtls_mesh_service_ports(config.mesh.as_deref_mut());
@@ -1108,14 +1198,17 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
     }
 
     if !udp_proxy_ids.is_empty() {
-        config
-            .proxies
-            .retain(|proxy| !udp_proxy_ids.contains(&proxy.id));
+        config.proxies.retain(|proxy| {
+            !udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        });
         config.plugin_configs.retain(|plugin| {
-            plugin
-                .proxy_id
-                .as_deref()
-                .is_none_or(|proxy_id| !udp_proxy_ids.contains(proxy_id))
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !udp_proxy_ids
+                    .get(plugin.namespace.as_str())
+                    .is_some_and(|ids| ids.contains(proxy_id))
+            })
         });
     }
     if !udp_upstreams.is_empty() {
@@ -1425,11 +1518,12 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
 /// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
 /// onto an upstream that entered the projection with `source_locality = None`
 /// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
-/// upstream identity on `id` and detects modification by `updated_at != old`
-/// (`src/config_delta.rs`), so without reconciliation EVERY mesh upstream would
-/// look "modified" on EVERY apply — and a "modified" upstream rebuilds a fresh
-/// `LoadBalancer` (`LoadBalancerCache::build_delta_inner`), discarding its
-/// round-robin counters, latency EWMAs, hash rings, and passive-health state.
+/// upstream identity on `(namespace, id)` and detects modification by
+/// `updated_at != old` (`src/config_delta.rs`), so without reconciliation EVERY
+/// mesh upstream would look "modified" on EVERY apply — and a "modified"
+/// upstream rebuilds a fresh `LoadBalancer`
+/// (`LoadBalancerCache::build_delta_inner`), discarding its round-robin
+/// counters, latency EWMAs, hash rings, and passive-health state.
 /// That means an unrelated mesh-only update (a federation/trust-bundle overlay
 /// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
 /// LB + health for every materialized upstream.
@@ -1448,13 +1542,18 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
     if candidate.upstreams.is_empty() || previous.upstreams.is_empty() {
         return;
     }
-    let previous_by_id: HashMap<&str, &Upstream> = previous
+    let previous_by_id: HashMap<(&str, &str), &Upstream> = previous
         .upstreams
         .iter()
-        .map(|upstream| (upstream.id.as_str(), upstream))
+        .map(|upstream| {
+            (
+                (upstream.namespace.as_str(), upstream.id.as_str()),
+                upstream,
+            )
+        })
         .collect();
     for upstream in &mut candidate.upstreams {
-        if let Some(old) = previous_by_id.get(upstream.id.as_str())
+        if let Some(old) = previous_by_id.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
             && upstream_content_eq(upstream, old)
         {
             // Content-identical to the last accepted projection: preserve the
@@ -1860,11 +1959,9 @@ fn materialize_east_west_gateway_proxies(
 
             let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
 
-            if let Some(existing) = config
-                .proxies
-                .iter_mut()
-                .find(|candidate| candidate.id == proxy.id)
-            {
+            if let Some(existing) = config.proxies.iter_mut().find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            }) {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -1937,11 +2034,9 @@ fn materialize_east_west_gateway_proxies(
     }
 
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -1952,7 +2047,7 @@ fn materialize_east_west_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -2766,6 +2861,9 @@ pub(crate) fn service_http_family_ports(
 /// siblings (disambiguated by inbound orig-dst / the request authority port
 /// instead of the outbound capture's orig-dst).
 pub(crate) struct MeshOutboundServiceGroup {
+    /// Owning resource namespace. Generated sibling ids include namespace text
+    /// but the join is lossy, so every consumer must key by this field plus id.
+    pub namespace: String,
     /// How many HTTP-family ports the service DECLARES — which can exceed the
     /// materialized sibling count (e.g. an unresolved named `targetPort`
     /// produced no targets for one port). Orig-dst-less requests must fail
@@ -2791,6 +2889,7 @@ pub(crate) fn mesh_outbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2895,6 +2994,7 @@ pub(crate) fn mesh_inbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2924,9 +3024,9 @@ pub(crate) fn mesh_inbound_service_groups(
 pub(crate) fn mesh_ingress_listener_groups(
     mesh: &crate::modes::mesh::config::MeshConfig,
 ) -> Vec<MeshOutboundServiceGroup> {
-    if mesh.local_ingress_listeners.is_empty() {
+    let Some(first_listener) = mesh.local_ingress_listeners.first() else {
         return Vec::new();
-    }
+    };
     let siblings: Vec<(u16, String)> = mesh
         .local_ingress_listeners
         .iter()
@@ -2952,6 +3052,7 @@ pub(crate) fn mesh_ingress_listener_groups(
     // multi-listener group back to the single-listener no-signal pass-through.
     let declared_http_ports = mesh.declared_ingress_http_ports.max(siblings.len());
     vec![MeshOutboundServiceGroup {
+        namespace: first_listener.owner_namespace.clone(),
         declared_http_ports,
         siblings,
     }]
@@ -3597,7 +3698,9 @@ fn materialize_sidecar_inbound_proxies(
                 // overlapping bare-name host variant still wins first-materialized,
                 // exactly as before per-port siblings existed.
                 if config.proxies.iter().any(|p| {
-                    if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+                    if (p.namespace == service.namespace && sibling_ids.contains(p.id.as_str()))
+                        || p.dispatch_kind.is_stream()
+                    {
                         return false;
                     }
                     let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3614,7 +3717,11 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 }
-                if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                if let Some(existing) = config
+                    .proxies
+                    .iter_mut()
+                    .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+                {
                     *existing = proxy;
                 } else {
                     config.proxies.push(proxy);
@@ -3859,7 +3966,9 @@ fn materialize_sidecar_ingress_listener_proxies(
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
         if config.proxies.iter().any(|p| {
-            if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+            if (p.namespace == listener.owner_namespace && sibling_ids.contains(p.id.as_str()))
+                || p.dispatch_kind.is_stream()
+            {
                 return false;
             }
             let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3875,7 +3984,11 @@ fn materialize_sidecar_ingress_listener_proxies(
             );
             continue;
         }
-        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+        if let Some(existing) = config
+            .proxies
+            .iter_mut()
+            .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+        {
             *existing = proxy;
         } else {
             config.proxies.push(proxy);
@@ -4307,7 +4420,7 @@ fn materialize_mesh_outbound_proxies(
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
             if config.proxies.iter().any(|p| {
-                if p.id == proxy.id
+                if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
@@ -4346,12 +4459,20 @@ fn materialize_mesh_outbound_proxies(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4397,12 +4518,20 @@ fn materialize_mesh_outbound_proxies(
                 now,
             );
             let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4540,7 +4669,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -4635,7 +4768,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
             vec![target],
             now,
         );
-        if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+        {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -4755,7 +4892,11 @@ fn materialize_mesh_outbound_udp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -4874,7 +5015,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(scheme),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(scheme),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -6462,7 +6603,11 @@ fn synthesize_mesh_outbound_cors_plugins(
         for service_port in service_http_family_ports(service) {
             let proxy_id =
                 mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port);
-            let Some(proxy) = config.proxies.iter_mut().find(|proxy| proxy.id == proxy_id) else {
+            let Some(proxy) = config
+                .proxies
+                .iter_mut()
+                .find(|proxy| proxy.namespace == service.namespace && proxy.id == proxy_id)
+            else {
                 // Not every declared HTTP port materializes (e.g. an
                 // unresolved named targetPort skips its sibling) — nothing to
                 // attach CORS to on a route that does not exist.
@@ -6533,7 +6678,7 @@ fn apply_destination_rules(
     // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
     // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
+    let mut outbound_upstream_owner_port: HashMap<NamespacedResourceId, u16> = mesh_slice
         .services
         .iter()
         .flat_map(|svc| {
@@ -6541,19 +6686,28 @@ fn apply_destination_rules(
                 .into_iter()
                 .map(|sp| {
                     (
-                        mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 })
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
                 .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
@@ -6567,14 +6721,20 @@ fn apply_destination_rules(
     for spec in
         mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
     for spec in mesh_outbound_http_bywl_upstreams(
         &mesh_slice.services,
         &mesh_slice.workloads,
         multi_cluster,
     ) {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
 
     for dr in sorted_destination_rules {
@@ -6682,6 +6842,8 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
+            let upstream_owner_key =
+                NamespacedResourceId::new(upstream.namespace.as_str(), upstream.id.as_str());
             // Captured owned (like `upstream_base_tls`) so the per-port
             // `entry()` mutable borrow below does not conflict with reading the
             // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
@@ -6699,7 +6861,7 @@ fn apply_destination_rules(
                 // leak onto this upstream merely because their service port
                 // number appears as a fallback target's dial port.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
-                    outbound_upstream_owner_port.get(&upstream.id)
+                    outbound_upstream_owner_port.get(&upstream_owner_key)
                 {
                     if port != owning_port {
                         debug!(
@@ -6760,7 +6922,8 @@ fn apply_destination_rules(
                     None
                 };
 
-                let is_owner_entry = outbound_upstream_owner_port.get(&upstream.id) == Some(port);
+                let is_owner_entry =
+                    outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
                 // Seed a FRESH fanned slot's passive health from the upstream
                 // level — which carries this DR's top-level outlierDetection,
                 // applied above — so a PARTIAL per-port outlier override
@@ -7639,11 +7802,9 @@ fn materialize_egress_gateway_proxies(
 
     // Merge upstreams: replace existing by ID or append.
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -7655,7 +7816,7 @@ fn materialize_egress_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -8627,9 +8788,11 @@ fn inject_mesh_global_plugins(
         let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
         let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
         if outbound_listen_ports.is_empty() {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+            remove_mesh_managed_plugin(
+                config,
+                MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+                &runtime.namespace,
+            );
         } else {
             let plugin_config = serde_json::json!({
                 "registry": registry,
@@ -8647,9 +8810,7 @@ fn inject_mesh_global_plugins(
         }
     } else {
         // Remove any stale instance (e.g., operator flipped policy back).
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_OUTBOUND_REGISTRY_PLUGIN_ID, &runtime.namespace);
     }
 
     // Merge applicable Telemetry resources (most specific scope wins per section).
@@ -8747,9 +8908,7 @@ fn inject_mesh_global_plugins(
     // injected plugins are updated in place across upgrades.
     let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
         Some(al) if !al.enabled => {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID);
+            remove_mesh_managed_plugin(config, MESH_ACCESS_LOG_PLUGIN_ID, &runtime.namespace);
             None
         }
         Some(al) => Some(match &al.filter {
@@ -8783,9 +8942,7 @@ fn inject_mesh_global_plugins(
             &runtime.namespace,
         );
     } else {
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_BPF_METRICS_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_BPF_METRICS_PLUGIN_ID, &runtime.namespace);
     }
 }
 
@@ -9003,9 +9160,7 @@ fn inject_mesh_request_auth_plugin(
     if applicable.is_empty() {
         // No applicable RequestAuthentication — remove any previously injected
         // mesh request auth plugin so it doesn't persist across config updates.
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9019,9 +9174,7 @@ fn inject_mesh_request_auth_plugin(
     }
 
     if providers.is_empty() {
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9109,7 +9262,7 @@ fn ensure_global_plugin(
     if let Some(existing) = config
         .plugin_configs
         .iter_mut()
-        .find(|plugin| plugin.id == id)
+        .find(|plugin| plugin.namespace == namespace && plugin.id == id)
     {
         *existing = mesh_plugin;
     } else if config
@@ -9125,6 +9278,12 @@ fn ensure_global_plugin(
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
+}
+
+fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &str) {
+    config
+        .plugin_configs
+        .retain(|plugin| plugin.namespace != namespace || plugin.id != id);
 }
 
 pub async fn run(
@@ -13344,6 +13503,8 @@ async fn apply_mesh_slice_generation(
         federation_activation,
     ) {
         Ok(mut config) => {
+            let trusted_mesh_ids =
+                TrustedMeshGeneratedResourceIds::from_materialized_config(&config);
             let previous_config = proxy_state.config.load_full();
             // Materialized mesh upstreams are rebuilt with fresh per-apply
             // timestamps every slice apply (the materializers stamp `Utc::now()`
@@ -13394,7 +13555,7 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_config(config);
+            let outcome = proxy_state.update_mesh_config(config, &trusted_mesh_ids);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -15500,6 +15661,60 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_materialization_qualifies_lossy_generated_ids() {
+        let service_and_workload =
+            |namespace: &str, name: &str, address: &str| -> (MeshService, Workload) {
+                let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{name}");
+                let mut service = http_mesh_service(name, 8080, &spiffe);
+                service.namespace = namespace.to_string();
+
+                let mut workload = workload_with_address(name, name, address);
+                workload.spiffe_id = SpiffeId::new(&spiffe).expect("spiffe id");
+                workload.namespace = namespace.to_string();
+                workload.selector.namespace = Some(namespace.to_string());
+                (service, workload)
+            };
+        let (service_a, workload_a) = service_and_workload("a", "b-c", "10.0.0.1");
+        let (service_b, workload_b) = service_and_workload("a-b", "c", "10.0.0.2");
+        let proxy_id_a = mesh_outbound_proxy_id("a", "b-c", 8080);
+        let proxy_id_b = mesh_outbound_proxy_id("a-b", "c", 8080);
+        let upstream_id_a = mesh_outbound_upstream_id("a", "b-c", 8080);
+        let upstream_id_b = mesh_outbound_upstream_id("a-b", "c", 8080);
+        assert_eq!(proxy_id_a, proxy_id_b, "proxy id join is lossy");
+        assert_eq!(upstream_id_a, upstream_id_b, "upstream id join is lossy");
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_a, workload_b],
+            services: vec![service_a, service_b],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+
+        let proxy_namespaces: std::collections::HashSet<&str> = config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id == proxy_id_a)
+            .map(|proxy| proxy.namespace.as_str())
+            .collect();
+        let upstream_namespaces: std::collections::HashSet<&str> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.id == upstream_id_a)
+            .map(|upstream| upstream.namespace.as_str())
+            .collect();
+        assert_eq!(
+            proxy_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
+        );
+        assert_eq!(
+            upstream_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
+        );
+    }
+
+    #[test]
     fn mesh_outbound_node_waypoint_dev_fallback_materializes_plaintext_captured_service_route() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let slice = MeshSlice {
@@ -15796,6 +16011,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["reviews"],
             "the prepared config carries the slice-narrowed services view"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
+        let runtime = test_mesh_runtime_config();
+        let prepared =
+            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id.starts_with("__mesh")),
+            "fixture must contain a trusted mesh-generated resource"
+        );
+        assert!(
+            prepared.validate_resource_ids().is_err(),
+            "the ordinary external config boundary must stay strict"
+        );
+
+        let trusted = TrustedMeshGeneratedResourceIds::from_materialized_config(&prepared);
+        crate::proxy::validate_runtime_resource_ids(&prepared, Some(&trusted))
+            .expect("exact mesh-generated identities pass the runtime check");
+
+        let mut hostile = prepared;
+        let mut injected = hostile
+            .plugin_configs
+            .first()
+            .cloned()
+            .expect("managed plugin");
+        injected.id = "__mesh_hostile_after_materialization".to_string();
+        hostile.plugin_configs.push(injected);
+        let errors = crate::proxy::validate_runtime_resource_ids(&hostile, Some(&trusted))
+            .expect_err("an unrecorded reserved identity must still fail closed");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("PluginConfig ID")
+                    && error.contains("__mesh_hostile_after_materialization")
+            }),
+            "unexpected runtime identity errors: {errors:?}"
         );
     }
 
@@ -16899,6 +17154,80 @@ mod tests {
                 .iter()
                 .all(|plugin| plugin.proxy_id.as_deref() != Some("operator-udp")),
             "proxy-scoped plugin config must not dangle after disabling UDP proxy"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_relay_builder_preserves_backend_protocol_dispatch() {
+        let tcp = mesh_outbound_tcp_relay_proxy("default", "redis", 6379, "tcp-upstream");
+        let udp = mesh_outbound_udp_relay_proxy("default", "dns", 53, "udp-upstream");
+
+        assert_eq!(tcp.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(tcp.dispatch_kind, DispatchKind::TcpRaw);
+        assert_eq!(udp.backend_scheme, Some(BackendScheme::Udp));
+        assert_eq!(udp.dispatch_kind, DispatchKind::UdpRaw);
+    }
+
+    #[test]
+    fn node_waypoint_udp_fail_closed_pruning_is_namespace_qualified() {
+        let mut udp_proxy =
+            mesh_outbound_udp_relay_proxy("default", "operator-dns", 53, "operator-upstream");
+        udp_proxy.id = "shared".to_string();
+        let mut other_proxy = destination_rule_test_proxy("shared", "other-upstream");
+        other_proxy.namespace = "tenant-b".to_string();
+
+        let plugin = |id: &str, namespace: &str| PluginConfig {
+            id: id.to_string(),
+            plugin_name: "tcp_logging".to_string(),
+            namespace: namespace.to_string(),
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("shared".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // Scoped fail-closed is driven by mesh_authz plugin config with
+        // per_pod_policy_scoping, not by MeshConfig.mesh_policies alone.
+        let operator_authz = global_mesh_authz_plugin(
+            "operator-mesh-authz",
+            serde_json::json!({
+                "per_pod_policy_scoping": true,
+                "mesh_policies": [scoped_node_waypoint_deny_policy()],
+            }),
+        );
+        let mut config = GatewayConfig {
+            proxies: vec![udp_proxy, other_proxy],
+            plugin_configs: vec![
+                plugin("default-shared-plugin", "default"),
+                plugin("tenant-b-shared-plugin", "tenant-b"),
+                operator_authz,
+            ],
+            ..GatewayConfig::default()
+        };
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+
+        fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, &runtime);
+
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].namespace, "tenant-b");
+        assert_eq!(config.proxies[0].id, "shared");
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "tenant-b"
+                    && plugin.id == "tenant-b-shared-plugin"),
+            "same-id proxy plugin in another namespace must survive UDP fail-closed pruning"
+        );
+        assert!(
+            !config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "default" && plugin.id == "default-shared-plugin"),
+            "UDP proxy-scoped plugins must prune only within the UDP proxy's namespace"
         );
     }
 
@@ -20594,8 +20923,13 @@ mod tests {
             ..GatewayConfig::default()
         };
         // p2 selects subset v1 — should pick up the subset overlay.
+        // `resolve_upstream_tls` resolves upstream/subset TLS by
+        // `(namespace, upstream_id)`, so the proxy must declare the test
+        // upstream's namespace explicitly — the serde default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), not `"default"`.
         let mut p2: Proxy = serde_json::from_value(serde_json::json!({
             "id": "p2",
+            "namespace": "default",
             "hosts": ["p2.example.com"],
             "backend_host": "",
             "backend_port": 0,
@@ -21978,6 +22312,61 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn mesh_managed_plugin_cleanup_is_namespace_qualified() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: runtime.namespace.clone(),
+                    config: serde_json::json!({"registry": ["stale.default"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: "tenant-b".to_string(),
+                    config: serde_json::json!({"registry": ["tenant-b.example"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &slice);
+
+        assert_eq!(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+                .map(|plugin| plugin.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-b"]
         );
     }
 
@@ -23438,6 +23827,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_is_namespace_qualified() {
+        let first_now = chrono::Utc::now();
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut tenant_a = reconcile_test_upstream("shared", 8080, first_now);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = reconcile_test_upstream("shared", 9090, first_now);
+        tenant_b.namespace = "tenant-b".to_string();
+        let accepted = GatewayConfig {
+            upstreams: vec![tenant_a.clone(), tenant_b.clone()],
+            ..GatewayConfig::default()
+        };
+
+        tenant_a.created_at = second_now;
+        tenant_a.updated_at = second_now;
+        tenant_b.created_at = second_now;
+        tenant_b.updated_at = second_now;
+        let mut candidate = GatewayConfig {
+            upstreams: vec![tenant_b, tenant_a],
+            ..GatewayConfig::default()
+        };
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        let reconciled_a = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-a")
+            .expect("tenant-a upstream");
+        let reconciled_b = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-b")
+            .expect("tenant-b upstream");
+        assert_eq!(reconciled_a.updated_at, first_now);
+        assert_eq!(reconciled_b.updated_at, first_now);
+        assert_eq!(reconciled_a.targets[0].port, 8080);
+        assert_eq!(reconciled_b.targets[0].port, 9090);
+    }
+
     /// #1806 codex r2 finding 3: a DR-only change to an SD upstream's top-level
     /// `connectionPool.http` alters the DERIVED `dispatch_port_override_fallback`
     /// while the SERIALIZED `Upstream` content stays byte-identical (the field is
@@ -24771,6 +25200,9 @@ mod tests {
     fn mesh_runtime_updates_mesh_managed_global_plugin_by_id() {
         let runtime = test_mesh_runtime_config();
         let now = chrono::Utc::now();
+        // Reserved mesh IDs are illegal on the operator-input prepare boundary.
+        // Re-injection against prior materializer output updates the existing
+        // `(namespace, id)` row instead of duplicating it.
         let existing = PluginConfig {
             id: MESH_REQUEST_AUTH_PLUGIN_ID.to_string(),
             plugin_name: "jwks_auth".to_string(),
@@ -24788,20 +25220,19 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let config = GatewayConfig {
-            mesh: Some(Box::new(MeshConfig {
-                request_authentications: vec![test_request_authentication(
-                    "fresh",
-                    PolicyScope::MeshWide,
-                )],
-                ..MeshConfig::default()
-            })),
+        let fresh = test_request_authentication("fresh", PolicyScope::MeshWide);
+        let mut config = GatewayConfig {
             plugin_configs: vec![existing],
             ..GatewayConfig::default()
         };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            request_authentications: vec![fresh],
+            ..MeshSlice::default()
+        };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
-        let jwks_plugins: Vec<_> = prepared
+        inject_mesh_request_auth_plugin(&mut config, &runtime, &mesh_slice);
+        let jwks_plugins: Vec<_> = config
             .plugin_configs
             .iter()
             .filter(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)

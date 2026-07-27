@@ -28,8 +28,9 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 ## Scope
 
 - **Global** plugins (`scope: "global"`) apply to all proxies automatically. `proxy_id` must be null.
-- **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required.
+- **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required and is resolved within the plugin config's own namespace.
 - **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
+- Proxy and proxy-group attachment identity is `(namespace, id)`. Two namespaces may reuse the same bare proxy id and the same bare plugin config id; a proxy only ever resolves plugin configs from its own namespace, and same-id proxy-group configs in two namespaces get independent instances with independent state.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
 
 **Example** (file mode YAML):
@@ -1521,19 +1522,21 @@ sentinel in that same digest-form class, so neither an ordinary identity equal
 to `__cardinality_overflow__` nor one equal to the sentinel string itself can
 share the overflow row's key.
 
-**`proxy_name` contract:** exported `proxy_name` is live display metadata for the
-stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
-reload preserves the accumulated counter values. After an accepted
-configuration is published, JSON and Prometheus resolve active proxy IDs through
-the same lock-free snapshot of that configuration's names. Request completion
-order cannot change the exported label, so late traffic admitted under a retired
-generation cannot restore an old name. Because `proxy_name` remains a Prometheus
-label, a rename creates a controlled label transition at the accepted reload
-boundary; the new label carries the existing cumulative counter rather than
-restarting its in-memory value. Pricing changes still create distinct
-pricing-generation entries; overlapping entries collapse under the current
-published name. Retained rows for a deleted proxy use a deterministic
-recorded-name fallback.
+**Proxy identity and `proxy_name` contract:** charge rows are keyed by the
+matched proxy's `(namespace, proxy_id)`, including when one gateway-wide global
+instance records traffic for multiple namespaces. Same-id tenant proxies
+therefore never share counters or live display metadata. Exported `proxy_name`
+is omitted from the in-memory registry key, so a name-only reload preserves the
+accumulated counter values. After an accepted configuration is published, JSON
+and Prometheus resolve active proxy names through the same namespace-qualified,
+lock-free snapshot. Request completion order cannot change the exported label,
+so late traffic admitted under a retired generation cannot restore an old name.
+Because `proxy_name` remains a Prometheus label, a rename creates a controlled
+label transition at the accepted reload boundary; the new label carries the
+existing cumulative counter rather than restarting its in-memory value. Pricing
+changes still create distinct pricing-generation entries; overlapping entries
+collapse under the current published name. Retained rows for a deleted proxy use
+a deterministic recorded-name fallback.
 
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`
@@ -5726,6 +5729,8 @@ These plugins are registered built-ins even when they are most often generated o
 Applies per-request route overrides generated from mesh/Istio routing resources. It runs in `before_proxy` after authentication and admission plugins, so policy evaluates the original public proxy identity before the backend override is applied. For WebSockets, the override selects the upgrade backend only; individual frames are not re-routed.
 
 **Strict config validation:** unknown keys are rejected at every security-relevant nesting level — top-level plugin config, each rule, match, destination, fault, rewrite, redirect, transform, route-local `retry`, nested retry backoff, and destination `backend_tls`. Misspellings such as `reject_unmtached`, `requires_node_waypoint_auth`, `retry.max_retry`, or `backend_tls.client_certpath` fail admission on native/file/admin/translated/CP-DP paths instead of silently disabling fail-closed controls. Shared gateway `RetryConfig` / `BackendTlsConfig` consumers keep their existing compatibility boundary; mesh route policy uses strict route-local wire shapes that convert into those runtime types after validation.
+
+An `upstream_id` destination resolves in the matched proxy's namespace. Scoped plugin references are validated in their resource namespace; a gateway-wide global reference must exist in every proxy namespace where that global is effective (excluding proxies that replace it with a scoped `mesh_route_dispatch` instance). A same-ID upstream in another namespace never satisfies the reference.
 
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 

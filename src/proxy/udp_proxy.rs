@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
@@ -315,8 +316,9 @@ pub(crate) fn take_udp_last_client_if_live<T>(
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
 type BackendDtlsConfigCache = Arc<BackendDtlsConfigCacheState>;
 
-/// Listener-local cache of built backend DTLS params keyed by the inputs that
-/// affect the resulting config. The key is path/options-based, so it cannot
+/// Listener-local cache of built backend DTLS params keyed by the owning
+/// `(namespace, proxy_id)` and the inputs that affect the resulting config.
+/// The key is path/options-based, so it cannot
 /// observe in-place cert/key/CA rotation — backend TLS live reload bumps the
 /// shared `reload_epoch` (via
 /// `StreamListenerManager::bump_backend_tls_reload_epoch`, called from
@@ -573,6 +575,9 @@ impl Drop for PendingSessionGate {
 
 #[derive(Clone, Eq, PartialEq)]
 struct BackendDtlsConfigCacheKey {
+    /// Required for shared SNI listeners, which can serve same-ID proxies from
+    /// different namespaces through one listener-local cache.
+    proxy_namespace: String,
     proxy_id: String,
     backend_host: String,
     client_cert_path: Option<String>,
@@ -592,6 +597,7 @@ struct BackendDtlsConfigCacheKey {
 
 impl Hash for BackendDtlsConfigCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.proxy_namespace.hash(state);
         self.proxy_id.hash(state);
         self.backend_host.hash(state);
         self.client_cert_path.hash(state);
@@ -617,6 +623,7 @@ fn backend_dtls_config_cache_key(
     reload_epoch: u64,
 ) -> BackendDtlsConfigCacheKey {
     BackendDtlsConfigCacheKey {
+        proxy_namespace: proxy.namespace.clone(),
         proxy_id: proxy.id.clone(),
         backend_host: backend_host.to_string(),
         client_cert_path: proxy.resolved_tls.client_cert_path.clone(),
@@ -874,14 +881,17 @@ struct UdpSessionEpochView {
 
 fn resolve_udp_session_epoch_view(
     listener_proxy_id: &str,
+    listener_proxy_namespace: &str,
     epoch: &RequestEpoch,
     initial_data: &[u8],
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     listen_port: u16,
 ) -> Result<UdpSessionEpochView, anyhow::Error> {
     let base_proxy = epoch
-        .proxy_by_id(listener_proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", listener_proxy_id))?;
+        .proxy_by_namespaced_id(listener_proxy_namespace, listener_proxy_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Proxy {listener_proxy_namespace}/{listener_proxy_id} not found")
+        })?;
 
     let sni_hostname = if base_proxy.passthrough {
         match super::sni::extract_sni_from_dtls_client_hello(initial_data) {
@@ -902,26 +912,31 @@ fn resolve_udp_session_epoch_view(
         None
     };
 
-    let resolved_proxy_id = if let Some(sni_ids) = sni_proxy_ids {
-        super::sni::resolve_proxy_by_sni_in_epoch(sni_hostname.as_deref(), sni_ids, epoch)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No matching passthrough proxy for SNI {:?} on port {}",
-                    sni_hostname,
-                    listen_port
-                )
-            })?
+    // Shared passthrough ports can host same-ID proxies owned by different
+    // namespaces, so SNI selects a full `(namespace, id)` identity.
+    let (resolved_namespace, resolved_proxy_id) = if let Some(sni_ids) = sni_proxy_ids {
+        let matched =
+            super::sni::resolve_proxy_by_sni_in_epoch(sni_hostname.as_deref(), sni_ids, epoch)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No matching passthrough proxy for SNI {:?} on port {}",
+                        sni_hostname,
+                        listen_port
+                    )
+                })?;
+        (matched.namespace.as_str(), matched.id.as_str())
     } else {
-        listener_proxy_id
+        (listener_proxy_namespace, listener_proxy_id)
     };
 
     let proxy = epoch
-        .proxy_by_id(resolved_proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", resolved_proxy_id))?
+        .proxy_by_namespaced_id(resolved_namespace, resolved_proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {resolved_namespace}/{resolved_proxy_id} not found"))?
         .clone();
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Udp);
     let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
         .iter()
         .filter(|p| p.requires_udp_datagram_hooks())
@@ -1470,6 +1485,10 @@ pub struct UdpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id`. Runtime state keyed by proxy identity —
+    /// notably the adaptive batch-limit EWMA — must be qualified by this so a
+    /// same-id proxy in another namespace never shares or prunes it.
+    pub proxy_namespace: String,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
     pub health_checker: Arc<HealthChecker>,
@@ -1513,7 +1532,10 @@ pub struct UdpListenerConfig {
     pub started: Arc<AtomicBool>,
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the DTLS ClientHello selects which proxy to route to.
-    pub sni_proxy_ids: Option<Vec<String>>,
+    ///
+    /// Candidates are namespace-qualified: one shared port may host same-ID
+    /// passthrough proxies owned by different namespaces.
+    pub sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     /// Adaptive buffer tracker for dynamic batch limit sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Number of datagrams per `recvmmsg` syscall on Linux (default: 64).
@@ -1556,6 +1578,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
+        proxy_namespace,
         dns_cache,
         request_epoch,
         health_checker,
@@ -1594,6 +1617,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             port,
             bind_addr,
             proxy_id,
+            proxy_namespace,
             dns_cache,
             request_epoch,
             health_checker,
@@ -1771,7 +1795,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     let mut batch_bytes_in: u64 = 0;
                     let mut batch_dgrams_out: u64 = 0;
                     let mut batch_bytes_out: u64 = 0;
-                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+                    let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
 
                     use std::os::fd::AsRawFd;
                     let fd = frontend_socket.as_raw_fd();
@@ -1812,6 +1836,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     chunk,
                                                     addr2,
                                                     &proxy_id,
+                                                    &proxy_namespace,
                                                     &request_epoch,
                                                     &health_checker,
                                                     &dns_cache,
@@ -1856,6 +1881,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         data,
                                         addr2,
                                         &proxy_id,
+                                        &proxy_namespace,
                                         &request_epoch,
                                         &health_checker,
                                         &dns_cache,
@@ -1894,7 +1920,11 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     }
 
                     if batch_dgrams_in > 0 {
-                        adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
+                        adaptive_buffer.record_batch_cycle(
+                            &proxy_namespace,
+                            &proxy_id,
+                            batch_dgrams_in,
+                        );
                         metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
                         metrics.bytes_in.fetch_add(batch_bytes_in, Ordering::Relaxed);
                         metrics.datagrams_out.fetch_add(batch_dgrams_out, Ordering::Relaxed);
@@ -1937,6 +1967,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &buf[..len],
                     client_addr,
                     &proxy_id,
+                    &proxy_namespace,
                     &request_epoch,
                     &health_checker,
                     &dns_cache,
@@ -1971,7 +2002,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 // Drain additional pending datagrams without yielding to the runtime.
                 // On Linux, uses recvmmsg to batch multiple datagrams per syscall.
                 // On other platforms, falls back to individual try_recv_from calls.
-                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
+                let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
 
                 #[cfg(target_os = "linux")]
                 {
@@ -2017,6 +2048,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     chunk,
                                                     addr2,
                                                     &proxy_id,
+                                                    &proxy_namespace,
                                                     &request_epoch,
                                                     &health_checker,
                                                     &dns_cache,
@@ -2061,6 +2093,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         data,
                                         addr2,
                                         &proxy_id,
+                                        &proxy_namespace,
                                         &request_epoch,
                                         &health_checker,
                                         &dns_cache,
@@ -2119,6 +2152,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &buf[..len2],
                                     addr2,
                                     &proxy_id,
+                                    &proxy_namespace,
                                     &request_epoch,
                                     &health_checker,
                                     &dns_cache,
@@ -2156,7 +2190,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 }
 
                 // Record batch cycle for adaptive batch limit tuning.
-                adaptive_buffer.record_batch_cycle(&proxy_id, batch_dgrams_in);
+                adaptive_buffer.record_batch_cycle(&proxy_namespace, &proxy_id, batch_dgrams_in);
 
                 // Flush batched metrics to atomics once.
                 metrics.datagrams_in.fetch_add(batch_dgrams_in, Ordering::Relaxed);
@@ -2190,6 +2224,7 @@ async fn process_datagram(
     data: &[u8],
     client_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     request_epoch: &Arc<RequestEpochStore>,
     health_checker: &Arc<HealthChecker>,
     dns_cache: &DnsCache,
@@ -2207,7 +2242,7 @@ async fn process_datagram(
     listen_port: u16,
     circuit_breaker_cache: &Arc<CircuitBreakerCache>,
     crls: &crate::tls::CrlList,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
@@ -2274,6 +2309,7 @@ async fn process_datagram(
             data.to_vec(),
             client_addr,
             proxy_id.to_string(),
+            proxy_namespace.to_string(),
             Arc::clone(request_epoch),
             Arc::clone(health_checker),
             dns_cache.clone(),
@@ -2334,6 +2370,7 @@ fn spawn_new_session_datagram(
     data: Vec<u8>,
     client_addr: SocketAddr,
     proxy_id: String,
+    proxy_namespace: String,
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
     dns_cache: DnsCache,
@@ -2347,7 +2384,7 @@ fn spawn_new_session_datagram(
     listen_port: u16,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
     crls: crate::tls::CrlList,
-    sni_proxy_ids: Option<Vec<String>>,
+    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
@@ -2372,6 +2409,7 @@ fn spawn_new_session_datagram(
             data,
             client_addr,
             &proxy_id,
+            &proxy_namespace,
             &request_epoch,
             &health_checker,
             &dns_cache,
@@ -2437,6 +2475,7 @@ async fn process_new_session_datagram(
     data: Vec<u8>,
     client_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     request_epoch: &RequestEpochStore,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -2450,7 +2489,7 @@ async fn process_new_session_datagram(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     crls: &crate::tls::CrlList,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
     local_addr: Option<crate::socket_opts::PktinfoLocal>,
@@ -2467,7 +2506,14 @@ async fn process_new_session_datagram(
     }
 
     let epoch = request_epoch.load();
-    let view = resolve_udp_session_epoch_view(proxy_id, &epoch, &data, sni_proxy_ids, listen_port)?;
+    let view = resolve_udp_session_epoch_view(
+        proxy_id,
+        proxy_namespace,
+        &epoch,
+        &data,
+        sni_proxy_ids,
+        listen_port,
+    )?;
     let first_datagram_metadata =
         std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     if !udp_datagram_allowed(
@@ -2770,6 +2816,8 @@ async fn start_dtls_frontend_listener(
     port: u16,
     bind_addr: IpAddr,
     proxy_id: String,
+    // Namespace owning `proxy_id`, carried from the listener's exact identity.
+    proxy_namespace: String,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
@@ -2865,7 +2913,11 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
+                // Spawn per-client handler. Epoch lookup + stream-connect
+                // admission run inside the task (main's accept-loop isolation);
+                // plugin-cache lookups use the namespace-qualified proxy key.
                 let handler_proxy_id = proxy_id.clone();
+                let handler_proxy_namespace = proxy_namespace.clone();
                 let handler_request_epoch = Arc::clone(&request_epoch);
                 let handler_health_checker = health_checker.clone();
                 let handler_dns = dns_cache.clone();
@@ -2882,10 +2934,13 @@ async fn start_dtls_frontend_listener(
                 let connected_at = chrono::Utc::now();
                 tokio::spawn(async move {
                     let epoch = handler_request_epoch.load();
-                    let Some(proxy) = epoch.proxy_by_id(&handler_proxy_id) else {
+                    let Some(proxy) = epoch
+                        .proxy_by_namespaced_id(&handler_proxy_namespace, &handler_proxy_id)
+                    else {
                         handler_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                         client_conn.close().await;
                         warn!(
+                            namespace = %handler_proxy_namespace,
                             proxy_id = %handler_proxy_id,
                             "DTLS listener proxy no longer exists in request epoch"
                         );
@@ -2897,9 +2952,11 @@ async fn start_dtls_frontend_listener(
                     let proxy_name = proxy.name.clone();
                     let proxy_namespace = proxy.namespace.clone();
                     let backend_scheme = proxy.effective_scheme();
-                    let plugins = epoch
-                        .plugin_cache
-                        .get_plugins_for_protocol(&resolved_proxy_id, ProxyProtocol::Udp);
+                    let plugins = epoch.plugin_cache.plugins_for_protocol(
+                        &proxy_namespace,
+                        &resolved_proxy_id,
+                        ProxyProtocol::Udp,
+                    );
                     let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
                         .iter()
                         .filter(|p| p.requires_udp_datagram_hooks())
@@ -2922,9 +2979,10 @@ async fn start_dtls_frontend_listener(
                         backend_scheme,
                         consumer_index,
                     );
+                    stream_ctx.proxy_namespace = proxy_namespace.clone();
                     stream_ctx.proxy_lifecycle_generation = epoch
                         .plugin_cache
-                        .proxy_lifecycle_generation(resolved_proxy_id.as_str());
+                        .proxy_lifecycle_generation(&proxy_namespace, &resolved_proxy_id);
                     stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
                     stream_ctx.tls_client_cert_chain_der =
                         client_conn.tls_client_cert_chain_der.clone();
@@ -3003,6 +3061,7 @@ async fn start_dtls_frontend_listener(
                         client_conn,
                         client_addr,
                         &resolved_proxy_id,
+                        &proxy_namespace,
                         &epoch,
                         &handler_health_checker,
                         &handler_dns,
@@ -3158,6 +3217,7 @@ async fn handle_dtls_client(
     client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -3186,6 +3246,7 @@ async fn handle_dtls_client(
         client_conn,
         client_addr,
         proxy_id,
+        proxy_namespace,
         epoch,
         health_checker,
         dns_cache,
@@ -3327,6 +3388,7 @@ async fn handle_dtls_client_inner(
     client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -3347,8 +3409,8 @@ async fn handle_dtls_client_inner(
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let proxy = epoch
-        .proxy_by_id(proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found", proxy_id))?
+        .proxy_by_namespaced_id(proxy_namespace, proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found"))?
         .clone();
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
@@ -3369,7 +3431,12 @@ async fn handle_dtls_client_inner(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -3405,6 +3472,7 @@ async fn handle_dtls_client_inner(
             // recover. Genuine DNS/transport failures still record a failure.
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3447,6 +3515,7 @@ async fn handle_dtls_client_inner(
         Err(error) => {
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3464,7 +3533,12 @@ async fn handle_dtls_client_inner(
 
     // Record circuit breaker success — backend connection established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -3736,7 +3810,10 @@ async fn create_session(
         backend_scheme,
         consumer_index,
     );
-    stream_ctx.proxy_lifecycle_generation = epoch.plugin_cache.proxy_lifecycle_generation(proxy_id);
+    stream_ctx.proxy_namespace = proxy.namespace.clone();
+    stream_ctx.proxy_lifecycle_generation = epoch
+        .plugin_cache
+        .proxy_lifecycle_generation(&proxy.namespace, proxy_id);
     stream_ctx.sni_hostname = sni_hostname;
     // The constructor intentionally leaves node-waypoint per-pod policy scope
     // absent: plain UDP cannot wire it without a new capture path. Identity is
@@ -3778,7 +3855,12 @@ async fn create_session(
         .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
     let mut cb_is_half_open_probe = false;
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        match circuit_breaker_cache.can_execute(proxy_id, cb_target_key.as_deref(), cb_config) {
+        match circuit_breaker_cache.can_execute(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        ) {
             Ok((_cb, is_half_open_probe)) => {
                 cb_is_half_open_probe = is_half_open_probe;
             }
@@ -3815,6 +3897,7 @@ async fn create_session(
             // recover. Genuine DNS/transport failures still record a failure.
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3858,6 +3941,7 @@ async fn create_session(
         Err(error) => {
             if let Some(ref cb_config) = proxy.circuit_breaker {
                 let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     proxy_id,
                     cb_target_key.as_deref(),
                     cb_config,
@@ -3875,7 +3959,12 @@ async fn create_session(
 
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(proxy_id, cb_target_key.as_deref(), cb_config);
+        let cb = circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            proxy_id,
+            cb_target_key.as_deref(),
+            cb_config,
+        );
         cb.record_success(cb_is_half_open_probe);
     }
 
@@ -4241,7 +4330,8 @@ async fn create_session(
                 let Some(ref sock) = backend_socket else {
                     break;
                 };
-                let batch_limit = reply_adaptive_buffer.get_batch_limit(&reply_proxy_id);
+                let batch_limit =
+                    reply_adaptive_buffer.get_batch_limit(&reply_proxy_namespace, &reply_proxy_id);
                 for _ in 0..batch_limit {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
@@ -4580,8 +4670,11 @@ fn resolve_backend_target(
         // stream proxy referencing an upstream, `backend_port` is a placeholder,
         // and a coincidental match with one overridden port of a mixed-port
         // upstream would silently pin selection to that port's targets.
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb_snapshot,
+            &proxy.namespace,
+            upstream_id,
+        );
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -4606,6 +4699,7 @@ fn resolve_backend_target(
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
@@ -4614,6 +4708,7 @@ fn resolve_backend_target(
         } else {
             LoadBalancerCache::select_target_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
@@ -4665,7 +4760,7 @@ fn udp_port_lane_selection_supported(
     }
     let selection_affecting = stream_port_override_affects_selection(override_config);
     if selection_affecting {
-        validate_stream_hash_on(lb_snapshot, upstream_id, port)?;
+        validate_stream_hash_on(proxy, lb_snapshot, upstream_id, port)?;
     }
     Ok(selection_affecting)
 }
@@ -4679,12 +4774,14 @@ fn stream_port_override_affects_selection(
 }
 
 fn validate_stream_hash_on(
+    proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
     upstream_id: &str,
     port: u16,
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
+        &proxy.namespace,
         upstream_id,
         Some(port),
         None,
@@ -4896,6 +4993,34 @@ backend_tls_verify_server_cert: false
             first.certificate.certificates(),
             second.certificate.certificates(),
             "cached DTLS params should reuse the generated ephemeral certificate"
+        );
+    }
+
+    #[test]
+    fn backend_dtls_config_cache_isolates_same_id_across_namespaces() {
+        let proxy = test_dtls_proxy();
+        let mut other_namespace = proxy.clone();
+        other_namespace.namespace = "tenant-b".to_string();
+        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(Arc::new(
+            AtomicU64::new(0),
+        )));
+        let crls = Arc::new(Vec::new());
+
+        let first =
+            cached_backend_dtls_config(&cache, &proxy, "localhost", true, &crls, None).unwrap();
+        let second =
+            cached_backend_dtls_config(&cache, &other_namespace, "localhost", true, &crls, None)
+                .unwrap();
+
+        assert_eq!(
+            cache.entries.len(),
+            2,
+            "same-ID proxies in different namespaces need distinct DTLS cache entries"
+        );
+        assert_ne!(
+            first.certificate.certificates(),
+            second.certificate.certificates(),
+            "one namespace must not reuse another namespace's generated DTLS client identity"
         );
     }
 

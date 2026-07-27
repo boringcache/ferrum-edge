@@ -7823,18 +7823,24 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         assert_component_validity(&spec, "AdminMetrics", &instance, true);
     }
 
-    // Conditional semantics: passive requires proxy_id; active forbids it.
+    // Conditional semantics: passive requires proxy_id; active requires upstream_id.
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
-        &serde_json::to_value(AdminMetricsUnhealthyTarget::active("10.0.0.1:80", 1))
-            .expect("active"),
+        &serde_json::to_value(AdminMetricsUnhealthyTarget::active(
+            "ferrum",
+            "upstream-a",
+            "10.0.0.1:80",
+            1,
+        ))
+        .expect("active"),
         true,
     );
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
         &serde_json::to_value(AdminMetricsUnhealthyTarget::passive(
+            "ferrum",
             "proxy-a",
             "10.0.0.1:80",
             1,
@@ -7846,6 +7852,7 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         &spec,
         "AdminMetricsUnhealthyTarget",
         &json!({
+            "namespace": "ferrum",
             "target": "10.0.0.1:80",
             "type": "passive",
             "since_epoch_ms": 1

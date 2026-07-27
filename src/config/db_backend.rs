@@ -870,10 +870,11 @@ impl Default for ApiSpecListFilter {
     }
 }
 
-/// Namespace-qualified key for resources whose IDs are only unique per namespace.
+/// Namespace-qualified key for resources whose IDs are not globally unique.
 ///
-/// Used for incremental removals across every resource type so a misrouted or
-/// adversarial delta cannot delete a same-id object in another namespace.
+/// Resource identity is the `(namespace, id)` pair end to end: config deltas,
+/// incremental removals, and runtime cache pruning all use this type so the
+/// same id in two namespaces cannot collide or leave stale tenant state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NamespacedResourceId {
     pub namespace: String,
@@ -887,6 +888,67 @@ impl NamespacedResourceId {
             id: id.into(),
         }
     }
+
+    /// Borrowed `(namespace, id)` pair for zero-alloc set lookups.
+    #[inline]
+    pub fn as_key(&self) -> (&str, &str) {
+        (self.namespace.as_str(), self.id.as_str())
+    }
+
+    /// Runtime cache key using `|` as the delimiter (same convention as pool keys).
+    ///
+    /// Prefer [`write_runtime_key`](Self::write_runtime_key) / a thread-local
+    /// buffer on request hot paths to avoid per-lookup allocation.
+    #[inline]
+    pub fn runtime_key(&self) -> String {
+        namespaced_runtime_key(&self.namespace, &self.id)
+    }
+
+    /// Write `namespace|id` into `out` (clears `out` first).
+    #[inline]
+    pub fn write_runtime_key(&self, out: &mut String) {
+        write_namespaced_runtime_key(out, &self.namespace, &self.id);
+    }
+}
+
+/// Format a namespace-qualified runtime cache key (`namespace|id`).
+#[inline]
+pub fn namespaced_runtime_key(namespace: &str, id: &str) -> String {
+    let mut key = String::with_capacity(namespace.len() + 1 + id.len());
+    write_namespaced_runtime_key(&mut key, namespace, id);
+    key
+}
+
+/// Clear `out` and write `namespace|id` into it.
+#[inline]
+pub fn write_namespaced_runtime_key(out: &mut String, namespace: &str, id: &str) {
+    out.clear();
+    out.reserve(namespace.len() + 1 + id.len());
+    out.push_str(namespace);
+    out.push('|');
+    out.push_str(id);
+}
+
+/// True when `key` is exactly `namespace|id` or a target-scoped
+/// `namespace|id::…` circuit-breaker style suffix key.
+#[inline]
+pub fn runtime_key_matches_resource(key: &str, namespace: &str, id: &str) -> bool {
+    let ns_len = namespace.len();
+    let id_len = id.len();
+    let prefix_len = ns_len + 1 + id_len;
+    if key.len() < prefix_len {
+        return false;
+    }
+    let bytes = key.as_bytes();
+    if &bytes[..ns_len] != namespace.as_bytes() || bytes[ns_len] != b'|' {
+        return false;
+    }
+    let id_start = ns_len + 1;
+    let id_end = id_start + id_len;
+    if &bytes[id_start..id_end] != id.as_bytes() {
+        return false;
+    }
+    key.len() == prefix_len || (key.len() > prefix_len + 1 && &bytes[id_end..id_end + 2] == b"::")
 }
 
 impl std::fmt::Display for NamespacedResourceId {
