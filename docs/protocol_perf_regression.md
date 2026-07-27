@@ -5,9 +5,14 @@ Ferrum Edge. This lane tracks throughput, error rate, and latency percentiles
 across the supported protocol matrix, plus connection churn, long-lived soak /
 resource plateaus, and reload-under-load coverage.
 
-It is **not** a required pull-request check. The lightweight HTTP/1 overhead
-gate in `.github/workflows/ci.yml` remains the PR path. Noisy shared-runner
-microbenchmarks stay out of branch protection.
+It is **not** a required pull-request check for the scheduled multi-protocol
+benchmark itself. Required PR CI does run lightweight static contracts for this
+lane inside the `Performance Regression Check` job in `.github/workflows/ci.yml`
+(workflow verifier self-test + repository contract, evaluator self-test, and a
+non-executing `bash -n` syntax check of the scenario harness) before optional
+benchmark/build gating. The lightweight HTTP/1 overhead gate in `ci.yml`
+remains the PR path for measured overhead. Noisy shared-runner microbenchmarks
+stay out of branch protection.
 
 ## Documented runner and build profile
 
@@ -47,8 +52,11 @@ Versioned budgets live in
   does not block the schedule.
 - **Harness / data-completeness failures are always hard failures**, even
   while `enforcement` is `alert`: missing expected protocol samples,
-  zero-total/invalid metrics, missing required scenario output, and
-  insufficient RSS/FD/task sampling all fail the job.
+  zero-total/invalid metrics, non-finite or malformed numeric fields (NaN,
+  Infinity, non-numeric counts/rates/plateau arrays), missing required
+  scenario output, and insufficient RSS/FD/task sampling all fail the job.
+  Finite measured product regressions such as zero RPS or large latency stay
+  alert-only under `enforcement=alert`.
 - Absolute `min_gateway_rps` / `max_p*_us` floors are intentionally `null`
   until operators measure variance on `ubuntu-latest` + `ci-release` and fill
   them in. Do not invent floors from unexecuted local runs.
@@ -87,7 +95,11 @@ Optional inputs: duration, concurrency, iterations, protocol subset.
 python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
 python3 .github/scripts/verify_protocol_perf_regression_workflow.py
 python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
 ```
+
+Full-mode PR CI runs the same static set in `Performance Regression Check`
+immediately after checkout.
 
 ## Related surfaces
 

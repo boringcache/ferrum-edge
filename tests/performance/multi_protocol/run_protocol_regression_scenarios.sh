@@ -255,25 +255,63 @@ def load_bench(name: str):
     return None
 
 def sample_total(sample):
-    return int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+    try:
+        req = sample.get("total_requests", 0)
+        err = sample.get("total_errors", 0)
+        if isinstance(req, bool) or isinstance(err, bool):
+            return None
+        req_i = int(req)
+        err_i = int(err)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if req_i < 0 or err_i < 0:
+        return None
+    return req_i + err_i
+
+def _finite_unit_rate(value):
+    try:
+        if isinstance(value, bool):
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if number < 0.0 or number > 1.0:
+        return None
+    return number
 
 def sample_usable(sample):
     if not isinstance(sample, dict):
         return False
-    if sample_total(sample) > 0:
+    total = sample_total(sample)
+    if total is not None and total > 0:
         return True
-    if "heartbeat_success_rate" in sample or "connect_success_rate" in sample:
-        return True
-    return False
+    if total is None and ("total_requests" in sample or "total_errors" in sample):
+        return False
+    has_heartbeat = "heartbeat_success_rate" in sample
+    has_connect = "connect_success_rate" in sample
+    if not (has_heartbeat or has_connect):
+        return False
+    if has_heartbeat and _finite_unit_rate(sample.get("heartbeat_success_rate")) is None:
+        return False
+    if has_connect and _finite_unit_rate(sample.get("connect_success_rate")) is None:
+        return False
+    return True
 
 def error_rate(sample):
     if not sample:
         return 1.0
     total = sample_total(sample)
+    if total is None:
+        return 1.0
     if total <= 0:
         # saturate reports connect/heartbeat rates instead of request totals
         if "heartbeat_success_rate" in sample:
-            return 1.0 - float(sample.get("heartbeat_success_rate", 0.0))
+            rate = _finite_unit_rate(sample.get("heartbeat_success_rate", 0.0))
+            if rate is None:
+                return 1.0
+            return 1.0 - rate
         return 1.0
     return float(sample.get("total_errors", 0)) / float(total)
 
@@ -285,9 +323,20 @@ if sample_path.is_file():
         if len(parts) != 4:
             continue
         _, rss_v, fd_v, task_v = parts
-        rss.append(int(float(rss_v)))
-        fds.append(int(float(fd_v)))
-        tasks.append(int(float(task_v)))
+        try:
+            rss_n = float(rss_v)
+            fd_n = float(fd_v)
+            task_n = float(task_v)
+        except ValueError:
+            continue
+        if not all(
+            n == n and n not in (float("inf"), float("-inf")) and n >= 0.0
+            for n in (rss_n, fd_n, task_n)
+        ):
+            continue
+        rss.append(int(rss_n))
+        fds.append(int(fd_n))
+        tasks.append(int(task_n))
 
 churn = load_bench("connection_churn.json")
 reload_sample = load_bench("reload_under_load.json")

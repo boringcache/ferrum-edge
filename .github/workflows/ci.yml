@@ -3783,6 +3783,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Lightweight protocol-perf contract gates (no benchmarks): keep evaluator /
+      # workflow/harness integrity on the required PR CI surface. The scheduled
+      # multi-protocol bench in protocol-perf-regression.yml stays non-required.
+      - name: Verify protocol-perf contracts (static)
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+          bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+
       - name: Detect performance-sensitive changes
         id: perf_changes
         shell: bash

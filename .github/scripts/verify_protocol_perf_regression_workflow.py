@@ -41,6 +41,7 @@ SCENARIOS_PATH = (
 )
 RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
+CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
 PINNED_ACTION = re.compile(
     r"uses:\s*(?P<action>(?!./)[^@\s]+)@(?P<ref>[0-9a-f]{40})\b",
@@ -167,6 +168,16 @@ def validate_evaluator_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "parse_finite_number" in text and "math.isfinite" in text,
+        "evaluator must reject non-finite metric values",
+        failures,
+    )
+    require(
+        "parse_unit_rate" in text,
+        "evaluator must validate scenario rates as finite unit intervals",
+        failures,
+    )
+    require(
         "validate_required_scenarios" in text,
         "evaluator must validate required scenario output",
         failures,
@@ -187,6 +198,11 @@ def validate_evaluator_contract(text: str, failures: list[str]) -> None:
         ("missing scenarios should hard-fail", "missing-scenario self-test"),
         ("http1 subset should not require HTTP/2", "subset self-test"),
         ("measured regression must not hard-fail under alert enforcement", "alert-only self-test"),
+        ("NaN rps should hard-fail", "non-finite rps self-test"),
+        ("malformed total_requests should hard-fail", "malformed counts self-test"),
+        ("NaN heartbeat_success_rate should hard-fail", "non-finite heartbeat self-test"),
+        ("non-finite resource plateau values should hard-fail", "non-finite plateau self-test"),
+        ("finite zero-RPS should alert-only under alert enforcement", "zero-RPS alert-only self-test"),
     ):
         require(needle in text, f"evaluator self-test missing coverage: {label}", failures)
 
@@ -219,6 +235,53 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
     )
 
 
+def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
+    """Required PR CI must run lightweight protocol-perf validators without benches."""
+    require(
+        "Verify protocol-perf contracts (static)" in text,
+        "ci.yml Performance Regression Check must run protocol-perf static contracts",
+        failures,
+    )
+    require(
+        "verify_protocol_perf_regression_workflow.py --self-test" in text,
+        "ci.yml must run the protocol-perf workflow verifier self-test",
+        failures,
+    )
+    require(
+        "verify_protocol_perf_regression_workflow.py\n" in text
+        or "verify_protocol_perf_regression_workflow.py" in text,
+        "ci.yml must run repository-contract verification for protocol-perf",
+        failures,
+    )
+    require(
+        "evaluate_protocol_perf_budgets.py --self-test" in text,
+        "ci.yml must run the protocol-perf evaluator self-test",
+        failures,
+    )
+    require(
+        "bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh"
+        in text,
+        "ci.yml must syntax-check the protocol regression scenario harness",
+        failures,
+    )
+    # Ensure the static gate is not buried behind optional benchmark path filters.
+    checkout_idx = text.find("performance-regression:")
+    static_idx = text.find("Verify protocol-perf contracts (static)")
+    detect_idx = text.find("Detect performance-sensitive changes")
+    require(
+        checkout_idx != -1 and static_idx != -1 and detect_idx != -1,
+        "ci.yml must contain performance-regression, static protocol-perf, and path detect steps",
+        failures,
+    )
+    if checkout_idx != -1 and static_idx != -1 and detect_idx != -1:
+        require(
+            checkout_idx < static_idx < detect_idx,
+            "ci.yml must run protocol-perf static contracts after checkout and before "
+            "optional benchmark path gating",
+            failures,
+        )
+
+
 def validate_repository_contract(failures: list[str]) -> None:
     require(WORKFLOW_PATH.is_file(), f"missing workflow: {WORKFLOW_PATH}", failures)
     require(BUDGETS_PATH.is_file(), f"missing budgets file: {BUDGETS_PATH}", failures)
@@ -226,6 +289,7 @@ def validate_repository_contract(failures: list[str]) -> None:
     require(SCENARIOS_PATH.is_file(), f"missing scenarios harness: {SCENARIOS_PATH}", failures)
     require(RUNBOOK_PATH.is_file(), f"missing runbook: {RUNBOOK_PATH}", failures)
     require(CI_CD_PATH.is_file(), f"missing CI/CD docs: {CI_CD_PATH}", failures)
+    require(CI_WORKFLOW_PATH.is_file(), f"missing CI workflow: {CI_WORKFLOW_PATH}", failures)
 
     if WORKFLOW_PATH.is_file():
         validate_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"), failures)
@@ -235,6 +299,9 @@ def validate_repository_contract(failures: list[str]) -> None:
 
     if SCENARIOS_PATH.is_file():
         validate_scenarios_contract(SCENARIOS_PATH.read_text(encoding="utf-8"), failures)
+
+    if CI_WORKFLOW_PATH.is_file():
+        validate_pr_ci_contract(CI_WORKFLOW_PATH.read_text(encoding="utf-8"), failures)
 
     if BUDGETS_PATH.is_file():
         import json
@@ -286,6 +353,11 @@ def validate_repository_contract(failures: list[str]) -> None:
             "docs/ci_cd.md must still document the manual multi-protocol benchmark",
             failures,
         )
+        require(
+            "protocol-perf" in ci_cd.lower() and "static" in ci_cd.lower(),
+            "docs/ci_cd.md must document protocol-perf static PR CI validation",
+            failures,
+        )
 
     if RUNBOOK_PATH.is_file():
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
@@ -303,8 +375,19 @@ def validate_repository_contract(failures: list[str]) -> None:
             failures,
         )
         require(
+            "non-finite" in runbook.lower() or "nan" in runbook.lower(),
+            "runbook must document non-finite/malformed metric hard failures",
+            failures,
+        )
+        require(
             "ci.yml" in runbook and "overhead" in runbook.lower(),
             "runbook must preserve the lightweight PR overhead check",
+            failures,
+        )
+        require(
+            "Performance Regression Check" in runbook
+            or "protocol-perf contracts" in runbook.lower(),
+            "runbook must document PR CI static protocol-perf contract checks",
             failures,
         )
 
@@ -370,6 +453,40 @@ resource_plateau insufficient rss_bytes sampling
         failures.append(
             f"self-test unexpectedly rejected good scenarios snippet: {good_scenario_failures}"
         )
+
+    pr_ci_good = """
+  performance-regression:
+    name: Performance Regression Check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Verify protocol-perf contracts (static)
+        run: |
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+          bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+      - name: Detect performance-sensitive changes
+        run: echo detect
+"""
+    pr_ci_failures: list[str] = []
+    validate_pr_ci_contract(pr_ci_good, pr_ci_failures)
+    if pr_ci_failures:
+        failures.append(
+            f"self-test unexpectedly rejected good PR CI snippet: {pr_ci_failures}"
+        )
+
+    pr_ci_bad_failures: list[str] = []
+    validate_pr_ci_contract(
+        """
+  performance-regression:
+    steps:
+      - name: Detect performance-sensitive changes
+        run: echo detect
+""",
+        pr_ci_bad_failures,
+    )
+    if not any("static" in item for item in pr_ci_bad_failures):
+        failures.append("self-test expected missing protocol-perf static PR CI detection")
 
     if failures:
         for failure in failures:

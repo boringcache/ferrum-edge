@@ -73,16 +73,68 @@ def is_gateway_target(target: str) -> bool:
     return any(marker in target for marker in GATEWAY_PORT_MARKERS)
 
 
-def sample_total(sample: dict[str, Any]) -> int:
-    return int(sample.get("total_requests", 0)) + int(sample.get("total_errors", 0))
+def parse_finite_number(value: Any) -> float | None:
+    """Parse a finite float, or None when missing/malformed/non-finite."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def parse_nonnegative_number(value: Any) -> float | None:
+    number = parse_finite_number(value)
+    if number is None or number < 0.0:
+        return None
+    return number
+
+
+def parse_nonnegative_int(value: Any) -> int | None:
+    """Parse a nonnegative integral count without raising on malformed input."""
+    number = parse_nonnegative_number(value)
+    if number is None or not float(number).is_integer():
+        return None
+    return int(number)
+
+
+def parse_unit_rate(value: Any) -> float | None:
+    """Parse a finite rate in [0, 1], or None when malformed."""
+    number = parse_finite_number(value)
+    if number is None or number < 0.0 or number > 1.0:
+        return None
+    return number
+
+
+def sample_total(sample: dict[str, Any]) -> int | None:
+    """Return request+error total, or None when counts are malformed."""
+    requests = parse_nonnegative_int(sample.get("total_requests", 0))
+    errors = parse_nonnegative_int(sample.get("total_errors", 0))
+    if requests is None or errors is None:
+        return None
+    return requests + errors
 
 
 def error_rate(sample: dict[str, Any]) -> float | None:
-    """Return error rate, or None when the sample has zero total activity."""
+    """Return error rate, or None when activity is zero or counts are malformed."""
     total = sample_total(sample)
-    if total <= 0:
+    if total is None or total <= 0:
         return None
-    return float(sample.get("total_errors", 0)) / float(total)
+    errors = parse_nonnegative_int(sample.get("total_errors", 0))
+    if errors is None:
+        return None
+    return float(errors) / float(total)
 
 
 def normalize_protocol_name(name: str) -> str:
@@ -129,23 +181,26 @@ def resolve_expected_protocols(
 
 
 def is_valid_gateway_sample(sample: dict[str, Any]) -> bool:
-    """Reject zero-total and structurally invalid metric samples."""
+    """Reject zero-total, non-finite, and structurally invalid metric samples."""
     if not isinstance(sample, dict):
         return False
     if not is_gateway_target(str(sample.get("target", ""))):
         return False
     if not str(sample.get("protocol", "")).strip():
         return False
-    if sample_total(sample) <= 0:
+    total = sample_total(sample)
+    if total is None or total <= 0:
         return False
-    if sample.get("rps") is None:
+    # Zero RPS / large but finite latency remain valid measured outcomes.
+    if parse_nonnegative_number(sample.get("rps")) is None:
         return False
-    try:
-        float(sample.get("rps"))
-        float(sample.get("p50_us", 0))
-        float(sample.get("p99_us", 0))
-    except (TypeError, ValueError):
-        return False
+    for key in ("p50_us", "p99_us"):
+        if parse_nonnegative_number(sample.get(key, 0)) is None:
+            return False
+    for key in ("p95_us", "p90_us"):
+        if key in sample and sample.get(key) is not None:
+            if parse_nonnegative_number(sample.get(key)) is None:
+                return False
     return True
 
 
@@ -238,16 +293,42 @@ def hard_fail(failures: list[str], message: str) -> None:
 def scenario_request_sample_usable(sample: Any) -> bool:
     if not isinstance(sample, dict):
         return False
-    if sample_total(sample) > 0:
+    total = sample_total(sample)
+    if total is not None and total > 0:
+        if "rps" in sample and sample.get("rps") is not None:
+            if parse_nonnegative_number(sample.get("rps")) is None:
+                return False
         return True
+    # Malformed request/error counts are never usable.
+    if total is None and (
+        "total_requests" in sample or "total_errors" in sample
+    ):
+        return False
     # Saturate reports connect/heartbeat rates instead of request totals.
-    if "heartbeat_success_rate" in sample or "connect_success_rate" in sample:
-        try:
-            float(sample.get("heartbeat_success_rate", sample.get("connect_success_rate")))
-        except (TypeError, ValueError):
-            return False
-        return True
-    return False
+    has_heartbeat = "heartbeat_success_rate" in sample
+    has_connect = "connect_success_rate" in sample
+    if not (has_heartbeat or has_connect):
+        return False
+    if has_heartbeat and parse_unit_rate(sample.get("heartbeat_success_rate")) is None:
+        return False
+    if has_connect and parse_unit_rate(sample.get("connect_success_rate")) is None:
+        return False
+    return True
+
+
+def resource_series_structurally_valid(series: Any, *, min_samples: int) -> str | None:
+    """Return an error fragment when a plateau series is short or non-numeric."""
+    if not isinstance(series, list):
+        return "not a list"
+    if len(series) < min_samples:
+        return f"insufficient sampling (need >= {min_samples}, got {len(series)})"
+    for index, item in enumerate(series):
+        if parse_nonnegative_number(item) is None:
+            return (
+                f"non-finite/malformed value at index {index} "
+                "(require nonnegative finite numbers)"
+            )
+    return None
 
 
 def validate_required_scenarios(
@@ -279,6 +360,12 @@ def validate_required_scenarios(
                 f"scenarios: {key} missing usable measurement sample "
                 "(zero-total/invalid harness output)",
             )
+        if "error_rate" in block and parse_unit_rate(block.get("error_rate")) is None:
+            hard_fail(
+                failures,
+                f"scenarios: {key} has non-finite/malformed error_rate "
+                "(require finite rate in [0, 1])",
+            )
 
     soak = scenarios.get("soak")
     if isinstance(soak, dict) and not scenario_request_sample_usable(soak.get("sample")):
@@ -292,12 +379,22 @@ def validate_required_scenarios(
     if isinstance(plateau, dict):
         for resource in ("rss_bytes", "fd_count", "task_count"):
             series = plateau.get(resource, [])
-            if not isinstance(series, list) or len(series) < min_resource_samples:
+            problem = resource_series_structurally_valid(
+                series, min_samples=min_resource_samples
+            )
+            if problem is None:
+                continue
+            if problem.startswith("insufficient"):
                 hard_fail(
                     failures,
                     f"scenarios: resource_plateau insufficient {resource} sampling "
                     f"(need >= {min_resource_samples}, got "
                     f"{len(series) if isinstance(series, list) else 0})",
+                )
+            else:
+                hard_fail(
+                    failures,
+                    f"scenarios: resource_plateau {resource} {problem}",
                 )
 
 
@@ -362,22 +459,46 @@ def evaluate(
             )
             continue
 
-        rps_vals = [float(s.get("rps", 0.0)) for s in samples]
-        p50_vals = [float(s.get("p50_us", 0)) for s in samples]
-        p95_vals = [
-            float(s["p95_us"]) if s.get("p95_us") is not None else float(s.get("p90_us", 0))
-            for s in samples
+        rps_vals = [
+            value
+            for value in (parse_nonnegative_number(s.get("rps", 0.0)) for s in samples)
+            if value is not None
         ]
-        p99_vals = [float(s.get("p99_us", 0)) for s in samples]
+        p50_vals = [
+            value
+            for value in (parse_nonnegative_number(s.get("p50_us", 0)) for s in samples)
+            if value is not None
+        ]
+        p95_vals = []
+        for sample in samples:
+            raw = sample.get("p95_us")
+            if raw is None:
+                raw = sample.get("p90_us", 0)
+            parsed = parse_nonnegative_number(raw)
+            if parsed is not None:
+                p95_vals.append(parsed)
+        p99_vals = [
+            value
+            for value in (parse_nonnegative_number(s.get("p99_us", 0)) for s in samples)
+            if value is not None
+        ]
         err_vals = [rate for rate in (error_rate(s) for s in samples) if rate is not None]
+
+        if not rps_vals or not p50_vals or not p99_vals:
+            hard_fail(
+                failures,
+                f"{proto}: gateway samples failed finite metric extraction "
+                "(harness data-quality failure)",
+            )
+            continue
 
         summary = {
             "samples": len(samples),
-            "rps": median(rps_vals) if rps_vals else 0.0,
+            "rps": median(rps_vals),
             "error_rate": median(err_vals) if err_vals else 0.0,
-            "p50_us": median(p50_vals) if p50_vals else 0.0,
+            "p50_us": median(p50_vals),
             "p95_us": median(p95_vals) if p95_vals else 0.0,
-            "p99_us": median(p99_vals) if p99_vals else 0.0,
+            "p99_us": median(p99_vals),
         }
         protocol_summary[proto] = summary
 
@@ -437,11 +558,11 @@ def evaluate(
                 ("task_count", "max_task_growth_ratio"),
             ):
                 series = plateau.get(resource, [])
-                if not isinstance(series, list) or len(series) < 2:
+                if resource_series_structurally_valid(series, min_samples=2) is not None:
                     continue
-                start = float(series[0])
-                end = float(series[-1])
-                if start <= 0:
+                start = parse_nonnegative_number(series[0])
+                end = parse_nonnegative_number(series[-1])
+                if start is None or end is None or start <= 0:
                     continue
                 growth = end / start
                 limit = float(global_cfg.get(growth_key, 2.5))
@@ -453,17 +574,31 @@ def evaluate(
 
         reload = scenarios.get("reload_under_load", {})
         if isinstance(reload, dict) and reload.get("sample") is not None:
-            rate = float(reload.get("error_rate", 0.0))
-            limit = float(global_cfg.get("reload_max_error_rate", 0.15))
-            if rate > limit:
-                note(f"reload_under_load: error_rate {rate:.4f} exceeds {limit:.4f}")
+            rate = parse_unit_rate(reload.get("error_rate", 0.0))
+            if rate is None:
+                hard_fail(
+                    failures,
+                    "scenarios: reload_under_load has non-finite/malformed error_rate "
+                    "(require finite rate in [0, 1])",
+                )
+            else:
+                limit = float(global_cfg.get("reload_max_error_rate", 0.15))
+                if rate > limit:
+                    note(f"reload_under_load: error_rate {rate:.4f} exceeds {limit:.4f}")
 
         churn = scenarios.get("connection_churn", {})
         if isinstance(churn, dict) and churn.get("sample") is not None:
-            rate = float(churn.get("error_rate", 0.0))
-            limit = float(global_cfg.get("max_error_rate", 0.05))
-            if rate > limit:
-                note(f"connection_churn: error_rate {rate:.4f} exceeds {limit:.4f}")
+            rate = parse_unit_rate(churn.get("error_rate", 0.0))
+            if rate is None:
+                hard_fail(
+                    failures,
+                    "scenarios: connection_churn has non-finite/malformed error_rate "
+                    "(require finite rate in [0, 1])",
+                )
+            else:
+                limit = float(global_cfg.get("max_error_rate", 0.05))
+                if rate > limit:
+                    note(f"connection_churn: error_rate {rate:.4f} exceeds {limit:.4f}")
 
     status = "failed" if failures else ("alert" if alerts else "ok")
     return {
@@ -638,6 +773,93 @@ def self_test() -> int:
     if error_rate({"total_requests": 0, "total_errors": 0}) is not None:
         failures.append("error_rate must return None for zero-total samples")
 
+    # Non-finite / malformed gateway metrics must hard-fail without raising.
+    nan_rps = json.loads(json.dumps(results))
+    nan_rps["runs"]["run_1"][0]["rps"] = float("nan")
+    try:
+        evaluation = evaluate(nan_rps, budgets, None)
+    except Exception as exc:  # pragma: no cover - defensive self-test
+        failures.append(f"NaN rps must not raise, got {type(exc).__name__}: {exc}")
+    else:
+        if evaluation["status"] != "failed":
+            failures.append("NaN rps should hard-fail")
+        if not any(
+            "invalid/zero-total" in msg or "missing expected" in msg or "data-quality" in msg
+            for msg in evaluation["failures"]
+        ):
+            failures.append("NaN rps should produce data-quality failure text")
+
+    inf_p99 = json.loads(json.dumps(results))
+    inf_p99["runs"]["run_1"][0]["p99_us"] = float("inf")
+    try:
+        evaluation = evaluate(inf_p99, budgets, None)
+    except Exception as exc:  # pragma: no cover - defensive self-test
+        failures.append(f"Infinity p99 must not raise, got {type(exc).__name__}: {exc}")
+    else:
+        if evaluation["status"] != "failed":
+            failures.append("Infinity p99 should hard-fail")
+
+    malformed_counts = json.loads(json.dumps(results))
+    malformed_counts["runs"]["run_1"][0]["total_requests"] = "not-a-number"
+    try:
+        evaluation = evaluate(malformed_counts, budgets, None)
+    except Exception as exc:  # pragma: no cover - defensive self-test
+        failures.append(
+            f"malformed total_requests must not raise, got {type(exc).__name__}: {exc}"
+        )
+    else:
+        if evaluation["status"] != "failed":
+            failures.append("malformed total_requests should hard-fail")
+        if not any(
+            "invalid/zero-total" in msg or "missing expected" in msg or "data-quality" in msg
+            for msg in evaluation["failures"]
+        ):
+            failures.append("malformed total_requests should produce data-quality failure text")
+
+    null_errors = json.loads(json.dumps(results))
+    null_errors["runs"]["run_1"][0]["total_errors"] = None
+    try:
+        evaluation = evaluate(null_errors, budgets, None)
+    except Exception as exc:  # pragma: no cover - defensive self-test
+        failures.append(f"null total_errors must not raise, got {type(exc).__name__}: {exc}")
+    else:
+        if evaluation["status"] != "failed":
+            failures.append("null total_errors should hard-fail")
+
+    if sample_total({"total_requests": "bad", "total_errors": 1}) is not None:
+        failures.append("sample_total must return None for malformed counts")
+    if parse_finite_number(float("nan")) is not None:
+        failures.append("parse_finite_number must reject NaN")
+    if parse_unit_rate(1.5) is not None:
+        failures.append("parse_unit_rate must reject rates above 1")
+
+    # Finite zero-RPS / large latency remain alert-only measured outcomes.
+    zero_rps = json.loads(json.dumps(results))
+    zero_rps["runs"]["run_1"][0]["rps"] = 0.0
+    zero_rps_budgets = json.loads(json.dumps(budgets))
+    zero_rps_budgets["protocols"]["HTTP/1.1"]["min_gateway_rps"] = 100.0
+    evaluation = evaluate(zero_rps, zero_rps_budgets, None)
+    if evaluation["status"] != "alert":
+        failures.append(
+            "finite zero-RPS should alert-only under alert enforcement, got "
+            f"{evaluation['status']}: {evaluation['failures']}"
+        )
+    if evaluation["failures"]:
+        failures.append("finite zero-RPS must not hard-fail under alert enforcement")
+
+    huge_latency = json.loads(json.dumps(results))
+    huge_latency["runs"]["run_1"][0]["p99_us"] = 50_000_000.0
+    huge_latency_budgets = json.loads(json.dumps(budgets))
+    huge_latency_budgets["protocols"]["HTTP/1.1"]["max_p99_us"] = 1_000.0
+    evaluation = evaluate(huge_latency, huge_latency_budgets, None)
+    if evaluation["status"] != "alert":
+        failures.append(
+            "finite large latency should alert-only under alert enforcement, got "
+            f"{evaluation['status']}: {evaluation['failures']}"
+        )
+    if evaluation["failures"]:
+        failures.append("finite large latency must not hard-fail under alert enforcement")
+
     # Required scenario absence / invalid sample must hard-fail.
     no_scenarios = json.loads(json.dumps(results))
     no_scenarios["scenarios"] = {}
@@ -653,6 +875,25 @@ def self_test() -> int:
     if evaluation["status"] != "failed":
         failures.append("null connection_churn sample should hard-fail")
 
+    nan_heartbeat = json.loads(json.dumps(results))
+    nan_heartbeat["scenarios"]["soak"]["sample"] = {
+        "heartbeat_success_rate": float("nan"),
+        "connect_success_rate": 0.99,
+    }
+    evaluation = evaluate(nan_heartbeat, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("NaN heartbeat_success_rate should hard-fail")
+    if not any("soak" in msg and "usable" in msg for msg in evaluation["failures"]):
+        failures.append("NaN heartbeat should report soak sample usability failure")
+
+    nan_error_rate = json.loads(json.dumps(results))
+    nan_error_rate["scenarios"]["connection_churn"]["error_rate"] = float("nan")
+    evaluation = evaluate(nan_error_rate, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("NaN scenario error_rate should hard-fail")
+    if not any("error_rate" in msg for msg in evaluation["failures"]):
+        failures.append("NaN scenario error_rate should mention malformed error_rate")
+
     thin_plateau = json.loads(json.dumps(results))
     thin_plateau["scenarios"]["resource_plateau"]["rss_bytes"] = [100]
     thin_plateau["scenarios"]["resource_plateau"]["fd_count"] = [20]
@@ -662,6 +903,17 @@ def self_test() -> int:
         failures.append("insufficient resource sampling should hard-fail")
     if not any("insufficient rss_bytes" in msg for msg in evaluation["failures"]):
         failures.append("insufficient RSS sampling should be reported")
+
+    nan_plateau = json.loads(json.dumps(results))
+    nan_plateau["scenarios"]["resource_plateau"]["rss_bytes"] = [100, float("nan"), 120]
+    evaluation = evaluate(nan_plateau, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("non-finite resource plateau values should hard-fail")
+    if not any(
+        "rss_bytes" in msg and ("non-finite" in msg or "malformed" in msg)
+        for msg in evaluation["failures"]
+    ):
+        failures.append("non-finite RSS plateau should mention malformed/non-finite values")
 
     # Complete measured regression remains alert-only under enforcement=alert.
     noisy = json.loads(json.dumps(results))
