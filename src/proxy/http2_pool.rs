@@ -162,9 +162,9 @@ impl Http2PoolManager {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -175,42 +175,53 @@ impl Http2PoolManager {
                 source: Some(BackendUnavailableSource::Dns),
             })?;
 
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let connect_started = Instant::now();
 
-        let tcp = tokio::time::timeout(
+        let (tcp, sock_addr) = crate::dns::connect_candidates(
+            &candidates,
+            port,
             connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
+            crate::socket_opts::connect_with_socket_opts,
         )
         .await
-        .map_err(|_| Http2PoolError::BackendTimeout {
-            message: format!(
-                "Connect timeout after {}ms to {}",
-                proxy.backend_connect_timeout_ms, addr
-            ),
-            source: Some(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "backend connect timed out",
-            )),
-        })?
-        .map_err(|e| {
-            if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
-                     reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                    addr,
-                    e
-                );
-            } else {
-                warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                Http2PoolError::BackendTimeout {
+                    message: format!(
+                        "Connect timeout after {}ms to {}",
+                        proxy.backend_connect_timeout_ms, last_addr
+                    ),
+                    source: Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend connect timed out",
+                    )),
+                }
             }
-            Http2PoolError::BackendUnavailable {
-                message: format!("Connection refused: {}", e),
-                source: Some(BackendUnavailableSource::Io(e)),
+            crate::dns::CandidateConnectError::Failed {
+                last_addr,
+                source: e,
+            } => {
+                if crate::retry::is_port_exhaustion(&e) {
+                    tracing::error!(
+                        "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                        last_addr,
+                        e
+                    );
+                } else {
+                    warn!(
+                        "http2_pool: all DNS candidates failed for backend {} (last={}): {}",
+                        host, last_addr, e
+                    );
+                }
+                Http2PoolError::BackendUnavailable {
+                    message: format!("Connection refused: {}", e),
+                    source: Some(BackendUnavailableSource::Io(e)),
+                }
             }
         })?;
+        let addr = sock_addr.to_string();
 
         let _ = tcp.set_nodelay(true);
 

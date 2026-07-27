@@ -767,9 +767,9 @@ impl GrpcPoolManager {
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -782,52 +782,58 @@ impl GrpcPoolManager {
                 )
             })?;
 
-        // Construct SocketAddr from the resolved IpAddr + port directly.
-        // This handles both IPv4 and IPv6 correctly without string formatting
-        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
-        // which breaks "ip:port" string parsing).
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let connect_started = Instant::now();
 
-        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
-        // before connect() so the kernel can co-select ephemeral ports.
-        let tcp = tokio::time::timeout(
+        // Connect with a deterministic rotated candidate order. The shared
+        // helper divides one overall budget across candidates and TcpSocket
+        // keeps IP_BIND_ADDRESS_NO_PORT on every attempt.
+        let (tcp, sock_addr) = crate::dns::connect_candidates(
+            &candidates,
+            port,
             connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
+            crate::socket_opts::connect_with_socket_opts,
         )
         .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: connect timeout ({}ms) to backend {}",
-                proxy.backend_connect_timeout_ms, addr
-            );
-            GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Connect,
-                message: format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ),
-            }
-        })?
-        .map_err(|e| {
-            if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                    addr,
-                    e
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                warn!(
+                    "gRPC: connect budget exhausted ({}ms) for backend {} (last={})",
+                    proxy.backend_connect_timeout_ms, host, last_addr
                 );
-            } else {
-                warn!("gRPC: failed to connect to backend {}: {}", addr, e);
+                GrpcProxyError::BackendTimeout {
+                    kind: GrpcTimeoutKind::Connect,
+                    message: format!(
+                        "Connect timeout after {}ms to {}",
+                        proxy.backend_connect_timeout_ms, last_addr
+                    ),
+                }
             }
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::Connect,
-                format!("Connection failed: {}", e),
-                e,
-            )
+            crate::dns::CandidateConnectError::Failed {
+                last_addr,
+                source: e,
+            } => {
+                if crate::retry::is_port_exhaustion(&e) {
+                    tracing::error!(
+                        "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                        last_addr,
+                        e
+                    );
+                } else {
+                    warn!(
+                        "gRPC: all DNS candidates failed for backend {} (last={}): {}",
+                        host, last_addr, e
+                    );
+                }
+                GrpcProxyError::backend_unavailable_with_source(
+                    GrpcBackendUnavailableKind::Connect,
+                    format!("Connection failed: {}", e),
+                    e,
+                )
+            }
         })?;
+        let addr = sock_addr.to_string();
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);

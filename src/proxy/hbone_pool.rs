@@ -1526,8 +1526,8 @@ pub(crate) async fn dial_h2_connect_sender(
     // inbound relay's `effective_connect_timeout_ms` (codex r5 P2).
     connect_timeout_override: Option<Duration>,
 ) -> Result<SendRequest<Bytes>, HbonePoolError> {
-    let resolved_ip = dns_cache
-        .resolve(
+    let candidates = dns_cache
+        .resolve_candidates(
             target_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
@@ -1537,27 +1537,34 @@ pub(crate) async fn dial_h2_connect_sender(
             host: target_host.to_string(),
             message: e.to_string(),
         })?;
-    let sock_addr = std::net::SocketAddr::new(resolved_ip, dial_port);
-    let addr = sock_addr.to_string();
     let effective_connect_timeout_ms = connect_timeout_override
         .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(proxy.backend_connect_timeout_ms);
     let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
     let connect_started = Instant::now();
 
-    let tcp = tokio::time::timeout(
+    let (tcp, sock_addr) = crate::dns::connect_candidates(
+        &candidates,
+        dial_port,
         connect_timeout,
-        crate::socket_opts::connect_with_socket_opts(sock_addr),
+        crate::socket_opts::connect_with_socket_opts,
     )
     .await
-    .map_err(|_| HbonePoolError::ConnectTimeout {
-        addr: addr.clone(),
-        timeout_ms: effective_connect_timeout_ms,
-    })?
-    .map_err(|source| HbonePoolError::Connect {
-        addr: addr.clone(),
-        source,
+    .map_err(|error| match error {
+        crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+            HbonePoolError::ConnectTimeout {
+                addr: last_addr.to_string(),
+                timeout_ms: effective_connect_timeout_ms,
+            }
+        }
+        crate::dns::CandidateConnectError::Failed { last_addr, source } => {
+            HbonePoolError::Connect {
+                addr: last_addr.to_string(),
+                source,
+            }
+        }
     })?;
+    let addr = sock_addr.to_string();
     let _ = tcp.set_nodelay(true);
     crate::socket_opts::apply_pooled_tcp_keepalive(
         "hbone_pool",

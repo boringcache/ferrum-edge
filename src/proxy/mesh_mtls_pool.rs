@@ -1292,9 +1292,9 @@ impl MeshMtlsConnectionPool {
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
         crls: crate::tls::CrlList,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 target_host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -1304,24 +1304,31 @@ impl MeshMtlsConnectionPool {
                 host: target_host.to_string(),
                 message: e.to_string(),
             })?;
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, mtls_port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let connect_started = Instant::now();
 
-        let tcp = tokio::time::timeout(
+        let (tcp, sock_addr) = crate::dns::connect_candidates(
+            &candidates,
+            mtls_port,
             connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
+            crate::socket_opts::connect_with_socket_opts,
         )
         .await
-        .map_err(|_| HbonePoolError::ConnectTimeout {
-            addr: addr.clone(),
-            timeout_ms: proxy.backend_connect_timeout_ms,
-        })?
-        .map_err(|source| HbonePoolError::Connect {
-            addr: addr.clone(),
-            source,
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                HbonePoolError::ConnectTimeout {
+                    addr: last_addr.to_string(),
+                    timeout_ms: proxy.backend_connect_timeout_ms,
+                }
+            }
+            crate::dns::CandidateConnectError::Failed { last_addr, source } => {
+                HbonePoolError::Connect {
+                    addr: last_addr.to_string(),
+                    source,
+                }
+            }
         })?;
+        let addr = sock_addr.to_string();
         let _ = tcp.set_nodelay(true);
         // Honor the DR `connectionPool.tcp.tcpKeepalive` per-port override
         // resolved by the caller for the app port (NOT this transport

@@ -285,6 +285,18 @@ The separation of TCP and UDP trust stores allows independent certificate rotati
 
 ## Load Balancing
 
+### Multi-address DNS backends
+
+For a hostname target, TCP, TCP+TLS, UDP, DTLS, passthrough, and mesh stream
+connectors consume the shared DNS cache's complete rotated answer set. They try
+alternate IPv4 or IPv6 candidates deterministically within the proxy's single
+overall connect budget; a stalled candidate receives only its share of the
+remaining budget. Denied addresses are filtered independently and the dial
+fails closed if no approved address remains. TLS and DTLS continue to use
+`backend_host` (or the configured TLS name override) for SNI and certificate
+verification—the selected IP is only the socket peer. See
+[DNS address selection and failover](dns_resolver.md#address-selection-and-failover).
+
 Stream proxies support load balancing via upstreams, the same as HTTP proxies:
 
 ```yaml

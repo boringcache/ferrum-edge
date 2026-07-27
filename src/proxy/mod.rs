@@ -6238,9 +6238,9 @@ impl ProxyState {
             targets.retain(|target| {
                 // Screen BOTH the probe's backend host literal AND a literal
                 // `dns_override`: the H3/H2/reqwest capability probes dial via
-                // `resolve_backend_addr_cached`, whose IP-literal fast path skips
-                // the `DnsCacheResolver`, so a denied literal in EITHER field would
-                // be dialed at startup/reload (e.g. a QUIC probe to 169.254.169.254)
+                // the native-H3 pool's cached resolver, so a denied literal in
+                // EITHER field would be dialed at startup/reload (e.g. a QUIC
+                // probe to 169.254.169.254)
                 // even when a DB-sourced row only warned at load. Mirrors the
                 // request-path `denied_literal_backend_or_dns_override` guard;
                 // dropping the target leaves it `Unknown`, which routes via reqwest
@@ -11184,46 +11184,77 @@ pub(crate) async fn connect_websocket_backend(
             80
         }
     });
-    let connect_future = async {
-        // Resolve through the gateway DNS cache when available so the egress
-        // policy is enforced on the resolved address (a hostname that resolves —
-        // or rebinds — to a denied IP such as 169.254.169.254 fails here) and we
-        // dial that exact IP. The TLS connector still derives SNI from
-        // `ws_request` (the hostname), so dialing the IP is transparent.
-        let tcp = match dns_cache {
-            Some(cache) => {
-                let resolved_ip = cache
-                    .resolve(
-                        &dial_host,
-                        proxy.dns_override.as_deref(),
-                        proxy.dns_cache_ttl_seconds,
-                    )
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
-                    })?;
-                tokio::net::TcpStream::connect((resolved_ip, dial_port)).await?
+    let connect_result = if let Some(cache) = dns_cache {
+        let candidates = cache
+            .resolve_candidates(
+                &dial_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
+            })?;
+        crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |addr| {
+            let request = ws_request.clone();
+            let connector = connector.clone();
+            let ws_config = ws_config.clone();
+            let idle_tracker = idle_tracker.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await?;
+                // Keep the hostname-bearing request intact: tungstenite derives
+                // Host and TLS SNI/certificate verification from it, never from
+                // the concrete address selected for this attempt.
+                set_tcp_keepalive(&tcp);
+                client_async_tls_with_config(
+                    request,
+                    WsActivityIo::new(tcp, idle_tracker),
+                    Some(ws_config),
+                    connector,
+                )
+                .await
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
             }
-            None => tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?,
-        };
-        // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
-        // (~40 ms/msg); keepalive bounds dead-peer detection on idle
-        // long-lived sessions.
-        set_tcp_keepalive(&tcp);
-        client_async_tls_with_config(
-            ws_request,
-            WsActivityIo::new(tcp, idle_tracker),
-            Some(ws_config),
-            connector,
-        )
+        })
         .await
-        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+        .map(|(handshake, _)| handshake)
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+            match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => format!(
+                    "WebSocket backend connect timeout ({}ms) for proxy {}",
+                    proxy.backend_connect_timeout_ms, proxy.id
+                )
+                .into(),
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            }
+        })
+    } else {
+        tokio::time::timeout(connect_timeout, async {
+            let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+            set_tcp_keepalive(&tcp);
+            client_async_tls_with_config(
+                ws_request,
+                WsActivityIo::new(tcp, idle_tracker),
+                Some(ws_config),
+                connector,
+            )
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+        })
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!(
+                "WebSocket backend connect timeout ({}ms) for proxy {}",
+                proxy.backend_connect_timeout_ms, proxy.id
+            )
+            .into()
+        })?
     };
 
-    let (backend_ws_stream, backend_response) =
-        match tokio::time::timeout(connect_timeout, connect_future).await {
-            Ok(result) => result?,
-            Err(_) => {
+    let (backend_ws_stream, backend_response) = match connect_result {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            if error.to_string().contains("connect timeout") {
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
@@ -11231,13 +11262,10 @@ pub(crate) async fn connect_websocket_backend(
                     error_kind = "connect_timeout",
                     "WebSocket backend connect timeout"
                 );
-                return Err(format!(
-                    "WebSocket backend connect timeout ({}ms) for proxy {}",
-                    proxy.backend_connect_timeout_ms, proxy.id
-                )
-                .into());
             }
-        };
+            return Err(error);
+        }
+    };
 
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
@@ -27598,7 +27626,7 @@ pub(crate) fn denied_literal_backend_or_dns_override(
 /// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
 /// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
 /// parser; they resolve it themselves through `DnsCache::resolve` /
-/// `resolve_backend_addr_cached`, whose literal fast path is `IpAddr::parse`
+/// the cached direct resolver, whose literal fast path is `IpAddr::parse`
 /// (canonical only) and which otherwise performs real DNS and policy-screens the
 /// *resolved* address. So a non-canonical numeric spelling like `2852039166` or
 /// `111` is a DNS NAME on those paths (resolved, then screened), NOT the
@@ -32947,7 +32975,7 @@ async fn proxy_to_backend_http3(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
     // Enforce the backend egress policy for a literal-IP backend before dialing.
-    // The native H3 pool self-resolves via `resolve_backend_addr_cached` — whose
+    // The native H3 pool self-resolves via the shared DNS cache — whose
     // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
     // to real DNS and are screened on the resolved address) — never reqwest's URL
     // parser, so use the canonical screen. The URL-canonicalizing one would
@@ -34031,7 +34059,7 @@ async fn proxy_to_backend_http3_retry(
         .unwrap_or(proxy.backend_port);
 
     // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
-    // self-resolves via `resolve_backend_addr_cached` (canonical `IpAddr` fast
+    // self-resolves via the shared DNS cache (canonical `IpAddr` fast
     // path; non-canonical → real DNS + resolved-address screen), so use the
     // canonical screen, mirroring the first-attempt H3 screen — the
     // URL-canonicalizing one would wrongly reject a legitimate all-numeric
