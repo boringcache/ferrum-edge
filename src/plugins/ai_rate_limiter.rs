@@ -17,7 +17,6 @@ use super::utils::rate_limit::{
     validate_window_seconds,
 };
 use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
-use crate::util::unknown_keys::reject_unknown_keys;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
@@ -29,6 +28,7 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::proxy::{
     AI_REQUEST_METADATA_KEY, BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
