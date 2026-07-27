@@ -1016,11 +1016,7 @@ async fn handle_h3_connection(
                     biased;
                     accepted = h3_conn.accept() => (Some(accepted), None),
                     completed = completion_rx => {
-                        let succeeded = match completed {
-                            Ok(succeeded) => succeeded,
-                            Err(_closed) => false,
-                        };
-                        (None, Some(succeeded))
+                        (None, Some(completed.unwrap_or_default()))
                     }
                 }
             } else {
