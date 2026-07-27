@@ -20480,7 +20480,7 @@ components:
         semantic_embedding_endpoint:
           type: string
           format: uri
-          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
+          description: Embedding endpoint URL. Required when semantic_similarity_enabled is true. Must not include URL userinfo; use semantic_embedding_api_key for credentials. Query parameters and path tokens required by signed or credential-bearing endpoints are preserved on the outbound request but stripped from logs and error diagnostics (canonical redacted form uses scheme/host/port plus /...). OpenAI-compatible endpoints use input/model JSON; other providers send native embedding JSON.
         semantic_embedding_model:
           type: string
           description: Model name sent in the embedding request body. Omit for local endpoints that do not require a model field.
