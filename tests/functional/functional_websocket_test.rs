@@ -256,7 +256,9 @@ async fn next_ws_message_within(
     ws: &mut (impl StreamExt<Item = Result<Message, WsError>> + Unpin),
     duration: Duration,
 ) -> Option<Result<Message, WsError>> {
-    tokio::time::timeout(duration, ws.next()).await.unwrap_or_default()
+    tokio::time::timeout(duration, ws.next())
+        .await
+        .unwrap_or_default()
 }
 
 /// Start a WebSocket probe backend that can report whether an oversized
