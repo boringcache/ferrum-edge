@@ -13,8 +13,11 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
-    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, validate_window_seconds,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
+use crate::util::unknown_keys::reject_unknown_keys;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
@@ -141,6 +144,45 @@ const EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
     ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
 ];
 
+/// `ai_rate_limiter`-specific top-level config keys (excludes shared Redis fields).
+const AI_RATE_LIMITER_POLICY_CONFIG_KEYS: &[&str] = &[
+    "token_limit",
+    "window_seconds",
+    "count_mode",
+    "limit_by",
+    "expose_headers",
+    "provider",
+    "on_unmetered_response",
+];
+
+/// Closed top-level key set for `ai_rate_limiter` plugin config.
+///
+/// Must stay aligned with OpenAPI `AiRateLimiterConfig` (which must declare
+/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `docs/plugins.md`. Unknown root keys fail closed: a valid `token_limit` can
+/// mask a misspelled `sync_mdoe`, `on_unmetered_responce`, or `limit_byy`, so
+/// construction would succeed while distributed enforcement, identity scope,
+/// unmetered posture, or provider extraction silently fell back to defaults.
+pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
+    "token_limit",
+    "window_seconds",
+    "count_mode",
+    "limit_by",
+    "expose_headers",
+    "provider",
+    "on_unmetered_response",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -177,9 +219,20 @@ impl AiRateLimiter {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ai_rate_limiter: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ai_rate_limiter: config must be an object".to_string())?;
+        debug_assert_closed_root_keys(
+            AI_RATE_LIMITER_CONFIG_KEYS,
+            AI_RATE_LIMITER_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            AI_RATE_LIMITER_CONFIG_KEYS,
+            "ai_rate_limiter: ",
+        )?;
 
         let token_limit = required_u64(config, "token_limit")?;
         if token_limit == 0 {
