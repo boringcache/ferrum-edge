@@ -776,7 +776,12 @@ struct StreamCaptureWork {
 enum StreamCaptureLifecycle {
     Active(StreamCaptureWork),
     Complete(Option<StreamCaptured>),
-    Revoked { hashed_bytes: u64 },
+    /// `hashed_bytes` is retained for external lifecycle probes after expiry
+    /// revokes capture; production emission paths only match on the variant.
+    Revoked {
+        #[allow(dead_code)] // read by AuditStreamCaptureProbe in external tests
+        hashed_bytes: u64,
+    },
     Claimed,
 }
 
@@ -953,6 +958,7 @@ impl StreamSlot {
         lease.take()
     }
 
+    #[allow(dead_code)] // used only by external tests; dead in binary target
     fn capture_snapshot(&self) -> AuditStreamCaptureSnapshot {
         let capture = self.lock_capture();
         match &*capture {
@@ -994,12 +1000,14 @@ impl StreamSlot {
 /// Read-only test probe for one inspector-owned capture lifecycle. It holds a
 /// weak reference so tests cannot extend the production state lifetime.
 #[doc(hidden)]
+#[allow(dead_code)] // constructed only by external tests; dead in binary target
 pub struct AuditStreamCaptureProbe {
     slot: Weak<StreamSlot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
+#[allow(dead_code)] // constructed only by external tests; dead in binary target
 pub struct AuditStreamCaptureSnapshot {
     pub retained_capture_bytes: u64,
     pub hashed_bytes: u64,
@@ -1009,6 +1017,7 @@ pub struct AuditStreamCaptureSnapshot {
 
 impl AuditStreamCaptureProbe {
     #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn snapshot(&self) -> Option<AuditStreamCaptureSnapshot> {
         self.slot.upgrade().map(|slot| slot.capture_snapshot())
     }
@@ -1811,6 +1820,7 @@ impl AiTranscriptAudit {
     /// Obtain a weak, read-only probe for focused external lifecycle tests.
     /// Production code never calls this and the probe cannot retain the slot.
     #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary target
     pub fn stream_capture_probe(&self, ctx: &RequestContext) -> Option<AuditStreamCaptureProbe> {
         let record_id = ctx.metadata.get(MD_RECORD_ID)?;
         self.pending_streams
@@ -1874,7 +1884,16 @@ impl AiTranscriptAudit {
             return SinkOutcome::Dropped;
         }
         let (permit, staged_lease) = match staging {
-            Some(staging) => (staging.commit_permit.take(), staging.commit_lease.take()),
+            Some(staging) => {
+                // Record fields are already copied out of staging. Release the
+                // staging byte lease before taking a fail-open delivery
+                // reservation so peak charge is not staging + provisional.
+                if staging.commit_lease.is_none() {
+                    staging.retained_lease.shrink_to(0);
+                    staging.retained_bytes = 0;
+                }
+                (staging.commit_permit.take(), staging.commit_lease.take())
+            }
             None => (None, None),
         };
         let provisional = self.limits.max_entry_retained_bytes();
@@ -2013,6 +2032,26 @@ impl AiTranscriptAudit {
             return reject_audit_unavailable();
         }
         PluginResult::Continue
+    }
+
+    /// Whether request-phase hooks must leave fail-closed commit admission to a
+    /// later response-side gate.
+    ///
+    /// Ordinary buffered JSON responses reserve in `on_final_response_body`
+    /// before the response becomes immutable. Active streaming capture reserves
+    /// at response-header / inspector selection. Request-only configs, and
+    /// conservative maybe-streaming markers when streaming capture is off, still
+    /// admit on the request path because no later buffered/stream gate will.
+    fn defer_commit_admission_to_response(&self, ctx: &RequestContext) -> bool {
+        let response_side_hooks =
+            self.capture.response || self.capture.streaming != StreamingCapture::Off;
+        if flag(&ctx.metadata, MD_STREAM_REQUEST)
+            && self.capture.streaming != StreamingCapture::Off
+            && response_side_hooks
+        {
+            return true;
+        }
+        self.capture.response && !flag(&ctx.metadata, MD_STREAM_REQUEST)
     }
 
     fn stream_commit_selected(
@@ -3088,10 +3127,7 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST)
-            && self.capture.streaming != StreamingCapture::Off
-            && self.requires_response_committed_hook()
-        {
+        if self.defer_commit_admission_to_response(ctx) {
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
@@ -3138,10 +3174,7 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if flag(&ctx.metadata, MD_STREAM_REQUEST)
-            && self.capture.streaming != StreamingCapture::Off
-            && self.requires_response_committed_hook()
-        {
+        if self.defer_commit_admission_to_response(ctx) {
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)

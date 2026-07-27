@@ -8097,8 +8097,14 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
         after_refresh.buffer_max_bytes
     );
 
-    // Drop fillers so the small, correctly-leased record can enqueue and flush.
-    drop(fillers);
+    // Drop fillers by discarding their staging entries so the small,
+    // correctly-leased record can enqueue and flush. RequestContext drop alone
+    // does not release plugin-owned staging leases.
+    for mut filler in fillers {
+        plugin
+            .on_final_request_body_with_context(&mut filler, &json_headers(), b"{}")
+            .await;
+    }
     plugin
         .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
         .await;
