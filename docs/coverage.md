@@ -187,9 +187,15 @@ legacy functional filters, can still select tests that under-report
 child-process coverage until their local `kill()` cleanup paths are migrated to
 the shared coverage-aware shutdown helper.
 
-## Lowest-Covered Modules
+## Lowest-Covered Modules (historical snapshot)
 
-Measured from the local baseline run. Percentages are line coverage.
+> **Historical.** The table and percentages below are a dated local baseline
+> snapshot retained for archaeology. They are **not** a current coverage claim
+> and must not drive "next priority" planning without regenerating from a fresh
+> `scripts/coverage.sh` / CI coverage artifact. Prefer timeless guidance: raise
+> coverage where new code lands; do not treat this table as the live gap list.
+
+Measured from a prior local baseline run. Percentages are line coverage.
 
 | Module | Coverage | Assessment |
 | --- | ---: | --- |
@@ -204,18 +210,22 @@ Measured from the local baseline run. Percentages are line coverage.
 | `src/tls_offload.rs` | 75.71% | Targeted-test candidate for policy and offload edge cases. |
 | `src/grpc/` | 77.34% | Protocol integration candidate; CP/DP and mesh gRPC failure paths are the likely remaining gaps. |
 
-## Next Test Priorities
+## Next Test Priorities (historical planning notes)
+
+> **Historical.** The H3-fixture / health-check / identity / CLI / UDP items
+> below were written against the snapshot table above. Substantial H3 fixtures,
+> health-check, identity, CLI, and UDP coverage have landed since; do not treat
+> this list as the current backlog. Regenerate priorities from the latest
+> coverage artifact when prioritizing new tests.
 
 1. `src/http3/`: add a small H3 fixture layer for handshake, request body,
-   WebSocket, and cross-protocol fallback error cases. This is the largest
-   measured gap in core protocol code.
+   WebSocket, and cross-protocol fallback error cases. This was the largest
+   measured gap in core protocol code at snapshot time.
 2. `src/health_check.rs`: cover passive-state transitions and active-probe
-   formatting/error branches with mocked HTTP/gRPC backends. This gives good
-   risk reduction without touching the proxy hot path.
+   formatting/error branches with mocked HTTP/gRPC backends.
 3. `src/identity/`: add fake-CA and fake-Workload-API tests for SVID rotation,
    failed issuance, revision bumps, and trust-bundle refresh behavior.
 4. `src/cli.rs` and `src/bin/ferrum-cni.rs`: add parser/error-path tests for
-   command surfaces. These are quick wins and should not need external services.
+   command surfaces.
 5. `src/proxy/udp_proxy.rs` and `src/proxy/udp_batch.rs`: add narrow UDP
-   fixture tests for batching, disconnect, and timeout/error accounting before
-   expanding broader proxy coverage.
+   fixture tests for batching, disconnect, and timeout/error accounting.
