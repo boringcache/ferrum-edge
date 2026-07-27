@@ -7622,6 +7622,9 @@ impl ProxyState {
     ///
     /// - *Reject* — accumulate into the returned error vector and abort
     ///   the reload:
+    ///   - `validate_resource_ids` — delimiter-bearing or otherwise malformed
+    ///     resource IDs/namespaces would make namespace-qualified runtime cache
+    ///     keys ambiguous.
     ///   - `validate_regex_listen_paths` — uncompilable regex would
     ///     silently skip routes at runtime.
     ///   - `validate_unique_listen_paths` — overlapping listen paths
@@ -7682,6 +7685,9 @@ impl ProxyState {
         // error vector so callers can log every reason at once instead of
         // discovering them iteratively across reloads.
         let mut errors: Vec<String> = Vec::new();
+        if let Err(errs) = config.validate_resource_ids() {
+            errors.extend(errs);
+        }
         if let Err(errs) = config.validate_regex_listen_paths() {
             errors.extend(errs);
         }
@@ -43506,6 +43512,22 @@ mod tests {
         assert_eq!(
             svid.trust_bundles.local.x509_authorities,
             vec![vec![7, 8, 9]]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_malformed_runtime_identity() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.namespace = "tenant|prod".to_string();
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("delimiter-bearing namespace must be rejected before cache encoding");
+        assert!(
+            err.iter().any(|error| error.contains("namespace")),
+            "error must identify the malformed namespace; got {err:?}"
         );
     }
 
