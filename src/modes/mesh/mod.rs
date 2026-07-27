@@ -16624,7 +16624,8 @@ mod tests {
             config
                 .plugin_configs
                 .iter()
-                .any(|plugin| plugin.namespace == "tenant-b" && plugin.id == "tenant-b-shared-plugin"),
+                .any(|plugin| plugin.namespace == "tenant-b"
+                    && plugin.id == "tenant-b-shared-plugin"),
             "same-id proxy plugin in another namespace must survive UDP fail-closed pruning"
         );
         assert!(
