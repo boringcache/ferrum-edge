@@ -645,8 +645,7 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
 
 #[tokio::test]
 async fn test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn() {
-    let (healthy_listener, non_h2_listener, non_h2_ip, port) =
-        bind_dual_loopback_listeners().await;
+    let (healthy_listener, non_h2_listener, non_h2_ip, port) = bind_dual_loopback_listeners().await;
     let non_h2_attempts = Arc::new(AtomicUsize::new(0));
     let _non_h2_task = start_tls_backend_on_counted(
         non_h2_listener,
@@ -665,11 +664,8 @@ async fn test_grpc_tls_pool_fails_over_when_first_peer_omits_h2_alpn() {
     )
     .await
     .expect("start healthy gRPC TLS backend");
-    let dns = TestDnsServer::spawn(vec![
-        IpAddr::V4(non_h2_ip),
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-    ])
-    .await;
+    let dns =
+        TestDnsServer::spawn(vec![IpAddr::V4(non_h2_ip), IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
     let pool = GrpcConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),
