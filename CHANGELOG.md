@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   servers that advertise endpoints on another host or port, and pre-0.4
   `instant-acme` credentials with embedded `urls`, must be migrated to the
   configured directory origin (#2407).
+- `ai_semantic_cache` no longer discards Redis quarantine-`DEL` failures for
+  malformed, oversized, empty, or otherwise inadmissible entries. Failed deletes
+  are counted with rate-limited warnings that omit keys, payloads, credentials,
+  and endpoints, and a bounded per-instance local suppressor (content fingerprint
+  + 30s TTL, hard-capped, constant-work capacity eviction) prevents immediate
+  re-download/parse/delete amplification of the same poisoned remote value while
+  still reconsidering repaired replacements within that bound. Quarantine
+  fingerprints are computed only after a Redis value fails admission, so valid
+  hits are not hashed for poison markers. Invalid entries remain unserved;
+  deletion failure cannot convert a miss into a hit (issue #3213).
 - `response_caching` now applies RFC 9111 §3.5 shared-cache admission to the
   live request credential rather than only to a gateway-minted identity, so a
   gateway that forwards `Authorization` to a backend that validates it no longer

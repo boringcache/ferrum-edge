@@ -20,6 +20,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
@@ -40,6 +41,17 @@ const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 /// Wrap the test secret in `GrpcJwtSecret` for type-safe calls.
 fn test_secret() -> GrpcJwtSecret {
     GrpcJwtSecret::new(TEST_JWT_SECRET.to_string())
+}
+
+fn generate_local_mesh_jwt(node_id: &str) -> String {
+    dp_client::generate_dp_jwt_full(
+        TEST_JWT_SECRET,
+        node_id,
+        TEST_DEFAULT_ISSUER,
+        None,
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
+    )
+    .expect("local mesh JWT should mint")
 }
 
 /// Create a test Proxy entry.
@@ -854,7 +866,7 @@ async fn test_dp_clears_gateway_trust_bundles_from_explicit_side_channel_null() 
 async fn test_mesh_subscribe_receives_initial_mesh_slice() {
     let cp_config = create_test_mesh_config();
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
-    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let token = generate_local_mesh_jwt("mesh-node");
     let auth_header = format!("Bearer {token}");
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
@@ -882,6 +894,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -942,7 +955,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
     }));
 
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
-    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let token = generate_local_mesh_jwt("mesh-node");
     let auth_header = format!("Bearer {token}");
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
@@ -970,6 +983,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         labels: HashMap::new(),
         waypoint_name: "api-waypoint".to_string(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1628,10 +1642,12 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
     let cp_config = create_test_mesh_config();
     let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
-    let token = dp_client::generate_dp_jwt_with_issuer(
+    let token = dp_client::generate_dp_jwt_full(
         TEST_JWT_SECRET,
         "mesh-iss-bad",
         "some-other-service",
+        None,
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )
     .unwrap();
     let mut client = connect_mesh_client_with_token!(addr, token);
@@ -1644,6 +1660,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -3993,7 +4010,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
     let (addr, _update_tx, server_handle) =
         start_test_cp_server_with_namespace(cp_config, "production").await;
 
-    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
+    let generated_token = generate_local_mesh_jwt("test-mesh-dp");
     let mut client = connect_mesh_client_with_token!(addr, generated_token);
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
@@ -4004,6 +4021,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
