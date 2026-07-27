@@ -11361,10 +11361,11 @@ components:
         the operator's synchronously replicated multi-primary assertion; this
         opt-in divergence-risk contract records each admitted failover-window
         mutation conservatively and process-locally fences automatic primary
-        failback until reconciliation or restart. The fence is not
-        coordinated across gateway replicas. Managed TLS/ACME stores are
-        independent and are not gated by this topology. This object does not
-        claim per-request mutation success.
+        failback until the process is restarted after operator reconciliation
+        or confirmed replication catch-up. The fence is not coordinated across
+        gateway replicas. Managed TLS/ACME stores are independent and are not
+        gated by this topology. This object does not claim per-request mutation
+        success.
       required: [primary_active, allow_writes, opt_in_writes_enabled_during_window, primary_failback_fenced]
       properties:
         primary_active:

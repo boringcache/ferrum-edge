@@ -106,8 +106,9 @@ impl DbWriteTopologyPermit {
 /// issue #3001. Contract: default fail-closed admin writes on failover;
 /// `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` is only for operator-asserted
 /// synchronously replicated multi-primary topologies. An admitted mutation
-/// fences automatic primary failback until reconciliation or restart. This
-/// state is not durable across process restart.
+/// fences automatic primary failback until the process is restarted after
+/// operator reconciliation or confirmed replication catch-up. This state is
+/// not durable across process restart.
 #[derive(Clone)]
 pub struct DbFailoverTopologyState {
     primary_active: Arc<AtomicBool>,
@@ -190,7 +191,7 @@ impl DbFailoverTopologyState {
             warn!(
                 active_url_redacted = %redacted,
                 failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
-                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; an admitted Admin mutation will fence automatic primary failback until reconciliation or restart. Use only with operator-asserted synchronously replicated multi-primary replication"
+                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; an admitted Admin mutation will fence automatic primary failback until this process is restarted after operator reconciliation or confirmed replication catch-up. Use only with operator-asserted synchronously replicated multi-primary replication"
             );
         }
     }
@@ -266,7 +267,7 @@ impl DbFailoverTopologyState {
             warn!(
                 active_url_redacted = %redacted,
                 failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
-                "Admin mutation admitted on failover topology; automatic primary failback is now fenced in this process until reconciliation or restart"
+                "Admin mutation admitted on failover topology; automatic primary failback is now fenced until this process is restarted after operator reconciliation or confirmed replication catch-up"
             );
         }
     }
@@ -289,7 +290,7 @@ pub struct PrimaryFailbackFenced;
 impl std::fmt::Display for PrimaryFailbackFenced {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
-            "Refusing primary database failback because an Admin write was admitted on the active failover topology; reconcile the failover changes onto the primary or restart after replication catch-up",
+            "Refusing primary database failback because an Admin write was admitted on the active failover topology; reconcile the failover changes onto the primary or confirm replication catch-up, then restart this process",
         )
     }
 }

@@ -6082,7 +6082,7 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
         "topology schema must document opt-in divergence-risk contract"
     );
     assert!(
-        topology_desc.contains("fences") && topology_desc.contains("reconciliation or restart"),
+        topology_desc.contains("fences") && topology_desc.contains("restarted after operator"),
         "topology schema must document the process-local failback fence"
     );
 }
