@@ -246,76 +246,19 @@ impl Http2PoolManager {
 
                 let io = TokioIo::new(tls_stream);
                 let builder = Self::build_h2_builder(pool_config);
-                let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
+                let (sender, conn) = builder.handshake(io).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("h2 handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Hyper(e)),
                     }
                 })?;
 
-                // hyper/h2 `handshake()` resolves after the client preface is
-                // written; peer SETTINGS still arrive on the connection driver.
-                // Wait for readiness before treating this DNS candidate as
-                // established so a TLS-successful non-H2 peer cannot suppress
-                // failover to a later address.
-                std::future::poll_fn(|cx| {
-                    if conn.current_max_send_streams() > 0 {
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
-                        std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
-                            "h2 connection closed before peer SETTINGS".to_string(),
-                        )),
-                        std::task::Poll::Ready(Err(e)) => {
-                            std::task::Poll::Ready(Err(format!("h2 handshake failed: {e}")))
-                        }
-                        // SETTINGS can be applied during this poll; re-check
-                        // before parking or a wake may never arrive.
-                        std::task::Poll::Pending if conn.current_max_send_streams() > 0 => {
-                            std::task::Poll::Ready(Ok(()))
-                        }
-                        std::task::Poll::Pending => std::task::Poll::Pending,
-                    }
-                })
-                .await
-                .map_err(|message| Http2PoolError::BackendUnavailable {
-                    message: message.clone(),
-                    source: Some(BackendUnavailableSource::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        message,
-                    ))),
-                })?;
-
-                // Spawn only after the complete candidate establishment
-                // succeeds. Failed or timed-out attempts therefore cannot
-                // leave detached connection-driver tasks behind.
-                let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
+                // ALPN has already proved H2 for this TLS candidate.
                 tokio::spawn(async move {
-                    let mut driver_polled_tx = Some(driver_polled_tx);
-                    let result = std::future::poll_fn(|cx| {
-                        let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
-                        if let Some(tx) = driver_polled_tx.take() {
-                            let _ = tx.send(poll.is_pending());
-                        }
-                        poll
-                    })
-                    .await;
-                    if let Err(e) = result {
+                    if let Err(e) = conn.await {
                         debug!("http2_pool: TLS connection closed: {}", e);
                     }
                 });
-                // Do not release the sender until the spawned driver has
-                // replaced the creator task's SETTINGS-poll waker.
-                if !matches!(driver_polled_rx.await, Ok(true)) {
-                    let message = "h2 connection closed during driver handoff".to_string();
-                    return Err(Http2PoolError::BackendUnavailable {
-                        message: message.clone(),
-                        source: Some(BackendUnavailableSource::Io(std::io::Error::new(
-                            std::io::ErrorKind::ConnectionAborted,
-                            message,
-                        ))),
-                    });
-                }
                 Ok(Http2CandidateOutcome::Established(sender))
             }
         })
@@ -381,12 +324,11 @@ impl Http2PoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push).
+            // Cap server-initiated streams (push) and preserve the operator's
+            // initial outbound concurrency bound until peer SETTINGS arrive.
             builder.max_concurrent_streams(max_streams);
+            builder.initial_max_send_streams(max_streams as usize);
         }
-        // Zero is a pre-SETTINGS sentinel only. The peer's initial SETTINGS
-        // replaces it, including the RFC default when the parameter is absent.
-        builder.initial_max_send_streams(0);
 
         builder
     }

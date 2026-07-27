@@ -925,12 +925,11 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push).
+            // Preserve the configured initial outbound bound until the peer's
+            // SETTINGS frame replaces it.
             builder.max_concurrent_streams(max_streams);
+            builder.initial_max_send_streams(max_streams as usize);
         }
-        // Zero is a pre-SETTINGS sentinel only. The peer's initial SETTINGS
-        // replaces it, including the RFC default when the parameter is absent.
-        builder.initial_max_send_streams(0);
 
         builder
     }
@@ -944,7 +943,7 @@ impl GrpcPoolManager {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 format!("h2c handshake failed: {}", e),
@@ -952,60 +951,30 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // hyper/h2 `handshake()` resolves after the client preface is written;
-        // peer SETTINGS still arrive on the connection driver. Wait for
-        // readiness before treating this DNS candidate as established so a
-        // TCP-successful non-H2 peer cannot pin the pool and suppress failover.
-        std::future::poll_fn(|cx| {
-            if conn.current_max_send_streams() > 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
-                std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
-                    "h2c connection closed before peer SETTINGS".to_string(),
-                )),
-                std::task::Poll::Ready(Err(e)) => {
-                    std::task::Poll::Ready(Err(format!("h2c handshake failed: {e}")))
-                }
-                // SETTINGS can be applied during this poll; re-check before
-                // parking or a wake may never arrive.
-                std::task::Poll::Pending if conn.current_max_send_streams() > 0 => {
-                    std::task::Poll::Ready(Ok(()))
-                }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        })
-        .await
-        .map_err(|message| {
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::H2cHandshake,
-                message.clone(),
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )
-        })?;
-
-        // Spawn only after the peer completed the H2 preface exchange.
-        let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
+        // Unlike TLS-backed H2, h2c has no ALPN proof. Give the spawned driver
+        // one short observation window to surface an immediate protocol error
+        // (for example an HTTP/1.1 response to the prior-knowledge preface)
+        // before this DNS candidate is accepted.
+        let (driver_closed_tx, mut driver_closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut driver_polled_tx = Some(driver_polled_tx);
-            let result = std::future::poll_fn(|cx| {
-                let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
-                if let Some(tx) = driver_polled_tx.take() {
-                    let _ = tx.send(poll.is_pending());
-                }
-                poll
-            })
-            .await;
-            if let Err(e) = result {
+            let result = conn.await.map_err(|error| error.to_string());
+            if let Err(ref e) = result {
                 debug!("gRPC h2c connection closed: {}", e);
             }
+            let _ = driver_closed_tx.send(result);
         });
-        if !matches!(driver_polled_rx.await, Ok(true)) {
-            let message = "gRPC h2c connection closed during driver handoff".to_string();
+        if let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(25), &mut driver_closed_rx).await
+        {
+            let message = match result {
+                Ok(Err(message)) => format!("h2c handshake failed: {message}"),
+                Ok(Ok(())) => "h2c connection closed during handshake".to_string(),
+                Err(_) => "h2c connection driver ended during handshake".to_string(),
+            };
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
-                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
             ));
         }
 
@@ -1030,7 +999,7 @@ impl GrpcPoolManager {
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
-        let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2Handshake,
                 format!("h2 handshake failed: {}", e),
@@ -1038,58 +1007,12 @@ impl GrpcPoolManager {
             )
         })?;
 
-        std::future::poll_fn(|cx| {
-            if conn.current_max_send_streams() > 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
-                std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
-                    "h2 connection closed before peer SETTINGS".to_string(),
-                )),
-                std::task::Poll::Ready(Err(e)) => {
-                    std::task::Poll::Ready(Err(format!("h2 handshake failed: {e}")))
-                }
-                // SETTINGS can be applied during this poll; re-check before
-                // parking or a wake may never arrive.
-                std::task::Poll::Pending if conn.current_max_send_streams() > 0 => {
-                    std::task::Poll::Ready(Ok(()))
-                }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        })
-        .await
-        .map_err(|message| {
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::H2Handshake,
-                message.clone(),
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )
-        })?;
-
-        // Spawn only after the peer completed the H2 preface exchange.
-        let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
+        // TLS negotiation already proved H2 via ALPN.
         tokio::spawn(async move {
-            let mut driver_polled_tx = Some(driver_polled_tx);
-            let result = std::future::poll_fn(|cx| {
-                let poll = std::future::Future::poll(std::pin::Pin::new(&mut conn), cx);
-                if let Some(tx) = driver_polled_tx.take() {
-                    let _ = tx.send(poll.is_pending());
-                }
-                poll
-            })
-            .await;
-            if let Err(e) = result {
+            if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
         });
-        if !matches!(driver_polled_rx.await, Ok(true)) {
-            let message = "gRPC h2 TLS connection closed during driver handoff".to_string();
-            return Err(GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::H2Handshake,
-                message.clone(),
-                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, message),
-            ));
-        }
 
         Ok(sender)
     }

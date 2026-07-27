@@ -1399,12 +1399,9 @@ impl MeshMtlsConnectionPool {
                 if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
                     builder.max_concurrent_streams(max_streams);
                 }
-                // Zero is a pre-SETTINGS sentinel used to prove the peer
-                // preface was received before this DNS candidate is accepted.
-                builder.initial_max_send_streams(0);
 
                 let io = TokioIo::new(tls_stream);
-                let (sender, mut connection) =
+                let (sender, connection) =
                     builder
                         .handshake(io)
                         .await
@@ -1413,64 +1410,15 @@ impl MeshMtlsConnectionPool {
                             message: e.to_string(),
                         })?;
 
-                // hyper/h2 `handshake()` resolves after the client preface is
-                // written; wait for peer SETTINGS before accepting this
-                // candidate so a TLS-successful non-H2 peer cannot suppress
-                // DNS failover.
-                std::future::poll_fn(|cx| {
-                    if connection.current_max_send_streams() > 0 {
-                        return std::task::Poll::Ready(Ok(()));
-                    }
-                    match std::future::Future::poll(std::pin::Pin::new(&mut connection), cx) {
-                        std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
-                            "H2 connection closed before peer SETTINGS".to_string(),
-                        )),
-                        std::task::Poll::Ready(Err(e)) => {
-                            std::task::Poll::Ready(Err(e.to_string()))
-                        }
-                        // SETTINGS can be applied during this poll; re-check
-                        // before parking or a wake may never arrive.
-                        std::task::Poll::Pending if connection.current_max_send_streams() > 0 => {
-                            std::task::Poll::Ready(Ok(()))
-                        }
-                        std::task::Poll::Pending => std::task::Poll::Pending,
-                    }
-                })
-                .await
-                .map_err(|message| HbonePoolError::H2Handshake {
-                    host: target_host.to_string(),
-                    message,
-                })?;
-
-                // Spawn only after complete protocol establishment. Failed or
-                // timed-out candidates cannot leave driver tasks behind.
-                let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
+                // TLS ALPN already proved H2 for this sidecar candidate.
                 tokio::spawn(async move {
-                    let mut driver_polled_tx = Some(driver_polled_tx);
-                    let result = std::future::poll_fn(|cx| {
-                        let poll =
-                            std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
-                        if let Some(tx) = driver_polled_tx.take() {
-                            let _ = tx.send(poll.is_pending());
-                        }
-                        poll
-                    })
-                    .await;
-                    if let Err(e) = result {
+                    if let Err(e) = connection.await {
                         debug!(
                             "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
                             e
                         );
                     }
                 });
-                // Do not release the sender until the spawned driver has
-                // replaced the creator task's SETTINGS-poll waker.
-                if !matches!(driver_polled_rx.await, Ok(true)) {
-                    return Err(HbonePoolError::H2Handshake {
-                        host: target_host.to_string(),
-                        message: "H2 connection closed during driver handoff".to_string(),
-                    });
-                }
                 Ok(sender)
             }
         })

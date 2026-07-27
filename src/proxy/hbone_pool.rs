@@ -1606,9 +1606,6 @@ pub(crate) async fn dial_h2_connect_sender(
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
                 builder.max_concurrent_streams(max_streams);
             }
-            // Zero is a pre-SETTINGS sentinel used to prove the peer preface
-            // was received before this DNS candidate is accepted.
-            builder.initial_max_send_streams(0);
 
             let (sender, mut connection) =
                 builder
@@ -1618,31 +1615,6 @@ pub(crate) async fn dial_h2_connect_sender(
                         host: target_host.to_string(),
                         message: e.to_string(),
                     })?;
-
-            // Raw h2 `handshake()` returns after writing the client preface;
-            // peer SETTINGS require polling `connection`. The zero initial
-            // stream limit changes only after that frame is processed, so a
-            // TLS-successful non-H2 peer cannot suppress DNS failover.
-            std::future::poll_fn(|cx| {
-                if connection.max_concurrent_send_streams() > 0 {
-                    return std::task::Poll::Ready(Ok(()));
-                }
-                match std::future::Future::poll(std::pin::Pin::new(&mut connection), cx) {
-                    std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Err(
-                        "H2 connection closed before peer SETTINGS".to_string(),
-                    )),
-                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e.to_string())),
-                    std::task::Poll::Pending if connection.max_concurrent_send_streams() > 0 => {
-                        std::task::Poll::Ready(Ok(()))
-                    }
-                    std::task::Poll::Pending => std::task::Poll::Pending,
-                }
-            })
-            .await
-            .map_err(|message| HbonePoolError::H2Handshake {
-                host: target_host.to_string(),
-                message,
-            })?;
 
             if pool_config.enable_http2
                 && let Some(ping_pong) = connection.ping_pong()
@@ -1654,32 +1626,13 @@ pub(crate) async fn dial_h2_connect_sender(
                 );
             }
 
-            // Spawn only after TLS and H2 have both succeeded. A failed or
-            // timed-out candidate therefore cannot leak a driver task.
-            let (driver_polled_tx, driver_polled_rx) = tokio::sync::oneshot::channel();
+            // TLS ALPN already proved H2 for this candidate. Drive it without
+            // blocking healthy HBONE peers on a SETTINGS-derived sentinel.
             tokio::spawn(async move {
-                let mut driver_polled_tx = Some(driver_polled_tx);
-                let result = std::future::poll_fn(|cx| {
-                    let poll = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
-                    if let Some(tx) = driver_polled_tx.take() {
-                        let _ = tx.send(poll.is_pending());
-                    }
-                    poll
-                })
-                .await;
-                if let Err(e) = result {
+                if let Err(e) = connection.await {
                     debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
                 }
             });
-            // The SETTINGS readiness poll above registered this creator task's
-            // waker. Do not release the sender until the spawned driver has
-            // polled the connection and installed its own waker.
-            if !matches!(driver_polled_rx.await, Ok(true)) {
-                return Err(HbonePoolError::H2Handshake {
-                    host: target_host.to_string(),
-                    message: "H2 connection closed during driver handoff".to_string(),
-                });
-            }
             Ok(sender)
         }
     })
