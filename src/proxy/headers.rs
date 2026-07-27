@@ -656,26 +656,100 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
 const GRPC_CONTROL_TRAILER_NAMES: &[&str] =
     &["grpc-status", "grpc-message", "grpc-status-details-bin"];
 
+/// Outcome of a case-insensitive lookup into a plugin-facing header map.
+///
+/// Plugins may synthesize several case variants of one field name (`x-name`
+/// alongside `X-Name`), and a `HashMap` yields them in arbitrary order.
+/// Collapsing that to "whichever variant iteration reached first" would let the
+/// trailer reconciliation compare against a copy the policy never touched and
+/// miss the changed or added duplicate, so ambiguity is a distinct outcome
+/// rather than a value — and every ambiguous transition is treated as governed.
+#[derive(Debug, PartialEq, Eq)]
+enum CaseInsensitiveHeader<'a> {
+    /// No key in the map matches the field name.
+    Absent,
+    /// Exactly one key matches; this is its value.
+    Unique(&'a str),
+    /// Two or more case variants match, so no single value represents the field.
+    Ambiguous,
+}
+
+/// Case-insensitive lookup into a plugin-facing header map. Plugins may
+/// synthesize mixed-case keys, so the trailer reconciliation cannot rely on the
+/// map being normalized — and must not silently pick one of several variants.
+fn find_header_value_ci<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> CaseInsensitiveHeader<'a> {
+    let mut found: Option<&'a str> = None;
+    for (key, value) in headers {
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if found.is_some() {
+            return CaseInsensitiveHeader::Ambiguous;
+        }
+        found = Some(value.as_str());
+    }
+    match found {
+        Some(value) => CaseInsensitiveHeader::Unique(value),
+        None => CaseInsensitiveHeader::Absent,
+    }
+}
+
+/// Owned pre-policy form of [`CaseInsensitiveHeader`]. Carried inside the
+/// `pub(crate)` witness, so it shares that visibility.
+#[derive(Debug)]
+pub(crate) enum PrePolicyHeaderValue {
+    Absent,
+    Unique(String),
+    Ambiguous,
+}
+
+impl PrePolicyHeaderValue {
+    fn capture(lookup: CaseInsensitiveHeader<'_>) -> Self {
+        match lookup {
+            CaseInsensitiveHeader::Absent => Self::Absent,
+            CaseInsensitiveHeader::Unique(value) => Self::Unique(value.to_string()),
+            CaseInsensitiveHeader::Ambiguous => Self::Ambiguous,
+        }
+    }
+
+    /// Whether the field is PROVABLY unchanged between capture and the client
+    /// boundary. Only two transitions qualify: absent stayed absent, and a
+    /// single value stayed the same single value. Anything else — an appearing
+    /// or disappearing field, a changed value, or duplicate case variants on
+    /// either side — is unproven and therefore governed.
+    fn is_unchanged(&self, now: &CaseInsensitiveHeader<'_>) -> bool {
+        match (self, now) {
+            (Self::Absent, CaseInsensitiveHeader::Absent) => true,
+            (Self::Unique(before), CaseInsensitiveHeader::Unique(after)) => before == after,
+            _ => false,
+        }
+    }
+}
+
 /// Backend values, captured before any response-header phase ran, for exactly
 /// the field names a backend trailer section also carries.
 ///
-/// Bounded by the TRAILER count rather than the header count: the reconciliation
-/// only has to answer "did the response-header phases change THIS name?", so a
-/// response without trailers allocates nothing at all.
-pub(crate) struct ResponseTrailerPolicyWitness {
-    /// `(trailer field name, backend header value before the response-header
-    /// phases ran)`.
-    observed: Vec<(http::HeaderName, Option<String>)>,
+/// The captured form is bounded by the TRAILER count rather than the header
+/// count: the reconciliation only has to answer "did the response-header phases
+/// change THIS name?", so a response without trailers allocates nothing at all.
+pub(crate) enum ResponseTrailerPolicyWitness {
+    /// Nothing was captured, so the reconciliation cannot prove the
+    /// response-header phases left any field alone. Every trailer name is
+    /// treated as mutated: callers without a witness fail closed instead of
+    /// forwarding an unreconciled trailer section.
+    Unproven,
+    /// No response-header phase could run for this response, so no field can
+    /// have changed. Preserves the issue #2941 pass-through for chains that
+    /// cannot touch the response headers at all.
+    NoHeaderPolicyPhase,
+    /// `(trailer field name, pre-policy backend header value)`.
+    PrePolicyValues(Vec<(http::HeaderName, PrePolicyHeaderValue)>),
 }
 
 impl ResponseTrailerPolicyWitness {
-    /// A witness that proves nothing. Every trailer name is treated as mutated,
-    /// so callers that could not capture one still fail closed instead of
-    /// forwarding an unreconciled trailer section.
-    pub(crate) const EMPTY: Self = Self {
-        observed: Vec::new(),
-    };
-
     /// Capture the pre-policy backend header value for every field name the
     /// backend also sent as a trailer. Call this before the first response-header
     /// phase (`after_proxy`) runs.
@@ -685,12 +759,10 @@ impl ResponseTrailerPolicyWitness {
     ) -> Self {
         let mut observed = Vec::with_capacity(trailers.keys_len());
         for name in trailers.keys() {
-            observed.push((
-                name.clone(),
-                find_header_value_ci(response_headers, name.as_str()).cloned(),
-            ));
+            let lookup = find_header_value_ci(response_headers, name.as_str());
+            observed.push((name.clone(), PrePolicyHeaderValue::capture(lookup)));
         }
-        Self { observed }
+        Self::PrePolicyValues(observed)
     }
 
     /// Whether the response-header phases changed this field between capture
@@ -704,35 +776,121 @@ impl ResponseTrailerPolicyWitness {
         name: &http::HeaderName,
         response_headers: &std::collections::HashMap<String, String>,
     ) -> bool {
-        match self.observed.iter().find(|(known, _)| known == name) {
-            Some((_, before)) => {
-                find_header_value_ci(response_headers, name.as_str()) != before.as_ref()
+        match self {
+            Self::Unproven => true,
+            Self::NoHeaderPolicyPhase => false,
+            Self::PrePolicyValues(observed) => {
+                let Some((_, before)) = observed.iter().find(|(known, _)| known == name) else {
+                    // A trailer field the capture never saw. Unprovable, so
+                    // governed.
+                    return true;
+                };
+                let now = find_header_value_ci(response_headers, name.as_str());
+                !before.is_unchanged(&now)
             }
-            None => true,
         }
     }
 }
 
-/// Case-insensitive lookup into a plugin-facing header map. Plugins may
-/// synthesize mixed-case keys, so the trailer reconciliation cannot rely on the
-/// map being normalized.
-fn find_header_value_ci<'a>(
-    headers: &'a std::collections::HashMap<String, String>,
-    name: &str,
-) -> Option<&'a String> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value)
+/// Config-time response-trailer governance for one request, read once from the
+/// plugin cache and threaded down the HTTP/3 relay helpers.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseTrailerGovernance<'a> {
+    /// Union of `Plugin::response_trailer_policy()` names for this proxy and
+    /// protocol, precomputed per reload.
+    pub(crate) policy_names: &'a [String],
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    pub(crate) unbounded: bool,
+}
+
+/// The backend's response headers as a STREAMING relay saw them before its
+/// response-header phases ran.
+///
+/// A streaming relay cannot use the buffered capture: the initial HEADERS frame
+/// is on the wire long before the backend's trailer section exists, so the set
+/// of trailer field names is unknown at capture time. Retaining the pre-policy
+/// map instead keeps the evidence bounded by the response's own header count —
+/// one clone per streaming RESPONSE, never per frame — and defers the
+/// per-trailer-name comparison to the trailer boundary, where it is bounded by
+/// the trailer count exactly as on the buffered path.
+pub(crate) enum PrePolicyResponseHeaders {
+    /// No evidence retained; the witness fails closed.
+    Unproven,
+    /// No response-header phase can run for this response.
+    NoHeaderPolicyPhase,
+    /// Pre-policy backend header map.
+    Snapshot(std::collections::HashMap<String, String>),
+}
+
+impl PrePolicyResponseHeaders {
+    /// Decide what evidence a streaming relay needs, and capture only that.
+    ///
+    /// * An `Unbounded` chain drops the whole reconcilable trailer section no
+    ///   matter what the headers did, so no evidence could change the outcome
+    ///   and none is retained.
+    /// * A chain with no response-header phase (`header_phases_can_mutate` is
+    ///   false) cannot have changed anything, so the snapshot would be a clone
+    ///   compared against itself.
+    /// * Otherwise the snapshot is the only way to tell a policy mutation from
+    ///   an untouched backend field once the trailers arrive.
+    pub(crate) fn capture_for_streaming(
+        response_headers: &std::collections::HashMap<String, String>,
+        governance: ResponseTrailerGovernance<'_>,
+        header_phases_can_mutate: bool,
+    ) -> Self {
+        if governance.unbounded {
+            Self::Unproven
+        } else if header_phases_can_mutate {
+            Self::Snapshot(response_headers.clone())
+        } else {
+            Self::NoHeaderPolicyPhase
+        }
+    }
+
+    fn witness(&self, trailers: &http::HeaderMap) -> ResponseTrailerPolicyWitness {
+        match self {
+            Self::Unproven => ResponseTrailerPolicyWitness::Unproven,
+            Self::NoHeaderPolicyPhase => ResponseTrailerPolicyWitness::NoHeaderPolicyPhase,
+            Self::Snapshot(pre_policy) => {
+                ResponseTrailerPolicyWitness::capture(trailers, pre_policy)
+            }
+        }
+    }
+}
+
+/// Streaming-relay entry point for
+/// [`reconcile_backend_trailers_with_response_policy`].
+///
+/// Builds the per-trailer witness from the retained pre-policy snapshot and
+/// applies the same governance rules the buffered path applies. Call it after
+/// every response-header mutation for the path and immediately before
+/// `send_trailers`.
+pub(crate) fn reconcile_streaming_backend_trailers(
+    trailers: &mut http::HeaderMap,
+    response_headers: &std::collections::HashMap<String, String>,
+    pre_policy: &PrePolicyResponseHeaders,
+    governance: ResponseTrailerGovernance<'_>,
+) -> usize {
+    let witness = pre_policy.witness(trailers);
+    reconcile_backend_trailers_with_response_policy(
+        trailers,
+        response_headers,
+        &witness,
+        governance.policy_names,
+        governance.unbounded,
+    )
 }
 
 /// Drop backend trailer fields that would re-open the response-header policy a
-/// buffered path already applied, and report how many were dropped.
+/// protocol path already applied, and report how many were dropped.
 ///
-/// `after_proxy` and every later buffered response-header phase see only the
-/// INITIAL header map. A backend trailer carrying a governed field name arrives
-/// after that boundary, so without this reconciliation it reintroduces exactly
-/// what the policy removed — or contradicts what the policy set — on the wire.
+/// `after_proxy` and every later response-header phase see only the INITIAL
+/// header map. A backend trailer carrying a governed field name arrives after
+/// that boundary, so without this reconciliation it reintroduces exactly what
+/// the policy removed — or contradicts what the policy set — on the wire. Both
+/// the buffered native-HTTP/3 send path and the plain native/refined HTTP/3
+/// STREAMING relays cross that boundary; the streaming relays reach this
+/// function through [`reconcile_streaming_backend_trailers`].
 ///
 /// Two independent signals decide "governed", because neither alone is
 /// sufficient:

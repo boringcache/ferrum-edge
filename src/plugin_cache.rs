@@ -2927,8 +2927,9 @@ impl PluginCapabilities {
     pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
     pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`, so
-    /// buffered paths that forward backend trailers must fail closed and drop
-    /// the whole trailer section rather than reconcile field by field.
+    /// buffered and streaming paths that forward backend trailers must fail
+    /// closed and drop the whole trailer section rather than reconcile field by
+    /// field.
     pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u16 = 1 << 15;
 
     #[inline(always)]
@@ -2960,8 +2961,8 @@ pub struct PluginPhaseData {
     pub initial_response_header_policy_names: Arc<Vec<String>>,
     /// Unique canonical field names whose response-header policy also binds the
     /// TRAILER section, unioned from `Plugin::response_trailer_policy()`.
-    /// Buffered paths that forward backend trailers drop exactly these names,
-    /// so an auth/logging-only chain contributes nothing and keeps its trailers.
+    /// Trailer-forwarding paths drop exactly these names, so an
+    /// auth/logging-only chain contributes nothing and keeps its trailers.
     pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,

@@ -2988,12 +2988,7 @@ pub mod _test_support {
         policy_names: &[String],
         unbounded_policy: bool,
     ) -> Vec<(String, String)> {
-        let mut map = http::HeaderMap::new();
-        for (name, value) in trailers {
-            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("trailer name");
-            let value = http::HeaderValue::from_str(value).expect("trailer value");
-            map.append(name, value);
-        }
+        let mut map = backend_trailer_map_for_test(trailers);
         let witness =
             crate::proxy::headers::ResponseTrailerPolicyWitness::capture(&map, pre_policy_headers);
         crate::proxy::headers::reconcile_backend_trailers_with_response_policy(
@@ -3003,8 +2998,58 @@ pub mod _test_support {
             policy_names,
             unbounded_policy,
         );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Run the STREAMING-relay backend-trailer / response-header-policy
+    /// reconciliation over plain data.
+    ///
+    /// A streaming relay commits its initial HEADERS frame before the backend's
+    /// trailers exist, so it retains the pre-policy header map instead of
+    /// per-trailer values and derives the witness at the trailer frame. This
+    /// exercises that capture decision too: `header_phases_can_mutate` is false
+    /// when no response-header phase can run for the response, and the
+    /// unbounded arm retains no evidence at all.
+    pub fn reconcile_streaming_backend_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+        );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    fn backend_trailer_map_for_test(trailers: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in trailers {
+            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("trailer name");
+            let value = http::HeaderValue::from_str(value).expect("trailer value");
+            map.append(name, value);
+        }
+        map
+    }
+
+    fn surviving_trailer_lines_for_test(map: &http::HeaderMap) -> Vec<(String, String)> {
         let mut surviving = Vec::new();
-        for (name, value) in &map {
+        for (name, value) in map {
             surviving.push((
                 name.as_str().to_string(),
                 String::from_utf8_lossy(value.as_bytes()).into_owned(),

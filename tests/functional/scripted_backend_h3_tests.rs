@@ -4163,3 +4163,159 @@ async fn spawn_h3_trailer_policy_harness(
 
     (harness, https_port, (tcp_backend, h3_backend))
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// The same boundary on the STREAMING relays. Here the initial HEADERS frame is
+// already on the wire when the backend's trailer section arrives, so the
+// reconciliation happens at the trailer frame instead of at response build.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_security_headers_policy_strips_only_governed_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-streaming-trailers-policy", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-security-headers"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-security-headers",
+                    "plugin_name": "security_headers",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    // Removal is a no-op on the initial header map; only the
+                    // config-time declaration can bind the trailer copy, which
+                    // arrives long after the HEADERS frame was committed.
+                    "config": {"remove": ["x-powered-by"]},
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming security_headers path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("x-powered-by"),
+        None,
+        "a streamed backend trailer must not reintroduce a field the response \
+         header policy removes; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        Some("true"),
+        "ungoverned backend trailers must survive on the streaming relay; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
+// The fail-closed arm applies to the streaming relay too: a chain whose
+// governed field set is not enumerable at config time drops the whole trailer
+// section rather than guessing which names the route overrides touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_unbounded_response_policy_drops_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-streaming-trailers-unbounded", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming response_transformer path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-note")
+            .and_then(|value| value.to_str().ok()),
+        Some("transformed")
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        None,
+        "a non-enumerable response header policy must fail closed on the \
+         streamed trailer section; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("x-powered-by"), None);
+}

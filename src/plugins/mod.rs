@@ -1150,11 +1150,11 @@ impl BufferedInitialResponseHeaderPolicyState {
 ///
 /// `after_proxy` and every buffered response-header phase see only the INITIAL
 /// header map. On protocol paths that forward backend trailers after those
-/// phases (buffered native HTTP/3), a backend trailer carrying a governed field
-/// name re-opens the policy those phases applied — the classic case is a
-/// `security_headers` removal that was a no-op on the initial map because the
-/// backend only ever sent the field as a trailer, so no observed-mutation diff
-/// can see it.
+/// phases (buffered and streaming native HTTP/3), a backend trailer carrying a
+/// governed field name re-opens the policy those phases applied — the classic
+/// case is a `security_headers` removal that was a no-op on the initial map
+/// because the backend only ever sent the field as a trailer, so no
+/// observed-mutation diff can see it.
 ///
 /// This is a config-time declaration: the plugin cache unions it once per
 /// reload so the request path reads a precomputed name list instead of scanning
@@ -1171,8 +1171,8 @@ pub enum ResponseTrailerPolicy<'a> {
     /// forwarded unchanged.
     Names(&'a [String]),
     /// The governed field set is not enumerable at config time (for example
-    /// rules published at request time by another plugin). Buffered paths fail
-    /// closed and drop the whole backend trailer section.
+    /// rules published at request time by another plugin). Trailer-forwarding
+    /// paths fail closed and drop the whole backend trailer section.
     Unbounded,
 }
 
@@ -6758,8 +6758,8 @@ pub trait Plugin: Send + Sync {
     /// Declare how far this plugin's response-header policy binds the response
     /// TRAILER section.
     ///
-    /// Buffered protocol paths that forward backend trailers after the
-    /// response-header phases (buffered native HTTP/3) reconcile the trailer
+    /// Protocol paths that forward backend trailers after the response-header
+    /// phases (buffered and streaming native HTTP/3) reconcile the trailer
     /// section against the union of these declarations. Override this only when
     /// the policy can be a NO-OP on the initial header map while still needing
     /// to bind the trailer channel — a conditional removal, or a rejection

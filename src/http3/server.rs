@@ -46,9 +46,10 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    ResponseTrailerPolicyWitness, apply_response_headers, is_backend_request_strip_header,
-    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
-    reconcile_backend_trailers_with_response_policy, strip_client_response_hop_by_hop_headers,
+    PrePolicyResponseHeaders, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
+    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map, reconcile_backend_trailers_with_response_policy,
+    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
@@ -481,6 +482,26 @@ fn build_h3_quinn_server_config(
 /// trailer-read fault is a backend transport error (classified via
 /// `classify_http3_error`, reported to circuit breaker / passive health),
 /// while a client send/finish failure is a genuine `ClientDisconnect`.
+/// Everything the trailer-finish phase needs to re-apply the response-header
+/// policy boundary to a STREAMING relay's trailer section.
+///
+/// A streaming relay sends its initial HEADERS frame before the backend's
+/// trailers exist, so `after_proxy`, sticky-cookie injection, and the final
+/// hop-by-hop strip have all already run and gone on the wire by the time the
+/// trailers are read. Without this, a backend trailer repeating a governed
+/// field name lands AFTER the policy boundary and undoes it — the same gap the
+/// buffered native-H3 send path closes inline. See `docs/http3.md`
+/// ("Backend trailers and response header policy").
+struct H3StreamingTrailerPolicy<'a> {
+    /// The response headers exactly as they went on the wire, after every
+    /// response-header phase for this path.
+    final_headers: &'a std::collections::HashMap<String, String>,
+    /// Evidence captured before the first response-header phase ran.
+    pre_policy: &'a PrePolicyResponseHeaders,
+    /// Config-time declarations plus the fail-closed unbounded arm.
+    governance: ResponseTrailerGovernance<'a>,
+}
+
 enum H3TrailerFinishError {
     /// `recv_trailers()` on the backend stream failed non-gracefully.
     Backend(h3::error::StreamError),
@@ -498,6 +519,7 @@ async fn finish_h3_response_with_backend_trailers<S>(
     h3_stream: &mut RequestStream<S, Bytes>,
     recv_stream: &mut crate::http3::client::H3RequestStream,
     backend_read_timeout_ms: u64,
+    trailer_policy: H3StreamingTrailerPolicy<'_>,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
@@ -533,6 +555,25 @@ where
     match trailers {
         Some(mut trailers) => {
             strip_response_hop_by_hop_trailers(&mut trailers);
+            // Last point on a streaming relay where the response-header policy
+            // boundary can still bind the trailer section: the initial HEADERS
+            // frame, sticky-cookie injection, and the final hop-by-hop strip all
+            // happened before the first body frame. Runs once per response, on
+            // the trailer frame only — never per body frame — and an
+            // auth/logging-only chain contributes no governance, so its trailers
+            // pass through untouched (issue #2941).
+            let removed = reconcile_streaming_backend_trailers(
+                &mut trailers,
+                trailer_policy.final_headers,
+                trailer_policy.pre_policy,
+                trailer_policy.governance,
+            );
+            if removed > 0 {
+                debug!(
+                    removed,
+                    "streaming H3: dropped backend trailer fields governed by response header policy"
+                );
+            }
             if !trailers.is_empty() {
                 h3_stream
                     .send_trailers(trailers)
@@ -1987,6 +2028,16 @@ async fn handle_h3_request(
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
+    // Config-time response-trailer governance, read once and threaded into
+    // every plain native/refined H3 STREAMING relay below. Those relays send
+    // initial HEADERS before the backend's trailers exist, so the trailer frame
+    // is a second crossing of the same response-header policy boundary the
+    // buffered send path reconciles inline.
+    let response_trailer_governance = ResponseTrailerGovernance {
+        policy_names: plugin_cache_view.response_trailer_policy_names(),
+        unbounded: capabilities
+            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+    };
 
     let mut plugin_execution_ns: u64 = 0;
 
@@ -5134,6 +5185,18 @@ async fn handle_h3_request(
             return Ok(());
         }
 
+        // Retain the backend's pre-policy response headers before the first
+        // response-header phase can rewrite them, so the trailer frame at the
+        // end of this relay can still tell a policy mutation from an untouched
+        // backend field. One clone per streaming RESPONSE, skipped entirely
+        // when no response-header phase can run or when the chain already fails
+        // closed; never touched per body frame.
+        let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+            &response_headers,
+            response_trailer_governance,
+            !plugins.is_empty() || sticky_cookie_needed,
+        );
+
         // after_proxy hooks run before streaming begins so headers can be
         // modified or the response rejected before any downstream bytes are
         // committed. A reject here (e.g. a WAF response-header-inspection
@@ -5573,6 +5636,11 @@ async fn handle_h3_request(
                         &mut stream,
                         &mut h3_resp.recv_stream,
                         backend_read_timeout_ms,
+                        H3StreamingTrailerPolicy {
+                            final_headers: &response_headers,
+                            pre_policy: &pre_policy_response_headers,
+                            governance: response_trailer_governance,
+                        },
                     )
                     .await
                 };
@@ -6095,6 +6163,7 @@ async fn handle_h3_request(
             } else {
                 None
             },
+            response_trailer_governance,
         )
         .await?
         {
@@ -6140,6 +6209,7 @@ async fn handle_h3_request(
                 &mut ctx,
                 &mut plugin_execution_ns,
                 backend_admission_start,
+                response_trailer_governance,
             )
             .await;
 
@@ -6732,12 +6802,12 @@ async fn handle_h3_request(
         // also sent as trailers, before the first response-header phase can
         // rewrite them. Allocated only when the backend actually sent trailers,
         // and sized by the trailer count — never by the header count. A response
-        // with no trailers gets the empty witness and never reaches the
+        // with no trailers gets the unproven witness and never reaches the
         // reconciliation below; that value proves nothing, so any future caller
         // that does reach it fails closed.
         let trailer_policy_witness = match response_trailers.as_ref() {
             Some(trailers) => ResponseTrailerPolicyWitness::capture(trailers, &response_headers),
-            None => ResponseTrailerPolicyWitness::EMPTY,
+            None => ResponseTrailerPolicyWitness::Unproven,
         };
 
         // after_proxy hooks
@@ -8067,6 +8137,7 @@ async fn proxy_to_backend_h3_refined_response(
     is_early_data: bool,
     backend_admission_start: std::time::Instant,
     retry_config: Option<&crate::config::types::RetryConfig>,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -8205,6 +8276,7 @@ async fn proxy_to_backend_h3_refined_response(
                 ctx,
                 plugin_execution_ns,
                 backend_admission_elapsed,
+                trailer_governance,
             )
             .await?;
             return Ok(H3RefinedResponse::Streamed(result));
@@ -8480,6 +8552,7 @@ async fn stream_h3_open_response_to_client(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     backend_admission_elapsed: std::time::Duration,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
     if state.max_response_body_size_bytes > 0
         && let Some(len) = response_headers
@@ -8506,6 +8579,16 @@ async fn stream_h3_open_response_to_client(
             backend_admission_elapsed,
         });
     }
+
+    // Same pre-policy capture as the inline native-H3 streaming relay: this
+    // path also commits its initial HEADERS before the backend's trailers
+    // exist, so the trailer frame needs evidence of what the response-header
+    // phases actually changed.
+    let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        trailer_governance,
+        !plugins.is_empty() || sticky_cookie_needed,
+    );
 
     if let Some(reject) = run_h3_streaming_after_proxy_hooks(
         plugins,
@@ -8737,6 +8820,11 @@ async fn stream_h3_open_response_to_client(
                 h3_stream,
                 &mut recv_stream,
                 backend_read_timeout_ms,
+                H3StreamingTrailerPolicy {
+                    final_headers: &response_headers,
+                    pre_policy: &pre_policy_response_headers,
+                    governance: trailer_governance,
+                },
             )
             .await
             {
@@ -10305,6 +10393,7 @@ async fn proxy_to_backend_h3_streaming(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     backend_admission_start: std::time::Instant,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -10443,6 +10532,16 @@ async fn proxy_to_backend_h3_streaming(
             backend_admission_elapsed,
         });
     }
+
+    // Same pre-policy capture as the inline native-H3 streaming relay: the
+    // initial HEADERS frame is committed before the backend's trailers exist,
+    // so the trailer frame needs evidence of what the response-header phases
+    // actually changed.
+    let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        trailer_governance,
+        !plugins.is_empty() || sticky_cookie_needed,
+    );
 
     // after_proxy hooks run before streaming begins so headers can be modified
     // or the response can be rejected before any downstream bytes are committed.
@@ -10710,6 +10809,11 @@ async fn proxy_to_backend_h3_streaming(
                 h3_stream,
                 &mut h3_resp.recv_stream,
                 backend_read_timeout_ms,
+                H3StreamingTrailerPolicy {
+                    final_headers: &response_headers,
+                    pre_policy: &pre_policy_response_headers,
+                    governance: trailer_governance,
+                },
             )
             .await
             {

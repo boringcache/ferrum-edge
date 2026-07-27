@@ -267,13 +267,13 @@ not duplicated between initial and terminal metadata.
 
 ## Backend trailers and response header policy
 
-Plain (non-gRPC) buffered native-H3 responses forward the backend's trailers
-after the DATA frames (issue #1630). Every response-header phase on that path —
-`after_proxy`, sticky-cookie injection, committed hooks — sees only the
-**initial** header map, so a backend trailer repeating a governed field name
-would arrive after the policy boundary and undo it. Before the trailers are
-written, Ferrum reconciles them against the response-header policy actually in
-force for the request:
+Plain (non-gRPC) native-H3 responses forward the backend's trailers after the
+DATA frames (issue #1630) — on the buffered send path and on the streaming
+relays alike. Every response-header phase on those paths — `after_proxy`,
+sticky-cookie injection, committed hooks — sees only the **initial** header map,
+so a backend trailer repeating a governed field name would arrive after the
+policy boundary and undo it. Before the trailers are written, Ferrum reconciles
+them against the response-header policy actually in force for the request:
 
 - **Declared policy names.** Plugins classify their reach with
   `Plugin::response_trailer_policy()`, and the plugin cache unions the names once
@@ -303,6 +303,34 @@ gate: that would strip valid trailers from every proxy that merely authenticates
 A response-body plugin phase that actually processes the response body still
 clears the trailers wholesale, because those hooks cannot inspect or transform a
 trailer at all.
+
+### Streaming relays
+
+The plain native/refined H3 streaming relays cross the same boundary later: the
+initial HEADERS frame is on the wire before the backend's trailer section even
+exists. They therefore reconcile at the trailer frame, inside the shared
+trailer-finish helper and immediately before `send_trailers`, using the same
+three signals. Two details differ from the buffered path:
+
+- **Evidence shape.** The set of trailer field names is unknown when the headers
+  go out, so a streaming relay retains the backend's **pre-policy header map**
+  for the response and derives the per-trailer witness once the trailers arrive.
+  That is one snapshot per streaming *response* — never per body frame — and it
+  is skipped entirely when no response-header phase can run for the request (no
+  plugins and no sticky-cookie injection), or when the chain already fails
+  closed under `ResponseTrailerPolicy::Unbounded`.
+- **Ambiguous duplicates fail closed.** A plugin may synthesize several case
+  variants of one field name (`x-name` beside `X-Name`) in the string header
+  map. A field counts as untouched only when the pre-policy and final maps each
+  hold exactly zero matches, or exactly one match with the same value; duplicate
+  case variants on either side are ambiguous and the trailer is dropped. The
+  buffered path applies the identical rule.
+
+Everything else is unchanged: the trailer read timeout and its error
+classification, connection/accounting release, H3 capability downgrade on
+trailer-boundary transport faults, and client-disconnect semantics all behave
+exactly as before. Native gRPC over H3 inlines its own trailer finish and is not
+reconciled here, so `grpc-status` stays protocol-correct.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

@@ -1539,7 +1539,7 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
         .expect("pre-after_proxy region");
     assert!(
         before_capture.contains("ResponseTrailerPolicyWitness::capture(")
-            && before_capture.contains("ResponseTrailerPolicyWitness::EMPTY"),
+            && before_capture.contains("ResponseTrailerPolicyWitness::Unproven"),
         "buffered H3 must witness the backend's pre-policy header values before after_proxy runs"
     );
     assert!(
@@ -1592,5 +1592,98 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     assert!(
         send.contains("Auth/logging-only plugins must not"),
         "retention rationale for auth/logging-only plugins must remain documented"
+    );
+}
+
+#[test]
+fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
+    let src = include_str!("../../../src/http3/server.rs");
+
+    // The shared trailer-finish helper must reconcile BEFORE `send_trailers`:
+    // a streaming relay's initial HEADERS frame is already on the wire, so this
+    // is the last point at which the response-header policy can bind the
+    // trailer section.
+    let helper = src
+        .split("async fn finish_h3_response_with_backend_trailers<S>")
+        .nth(1)
+        .expect("trailer finish helper")
+        .split("/// Start the HTTP/3 listener")
+        .next()
+        .expect("bounded trailer finish helper");
+    let reconcile_at = helper
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("streaming trailer reconciliation");
+    let send_at = helper.find(".send_trailers(").expect("trailer send");
+    assert!(
+        reconcile_at < send_at,
+        "streaming H3 must reconcile backend trailers before they reach the wire"
+    );
+    assert!(
+        helper.contains("strip_response_hop_by_hop_trailers(&mut trailers);"),
+        "streaming H3 must keep the hop-by-hop trailer strip"
+    );
+
+    // All three plain native/refined streaming relays — the inline stream, the
+    // refined stream, and the buffered-request streaming helper — pass the
+    // policy through, and each captures its pre-policy evidence before the
+    // first response-header phase runs.
+    assert_eq!(
+        src.matches("H3StreamingTrailerPolicy {").count(),
+        3,
+        "every plain native/refined H3 streaming relay must bind the response \
+         trailer policy at its trailer frame"
+    );
+    let captures: Vec<&str> = src
+        .split("PrePolicyResponseHeaders::capture_for_streaming(")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        captures.len(),
+        3,
+        "every plain native/refined H3 streaming relay must capture its \
+         pre-policy response headers"
+    );
+    for region in captures {
+        let hooks = region.find("run_h3_streaming_after_proxy_hooks(");
+        let finish = region.find("finish_h3_response_with_backend_trailers(");
+        assert!(
+            hooks.is_some() && finish.is_some() && hooks < finish,
+            "the pre-policy capture must precede the response-header phases, \
+             which must precede the trailer frame"
+        );
+    }
+
+    // Governance is read once from the precomputed plugin-cache view, not
+    // rebuilt per response, and keeps the fail-closed unbounded arm.
+    let governance = src
+        .split("let response_trailer_governance = ResponseTrailerGovernance {")
+        .nth(1)
+        .expect("streaming trailer governance")
+        .split("};")
+        .next()
+        .expect("bounded streaming trailer governance");
+    assert!(
+        governance.contains("policy_names: plugin_cache_view.response_trailer_policy_names(),"),
+        "streaming governance names must come from the per-reload plugin cache view"
+    );
+    assert!(
+        governance.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+        "streaming governance must keep the fail-closed unbounded arm"
+    );
+
+    // Native gRPC over H3 inlines its own trailer finish so the backend
+    // `grpc-status` stays protocol-correct; it must not be pulled into the
+    // response-header policy boundary.
+    let grpc = src
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native gRPC H3 dispatch")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native gRPC H3 dispatch");
+    assert!(
+        !grpc.contains("reconcile_streaming_backend_trailers(")
+            && !grpc.contains("H3StreamingTrailerPolicy {"),
+        "native gRPC H3 trailer status must not be reconciled as header policy"
     );
 }
