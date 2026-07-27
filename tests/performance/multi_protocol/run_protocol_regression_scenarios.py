@@ -338,8 +338,7 @@ def main() -> int:
             output_dir / "connection_churn.log"
         ).open("w", encoding="utf-8") as err:
             churn = subprocess.run(
-                [
-                    "proto_bench",
+                ["proto_bench",
                     "http1",
                     "--target",
                     "http://127.0.0.1:8000/echo",
@@ -393,8 +392,7 @@ def main() -> int:
             output_dir / "soak.log"
         ).open("w", encoding="utf-8") as err:
             soak = subprocess.run(
-                [
-                    "proto_bench",
+                ["proto_bench",
                     "saturate",
                     "--target",
                     "https://127.0.0.1:8443/echo",
@@ -443,8 +441,7 @@ def main() -> int:
             output_dir / "reload_under_load.log"
         ).open("w", encoding="utf-8") as err:
             benchmark = subprocess.Popen(
-                [
-                    "proto_bench",
+                ["proto_bench",
                     "http1",
                     "--target",
                     "http://127.0.0.1:8000/echo",
