@@ -1055,8 +1055,7 @@ mod tests {
         let only_in_candidate_td = TrustDomain::new("lkg.candidate-only").unwrap();
         let gateway_id = SpiffeId::from_parts(&local_td, "ns/default/sa/gateway").unwrap();
         let federated_peer = SpiffeId::from_parts(&federated_td, "ns/remote/sa/peer").unwrap();
-        let candidate_only_peer =
-            SpiffeId::from_parts(&only_in_candidate_td, "ns/x/sa/y").unwrap();
+        let candidate_only_peer = SpiffeId::from_parts(&only_in_candidate_td, "ns/x/sa/y").unwrap();
 
         let (local_root_der, local_root_pem, local_key_pem) = synthetic_root(&local_td);
         let (federated_root_der, federated_root_pem, federated_key_pem) =
@@ -1064,8 +1063,12 @@ mod tests {
         let (_candidate_root_der, candidate_root_pem, candidate_key_pem) =
             synthetic_root(&only_in_candidate_td);
         let gateway_leaf = issue_leaf(&gateway_id, &local_root_pem, &local_key_pem, None);
-        let federated_leaf =
-            issue_leaf(&federated_peer, &federated_root_pem, &federated_key_pem, None);
+        let federated_leaf = issue_leaf(
+            &federated_peer,
+            &federated_root_pem,
+            &federated_key_pem,
+            None,
+        );
         let candidate_only_leaf = issue_leaf(
             &candidate_only_peer,
             &candidate_root_pem,
