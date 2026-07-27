@@ -1872,8 +1872,7 @@ fn test_env_config_cp_rejects_surrounding_whitespace_in_mesh_config_authority() 
             ("FERRUM_MESH_CONFIG_AUTHORITY_ID", " db"),
         ],
         || {
-            let error =
-                EnvConfig::from_env().expect_err("surrounding whitespace must fail closed");
+            let error = EnvConfig::from_env().expect_err("surrounding whitespace must fail closed");
             assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
             assert!(error.contains("no surrounding whitespace"));
             assert!(

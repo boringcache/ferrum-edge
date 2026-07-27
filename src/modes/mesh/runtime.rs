@@ -447,10 +447,7 @@ impl MeshRuntimeState {
     /// Capture the config-revision apply capability before asynchronous proxy
     /// preparation begins. A concurrent operator reset invalidates the token,
     /// so completion of pre-reset work cannot restore the cleared watermark.
-    pub(crate) fn begin_revision_apply(
-        &self,
-        slice: &MeshSlice,
-    ) -> Option<MeshRevisionApplyToken> {
+    pub(crate) fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
         self.revision_gate.begin_apply(slice.revision.as_ref())
     }
 

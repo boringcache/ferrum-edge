@@ -1698,9 +1698,8 @@ async fn remote_discovery_loop(
 
         let (succeeded, sleep_duration) = match result {
             Ok(candidate) => {
-                let revision_apply_token = ctx
-                    .revision_gate
-                    .begin_apply(candidate.revision.as_ref());
+                let revision_apply_token =
+                    ctx.revision_gate.begin_apply(candidate.revision.as_ref());
                 let now = chrono::Utc::now().timestamp().max(0) as u64;
                 let workload_count = candidate.endpoints.workloads.len();
                 let entry = RemoteClusterEntry::new(
@@ -3849,10 +3848,12 @@ mod tests {
             if responses.is_empty() {
                 return Err("no more mock responses".to_string());
             }
-            responses.remove(0).map(|endpoints| RemoteDiscoveryCandidate {
-                endpoints,
-                revision: None,
-            })
+            responses
+                .remove(0)
+                .map(|endpoints| RemoteDiscoveryCandidate {
+                    endpoints,
+                    revision: None,
+                })
         }
     }
 

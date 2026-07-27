@@ -23512,13 +23512,7 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(
-            &mesh_state,
-            &mut last_applied_slice,
-            &rejected,
-            true,
-            None,
-        );
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true, None);
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
