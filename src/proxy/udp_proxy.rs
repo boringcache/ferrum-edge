@@ -5112,7 +5112,8 @@ backend_tls_verify_server_cert: false
             "same-ID proxies in different namespaces need distinct DTLS cache entries"
         );
         assert_ne!(
-            first.certificate.certificate, second.certificate.certificate,
+            first.certificate.certificates(),
+            second.certificate.certificates(),
             "one namespace must not reuse another namespace's generated DTLS client identity"
         );
     }
