@@ -29873,17 +29873,19 @@ pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow
 }
 
 /// Same as [`effective_backend_query_string`], but prefer a caller-held raw
-/// query borrow when no outbound transform was published (avoids an extra
-/// Option dance on the H1/H2 hot path that already owns `query_string`).
+/// query borrow when no outbound transform was published. An outbound
+/// transform is copied into the returned value so callers may continue
+/// mutating the request context while they retain the canonical query. The
+/// ordinary no-transform / no-strip hot path still borrows `raw_query`
+/// without allocating.
 pub(crate) fn effective_backend_query_string_with_raw<'a>(
-    ctx: &'a RequestContext,
+    ctx: &RequestContext,
     raw_query: &'a str,
 ) -> Cow<'a, str> {
-    let base = match ctx.outbound_query_string() {
-        Some(q) => q,
-        None => raw_query,
-    };
-    query_string_after_plugin_strips(ctx, base)
+    match ctx.outbound_query_string() {
+        Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
+        None => query_string_after_plugin_strips(ctx, raw_query),
+    }
 }
 
 pub(crate) fn record_status(state: &ProxyState, status: u16) {
