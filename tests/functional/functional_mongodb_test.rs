@@ -12,18 +12,28 @@
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
 //!      - Docker: `docker run -d --name mongo-test -p 27017:27017 mongo:7`
-//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs
-//!      - Run `tests/scripts/setup_mongo_tls.sh` (if available) or configure manually
+//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs under
+//!      `FERRUM_TEST_MONGO_CERT_DIR` (defaults to `/tmp/ferrum-mongo-tls-certs`)
+//!      listening on 27018 (TLS) / 27019 (mTLS). Hosted data-plane CI
+//!      provisions these fixtures inline; local runs skip unless present.
 //!   3. Build the gateway: `cargo build`
+//!
+//! Hosted data-plane sets `FERRUM_DB_TLS_REQUIRED=1` with explicit
+//! `FERRUM_TEST_MONGO_TLS_*` / `FERRUM_TEST_MONGO_CERT_DIR` values so missing
+//! TLS fixtures fail closed. Local runs leave that flag unset and skip.
 //!
 //! Run with:
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
 use crate::common::{
-    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+    configure_coverage_gateway_command, continue_if_backend_available,
+    continue_if_tls_fixture_available, explicit_test_binary, host_port_from_db_url,
+    shutdown_gateway_child, tcp_endpoint_reachable,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
+use mongodb::bson::{Bson, Document, doc};
+use mongodb::{Client as MongoClient, Database as MongoDatabase};
 use serde_json::json;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -34,33 +44,9 @@ const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
 
 /// Check if MongoDB is reachable at the expected address.
-/// Returns false if MongoDB is down — tests will be skipped gracefully.
 async fn mongodb_is_available(url: &str) -> bool {
-    // Extract host:port from the MongoDB URL (mongodb://host:port/db)
-    let host_port = url
-        .strip_prefix("mongodb://")
-        .or_else(|| url.strip_prefix("mongodb+srv://"))
-        .and_then(|s| s.split('/').next())
-        .and_then(|s| {
-            // Strip credentials if present (user:pass@host:port)
-            if s.contains('@') {
-                s.split('@').next_back()
-            } else {
-                Some(s)
-            }
-        })
-        .unwrap_or("localhost:27017");
-
-    match tokio::net::TcpStream::connect(host_port).await {
-        Ok(_) => true,
-        Err(_) => {
-            eprintln!(
-                "MongoDB not available at {} — skipping MongoDB functional tests",
-                host_port
-            );
-            false
-        }
-    }
+    let host_port = host_port_from_db_url(url);
+    tcp_endpoint_reachable(&host_port).await
 }
 
 /// Default certificate directory for TLS tests.
@@ -73,6 +59,7 @@ struct MongoTestHarness {
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
+    mongo_app_name: String,
     admin_port: u16,
     proxy_port: u16,
 }
@@ -96,6 +83,7 @@ impl MongoTestHarness {
             admin_base_url: format!("http://127.0.0.1:{}", admin_port),
             jwt_secret,
             jwt_issuer,
+            mongo_app_name: format!("ferrum-functional-{}", Uuid::new_v4()),
             admin_port,
             proxy_port,
         })
@@ -155,6 +143,7 @@ impl MongoTestHarness {
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
+            .env("FERRUM_MONGO_APP_NAME", &self.mongo_app_name)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
@@ -270,6 +259,7 @@ impl MongoTestHarness {
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
+            .env("FERRUM_MONGO_APP_NAME", &self.mongo_app_name)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
@@ -347,6 +337,7 @@ impl MongoTestHarness {
             .env("FERRUM_DB_TYPE", "mongodb")
             .env("FERRUM_DB_URL", mongo_url)
             .env("FERRUM_MONGO_DATABASE", DEFAULT_MONGO_DATABASE)
+            .env("FERRUM_MONGO_APP_NAME", &self.mongo_app_name)
             .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
@@ -729,7 +720,12 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
 
-    if !mongodb_is_available(&mongo_url).await {
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
@@ -767,22 +763,25 @@ async fn test_mongodb_plaintext_full_lifecycle() {
 #[tokio::test]
 #[ignore]
 async fn test_mongodb_tls_connection() {
-    println!("\n=== MongoDB TLS Functional Test ===\n");
+    println!("\n=== MongoDB TLS Functional Test (verify-full) ===\n");
 
     let mongo_url = std::env::var("FERRUM_TEST_MONGO_TLS_URL")
         .unwrap_or_else(|_| "mongodb://localhost:27018/ferrum_test".to_string());
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !std::path::Path::new(&format!("{}/ca.crt", cert_dir)).exists() {
-        println!(
-            "SKIP: TLS certs not found at {}. Run setup_mongo_tls.sh first.",
-            cert_dir
-        );
-        return;
-    }
-
-    if !mongodb_is_available(&mongo_url).await {
+    let ca_path = format!("{cert_dir}/ca.crt");
+    let ca_exists = std::path::Path::new(&ca_path).exists();
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        ca_exists && reachable,
+        &format!(
+            "verify-full fixture unavailable (ca_exists={ca_exists}, reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo TLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -819,7 +818,16 @@ async fn test_mongodb_tls_require_connection() {
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !mongodb_is_available(&mongo_url).await {
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        reachable,
+        &format!(
+            "require-mode fixture unavailable (reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo TLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -855,15 +863,22 @@ async fn test_mongodb_mtls_connection() {
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !std::path::Path::new(&format!("{}/client.crt", cert_dir)).exists() {
-        println!(
-            "SKIP: mTLS client certs not found at {}. Run setup_mongo_tls.sh first.",
-            cert_dir
-        );
-        return;
-    }
-
-    if !mongodb_is_available(&mongo_url).await {
+    let client_cert = format!("{cert_dir}/client.crt");
+    let client_key = format!("{cert_dir}/client.key");
+    let ca_path = format!("{cert_dir}/ca.crt");
+    let certs_present = std::path::Path::new(&client_cert).exists()
+        && std::path::Path::new(&client_key).exists()
+        && std::path::Path::new(&ca_path).exists();
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        certs_present && reachable,
+        &format!(
+            "mTLS fixture unavailable (certs_present={certs_present}, reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo mTLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -950,7 +965,15 @@ async fn test_mongodb_batch_atomicity_refused_on_standalone() {
 
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
+    // Same required standalone backend as the plaintext lifecycle cell, so it
+    // takes the same fail-closed gate: a missing container must fail the hosted
+    // job rather than return success after a silent skip.
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
@@ -1023,7 +1046,15 @@ async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
     let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
         .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
         .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
+    // The env opt-in above stays a plain skip (a replica set is not part of the
+    // required-backend set). But once it is declared, an unreachable member is a
+    // provisioning failure, not a reason to report success.
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb-replica-set",
+        mongodb_is_available(&mongo_url).await,
+        &format!("declared but not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
@@ -1106,4 +1137,616 @@ async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
     assert_eq!(body["created"]["plugin_configs"], 1);
     println!("  OK: corrected retry applied the whole graph");
     println!("\n=== MongoDB Replica-Set Batch Atomicity Test PASSED ===\n");
+}
+
+#[derive(Debug)]
+struct OwnedProxyDeleteFixture {
+    proxy_id: String,
+    upstream_id: String,
+    plugin_id: String,
+}
+
+impl OwnedProxyDeleteFixture {
+    fn new(label: &str) -> Self {
+        let run_id = Uuid::new_v4().to_string()[..8].to_string();
+        Self {
+            proxy_id: format!("{label}-proxy-{run_id}"),
+            upstream_id: format!("{label}-upstream-{run_id}"),
+            plugin_id: format!("{label}-plugin-{run_id}"),
+        }
+    }
+
+    fn api_spec(&self) -> serde_json::Value {
+        json!({
+            "openapi": "3.1.0",
+            "info": {
+                "title": "Mongo proxy delete atomicity fixture",
+                "version": "1.0.0"
+            },
+            "x-ferrum-proxy": {
+                "id": self.proxy_id.as_str(),
+                "listen_path": format!("/{}", self.proxy_id),
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 8080
+            },
+            "x-ferrum-upstream": {
+                "id": self.upstream_id.as_str(),
+                "name": self.upstream_id.as_str(),
+                "targets": [{
+                    "host": "127.0.0.1",
+                    "port": 8080,
+                    "weight": 100
+                }],
+                "algorithm": "round_robin"
+            },
+            "x-ferrum-plugins": [{
+                "id": self.plugin_id.as_str(),
+                "plugin_name": "request_size_limiting",
+                "config": {"max_bytes": 1048576}
+            }],
+            "paths": {}
+        })
+    }
+
+    fn change_filter(&self) -> Document {
+        doc! {
+            "namespace": "ferrum",
+            "resource_id": {
+                "$in": [
+                    self.proxy_id.as_str(),
+                    self.upstream_id.as_str(),
+                    self.plugin_id.as_str(),
+                ]
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OwnedProxyDeleteSnapshot {
+    proxies: u64,
+    plugin_configs: u64,
+    api_specs: u64,
+    upstreams: u64,
+    config_changes: u64,
+}
+
+async fn mongo_database(url: &str) -> MongoDatabase {
+    MongoClient::with_uri_str(url)
+        .await
+        .expect("connect MongoDB test observer")
+        .database(DEFAULT_MONGO_DATABASE)
+}
+
+async fn submit_owned_proxy_fixture(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    fixture: &OwnedProxyDeleteFixture,
+) -> String {
+    let response = client
+        .post(format!("{}/api-specs", harness.admin_base_url))
+        .header("Authorization", auth_header)
+        .json(&fixture.api_spec())
+        .send()
+        .await
+        .expect("submit API-spec-owned proxy fixture");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        201,
+        "API-spec-owned proxy fixture must be created: {body:?}"
+    );
+    body["id"]
+        .as_str()
+        .expect("API-spec response id")
+        .to_string()
+}
+
+async fn submit_hand_managed_proxy(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    proxy_id: &str,
+) {
+    let response = client
+        .post(format!("{}/proxies", harness.admin_base_url))
+        .header("Authorization", auth_header)
+        .json(&json!({
+            "id": proxy_id,
+            "name": format!("hand-managed-{proxy_id}"),
+            "listen_path": format!("/{proxy_id}"),
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080,
+        }))
+        .send()
+        .await
+        .expect("submit hand-managed proxy fixture");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        201,
+        "hand-managed proxy fixture must be created: {body:?}"
+    );
+}
+
+async fn owned_proxy_delete_snapshot(
+    db: &MongoDatabase,
+    fixture: &OwnedProxyDeleteFixture,
+    spec_id: &str,
+) -> OwnedProxyDeleteSnapshot {
+    OwnedProxyDeleteSnapshot {
+        proxies: db
+            .collection::<Document>("proxies")
+            .count_documents(doc! { "_id": fixture.proxy_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count fixture proxies"),
+        plugin_configs: db
+            .collection::<Document>("plugin_configs")
+            .count_documents(doc! { "_id": fixture.plugin_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count fixture plugin configs"),
+        api_specs: db
+            .collection::<Document>("api_specs")
+            .count_documents(doc! { "_id": spec_id, "namespace": "ferrum" })
+            .await
+            .expect("count fixture API specs"),
+        upstreams: db
+            .collection::<Document>("upstreams")
+            .count_documents(doc! { "_id": fixture.upstream_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count fixture upstreams"),
+        config_changes: db
+            .collection::<Document>("config_changes")
+            .count_documents(fixture.change_filter())
+            .await
+            .expect("count fixture config changes"),
+    }
+}
+
+fn failpoint_count(result: &Document) -> i64 {
+    match result.get("count") {
+        Some(Bson::Int32(value)) => i64::from(*value),
+        Some(Bson::Int64(value)) => *value,
+        other => panic!("configureFailPoint response missing numeric count: {other:?}"),
+    }
+}
+
+async fn enable_delete_failpoint(
+    mongo_url: &str,
+    app_name: &str,
+    collection: &str,
+) -> (MongoClient, i64) {
+    let client = MongoClient::with_uri_str(mongo_url)
+        .await
+        .expect("connect MongoDB failpoint controller");
+    let result = client
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": "alwaysOn",
+            "data": {
+                "errorCode": 1,
+                "failCommands": ["delete"],
+                "namespace": format!("{DEFAULT_MONGO_DATABASE}.{collection}"),
+                "appName": app_name,
+            }
+        })
+        .await
+        .expect("enable namespace-scoped MongoDB delete failpoint");
+    let count = failpoint_count(&result);
+    (client, count)
+}
+
+async fn disable_delete_failpoint(client: &MongoClient, initial_count: i64) {
+    let result = client
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": "off",
+        })
+        .await
+        .expect("disable MongoDB delete failpoint");
+    assert!(
+        failpoint_count(&result) > initial_count,
+        "the targeted MongoDB delete command must reach the configured failpoint"
+    );
+}
+
+fn assert_delete_error_is_redacted(
+    body: &serde_json::Value,
+    mongo_url: &str,
+    fixture: &OwnedProxyDeleteFixture,
+    spec_id: &str,
+) {
+    let rendered = body.to_string();
+    for forbidden in [
+        mongo_url,
+        fixture.proxy_id.as_str(),
+        fixture.upstream_id.as_str(),
+        fixture.plugin_id.as_str(),
+        spec_id,
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "delete error must not expose database or ownership identifiers: {body:?}"
+        );
+    }
+}
+
+/// A standalone deployment must refuse a direct delete of an API-spec-owned
+/// proxy before touching any member of the ownership graph or its change log.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_owned_proxy_delete_refuses_before_mutation() {
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("start gateway with standalone MongoDB");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let fixture = OwnedProxyDeleteFixture::new("standalone-owned-delete");
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let db = mongo_database(&mongo_url).await;
+    let before = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
+    assert_eq!(
+        before,
+        OwnedProxyDeleteSnapshot {
+            proxies: 1,
+            plugin_configs: 1,
+            api_specs: 1,
+            upstreams: 1,
+            config_changes: 3,
+        },
+        "fixture must contain the complete ownership graph before refusal"
+    );
+
+    let response = client
+        .delete(format!(
+            "{}/proxies/{}",
+            harness.admin_base_url, fixture.proxy_id
+        ))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete API-spec-owned proxy");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        501,
+        "standalone owned proxy deletion must fail closed: {body:?}"
+    );
+    assert_eq!(
+        body["error"],
+        "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FERRUM_MONGO_REPLICA_SET"),
+        "refusal must name the transaction-capable remediation: {body:?}"
+    );
+    assert_delete_error_is_redacted(&body, &mongo_url, &fixture, &spec_id);
+
+    let after = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
+    assert_eq!(
+        after, before,
+        "preflight refusal must leave proxy, plugin, owner spec, generated upstream, and config changes untouched"
+    );
+}
+
+/// Ownership metadata for another namespace must not classify a hand-managed
+/// proxy in the requested namespace as API-spec-owned.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_proxy_delete_scopes_owner_preflight_to_namespace() {
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("start gateway with standalone MongoDB");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let proxy_id = format!("namespace-owner-proxy-{}", &Uuid::new_v4().to_string()[..8]);
+    submit_hand_managed_proxy(&client, &harness, &auth_header, &proxy_id).await;
+
+    let db = mongo_database(&mongo_url).await;
+    let foreign_spec_id = format!("foreign-owner-{}", &Uuid::new_v4().to_string()[..8]);
+    db.collection::<Document>("api_specs")
+        .insert_one(doc! {
+            "_id": foreign_spec_id.as_str(),
+            "namespace": "other-namespace",
+            "proxy_id": proxy_id.as_str(),
+        })
+        .await
+        .expect("insert same-id API-spec owner in another namespace");
+
+    let response = client
+        .delete(format!("{}/proxies/{proxy_id}", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete hand-managed proxy");
+    assert_eq!(
+        response.status().as_u16(),
+        204,
+        "foreign-namespace ownership metadata must not block the requested namespace"
+    );
+    assert_eq!(
+        db.collection::<Document>("proxies")
+            .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+            .await
+            .expect("count deleted hand-managed proxy"),
+        0
+    );
+    assert_eq!(
+        db.collection::<Document>("api_specs")
+            .count_documents(
+                doc! { "_id": foreign_spec_id.as_str(), "namespace": "other-namespace" },
+            )
+            .await
+            .expect("count foreign owner metadata"),
+        1,
+        "deleting one namespace must not mutate another namespace's owner metadata"
+    );
+}
+
+/// A malformed ownership tag is still an ownership/corruption signal. The
+/// standalone path must refuse it before deleting the proxy or its change log.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_proxy_delete_refuses_malformed_ownership_stamp() {
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("start gateway with standalone MongoDB");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let proxy_id = format!("malformed-owner-proxy-{}", &Uuid::new_v4().to_string()[..8]);
+    submit_hand_managed_proxy(&client, &harness, &auth_header, &proxy_id).await;
+
+    let db = mongo_database(&mongo_url).await;
+    db.collection::<Document>("proxies")
+        .update_one(
+            doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" },
+            doc! { "$set": { "api_spec_id": 42 } },
+        )
+        .await
+        .expect("inject malformed ownership stamp");
+    let changes_before = db
+        .collection::<Document>("config_changes")
+        .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
+        .await
+        .expect("count proxy changes before refusal");
+
+    let response = client
+        .delete(format!("{}/proxies/{proxy_id}", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete proxy with malformed ownership stamp");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    let proxies_after = db
+        .collection::<Document>("proxies")
+        .count_documents(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .await
+        .expect("count proxy after refusal");
+    let changes_after = db
+        .collection::<Document>("config_changes")
+        .count_documents(doc! { "namespace": "ferrum", "resource_id": proxy_id.as_str() })
+        .await
+        .expect("count proxy changes after refusal");
+
+    // Remove the intentionally undecodable fixture before asserts so a failed
+    // expectation cannot poison the shared CI MongoDB used by later startups.
+    db.collection::<Document>("proxies")
+        .delete_one(doc! { "_id": proxy_id.as_str(), "namespace": "ferrum" })
+        .await
+        .expect("cleanup malformed ownership fixture");
+
+    assert_eq!(status.as_u16(), 501, "malformed ownership must fail closed");
+    assert_eq!(
+        body["error"],
+        "Atomic deletion of an API-spec-owned proxy is not supported by the configured database deployment"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("FERRUM_MONGO_REPLICA_SET"),
+        "refusal must name the transaction-capable remediation: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains(&proxy_id),
+        "refusal must not expose the proxy identifier: {body:?}"
+    );
+    assert_eq!(
+        proxies_after, 1,
+        "malformed ownership refusal must happen before proxy mutation"
+    );
+    assert_eq!(
+        changes_after, changes_before,
+        "malformed ownership refusal must not append config changes"
+    );
+}
+
+async fn assert_replica_set_delete_failure_rolls_back(collection: &str) {
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set");
+        return;
+    };
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_replica_set(&mongo_url, &replica_set)
+        .await
+        .expect("start gateway with MongoDB replica set");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let fixture = OwnedProxyDeleteFixture::new(collection);
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let db = mongo_database(&mongo_url).await;
+    let before = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
+    assert_eq!(
+        before,
+        OwnedProxyDeleteSnapshot {
+            proxies: 1,
+            plugin_configs: 1,
+            api_specs: 1,
+            upstreams: 1,
+            config_changes: 3,
+        },
+        "failpoint fixture must contain the complete ownership graph"
+    );
+
+    let (failpoint_client, initial_count) =
+        enable_delete_failpoint(&mongo_url, &harness.mongo_app_name, collection).await;
+    let response_result = client
+        .delete(format!(
+            "{}/proxies/{}",
+            harness.admin_base_url, fixture.proxy_id
+        ))
+        .header("Authorization", &auth_header)
+        .send()
+        .await;
+    disable_delete_failpoint(&failpoint_client, initial_count).await;
+    let response = response_result.expect("delete request with MongoDB failpoint");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        503,
+        "a failed {collection} cascade command must never report success: {body:?}"
+    );
+    assert_delete_error_is_redacted(&body, &mongo_url, &fixture, &spec_id);
+
+    let after = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
+    assert_eq!(
+        after, before,
+        "the transaction must roll back every resource and change record after {collection} deletion fails"
+    );
+}
+
+/// The owner-row delete occurs after proxy/plugin mutations inside the MongoDB
+/// transaction. Injecting failure there must abort the whole transaction.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_owner_delete_failure_rolls_back() {
+    assert_replica_set_delete_failure_rolls_back("api_specs").await;
+}
+
+/// The generated-upstream delete occurs after the owner row inside the same
+/// transaction. Injecting failure there must restore the full graph and require
+/// no convergence tombstones because nothing committed.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_owned_upstream_delete_failure_rolls_back() {
+    assert_replica_set_delete_failure_rolls_back("upstreams").await;
+}
+
+/// The transaction-capable path still removes the complete ownership graph and
+/// commits one coherent runtime deletion record for each affected resource.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_owned_proxy_delete_commits_complete_graph() {
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set");
+        return;
+    };
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_replica_set(&mongo_url, &replica_set)
+        .await
+        .expect("start gateway with MongoDB replica set");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let fixture = OwnedProxyDeleteFixture::new("transactional-owned-delete");
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+    let db = mongo_database(&mongo_url).await;
+
+    let response = client
+        .delete(format!(
+            "{}/proxies/{}",
+            harness.admin_base_url, fixture.proxy_id
+        ))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("delete API-spec-owned proxy transactionally");
+    assert_eq!(
+        response.status().as_u16(),
+        204,
+        "transactional owned proxy deletion must succeed"
+    );
+
+    let after = owned_proxy_delete_snapshot(&db, &fixture, &spec_id).await;
+    assert_eq!(after.proxies, 0, "proxy must be deleted");
+    assert_eq!(after.plugin_configs, 0, "scoped plugin must be deleted");
+    assert_eq!(after.api_specs, 0, "owning API spec must be deleted");
+    assert_eq!(after.upstreams, 0, "generated upstream must be deleted");
+    assert_eq!(
+        after.config_changes, 6,
+        "three create records plus three coherent delete records must remain"
+    );
+
+    for (resource_type, resource_id) in [
+        ("proxy", fixture.proxy_id.as_str()),
+        ("plugin_config", fixture.plugin_id.as_str()),
+        ("upstream", fixture.upstream_id.as_str()),
+    ] {
+        let delete_changes = db
+            .collection::<Document>("config_changes")
+            .count_documents(doc! {
+                "namespace": "ferrum",
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "operation": "delete",
+            })
+            .await
+            .expect("count coherent delete change");
+        assert_eq!(
+            delete_changes, 1,
+            "transaction must emit exactly one delete record for {resource_type}"
+        );
+    }
 }

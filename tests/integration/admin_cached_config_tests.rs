@@ -7009,6 +7009,90 @@ async fn test_upstream_duplicate_name_returns_409() {
     assert_eq!(status, 409, "Duplicate name should return 409: {:?}", body);
 }
 
+#[tokio::test]
+async fn concurrent_upstream_create_same_name_one_succeeds_one_409() {
+    // Issue #2999: with namespace admission serialization + the durable
+    // (namespace, name) unique index, raced POSTs must not both commit.
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream_a = json!({
+        "id": "race-u-a",
+        "name": "raced-admin-name",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let upstream_b = json!({
+        "id": "race-u-b",
+        "name": "raced-admin-name",
+        "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+    });
+
+    let (result_a, result_b) = tokio::join!(
+        admin_post(&base_url, "/upstreams", &token, &upstream_a),
+        admin_post(&base_url, "/upstreams", &token, &upstream_b),
+    );
+
+    let statuses = [result_a.0, result_b.0];
+    let bodies = [&result_a.1, &result_b.1];
+    let created = statuses.iter().filter(|&&s| s == 201).count();
+    let conflicts = statuses.iter().filter(|&&s| s == 409).count();
+    assert_eq!(
+        created, 1,
+        "exactly one POST must return 201; statuses={statuses:?}, bodies={bodies:?}"
+    );
+    assert_eq!(
+        conflicts, 1,
+        "exactly one POST must return 409; statuses={statuses:?}, bodies={bodies:?}"
+    );
+
+    let (list_status, list_body, _) = admin_get(&base_url, "/upstreams", &token).await;
+    assert_eq!(list_status, 200);
+    let items = list_body["data"]
+        .as_array()
+        .expect("upstream list must expose data array");
+    let named: Vec<_> = items
+        .iter()
+        .filter(|item| item["name"].as_str() == Some("raced-admin-name"))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "exactly one upstream with the raced name must remain: {list_body:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_upstream_keeping_own_name_returns_200() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "keep-name-u1",
+        "name": "stable-name",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    let updated = json!({
+        "id": "keep-name-u1",
+        "name": "stable-name",
+        "targets": [{"host": "10.0.0.1", "port": 9090, "weight": 100}]
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/keep-name-u1", &token, &updated).await;
+    assert_eq!(
+        status, 200,
+        "PUT keeping the same name must succeed: {:?}",
+        body
+    );
+    assert_eq!(body["name"], "stable-name");
+    assert_eq!(body["targets"][0]["port"], 9090);
+}
+
 // ---- Cluster Status Endpoint Tests ----
 
 #[tokio::test]

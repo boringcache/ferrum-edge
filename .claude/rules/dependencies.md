@@ -65,3 +65,6 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - HTTP/3 graceful close with a buffered response is not a false 502:
   `tests/integration/http3_integration_tests.rs` +
   `tests/functional/scripted_backend_h3_tests.rs`.
+- Tungstenite `auto_pong` opt-out (issue #2963): vendored `--lib auto_pong`,
+  `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, and functional
+  H1/H2/H3 Ping transparency tests in `functional_websocket_test.rs`.

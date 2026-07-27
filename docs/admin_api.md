@@ -837,6 +837,11 @@ Deletes the spec and cascades:
 - Spec-owned **proxy** is deleted → FK cascade removes its plugins (including any added manually after import).
 - Spec-owned **upstream** is deleted if present. Upstreams without `api_spec_id` survive.
 - Calling `DELETE /proxies/{id}` directly also removes the spec row via the `ON DELETE CASCADE` FK constraint.
+- On standalone MongoDB, direct deletion of an API-spec-owned proxy returns
+  `501 Not Implemented` before mutating the proxy, scoped plugins, owner spec,
+  generated upstreams, or config-change rows. Configure
+  `FERRUM_MONGO_REPLICA_SET` (or a `replicaSet` URL option) and retry. Direct
+  deletion of a hand-managed proxy remains supported.
 - Before a direct delete of an API-spec-owned proxy, Ferrum re-reads the
   current upstream and every cascade plugin with ownership metadata intact.
   Hand-owned rows remain hand-owned; foreign API-spec ownership, missing rows,
@@ -875,7 +880,7 @@ Deletes the spec and cascades:
 | `POST /api-specs` | Created; tagged with `api_spec_id` | — |
 | `PUT /api-specs/{id}` | Replaced (deleted + re-inserted) | Survive unchanged |
 | `DELETE /api-specs/{id}` | Proxy + plugins deleted; spec-owned upstream deleted | Non-spec upstreams survive |
-| `DELETE /proxies/{id}` | Spec row deleted by FK cascade | — |
+| `DELETE /proxies/{id}` | Proxy, spec row, scoped plugins, and generated upstreams deleted atomically on SQL/replica-set MongoDB; standalone MongoDB refuses before mutation | — |
 
 ### Mode behavior
 
@@ -1229,7 +1234,7 @@ JWT-authenticated, mesh-only introspection of the data plane's view of multiclus
 Two views are returned:
 
 - `discovered` — remote clusters this DP has successfully polled over the native `MeshSubscribe` stream (cross-cluster endpoint discovery), keyed and sorted by `cluster_name`, each with per-cluster `workload_count` / `service_count`, the `fetched_at_unix_seconds` of the last successful poll, and the derived `age_seconds`. `age_seconds` measures time since the last successful **poll**, not the last endpoint **change**: a stable cluster whose endpoints have not changed still has its `fetched_at_unix_seconds` refreshed on every successful poll, so a healthy-but-static remote cluster does not look stale. This view is scoped to the **accepted** slice's configured remote clusters (matched by `cluster_name` and `trust_domain`): a cluster present in the discovery store but absent from the accepted config — e.g. left over from a slice the proxy rejected — is omitted, so an invalid slice never appears as live discovery. Empty when discovery is disabled (`FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS` is `0`), no slice has been accepted, no remote cluster is trust-eligible, or no poll has succeeded yet.
-- `configured` — remote clusters declared in the **accepted** slice's multicluster config: name, trust domain, network, and whether a control plane (`control_plane_configured`) / federation endpoint (`federation_endpoint_configured`) is set. Each carries a `discovered` flag cross-referencing the scoped `discovered` view, plus `outbound_trust_active`, `inbound_trust_active`, `trust_source`, and polled-bundle freshness when available so asymmetric trust and fail-closed bootstrap are visible.
+- `configured` — remote clusters declared in the **accepted** slice's multicluster config: name, trust domain, network, and whether a control plane (`control_plane_configured`) / federation endpoint (`federation_endpoint_configured`) is set, plus the derived `discovery_audience` (`ferrum-mesh-discovery:<cluster_name>`, present only when a control plane is configured) this data plane binds that cluster's remote-discovery token to — the peer control plane's `FERRUM_MESH_CLUSTER_AUDIENCE` must produce the same value or the poll is refused. Each carries a `discovered` flag cross-referencing the scoped `discovered` view, plus `outbound_trust_active`, `inbound_trust_active`, `trust_source`, and polled-bundle freshness when available so asymmetric trust and fail-closed bootstrap are visible.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/mesh/remote-clusters
@@ -1258,6 +1263,7 @@ Response:
       "network": "net2",
       "control_plane_configured": true,
       "federation_endpoint_configured": true,
+      "discovery_audience": "ferrum-mesh-discovery:remote-east",
       "discovered": true,
       "outbound_trust_active": true,
       "inbound_trust_active": true,
