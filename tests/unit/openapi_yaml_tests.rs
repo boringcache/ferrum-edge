@@ -5050,8 +5050,10 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         "mirror_request_body": false
     });
     assert_component_validity(&spec, "RequestMirrorConfig", &typo, false);
-    let err = RequestMirror::new(&typo, PluginHttpClient::default())
-        .expect_err("misspelled protocol key must fail admission");
+    let err = match RequestMirror::new(&typo, PluginHttpClient::default()) {
+        Ok(_) => panic!("misspelled protocol key must fail admission"),
+        Err(err) => err,
+    };
     assert!(err.contains("mirror_protcol"), "got: {err}");
     assert!(err.contains("allowed keys"), "got: {err}");
     validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
