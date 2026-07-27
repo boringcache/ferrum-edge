@@ -3,7 +3,9 @@
 use ferrum_edge::PluginCache;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, Proxy};
 use ferrum_edge::plugins::api_chargeback::{
-    ApiChargeback, ChargebackRegistry, InstanceScope, ProtocolFamily, global_registry,
+    ApiChargeback, ChargebackRegistry, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_RETAINED_BYTES,
+    InstanceScope, OVERFLOW_CONSUMER_SENTINEL, ProtocolFamily, empty_charges_json,
+    empty_charges_prometheus, global_registry, try_global_registry,
 };
 use ferrum_edge::plugins::chargeback::pricing::{
     MAX_UNIT_PRICE, checked_add_charge, checked_mul_quantity,
@@ -16,6 +18,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Registry budgets used by tests that only care about the other tunables.
+const TEST_MAX_ENTRIES: usize = DEFAULT_MAX_ENTRIES;
+const TEST_MAX_BYTES: usize = DEFAULT_MAX_RETAINED_BYTES;
 
 /// Default per-instance scope used by registry tests (USD / "ferrum").
 fn scope() -> InstanceScope {
@@ -566,6 +572,8 @@ fn test_unknown_keys_rejected_by_schema_and_runtime() {
             "stale_entry_ttl_seconds",
             "cache_invalidation_min_age_ms",
             "cleanup_interval_seconds",
+            "max_entries",
+            "max_retained_bytes",
         ]
     );
 }
@@ -1002,7 +1010,7 @@ fn test_prometheus_render_empty() {
 #[test]
 fn test_prometheus_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     registry.record_http(
         &s,
@@ -1043,7 +1051,7 @@ fn test_prometheus_render_with_data() {
 #[test]
 fn test_prometheus_render_emits_stream_metrics() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.record_stream(
         &scope(),
         "bob",
@@ -1066,7 +1074,7 @@ fn test_prometheus_render_emits_stream_metrics() {
 #[test]
 fn test_prometheus_render_bandwidth_aggregates_across_status_codes() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     registry.record_http(
         &s, "charlie", "proxy-x", "API", 200, 0.0, 1_000, 10_000, 0.0000001, 0.0000002,
@@ -1124,7 +1132,7 @@ async fn test_cleanup_interval_reconfigures_across_reload_values() {
 #[test]
 fn test_json_render_with_data() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope_for("EUR", "ferrum");
 
     for _ in 0..100 {
@@ -1176,7 +1184,7 @@ fn test_json_render_with_data() {
 #[test]
 fn test_json_render_includes_bandwidth() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.record_http(
         &scope(),
         "alice",
@@ -1200,7 +1208,7 @@ fn test_json_render_includes_bandwidth() {
 #[test]
 fn test_json_render_includes_stream_section() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.record_stream(
         &scope(),
         "alice",
@@ -1512,7 +1520,7 @@ fn test_multiple_pricing_tiers() {
 #[test]
 fn test_prometheus_render_namespace_present_for_default() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.record_http(
         &scope_for("USD", "ferrum"),
         "alice",
@@ -1534,7 +1542,7 @@ fn test_prometheus_render_namespace_present_for_default() {
 #[test]
 fn test_prometheus_render_namespace_present_for_non_default() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.record_http(
         &scope_for("USD", "staging"),
         "bob",
@@ -1563,7 +1571,7 @@ fn test_prometheus_render_namespace_present_for_non_default() {
 #[test]
 fn test_per_instance_currency_and_namespace_not_last_writer_wins() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
 
     // Instance A: USD / namespace "team-a", recording for proxy-a.
     let scope_a = scope_for("USD", "team-a");
@@ -1755,7 +1763,7 @@ fn test_same_proxy_records_stay_partitioned_by_instance_scope() {
 #[test]
 fn test_json_top_level_currency_single_when_uniform() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope_for("GBP", "ferrum");
     registry.record_http(&s, "alice", "proxy-a", "API", 200, 1.0, 0, 0, 0.0, 0.0);
     registry.record_http(&s, "bob", "proxy-b", "API", 200, 1.0, 0, 0, 0.0, 0.0);
@@ -1776,7 +1784,7 @@ fn test_json_top_level_currency_single_when_uniform() {
 #[test]
 fn test_http_and_stream_share_proxy_id_render_is_deterministic() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
 
     // HTTP entry: 100 bytes sent / 200 received under (alice, proxy-1, 200).
@@ -2010,7 +2018,7 @@ fn assert_bandwidth_only_stream_and_websocket_reconcile(
 #[test]
 fn test_bandwidth_only_stream_then_websocket_keeps_families_distinct() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     // Stream first: zero connection price + identical directional bandwidth rates.
     registry.record_stream(&s, "alice", "edge", "Edge", 0.0, 100, 200, 0.001, 0.001);
@@ -2021,7 +2029,7 @@ fn test_bandwidth_only_stream_then_websocket_keeps_families_distinct() {
 #[test]
 fn test_websocket_then_bandwidth_only_stream_keeps_families_distinct() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     // WebSocket first: reverse insertion order of the colliding status-0 key.
     registry.record_websocket_bandwidth(&s, "alice", "edge", "Edge", 50, 75, 0.001, 0.001);
@@ -2119,7 +2127,7 @@ fn assert_json_and_prometheus_proxy_name_agree(
 #[test]
 fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
     let s = scope();
     let price = 0.001;
@@ -2270,7 +2278,7 @@ fn assert_rename_plus_price_overlap(
 #[test]
 fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
 
@@ -2289,7 +2297,7 @@ fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
 #[test]
 fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v2"));
 
@@ -2376,7 +2384,7 @@ async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
 #[test]
 fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
 
     // Leave active_proxy_names empty so exporters must use admission fallbacks.
@@ -2435,7 +2443,7 @@ fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
 #[test]
 fn test_render_cache_hits_until_proxy_metadata_generation_advances() {
     let registry = ChargebackRegistry::new();
-    registry.configure(60, 3600, 500);
+    registry.configure(60, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let s = scope();
     registry.set_active_proxy_names(active_proxy_names("ferrum", "payments", "Payments v1"));
     record_payment(&registry, &s, "Payments v1", 0.001);
@@ -2869,7 +2877,7 @@ fn test_mixed_currency_export_still_succeeds_with_finite_prices() {
 #[test]
 fn test_json_mixed_currency_consumer_totals_partitioned_not_summed() {
     let registry = ChargebackRegistry::new();
-    registry.configure(5, 3600, 500);
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     let usd = scope_for("USD", "team-usd");
     let eur = scope_for("EUR", "team-eur");
 
@@ -3495,4 +3503,699 @@ fn test_validate_composition_resolves_associations_by_namespace_and_id() {
     ferrum_edge::plugins::api_chargeback::validate_composition(&config).unwrap_or_else(|err| {
         panic!("same-id plugin in another namespace must not attach: {err:?}")
     });
+}
+
+// --- Billing identity integrity (GHSA-m28c-f3v5-26qg) ---
+
+/// Two identities that share a long prefix must never collapse onto one
+/// registry entry. Before the fix, any prefix-truncating bound would have
+/// merged both principals' calls and charges into a single billed row.
+#[test]
+fn test_shared_prefix_identities_stay_distinct_entries() {
+    let registry = ChargebackRegistry::new();
+    let prefix = "p".repeat(4096);
+    let alice = format!("{prefix}alice");
+    let bob = format!("{prefix}bob");
+
+    for consumer in [alice.as_str(), bob.as_str()] {
+        registry.record_http(
+            &scope(),
+            consumer,
+            "proxy-a",
+            "My API",
+            200,
+            0.00001,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+
+    assert_eq!(
+        registry.entries.len(),
+        2,
+        "shared-prefix identities must not merge into one billed principal"
+    );
+    let mut consumers: Vec<String> = registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().consumer.to_string())
+        .collect();
+    consumers.sort();
+    assert_ne!(consumers[0], consumers[1]);
+    for consumer in &consumers {
+        assert!(
+            consumer.contains("~sha256:"),
+            "oversized identity must carry a digest, got: {consumer}"
+        );
+        assert_eq!(
+            registry
+                .entries
+                .iter()
+                .filter(|entry| entry.value().consumer.as_ref() == consumer.as_str())
+                .count(),
+            1
+        );
+    }
+}
+
+/// An identity within the bound is retained byte-for-byte, so ordinary rows
+/// stay directly reconcilable against the identity provider.
+#[test]
+fn test_bounded_identity_is_verbatim_within_the_limit() {
+    let registry = ChargebackRegistry::new();
+    let consumer = "u".repeat(512);
+    registry.record_http(
+        &scope(),
+        &consumer,
+        "proxy-a",
+        "My API",
+        200,
+        0.00001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    let entry = registry.entries.iter().next().unwrap();
+    assert_eq!(entry.value().consumer.as_ref(), consumer.as_str());
+}
+
+/// The digest form must stay bounded and must not split a multibyte character.
+#[test]
+fn test_bounded_identity_is_multibyte_safe_and_bounded() {
+    let registry = ChargebackRegistry::new();
+    let consumer = "é".repeat(600);
+    registry.record_http(
+        &scope(),
+        &consumer,
+        "proxy-a",
+        "My API",
+        200,
+        0.00001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+    let entry = registry.entries.iter().next().unwrap();
+    let stored = entry.value().consumer.to_string();
+    assert!(stored.len() <= 512, "bounded identity exceeded 512 bytes");
+    assert!(stored.is_char_boundary(stored.len()));
+    assert!(stored.contains("~sha256:"));
+}
+
+// --- Registry cardinality budget (GHSA-wxmv-8mwr-92xf) ---
+
+fn record_identity(registry: &ChargebackRegistry, consumer: &str) {
+    registry.record_http(
+        &scope(),
+        consumer,
+        "proxy-a",
+        "My API",
+        200,
+        0.00001,
+        0,
+        0,
+        0.0,
+        0.0,
+    );
+}
+
+/// Distinct identities beyond `max_entries` must not grow the registry, and
+/// their charges must survive in the fixed-cardinality aggregate row.
+#[test]
+fn test_identity_budget_caps_entries_without_losing_charges() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+
+    for index in 0..50 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    assert_eq!(
+        registry.reserved_entries_for_tests(),
+        2,
+        "retained-row slots must stop at max_entries"
+    );
+    // Two ordinary billing rows plus one aggregate overflow row.
+    assert_eq!(registry.entries.len(), 3);
+
+    let overflow: u64 = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    let identity_calls: u64 = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() != OVERFLOW_CONSUMER_SENTINEL)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(
+        overflow + identity_calls,
+        50,
+        "every billable call must survive admission refusal"
+    );
+    assert_eq!(overflow, 48);
+}
+
+/// An ordinary/external identity equal to the old human-looking overflow label
+/// (or to the current internal sentinel string) must never share the aggregate
+/// overflow row. The sentinel lives in the digest-form class, so
+/// `bounded_billing_identity` remaps those values onto distinct principals.
+#[test]
+fn test_ordinary_identity_equal_to_overflow_label_does_not_collide() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+
+    const OLD_RESERVED_LOOKING: &str = "__cardinality_overflow__";
+    record_identity(&registry, OLD_RESERVED_LOOKING);
+    record_identity(&registry, OVERFLOW_CONSUMER_SENTINEL);
+
+    assert_eq!(registry.entries.len(), 2);
+    let consumers: Vec<String> = registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().consumer.to_string())
+        .collect();
+    assert!(
+        consumers.iter().any(|c| c == OLD_RESERVED_LOOKING),
+        "old human-looking label must remain a verbatim ordinary identity"
+    );
+    assert!(
+        consumers
+            .iter()
+            .any(|c| c != OLD_RESERVED_LOOKING && c != OVERFLOW_CONSUMER_SENTINEL),
+        "sentinel-equal identity must be digested away from the internal overflow row"
+    );
+    assert!(
+        consumers
+            .iter()
+            .all(|c| c.as_str() != OVERFLOW_CONSUMER_SENTINEL),
+        "no real principal may land on the internal overflow sentinel"
+    );
+
+    // Saturate the remaining identity slots and force overflow aggregation.
+    record_identity(&registry, "user-fill");
+    // max_entries=2: OLD + digested-sentinel already occupy both slots, so
+    // user-fill and further identities fold into overflow.
+    for index in 0..5 {
+        record_identity(&registry, &format!("overflow-extra-{index}"));
+    }
+
+    let overflow_entry = registry
+        .entries
+        .iter()
+        .find(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+        .expect("overflow aggregate row must exist after budget exhaustion");
+    let overflow_calls = overflow_entry.value().call_count.load(Ordering::Relaxed);
+    assert!(
+        overflow_calls >= 5,
+        "overflow row must retain folded charges, got {overflow_calls}"
+    );
+
+    let old_label_calls: u64 = registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() == OLD_RESERVED_LOOKING)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(
+        old_label_calls, 1,
+        "ordinary identity equal to the old label must keep its own unmerged charge"
+    );
+
+    // Identity rows stay at the budget; overflow is fixed-cardinality (one row
+    // for these matching non-identity dimensions).
+    assert_eq!(registry.reserved_entries_for_tests(), 2);
+    assert_eq!(
+        registry
+            .entries
+            .iter()
+            .filter(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+            .count(),
+        1
+    );
+}
+
+/// An operator-configured Consumer username equal to the old reserved-looking
+/// label or the current internal sentinel must also stay off the overflow row.
+/// Both paths enter the registry through the same billing-identity bound.
+#[test]
+fn test_configured_consumer_username_equal_to_overflow_label_does_not_collide() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 4, TEST_MAX_BYTES);
+
+    const OLD_RESERVED_LOOKING: &str = "__cardinality_overflow__";
+    // Simulate Consumer.username values that look like (or equal) the overflow
+    // representation reaching record_http unchanged.
+    record_identity(&registry, OLD_RESERVED_LOOKING);
+    record_identity(&registry, OVERFLOW_CONSUMER_SENTINEL);
+    record_identity(&registry, "legitimate-consumer");
+
+    let by_consumer: HashMap<String, u64> = registry
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.value().consumer.to_string(),
+                entry.value().call_count.load(Ordering::Relaxed),
+            )
+        })
+        .collect();
+
+    assert_eq!(by_consumer.get(OLD_RESERVED_LOOKING), Some(&1));
+    assert_eq!(by_consumer.get("legitimate-consumer"), Some(&1));
+    assert!(
+        !by_consumer.contains_key(OVERFLOW_CONSUMER_SENTINEL),
+        "configured username equal to the sentinel must not create the overflow row"
+    );
+    assert_eq!(by_consumer.len(), 3);
+
+    // Force overflow and confirm the username rows stay separate while overflow
+    // absorbs only the refused identities.
+    registry.configure(5, 3600, 500, 3, TEST_MAX_BYTES);
+    for index in 0..10 {
+        record_identity(&registry, &format!("extra-{index}"));
+    }
+    assert_eq!(
+        by_consumer_calls(&registry, OLD_RESERVED_LOOKING),
+        1,
+        "configured username must not merge with overflow charges"
+    );
+    assert_eq!(by_consumer_calls(&registry, "legitimate-consumer"), 1);
+    assert!(by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL) >= 10);
+    assert_eq!(
+        registry
+            .entries
+            .iter()
+            .filter(|entry| entry.value().consumer.as_ref() == OVERFLOW_CONSUMER_SENTINEL)
+            .count(),
+        1,
+        "overflow aggregation must remain fixed-cardinality"
+    );
+}
+
+fn by_consumer_calls(registry: &ChargebackRegistry, consumer: &str) -> u64 {
+    registry
+        .entries
+        .iter()
+        .filter(|entry| entry.value().consumer.as_ref() == consumer)
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// The retained-byte ceiling is hard: it holds even when the identity slot
+/// ceiling is generous.
+#[test]
+fn test_retained_byte_budget_is_a_hard_ceiling() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, 4096);
+
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    assert!(
+        registry.retained_bytes_for_tests() <= 4096,
+        "retained bytes {} exceeded the configured ceiling",
+        registry.retained_bytes_for_tests()
+    );
+}
+
+/// TTL eviction must return capacity so a saturated registry recovers.
+#[test]
+fn test_eviction_releases_budget_capacity() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+
+    record_identity(&registry, "user-a");
+    record_identity(&registry, "user-b");
+    assert_eq!(registry.reserved_entries_for_tests(), 2);
+    let saturated_bytes = registry.retained_bytes_for_tests();
+    assert!(saturated_bytes > 0);
+
+    // Evict everything (ttl of 0 nanos makes every entry stale).
+    registry.evict_stale(0);
+    assert_eq!(registry.entries.len(), 0);
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+    assert_eq!(registry.retained_bytes_for_tests(), 0);
+
+    record_identity(&registry, "user-c");
+    assert_eq!(registry.reserved_entries_for_tests(), 1);
+}
+
+/// Saturation must be observable without exporting any raw identity.
+#[test]
+fn test_registry_saturation_is_exported_without_identities() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, 1, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    record_identity(&registry, "user-b");
+
+    let prometheus = registry.render_prometheus().unwrap();
+    assert!(prometheus.contains("ferrum_api_chargeback_registry_entries 1"));
+    assert!(prometheus.contains("ferrum_api_chargeback_registry_max_entries 1"));
+    assert!(prometheus.contains("ferrum_api_chargeback_registry_retained_bytes "));
+    assert!(prometheus.contains("ferrum_api_chargeback_identity_overflow_total 1"));
+    assert!(prometheus.contains("ferrum_api_chargeback_dropped_charges_total 0"));
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(rendered["registry"]["entries"], 1);
+    assert_eq!(rendered["registry"]["max_entries"], 1);
+    assert_eq!(rendered["registry"]["identity_overflow_total"], 1);
+    assert_eq!(rendered["registry"]["dropped_charges_total"], 0);
+    assert_eq!(
+        rendered["registry"]["overflow_consumer_id"],
+        OVERFLOW_CONSUMER_SENTINEL
+    );
+}
+
+/// A zero budget is a configuration error, not an "unlimited" mode.
+#[test]
+fn test_zero_budget_values_are_rejected() {
+    for key in ["max_entries", "max_retained_bytes"] {
+        let config = json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+            key: 0,
+        });
+        let error = ApiChargeback::new(&config, "ferrum")
+            .err()
+            .expect("zero budget must be rejected");
+        assert!(error.contains(key), "unexpected error: {error}");
+        assert!(
+            error.contains("greater than 0"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// The bounded representation must be injective. An actor who knows another
+/// principal's long identity must not be able to present that identity's
+/// *representation* as a short identity and be billed into the same row.
+#[test]
+fn test_bounded_identity_representation_is_not_forgeable() {
+    let registry = ChargebackRegistry::new();
+    let victim = "v".repeat(4096);
+    record_identity(&registry, &victim);
+    let victim_representation = registry
+        .entries
+        .iter()
+        .next()
+        .unwrap()
+        .value()
+        .consumer
+        .to_string();
+    assert!(victim_representation.contains("~sha256:"));
+    assert!(victim_representation.len() <= 512);
+
+    record_identity(&registry, &victim_representation);
+    assert_eq!(
+        registry.entries.len(),
+        2,
+        "a replayed representation must not land in the victim's row"
+    );
+}
+
+/// Construction must leave the process-global registry untouched: admin
+/// validation and staged-but-rejected generations both build an instance, and
+/// neither may repoint the budgets the live generation is using.
+#[tokio::test]
+async fn test_construction_does_not_mutate_shared_registry_budgets() {
+    let registry = global_registry();
+    let before_entries = registry.max_entries_for_test();
+    let before_bytes = registry.max_retained_bytes_for_test();
+
+    let config = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+        "max_entries": before_entries + 1234,
+        "max_retained_bytes": before_bytes + 4096,
+    });
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    assert_eq!(registry.max_entries_for_test(), before_entries);
+    assert_eq!(registry.max_retained_bytes_for_test(), before_bytes);
+
+    // Only an accepted generation publishes the tunables.
+    plugin.commit_background_tasks();
+    assert_eq!(registry.max_entries_for_test(), before_entries + 1234);
+    assert_eq!(registry.max_retained_bytes_for_test(), before_bytes + 4096);
+
+    // Restore the process-global defaults for sibling tests in this binary.
+    registry.configure(5, 3600, 500, before_entries, before_bytes);
+}
+
+/// The identity ceiling must hold under concurrent cold-path inserts, and no
+/// billable call may be lost or double-counted while renders run alongside.
+#[test]
+fn test_identity_budget_holds_under_concurrent_recording_and_render() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 200;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, 16, TEST_MAX_BYTES);
+    let barrier = Arc::new(Barrier::new(THREADS + 1));
+
+    let mut handles = Vec::new();
+    for thread_index in 0..THREADS {
+        let registry = Arc::clone(&registry);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for index in 0..PER_THREAD {
+                record_identity(&registry, &format!("user-{thread_index}-{index}"));
+            }
+        }));
+    }
+
+    let render_registry = Arc::clone(&registry);
+    let render_barrier = Arc::clone(&barrier);
+    let renderer = thread::spawn(move || {
+        render_barrier.wait();
+        for _ in 0..25 {
+            render_registry.render_prometheus().unwrap();
+            render_registry.render_json().unwrap();
+        }
+    });
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    renderer.join().unwrap();
+
+    assert!(
+        registry.reserved_entries_for_tests() <= 16,
+        "identity ceiling was exceeded: {}",
+        registry.reserved_entries_for_tests()
+    );
+    assert!(registry.retained_bytes_for_tests() <= TEST_MAX_BYTES);
+    let total_calls: u64 = registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(
+        total_calls,
+        (THREADS * PER_THREAD) as u64,
+        "every recorded call must be attributed exactly once"
+    );
+}
+
+/// `max_entries` reserves one slot per complete registry entry key, not per
+/// distinct principal. The same identity across multiple billable statuses
+/// therefore consumes multiple slots, and a further new status overflows.
+#[test]
+fn test_same_identity_multi_status_consumes_distinct_entry_slots() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
+    let s = scope();
+
+    registry.record_http(&s, "alice", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.record_http(&s, "alice", "proxy-a", "API", 404, 0.001, 0, 0, 0.0, 0.0);
+
+    assert_eq!(
+        registry.reserved_entries_for_tests(),
+        2,
+        "same identity at two statuses must occupy two max_entries slots"
+    );
+    assert_eq!(registry.entries.len(), 2);
+    assert_eq!(by_consumer_calls(&registry, "alice"), 2);
+
+    // A third status for the same principal is a new row and must overflow.
+    registry.record_http(&s, "alice", "proxy-a", "API", 500, 0.001, 0, 0, 0.0, 0.0);
+
+    assert_eq!(
+        registry.reserved_entries_for_tests(),
+        2,
+        "max_entries must not grow for the third status row"
+    );
+    assert_eq!(
+        registry.entries.len(),
+        3,
+        "two ordinary rows plus one overflow aggregate"
+    );
+    assert_eq!(
+        by_consumer_calls(&registry, "alice"),
+        2,
+        "admitted status rows keep per-identity attribution"
+    );
+    assert_eq!(
+        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL),
+        1,
+        "refused new status row loses only per-identity attribution"
+    );
+
+    let prometheus = registry.render_prometheus_uncached().unwrap();
+    assert!(prometheus.contains(
+        "Billing rows (complete registry entry keys) currently retained against max_entries"
+    ));
+    assert!(prometheus.contains("ferrum_api_chargeback_identity_overflow_total 1"));
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    assert_eq!(json["registry"]["entries"], 2);
+    assert_eq!(json["registry"]["max_entries"], 2);
+    assert_eq!(json["registry"]["identity_overflow_total"], 1);
+}
+
+/// `DashMap::with_shard_amount` panics when the shard count is not a power of
+/// two strictly greater than one. Empty `/charges` helpers must use the
+/// dedicated minimum valid shard constant, not `1`.
+#[test]
+fn test_empty_charges_render_uses_valid_dashmap_shard_amount() {
+    const MIN_VALID: usize = 2;
+    assert!(
+        MIN_VALID.is_power_of_two() && MIN_VALID > 1,
+        "DashMap requires a power of two strictly greater than one"
+    );
+    let source = include_str!("../../../src/plugins/api_chargeback.rs");
+    assert!(
+        source.contains("EMPTY_CHARGES_RENDER_SHARD_AMOUNT"),
+        "empty /charges render must use the dedicated valid shard constant"
+    );
+    assert!(
+        !source.contains("with_shard_amount(1)"),
+        "with_shard_amount(1) panics in DashMap; empty render must not use it"
+    );
+}
+
+/// Authenticated empty `/charges` must not claim the process-global OnceLock.
+/// Otherwise a scrape before any `api_chargeback` plugin is configured locks
+/// auto sharding in and a later accepted generation cannot honor
+/// `PluginHttpClient::pool_shard_amount()`.
+#[test]
+fn test_unconfigured_charges_render_does_not_claim_global_registry() {
+    let claimed_before = try_global_registry().is_some();
+
+    let json = empty_charges_json().expect("empty JSON shape");
+    let prom = empty_charges_prometheus().expect("empty Prometheus shape");
+
+    assert_eq!(
+        try_global_registry().is_some(),
+        claimed_before,
+        "empty /charges helpers must not initialize CHARGEBACK_REGISTRY"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed["currency"], "USD");
+    assert!(parsed["consumers"].as_object().unwrap().is_empty());
+    assert_eq!(parsed["registry"]["entries"], 0);
+    assert_eq!(parsed["registry"]["max_entries"], DEFAULT_MAX_ENTRIES);
+    assert_eq!(
+        parsed["registry"]["max_retained_bytes"],
+        DEFAULT_MAX_RETAINED_BYTES
+    );
+    assert_eq!(
+        parsed["registry"]["overflow_consumer_id"],
+        OVERFLOW_CONSUMER_SENTINEL
+    );
+    assert!(prom.contains("ferrum_api_chargeable_calls_total"));
+    assert!(prom.contains(&format!(
+        "ferrum_api_chargeback_registry_max_entries {DEFAULT_MAX_ENTRIES}"
+    )));
+}
+
+/// When the process-global registry is still unset, empty scrapes must leave
+/// the first-writer window open so an accepted generation can create the hot
+/// map with `PluginHttpClient::pool_shard_amount()`. Creation-time shard amount
+/// is what `OnceLock` freezes; pin that contract without racing sibling tests
+/// on the process singleton.
+#[test]
+fn test_request_before_plugin_then_reload_honors_configured_shard_amount() {
+    let claimed_before = try_global_registry().is_some();
+    let _ = empty_charges_json().unwrap();
+    let _ = empty_charges_prometheus().unwrap();
+    assert_eq!(
+        try_global_registry().is_some(),
+        claimed_before,
+        "pre-plugin /charges must remain non-owning"
+    );
+
+    const CONFIGURED_SHARDS: usize = 64;
+    let registry = ChargebackRegistry::with_shard_amount(CONFIGURED_SHARDS);
+    assert_eq!(
+        registry.shard_amount_for_tests(),
+        CONFIGURED_SHARDS,
+        "owning construction must size the entry map with the configured shard count"
+    );
+
+    let plugin_source = include_str!("../../../src/plugins/api_chargeback.rs");
+    assert!(
+        plugin_source.contains("global_registry_with_shard_amount(shard_amount)"),
+        "ApiChargeback::new_with_shard_amount must pass the configured shard count into owning init"
+    );
+    let factory = include_str!("../../../src/plugins/mod.rs");
+    assert!(
+        factory.contains("api_chargeback::ApiChargeback::new_with_shard_amount")
+            && factory.contains("http_client.pool_shard_amount()"),
+        "plugin factory must thread pool_shard_amount into api_chargeback construction"
+    );
+
+    // Construction still resolves the (possibly already-created) singleton
+    // without panicking; shard count stays whatever the first owning writer set.
+    let config = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }],
+    });
+    let plugin =
+        ApiChargeback::new_with_shard_amount(&config, "ferrum", CONFIGURED_SHARDS).unwrap();
+    assert_eq!(
+        plugin.registry_shard_amount_for_tests(),
+        global_registry().shard_amount_for_tests()
+    );
+}
+
+/// Admin `GET /charges` must use the non-owning try path, not claim the
+/// registry with auto sharding.
+#[test]
+fn test_admin_charges_path_is_non_owning_when_unconfigured() {
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let charges_idx = admin
+        .find("if path == \"/charges\" && method == Method::GET")
+        .expect("/charges handler");
+    let next_route = admin[charges_idx + 1..]
+        .find("if path == \"/charges/sink/status\"")
+        .map(|offset| charges_idx + 1 + offset)
+        .unwrap_or(admin.len());
+    let charges_block = &admin[charges_idx..next_route];
+    assert!(
+        charges_block.contains("try_global_registry"),
+        "GET /charges must use try_global_registry"
+    );
+    assert!(
+        charges_block.contains("empty_charges_json")
+            && charges_block.contains("empty_charges_prometheus"),
+        "GET /charges must render empty shapes without claiming the registry"
+    );
+    // `try_global_registry()` contains the substring `global_registry()`; strip
+    // the non-owning helper so this assertion only catches owning calls.
+    let without_try = charges_block.replace("try_global_registry()", "");
+    assert!(
+        !without_try.contains("global_registry()"),
+        "GET /charges must not call owning global_registry()"
+    );
 }

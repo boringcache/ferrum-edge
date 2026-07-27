@@ -44,6 +44,7 @@ adding, removing, or materially changing a workflow.
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
+| `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
 | `claude-review.yml` | Claude PR Review | `@claude review` issue comment on PRs | Maintainer-triggered AI review comments. |
 | `cleanup-pending-reviews.yml` | Cleanup Pending Deployment Reviews | Schedule, manual | Clears stale pending deployment review state. |
 | `prune-stale-prs.yml` | Prune Stale PRs and Branches | Schedule, manual | Repository hygiene for stale PRs/branches. |
@@ -309,10 +310,14 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 
 **Runs**: `ubuntu-latest`
 
-Runs on full-mode PRs, pushes to `main`, and manual dispatches. PRs first apply a
-performance-sensitive path filter; unrelated PRs skip the expensive benchmark
-and report success. The PR gate covers proxy and connection hot paths, the
-file-mode startup path used by this benchmark, performance fixtures, and
+Runs on full-mode PRs, pushes to `main`, and manual dispatches. Immediately after
+checkout, the job always runs lightweight protocol-perf static validation (no
+benchmarks): workflow verifier `--self-test`, repository-contract verification,
+evaluator `--self-test`, and `python3 -m py_compile` on
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
+apply a performance-sensitive path filter; unrelated PRs skip the expensive
+benchmark and report success. The PR gate covers proxy and connection hot paths,
+the file-mode startup path used by this benchmark, performance fixtures, and
 dependency/build-graph inputs. Plugin-internal, admin, secrets, and unrelated
 operating-mode changes are excluded because this plain HTTP/1.1 file-mode route
 cannot observe them. If the PR diff cannot be computed, the benchmark runs to

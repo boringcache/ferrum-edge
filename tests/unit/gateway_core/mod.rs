@@ -25,6 +25,7 @@ mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 mod health_check_tests;
 mod http3_config_tests;
+mod http3_peer_identity_tests;
 mod http3_selected_target_policy_tests;
 mod http3_server_dispatch_tests;
 mod http3_websocket_tests;

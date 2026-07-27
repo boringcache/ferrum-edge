@@ -21357,10 +21357,26 @@ components:
         proxy-group-scoped, or mixed attachments on one proxy are rejected
         because the process-global `/charges` registry has no ledger/instance
         dimension. Distinct proxies may each attach one instance (including
-        different currencies/pricing). Shared render/cleanup tunables
+        different currencies/pricing). Shared render/cleanup/budget tunables
         (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
-        `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) must
+        `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`,
+        `max_entries`, `max_retained_bytes`) must
         agree across every enabled instance in the process.
+        Cardinality budget: the shared registry retains at most `max_entries`
+        billing rows (complete registry entry keys) and at most
+        `max_retained_bytes` of state. Keys include consumer, proxy, status,
+        protocol family, currency, namespace, and prices, so one principal can
+        occupy many slots. A new row beyond either ceiling is not dropped —
+        its charges are folded into a fixed-cardinality aggregate row whose
+        `consumer` label is the internal sentinel
+        `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
+        preserving billable totals while losing only per-identity attribution.
+        That sentinel lives in the digest-form billing-identity class, so a real
+        authenticated or configured identity can never share its registry key.
+        Billing identities are never prefix-truncated: an external identity
+        claim above 512 bytes is rejected at authentication, and any remaining
+        oversized value is represented as a prefix plus a domain-separated
+        SHA-256 digest of the complete value.
       properties:
         currency:
           type: string
@@ -21469,6 +21485,30 @@ components:
           description: |
             How often (seconds) the background task evicts entries that have
             been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
+        max_entries:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: |
+            Hard ceiling on retained billing rows (complete registry entry keys)
+            in the shared /charges registry. One principal can occupy many slots
+            because keys also include proxy, status, protocol family, currency,
+            namespace, and prices. Charges for a new row beyond this ceiling are
+            folded into the fixed-cardinality internal overflow aggregate row
+            (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
+            instead of being dropped — per-identity attribution is lost; invoice
+            totals are preserved. 0 is rejected — there is no unlimited mode.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
+        max_retained_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: |
+            Hard ceiling on estimated retained registry bytes, covering ordinary
+            billing rows and aggregate overflow rows together. 0 is rejected.
             Process-global: every enabled api_chargeback instance must use the
             same value.
 
@@ -21985,6 +22025,48 @@ components:
         generated_at:
           type: string
           format: date-time
+        registry:
+          type: object
+          description: |
+            Fixed-cardinality admission-budget snapshot for the shared registry.
+            Contains no identity values. `entries` / `max_entries` count retained
+            billing rows (complete registry entry keys), not distinct principals.
+            `identity_overflow_total` counts charges folded into the aggregate
+            overflow row after a new row could not be admitted under
+            `max_entries` (billable totals preserved, per-identity attribution
+            lost); `dropped_charges_total` counts charges that could not be
+            retained at all, which is only reachable when `max_retained_bytes`
+            is too small for the configured proxy/status matrix.
+          properties:
+            entries:
+              type: integer
+              description: |
+                Billing rows (complete registry entry keys) currently retained
+                against max_entries.
+            max_entries:
+              type: integer
+              description: Configured ceiling on retained billing rows.
+            retained_bytes:
+              type: integer
+              description: Estimated bytes retained across ordinary and aggregate rows.
+            max_retained_bytes:
+              type: integer
+              description: Configured ceiling on retained registry bytes.
+            identity_overflow_total:
+              type: integer
+              description: |
+                Charges folded into the aggregate overflow row because a new
+                billing row could not be admitted.
+            dropped_charges_total:
+              type: integer
+              description: Charges lost because no row could be admitted.
+            overflow_consumer_id:
+              type: string
+              description: |
+                Internal `consumer` value carrying aggregated overflow charges.
+                Lives in the digest-form billing-identity class so a real
+                principal can never share this registry key.
+              example: "__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1"
         consumers:
           type: object
           additionalProperties:

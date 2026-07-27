@@ -143,6 +143,32 @@ With `auth_mode: single` (the default), authentication plugins are tried in prio
 
 In either mode, rejected, not-applicable, and principal-less attempts leave no claim headers, external identity header, mesh principal, rolling session cookie, or backend token-stripping state for another credential to inherit. Requester-owned cookies from rejected attempts are retained only when authentication ultimately rejects and are merged with the selected rejection's cookies by effective RFC 10025 storage key (case-sensitive name, canonicalized reg-name or bracketed IP-literal Domain with omitted Domain resolved to the validated request host, computed host-only state, Path after RFC default-path resolution, and Partitioned state); a later successful credential discards them. Malformed cookie-pairs, including control-bearing values, a trimmed name/value pair over 4096 octets, or invalid Domain syntax, and cookies that fail browser storage requirements for Secure (accounting for direct TLS, HTTPS reported by a peer in `FERRUM_TRUSTED_PROXIES`, and trustworthy localhost/loopback origins), HttpOnly-constrained `__Http-`/`__Host-Http-` prefixes, Partitioned, SameSite=None, or `__Secure-`/`__Host-` prefixes replace only byte-identical lines. After authentication, the Access Control plugin can apply consumer or group policy.
 
+## Authenticated Principal Size Limit
+
+An authentication mechanism may accept a verified external identity claim as the
+request principal even when no configured Consumer matches. That value is
+issuer- and often subject-controlled, so Ferrum enforces one canonical bound at
+the single boundary where an attempt becomes the authoritative principal: an
+external identity claim (or its display/header variant) larger than **512 UTF-8
+bytes** is rejected with `403` and a message that reports only the limit and the
+observed length — the identity itself is never echoed or logged.
+
+The limit is deliberately a rejection, not a truncation. Every downstream
+consumer of the principal (billing rows, rate-limit and cache keys, log
+summaries, backend identity headers) needs a bounded value, and any component
+that bounded it by prefix truncation would silently merge two distinct
+principals that share a prefix into one — for chargeback that means one invoice
+covering two customers (GHSA-m28c-f3v5-26qg). Rejecting at the boundary keeps
+every accepted principal collision-free by construction. Mapped Consumer
+usernames are configuration-controlled and are governed by the admin API's own
+username validation instead.
+
+Practical effect: `mtls_auth`, `jwks_auth`, `jwt_auth`, `oauth2_introspection`,
+`oidc_relying_party`, `ldap_auth`, `hmac_auth`, `key_auth`, `basic_auth`, and
+`soap_ws_security` all commit through this boundary. A deployment whose issuer
+can mint identity claims above 512 bytes must shorten the configured identity
+claim (for example use `sub` rather than a bundle of encoded attributes).
+
 ## Consumer Identity Headers
 
 When a request is successfully authenticated, the gateway automatically injects identity headers:
@@ -1426,8 +1452,67 @@ would otherwise each receive the same transaction summary and inflate
 `total_calls` and charges. Distinct proxies may each attach their own instance
 (including different `currency` / pricing). Only one enabled global instance is
 allowed process-wide because unmatched/fallback paths retain the global chain.
-The four shared render/cleanup tunables must agree across every enabled instance
-in the process, making registry behavior independent of construction order.
+The six shared render/cleanup/budget tunables must agree across every enabled
+instance in the process, making registry behavior independent of construction
+order.
+
+**Identity cardinality budget (GHSA-wxmv-8mwr-92xf):** Ferrum accepts a verified
+external identity as the request principal even when no configured Consumer
+matches, so the number of distinct billing identities is not bounded by
+configuration. The shared registry therefore admits at most `max_entries`
+retained billing rows (complete registry entry keys) and at most
+`max_retained_bytes` of retained state. A registry key includes consumer,
+proxy, billable status, protocol family, currency, namespace, and prices, so one
+authenticated principal can occupy many slots. Once either ceiling is reached,
+further *new rows* are not dropped: their charges are folded into a
+fixed-cardinality aggregate row whose `consumer` label is the internal sentinel
+`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
+keeping every other dimension (proxy, billable status, protocol family,
+currency, namespace, prices) intact so invoice totals still reconcile — only
+per-identity attribution is lost when a new row cannot be admitted. That
+sentinel lives in the digest-form
+billing-identity class (`~sha256:` marker, non-hex suffix), so
+`bounded_billing_identity` can never return it for a real authenticated claim
+or operator-configured Consumer username — including one equal to the
+human-looking label `__cardinality_overflow__` or to the sentinel string
+itself.
+Already-admitted rows keep accumulating normally and capacity is recovered
+by ordinary `stale_entry_ttl_seconds` eviction. Admission pressure is exported
+as fixed-cardinality, identity-free series
+(`ferrum_api_chargeback_registry_entries`,
+`ferrum_api_chargeback_registry_max_entries`,
+`ferrum_api_chargeback_registry_retained_bytes`,
+`ferrum_api_chargeback_registry_max_retained_bytes`,
+`ferrum_api_chargeback_identity_overflow_total`,
+`ferrum_api_chargeback_dropped_charges_total`) and as the `registry` object in
+the JSON format. `dropped_charges_total` is the only genuine loss path: it can
+advance only when even the aggregate row cannot reserve bytes, which means
+`max_retained_bytes` is set below the space the configured proxy/status matrix
+needs. Because `/charges` renders the whole registry in one pass, render cost is
+bounded by `max_entries`; size it for the row cardinality you are willing to
+scrape.
+Neither budget accepts `0` — there is no unlimited mode. Budgets (and the other
+process-global tunables) are applied only once a plugin generation is accepted
+and installed, so admin validation and a rejected reload candidate never repoint
+the registry the live generation is still using. Lowering a budget never deletes
+retained billable state: existing entries keep their reservations and drain
+through normal TTL eviction while new rows overflow until occupancy falls
+back under the ceiling. Authenticated `GET /charges` before any
+`api_chargeback` plugin is configured returns the empty response shape without
+creating the process-global registry, so a later accepted generation can still
+size the hot map with its configured pool shard count.
+
+**Billing identity integrity (GHSA-m28c-f3v5-26qg):** a verified external
+identity larger than 512 bytes is rejected at authentication with `403` rather
+than being shortened, so an oversized claim never becomes a request principal.
+Identity values that still need bounding inside the registry (for example a very
+long operator-configured Consumer username) keep a readable prefix plus a
+domain-separated SHA-256 digest of the complete value. A plain prefix is never
+used as a registry key, so two identities sharing a prefix can never collapse
+into one billed principal. The overflow aggregate row uses a distinct internal
+sentinel in that same digest-form class, so neither an ordinary identity equal
+to `__cardinality_overflow__` nor one equal to the sentinel string itself can
+share the overflow row's key.
 
 **Proxy identity and `proxy_name` contract:** charge rows are keyed by the
 matched proxy's `(namespace, proxy_id)`, including when one gateway-wide global
@@ -1490,6 +1575,8 @@ are HTTP/gRPC only).
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
+| `max_entries` | Integer | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
+| `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
@@ -1498,8 +1585,8 @@ authentication policy.
 
 | Query Parameter | Description |
 |---|---|
-| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum |
+| _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels. Registry saturation is additionally exported as the identity-free gauges/counters `ferrum_api_chargeback_registry_entries`, `ferrum_api_chargeback_registry_max_entries`, `ferrum_api_chargeback_registry_retained_bytes`, `ferrum_api_chargeback_registry_max_retained_bytes`, `ferrum_api_chargeback_identity_overflow_total`, and `ferrum_api_chargeback_dropped_charges_total` |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum. A top-level `registry` object reports admission budget occupancy (`entries` / `max_entries` count retained billing rows / complete entry keys, not distinct principals; also `retained_bytes`, `max_retained_bytes`, `identity_overflow_total`, `dropped_charges_total`, `overflow_consumer_id`) with no identity values |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and
@@ -2259,7 +2346,7 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
-| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
 | `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming) and must contain a non-whitespace value. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |

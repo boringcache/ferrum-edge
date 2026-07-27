@@ -684,10 +684,10 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites, inbound + outbound (see [TLS Policy Hardening](frontend_tls.md#tls-policy-hardening)) |
 | `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | No | `X25519,secp256r1` | Comma-separated key exchange groups, inbound + outbound. `FERRUM_TLS_CURVES` is accepted as an alias |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation (inbound only) |
-| `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | TLS session resumption cache size (inbound only, TLS 1.2 stateful session IDs) |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | Inbound TLS stateful session cache size: TLS 1.2 session IDs and HTTP/3 server 0-RTT sessions when early data is enabled on a non-mTLS listener |
 | `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | No | `30` | Warn when configured certificates expire within this many days; `0` disables warnings |
 | `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` | No | `300` | Maximum age of the cached, non-secret TLS inventory snapshot behind the `/metrics` certificate gauges. Scrapes read the snapshot only (no certificate/key/Kubernetes/secret-manager I/O) and schedule a single-flight background refresh once it is older than this bound; `0` disables the refresh and leaves the gauges absent |
-| `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
+| `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data. For HTTP/3 without frontend mTLS, enabling this sets QUIC rustls `max_early_data_size` to `u32::MAX` (the only enabled size quinn accepts; there is no finite QUIC TLS byte cap) and Ferrum enforces the method allowlist at admission. HTTPS/H1/H2 currently keep rustls 0-RTT disabled until per-request early-data state is available. Inert for HTTP/3 when `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set: the H3 listener sets QUIC rustls `max_early_data_size` to `0`, keeps the full 1-RTT handshake (a startup warning records this), and frontend H3 mTLS keeps working |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
 
