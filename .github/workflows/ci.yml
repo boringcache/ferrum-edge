@@ -343,6 +343,11 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Run ACME outbound-boundary regressions
+        run: cargo test --features acme --lib tls::acme::client::tests
+        env:
+          RUST_BACKTRACE: 1
+
   test-secrets:
     name: Secret Backends
     needs: ci-plan

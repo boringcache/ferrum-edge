@@ -659,7 +659,7 @@ pub(super) async fn handle_create_acme_order(
             Ok(store) => store,
             Err(response) => return Ok(*response),
         };
-        let (record, overwrite) = match acme_order_record_from_request(request).await {
+        let (record, overwrite) = match acme_order_record_from_request(state, request).await {
             Ok(value) => value,
             Err(error) => {
                 return Ok(super::json_response(
@@ -765,7 +765,17 @@ pub(super) async fn handle_finalize_acme_order(
             ));
         };
 
+        let dns_cache = match acme_dns_cache(state) {
+            Ok(dns_cache) => dns_cache,
+            Err(error) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_GATEWAY,
+                    &json!({"error": error}),
+                ));
+            }
+        };
         let complete_config = crate::tls::acme::client::CompleteAcmeHttp01OrderConfig {
+            directory_url: order.directory_url.clone(),
             account_credentials_json: crate::tls::source::SecretString::new(
                 account_credentials_json,
             ),
@@ -773,6 +783,7 @@ pub(super) async fn handle_finalize_acme_order(
             poll_timeout: Duration::from_secs(
                 request.poll_timeout_seconds.unwrap_or(60).clamp(1, 600),
             ),
+            dns_cache,
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -999,17 +1010,20 @@ pub(super) async fn handle_renew_acme_certificate(
                 ));
             }
         };
-        let (record, overwrite) = match acme_order_record_from_request(AcmeOrderRequest {
-            id: Some(renewal_order_id),
-            certificate_id: Some(certificate_id.to_string()),
-            domains: certificate.domains,
-            directory_url: certificate.directory_url,
-            contact: request.contact,
-            terms_of_service_agreed: request.terms_of_service_agreed,
-            challenge_type: request.challenge_type,
-            existing_account_credentials_json,
-            allow_overwrite: request.allow_overwrite,
-        })
+        let (record, overwrite) = match acme_order_record_from_request(
+            state,
+            AcmeOrderRequest {
+                id: Some(renewal_order_id),
+                certificate_id: Some(certificate_id.to_string()),
+                domains: certificate.domains,
+                directory_url: certificate.directory_url,
+                contact: request.contact,
+                terms_of_service_agreed: request.terms_of_service_agreed,
+                challenge_type: request.challenge_type,
+                existing_account_credentials_json,
+                allow_overwrite: request.allow_overwrite,
+            },
+        )
         .await
         {
             Ok(value) => value,
@@ -1895,7 +1909,16 @@ fn acme_certificate_record_from_request(
 }
 
 #[cfg(feature = "acme")]
+fn acme_dns_cache(state: &AdminState) -> Result<crate::dns::DnsCache, String> {
+    if let Some(proxy) = state.proxy_state.as_ref() {
+        return Ok(proxy.dns_cache.clone());
+    }
+    crate::tls::acme::client::configured_acme_dns_cache().map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "acme")]
 async fn acme_order_record_from_request(
+    state: &AdminState,
     request: AcmeOrderRequest,
 ) -> Result<(AcmeOrderRecord, bool), String> {
     let id = managed_request_id(None, request.id.as_deref())?;
@@ -1920,6 +1943,7 @@ async fn acme_order_record_from_request(
             existing_credentials_json: existing_account_credentials_json,
         },
         domains: domains.clone(),
+        dns_cache: acme_dns_cache(state)?,
     };
 
     let prepared = match challenge_type {
