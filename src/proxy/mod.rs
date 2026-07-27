@@ -409,12 +409,10 @@ pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_
 pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
 
 /// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
-/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
-/// transformations operate on the decoded parameter map, which cannot be
-/// reconciled with `serverless_function`'s raw-query payload without losing the
-/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
-/// preserve, so the serverless egress fails closed on the composition rather than
-/// emitting a payload that silently ignores the operator's query transform.
+/// actually mutated the ordered outbound query (add/remove/update/rename).
+/// Downstream consumers that previously failed closed on this marker can now
+/// read [`RequestContext::outbound_query_string`] / the auth-composed effective
+/// query instead of rebuilding from the untransformed raw string.
 pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
 
 /// True when a `Content-Encoding` field-line declares a coding other than
@@ -20862,7 +20860,8 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
+    let effective_query_string =
+        effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -29860,6 +29859,32 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
     } else {
         Cow::Borrowed(query_string)
     }
+}
+
+/// Canonical backend-visible query: transformer-published outbound query when
+/// present (including empty), otherwise the retained raw wire query, then
+/// authentication-owned credential strips. Ordinary no-transform / no-strip
+/// requests borrow the raw string with no allocation.
+pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    let base = match ctx.outbound_query_string() {
+        Some(q) => q,
+        None => ctx.raw_query_string().unwrap_or(""),
+    };
+    query_string_after_plugin_strips(ctx, base)
+}
+
+/// Same as [`effective_backend_query_string`], but prefer a caller-held raw
+/// query borrow when no outbound transform was published (avoids an extra
+/// Option dance on the H1/H2 hot path that already owns `query_string`).
+pub(crate) fn effective_backend_query_string_with_raw<'a>(
+    ctx: &'a RequestContext,
+    raw_query: &'a str,
+) -> Cow<'a, str> {
+    let base = match ctx.outbound_query_string() {
+        Some(q) => q,
+        None => raw_query,
+    };
+    query_string_after_plugin_strips(ctx, base)
 }
 
 pub(crate) fn record_status(state: &ProxyState, status: u16) {

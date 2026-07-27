@@ -3138,8 +3138,10 @@ async fn handle_h3_request(
         &mut proxy_headers,
         &state.mesh_egress_strip_baggage_keys,
     );
-    let effective_query_string =
-        crate::proxy::query_string_after_plugin_strips(&ctx, &query_string);
+    let effective_query_string = crate::proxy::effective_backend_query_string_with_raw(
+        &ctx,
+        &query_string,
+    );
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,

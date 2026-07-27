@@ -16919,10 +16919,16 @@ components:
           type: string
           enum: [add, remove, update, rename]
           description: |
-            add: insert if absent (does not overwrite).
-            update: write the query parameter value.
-            remove: delete the query parameter.
-            rename: move old → new query parameter name.
+            add: append if the decoded name is absent (does not overwrite;
+            existing duplicates are left untouched).
+            update: rewrite every matching decoded-name pair's value, or
+            append when absent.
+            remove: delete every matching decoded-name pair.
+            rename: rename every matching pair, preserving value encoding
+            and key-without-equals shape; existing destination names stay.
+            Mutations apply to an ordered, duplicate-aware representation of
+            the retained raw query and are published as the outbound query
+            for every primary backend URL builder and request_mirror.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.
@@ -16931,15 +16937,20 @@ components:
           const: query
         key:
           type: string
-          description: Query parameter name.
+          description: |
+            Query parameter name matched after percent-decoding. Must not
+            contain CR or LF.
         value:
           type: string
           description: |
             Required for add/update; must not be set for remove/rename.
+            Must not contain CR or LF. Authored onto the outbound query with
+            RFC 3986 percent-encoding (`%20` for spaces, never `+`).
         new_key:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not contain CR or LF.
 
     RequestTransformerBodyRule:
       type: object

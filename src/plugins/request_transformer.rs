@@ -14,10 +14,31 @@
 //! - Every configured header `value` must parse as an HTTP `HeaderValue`
 //!   (same complete syntax accepted at H1/H2/H3 emission). CR/LF keep a
 //!   dedicated diagnostic; other forbidden control bytes fail the same gate.
+//! - Query `value` / `new_key` / `key` strings must not contain CR or LF
+//!   (injection into the request-target). Names and values are otherwise
+//!   percent-encoded when authored onto the outbound query.
 //! - Rules are split into `header_rules` and `query_rules` so the hot path
 //!   does not dispatch on target strings per request, and so
 //!   [`modifies_request_headers`] returns an accurate answer (which lets the
 //!   handler skip cloning `ctx.headers` for query-only or body-only configs).
+//!
+//! ## Query mutation contract
+//!
+//! Query rules mutate an ordered, duplicate-aware representation derived from
+//! the retained raw wire query (not the single-value `query_params` map). The
+//! serialized result is published on
+//! [`RequestContext::publish_transformed_query`] so every primary dispatch
+//! surface and `request_mirror` compose the same canonical outbound query with
+//! authentication-owned strips. Unmodified pairs keep their original encoding;
+//! the ordinary no-query-rule path allocates nothing and leaves the raw query
+//! untouched.
+//!
+//! Duplicate-name semantics (decoded names):
+//! - `add`: append only when the name is absent; existing duplicates stay.
+//! - `update`: rewrite every matching pair's value; append when absent.
+//! - `remove`: drop every matching pair.
+//! - `rename`: rename every matching pair, preserving value encoding and
+//!   key-without-equals shape; existing destination names are left in place.
 //!
 //! ## Per-rule overrides from `mesh_route_dispatch`
 //!
@@ -57,6 +78,7 @@ use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
+use super::utils::query::OrderedQuery;
 use super::utils::route_header_transform::{
     RouteHeaderTransformRule, apply_route_header_transforms,
 };
@@ -190,6 +212,19 @@ fn validate_configured_header_value(value: &str, idx: usize) -> Result<(), Strin
     HeaderValue::from_str(value).map_err(|_| {
         format!("request_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue")
     })?;
+    Ok(())
+}
+
+fn validate_configured_query_string_field(
+    field: &str,
+    value: &str,
+    idx: usize,
+) -> Result<(), String> {
+    if contains_crlf(value) {
+        return Err(format!(
+            "request_transformer: rule[{idx}]: query '{field}' must not contain CR or LF"
+        ));
+    }
     Ok(())
 }
 
@@ -372,6 +407,13 @@ impl RequestTransformer {
                         new_key,
                     });
                 } else {
+                    validate_configured_query_string_field("key", &raw_key, idx)?;
+                    if let Some(ref v) = value {
+                        validate_configured_query_string_field("value", v, idx)?;
+                    }
+                    if let Some(ref nk) = raw_new_key {
+                        validate_configured_query_string_field("new_key", nk, idx)?;
+                    }
                     query_rules.push(QueryRule {
                         operation: qop,
                         key: raw_key,
@@ -473,6 +515,13 @@ impl Plugin for RequestTransformer {
         !self.body_rules.is_empty()
     }
 
+    fn requires_decoded_query_params(&self) -> bool {
+        // Query rules match on percent-decoded names. Opt H3 into the same
+        // decoded map H1/H2 already use so later plugins observing
+        // `ctx.query_params` after a transform stay coherent across protocols.
+        !self.query_rules.is_empty()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -514,48 +563,8 @@ impl Plugin for RequestTransformer {
                 }
             }
         }
-        let mut query_mutated = false;
-        for rule in &self.query_rules {
-            match rule.operation {
-                QueryOp::Add => {
-                    if let Some(ref val) = rule.value {
-                        let before = ctx.query_params.len();
-                        ctx.query_params
-                            .entry(rule.key.clone())
-                            .or_insert_with(|| val.clone());
-                        query_mutated |= ctx.query_params.len() != before;
-                    }
-                }
-                QueryOp::Update => {
-                    if let Some(ref val) = rule.value {
-                        ctx.query_params.insert(rule.key.clone(), val.clone());
-                        query_mutated = true;
-                    }
-                }
-                QueryOp::Remove => {
-                    query_mutated |= ctx.query_params.remove(&rule.key).is_some();
-                }
-                QueryOp::Rename => {
-                    if let Some(ref new_key) = rule.new_key
-                        && let Some(val) = ctx.query_params.remove(&rule.key)
-                    {
-                        ctx.query_params.insert(new_key.clone(), val);
-                        query_mutated = true;
-                    }
-                }
-            }
-        }
-        if query_mutated {
-            // Signal the decoded-query transform so a downstream raw-query
-            // consumer (`serverless_function`) can fail closed rather than emit a
-            // payload rebuilt from the untransformed raw query string. The
-            // transform lands on `ctx.query_params`, which the backend request
-            // URL does not re-serialize, so this marker is the only faithful
-            // record that operator query intent diverged from the raw wire query.
-            ctx.metadata.insert(
-                crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
-                "true".to_string(),
-            );
+        if !self.query_rules.is_empty() {
+            apply_query_rules(self, ctx);
         }
         // Per-rule header transforms published by `mesh_route_dispatch`
         // run AFTER this plugin's static rules so route-level writes win on
@@ -589,4 +598,73 @@ impl Plugin for RequestTransformer {
         }
         body_transform::apply_body_rules(body, &self.body_rules)
     }
+}
+
+fn apply_query_rules(plugin: &RequestTransformer, ctx: &mut RequestContext) {
+    // Prefer an earlier transformer's published outbound query, then the
+    // retained raw wire query, then the decoded map for synthetic contexts.
+    // Starting from raw after a prior instance already mutated would undo
+    // earlier ordered rules when multiple request_transformer instances run.
+    let mut ordered = if let Some(outbound) = ctx.outbound_query_string() {
+        OrderedQuery::parse(outbound)
+    } else if let Some(raw) = ctx.raw_query_string() {
+        OrderedQuery::parse(raw)
+    } else if !ctx.query_params.is_empty() {
+        OrderedQuery::from_map(&ctx.query_params)
+    } else {
+        OrderedQuery::new()
+    };
+
+    let mut query_mutated = false;
+    for rule in &plugin.query_rules {
+        match rule.operation {
+            QueryOp::Add => {
+                if let Some(ref val) = rule.value {
+                    let changed = ordered.add(&rule.key, val);
+                    if changed {
+                        // Log only the parameter name — never the value (may be secret).
+                        debug!("request_transformer: added query param {}", rule.key);
+                    }
+                    query_mutated |= changed;
+                }
+            }
+            QueryOp::Update => {
+                if let Some(ref val) = rule.value {
+                    query_mutated |= ordered.update(&rule.key, val);
+                    debug!("request_transformer: updated query param {}", rule.key);
+                }
+            }
+            QueryOp::Remove => {
+                let changed = ordered.remove(&rule.key);
+                if changed {
+                    debug!("request_transformer: removed query param {}", rule.key);
+                }
+                query_mutated |= changed;
+            }
+            QueryOp::Rename => {
+                if let Some(ref new_key) = rule.new_key {
+                    let changed = ordered.rename(&rule.key, new_key);
+                    if changed {
+                        debug!(
+                            "request_transformer: renamed query param {} -> {}",
+                            rule.key, new_key
+                        );
+                    }
+                    query_mutated |= changed;
+                }
+            }
+        }
+    }
+
+    if !query_mutated {
+        return;
+    }
+
+    // Keep the plugin-visible map coherent with the ordered outbound query
+    // (last occurrence wins), without forcing later consumers to re-parse.
+    ctx.publish_transformed_query(ordered.serialize(), ordered.to_single_value_map());
+    ctx.metadata.insert(
+        crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
 }
