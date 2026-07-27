@@ -437,7 +437,7 @@ jobs:
       - name: Initialize SoftHSM token
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens" "$RUNNER_TEMP/pkcs11"
           cat > "$RUNNER_TEMP/softhsm/softhsm2.conf" <<EOF
           directories.tokendir = $RUNNER_TEMP/softhsm/tokens
           objectstore.backend = file
@@ -446,10 +446,27 @@ jobs:
           EOF
           export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm/softhsm2.conf"
           softhsm2-util --init-token --free --label ferrum-ci --so-pin 1234 --pin 123456
+
+          # Two distinct RSA keys are generated in software so a certificate can
+          # be issued for exactly one of them, then both are imported into the
+          # token. `edge-rsa` pairs with the certificate; `edge-rsa-mismatch`
+          # does not, which is what the key-match tests need (issue #2406).
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa.key"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa-mismatch.key"
+          openssl req -x509 -new -sha256 -days 365 \
+            -key "$RUNNER_TEMP/pkcs11/edge-rsa.key" \
+            -subj "/CN=ferrum-pkcs11-ci" \
+            -addext "subjectAltName=DNS:localhost" \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa.crt"
+
+          softhsm2-util --import "$RUNNER_TEMP/pkcs11/edge-rsa.key" \
+            --token ferrum-ci --pin 123456 --label edge-rsa --id 01
+          softhsm2-util --import "$RUNNER_TEMP/pkcs11/edge-rsa-mismatch.key" \
+            --token ferrum-ci --pin 123456 --label edge-rsa-mismatch --id 02
           pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
-            --login --pin 123456 --token-label ferrum-ci \
-            --keypairgen --key-type rsa:2048 \
-            --label edge-rsa --id 01 --usage-sign
+            --login --pin 123456 --token-label ferrum-ci --list-objects
           echo "SOFTHSM2_CONF=$SOFTHSM2_CONF" >> "$GITHUB_ENV"
 
       - name: Run PKCS#11 signer smoke test
@@ -458,6 +475,19 @@ jobs:
           FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
           FERRUM_PKCS11_PIN: "123456"
           FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          RUST_BACKTRACE: 1
+
+      # Token-key / leaf-certificate pairing coverage. Run single threaded:
+      # PKCS#11 module initialization and token login state are process-global
+      # on common providers, so independent test contexts must not race.
+      - name: Run PKCS#11 certificate-pairing tests
+        run: cargo test --features pkcs11 --test unit_tests tls::pkcs11 -- --include-ignored --test-threads=1
+        env:
+          FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
+          FERRUM_PKCS11_PIN: "123456"
+          FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          FERRUM_PKCS11_TEST_MISMATCHED_KEY_SOURCE: "pkcs11://edge-rsa-mismatch?pin_env=FERRUM_PKCS11_PIN&id_hex=02"
+          FERRUM_PKCS11_TEST_CERT_PATH: "${{ runner.temp }}/pkcs11/edge-rsa.crt"
           RUST_BACKTRACE: 1
 
   build-test-artifacts:
