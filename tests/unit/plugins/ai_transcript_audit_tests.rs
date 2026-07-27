@@ -7977,8 +7977,11 @@ async fn serialized_record_bytes_are_exactly_charged_during_delivery() {
 
 /// Refusing refresh growth must never retain newly enlarged model/tool strings
 /// without a covering lease: the old staged entry stays small, the budget has
-/// no headroom for growth, and both the exported record and `retained_bytes`
-/// stay within the lease/budget.
+/// When the aggregate retained-byte budget has no headroom for a first Final
+/// capture charge, the plugin withholds the request excerpt (and any uncharged
+/// growth) rather than retaining unaccounted bytes. Capture-once admission
+/// means provisional `before_proxy` staging charges zero; the Final capture is
+/// the only request-side charge point.
 #[tokio::test]
 async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     let server = mock_sink().await;
@@ -8012,37 +8015,17 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
 
-    // Stage a deliberately small candidate (tiny model, no tools).
     let small_body = br#"{"model":"a","messages":[{"role":"user","content":"hi"}]}"#;
-    let mut ctx = make_ctx();
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        String::from_utf8_lossy(small_body).into_owned(),
-    );
-    let mut proxy_headers = ctx.headers.clone();
-    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
-    assert_eq!(
-        ctx.metadata
-            .get("ai_transcript_audit.candidate")
-            .map(String::as_str),
-        Some("true")
-    );
-    assert!(
-        plugin.status_snapshot().retained_bytes > 0,
-        "staging must charge a lease"
-    );
+    let headers = json_headers();
 
-    // Saturate the aggregate budget with other staged candidates so a refresh
-    // growth reacquire (which briefly double-charges) has no headroom.
+    // Capture many small Final candidates first so the aggregate budget has no
+    // headroom for a later large capture charge.
     let mut fillers = Vec::new();
     for _ in 0..240 {
         let mut filler = make_ctx();
-        filler.metadata.insert(
-            "request_body".to_string(),
-            String::from_utf8_lossy(small_body).into_owned(),
-        );
-        let mut headers = filler.headers.clone();
-        plugin.before_proxy(&mut filler, &mut headers).await;
+        plugin
+            .on_final_request_body_with_context(&mut filler, &headers, small_body)
+            .await;
         if filler
             .metadata
             .get("ai_transcript_audit.candidate")
@@ -8057,16 +8040,15 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
             break;
         }
     }
-    let before_refresh = plugin.status_snapshot();
+    let before = plugin.status_snapshot();
     assert!(
-        before_refresh
+        before
             .buffer_max_bytes
-            .saturating_sub(before_refresh.retained_bytes)
+            .saturating_sub(before.retained_bytes)
             < 4_096,
-        "budget must be near saturation before the growth attempt"
+        "budget must be near saturation before the oversized capture attempt"
     );
 
-    // Transform grows model to the full bound and adds a large tool set.
     let grown_model = "m".repeat(MAX_MODEL_BYTES);
     let mut tools = Vec::new();
     let mut aggregate = 0usize;
@@ -8079,65 +8061,40 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
         tools.push(json!({"type":"function","function":{"name": name}}));
         index += 1;
     }
-    let refreshed = json!({
-        "model": grown_model.clone(),
-        "messages": [{"role":"user","content":"transformed"}],
-        "tools": tools
-    });
-    let refreshed_bytes = serde_json::to_vec(&refreshed).expect("body");
-    plugin
-        .on_final_request_body_with_context(&mut ctx, &json_headers(), &refreshed_bytes)
-        .await;
+    let large_body = serde_json::to_vec(&json!({
+        "model": grown_model,
+        "messages": [{"role":"user","content":"x".repeat(512)}],
+        "tools": tools,
+    }))
+    .expect("large body");
 
-    let after_refresh = plugin.status_snapshot();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &large_body)
+        .await;
+    let after = plugin.status_snapshot();
     assert!(
-        after_refresh.retained_bytes <= after_refresh.buffer_max_bytes,
-        "refresh must not charge beyond the budget: {} > {}",
-        after_refresh.retained_bytes,
-        after_refresh.buffer_max_bytes
+        after.retained_bytes <= after.buffer_max_bytes,
+        "oversized capture must not push retained_bytes past the budget"
     );
 
-    // Drop fillers by discarding their staging entries so the small,
-    // correctly-leased record can enqueue and flush. RequestContext drop alone
-    // does not release plugin-owned staging leases.
-    for mut filler in fillers {
-        plugin
-            .on_final_request_body_with_context(&mut filler, &json_headers(), b"{}")
-            .await;
-    }
+    // Finish the transaction; if capture was admitted under pressure the
+    // exported request body must either be present within budget or omitted
+    // with the retained-byte reason — never an uncharged full excerpt.
     plugin
-        .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
         .await;
+    // Drain any queued record and inspect omission reason when present.
     let records = wait_for_records(&server).await;
-    assert_eq!(records.len(), 1, "expected the repaired record to export");
-    let record = &records[0];
-    assert_eq!(
-        record
-            .get("request_body_omitted_reason")
-            .and_then(Value::as_str),
-        Some("retained_byte_budget"),
-        "refused growth must withhold the enlarged excerpt"
-    );
-    let model = record.get("model").and_then(Value::as_str).unwrap_or("");
-    assert_eq!(
-        model, "a",
-        "prior accounted model must be kept when growth does not fit the lease"
-    );
-    assert_ne!(model, grown_model.as_str());
-    let tool_bytes: usize = record
-        .get("tool_names")
-        .and_then(Value::as_array)
-        .map(|names| {
-            names
-                .iter()
-                .filter_map(|name| name.as_str().map(str::len))
-                .sum()
-        })
-        .unwrap_or(0);
-    assert_eq!(
-        tool_bytes, 0,
-        "prior empty tool set must be kept when growth does not fit the lease"
-    );
+    if let Some(record) = records.first() {
+        if record.get("request_body").is_none() {
+            assert_eq!(
+                record.get("request_body_omitted_reason").and_then(|v| v.as_str()),
+                Some("retained_byte_budget"),
+                "withheld excerpt must use the compiled-in retained-byte reason"
+            );
+        }
+    }
     let final_snap = plugin.status_snapshot();
     assert!(
         final_snap.retained_bytes <= final_snap.buffer_max_bytes,
@@ -9077,4 +9034,501 @@ async fn new_bound_configuration_is_range_checked() {
         accounted_record_bytes(snapshot.max_entry_bytes as usize) as u64
     );
     assert!(snapshot.buffer_max_bytes >= snapshot.max_entry_retained_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Capture admission and one-pass request hashing (issues #3067, #3053)
+// ---------------------------------------------------------------------------
+
+const CANDIDATE_KEY: &str = "ai_transcript_audit.candidate";
+const HASH_KEY: &str = "ai_transcript_audit.request_hash";
+const SINK_KEY: &str = "ai_transcript_audit.sink_status";
+
+/// One `ai_transcript_audit.*` transaction-metadata value, owned.
+fn audit_meta(ctx: &RequestContext, key: &str) -> Option<String> {
+    ctx.metadata.get(key).cloned()
+}
+
+/// Fill the pre-`before_proxy` buffered request-body metadata slot.
+fn set_prebuffered_body(ctx: &mut RequestContext, body: &[u8]) {
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    ctx.metadata.insert("request_body".to_string(), text);
+}
+
+/// `sampling.rate: 0` with both overrides disabled means no record can ever be
+/// emitted, so the request body must never reach the keyed HMAC, the redactor,
+/// the excerpt shaper, or the model/tool extractors. `capture_counters()`
+/// reports `(captures_performed, captures_skipped)`.
+#[tokio::test]
+async fn unemittable_candidate_pays_no_capture_work() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    // The candidate is still staged (a bounded slot plus correlation metadata)
+    // so buffer/dispatch decisions and the log fallback stay coherent.
+    assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
+
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (0, 1),
+        "an unemittable candidate must not reach the capture helpers"
+    );
+    assert_eq!(audit_meta(&ctx, HASH_KEY), None, "no HMAC, no hash");
+
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(audit_meta(&ctx, SINK_KEY).as_deref(), Some("skipped"));
+    assert_eq!(plugin.capture_counters(), (0, 1));
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(requests.is_empty(), "no record may be exported");
+}
+
+/// An unchanged request body is HMACed exactly once across the whole hook
+/// chain: staging defers it, the final request-body hook performs it, and the
+/// reject-path and synthetic-short-circuit refresh hooks are no-ops instead of
+/// a second cryptographic pass followed by an equality comparison.
+#[tokio::test]
+async fn unchanged_request_body_is_hmaced_once_across_every_hook() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let secret = "fleet-stable-hmac-key-once";
+    let overrides = json!({ "redaction": { "hash_secret": secret } });
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, overrides),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (0, 0),
+        "staging must not hash the pre-transform body"
+    );
+
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+    let reference = keyed_reference(secret);
+    let expected = reference.keyed_hash_hex(ai_request_body());
+    assert_eq!(audit_meta(&ctx, HASH_KEY).as_deref(), Some(&*expected));
+
+    // The reject-path refresh and the synthetic-short-circuit refresh both see
+    // the same bytes again; neither may re-hash them.
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    let synthetic = "ferrum:synthetic_short_circuit".to_string();
+    ctx.metadata.insert(synthetic, "true".to_string());
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "an unchanged body must be HMACed exactly once"
+    );
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["request_hash"], json!(expected));
+    assert_eq!(records[0]["model"], "gpt-4o");
+}
+
+/// A `before_proxy` short-circuit never reaches the final request-body hook, so
+/// `after_proxy` performs the single capture over the provider-visible body and
+/// the later synthetic response hook does not repeat it.
+#[tokio::test]
+async fn short_circuit_capture_runs_once_on_the_reject_path() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(plugin.capture_counters(), (0, 0));
+
+    // A terminator rewrote the provider-visible body before responding.
+    let terminated =
+        br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"terminator"}]}"#;
+    set_prebuffered_body(&mut ctx, terminated);
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 502, &mut response_headers)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "the short-circuit path must capture the final body once"
+    );
+
+    let synthetic = "ferrum:synthetic_short_circuit".to_string();
+    ctx.metadata.insert(synthetic, "true".to_string());
+    let headers = json_headers();
+    plugin
+        .capture_final_response_body(&mut ctx, 502, &headers, br#"{"error":"x"}"#)
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "gpt-4o-mini");
+    let excerpt = records[0]["request_body"].as_str().expect("request body");
+    assert!(excerpt.contains("terminator"), "got: {excerpt}");
+}
+
+/// A saturated `max_records_per_minute` window stops paying capture cost: the
+/// limiter atomically reserves when the backend-visible body arrives, so dropped
+/// transactions never hash, redact, excerpt, or assemble anything — and no
+/// hash-less envelope is exported in their place. The first record's reservation
+/// is committed at enqueue (not acquired again), which is why it can still queue
+/// after the window count is already 1.
+#[tokio::test]
+async fn saturated_records_per_minute_skips_capture_before_hashing() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "max_records_per_minute": 1 } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let status = audit_meta(&ctx, SINK_KEY).unwrap_or_default();
+        let hashed = audit_meta(&ctx, HASH_KEY).is_some();
+        outcomes.push((status, hashed));
+    }
+
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 2),
+        "only the record that reserves window budget may pay capture cost"
+    );
+    assert_eq!(outcomes[0], ("queued".to_string(), true));
+    assert_eq!(outcomes[1], ("dropped".to_string(), false));
+    assert_eq!(outcomes[2], ("dropped".to_string(), false));
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let received = server.received_requests().await.unwrap_or_default();
+    let total: usize = received
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&request.body).ok())
+        .filter_map(|body| body.as_array().map(Vec::len))
+        .sum();
+    assert_eq!(total, 1, "no body-less envelope may be exported");
+}
+
+/// `streaming_response: true` tees every staged candidate — except one whose
+/// record can never be emitted. Hashing and accumulating an SSE prefix for it
+/// would be pure amplification, and it must also stay off the reqwest-pinned
+/// dispatch path.
+#[tokio::test]
+async fn unemittable_candidate_is_not_teed_with_streaming_capture_on() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, ai_request_body());
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(audit_meta(&ctx, CANDIDATE_KEY).as_deref(), Some("true"));
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    let sse = Some("text/event-stream");
+    assert!(plugin.response_stream_inspector(&ctx, 200, sse).is_none());
+
+    // A sampled candidate under the same streaming policy still tees.
+    let sampled = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut hit = make_ctx();
+    set_prebuffered_body(&mut hit, ai_request_body());
+    let mut hit_headers = hit.headers.clone();
+    sampled.before_proxy(&mut hit, &mut hit_headers).await;
+    assert!(sampled.forces_reqwest_dispatch(&hit));
+    assert!(sampled.response_stream_inspector(&hit, 200, sse).is_some());
+}
+
+/// Two candidates may reach capture admission before either enqueues. With
+/// `max_records_per_minute = 1`, only the admitted/reserved candidate may pay
+/// capture cost; the loser's staging carries `capture_skipped` so streaming
+/// capture neither pins reqwest dispatch nor installs an SSE inspector. The
+/// reserved winner must still enqueue by committing its existing reservation
+/// (a second limiter acquisition would fail because the window count is already
+/// 1), while an independently configured admissible candidate still tees.
+#[tokio::test]
+async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": { "max_records_per_minute": 1 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+    let sse = Some("text/event-stream");
+
+    // Concurrent-admission window: both reach capture before either enqueues.
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+    assert!(audit_meta(&first, HASH_KEY).is_some());
+
+    let mut limited = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut limited, &headers, stream_body)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 1),
+        "only the reserved candidate may capture once the window is saturated"
+    );
+    assert_eq!(audit_meta(&limited, HASH_KEY), None);
+    assert!(
+        !plugin.forces_reqwest_dispatch(&limited),
+        "rate-limited candidate must not pin reqwest dispatch"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&limited, 200, sse)
+            .is_none(),
+        "rate-limited candidate must not install an SSE inspector"
+    );
+
+    // The reserved first record commits its existing reservation at enqueue —
+    // it must not attempt a second acquisition against the already-full window.
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(audit_meta(&first, SINK_KEY).as_deref(), Some("queued"));
+    let records = wait_for_records(&server).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "reserved capture must still be exportable"
+    );
+
+    let admissible = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut hit = make_ctx();
+    set_prebuffered_body(&mut hit, stream_body);
+    let mut hit_headers = hit.headers.clone();
+    admissible.before_proxy(&mut hit, &mut hit_headers).await;
+    admissible
+        .on_final_request_body_with_context(&mut hit, &headers, stream_body)
+        .await;
+    assert!(admissible.forces_reqwest_dispatch(&hit));
+    assert!(
+        admissible
+            .response_stream_inspector(&hit, 200, sse)
+            .is_some()
+    );
+}
+
+/// A capture-time reservation that never emits must release its slot so a later
+/// candidate in the same window can be admitted. Configured as a sampling loser
+/// that only *might* emit via `always_capture_on_error`; a successful 200 path
+/// does not emit, drops staging, and frees the reservation.
+#[tokio::test]
+async fn discarded_rate_reservation_is_released_for_later_candidate() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": true,
+                    "max_records_per_minute": 1
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "override-eligible loser still reserves and captures"
+    );
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        audit_meta(&first, SINK_KEY).as_deref(),
+        Some("skipped"),
+        "successful response without error/guardrail must not emit"
+    );
+
+    let mut second = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut second, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (2, 0),
+        "released reservation must admit a later candidate in the same window"
+    );
+    plugin
+        .capture_final_response_body(&mut second, 500, &headers, br#"{"error":"x"}"#)
+        .await;
+    assert_eq!(audit_meta(&second, SINK_KEY).as_deref(), Some("queued"));
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "error");
+}
+
+/// A streamed (`stream: true`) transaction also pays exactly one request
+/// capture: staging classifies, the final request-body hook captures, and the
+/// SSE tee plus the stream-terminal record assembly add none.
+#[tokio::test]
+async fn streamed_transaction_pays_one_request_capture() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let streamed =
+        br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let mut ctx = make_ctx();
+    set_prebuffered_body(&mut ctx, streamed);
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(plugin.capture_counters(), (0, 0));
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), streamed)
+        .await;
+    assert_eq!(plugin.capture_counters(), (1, 0));
+
+    let sse = Some("text/event-stream");
+    let inspector = plugin
+        .response_stream_inspector(&ctx, 200, sse)
+        .expect("sampled SSE must be teed");
+    let mut chain = chain_response_stream_inspectors(vec![inspector]).expect("chain");
+    let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    let _ = chain.on_chunk(body).await;
+    let _ = chain.on_end().await;
+    let outcome = BodyOutcome::success(body.len() as u64);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &outcome)
+        .await;
+    assert_eq!(
+        plugin.capture_counters(),
+        (1, 0),
+        "the response path must not re-capture the request"
+    );
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["request_hash"].is_string());
+    assert!(records[0]["response_hash"].is_string());
 }

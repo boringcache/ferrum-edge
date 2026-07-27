@@ -16,9 +16,25 @@
 //! The audit candidate is staged in `before_proxy` over the
 //! prebuffered request body (so terminate-and-respond plugins downstream cannot
 //! consume the transaction unaudited, and so the proxy's response buffering /
-//! dispatch decisions can see the candidate state), then refreshed with the
-//! final backend-visible body in `on_final_request_body_with_context` after
-//! request redaction/transforms ran.
+//! dispatch decisions can see the candidate state).
+//!
+//! Staging is deliberately cheap: JSON classification, the sampling roll, the
+//! `stream` marker, and a bounded staging slot — no hashing, redaction, excerpt
+//! shaping, or model/tool extraction. All of that runs exactly once per
+//! transaction, in `on_final_request_body_with_context` (or, for a
+//! `before_proxy` short-circuit, the reject/synthetic response hooks) over the
+//! backend-visible body, and only after cheap capture admission confirms an
+//! exportable record is still possible: the sampling roll must be able to emit
+//! (directly or via an `always_capture_on_*` override) and a finite
+//! `sampling.max_records_per_minute` window must atomically reserve budget.
+//! Concurrent candidates therefore cannot all pay capture work beyond the
+//! configured ceiling. A candidate that cannot be exported therefore costs a
+//! classification pass and a staging slot, not a cryptographic pass plus a
+//! retained excerpt. The deliberate trade-off is that a candidate whose
+//! transaction ends before ANY of those hooks run (e.g. a client disconnect
+//! after `before_proxy` but before dispatch) emits its `log`-fallback record
+//! without a request hash/excerpt; see the documented limitation in
+//! `docs/plugins.md`.
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
@@ -723,6 +739,24 @@ struct AuditStaging {
     /// consumed, discarded, or expired — including the normal terminal
     /// non-emitting handoff to transaction logging.
     stream_deadline: Option<StreamReservationDeadlineOwner>,
+    /// Set once [`AiTranscriptAudit::capture_request`] has run for this record
+    /// against a backend-visible body — whether it captured or deliberately
+    /// skipped. The request keyed HMAC, excerpt, and model/tool extraction are
+    /// therefore performed at most once per transaction; the later refresh
+    /// hooks (reject path, synthetic short-circuit) are no-ops once set instead
+    /// of re-hashing the same bytes just to discover they are unchanged.
+    captured: bool,
+    /// Fixed-cardinality reason capture was skipped before doing any expensive
+    /// work ([`CAPTURE_SKIP_NOT_SAMPLED`] / [`CAPTURE_SKIP_RATE_LIMITED`]).
+    /// `Some` means this record can never be exported, so `enqueue` drops it
+    /// rather than shipping a hash-less, body-less envelope.
+    capture_skipped: Option<&'static str>,
+    /// Finite-window limiter slot reserved at capture admission. `enqueue`
+    /// commits it (so queue-full/sink drops still consume budget, matching the
+    /// historical acquire-before-`try_send` order); Drop releases an
+    /// uncommitted reservation when the candidate is discarded, loses staging,
+    /// expires, or does not emit.
+    rate_reservation: Option<RateLimitReservation>,
 }
 
 impl AuditStaging {
@@ -1281,6 +1315,46 @@ struct BoundedToolNames {
     hash: Option<String>,
 }
 
+/// Capture was skipped because the sampling roll lost and no override
+/// (`always_capture_on_guardrail` / `always_capture_on_error`) is configured,
+/// so `emit_decision` can never emit for this record.
+const CAPTURE_SKIP_NOT_SAMPLED: &str = "not_sampled";
+/// Capture was skipped because `sampling.max_records_per_minute` had no budget
+/// left in the current window when the backend-visible body became known.
+const CAPTURE_SKIP_RATE_LIMITED: &str = "rate_limited";
+
+/// Which request body a staging/capture call is looking at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyPhase {
+    /// The pre-`before_proxy` buffered body. Request transforms have not run
+    /// yet, so it is only classified (AI shape, `stream`) — never hashed,
+    /// redacted, excerpted, or harvested.
+    Provisional,
+    /// The backend/provider-visible body. The single point where expensive
+    /// capture work is worth paying for.
+    Final,
+}
+
+/// Expensive request-side capture derived from the FINAL backend-visible body.
+/// Built outside the staging map's shard guard so redaction/hashing never runs
+/// while a `DashMap` shard lock is held.
+#[derive(Default)]
+struct RequestCapture {
+    /// Keyed HMAC-SHA256 of the backend-visible request body. `None` only when
+    /// `skipped` is set — never a stale digest from an earlier body.
+    hash: Option<String>,
+    excerpt: Option<String>,
+    truncated: bool,
+    /// Compiled-in reason the request excerpt was withheld (never a value).
+    omitted_reason: Option<&'static str>,
+    model: BoundedModel,
+    tools: BoundedToolNames,
+    skipped: Option<&'static str>,
+    /// Limiter slot reserved before expensive work when admission succeeded.
+    /// Moved onto [`AuditStaging`]; Drop releases it if staging never accepts it.
+    rate_reservation: Option<RateLimitReservation>,
+}
+
 /// Owned request/response envelope fields, sourced from either a live
 /// `RequestContext` or a `TransactionSummary`.
 struct EnvelopeOwned {
@@ -1316,38 +1390,151 @@ enum SinkOutcome {
     Rejected,
 }
 
+/// Length of one records-per-minute window, in seconds.
+const RECORDS_WINDOW_SECONDS: u64 = 60;
+
+/// Largest admissible effective `max_records_per_minute`. The in-window count
+/// lives in the low 32 bits of the packed limiter state, so the ceiling is
+/// clamped below `u32::MAX` and the counter can never wrap.
+const MAX_RECORDS_PER_WINDOW: u64 = (u32::MAX as u64) - 1;
+
 /// Fixed-window records-per-minute limiter. `max == 0` means unlimited.
+///
+/// Lock-free by design: the window index and the in-window count are packed
+/// into one `AtomicU64` (`window << 32 | count`) and advanced by CAS. Capture
+/// admission **reserves** a slot on the request path — before any hashing,
+/// redaction, or excerpt work — so concurrent candidates cannot all observe
+/// headroom and pay capture cost beyond the configured ceiling. A mutex here
+/// would add a hot-path lock. Windows are anchored to the process-monotonic
+/// clock.
 struct RecordsPerMinute {
     max_per_minute: u64,
-    window: Mutex<(Instant, u64)>,
+    state: AtomicU64,
+}
+
+/// RAII token for one reserved records-per-minute slot.
+///
+/// Created by [`RecordsPerMinute::try_reserve`] before expensive capture work.
+/// [`Self::commit`] consumes the slot without releasing (enqueue / sink-drop
+/// path). Drop releases an uncommitted reservation, but only while the token's
+/// window is still the current window — an older-window release never
+/// decrements the live counter.
+struct RateLimitReservation {
+    slot: Option<RateLimitSlot>,
+}
+
+struct RateLimitSlot {
+    limiter: Arc<RecordsPerMinute>,
+    window: u64,
+}
+
+impl RateLimitReservation {
+    /// Consume the reservation without returning budget. Used when an
+    /// exportable record reaches enqueue (including queue-full/sink drops,
+    /// which historically acquired before `try_send`).
+    fn commit(mut self) {
+        self.slot = None;
+    }
+}
+
+impl Drop for RateLimitReservation {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.limiter.release(slot.window);
+        }
+    }
 }
 
 impl RecordsPerMinute {
     fn new(max_per_minute: u64) -> Self {
         Self {
-            max_per_minute,
-            window: Mutex::new((Instant::now(), 0)),
+            max_per_minute: max_per_minute.min(MAX_RECORDS_PER_WINDOW),
+            state: AtomicU64::new(0),
         }
     }
 
-    fn try_acquire(&self) -> bool {
+    fn current_window() -> u64 {
+        process_monotonic_seconds() / RECORDS_WINDOW_SECONDS
+    }
+
+    fn unpack(state: u64) -> (u64, u64) {
+        (state >> 32, state & u32::MAX as u64)
+    }
+
+    fn pack(window: u64, count: u64) -> u64 {
+        (window << 32) | (count & u32::MAX as u64)
+    }
+
+    /// Atomically reserve one slot in the current window for upcoming capture
+    /// work. `None` means the window is saturated. Unlimited (`max == 0`)
+    /// returns an empty reservation that neither increments nor releases.
+    fn try_reserve(self: &Arc<Self>) -> Option<RateLimitReservation> {
         if self.max_per_minute == 0 {
-            return true;
+            return Some(RateLimitReservation { slot: None });
         }
-        let mut guard = match self.window.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let now = Instant::now();
-        if now.duration_since(guard.0) >= Duration::from_secs(60) {
-            guard.0 = now;
-            guard.1 = 0;
+        let mut observed = self.state.load(Ordering::Relaxed);
+        loop {
+            let now = Self::current_window();
+            let (window, count) = Self::unpack(observed);
+            let count = if window == now { count } else { 0 };
+            if count >= self.max_per_minute {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                Self::pack(now, count.saturating_add(1)),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(RateLimitReservation {
+                        slot: Some(RateLimitSlot {
+                            limiter: Arc::clone(self),
+                            window: now,
+                        }),
+                    });
+                }
+                Err(actual) => observed = actual,
+            }
         }
-        if guard.1 >= self.max_per_minute {
-            return false;
+    }
+
+    /// Release an uncommitted reservation from `window`. No-op when the live
+    /// window has already advanced past `window`, so stale releases cannot
+    /// inflate the current window's budget.
+    fn release(&self, window: u64) {
+        if self.max_per_minute == 0 {
+            return;
         }
-        guard.1 += 1;
-        true
+        let mut observed = self.state.load(Ordering::Relaxed);
+        loop {
+            let now = Self::current_window();
+            if window != now {
+                return;
+            }
+            let (state_window, count) = Self::unpack(observed);
+            if state_window != now || count == 0 {
+                return;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                Self::pack(now, count - 1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    /// Late acquire for the rare path that reaches enqueue without a
+    /// capture-time reservation (transaction ended before any request-side
+    /// capture hook). Identical CAS shape to [`Self::try_reserve`].
+    fn try_acquire(self: &Arc<Self>) -> bool {
+        self.try_reserve()
+            .map(RateLimitReservation::commit)
+            .is_some()
     }
 }
 
@@ -1432,6 +1619,16 @@ pub struct AiTranscriptAudit {
     staging_sweep_interval_secs: u64,
     /// Monotonic process-relative second at which another staging sweep may run.
     next_staging_sweep_at: AtomicU64,
+    /// Number of expensive request captures performed (one keyed HMAC over the
+    /// request body, plus redaction/excerpt/model/tool work, each). Kept as a
+    /// plain relaxed counter — never exported to logs, records, or the status
+    /// snapshot — so the "one HMAC per transaction" and
+    /// "no capture work for records that cannot be emitted" invariants are
+    /// externally observable instead of only reviewable.
+    request_captures: AtomicU64,
+    /// Number of captures skipped by early admission (see
+    /// [`CAPTURE_SKIP_NOT_SAMPLED`] / [`CAPTURE_SKIP_RATE_LIMITED`]).
+    request_captures_skipped: AtomicU64,
     /// Process-local id published into authenticated `/health` after commit.
     status_id: OnceLock<u64>,
 }
@@ -1807,8 +2004,19 @@ impl AiTranscriptAudit {
             staging_ttl: Duration::from_secs(60 * 60),
             staging_sweep_interval_secs,
             next_staging_sweep_at: AtomicU64::new(0),
+            request_captures: AtomicU64::new(0),
+            request_captures_skipped: AtomicU64::new(0),
             status_id: OnceLock::new(),
         })
+    }
+
+    /// `(captures_performed, captures_skipped)` — see [`Self::request_captures`].
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn capture_counters(&self) -> (u64, u64) {
+        (
+            self.request_captures.load(Ordering::Relaxed),
+            self.request_captures_skipped.load(Ordering::Relaxed),
+        )
     }
 
     /// Effective admitted capture ceilings for authenticated status / tests.
@@ -1879,9 +2087,35 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn enqueue(&self, record: AuditRecord, staging: Option<&mut AuditStaging>) -> SinkOutcome {
-        if !self.rate_limiter.try_acquire() {
+    fn enqueue(&self, record: AuditRecord, mut staging: Option<&mut AuditStaging>) -> SinkOutcome {
+        // Capture admission already decided this record cannot be exported (the
+        // limiter window was saturated when the backend-visible body became
+        // known), so the request side was never hashed/excerpted. Drop it here
+        // rather than shipping a body-less, hash-less envelope if the window
+        // happened to roll over in the meantime, and do not consume limiter
+        // budget that a fully-captured record could still use.
+        let precluded = match staging.as_ref() {
+            Some(staged) => staged.capture_skipped.is_some(),
+            None => false,
+        };
+        if precluded {
             return SinkOutcome::Dropped;
+        }
+        // Prefer the capture-time reservation: committing it consumes the slot
+        // without a second CAS. Queue-full / sink drops after this point still
+        // keep the slot (historical acquire-before-`try_send` semantics). The
+        // late `try_acquire` path covers transactions that reach enqueue
+        // without any request-side capture hook.
+        match staging
+            .as_mut()
+            .and_then(|staged| staged.rate_reservation.take())
+        {
+            Some(reservation) => reservation.commit(),
+            None => {
+                if !self.rate_limiter.try_acquire() {
+                    return SinkOutcome::Dropped;
+                }
+            }
         }
         let (permit, staged_lease) = match staging {
             Some(staging) => {
@@ -2334,13 +2568,128 @@ impl AiTranscriptAudit {
         )
     }
 
+    /// Cheap capture admission, evaluated once per transaction on the FIRST
+    /// backend-visible body — before any hashing, redaction, excerpt shaping,
+    /// or model/tool extraction.
+    ///
+    /// `None` admits full capture (and, for a finite limiter, returns a
+    /// reserved slot via [`RecordsPerMinute::try_reserve`] inside
+    /// [`Self::capture_request`]). `Some(reason)` means no exportable record
+    /// can result, so the expensive work is skipped entirely:
+    /// * [`CAPTURE_SKIP_NOT_SAMPLED`] — the sampling roll lost and neither
+    ///   override is configured, so [`Self::emit_decision`] can never emit.
+    ///   Exact: this is the same predicate the emit decision would apply later.
+    /// * [`CAPTURE_SKIP_RATE_LIMITED`] — `sampling.max_records_per_minute` had
+    ///   no reservable budget in the current window. The limiter decision moves
+    ///   from enqueue time to capture-admission time so a saturated instance
+    ///   stops paying capture CPU (and retaining excerpts) for records it will
+    ///   drop; the reservation is atomic so concurrent candidates cannot all
+    ///   pass a non-consuming peek and amplify past the ceiling.
+    fn capture_skip_reason(&self, sample_hit: bool) -> Result<RateLimitReservation, &'static str> {
+        if !self.commit_may_emit(sample_hit) {
+            return Err(CAPTURE_SKIP_NOT_SAMPLED);
+        }
+        self.rate_limiter
+            .try_reserve()
+            .ok_or(CAPTURE_SKIP_RATE_LIMITED)
+    }
+
+    /// Perform (or deliberately skip) the expensive request-side capture over a
+    /// backend-visible `body`. Runs outside the staging map's shard guard.
+    ///
+    /// This is the ONLY place the request body is hashed, redacted, excerpted,
+    /// or harvested, and each transaction reaches it at most once
+    /// ([`AuditStaging::captured`]) — so the common no-transform path performs a
+    /// single keyed HMAC pass instead of hashing once at staging and again to
+    /// discover the final body was unchanged.
+    fn capture_request(
+        &self,
+        parsed: Option<&Value>,
+        body: &[u8],
+        sample_hit: bool,
+    ) -> RequestCapture {
+        let reservation = match self.capture_skip_reason(sample_hit) {
+            Ok(reservation) => reservation,
+            Err(skipped) => {
+                self.request_captures_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                return RequestCapture {
+                    skipped: Some(skipped),
+                    ..RequestCapture::default()
+                };
+            }
+        };
+        self.request_captures.fetch_add(1, Ordering::Relaxed);
+        // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
+        // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
+        // chat JSON wrapper around one secret) would be an offline brute-force
+        // oracle for the secret in every mode, including hash_only.
+        let hash = self.redactor.keyed_hash_hex(body);
+        let redact_before_bound = self.mode != AuditMode::FullBody;
+        // `hash_only` exports no model/provider/tool metadata at all
+        // (`build_record` discards it), so do not extract or redact it.
+        let harvests = self.mode.harvests_metadata();
+        let model = if harvests {
+            parsed
+                .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
+                .unwrap_or_default()
+        } else {
+            BoundedModel::default()
+        };
+        let tools = if harvests && self.capture.tool_calls {
+            parsed
+                .map(|json| extract_tool_names_bounded(json, &self.redactor, redact_before_bound))
+                .unwrap_or_default()
+        } else {
+            BoundedToolNames::default()
+        };
+        let shaped = if self.capture.request {
+            self.shape_body(body, self.limits.max_request_bytes)
+        } else {
+            ShapedBody::default()
+        };
+        RequestCapture {
+            hash: Some(hash),
+            excerpt: shaped.excerpt,
+            truncated: shaped.truncated,
+            omitted_reason: shaped.omitted_reason,
+            model,
+            tools,
+            skipped: None,
+            rate_reservation: Some(reservation),
+        }
+    }
+
+    /// Publish a [`RequestCapture`] onto `ctx` metadata. The keyed hash is
+    /// exported as a transaction-log correlation field only when capture
+    /// actually ran; a skipped capture removes any stale value.
+    fn publish_request_capture(&self, ctx: &mut RequestContext, capture: &RequestCapture) {
+        match capture.hash.as_ref() {
+            Some(hash) => {
+                ctx.metadata
+                    .insert(MD_REQUEST_HASH.to_string(), hash.clone());
+            }
+            None => {
+                ctx.metadata.remove(MD_REQUEST_HASH);
+            }
+        }
+    }
+
     /// Classify `body` and stage the audit candidate: writes the
     /// `ai_transcript_audit.*` request-side metadata and inserts the staging
     /// entry keyed by the new `record_id`. `body` is the request body as
-    /// currently known (pre-transform in `before_proxy`, final in the
-    /// final-body hook fallback); callers have already checked the JSON
-    /// content-type. Body hashes are keyed (see [`PiiRedactor::keyed_hash_hex`]).
-    fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
+    /// currently known; callers have already checked the JSON content-type.
+    ///
+    /// Staging itself is deliberately cheap — JSON classification plus bounded
+    /// metadata. Expensive capture (keyed HMAC, redaction, excerpt, model/tool
+    /// extraction) runs only for [`BodyPhase::Final`], where the bytes are the
+    /// backend-visible ones and capture admission can be decided.
+    fn stage_candidate(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        phase: BodyPhase,
+    ) -> PluginResult {
         if body.is_empty() {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
@@ -2386,11 +2735,6 @@ impl AiTranscriptAudit {
             }
         };
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
-        // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
-        // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
-        // chat JSON wrapper around one secret) would be an offline brute-force
-        // oracle for the secret in every mode, including hash_only.
-        let request_hash = self.redactor.keyed_hash_hex(body);
 
         ctx.metadata
             .insert(MD_RECORD_ID.to_string(), record_id.clone());
@@ -2405,8 +2749,6 @@ impl AiTranscriptAudit {
         // re-confirms the same value.
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
-        ctx.metadata
-            .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
         // `stream: true` means an SSE response is expected; record it so the
         // response buffer decision streams rather than stalls (buffering a
         // stream holds it until EOF, and under retry the buffered->stream
@@ -2429,37 +2771,30 @@ impl AiTranscriptAudit {
         // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
         // staged, so they stay on the native-H3 path.
-        let redact_before_bound = self.mode != AuditMode::FullBody;
-        let bounded_model = parsed
-            .as_ref()
-            .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
-            .unwrap_or_default();
-        let bounded_tools = if self.capture.tool_calls {
-            parsed
-                .as_ref()
-                .map(|json| extract_tool_names_bounded(json, &self.redactor, redact_before_bound))
-                .unwrap_or_default()
-        } else {
-            BoundedToolNames::default()
+        //
+        // A `Provisional` body is pre-transform: hashing/redacting/excerpting it
+        // would be discarded by the final-body refresh on any mutating chain and
+        // duplicated on every non-mutating one, so all of that is deferred to
+        // the single `Final` capture.
+        let capture = match phase {
+            BodyPhase::Final => self.capture_request(parsed.as_ref(), body, sample_hit),
+            BodyPhase::Provisional => RequestCapture::default(),
         };
-        let shaped = if self.capture.request {
-            self.shape_body(body, self.limits.max_request_bytes)
-        } else {
-            ShapedBody::default()
-        };
-        let (request_excerpt, request_truncated, request_body_omitted_reason) =
-            (shaped.excerpt, shaped.truncated, shaped.omitted_reason);
+        self.publish_request_capture(ctx, &capture);
 
         // Charge the aggregate retained-byte budget for this staged candidate
-        // before it is published into the shared map. Staging is one of the
-        // three retention states (staging, pre-commit reservation, queued
-        // record) the budget must cover; the lease releases with the entry on
-        // every removal path, including the TTL/reservation sweeps.
-        let staged_bytes = staged_retained_bytes(
-            request_excerpt.as_deref().map_or(0, str::len),
-            bounded_model.value.as_deref().map_or(0, str::len),
-            tool_names_bytes(&bounded_tools.names),
-        );
+        // before it is published into the shared map. Provisional staging and
+        // deliberately skipped captures charge zero; Final captures charge the
+        // measured excerpt + bounded model/tool bytes.
+        let staged_bytes = if capture.skipped.is_some() {
+            0
+        } else {
+            staged_retained_bytes(
+                capture.excerpt.as_deref().map_or(0, str::len),
+                capture.model.value.as_deref().map_or(0, str::len),
+                tool_names_bytes(&capture.tools.names),
+            )
+        };
         let Some(retained_lease) = self.retained_budget.try_acquire(staged_bytes) else {
             self.discard_staged_candidate(ctx);
             let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
@@ -2483,32 +2818,43 @@ impl AiTranscriptAudit {
                 retained_bytes: staged_bytes,
                 captured_at: Instant::now(),
                 sample_hit,
-                request_excerpt,
-                request_truncated,
-                request_body_omitted_reason,
-                request_hash: Some(request_hash),
-                request_model: bounded_model.value,
-                request_model_truncated: bounded_model.truncated,
-                request_model_hash: bounded_model.hash,
-                tool_names: bounded_tools.names,
-                tool_names_truncated: bounded_tools.truncated,
-                tool_names_omitted: bounded_tools.omitted,
-                tool_names_hash: bounded_tools.hash,
+                request_excerpt: capture.excerpt,
+                request_truncated: capture.truncated,
+                request_body_omitted_reason: capture.omitted_reason,
+                request_hash: capture.hash,
+                request_model: capture.model.value,
+                request_model_truncated: capture.model.truncated,
+                request_model_hash: capture.model.hash,
+                tool_names: capture.tools.names,
+                tool_names_truncated: capture.tools.truncated,
+                tool_names_omitted: capture.tools.omitted,
+                tool_names_hash: capture.tools.hash,
                 commit_permit: None,
                 commit_lease: None,
                 stream_active: false,
                 stream_active_since: None,
                 stream_deadline: None,
+                captured: phase == BodyPhase::Final,
+                capture_skipped: capture.skipped,
+                rate_reservation: capture.rate_reservation,
             },
         );
         PluginResult::Continue
     }
 
-    /// Refresh an already-staged candidate with the FINAL backend-visible
-    /// request body (request transforms run after `before_proxy`, where the
-    /// candidate was staged). No-op when the body is unchanged, so the common
-    /// no-transform path costs one keyed-hash pass.
-    fn refresh_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
+    /// Complete an already-staged candidate from a FINAL backend-visible request
+    /// body. `before_proxy` stages the candidate cheaply (classification only),
+    /// so this is where the transaction's single keyed HMAC / redaction /
+    /// excerpt / model+tool pass happens.
+    ///
+    /// Idempotent: once [`AuditStaging::captured`] is set, later refresh hooks
+    /// (the reject path's `after_proxy`, a synthetic short-circuit's buffered
+    /// response hook) are no-ops. That is what removes the second cryptographic
+    /// pass the old "hash again, then compare" refresh needed just to learn the
+    /// body had not changed — and the alternative, retaining the staged bytes to
+    /// compare against, would have doubled retained request memory per
+    /// in-flight candidate.
+    fn capture_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
@@ -2526,114 +2872,14 @@ impl AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return;
         }
-        let request_hash = self.redactor.keyed_hash_hex(body);
-        if self
-            .staging
-            .get(&record_id)
-            .and_then(|staging| staging.request_hash.clone())
-            .is_some_and(|existing| existing == request_hash)
-        {
-            return;
-        }
-        if let Some(mut staged) = self.staging.get_mut(&record_id) {
-            let shaped = if self.capture.request {
-                self.shape_body(body, self.limits.max_request_bytes)
-            } else {
-                ShapedBody::default()
-            };
-            let mut request_excerpt = shaped.excerpt;
-            let mut request_truncated = shaped.truncated;
-            let mut request_body_omitted_reason = shaped.omitted_reason;
-            staged.request_hash = Some(request_hash.clone());
-            let redact_before_bound = self.mode != AuditMode::FullBody;
-            let bounded_model = parsed
-                .as_ref()
-                .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
-                .unwrap_or_default();
-            let mut bounded_tools = None;
-            if self.capture.tool_calls {
-                bounded_tools = Some(
-                    parsed
-                        .as_ref()
-                        .map(|json| {
-                            extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
-                        })
-                        .unwrap_or_default(),
-                );
-            }
-
-            // Re-charge the aggregate budget for the refreshed content. Leases
-            // shrink but never grow, so growth re-acquires the whole new amount
-            // and drops the old lease afterwards — briefly double-charged,
-            // which errs toward refusing rather than over-retaining. A refused
-            // growth withholds the larger excerpt (with an explicit reason)
-            // and only retains newly grown model/tool strings when they still
-            // fit the existing lease; otherwise the prior accounted values are
-            // kept so no uncharged growth is retained.
-            let tool_bytes: usize = match bounded_tools.as_ref() {
-                Some(bounded) => tool_names_bytes(&bounded.names),
-                None => tool_names_bytes(&staged.tool_names),
-            };
-            let model_bytes = bounded_model.value.as_deref().map_or(0, str::len);
-            let refreshed_bytes = staged_retained_bytes(
-                request_excerpt.as_deref().map_or(0, str::len),
-                model_bytes,
-                tool_bytes,
-            );
-            let mut apply_refreshed_metadata = true;
-            if refreshed_bytes <= staged.retained_bytes {
-                staged.retained_lease.shrink_to(refreshed_bytes);
-                staged.retained_bytes = refreshed_bytes;
-            } else if let Some(lease) = self.retained_budget.try_acquire(refreshed_bytes) {
-                staged.retained_lease = lease;
-                staged.retained_bytes = refreshed_bytes;
-            } else {
-                request_excerpt = None;
-                request_truncated = true;
-                request_body_omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
-                let without_excerpt = staged_retained_bytes(0, model_bytes, tool_bytes);
-                if without_excerpt <= staged.retained_bytes {
-                    staged.retained_lease.shrink_to(without_excerpt);
-                    staged.retained_bytes = without_excerpt;
-                } else {
-                    // New model/tool values do not fit the retained lease and
-                    // no replacement lease exists. Keep prior accounted
-                    // metadata; shrink to the post-omission footprint of those
-                    // prior values so the lease still matches retained strings.
-                    apply_refreshed_metadata = false;
-                    let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
-                    let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
-                    let prior_without_excerpt =
-                        staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
-                    if prior_without_excerpt <= staged.retained_bytes {
-                        staged.retained_lease.shrink_to(prior_without_excerpt);
-                        staged.retained_bytes = prior_without_excerpt;
-                    }
-                }
-            }
-
-            staged.request_excerpt = request_excerpt;
-            staged.request_truncated = request_truncated;
-            staged.request_body_omitted_reason = request_body_omitted_reason;
-            if apply_refreshed_metadata {
-                staged.request_model = bounded_model.value;
-                staged.request_model_truncated = bounded_model.truncated;
-                staged.request_model_hash = bounded_model.hash;
-                if let Some(bounded_tools) = bounded_tools {
-                    staged.tool_names = bounded_tools.names;
-                    staged.tool_names_truncated = bounded_tools.truncated;
-                    staged.tool_names_omitted = bounded_tools.omitted;
-                    staged.tool_names_hash = bounded_tools.hash;
-                }
-            }
-        }
         // Re-detect `stream` on the FINAL backend-visible body: a
         // `request_transformer` may have added OR removed `"stream": true`
         // after `before_proxy` staged the candidate. `MD_STREAM_REQUEST` drives
         // the later buffer-vs-stream response decision
         // (`buffered_response_capture_wanted`), so — mirroring
         // `ai_tool_governor` — the marker must track the final body in BOTH
-        // directions.
+        // directions. This is cheap and runs even when capture is skipped,
+        // because stream-vs-buffer correctness is not a capture concern.
         if scan_limited
             || parsed
                 .as_ref()
@@ -2646,8 +2892,87 @@ impl AiTranscriptAudit {
         } else {
             ctx.metadata.remove(MD_STREAM_REQUEST);
         }
-        ctx.metadata
-            .insert(MD_REQUEST_HASH.to_string(), request_hash);
+
+        // Read the staged sampling roll and the already-captured marker under a
+        // short read guard, then build the capture with no shard lock held.
+        let staged_state = self
+            .staging
+            .get(&record_id)
+            .map(|staging| (staging.sample_hit, staging.captured));
+        let Some((sample_hit, already_captured)) = staged_state else {
+            return;
+        };
+        if already_captured {
+            return;
+        }
+        let mut capture = self.capture_request(parsed.as_ref(), body, sample_hit);
+        self.publish_request_capture(ctx, &capture);
+        if let Some(mut staged) = self.staging.get_mut(&record_id) {
+            staged.captured = true;
+            staged.capture_skipped = capture.skipped;
+            // Charge / refresh the aggregate retained-byte budget for the first
+            // (and only) capture of this candidate. Provisional staging charged
+            // zero; a skipped capture stays at zero. Growth re-acquires; a
+            // refused growth withholds the excerpt rather than retaining
+            // unaccounted bytes.
+            let mut apply_metadata = true;
+            if capture.skipped.is_some() {
+                staged.retained_lease.shrink_to(0);
+                staged.retained_bytes = 0;
+            } else {
+                let model_bytes = capture.model.value.as_deref().map_or(0, str::len);
+                let tool_bytes = tool_names_bytes(&capture.tools.names);
+                let captured_bytes = staged_retained_bytes(
+                    capture.excerpt.as_deref().map_or(0, str::len),
+                    model_bytes,
+                    tool_bytes,
+                );
+                if captured_bytes <= staged.retained_bytes {
+                    staged.retained_lease.shrink_to(captured_bytes);
+                    staged.retained_bytes = captured_bytes;
+                } else if let Some(lease) = self.retained_budget.try_acquire(captured_bytes) {
+                    staged.retained_lease = lease;
+                    staged.retained_bytes = captured_bytes;
+                } else {
+                    capture.excerpt = None;
+                    capture.truncated = true;
+                    capture.omitted_reason = Some(OMIT_REASON_RETAINED_BYTE_BUDGET);
+                    let without_excerpt = staged_retained_bytes(0, model_bytes, tool_bytes);
+                    if without_excerpt <= staged.retained_bytes {
+                        staged.retained_lease.shrink_to(without_excerpt);
+                        staged.retained_bytes = without_excerpt;
+                    } else {
+                        apply_metadata = false;
+                        let prior_model_bytes =
+                            staged.request_model.as_deref().map_or(0, str::len);
+                        let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
+                        let prior_without_excerpt =
+                            staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
+                        if prior_without_excerpt <= staged.retained_bytes {
+                            staged.retained_lease.shrink_to(prior_without_excerpt);
+                            staged.retained_bytes = prior_without_excerpt;
+                        }
+                    }
+                }
+            }
+            staged.request_excerpt = capture.excerpt;
+            staged.request_truncated = capture.truncated;
+            staged.request_body_omitted_reason = capture.omitted_reason;
+            staged.request_hash = capture.hash;
+            if apply_metadata {
+                staged.request_model = capture.model.value;
+                staged.request_model_truncated = capture.model.truncated;
+                staged.request_model_hash = capture.model.hash;
+                staged.tool_names = capture.tools.names;
+                staged.tool_names_truncated = capture.tools.truncated;
+                staged.tool_names_omitted = capture.tools.omitted;
+                staged.tool_names_hash = capture.tools.hash;
+            }
+            // Replace any prior reservation (there should be none on the
+            // classification-only provisional staging path). If staging vanished
+            // between build and publish, `capture`'s Drop releases the new slot.
+            staged.rate_reservation = capture.rate_reservation;
+        }
     }
 
     fn has_staged_candidate(&self, metadata: &HashMap<String, String>) -> bool {
@@ -2680,17 +3005,40 @@ impl AiTranscriptAudit {
     /// later still: on un-sampled streams those overrides emit via the `log`
     /// fallback without a response body/hash (teeing every stream "just in
     /// case" would defeat sampled capture entirely).
+    ///
+    /// Every mode — `On` included — additionally requires that an exportable
+    /// record is still possible for this candidate (`commit_may_emit`) and that
+    /// capture admission has not already precluded export
+    /// ([`export_precluded`]). Teeing, hashing, and accumulating an SSE prefix
+    /// for a sampling loser or a rate-limited candidate that no override can ever
+    /// emit is pure amplification: `emit_decision` / `enqueue` would discard
+    /// the result. This also keeps the mode off the reqwest-pinned dispatch
+    /// path, since `forces_reqwest_dispatch` shares this predicate.
     fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
+        if self.capture.streaming == StreamingCapture::Off {
+            return false;
+        }
+        // Ownership is proven by a local staging entry only — never by the
+        // shared peer-writable `MD_SAMPLE_HIT` key (see `owned_sample_hit`).
+        let Some(sample_hit) = self.owned_sample_hit(metadata) else {
+            return false;
+        };
+        if !self.commit_may_emit(sample_hit) {
+            return false;
+        }
+        if metadata
+            .get(MD_RECORD_ID)
+            .and_then(|record_id| self.staging.get(record_id))
+            .is_some_and(|staged| export_precluded(Some(&staged)))
+        {
+            return false;
+        }
         match self.capture.streaming {
             StreamingCapture::Off => false,
-            StreamingCapture::On => self.has_staged_candidate(metadata),
-            StreamingCapture::Sampled => match self.owned_sample_hit(metadata) {
-                Some(true) => true,
-                Some(false) => self.sampling.always_on_guardrail && guardrail_fired(metadata),
-                // Shared peer marker / no local staging: never tee from a
-                // borrowed `MD_SAMPLE_HIT` roll.
-                None => false,
-            },
+            StreamingCapture::On => true,
+            StreamingCapture::Sampled => {
+                sample_hit || (self.sampling.always_on_guardrail && guardrail_fired(metadata))
+            }
         }
     }
 
@@ -3004,7 +3352,7 @@ impl AiTranscriptAudit {
         // Forcing a buffer to catch that body would risk the failure above for
         // the common SSE success case. The marker is refreshed from the final
         // backend-visible body by `on_final_request_body_with_context`
-        // (via `refresh_staged_request` for an already-classified candidate, or
+        // (via `capture_staged_request` for an already-classified candidate, or
         // `stage_candidate` otherwise) — after transforms and before this
         // response policy is committed — in both directions, so a
         // transformer-added or -removed `stream` value is reflected here.
@@ -3164,7 +3512,7 @@ impl Plugin for AiTranscriptAudit {
         let Some(body) = ctx.metadata.remove("request_body") else {
             return PluginResult::Continue;
         };
-        let stage_result = self.stage_candidate(ctx, body.as_bytes());
+        let stage_result = self.stage_candidate(ctx, body.as_bytes(), BodyPhase::Provisional);
         ctx.metadata.insert("request_body".to_string(), body);
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
@@ -3192,12 +3540,11 @@ impl Plugin for AiTranscriptAudit {
         // `after_proxy` refresh knows this was NOT a `before_proxy` short-circuit.
         ctx.metadata
             .insert(MD_FINAL_REQ_SEEN.to_string(), "true".to_string());
-        // Staged in `before_proxy`: request transforms may have changed the
-        // body since, so refresh the captured hash/excerpt with the final
-        // backend-visible bytes.
+        // Staged (cheaply) in `before_proxy`: these are the backend-visible
+        // bytes, so this is where the transaction's single capture pass runs.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
-            self.refresh_staged_request(ctx, body);
-            // Refresh may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
+            self.capture_staged_request(ctx, body);
+            // Capture may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
             // response/stream gate will reserve, or whether request-time
             // reservation must run now (conservative maybe-stream with
             // streaming capture off has no later buffered gate).
@@ -3212,7 +3559,7 @@ impl Plugin for AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        let stage_result = self.stage_candidate(ctx, body);
+        let stage_result = self.stage_candidate(ctx, body, BodyPhase::Final);
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
@@ -3233,12 +3580,13 @@ impl Plugin for AiTranscriptAudit {
     /// request-body hook), a later terminator can rewrite `request_body` after we
     /// staged the candidate — e.g. `ai_prompt_shield` redacts, then
     /// `ai_federation` returns a non-2xx `RejectBinary` whose synthetic
-    /// response-body hooks never run. Refresh the staged request from the final
+    /// response-body hooks never run. Capture the staged request from the final
     /// `request_body` so the record reflects the provider-visible (redacted)
     /// request, not the pre-redaction prompt/hash. The normal backend path
     /// already captured the backend-visible request in the final-body hook
     /// (`MD_FINAL_REQ_SEEN`), so skip there to avoid reverting it from carried
-    /// pre-transform metadata.
+    /// pre-transform metadata; `AuditStaging::captured` is the second, stateful
+    /// guard that keeps this to one capture pass per transaction.
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -3254,7 +3602,7 @@ impl Plugin for AiTranscriptAudit {
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
             && let Some(body) = ctx.metadata.remove("request_body")
         {
-            self.refresh_staged_request(ctx, body.as_bytes());
+            self.capture_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
         if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
@@ -3362,15 +3710,21 @@ impl Plugin for AiTranscriptAudit {
 
         // On synthetic short-circuits, downstream `before_proxy` plugins may
         // have updated `ctx.metadata["request_body"]` and then returned a
-        // synthetic 2xx before the final request-body hook could run. Refresh
-        // from that live metadata before consuming staging. Do not do this on
-        // the normal backend path: there, the final-body hook already saw the
-        // backend-visible bytes and the carried `request_body` metadata may be
-        // the intentionally preserved pre-transform body.
+        // synthetic 2xx before the final request-body hook could run. Capture
+        // from that live metadata before consuming staging. This is also the
+        // last-resort capture for a synthetic 2xx that never reached a
+        // request-side capture hook, so the record does not ship without its
+        // keyed request hash. Still gated on the synthetic marker: on the normal
+        // backend path the final-body hook already saw the backend-visible bytes
+        // and the carried `request_body` metadata may be the intentionally
+        // preserved pre-transform body, which must not re-drive AI
+        // classification or the `stream` marker. `AuditStaging::captured` is the
+        // second guard that keeps the expensive pass to one per transaction when
+        // both this hook and `after_proxy` see the same short-circuit.
         if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
             && let Some(body) = ctx.metadata.remove("request_body")
         {
-            self.refresh_staged_request(ctx, body.as_bytes());
+            self.capture_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
 
@@ -3460,6 +3814,21 @@ impl Plugin for AiTranscriptAudit {
                     "rejected".to_string()
                 } else {
                     "skipped".to_string()
+                },
+            );
+            return;
+        }
+        if export_precluded(Some(&staging)) {
+            // `sampling.max_records_per_minute` was already saturated when the
+            // backend-visible request body arrived, so the request side was
+            // never hashed or excerpted and this record cannot ship. Do not pay
+            // response-side hashing/redaction/assembly for it either.
+            ctx.metadata.insert(
+                MD_SINK_STATUS.to_string(),
+                if request_rejected_for_sink {
+                    "rejected".to_string()
+                } else {
+                    "dropped".to_string()
                 },
             );
             return;
@@ -3798,14 +4167,21 @@ impl Plugin for AiTranscriptAudit {
             };
             Some(staging)
         };
-        if let Some(staging) = staging.as_mut()
-            && staging.commit_lease.is_none()
-        {
-            // Fail-open stream capture reserved the full retained-record charge
-            // before copying bytes. Transfer that same lease into enqueue so
-            // the capture and queued phases cannot open an accounting gap or
-            // require a second worst-case reservation.
-            staging.commit_lease = slot.take_record_lease();
+        if let Some(staging) = staging.as_mut() {
+            if export_precluded(Some(staging)) {
+                // Capture admission dropped this record on the request side; skip
+                // assembly and report the limiter's terminal outcome.
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "dropped".to_string());
+                return;
+            }
+            if staging.commit_lease.is_none() {
+                // Fail-open stream capture reserved the full retained-record charge
+                // before copying bytes. Transfer that same lease into enqueue so
+                // the capture and queued phases cannot open an accounting gap or
+                // require a second worst-case reservation.
+                staging.commit_lease = slot.take_record_lease();
+            }
         }
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
@@ -3851,6 +4227,10 @@ impl Plugin for AiTranscriptAudit {
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&summary.metadata), errored);
         if !emit {
+            return;
+        }
+        if export_precluded(Some(&staging)) {
+            // Capture admission dropped this record on the request side.
             return;
         }
         let envelope = self.envelope_from_summary(summary);
@@ -4327,6 +4707,16 @@ pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String
         if !saturation_outcome {
             metadata.remove(MD_SINK_STATUS);
         }
+    }
+}
+
+/// True when capture admission already decided this record cannot be exported
+/// (see [`AuditStaging::capture_skipped`]). The request side was never hashed or
+/// excerpted, so no record should be assembled, hashed further, or enqueued.
+fn export_precluded(staging: Option<&AuditStaging>) -> bool {
+    match staging {
+        Some(staged) => staged.capture_skipped.is_some(),
+        None => false,
     }
 }
 

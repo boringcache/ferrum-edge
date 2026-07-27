@@ -437,7 +437,7 @@ jobs:
       - name: Initialize SoftHSM token
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/softhsm/tokens"
+          mkdir -p "$RUNNER_TEMP/softhsm/tokens" "$RUNNER_TEMP/pkcs11"
           cat > "$RUNNER_TEMP/softhsm/softhsm2.conf" <<EOF
           directories.tokendir = $RUNNER_TEMP/softhsm/tokens
           objectstore.backend = file
@@ -446,10 +446,27 @@ jobs:
           EOF
           export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm/softhsm2.conf"
           softhsm2-util --init-token --free --label ferrum-ci --so-pin 1234 --pin 123456
+
+          # Two distinct RSA keys are generated in software so a certificate can
+          # be issued for exactly one of them, then both are imported into the
+          # token. `edge-rsa` pairs with the certificate; `edge-rsa-mismatch`
+          # does not, which is what the key-match tests need (issue #2406).
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa.key"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa-mismatch.key"
+          openssl req -x509 -new -sha256 -days 365 \
+            -key "$RUNNER_TEMP/pkcs11/edge-rsa.key" \
+            -subj "/CN=ferrum-pkcs11-ci" \
+            -addext "subjectAltName=DNS:localhost" \
+            -out "$RUNNER_TEMP/pkcs11/edge-rsa.crt"
+
+          softhsm2-util --import "$RUNNER_TEMP/pkcs11/edge-rsa.key" \
+            --token ferrum-ci --pin 123456 --label edge-rsa --id 01
+          softhsm2-util --import "$RUNNER_TEMP/pkcs11/edge-rsa-mismatch.key" \
+            --token ferrum-ci --pin 123456 --label edge-rsa-mismatch --id 02
           pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
-            --login --pin 123456 --token-label ferrum-ci \
-            --keypairgen --key-type rsa:2048 \
-            --label edge-rsa --id 01 --usage-sign
+            --login --pin 123456 --token-label ferrum-ci --list-objects
           echo "SOFTHSM2_CONF=$SOFTHSM2_CONF" >> "$GITHUB_ENV"
 
       - name: Run PKCS#11 signer smoke test
@@ -458,6 +475,19 @@ jobs:
           FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
           FERRUM_PKCS11_PIN: "123456"
           FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          RUST_BACKTRACE: 1
+
+      # Token-key / leaf-certificate pairing coverage. Run single threaded:
+      # PKCS#11 module initialization and token login state are process-global
+      # on common providers, so independent test contexts must not race.
+      - name: Run PKCS#11 certificate-pairing tests
+        run: cargo test --features pkcs11 --test unit_tests tls::pkcs11 -- --include-ignored --test-threads=1
+        env:
+          FERRUM_PKCS11_MODULE_PATH: /usr/lib/softhsm/libsofthsm2.so
+          FERRUM_PKCS11_PIN: "123456"
+          FERRUM_PKCS11_TEST_KEY_SOURCE: "pkcs11://edge-rsa?pin_env=FERRUM_PKCS11_PIN&id_hex=01"
+          FERRUM_PKCS11_TEST_MISMATCHED_KEY_SOURCE: "pkcs11://edge-rsa-mismatch?pin_env=FERRUM_PKCS11_PIN&id_hex=02"
+          FERRUM_PKCS11_TEST_CERT_PATH: "${{ runner.temp }}/pkcs11/edge-rsa.crt"
           RUST_BACKTRACE: 1
 
   build-test-artifacts:
@@ -592,6 +622,7 @@ jobs:
               integration::file_mode_reload_observability_tests
               integration::admin_cached_config_tests
               integration::admin_cross_namespace_refs_tests
+              integration::upstream_name_uniqueness_tests
               integration::admin_mesh_config_drift_tests
               integration::admin_mesh_egress_scope_tests
               integration::admin_mesh_policy_denies_tests
@@ -609,6 +640,7 @@ jobs:
               integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
+              integration::gateway_allowed_routes_selector_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
@@ -662,11 +694,13 @@ jobs:
               integration::frontend_tls_live_reload_tests
               integration::tcp_frontend_tls_order_tests
               integration::tcp_fast_path_l4_plugins_tests
+              integration::udp_hook_concurrency_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
+              integration::db_mutation_decode_fail_closed_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
               integration::db_row_decode_rejection_tests
@@ -847,6 +881,7 @@ jobs:
         run: |
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
         run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
@@ -1000,13 +1035,16 @@ jobs:
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
-            # race when nextest runs this shard in parallel.
+            # race when nextest runs this shard in parallel. Also hosts the
+            # required PostgreSQL/MySQL/MongoDB/Redis persistence-parity cells
+            # documented in docs/functional_testing_database.md.
             nextest_jobs: 1
             filters: |
               functional_capability_registry_test
               functional_admin_crud_resources_test
               functional_cp_dp_resilience_test
               functional_cp_dp_test
+              functional_database_parity_test
               functional_database_test
               functional_db_failover_test
               functional_db_outage_test
@@ -1053,22 +1091,23 @@ jobs:
           path: .
 
       - name: Start data-plane service containers
-        # Only the data-plane shard runs the redis/mongo-backed functional tests
-        # (functional_redis_rate_limiting_test, functional_mongodb_test). These
-        # services were previously declared job-wide, so EVERY shard provisioned
-        # redis + mongo at job startup — a transient Docker Hub pull hiccup then
-        # failed otherwise-unrelated shards (e.g. resilience) before any test ran.
-        # Start them only where they're used to isolate that blast radius. Ports
-        # map to the runner's localhost exactly as the service containers did, so
-        # the tests' localhost:6379 / localhost:27017 connections are unchanged.
+        # Only the data-plane shard runs redis/mongo/postgres/mysql-backed
+        # functional persistence tests. These services were previously declared
+        # job-wide (or omitted for SQL), so either every shard paid the Docker
+        # cost or PostgreSQL/MySQL suites silently skipped. Start them only
+        # where they're used, set explicit URLs, and fail closed when readiness
+        # fails. Ports map to the runner's localhost exactly as the tests expect.
         if: matrix.shard == 'data-plane'
         #
-        # Two mongod instances on purpose: `POST /batch` is all-or-nothing
-        # (issue #2401), which on MongoDB needs multi-document transactions.
-        # The standalone instance covers the documented 501 refusal, and the
-        # single-node replica set covers the transactional path — neither can
-        # substitute for the other.
+        # Four mongod instances on purpose:
+        # - standalone 27017: documented `POST /batch` 501 refusal + plaintext matrix
+        # - replica set 27020: transactional `POST /batch` (issue #2401)
+        # - TLS 27018: verify-full + require modes (issue #2399)
+        # - mTLS 27019: client certificate authentication (issue #2399)
+        # Neither plaintext topology can substitute for the TLS fixtures.
         run: |
+          set -euo pipefail
+
           docker run -d --name ferrum-ci-redis -p 6379:6379 redis:7-alpine
           docker run -d --name ferrum-ci-mongo -p 27017:27017 mongo:7
           # `--network host` with a real port: a replica-set member advertises
@@ -1076,7 +1115,237 @@ jobs:
           # advertised. Behind a `-p` mapping it would advertise the container
           # port and the driver would dial the wrong process.
           docker run -d --name ferrum-ci-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            --setParameter enableTestCommands=1
+          docker run -d --name ferrum-ci-postgres \
+            -e POSTGRES_DB=ferrum \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum \
+            -p 5432:5432 \
+            postgres:16-alpine
+          docker run -d --name ferrum-ci-mysql \
+            -e MYSQL_DATABASE=ferrum \
+            -e MYSQL_USER=ferrum \
+            -e MYSQL_PASSWORD=ferrum \
+            -e MYSQL_ROOT_PASSWORD=ferrum \
+            -p 3306:3306 \
+            mysql:8
+
+          # TLS fixtures for functional_db_tls_test (ports 15432 / 13306) and
+          # functional_mongodb_test TLS/mTLS cells (ports 27018 / 27019).
+          # Provisioned inline in this non-ARM64 data-plane job — do not add
+          # new .github/scripts helpers for these fixtures (Trusted Cross treats
+          # newly reachable automation scripts as Cross-sensitive surfaces).
+          # Local SQL TLS remains tests/scripts/setup_db_tls.sh; Mongo TLS is
+          # hosted-CI-owned (local cells skip unless fixtures are already up).
+          DB_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-db-tls-certs"
+          MONGO_TLS_CERT_DIR="${RUNNER_TEMP}/ferrum-mongo-tls-certs"
+          mkdir -p "$DB_TLS_CERT_DIR" "$MONGO_TLS_CERT_DIR"
+
+          # --- PostgreSQL / MySQL TLS certificates ---
+          openssl genrsa -out "$DB_TLS_CERT_DIR/ca.key" 4096 2>/dev/null
+          openssl req -new -x509 -days 3650 -key "$DB_TLS_CERT_DIR/ca.key" \
+            -out "$DB_TLS_CERT_DIR/ca.crt" -subj "/CN=Ferrum Test CA" 2>/dev/null
+
+          pg_ext=$(mktemp)
+          cat > "$pg_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:postgres-tls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/pg-server.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/pg-server.key" \
+            -out "$DB_TLS_CERT_DIR/pg-server.csr" -subj "/CN=postgres-tls" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/pg-server.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$pg_ext" \
+            -out "$DB_TLS_CERT_DIR/pg-server.crt" 2>/dev/null
+          rm -f "$pg_ext" "$DB_TLS_CERT_DIR/pg-server.csr"
+
+          mysql_ext=$(mktemp)
+          cat > "$mysql_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:mysql-tls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/mysql-server.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/mysql-server.key" \
+            -out "$DB_TLS_CERT_DIR/mysql-server.csr" -subj "/CN=mysql-tls" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/mysql-server.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mysql_ext" \
+            -out "$DB_TLS_CERT_DIR/mysql-server.crt" 2>/dev/null
+          rm -f "$mysql_ext" "$DB_TLS_CERT_DIR/mysql-server.csr"
+
+          client_ext=$(mktemp)
+          cat > "$client_ext" <<'EXTEOF'
+          [v3_req]
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EXTEOF
+          openssl genrsa -out "$DB_TLS_CERT_DIR/client.key" 2048 2>/dev/null
+          openssl req -new -key "$DB_TLS_CERT_DIR/client.key" \
+            -out "$DB_TLS_CERT_DIR/client.csr" -subj "/CN=ferrum" 2>/dev/null
+          openssl x509 -req -in "$DB_TLS_CERT_DIR/client.csr" -CA "$DB_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$DB_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$client_ext" \
+            -out "$DB_TLS_CERT_DIR/client.crt" 2>/dev/null
+          rm -f "$client_ext" "$DB_TLS_CERT_DIR/client.csr" "$DB_TLS_CERT_DIR/ca.srl"
+
+          chmod 600 "$DB_TLS_CERT_DIR/pg-server.key" "$DB_TLS_CERT_DIR/client.key"
+          chmod 644 "$DB_TLS_CERT_DIR/mysql-server.key" "$DB_TLS_CERT_DIR/mysql-server.crt" \
+            "$DB_TLS_CERT_DIR/ca.crt" "$DB_TLS_CERT_DIR/pg-server.crt" "$DB_TLS_CERT_DIR/client.crt"
+
+          docker rm -f ferrum-test-pg-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-pg-tls \
+            -p 15432:5432 \
+            -e POSTGRES_DB=ferrum \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=test-password \
+            -v "$DB_TLS_CERT_DIR:/certs-src:ro" \
+            --entrypoint sh \
+            postgres:16 \
+            -c '
+              cp /certs-src/pg-server.crt /var/lib/postgresql/server.crt &&
+              cp /certs-src/pg-server.key /var/lib/postgresql/server.key &&
+              cp /certs-src/ca.crt /var/lib/postgresql/ca.crt &&
+              chown postgres:postgres /var/lib/postgresql/server.* /var/lib/postgresql/ca.crt &&
+              chmod 600 /var/lib/postgresql/server.key &&
+              chmod 644 /var/lib/postgresql/server.crt /var/lib/postgresql/ca.crt &&
+              exec docker-entrypoint.sh postgres \
+                -c ssl=on \
+                -c ssl_cert_file=/var/lib/postgresql/server.crt \
+                -c ssl_key_file=/var/lib/postgresql/server.key \
+                -c ssl_ca_file=/var/lib/postgresql/ca.crt
+            '
+
+          docker rm -f ferrum-test-mysql-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mysql-tls \
+            -p 13306:3306 \
+            -e MYSQL_DATABASE=ferrum \
+            -e MYSQL_USER=ferrum \
+            -e MYSQL_PASSWORD=test-password \
+            -e MYSQL_ROOT_PASSWORD=test-password \
+            -v "$DB_TLS_CERT_DIR/mysql-server.crt:/etc/mysql/ssl/server-cert.pem:ro" \
+            -v "$DB_TLS_CERT_DIR/mysql-server.key:/etc/mysql/ssl/server-key.pem:ro" \
+            -v "$DB_TLS_CERT_DIR/ca.crt:/etc/mysql/ssl/ca.pem:ro" \
+            mysql:8 \
+            --require-secure-transport=ON \
+            --ssl-cert=/etc/mysql/ssl/server-cert.pem \
+            --ssl-key=/etc/mysql/ssl/server-key.pem \
+            --ssl-ca=/etc/mysql/ssl/ca.pem
+
+          # --- MongoDB TLS / mTLS certificates ---
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/ca.key" 4096 2>/dev/null
+          openssl req -new -x509 -days 3650 -key "$MONGO_TLS_CERT_DIR/ca.key" \
+            -out "$MONGO_TLS_CERT_DIR/ca.crt" -subj "/CN=Ferrum Mongo Test CA" 2>/dev/null
+
+          mongo_server_ext=$(mktemp)
+          cat > "$mongo_server_ext" <<'EXTEOF'
+          [v3_req]
+          subjectAltName = DNS:localhost,DNS:mongo-tls,DNS:mongo-mtls,IP:127.0.0.1
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          EXTEOF
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/server.key" 2048 2>/dev/null
+          openssl req -new -key "$MONGO_TLS_CERT_DIR/server.key" \
+            -out "$MONGO_TLS_CERT_DIR/server.csr" -subj "/CN=mongo-tls" 2>/dev/null
+          openssl x509 -req -in "$MONGO_TLS_CERT_DIR/server.csr" -CA "$MONGO_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$MONGO_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mongo_server_ext" \
+            -out "$MONGO_TLS_CERT_DIR/server.crt" 2>/dev/null
+          rm -f "$mongo_server_ext" "$MONGO_TLS_CERT_DIR/server.csr"
+          cat "$MONGO_TLS_CERT_DIR/server.crt" "$MONGO_TLS_CERT_DIR/server.key" \
+            > "$MONGO_TLS_CERT_DIR/mongodb.pem"
+
+          mongo_client_ext=$(mktemp)
+          cat > "$mongo_client_ext" <<'EXTEOF'
+          [v3_req]
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = clientAuth
+          EXTEOF
+          openssl genrsa -out "$MONGO_TLS_CERT_DIR/client.key" 2048 2>/dev/null
+          openssl req -new -key "$MONGO_TLS_CERT_DIR/client.key" \
+            -out "$MONGO_TLS_CERT_DIR/client.csr" -subj "/CN=ferrum-mongo-client" 2>/dev/null
+          openssl x509 -req -in "$MONGO_TLS_CERT_DIR/client.csr" -CA "$MONGO_TLS_CERT_DIR/ca.crt" \
+            -CAkey "$MONGO_TLS_CERT_DIR/ca.key" -CAcreateserial -days 3650 \
+            -extensions v3_req -extfile "$mongo_client_ext" \
+            -out "$MONGO_TLS_CERT_DIR/client.crt" 2>/dev/null
+          rm -f "$mongo_client_ext" "$MONGO_TLS_CERT_DIR/client.csr" "$MONGO_TLS_CERT_DIR/ca.srl"
+          cat "$MONGO_TLS_CERT_DIR/client.crt" "$MONGO_TLS_CERT_DIR/client.key" \
+            > "$MONGO_TLS_CERT_DIR/client.pem"
+
+          # File-based mongosh ping (no opaque mongosh --eval readiness surface).
+          printf '%s\n' 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)' \
+            > "$MONGO_TLS_CERT_DIR/ping.js"
+
+          chmod 600 "$MONGO_TLS_CERT_DIR/ca.key" "$MONGO_TLS_CERT_DIR/server.key" \
+            "$MONGO_TLS_CERT_DIR/client.key" "$MONGO_TLS_CERT_DIR/mongodb.pem" \
+            "$MONGO_TLS_CERT_DIR/client.pem"
+          chmod 644 "$MONGO_TLS_CERT_DIR/ca.crt" "$MONGO_TLS_CERT_DIR/server.crt" \
+            "$MONGO_TLS_CERT_DIR/client.crt" "$MONGO_TLS_CERT_DIR/ping.js"
+
+          docker rm -f ferrum-test-mongo-tls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mongo-tls \
+            -p 27018:27017 \
+            -v "$MONGO_TLS_CERT_DIR:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
+            --entrypoint bash \
+            mongo:7 \
+            -c '
+              set -e
+              mkdir -p /certs
+              cp /certs-src/mongodb.pem /certs/mongodb.pem
+              cp /certs-src/ca.crt /certs/ca.crt
+              cp /certs-src/client.pem /certs/client.pem
+              cp /certs-src/ping.js /certs/ping.js
+              chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
+              chmod 600 /certs/mongodb.pem /certs/client.pem
+              chmod 644 /certs/ca.crt /certs/ping.js
+              exec docker-entrypoint.sh mongod \
+                --bind_ip_all \
+                --tlsMode requireTLS \
+                --tlsCertificateKeyFile /certs/mongodb.pem \
+                --tlsCAFile /certs/ca.crt \
+                --tlsAllowConnectionsWithoutCertificates
+            '
+
+          docker rm -f ferrum-test-mongo-mtls >/dev/null 2>&1 || true
+          docker run -d \
+            --name ferrum-test-mongo-mtls \
+            -p 27019:27017 \
+            -v "$MONGO_TLS_CERT_DIR:/certs-src:ro" \
+            --health-cmd='mongosh --quiet --tls --host 127.0.0.1 --port 27017 --tlsCAFile /certs/ca.crt --tlsCertificateKeyFile /certs/client.pem /certs/ping.js' \
+            --health-interval=2s \
+            --health-timeout=5s \
+            --health-retries=60 \
+            --entrypoint bash \
+            mongo:7 \
+            -c '
+              set -e
+              mkdir -p /certs
+              cp /certs-src/mongodb.pem /certs/mongodb.pem
+              cp /certs-src/ca.crt /certs/ca.crt
+              cp /certs-src/client.pem /certs/client.pem
+              cp /certs-src/ping.js /certs/ping.js
+              chown mongodb:mongodb /certs/mongodb.pem /certs/ca.crt /certs/client.pem /certs/ping.js
+              chmod 600 /certs/mongodb.pem /certs/client.pem
+              chmod 644 /certs/ca.crt /certs/ping.js
+              exec docker-entrypoint.sh mongod \
+                --bind_ip_all \
+                --tlsMode requireTLS \
+                --tlsCertificateKeyFile /certs/mongodb.pem \
+                --tlsCAFile /certs/ca.crt
+            '
+
           # The runner used to gate steps on the services' --health-cmd; reproduce
           # that readiness wait using the tools shipped inside each image.
           redis_ok=""
@@ -1086,6 +1355,10 @@ jobs:
             fi
             sleep 2
           done
+          if [ -z "$redis_ok" ]; then
+            echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
+          fi
+
           mongo_ok=""
           for _ in $(seq 1 30); do
             if docker exec ferrum-ci-mongo mongosh --quiet \
@@ -1094,6 +1367,10 @@ jobs:
             fi
             sleep 2
           done
+          if [ -z "$mongo_ok" ]; then
+            echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
+          fi
+
           mongo_rs_ok=""
           for _ in $(seq 1 30); do
             if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
@@ -1102,18 +1379,16 @@ jobs:
             fi
             sleep 2
           done
-          if [ -z "$redis_ok" ]; then
-            echo "::error::redis did not become ready"; docker logs ferrum-ci-redis; exit 1
-          fi
-          if [ -z "$mongo_ok" ]; then
-            echo "::error::mongo did not become ready"; docker logs ferrum-ci-mongo; exit 1
-          fi
           if [ -z "$mongo_rs_ok" ]; then
             echo "::error::mongo replica set did not become ready"
             docker logs ferrum-ci-mongo-rs; exit 1
           fi
+          # Not gated on directly: a fresh member throws from rs.status() and is
+          # initiated here, but the authoritative readiness gate is the primary
+          # election loop below, which also prints container logs on failure.
+          # `|| true` keeps `set -e` from pre-empting that diagnostic.
           docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 --eval \
-            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27020"}]}) }'
+            'try { rs.status() } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27020"}]}) }' || true
           mongo_rs_primary=""
           for _ in $(seq 1 60); do
             if docker exec ferrum-ci-mongo-rs mongosh --quiet --port 27020 \
@@ -1130,7 +1405,115 @@ jobs:
             echo "FERRUM_TEST_MONGO_REPLICA_SET=rs0"
             echo "FERRUM_TEST_MONGO_REPLICA_SET_URL=mongodb://localhost:27020/ferrum_test"
           } >> "$GITHUB_ENV"
-          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020)"
+
+          # `-h 127.0.0.1`: the postgres entrypoint's initialization server runs
+          # with `listen_addresses=''`, so a socket-only pg_isready reports ready
+          # mid-init and the server then restarts underneath the tests.
+          pg_ok=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-ci-postgres pg_isready -h 127.0.0.1 -U ferrum -d ferrum >/dev/null 2>&1; then
+              pg_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$pg_ok" ]; then
+            echo "::error::postgres did not become ready"; docker logs ferrum-ci-postgres; exit 1
+          fi
+
+          mysql_ok=""
+          for _ in $(seq 1 90); do
+            if MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
+              && MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysql -h 127.0.0.1 -uferrum -D ferrum \
+                   -e "SELECT 1" >/dev/null 2>&1; then
+              mysql_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mysql_ok" ]; then
+            echo "::error::mysql did not become ready"; docker logs ferrum-ci-mysql; exit 1
+          fi
+
+          # Functional cells provision per-cell databases via CREATE/DROP.
+          # Grant those privileges (and CREATEDB on Postgres) so isolation is
+          # not blocked by the default non-superuser MYSQL_USER / role caps.
+          MYSQL_PWD=ferrum docker exec -e MYSQL_PWD ferrum-ci-mysql mysql -uroot -e \
+            "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
+          docker exec ferrum-ci-postgres psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
+            "ALTER USER ferrum WITH CREATEDB;"
+
+          # SQL TLS readiness (TCP probes; avoid mid-init false positives).
+          pg_tls_ok=""
+          for _ in $(seq 1 60); do
+            if docker exec ferrum-test-pg-tls pg_isready -h 127.0.0.1 -U ferrum -d ferrum >/dev/null 2>&1; then
+              pg_tls_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$pg_tls_ok" ]; then
+            echo "::error::postgres TLS fixture did not become ready"
+            docker logs ferrum-test-pg-tls; exit 1
+          fi
+
+          mysql_tls_ok=""
+          for _ in $(seq 1 90); do
+            if MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
+                  mysqladmin ping -h 127.0.0.1 -uferrum --silent >/dev/null 2>&1 \
+              && MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls \
+                  mysql -h 127.0.0.1 -uferrum -D ferrum -e "SELECT 1" >/dev/null 2>&1; then
+              mysql_tls_ok=1; break
+            fi
+            sleep 2
+          done
+          if [ -z "$mysql_tls_ok" ]; then
+            echo "::error::mysql TLS fixture did not become ready"
+            docker logs ferrum-test-mysql-tls; exit 1
+          fi
+
+          MYSQL_PWD=test-password docker exec -e MYSQL_PWD ferrum-test-mysql-tls mysql -uroot -e \
+            "GRANT CREATE, DROP, ALTER, INDEX, SELECT, INSERT, UPDATE, DELETE, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, TRIGGER ON *.* TO 'ferrum'@'%'; FLUSH PRIVILEGES;"
+          docker exec ferrum-test-pg-tls psql -U ferrum -d ferrum -v ON_ERROR_STOP=1 -c \
+            "ALTER USER ferrum WITH CREATEDB;"
+
+          # Mongo TLS/mTLS readiness via docker HEALTHCHECK status only
+          # (file-based ping.js; no docker-exec mongosh --eval for these fixtures).
+          for name in ferrum-test-mongo-tls ferrum-test-mongo-mtls; do
+            mongo_tls_ok=""
+            for _ in $(seq 1 60); do
+              state_json="$(docker inspect "$name" 2>/dev/null || true)"
+              if [ -z "$state_json" ]; then
+                echo "::error::$name is missing"
+                exit 1
+              fi
+              running="$(printf '%s\n' "$state_json" | python3 -c 'import json,sys; print("true" if json.load(sys.stdin)[0]["State"].get("Running") else "false")')"
+              status="$(printf '%s\n' "$state_json" | python3 -c 'import json,sys; s=json.load(sys.stdin)[0]["State"]; print((s.get("Health") or {}).get("Status") or "none")')"
+              if [ "$running" != "true" ]; then
+                echo "::error::$name is not running"
+                docker logs --tail 40 "$name" || true
+                exit 1
+              fi
+              case "$status" in
+                healthy)
+                  mongo_tls_ok=1
+                  break
+                  ;;
+                unhealthy)
+                  echo "::error::$name HEALTHCHECK reported unhealthy"
+                  docker logs --tail 40 "$name" || true
+                  exit 1
+                  ;;
+              esac
+              sleep 2
+            done
+            if [ -z "$mongo_tls_ok" ]; then
+              echo "::error::$name did not become healthy"
+              docker logs --tail 40 "$name" || true
+              exit 1
+            fi
+          done
+
+          echo "data-plane services ready (redis:6379, mongo:27017, mongo-rs:27020, mongo-tls:27018, mongo-mtls:27019, postgres:5432, mysql:3306, pg-tls:15432, mysql-tls:13306)"
+          echo "parity backends: sqlite,postgres,mysql,mongodb,redis"
+          echo "parity behaviors: admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes"
 
       - name: Run functional test shard
         # ── Single nextest invocation per shard ───────────────────────────
@@ -1183,13 +1566,52 @@ jobs:
           NEXTEST_JOBS: ${{ matrix.nextest_jobs }}
           FERRUM_SKIP_GATEWAY_BUILD: "1"
           RUST_BACKTRACE: 1
-        timeout-minutes: 30
+          # Explicit backend URLs for the data-plane persistence matrix. Empty
+          # on non-data-plane shards (harmless — those filters never consult them).
+          FERRUM_TEST_POSTGRES_URL: ${{ matrix.shard == 'data-plane' && 'postgres://ferrum:ferrum@127.0.0.1:5432/ferrum' || '' }}
+          FERRUM_TEST_MYSQL_URL: ${{ matrix.shard == 'data-plane' && 'mysql://ferrum:ferrum@127.0.0.1:3306/ferrum' || '' }}
+          FERRUM_TEST_MONGO_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27017/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_TLS_REQUIRE_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27018/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_MTLS_URL: ${{ matrix.shard == 'data-plane' && 'mongodb://127.0.0.1:27019/ferrum_test' || '' }}
+          FERRUM_TEST_MONGO_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-mongo-tls-certs', runner.temp) || '' }}
+          FERRUM_TEST_CERT_DIR: ${{ matrix.shard == 'data-plane' && format('{0}/ferrum-db-tls-certs', runner.temp) || '' }}
+          FERRUM_DB_BACKENDS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+          FERRUM_DB_TLS_REQUIRED: ${{ matrix.shard == 'data-plane' && '1' || '' }}
+        timeout-minutes: 45
+
+      - name: Stop data-plane service containers
+        if: always() && matrix.shard == 'data-plane'
+        run: |
+          set +e
+          for name in ferrum-ci-redis ferrum-ci-mongo ferrum-ci-mongo-rs \
+                      ferrum-ci-postgres ferrum-ci-mysql \
+                      ferrum-test-pg-tls ferrum-test-mysql-tls \
+                      ferrum-test-mongo-tls ferrum-test-mongo-mtls; do
+            docker unpause "$name" >/dev/null 2>&1
+            docker rm -f "$name" >/dev/null 2>&1
+          done
+          rm -rf "${RUNNER_TEMP}/ferrum-db-tls-certs" "${RUNNER_TEMP}/ferrum-mongo-tls-certs"
 
       - name: Summarize functional shard
         if: always()
         run: |
           echo "## Functional Test Shard: ${{ matrix.shard }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ matrix.shard }}" = "data-plane" ]; then
+            # Keep parity mapping as plain prose (no Markdown table pipes beside
+            # workflow expressions). Trusted Cross otherwise treats a piped
+            # expression cell as an opaque command outside build-arm64-cross.
+            echo "### Persistence parity mapping" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Backends: \`sqlite,postgres,mysql,mongodb,redis\`" >> $GITHUB_STEP_SUMMARY
+            echo "Behaviors: \`admin-crud,polling-delete,namespace-isolation,migrate-idempotent,concurrent-mutations,connectivity-recovery,tls-modes\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Required URLs: \`FERRUM_TEST_POSTGRES_URL\`, \`FERRUM_TEST_MYSQL_URL\`, \`FERRUM_TEST_MONGO_URL\`, \`FERRUM_TEST_MONGO_TLS_URL\`, \`FERRUM_TEST_MONGO_TLS_REQUIRE_URL\`, \`FERRUM_TEST_MONGO_MTLS_URL\` with \`FERRUM_DB_BACKENDS_REQUIRED=1\` / \`FERRUM_DB_TLS_REQUIRED=1\`." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "See \`docs/functional_testing_database.md\` for the backend × behavior matrix." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
           echo '```' >> $GITHUB_STEP_SUMMARY
           printf '%s\n' "$FUNCTIONAL_FILTERS" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY

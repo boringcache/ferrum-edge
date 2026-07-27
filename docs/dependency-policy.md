@@ -42,6 +42,7 @@ Each row is the authoritative tracking record. Keep this table, the
 | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
 | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite` | 0.29.0 | `WebSocketConfig::auto_pong` opt-out for transparent Ping relay | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy | Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong | [docs/upstream-tungstenite-patches/003-…](upstream-tungstenite-patches/003-optional-auto-pong/README.md) |
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
@@ -57,10 +58,11 @@ Each row is the authoritative tracking record. Keep this table, the
 Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
 `scripts/check_vendored_patch_status.sh` polls those and goes red when one
-merges. Two patches — **h3 002** (Extended CONNECT `:protocol=websocket`) and
-**h3 003** (`peek_recv_trailers`) — have **no upstream issue or PR filed yet**.
-They are not an untracked TODO; they are carried as a **deliberate, time-boxed
-fork** of `h3` on `jeremyjpj0916/h3` and are governed as follows:
+merges. Fork-only patches currently include **h3 002** (Extended CONNECT
+`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
+frame-limit origin extension, and **tungstenite `auto_pong`** (transparent
+Ping relay). They are not an untracked TODO; they are carried as a
+**deliberate, time-boxed fork** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
@@ -172,6 +174,11 @@ of the vendor copy and must keep passing after retirement:
 - The tungstenite pre-reservation frame-origin regression lives in the vendored
   crate (`protocol::frame::tests::size_limit_hit`) and runs alongside the
   raw-takeover regression in the vendored-patch job.
+- The tungstenite `auto_pong` opt-out regressions live in the vendored crate
+  (`protocol::tests::auto_pong_*`) and in
+  `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, with end-to-end
+  coverage in `tests/functional/functional_websocket_test.rs`
+  (`test_*websocket_ping_*`).
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
