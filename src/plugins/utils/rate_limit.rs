@@ -2117,13 +2117,73 @@ pub struct WsFrameRateAlgorithm {
     burst_size: f64,
 }
 
-/// Upper bound on the Redis sliding-window length, in seconds. With
-/// pathological-but-legal configs (`burst_size=10_000_000, frames_per_second=1`)
-/// the derived window would otherwise span ~115 days, leaving per-connection
-/// Redis keys alive for ~230 days. Capping turns those configs into a lower-
-/// resolution counter (still safe — admission stays bounded by `burst_size`)
-/// instead of a multi-month TTL.
-const REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
+/// Upper bound on the Redis sliding-window length used to approximate the
+/// local token bucket for `ws_rate_limiting`, in seconds.
+///
+/// Redis mode enforces `burst_size` admissions over a fixed window of
+/// `burst_size / frames_per_second` seconds. Windows longer than this bound
+/// would force multi-hour (or multi-day) per-connection key TTLs. Configs that
+/// need a longer refill period are rejected at construction rather than
+/// clamping the window while retaining the full burst limit — that clamp
+/// previously over-admitted the configured sustained rate by orders of
+/// magnitude (GHSA-cjcm-546w-696v).
+pub const WS_FRAME_REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
+
+/// Validate `ws_rate_limiting` capacity/refill so local token-bucket and Redis
+/// two-window enforcement share the same sustained rate and burst ceiling.
+///
+/// Accepted configs must:
+/// - keep both values in `1..=MAX_RATE_LIMIT_MAX_REQUESTS`
+/// - keep `burst_size >= frames_per_second`
+/// - make `burst_size` an integer multiple of `frames_per_second` (exact
+///   Redis window length; non-integral ratios under-admit on Redis)
+/// - keep the derived refill window
+///   (`burst_size / frames_per_second`) in `1..=WS_FRAME_REDIS_MAX_WINDOW_SECONDS`
+///
+/// Rejecting unrepresentable configs is fail-closed: Redis never silently
+/// raises the configured frame rate, and Redis failure/recovery cannot change
+/// the effective sustained-rate policy for an accepted config.
+pub fn validate_ws_frame_rate_params(
+    frames_per_second: u64,
+    burst_size: u64,
+) -> Result<(), String> {
+    if frames_per_second == 0 {
+        return Err("ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string());
+    }
+    if burst_size == 0 {
+        return Err("ws_rate_limiting: 'burst_size' must be greater than zero".to_string());
+    }
+    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: 'frames_per_second' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {frames_per_second}"
+        ));
+    }
+    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {burst_size}"
+        ));
+    }
+    if burst_size < frames_per_second {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' ({burst_size}) must be >= 'frames_per_second' ({frames_per_second})"
+        ));
+    }
+    if !burst_size.is_multiple_of(frames_per_second) {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' ({burst_size}) must be an integer multiple of \
+             'frames_per_second' ({frames_per_second}) so Redis and local sustained rates match"
+        ));
+    }
+    let window_seconds = burst_size / frames_per_second;
+    if window_seconds > WS_FRAME_REDIS_MAX_WINDOW_SECONDS {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' / 'frames_per_second' refill window \
+             ({window_seconds}s) exceeds the Redis-representable maximum of \
+             {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
+        ));
+    }
+    Ok(())
+}
 
 impl WsFrameRateAlgorithm {
     pub fn new(frames_per_second: f64, burst_size: f64) -> Self {
@@ -2134,23 +2194,36 @@ impl WsFrameRateAlgorithm {
     }
 
     /// Returns `(window_seconds, limit)` for the Redis sliding-window
-    /// approximation. The window length is the bucket's full-refill period
-    /// (`ceil(burst_size / frames_per_second)`); the cap at
-    /// [`REDIS_MAX_WINDOW_SECONDS`] bounds Redis TTLs.
+    /// approximation of the local token bucket.
     ///
-    /// `ws_rate_limiting::new` rejects `frames_per_second == 0` and
-    /// `burst_size < frames_per_second` at construction, so the derived
-    /// window is always at least 1 second and the average sustained rate
-    /// matches `frames_per_second` for all configs that reach this code.
+    /// For configs admitted by [`validate_ws_frame_rate_params`], the window
+    /// is exactly `burst_size / frames_per_second` and the limit is
+    /// `burst_size`, so the average sustained rate matches
+    /// `frames_per_second`.
+    ///
+    /// Defense in depth for unvalidated inputs: never raise the sustained
+    /// rate above `frames_per_second`. A window that would exceed
+    /// [`WS_FRAME_REDIS_MAX_WINDOW_SECONDS`] is capped and the limit is scaled
+    /// down with it (`fps * window`), never left at the full burst (the
+    /// GHSA-cjcm-546w-696v over-admit). Non-integral ratios still ceil the
+    /// window and keep `limit <= burst`, which can only under-admit.
     fn redis_window_derivation(&self) -> (u64, u64) {
-        debug_assert!(
-            self.frames_per_second > 0.0,
-            "WsFrameRateAlgorithm: frames_per_second must be > 0; \
-             enforced by optional_positive_u64 at plugin construction"
-        );
-        let limit = self.burst_size as u64;
-        let window_seconds = ((self.burst_size / self.frames_per_second).ceil() as u64)
-            .clamp(1, REDIS_MAX_WINDOW_SECONDS);
+        let fps = self.frames_per_second as u64;
+        let burst = self.burst_size as u64;
+        if fps == 0 {
+            // Unreachable after plugin construction validation; deny all.
+            return (1, 0);
+        }
+        if burst >= fps && burst.is_multiple_of(fps) {
+            let window = burst / fps;
+            if (1..=WS_FRAME_REDIS_MAX_WINDOW_SECONDS).contains(&window) {
+                return (window, burst);
+            }
+        }
+
+        let raw_window = burst.div_ceil(fps).max(1);
+        let window_seconds = raw_window.min(WS_FRAME_REDIS_MAX_WINDOW_SECONDS);
+        let limit = fps.saturating_mul(window_seconds).min(burst);
         (window_seconds, limit)
     }
 }
@@ -2550,20 +2623,64 @@ mod tests {
         // burst = 4 * fps → 4-second window
         let alg = WsFrameRateAlgorithm::new(5.0, 20.0);
         assert_eq!(alg.redis_window_derivation(), (4, 20));
-        // Non-integer ratio → ceil
+        // Max representable refill window (validated at construction)
+        let alg = WsFrameRateAlgorithm::new(1.0, WS_FRAME_REDIS_MAX_WINDOW_SECONDS as f64);
+        assert_eq!(
+            alg.redis_window_derivation(),
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
+        );
+    }
+
+    #[test]
+    fn ws_frame_rate_redis_window_derivation_fail_closed_for_unvalidated_inputs() {
+        // GHSA-cjcm-546w-696v: never clamp the window while retaining a limit
+        // that raises the configured sustained rate. Unvalidated pathological
+        // inputs scale the limit down with the capped window.
+        let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
+        assert_eq!(
+            alg.redis_window_derivation(),
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
+        );
+        // Non-integral ratio: ceil window, keep limit <= burst (under-admit).
+        // Construction rejects these; derivation must not over-admit if reached.
         let alg = WsFrameRateAlgorithm::new(3.0, 10.0);
         assert_eq!(alg.redis_window_derivation(), (4, 10));
     }
 
     #[test]
-    fn ws_frame_rate_redis_window_derivation_caps_pathological_configs() {
-        // Without the cap, `burst=10_000_000, fps=1` would produce a
-        // ~115-day window and ~230-day Redis TTL on per-connection keys.
-        let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
-        assert_eq!(
-            alg.redis_window_derivation(),
-            (REDIS_MAX_WINDOW_SECONDS, 10_000_000)
+    fn validate_ws_frame_rate_params_rejects_unrepresentable_ratios() {
+        assert!(validate_ws_frame_rate_params(100, 100).is_ok());
+        assert!(validate_ws_frame_rate_params(50, 100).is_ok());
+        assert!(validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS).is_ok());
+
+        let err = validate_ws_frame_rate_params(50, 75).unwrap_err();
+        assert!(err.contains("integer multiple"), "{err}");
+
+        let err =
+            validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS + 1).unwrap_err();
+        assert!(err.contains("Redis-representable maximum"), "{err}");
+
+        let err = validate_ws_frame_rate_params(1, 10_000_000).unwrap_err();
+        assert!(
+            err.contains("must be <=") || err.contains("Redis-representable"),
+            "{err}"
         );
+
+        let err = validate_ws_frame_rate_params(100, 50).unwrap_err();
+        assert!(err.contains("must be >="), "{err}");
+
+        let err = validate_ws_frame_rate_params(
+            MAX_RATE_LIMIT_MAX_REQUESTS + 1,
+            MAX_RATE_LIMIT_MAX_REQUESTS + 1,
+        )
+        .unwrap_err();
+        assert!(err.contains("frames_per_second"), "{err}");
     }
 
     #[test]
