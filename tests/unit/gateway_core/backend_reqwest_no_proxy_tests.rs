@@ -1,6 +1,7 @@
 //! Ambient-proxy isolation for policy-governed backend reqwest clients.
 
 use chrono::Utc;
+use futures_util::FutureExt as _;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
@@ -141,8 +142,13 @@ async fn connection_pool_backend_client_ignores_ambient_proxy_environment() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _proxy_env = ProxyEnvGuard::point_all_at(&proxy_server.uri());
+        // Backend reqwest builders call `.no_proxy()`, but keep ambient proxy
+        // variables set through the synchronous pool-miss path so a dropped
+        // `.no_proxy()` fails CI. `now_or_never` avoids holding ENV_LOCK
+        // across `.await` while the first client is created.
         pool.get_client(&proxy)
-            .await
+            .now_or_never()
+            .expect("backend pool client creation should not yield while env is set")
             .expect("backend pool client should build")
     };
 
