@@ -4416,6 +4416,26 @@ pub mod _test_support {
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
 
+    // ── K8s controller shutdown supervision (#3220) ─────────────────────────
+
+    pub use crate::k8s_controller::{
+        K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
+    };
+
+    /// Build a controller handle over synthetic, already-spawned tasks so
+    /// external tests can drive the real
+    /// [`K8sControllerHandle::shutdown`] path (delayed exit, panic
+    /// propagation, grace-period abort) without a live Kubernetes API server
+    /// and without making the task list a production-public field.
+    pub fn k8s_controller_handle_for_test(
+        tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    ) -> K8sControllerHandle {
+        K8sControllerHandle::from_named_tasks(
+            Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            tasks,
+        )
+    }
+
     /// Thin wrapper over the production CP full-reload publication so external
     /// tests can drive it against real broadcast channels.
     #[allow(clippy::too_many_arguments)]

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::sync::{broadcast, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::types::GatewayConfig;
 use crate::grpc::cp_server::{CpScope, DpNodeRegistry, NamespaceBroadcasts};
@@ -65,20 +65,196 @@ pub struct K8sControllerConfig {
     pub kubeconfig_path: Option<String>,
 }
 
+/// A controller task that failed to terminate cleanly (panic or cancellation).
+#[derive(Debug, Clone)]
+pub struct K8sControllerTaskFailure {
+    pub task: String,
+    /// `true` when the task panicked, `false` when it was cancelled/aborted
+    /// externally. Both are unexpected for a controller task that is supposed
+    /// to observe the shutdown watch channel and return.
+    pub panicked: bool,
+    pub detail: String,
+}
+
+/// Terminal disposition of every task owned by [`K8sControllerHandle`].
+///
+/// Returned by [`K8sControllerHandle::shutdown`] so the control plane can log
+/// and propagate controller-task failures instead of detaching them (#3220).
+#[derive(Debug, Default)]
+pub struct K8sControllerShutdownOutcome {
+    /// Tasks that observed shutdown and returned within the grace period.
+    pub completed: Vec<String>,
+    /// Tasks that had already terminated *before* shutdown was requested.
+    /// A watcher, reconciler, or reprobe loop returning during normal
+    /// operation means that part of the controller silently stopped
+    /// reconciling; it is reported rather than mistaken for a clean exit.
+    pub exited_before_shutdown: Vec<String>,
+    /// Tasks that panicked or were cancelled.
+    pub failed: Vec<K8sControllerTaskFailure>,
+    /// Tasks still running at the grace deadline. They are aborted, and the
+    /// abort is reported instead of silently detaching them.
+    pub timed_out: Vec<String>,
+}
+
+impl K8sControllerShutdownOutcome {
+    /// `true` when every owned task stopped on its own, on time, without a
+    /// panic and without having exited early.
+    pub fn is_clean(&self) -> bool {
+        self.exited_before_shutdown.is_empty()
+            && self.failed.is_empty()
+            && self.timed_out.is_empty()
+    }
+
+    /// An error describing panicked/cancelled controller tasks, if any.
+    ///
+    /// A grace-period timeout is deliberately *not* an error: a stuck task is
+    /// aborted and warned about (mirroring background-task drain elsewhere in
+    /// the modes), while a panic is a real defect and is surfaced to `run()`
+    /// so the process exit code reflects it.
+    pub fn failure_error(&self) -> Option<anyhow::Error> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        let detail = self
+            .failed
+            .iter()
+            .map(|failure| {
+                let kind = if failure.panicked {
+                    "panicked"
+                } else {
+                    "cancelled"
+                };
+                format!("{} {kind}: {}", failure.task, failure.detail)
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(anyhow::anyhow!(
+            "Kubernetes controller task(s) terminated abnormally: {detail}"
+        ))
+    }
+}
+
 pub struct K8sControllerHandle {
     pub metrics: Arc<ControllerMetrics>,
-    watcher_handles: Vec<tokio::task::JoinHandle<()>>,
-    reconciler_handle: tokio::task::JoinHandle<()>,
-    reprobe_handle: tokio::task::JoinHandle<()>,
+    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
 }
 
 impl K8sControllerHandle {
-    pub async fn join(self) {
-        for handle in self.watcher_handles {
-            let _ = handle.await;
+    /// Assemble a handle from already-spawned, named controller tasks.
+    ///
+    /// Kept crate-visible plus a `_test_support` re-export so external tests
+    /// can drive the real shutdown path with synthetic tasks without widening
+    /// the production API.
+    pub(crate) fn from_named_tasks(
+        metrics: Arc<ControllerMetrics>,
+        tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    ) -> Self {
+        Self { metrics, tasks }
+    }
+
+    /// Signal shutdown, then await every owned task with a bounded grace
+    /// period, aborting and reporting whatever is still running at the
+    /// deadline.
+    ///
+    /// The signal is sent here (idempotently — `watch::Sender::send` on an
+    /// already-`true` channel still notifies) so the ordering is structural:
+    /// no caller can await controller tasks that were never told to stop.
+    /// When shutdown was already requested by the caller, tasks that have
+    /// finished are simply awaited; when it was not, any already-finished
+    /// task exited for some other reason and is reported through
+    /// [`K8sControllerShutdownOutcome::exited_before_shutdown`].
+    pub async fn shutdown(
+        self,
+        shutdown_tx: &watch::Sender<bool>,
+        grace: Duration,
+    ) -> K8sControllerShutdownOutcome {
+        let mut outcome = K8sControllerShutdownOutcome::default();
+        let shutdown_already_requested = *shutdown_tx.borrow();
+        if !shutdown_already_requested {
+            for (name, handle) in &self.tasks {
+                if handle.is_finished() {
+                    error!(
+                        task = %name,
+                        "Kubernetes controller task exited before shutdown was requested"
+                    );
+                    outcome.exited_before_shutdown.push(name.clone());
+                }
+            }
         }
-        let _ = self.reconciler_handle.await;
-        let _ = self.reprobe_handle.await;
+        // Ignore the send result: with no receivers left there is nothing to
+        // notify, and every task is already gone or about to be joined.
+        let _ = shutdown_tx.send(true);
+
+        await_controller_tasks(self.tasks, grace, &mut outcome).await;
+        outcome
+    }
+}
+
+/// Await named controller tasks concurrently under a single deadline.
+///
+/// Concurrent (rather than sequential) so a slow watcher does not hide a
+/// reconciler panic behind it, and so the whole set shares one grace budget.
+async fn await_controller_tasks(
+    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    grace: Duration,
+    outcome: &mut K8sControllerShutdownOutcome,
+) {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    use std::collections::BTreeMap;
+
+    if tasks.is_empty() {
+        return;
+    }
+
+    // Abort handles are captured up-front: dropping a `JoinHandle` (which is
+    // what dropping the `FuturesUnordered` at the deadline would do) *detaches*
+    // the task rather than stopping it — precisely the bug this shutdown path
+    // exists to fix. Keyed by spawn index so the deadline path reports stuck
+    // tasks in a deterministic order (watchers, reconciler, reprobe).
+    let mut pending: BTreeMap<usize, (String, tokio::task::AbortHandle)> = BTreeMap::new();
+    let mut futures = FuturesUnordered::new();
+    for (index, (name, handle)) in tasks.into_iter().enumerate() {
+        pending.insert(index, (name.clone(), handle.abort_handle()));
+        futures.push(async move { (index, name, handle.await) });
+    }
+
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        match tokio::time::timeout_at(deadline, futures.next()).await {
+            Ok(Some((index, name, result))) => {
+                pending.remove(&index);
+                match result {
+                    Ok(()) => outcome.completed.push(name),
+                    Err(err) => {
+                        let panicked = err.is_panic();
+                        error!(
+                            task = %name,
+                            panicked,
+                            error = %err,
+                            "Kubernetes controller task did not terminate cleanly"
+                        );
+                        outcome.failed.push(K8sControllerTaskFailure {
+                            task: name,
+                            panicked,
+                            detail: err.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                for (name, abort) in std::mem::take(&mut pending).into_values() {
+                    warn!(
+                        task = %name,
+                        grace_secs = grace.as_secs_f64(),
+                        "Kubernetes controller task still running at grace deadline; aborting"
+                    );
+                    abort.abort();
+                    outcome.timed_out.push(name);
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -210,12 +386,15 @@ pub async fn start_k8s_controller(
         Duration::from_secs(300),
     );
 
-    Ok(K8sControllerHandle {
-        metrics,
-        watcher_handles,
-        reconciler_handle,
-        reprobe_handle,
-    })
+    let mut tasks: Vec<(String, tokio::task::JoinHandle<()>)> = watcher_handles
+        .into_iter()
+        .enumerate()
+        .map(|(index, handle)| (format!("crd-watcher-{index}"), handle))
+        .collect();
+    tasks.push(("reconciler".to_string(), reconciler_handle));
+    tasks.push(("crd-reprobe".to_string(), reprobe_handle));
+
+    Ok(K8sControllerHandle::from_named_tasks(metrics, tasks))
 }
 
 async fn build_kube_client(

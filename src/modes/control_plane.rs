@@ -56,6 +56,14 @@ use crate::xds::XdsAdsServer;
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
 
+/// Bounded grace period for the Kubernetes CRD controller's owned tasks
+/// (watchers, reconciler, CRD reprobe) to observe shutdown and return.
+///
+/// Matches the background-handle drain budget below: a stuck controller task
+/// is aborted and warned about rather than being allowed to wedge a rolling
+/// restart.
+const K8S_CONTROLLER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Narrow full-load source used by the CP snapshot/cursor orchestration.
 ///
 /// Keeping this smaller than [`DatabaseBackend`] makes the ordering contract
@@ -2451,7 +2459,7 @@ pub async fn run(
     // (T2-B), opt-in via FERRUM_K8S_CONTROLLER_ENABLED outside one. When
     // enabled, watches Istio + Gateway API CRDs and reconciles them into
     // Ferrum config via translate_k8s_objects(). Runs alongside DB polling.
-    let _k8s_controller_handle = if env_config.k8s_controller_enabled {
+    let k8s_controller_handle = if env_config.k8s_controller_enabled {
         if env_config.k8s_node_locality_enabled && !env_config.k8s_pod_discovery_enabled {
             warn!(
                 "FERRUM_K8S_NODE_LOCALITY_ENABLED=true has no effect because \
@@ -3458,6 +3466,41 @@ pub async fn run(
     )
     .await;
 
+    // Kubernetes controller teardown (#3220). The handle owns every CRD
+    // watcher, the reconciler, and the CRD reprobe task; dropping those
+    // `JoinHandle`s would *detach* the tasks, so CP mode would return without
+    // any happens-before boundary proving watchers, status writers, and
+    // reconciler broadcasts had stopped. `shutdown()` signals the watch
+    // channel first, then awaits every task under one bounded grace budget,
+    // aborting and reporting whatever is still running at the deadline.
+    //
+    // Ordering: after the listeners, so no DP stream is still consuming
+    // reconciler broadcasts while the controller winds down, and before the
+    // remaining background handles.
+    let k8s_controller_result = match k8s_controller_handle {
+        Some(handle) => {
+            let outcome = handle
+                .shutdown(&shutdown_tx, K8S_CONTROLLER_SHUTDOWN_GRACE)
+                .await;
+            if outcome.is_clean() {
+                info!(
+                    tasks = outcome.completed.len(),
+                    "Kubernetes CRD controller stopped cleanly"
+                );
+            } else {
+                warn!(
+                    completed = outcome.completed.len(),
+                    exited_before_shutdown = outcome.exited_before_shutdown.len(),
+                    failed = outcome.failed.len(),
+                    timed_out = outcome.timed_out.len(),
+                    "Kubernetes CRD controller shutdown was not clean"
+                );
+            }
+            outcome.failure_error()
+        }
+        None => None,
+    };
+
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a DB query). Same 5 s
     // cap as the pre-refactor inline timeout — a stuck DB poll is never
@@ -3473,7 +3516,14 @@ pub async fn run(
     }
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
-    listener_result
+    // A listener failure is the more direct operational signal, so it wins the
+    // exit code; a controller-task panic is surfaced only when the listeners
+    // themselves shut down cleanly (it is logged either way).
+    match (listener_result, k8s_controller_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Some(err)) => Err(err),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 pub(crate) async fn wait_for_cp_listeners_until_shutdown_or_exit(
