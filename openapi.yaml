@@ -19471,7 +19471,12 @@ components:
         embedding provider and a local HNSW vector index.
         Supports local DashMap and Redis exact-response storage. Redis mode
         requires redis_integrity_key and treats Redis as an untrusted,
-        authenticated trust boundary. Multiple
+        authenticated trust boundary. Quarantine DEL failures are counted with
+        rate-limited warnings (no keys/payloads/credentials) and suppressed by a
+        bounded per-instance local fingerprint+TTL marker (fingerprints only
+        after admission failure; constant-work capacity eviction) so the same
+        poisoned remote value cannot amplify download/parse/delete on every
+        request; suppression never converts a miss into a hit. Multiple
         instances on one proxy namespace request staging metadata under
         ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
         per-instance RequestContext maps so differing key policies and
