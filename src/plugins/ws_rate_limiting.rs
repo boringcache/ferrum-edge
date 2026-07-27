@@ -54,8 +54,7 @@ impl WsRateLimiting {
         }
 
         let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
-        let burst_size =
-            optional_positive_u64(config, "burst_size")?.unwrap_or(frames_per_second);
+        let burst_size = optional_positive_u64(config, "burst_size")?.unwrap_or(frames_per_second);
 
         // Local token-bucket and Redis two-window enforcement must share the
         // same sustained rate for every accepted config (including Redis

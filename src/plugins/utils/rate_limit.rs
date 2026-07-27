@@ -2627,7 +2627,10 @@ mod tests {
         let alg = WsFrameRateAlgorithm::new(1.0, WS_FRAME_REDIS_MAX_WINDOW_SECONDS as f64);
         assert_eq!(
             alg.redis_window_derivation(),
-            (WS_FRAME_REDIS_MAX_WINDOW_SECONDS, WS_FRAME_REDIS_MAX_WINDOW_SECONDS)
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
         );
     }
 
@@ -2639,7 +2642,10 @@ mod tests {
         let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
         assert_eq!(
             alg.redis_window_derivation(),
-            (WS_FRAME_REDIS_MAX_WINDOW_SECONDS, WS_FRAME_REDIS_MAX_WINDOW_SECONDS)
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
         );
         // Non-integral ratio: ceil window, keep limit <= burst (under-admit).
         // Construction rejects these; derivation must not over-admit if reached.
@@ -2656,8 +2662,8 @@ mod tests {
         let err = validate_ws_frame_rate_params(50, 75).unwrap_err();
         assert!(err.contains("integer multiple"), "{err}");
 
-        let err = validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS + 1)
-            .unwrap_err();
+        let err =
+            validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS + 1).unwrap_err();
         assert!(err.contains("Redis-representable maximum"), "{err}");
 
         let err = validate_ws_frame_rate_params(1, 10_000_000).unwrap_err();
