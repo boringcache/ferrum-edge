@@ -2430,15 +2430,6 @@ pub mod _test_support {
         plugin.epoch_base_for_test()
     }
 
-    pub fn udp_rate_limiting_record_rejection_warn_for_test(
-        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
-        limit_kind: &'static str,
-        proxy_id: &str,
-        now_ms: u64,
-    ) -> bool {
-        plugin.record_rate_limit_rejection_warn_for_test(limit_kind, proxy_id, now_ms)
-    }
-
     /// Tuple view of a UDP rejection diagnostic decision for external regressions.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct UdpRejectionWarnDecisionForTest {
@@ -2449,12 +2440,14 @@ pub mod _test_support {
 
     pub fn udp_rate_limiting_record_rejection_warn_detail_for_test(
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
         limit_kind: &'static str,
         proxy_id: &str,
         now_ms: u64,
     ) -> UdpRejectionWarnDecisionForTest {
-        let detail =
-            plugin.record_rate_limit_rejection_warn_detail_for_test(limit_kind, proxy_id, now_ms);
+        let detail = plugin.record_rate_limit_rejection_warn_detail_for_test(
+            global, limit_kind, proxy_id, now_ms,
+        );
         UdpRejectionWarnDecisionForTest {
             emitted: detail.emitted,
             instance_suppressed: detail.instance_suppressed,
@@ -2468,18 +2461,10 @@ pub mod _test_support {
         plugin.rejection_warn_suppressed_count_for_test()
     }
 
-    pub fn udp_rate_limiting_global_rejection_warn_suppressed_count_for_test() -> u64 {
-        crate::plugins::udp_rate_limiting::global_rejection_warn_suppressed_count_for_test()
-    }
-
     pub fn udp_rate_limiting_reset_rejection_warn_for_test(
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
     ) {
         plugin.reset_rate_limit_rejection_warn_for_test();
-    }
-
-    pub fn udp_rate_limiting_reset_global_rejection_warn_for_test() {
-        crate::plugins::udp_rate_limiting::reset_global_rate_limit_rejection_warn_for_test();
     }
 
     // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
@@ -2493,9 +2478,7 @@ pub mod _test_support {
         limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
         now_ms: u64,
     ) -> Option<u64> {
-        limiter
-            .on_event(now_ms)
-            .map(|claim| claim.suppressed)
+        limiter.on_event(now_ms)
     }
 
     pub fn atomic_log_rate_limiter_suppressed_count_for_test(

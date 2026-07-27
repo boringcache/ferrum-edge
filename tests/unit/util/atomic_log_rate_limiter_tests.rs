@@ -68,7 +68,7 @@ fn suppressed_count_saturates() {
 }
 
 #[test]
-fn dual_gate_rolls_back_instance_claim_when_global_denies() {
+fn dual_gate_preserves_pending_counts_when_global_denies() {
     let first_instance = atomic_log_rate_limiter_with_window_for_test(
         DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS,
     );
@@ -94,7 +94,7 @@ fn dual_gate_rolls_back_instance_claim_when_global_denies() {
     assert_eq!(
         atomic_log_rate_limiter_suppressed_count_for_test(&late_instance),
         1,
-        "rolled-back instance claim must fold the rejection into suppressed"
+        "globally denied instance must retain the rejection as pending"
     );
     assert_eq!(
         atomic_log_rate_limiter_suppressed_count_for_test(&global),
@@ -113,23 +113,32 @@ fn concurrent_events_keep_bounded_emits_and_preserved_accounting() {
         let limiter = Arc::clone(&limiter);
         handles.push(thread::spawn(move || {
             let mut emissions = 0usize;
+            let mut reported = 0u64;
             for _ in 0..2_000 {
-                if atomic_log_rate_limiter_on_event_for_test(&limiter, 1_000).is_some() {
+                if let Some(suppressed) =
+                    atomic_log_rate_limiter_on_event_for_test(&limiter, 1_000)
+                {
                     emissions += 1;
+                    reported = reported.saturating_add(suppressed);
                 }
             }
-            emissions
+            (emissions, reported)
         }));
     }
 
-    let emissions: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    let (emissions, reported) = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .fold((0usize, 0u64), |acc, result| {
+            (acc.0 + result.0, acc.1.saturating_add(result.1))
+        });
     assert_eq!(
         emissions, 1,
         "identical timestamps within one window must emit at most once"
     );
     assert_eq!(
-        atomic_log_rate_limiter_suppressed_count_for_test(&limiter),
-        8 * 2_000 - 1,
-        "suppressed accounting must retain every non-winning rejection"
+        reported + atomic_log_rate_limiter_suppressed_count_for_test(&limiter),
+        (8 * 2_000 - 1) as u64,
+        "reported plus pending accounting must retain every suppressed rejection"
     );
 }

@@ -65,18 +65,6 @@ fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
     GLOBAL_REJECTION_WARN.get_or_init(AtomicLogRateLimiter::new)
 }
 
-/// Reset the process-wide UDP rate-limit rejection diagnostic limiter. Test-only.
-#[doc(hidden)]
-pub(crate) fn reset_global_rate_limit_rejection_warn_for_test() {
-    global_rejection_warn().reset_for_test();
-}
-
-/// Observed process-wide suppressed-event accumulator. Test-only.
-#[doc(hidden)]
-pub(crate) fn global_rejection_warn_suppressed_count_for_test() -> u64 {
-    global_rejection_warn().suppressed_count_for_test()
-}
-
 pub struct UdpRateLimiting {
     check_counter: AtomicU64,
     epoch_base: Instant,
@@ -261,30 +249,17 @@ impl UdpRateLimiting {
         self.epoch_base
     }
 
-    /// Record a rate-limit rejection diagnostic at `now_ms`. Returns `true`
-    /// when a bounded warning was emitted. Test-only seam for tracing-free
-    /// flood regressions.
-    #[doc(hidden)]
-    pub(crate) fn record_rate_limit_rejection_warn_for_test(
-        &self,
-        limit_kind: &'static str,
-        proxy_id: &str,
-        now_ms: u64,
-    ) -> bool {
-        self.record_rate_limit_rejection_warn(limit_kind, proxy_id, now_ms)
-            .emitted
-    }
-
-    /// Same as [`record_rate_limit_rejection_warn_for_test`] but exposes the
-    /// per-scope suppressed counts carried by an emit decision. Test-only.
+    /// Exercise the production dual-gate decision with an isolated global
+    /// limiter so parallel external tests never mutate process-global state.
     #[doc(hidden)]
     pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
         &self,
+        global: &AtomicLogRateLimiter,
         limit_kind: &'static str,
         proxy_id: &str,
         now_ms: u64,
     ) -> RejectionWarnDecisionForTest {
-        self.record_rate_limit_rejection_warn(limit_kind, proxy_id, now_ms)
+        self.record_rate_limit_rejection_warn_with_global(global, limit_kind, proxy_id, now_ms)
     }
 
     /// Observed per-instance suppressed-event accumulator. Test-only.
@@ -305,8 +280,23 @@ impl UdpRateLimiting {
         proxy_id: &str,
         now_ms: u64,
     ) -> RejectionWarnDecisionForTest {
+        self.record_rate_limit_rejection_warn_with_global(
+            global_rejection_warn(),
+            limit_kind,
+            proxy_id,
+            now_ms,
+        )
+    }
+
+    fn record_rate_limit_rejection_warn_with_global(
+        &self,
+        global: &AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> RejectionWarnDecisionForTest {
         let Some((instance_suppressed, global_suppressed)) =
-            AtomicLogRateLimiter::dual_gate_emit(&self.rejection_warn, global_rejection_warn(), now_ms)
+            AtomicLogRateLimiter::dual_gate_emit(&self.rejection_warn, global, now_ms)
         else {
             return RejectionWarnDecisionForTest {
                 emitted: false,
