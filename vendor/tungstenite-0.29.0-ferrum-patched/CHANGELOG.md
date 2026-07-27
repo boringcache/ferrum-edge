@@ -2,6 +2,7 @@
 
 * Backport snapview/tungstenite-rs#556: add `WebSocket::into_inner_with_read_buffer()` and `WebSocketContext::into_read_buffer()` so callers taking over the raw stream at a frame boundary can recover buffered bytes that `into_inner()` discards.
 * Enforce caller-supplied frame limits before payload reservation while exempting valid Close frames; all control frames remain capped at RFC 6455's 125-byte maximum before allocation. Frame-policy failures retain a distinct `CapacityError::FrameTooLong` origin so callers can distinguish them from reassembled-message limits.
+* Add `WebSocketConfig::auto_pong` (default `true`) so transparent proxies can surface Ping frames without queuing a local Pong reply. Explicit `Message::Pong` writes remain unchanged.
 
 # 0.29.0
 

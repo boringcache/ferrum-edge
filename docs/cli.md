@@ -143,6 +143,13 @@ The report withholds externally sourced values, not just the ones that appear in
    - Plugin config validation (each plugin is instantiated to verify its config)
    - TLS certificate path existence checks
    - Upstream reference validation
+3. **Startup security** (env-level TLS/CIDR/metrics surfaces shared with `run`) — side-effect-free loaders that `serve()` also uses, so `validate` cannot report success for configs that refuse to start. Mode-scoped:
+   - TLS policy (`TlsPolicy::from_env_config`) and CRLs (`FERRUM_TLS_CRL_FILE_PATH`) for file/database/cp/dp/mesh
+   - Strict `FERRUM_ADMIN_ALLOWED_CIDRS` and `FERRUM_METRICS_ALLOWED_CIDRS` / metrics bearer policy; node-agent validates these only when its plaintext admin listener is active, matching `run`
+   - Frontend TLS material (missing, mismatched, expired, or malformed cert/key) when both `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH` are set (file/database/dp; mesh validates an explicit frontend pair via the same identity loader `run` uses). Mesh also loads a configured `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` when the topology has an inbound TLS-terminating listener under the no-slice PERMISSIVE baseline (same byte loader as mesh `run`'s inbound TLS snapshot); missing/unreadable material fails closed. PEM/expiry parsing runs only when a mesh server identity is also configured (explicit frontend cert/key, gateway SVID file cert/key, or a non-`none` `FERRUM_MESH_CA_BACKEND`), matching `load_mesh_frontend_tls`'s path into `load_mesh_tls_config_with_identity_and_client_ca_bytes`. Passthrough-only topologies such as `east_west_gateway`, and fully DISABLE mTLS modes, skip an unused client CA. `validate` cannot fetch an applied PeerAuthentication slice, so it may conservatively validate a configured CA that a later all-DISABLE dynamic slice would leave unused; it does not claim exact knowledge of the live effective mTLS mode.
+   - Admin TLS material when admin HTTPS is enabled (`FERRUM_ADMIN_HTTPS_PORT != 0` and both admin cert/key paths are set)
+   - DTLS frontend cert (+ optional client CA) expiry when both `FERRUM_DTLS_CERT_PATH` and `FERRUM_DTLS_KEY_PATH` are set (file/database/dp)
+   - Does **not** bind sockets, spawn servers, mutate stores, mint random JWT secrets, or connect to a database/CP
 
 ### Examples
 
@@ -170,6 +177,7 @@ Spec (/etc/ferrum/resources.yaml): OK
   Consumers: 5
   Upstreams: 3
   Plugin configs: 18
+Startup security (env TLS/CIDRs/metrics): OK
 
 Validation passed.
 ```
@@ -180,6 +188,19 @@ On failure:
 Settings (ferrum.conf): OK
   Mode: File
 Error: Spec validation failed: Configuration file not found: /nonexistent.yaml
+```
+
+A startup-security failure (for example an expired frontend cert) looks like:
+
+```
+Settings (ferrum.conf): OK
+  Mode: File
+Spec (/etc/ferrum/resources.yaml): OK
+  Proxies: 0
+  Consumers: 0
+  Upstreams: 0
+  Plugin configs: 0
+Error: Startup security validation failed: Invalid TLS configuration: ...
 ```
 
 ## reload

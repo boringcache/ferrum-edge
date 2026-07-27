@@ -532,9 +532,7 @@ async fn test_plugin_complex_configurations() {
             "rate_limiting",
             json!({
                 "limit_by": "consumer",
-                "limits": [{"scope": "default", "window_seconds": 3600, "max_requests": 1000}],
-                "skip_successful_requests": false,
-                "skip_failed_requests": true
+                "limits": [{"scope": "default", "window_seconds": 3600, "max_requests": 1000}]
             }),
         ),
         (

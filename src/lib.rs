@@ -103,6 +103,39 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
+    /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TcpAcceptLoopClass {
+        Primary,
+        Extra { index: usize },
+    }
+
+    impl TcpAcceptLoopClass {
+        fn into_production(self) -> crate::proxy::tcp_proxy::TcpAcceptLoopClass {
+            match self {
+                Self::Primary => crate::proxy::tcp_proxy::TcpAcceptLoopClass::Primary,
+                Self::Extra { index } => {
+                    crate::proxy::tcp_proxy::TcpAcceptLoopClass::Extra { index }
+                }
+            }
+        }
+    }
+
+    /// Supervise TCP SO_REUSEPORT accept-loop peers the same way production does.
+    pub async fn supervise_tcp_accept_loop_peers_for_test(
+        peers: Vec<(
+            TcpAcceptLoopClass,
+            tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        )>,
+        cancel_siblings: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        let peers = peers
+            .into_iter()
+            .map(|(class, handle)| (class.into_production(), handle))
+            .collect();
+        crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -1603,6 +1636,102 @@ pub mod _test_support {
         plugin.staging_metadata_key_for_tests(suffix)
     }
 
+    pub fn ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        plugin.apply_redis_quarantine_delete_outcome_for_tests(cache_key, fingerprint, delete_ok);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_expire_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.expire_redis_quarantine_for_tests(cache_key);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_len_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_len_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_delete_failures_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_delete_failures_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressions_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_suppressions_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_cap_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_cap_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_ttl_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> std::time::Duration {
+        plugin.redis_quarantine_ttl_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_is_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_is_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_matches_active_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: &[u8; 32],
+    ) -> bool {
+        plugin.redis_quarantine_matches_active_for_tests(cache_key, fingerprint)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_content_for_test(
+        data: &[u8],
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_content_for_tests(
+            data,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test(
+        length: usize,
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_oversized_for_tests(
+            length,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test() -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_empty_for_tests(
+        )
+    }
+
+    pub fn ai_semantic_cache_clear_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.clear_redis_quarantine_for_tests(cache_key);
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
@@ -2062,6 +2191,68 @@ pub mod _test_support {
         WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default())
             .expect("WsRateLimiting::new with empty config must succeed")
             .redis_connection_scope_key(proxy_id, connection_id)
+    }
+
+    // ── rate-limit policy isolation (GHSA-gr3x-g777-hm78) ────────────────────
+    /// Effective default Redis key prefix for one rate-limit plugin config.
+    ///
+    /// Returns `None` for local-only configs. Used to prove that two
+    /// independent plugin configs of the same type in one namespace do not
+    /// share a default Redis key space, and that two replicas of the *same*
+    /// config still do.
+    pub fn rate_limit_redis_key_prefix(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: &str,
+    ) -> Result<Option<String>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::graphql::GraphqlPlugin;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+        use crate::plugins::rate_limiting::RateLimiting;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+
+        let http = PluginHttpClient::default();
+        match plugin_name {
+            "rate_limiting" => {
+                let plugin = RateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "graphql" => {
+                let plugin = GraphqlPlugin::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "grpc_method_router" => {
+                let plugin = GrpcMethodRouter::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            "udp_rate_limiting" => {
+                let plugin = UdpRateLimiting::new_with_config_id(config, http, config_id)?;
+                Ok(plugin.redis_key_prefix_for_test())
+            }
+            other => Err(format!("unsupported rate-limit plugin: {other}")),
+        }
+    }
+
+    /// Construct a rate-limit plugin through the production factory with an
+    /// explicit plugin-config id, returning only the admission result.
+    ///
+    /// Proves the factory actually threads the configured resource id into each
+    /// plugin: a blank id must fail closed rather than collapsing sibling
+    /// policies onto one shared default Redis key space.
+    pub fn create_rate_limit_plugin_with_config_id(
+        plugin_name: &str,
+        config: &serde_json::Value,
+        config_id: Option<&str>,
+    ) -> Result<(), String> {
+        use crate::plugins::PluginHttpClient;
+
+        crate::plugins::create_plugin_with_http_client_and_config_id(
+            plugin_name,
+            config,
+            PluginHttpClient::default(),
+            config_id,
+        )
+        .map(|_| ())
     }
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
@@ -2837,6 +3028,27 @@ pub mod _test_support {
             response_status,
             response_headers,
             response_body,
+        )
+        .await
+    }
+
+    /// Drive the complete shared H1/H2/H3 synthetic-response finalizer,
+    /// including the empty-body scheduling gate and rejection replacement.
+    pub async fn finalize_synthetic_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+    ) {
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            false,
+            false,
         )
         .await
     }

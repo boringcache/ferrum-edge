@@ -8,12 +8,41 @@ use std::time::Instant;
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    RateLimitBackend, UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup,
+    RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
     UdpDatagramVerdict,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// `udp_rate_limiting`-specific top-level config keys (excludes Redis fields).
+const UDP_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
+    &["datagrams_per_second", "bytes_per_second", "window_seconds"];
+
+/// Closed top-level key set for `udp_rate_limiting` plugin config.
+///
+/// Must stay aligned with OpenAPI `UdpRateLimitingConfig`,
+/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
+/// `sync_mdoe`/`bytes_per_secnod` otherwise loaded silently as per-process,
+/// datagram-only enforcement.
+pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
+    "datagrams_per_second",
+    "bytes_per_second",
+    "window_seconds",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
@@ -27,13 +56,39 @@ pub struct UdpRateLimiting {
 }
 
 impl UdpRateLimiting {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new_with_http_client(
         config: &Value,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("udp_rate_limiting: config must be an object".to_string());
-        }
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `udp_rate_limiting`
+    /// instances in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| "udp_rate_limiting: config must be an object".to_string())?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity.
+        debug_assert_closed_root_keys(
+            UDP_RATE_LIMITING_CONFIG_KEYS,
+            UDP_RATE_LIMITING_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            UDP_RATE_LIMITING_CONFIG_KEYS,
+            "udp_rate_limiting: ",
+        )?;
 
         let datagrams_per_second = optional_positive_u64(config, "datagrams_per_second")?;
         let bytes_per_second = optional_positive_u64(config, "bytes_per_second")?;
@@ -45,7 +100,14 @@ impl UdpRateLimiting {
             );
         }
 
-        let window_seconds = optional_positive_u64(config, "window_seconds")?.unwrap_or(1);
+        // A window near `u64::MAX` passed the checked per-window multiplication
+        // below when the rate was 1, then wrapped `window + 1` (Redis TTL) to
+        // zero and `window * 2` (activity retention) to zero — every increment
+        // deleted its own counter, removing enforcement entirely.
+        let window_seconds = match optional_positive_u64(config, "window_seconds")? {
+            Some(value) => validate_window_seconds("udp_rate_limiting", "window_seconds", value)?,
+            None => 1,
+        };
         let datagrams_per_window = per_window_limit(datagrams_per_second, window_seconds)?;
         let bytes_per_window = per_window_limit(bytes_per_second, window_seconds)?;
         let epoch_base = Instant::now();
@@ -54,8 +116,9 @@ impl UdpRateLimiting {
             check_counter: AtomicU64::new(0),
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "udp_rate_limiting",
+                config_id,
                 config,
                 &http_client,
                 UdpRateLimitAlgorithm::new(
@@ -72,6 +135,13 @@ impl UdpRateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
     }
 
     /// All-shard `DashMap::len()` observations on the local/fallback map.

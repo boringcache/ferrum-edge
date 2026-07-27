@@ -1654,11 +1654,19 @@ impl DnsCache {
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
         let total_hostnames = hostnames.len();
 
+        // Empty backend hosts are placeholders on upstream-backed proxies, not
+        // DNS names. Passing one to hickory applies the system search domain
+        // and can consume the full resolver retry window before listeners bind.
+        // Ignore them at this shared boundary so every startup/reload caller is
+        // protected even if its hostname collector includes placeholders.
+        //
         // Deduplicate by hostname, keeping the first override/TTL seen for each.
         let mut seen = HashSet::new();
         let unique: Vec<_> = hostnames
             .into_iter()
-            .filter(|(host, _, _)| seen.insert(dns_hostname_key(host).into_owned()))
+            .filter(|(host, _, _)| {
+                !host.trim().is_empty() && seen.insert(dns_hostname_key(host).into_owned())
+            })
             .collect();
 
         if unique.is_empty() {

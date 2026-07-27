@@ -20,7 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 #[cfg(target_os = "linux")]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backend_conn_limit::{
     BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
@@ -1034,6 +1034,207 @@ struct TcpAcceptLoopState {
     trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+/// Bound wait for sibling accept loops to observe peer-cancel before abort.
+/// Keeps reconcile/shutdown from hanging if a cancel signal is lost.
+const TCP_ACCEPT_PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Which SO_REUSEPORT accept loop a supervised peer represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TcpAcceptLoopClass {
+    Primary,
+    Extra { index: usize },
+}
+
+impl TcpAcceptLoopClass {
+    pub(crate) fn from_loop_id(accept_loop_id: usize) -> Self {
+        if accept_loop_id == 0 {
+            Self::Primary
+        } else {
+            Self::Extra {
+                index: accept_loop_id,
+            }
+        }
+    }
+
+    pub(crate) fn accept_loop_id(self) -> usize {
+        match self {
+            Self::Primary => 0,
+            Self::Extra { index } => index,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Extra { .. } => "extra",
+        }
+    }
+}
+
+impl std::fmt::Display for TcpAcceptLoopClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => write!(f, "primary"),
+            Self::Extra { index } => write!(f, "extra({index})"),
+        }
+    }
+}
+
+enum TcpAcceptPeerExit {
+    /// Ordinary shutdown, peer-cancel teardown, or post-failure abort join.
+    Clean,
+    /// Unexpected operational failure that must tear down the listener.
+    Failed(anyhow::Error),
+}
+
+fn classify_tcp_accept_peer_exit(
+    class: TcpAcceptLoopClass,
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    teardown_started: bool,
+) -> TcpAcceptPeerExit {
+    match join_result {
+        Ok(Ok(())) => TcpAcceptPeerExit::Clean,
+        Ok(Err(err)) => TcpAcceptPeerExit::Failed(err.context(format!(
+            "TCP SO_REUSEPORT accept loop {class} exited with error"
+        ))),
+        Err(join_err) if join_err.is_cancelled() => {
+            if teardown_started {
+                // Sibling abort after an earlier peer failure, or shutdown drain.
+                TcpAcceptPeerExit::Clean
+            } else {
+                TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+                    "TCP SO_REUSEPORT accept loop {class} was cancelled unexpectedly"
+                ))
+            }
+        }
+        Err(join_err) if join_err.is_panic() => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+            "TCP SO_REUSEPORT accept loop {class} panicked: {join_err}"
+        )),
+        Err(join_err) => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+            "TCP SO_REUSEPORT accept loop {class} failed to join: {join_err}"
+        )),
+    }
+}
+
+/// Supervise primary + extra SO_REUSEPORT accept loops as peer components.
+///
+/// The first unexpected exit cancels siblings, drains (then aborts) remaining
+/// tasks, and returns that failure. Clean shutdown-triggered exits return
+/// `Ok(())` and are not reported as operational failures. Subsequent peer
+/// exits after the first failure are drained without additional error logs.
+pub(crate) async fn supervise_tcp_accept_loop_peers(
+    peers: Vec<(
+        TcpAcceptLoopClass,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    )>,
+    cancel_siblings: impl FnOnce(),
+) -> Result<(), anyhow::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let abort_handles: Vec<_> = peers
+        .iter()
+        .map(|(_, handle)| handle.abort_handle())
+        .collect();
+    let mut futures: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|(class, handle)| async move { (class, handle.await) })
+        .collect();
+
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut cancel_siblings = Some(cancel_siblings);
+    let mut abort_handles = Some(abort_handles);
+
+    while let Some((class, join_result)) = futures.next().await {
+        let teardown_started = first_error.is_some();
+        match classify_tcp_accept_peer_exit(class, join_result, teardown_started) {
+            TcpAcceptPeerExit::Clean => {}
+            TcpAcceptPeerExit::Failed(err) => {
+                if first_error.is_none() {
+                    error!(
+                        accept_loop = class.accept_loop_id(),
+                        loop_class = class.label(),
+                        error = %err,
+                        "TCP SO_REUSEPORT accept loop exited unexpectedly; tearing down sibling accept loops"
+                    );
+                    first_error = Some(err);
+                    if let Some(cancel) = cancel_siblings.take() {
+                        cancel();
+                    }
+                }
+            }
+        }
+
+        if first_error.is_some() && !futures.is_empty() {
+            let drain = async {
+                while let Some((class, join_result)) = futures.next().await {
+                    // Already failing the listener: drain silently so one
+                    // failure is not double-logged and shutdown stays prompt.
+                    let _ = classify_tcp_accept_peer_exit(class, join_result, true);
+                }
+            };
+            if tokio::time::timeout(TCP_ACCEPT_PEER_DRAIN_TIMEOUT, drain)
+                .await
+                .is_err()
+            {
+                warn!(
+                    timeout_ms = TCP_ACCEPT_PEER_DRAIN_TIMEOUT.as_millis() as u64,
+                    "TCP accept-loop siblings did not exit after peer-cancel; aborting remaining loops"
+                );
+                if let Some(handles) = abort_handles.take() {
+                    for handle in handles {
+                        handle.abort();
+                    }
+                }
+                while futures.next().await.is_some() {}
+            }
+            break;
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+async fn run_supervised_tcp_accept_loop(
+    listener: TcpListener,
+    state: TcpAcceptLoopState,
+    shutdown_rx: watch::Receiver<bool>,
+    global_shutdown_rx: Option<watch::Receiver<bool>>,
+    mut peer_cancel_rx: watch::Receiver<bool>,
+    accept_loop_id: usize,
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        result = run_tcp_accept_loop(
+            listener,
+            state,
+            shutdown_rx,
+            global_shutdown_rx,
+            accept_loop_id,
+        ) => result,
+        _ = async {
+            loop {
+                if peer_cancel_rx.changed().await.is_err() {
+                    // Cancel sender dropped during teardown — treat as stop.
+                    break;
+                }
+                if *peer_cancel_rx.borrow() {
+                    break;
+                }
+            }
+        } => {
+            // Sibling failure teardown (or cancel-sender drop). Not an
+            // operational failure of this loop.
+            Ok(())
+        }
+    }
+}
+
 /// Start a TCP proxy listener on the given port.
 ///
 /// This binds a dedicated TCP listener and for each accepted connection:
@@ -1163,35 +1364,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     // Bind all extra sockets before spawning any accept loops. If one bind
     // fails, every already-bound socket is dropped here and startup fails
     // cleanly without leaving orphan listener tasks behind.
-    let mut extra_listeners = Vec::with_capacity(actual_accept_threads.saturating_sub(1));
+    let mut listeners = Vec::with_capacity(actual_accept_threads);
+    listeners.push(first_listener);
     for _ in 1..actual_accept_threads {
-        extra_listeners.push(crate::proxy::create_proxy_socket(
+        listeners.push(crate::proxy::create_proxy_socket(
             addr, backlog, tfo_queue, reuse_port,
         )?);
-    }
-
-    let mut handles = Vec::with_capacity(extra_listeners.len());
-    for (extra_loop_index, listener) in extra_listeners.into_iter().enumerate() {
-        let accept_loop_id = extra_loop_index + 1;
-        let state = loop_state.clone();
-        let shutdown_rx = shutdown.clone();
-        let global_shutdown_rx = global_shutdown.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = run_tcp_accept_loop(
-                listener,
-                state,
-                shutdown_rx,
-                global_shutdown_rx,
-                accept_loop_id,
-            )
-            .await
-            {
-                warn!(
-                    accept_loop = accept_loop_id,
-                    "TCP proxy accept loop exited with error: {}", e
-                );
-            }
-        }));
     }
 
     started.store(true, Ordering::Release);
@@ -1203,12 +1381,60 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         addr
     );
 
-    run_tcp_accept_loop(first_listener, loop_state, shutdown, global_shutdown, 0).await?;
-    for handle in handles {
-        let _ = handle.await;
+    // Single accept loop: keep the zero-spawn hot path. Multi-loop mode
+    // supervises primary + every SO_REUSEPORT peer concurrently so an
+    // unexpected exit cannot silently reduce capacity while readiness stays
+    // healthy (issue #3216).
+    if listeners.len() == 1 {
+        let listener = listeners
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("TCP listener set unexpectedly empty"))?;
+        let result = run_tcp_accept_loop(listener, loop_state, shutdown, global_shutdown, 0).await;
+        if result.is_err() {
+            started.store(false, Ordering::Release);
+        }
+        return result;
     }
 
-    Ok(())
+    // Peer-cancel is distinct from operator/global shutdown: it only fires when
+    // one accept loop fails so siblings tear down atomically. Operator shutdown
+    // still flows through the existing per-listener / global watch channels and
+    // must remain a clean `Ok` (not an operational failure).
+    let (peer_cancel_tx, peer_cancel_rx) = watch::channel(false);
+    let mut peers = Vec::with_capacity(listeners.len());
+    for (accept_loop_id, listener) in listeners.into_iter().enumerate() {
+        let class = TcpAcceptLoopClass::from_loop_id(accept_loop_id);
+        let state = loop_state.clone();
+        let shutdown_rx = shutdown.clone();
+        let global_shutdown_rx = global_shutdown.clone();
+        let peer_cancel_rx = peer_cancel_rx.clone();
+        peers.push((
+            class,
+            tokio::spawn(async move {
+                run_supervised_tcp_accept_loop(
+                    listener,
+                    state,
+                    shutdown_rx,
+                    global_shutdown_rx,
+                    peer_cancel_rx,
+                    accept_loop_id,
+                )
+                .await
+            }),
+        ));
+    }
+
+    let result = supervise_tcp_accept_loop_peers(peers, move || {
+        let _ = peer_cancel_tx.send(true);
+    })
+    .await;
+    if result.is_err() {
+        // Unexpected peer exit must not leave started/readiness healthy while
+        // accept capacity is gone. Shutdown-triggered Ok leaves started as-is;
+        // the owning StreamListenerManager clears handles on remove/shutdown.
+        started.store(false, Ordering::Release);
+    }
+    result
 }
 
 async fn run_tcp_accept_loop(

@@ -270,6 +270,24 @@ async fn test_dns_warmup_does_not_panic() {
 }
 
 #[tokio::test]
+async fn test_dns_warmup_skips_empty_upstream_placeholders() {
+    let cache = DnsCache::new(default_dns_config(HashMap::new()));
+
+    cache
+        .warmup(vec![
+            (String::new(), None, None),
+            ("   ".to_string(), None, None),
+        ])
+        .await;
+
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "empty upstream-backed proxy hosts must not become search-domain lookups"
+    );
+}
+
+#[tokio::test]
 async fn test_dns_warmup_with_overrides() {
     let cache = DnsCache::new(default_dns_config(HashMap::new()));
 
