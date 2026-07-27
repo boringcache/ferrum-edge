@@ -64,7 +64,11 @@ async fn request_transformer_query_rules_reach_primary_and_mirror_on_h1_h2_h3() 
 async fn request_transformer_query_survives_retry_on_h1() {
     let mut harness = TransformerRetryHarness::spawn().await;
     let status = http1_get_retry(&harness).await;
-    assert_eq!(status.as_u16(), 500, "status retries should exhaust with 500");
+    assert_eq!(
+        status.as_u16(),
+        500,
+        "status retries should exhaust with 500"
+    );
 
     let targets = harness
         .wait_for_attempts(3, Duration::from_secs(5))
@@ -252,7 +256,8 @@ impl TransformerQueryHarness {
     }
 
     fn http1_url(&self) -> String {
-        self.gateway.proxy_url(&format!("/resource?{INBOUND_QUERY}"))
+        self.gateway
+            .proxy_url(&format!("/resource?{INBOUND_QUERY}"))
     }
 
     fn h2_uri(&self) -> String {
@@ -317,7 +322,8 @@ impl TransformerRetryHarness {
     }
 
     fn http1_url(&self) -> String {
-        self.gateway.proxy_url(&format!("/resource?{INBOUND_QUERY}"))
+        self.gateway
+            .proxy_url(&format!("/resource?{INBOUND_QUERY}"))
     }
 
     fn shutdown(&mut self) {

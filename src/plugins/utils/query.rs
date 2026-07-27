@@ -80,8 +80,12 @@ impl QueryPair {
     fn from_raw_segment(pair: &str) -> Self {
         match pair.split_once('=') {
             Some((raw_name, raw_value)) => Self {
-                decoded_name: percent_decode_str(raw_name).decode_utf8_lossy().into_owned(),
-                decoded_value: percent_decode_str(raw_value).decode_utf8_lossy().into_owned(),
+                decoded_name: percent_decode_str(raw_name)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+                decoded_value: percent_decode_str(raw_value)
+                    .decode_utf8_lossy()
+                    .into_owned(),
                 raw_name: raw_name.to_string(),
                 raw_value: Some(raw_value.to_string()),
             },

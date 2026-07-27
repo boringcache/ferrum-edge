@@ -20860,8 +20860,7 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string =
-        effective_backend_query_string_with_raw(&ctx, &query_string);
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,

@@ -2052,8 +2052,14 @@ async fn test_ordered_query_duplicate_and_encoding_semantics() {
         Some("tag=green&tag=green&flag&empty=&q=a+b&new=1&keep=%ZZ&name=%E2%9C%93&version=v2")
     );
     assert!(!ctx.query_params.contains_key("access_token"));
-    assert_eq!(ctx.query_params.get("tag").map(String::as_str), Some("green"));
-    assert_eq!(ctx.query_params.get("version").map(String::as_str), Some("v2"));
+    assert_eq!(
+        ctx.query_params.get("tag").map(String::as_str),
+        Some("green")
+    );
+    assert_eq!(
+        ctx.query_params.get("version").map(String::as_str),
+        Some("v2")
+    );
     assert_eq!(ctx.query_params.get("new").map(String::as_str), Some("1"));
     assert!(!ctx.query_params.contains_key("old"));
 }
@@ -2148,7 +2154,10 @@ async fn test_query_transform_composes_with_auth_strip_helper() {
     );
     let mut headers = HashMap::new();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(ctx.outbound_query_string(), Some("api_key=secret&page=2&keep=1"));
+    assert_eq!(
+        ctx.outbound_query_string(),
+        Some("api_key=secret&page=2&keep=1")
+    );
     let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
     assert_eq!(effective, "page=2&keep=1");
 }
