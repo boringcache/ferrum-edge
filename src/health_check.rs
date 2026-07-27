@@ -73,6 +73,18 @@ fn format_probe_url(scheme: &str, host: &str, port: u16, path: &str) -> String {
     format!("{}://{}:{}{}", scheme, host, port, path)
 }
 
+fn grpc_probe_urls(
+    scheme: &str,
+    original_host: &str,
+    dial_addr: &str,
+    port: u16,
+) -> (String, String) {
+    (
+        format_probe_url(scheme, dial_addr, port, ""),
+        format_probe_url(scheme, original_host, port, ""),
+    )
+}
+
 fn load_probe_tls_material(
     source_value: &str,
     kind: MaterialKind,
@@ -1114,7 +1126,7 @@ impl HealthChecker {
                     // Screen with the parser that matches how THIS probe dials.
                     // HTTP probes go through reqwest (URL canonicalization), so a
                     // non-canonical literal like `2852039166` must be screened as
-                    // an IP. TCP/UDP/gRPC probes resolve through `DnsCache::resolve`
+                    // an IP. TCP/UDP/gRPC probes resolve through `DnsCache`
                     // (canonical literals only; everything else is real DNS, then
                     // the resolved address is policy-checked), so use the
                     // canonical-only parser — otherwise a numeric service name such
@@ -1159,12 +1171,12 @@ impl HealthChecker {
                         // TCP/UDP/gRPC dial directly (TcpStream/UdpSocket/tonic),
                         // bypassing the DnsCacheResolver, so resolve through the
                         // gateway DNS cache here to enforce the egress policy on
-                        // the resolved address (hostname rebinding to a denied IP
-                        // fails). TCP/UDP then dial that exact screened IP; gRPC
-                        // keeps the hostname so TLS SNI is unchanged but is still
-                        // screened by the resolve above.
+                        // the complete answer set. Each candidate was screened
+                        // independently; direct probes rotate and fail over within
+                        // the configured probe timeout. gRPC keeps the original
+                        // hostname for TLS SNI and HTTP/2 authority.
                         HealthProbeType::Tcp | HealthProbeType::Udp | HealthProbeType::Grpc => {
-                            // Strip URI brackets: `DnsCache::resolve` only
+                            // Strip URI brackets: `DnsCache` only
                             // recognizes UNbracketed IP literals, so a bracketed
                             // IPv6 target (`[::1]`, `[fd00::1]`) would fall through
                             // to DNS and flap unhealthy. Bare hostnames pass through
@@ -1176,39 +1188,38 @@ impl HealthChecker {
                                 .unwrap_or(host.as_str());
                             match probe_dns_cache.as_ref() {
                                 Some(cache) => {
-                                    match cache.resolve(resolve_host, None, None).await {
-                                        Ok(resolved_ip) => {
-                                            let ip_str = resolved_ip.to_string();
-                                            match probe_type {
-                                                HealthProbeType::Tcp => {
-                                                    tcp_probe(&ip_str, port, timeout).await
-                                                }
-                                                HealthProbeType::Udp => {
-                                                    udp_probe(&ip_str, port, timeout, &udp_payload)
-                                                        .await
-                                                }
-                                                // gRPC: dial the screened IP (`ip_str`)
-                                                // so tonic does not re-resolve and risk
-                                                // a split-DNS rebind, while keeping the
-                                                // hostname for TLS SNI / cert validation.
-                                                _ => {
-                                                    grpc_probe(
-                                                        &host,
-                                                        &ip_str,
-                                                        port,
-                                                        timeout,
-                                                        use_tls,
-                                                        &grpc_service_name,
-                                                        &probe_tls_config,
-                                                        probe_global_ca.as_deref(),
-                                                        probe_global_cert.as_deref(),
-                                                        probe_global_key.as_deref(),
-                                                        probe_no_verify,
-                                                    )
+                                    match cache.resolve_candidates(resolve_host, None, None).await {
+                                        Ok(candidates) => match probe_type {
+                                            HealthProbeType::Tcp => {
+                                                tcp_probe_candidates(&candidates, port, timeout)
                                                     .await
-                                                }
                                             }
-                                        }
+                                            HealthProbeType::Udp => {
+                                                udp_probe_candidates(
+                                                    &candidates,
+                                                    port,
+                                                    timeout,
+                                                    &udp_payload,
+                                                )
+                                                .await
+                                            }
+                                            _ => {
+                                                grpc_probe_candidates(
+                                                    &candidates,
+                                                    &host,
+                                                    port,
+                                                    timeout,
+                                                    use_tls,
+                                                    &grpc_service_name,
+                                                    &probe_tls_config,
+                                                    probe_global_ca.as_deref(),
+                                                    probe_global_cert.as_deref(),
+                                                    probe_global_key.as_deref(),
+                                                    probe_no_verify,
+                                                )
+                                                .await
+                                            }
+                                        },
                                         Err(e) => {
                                             warn!(
                                                 target = %host,
@@ -1500,6 +1511,26 @@ async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> ProbeOutcome {
     }
 }
 
+async fn tcp_probe_candidates(
+    candidates: &crate::dns::ResolvedAddresses,
+    port: u16,
+    timeout: Duration,
+) -> ProbeOutcome {
+    match crate::dns::connect_candidates(candidates, port, timeout, |addr| {
+        tokio::net::TcpStream::connect(addr)
+    })
+    .await
+    {
+        Ok((_stream, _addr)) => ProbeOutcome::success(),
+        Err(crate::dns::CandidateConnectError::Failed { source, .. }) => {
+            ProbeOutcome::failure(format!("tcp connect failed: {source}"))
+        }
+        Err(crate::dns::CandidateConnectError::TimedOut { .. }) => {
+            ProbeOutcome::failure("tcp connect timed out")
+        }
+    }
+}
+
 /// UDP health probe — sends a payload and waits for any response within the timeout.
 async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> ProbeOutcome {
     let addr = format_probe_socket_addr(host, port);
@@ -1541,6 +1572,90 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
     }
 }
 
+async fn udp_probe_candidates(
+    candidates: &crate::dns::ResolvedAddresses,
+    port: u16,
+    timeout: Duration,
+    payload: &[u8],
+) -> ProbeOutcome {
+    let data = if payload.is_empty() { &[0u8] } else { payload };
+    match crate::dns::connect_candidates(candidates, port, timeout, |addr| async move {
+        let bind_addr = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+        socket.connect(addr).await?;
+        socket.send(data).await?;
+        let mut buf = [0u8; 1];
+        socket.recv(&mut buf).await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    {
+        Ok(((), _addr)) => ProbeOutcome::success(),
+        Err(crate::dns::CandidateConnectError::Failed { source, .. }) => {
+            ProbeOutcome::failure(format!("udp probe failed: {source}"))
+        }
+        Err(crate::dns::CandidateConnectError::TimedOut { .. }) => {
+            ProbeOutcome::failure("udp probe timed out")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn grpc_probe_candidates(
+    candidates: &crate::dns::ResolvedAddresses,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    use_tls: bool,
+    service_name: &str,
+    tls_config: &BackendTlsConfig,
+    global_ca_path: Option<&str>,
+    global_cert_path: Option<&str>,
+    global_key_path: Option<&str>,
+    global_no_verify: bool,
+) -> ProbeOutcome {
+    match crate::dns::connect_candidates(candidates, port, timeout, |addr| {
+        let dial_addr = addr.ip().to_string();
+        async move {
+            let outcome = grpc_probe(
+                host,
+                &dial_addr,
+                port,
+                timeout,
+                use_tls,
+                service_name,
+                tls_config,
+                global_ca_path,
+                global_cert_path,
+                global_key_path,
+                global_no_verify,
+            )
+            .await;
+            if outcome.success {
+                Ok(())
+            } else {
+                Err(outcome
+                    .failure
+                    .unwrap_or_else(|| "grpc probe failed".to_string()))
+            }
+        }
+    })
+    .await
+    {
+        Ok(((), _addr)) => ProbeOutcome::success(),
+        Err(crate::dns::CandidateConnectError::Failed { source, .. }) => {
+            ProbeOutcome::failure(source)
+        }
+        Err(crate::dns::CandidateConnectError::TimedOut { .. }) => {
+            ProbeOutcome::failure("grpc connect timed out")
+        }
+    }
+}
+
 /// gRPC health probe — performs a unary grpc.health.v1.Health/Check RPC.
 ///
 /// When `use_tls` is true, the probe configures TLS using the upstream's
@@ -1565,7 +1680,7 @@ async fn grpc_probe(
     // health loop) so tonic does not re-resolve `host` and risk a split-DNS /
     // rebind to a denied address between the egress screen and the dial. TLS
     // SNI and the cert hostname still come from `host` (see `domain_name`).
-    let endpoint_url = format_probe_url(scheme, dial_addr, port, "");
+    let (endpoint_url, origin_url) = grpc_probe_urls(scheme, host, dial_addr, port);
 
     let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
         Ok(ep) => {
@@ -1574,7 +1689,7 @@ async fn grpc_probe(
             // the HTTP/2 `:authority` from that URI. Override the origin with the
             // original host so a virtual-hosted / H2-multiplexed backend routes
             // the health RPC the same as normal proxy traffic to the hostname.
-            match format_probe_url(scheme, host, port, "").parse::<http::Uri>() {
+            match origin_url.parse::<http::Uri>() {
                 Ok(origin) => ep.origin(origin),
                 Err(_) => ep,
             }
@@ -2408,6 +2523,13 @@ mod tests {
             format_probe_url("http", "backend.local", 8080, "/health"),
             "http://backend.local:8080/health"
         );
+    }
+
+    #[test]
+    fn grpc_probe_dials_candidate_but_preserves_original_authority() {
+        let (endpoint, origin) = grpc_probe_urls("https", "backend.internal", "192.0.2.25", 8443);
+        assert_eq!(endpoint, "https://192.0.2.25:8443");
+        assert_eq!(origin, "https://backend.internal:8443");
     }
 
     #[tokio::test]

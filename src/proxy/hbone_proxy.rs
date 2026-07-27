@@ -283,9 +283,9 @@ async fn connect_backend(
         .and_then(|override_config| override_config.connect_timeout_ms)
         .unwrap_or(proxy.backend_connect_timeout_ms);
 
-    let resolved_ip = state
+    let candidates = state
         .dns_cache
-        .resolve(
+        .resolve_candidates(
             host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
@@ -300,70 +300,47 @@ async fn connect_backend(
             target_url: Some(target_url.clone()),
             resolved_ip: None,
         })?;
-    let addr = SocketAddr::new(resolved_ip, port);
-
-    let connect = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
-        && node_waypoint_inbound_relay_mark_enabled()
+    let socket_mark = (proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
+        && node_waypoint_inbound_relay_mark_enabled())
+    .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
+    let timeout = Duration::from_millis(effective_connect_timeout_ms);
+    let (stream, addr) = match crate::dns::connect_candidates(&candidates, port, timeout, |addr| {
+        crate::socket_opts::connect_with_socket_opts_and_mark(addr, socket_mark)
+    })
+    .await
     {
-        crate::socket_opts::connect_with_socket_opts_and_mark(
-            addr,
-            Some(NODE_WAYPOINT_INBOUND_AUTH_MARK),
-        )
-    } else {
-        crate::socket_opts::connect_with_socket_opts_and_mark(addr, None)
-    };
-    let stream = if effective_connect_timeout_ms > 0 {
-        let timeout = Duration::from_millis(effective_connect_timeout_ms);
-        match tokio::time::timeout(timeout, connect).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                let class = classify_io_error(&err);
-                if class == retry::ErrorClass::PortExhaustion {
-                    state.overload.record_port_exhaustion();
-                }
-                return Err(HboneConnectError {
-                    status: StatusCode::BAD_GATEWAY,
-                    body: br#"{"error":"Backend HBONE connection failed"}"#,
-                    phase: "hbone_connect",
-                    class,
-                    message: err.to_string(),
-                    target_url: Some(target_url),
-                    resolved_ip: Some(resolved_ip.to_string()),
-                });
+        Ok(connected) => connected,
+        Err(crate::dns::CandidateConnectError::Failed {
+            last_addr,
+            source: err,
+        }) => {
+            let class = classify_io_error(&err);
+            if class == retry::ErrorClass::PortExhaustion {
+                state.overload.record_port_exhaustion();
             }
-            Err(_) => {
-                return Err(HboneConnectError {
-                    status: StatusCode::GATEWAY_TIMEOUT,
-                    body: br#"{"error":"Backend HBONE connection timed out"}"#,
-                    phase: "hbone_connect_timeout",
-                    class: retry::ErrorClass::ConnectionTimeout,
-                    message: format!(
-                        "backend connect timeout after {}ms",
-                        effective_connect_timeout_ms
-                    ),
-                    target_url: Some(target_url),
-                    resolved_ip: Some(resolved_ip.to_string()),
-                });
-            }
+            return Err(HboneConnectError {
+                status: StatusCode::BAD_GATEWAY,
+                body: br#"{"error":"Backend HBONE connection failed"}"#,
+                phase: "hbone_connect",
+                class,
+                message: err.to_string(),
+                target_url: Some(target_url),
+                resolved_ip: Some(last_addr.ip().to_string()),
+            });
         }
-    } else {
-        match connect.await {
-            Ok(stream) => stream,
-            Err(err) => {
-                let class = classify_io_error(&err);
-                if class == retry::ErrorClass::PortExhaustion {
-                    state.overload.record_port_exhaustion();
-                }
-                return Err(HboneConnectError {
-                    status: StatusCode::BAD_GATEWAY,
-                    body: br#"{"error":"Backend HBONE connection failed"}"#,
-                    phase: "hbone_connect",
-                    class,
-                    message: err.to_string(),
-                    target_url: Some(target_url),
-                    resolved_ip: Some(resolved_ip.to_string()),
-                });
-            }
+        Err(crate::dns::CandidateConnectError::TimedOut { last_addr }) => {
+            return Err(HboneConnectError {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                body: br#"{"error":"Backend HBONE connection timed out"}"#,
+                phase: "hbone_connect_timeout",
+                class: retry::ErrorClass::ConnectionTimeout,
+                message: format!(
+                    "backend connect timeout after {}ms",
+                    effective_connect_timeout_ms
+                ),
+                target_url: Some(target_url),
+                resolved_ip: Some(last_addr.ip().to_string()),
+            });
         }
     };
 
@@ -372,7 +349,7 @@ async fn connect_backend(
     Ok(HboneBackendConnection {
         stream,
         target_url,
-        resolved_ip: Some(resolved_ip.to_string()),
+        resolved_ip: Some(addr.ip().to_string()),
     })
 }
 
@@ -1082,8 +1059,8 @@ pub(super) async fn handle_hbone_udp_request(
     // Timed from here so the transaction summary's backend-connect span covers
     // the DNS resolve + bind + connect, mirroring the byte-stream relay.
     let backend_start = Instant::now();
-    let dest_addr = match resolve_local_udp_dest(state, proxy, app_host, app_port).await {
-        Ok(addr) => addr,
+    let dest_candidates = match resolve_local_udp_dest(state, proxy, app_host).await {
+        Ok(addresses) => addresses,
         Err((status, body, phase, message)) => {
             warn!(proxy_id = %proxy.id, error = %message, "HBONE UDP backend resolution failed");
             let reject = finalize_reject_response_with_after_proxy_hooks(
@@ -1109,14 +1086,54 @@ pub(super) async fn handle_hbone_udp_request(
         }
     };
 
-    let socket = match open_hbone_udp_relay_socket(state, dest_addr).await {
-        Ok(socket) => socket,
-        Err(error) => {
+    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let (socket, dest_addr) = match crate::dns::connect_candidates(
+        &dest_candidates,
+        app_port,
+        connect_timeout,
+        |dest_addr| open_hbone_udp_relay_socket(state, dest_addr),
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(crate::dns::CandidateConnectError::Failed { source, .. }) => {
+            let error = source;
             warn!(proxy_id = %proxy.id, error = %error.message, "HBONE UDP local socket open failed");
             let reject = finalize_reject_response_with_after_proxy_hooks(
                 plugins,
                 ctx,
                 StatusCode::BAD_GATEWAY,
+                error.body,
+                HashMap::new(),
+                false,
+            )
+            .await;
+            log_rejected_request(
+                plugins,
+                ctx,
+                reject.http_status.as_u16(),
+                start_time,
+                error.phase,
+                plugin_execution_ns,
+            )
+            .await;
+            record_request(state, reject.http_status.as_u16());
+            return build_response_from_normalized_reject(reject);
+        }
+        Err(crate::dns::CandidateConnectError::TimedOut { .. }) => {
+            let error = HboneUdpSocketOpenError {
+                phase: "hbone_udp_connect_timeout",
+                body: br#"{"error":"HBONE UDP local socket connect timed out"}"#,
+                message: format!(
+                    "backend connect budget exhausted after {}ms",
+                    proxy.backend_connect_timeout_ms
+                ),
+            };
+            warn!(proxy_id = %proxy.id, error = %error.message, "HBONE UDP local socket open failed");
+            let reject = finalize_reject_response_with_after_proxy_hooks(
+                plugins,
+                ctx,
+                StatusCode::GATEWAY_TIMEOUT,
                 error.body,
                 HashMap::new(),
                 false,
@@ -1246,11 +1263,10 @@ async fn resolve_local_udp_dest(
     state: &ProxyState,
     proxy: &Proxy,
     host: &str,
-    port: u16,
-) -> Result<SocketAddr, (StatusCode, &'static [u8], &'static str, String)> {
-    let ip = state
+) -> Result<crate::dns::ResolvedAddresses, (StatusCode, &'static [u8], &'static str, String)> {
+    state
         .dns_cache
-        .resolve(
+        .resolve_candidates(
             host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
@@ -1263,8 +1279,7 @@ async fn resolve_local_udp_dest(
                 "hbone_udp_dns",
                 e.to_string(),
             )
-        })?;
-    Ok(SocketAddr::new(ip, port))
+        })
 }
 
 async fn open_hbone_udp_relay_socket(

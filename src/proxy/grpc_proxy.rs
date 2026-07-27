@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -788,9 +788,9 @@ impl GrpcPoolManager {
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -803,103 +803,121 @@ impl GrpcPoolManager {
                 )
             })?;
 
-        // Construct SocketAddr from the resolved IpAddr + port directly.
-        // This handles both IPv4 and IPv6 correctly without string formatting
-        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
-        // which breaks "ip:port" string parsing).
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-
-        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
-        // before connect() so the kernel can co-select ephemeral ports.
-        let tcp = tokio::time::timeout(
-            connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
-        )
-        .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: connect timeout ({}ms) to backend {}",
-                proxy.backend_connect_timeout_ms, addr
-            );
-            GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Connect,
-                message: format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ),
-            }
-        })?
-        .map_err(|e| {
-            if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                    addr,
-                    e
-                );
-            } else {
-                warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-            }
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::Connect,
-                format!("Connection failed: {}", e),
-                e,
-            )
-        })?;
-
-        // Disable Nagle for lower latency
-        let _ = tcp.set_nodelay(true);
-
-        // Apply TCP keepalive: honor the DestinationRule
-        // `connectionPool.tcp.tcpKeepalive` per-port override (keyed by the
-        // dial target's port, `proxy.backend_port`), falling back to the
-        // global pool keepalive. NOTE: keepalive is NOT in the pool key
-        // (forbidden by `.claude/rules/proxy-protocols.md`), and this
-        // connection is pooled+shared, so the first dispatcher to materialize
-        // the connection wins — same first-materializer tradeoff documented
-        // for `idleTimeout` / `maxRequestsPerConnection`.
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        crate::socket_opts::apply_pooled_tcp_keepalive(
-            "grpc_proxy",
-            &tcp,
-            proxy
-                .dispatch_port_overrides
-                .as_ref()
-                .and_then(|m| m.get(&port))
-                .and_then(|o| o.tcp_keepalive.as_ref()),
-            pool_config.enable_http_keep_alive,
-            pool_config.tcp_keepalive_seconds,
-        );
-
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
-        if use_tls {
-            self.create_tls_connection(
-                tcp,
-                host,
-                proxy,
-                svid_generation,
-                connect_started,
-                connect_timeout,
-            )
+        // The candidate attempt includes TCP socket setup, negotiated ALPN h2
+        // when TLS is configured, and the Hyper H2 handshake. Cleartext h2c
+        // additionally observes the spawned driver for an immediate protocol
+        // rejection. A peer that accepts TCP but cannot establish the requested
+        // protocol must not pin this pool to that DNS address.
+        let result = if use_tls {
+            let tls_config = self.get_tls_config(proxy, svid_generation)?;
+            let connector = tokio_rustls::TlsConnector::from(tls_config);
+            let server_name =
+                crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host)
+                    .map_err(|e| {
+                        GrpcProxyError::backend_unavailable(
+                            GrpcBackendUnavailableKind::InvalidServerName,
+                            format!("Invalid server name: {}", e),
+                        )
+                    })?;
+
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
+                let connector = connector.clone();
+                let server_name = server_name.clone();
+                let pool_config = &pool_config;
+                async move {
+                    let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                        .await
+                        .map_err(|e| {
+                            GrpcProxyError::backend_unavailable_with_source(
+                                GrpcBackendUnavailableKind::Connect,
+                                format!("Connection failed: {}", e),
+                                e,
+                            )
+                        })?;
+                    let _ = tcp.set_nodelay(true);
+                    crate::socket_opts::apply_pooled_tcp_keepalive(
+                        "grpc_proxy",
+                        &tcp,
+                        keepalive_override,
+                        pool_config.enable_http_keep_alive,
+                        pool_config.tcp_keepalive_seconds,
+                    );
+                    self.create_tls_connection(tcp, connector, server_name, pool_config)
+                        .await
+                }
+            })
             .await
         } else {
-            self.create_h2c_connection(tcp, &pool_config, proxy, connect_started, connect_timeout)
-                .await
-        }
-    }
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
+                let pool_config = &pool_config;
+                async move {
+                    let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                        .await
+                        .map_err(|e| {
+                            GrpcProxyError::backend_unavailable_with_source(
+                                GrpcBackendUnavailableKind::Connect,
+                                format!("Connection failed: {}", e),
+                                e,
+                            )
+                        })?;
+                    let _ = tcp.set_nodelay(true);
+                    crate::socket_opts::apply_pooled_tcp_keepalive(
+                        "grpc_proxy",
+                        &tcp,
+                        keepalive_override,
+                        pool_config.enable_http_keep_alive,
+                        pool_config.tcp_keepalive_seconds,
+                    );
+                    self.create_h2c_connection(tcp, pool_config).await
+                }
+            })
+            .await
+        };
 
-    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> GrpcProxyError {
-        GrpcProxyError::BackendTimeout {
-            kind: GrpcTimeoutKind::Connect,
-            message: format!(
-                "Connect timeout after {}ms during {} to {}:{}",
-                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
-            ),
-        }
+        result
+            .map(|(sender, _)| sender)
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                    warn!(
+                        "gRPC: protocol establishment budget exhausted ({}ms) for backend {} \
+                         (last={})",
+                        proxy.backend_connect_timeout_ms, host, last_addr
+                    );
+                    GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Connect,
+                        message: format!(
+                            "Connect timeout after {}ms establishing gRPC HTTP/2 to {}",
+                            proxy.backend_connect_timeout_ms, last_addr
+                        ),
+                    }
+                }
+                crate::dns::CandidateConnectError::Failed { last_addr, source } => {
+                    if crate::retry::is_port_exhaustion(&source) {
+                        tracing::error!(
+                            "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                             reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                            last_addr,
+                            source
+                        );
+                    } else {
+                        warn!(
+                            "gRPC: all DNS candidates failed protocol establishment for backend {} \
+                             (last={}): {}",
+                            host, last_addr, source
+                        );
+                    }
+                    source
+                }
+            })
     }
 
     /// Build an HTTP/2 client builder with keepalive and flow-control settings.
@@ -929,11 +947,8 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) AND advertise our local
-            // initial cap on locally-initiated streams. The server's SETTINGS
-            // frame can raise the local cap later, but the initial value
-            // gives operators a starting bound that maps onto Istio's
-            // `http2MaxRequests` semantics for outbound concurrent requests.
+            // Preserve the configured initial outbound bound until the peer's
+            // SETTINGS frame replaces it.
             builder.max_concurrent_streams(max_streams);
             builder.initial_max_send_streams(max_streams as usize);
         }
@@ -946,36 +961,44 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
-        proxy: &Proxy,
-        connect_started: Instant,
-        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "h2c handshake"));
-        };
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                format!("h2c handshake failed: {}", e),
+                e,
+            )
+        })?;
 
-        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2c handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::H2cHandshake,
-                    format!("h2c handshake failed: {}", e),
-                    e,
-                )
-            })?;
-
-        // Spawn the connection driver
+        // Unlike TLS-backed H2, h2c has no ALPN proof. Give the spawned driver
+        // one short observation window to surface an immediate protocol error
+        // (for example an HTTP/1.1 response to the prior-knowledge preface)
+        // before this DNS candidate is accepted.
+        let (driver_closed_tx, mut driver_closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let result = conn.await.map_err(|error| error.to_string());
+            if let Err(ref e) = result {
                 debug!("gRPC h2c connection closed: {}", e);
             }
+            let _ = driver_closed_tx.send(result);
         });
+        if let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(25), &mut driver_closed_rx).await
+        {
+            let message = match result {
+                Ok(Err(message)) => format!("h2c handshake failed: {message}"),
+                Ok(Ok(())) => "h2c connection closed during handshake".to_string(),
+                Err(_) => "h2c connection driver ended during handshake".to_string(),
+            };
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ));
+        }
 
         Ok(sender)
     }
@@ -984,65 +1007,37 @@ impl GrpcPoolManager {
     async fn create_tls_connection(
         &self,
         tcp: TcpStream,
-        host: &str,
-        proxy: &Proxy,
-        svid_generation: Option<u64>,
-        connect_started: Instant,
-        connect_timeout: Duration,
+        connector: tokio_rustls::TlsConnector,
+        server_name: rustls::pki_types::ServerName<'static>,
+        pool_config: &PoolConfig,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        use tokio_rustls::TlsConnector;
-
-        let tls_config = self.get_tls_config(proxy, svid_generation)?;
-        let connector = TlsConnector::from(tls_config);
-        let server_name =
-            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
-                |e| {
-                    GrpcProxyError::backend_unavailable(
-                        GrpcBackendUnavailableKind::InvalidServerName,
-                        format!("Invalid server name: {}", e),
-                    )
-                },
-            )?;
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
-        };
-
-        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::TlsHandshake,
-                    format!("TLS handshake failed: {}", e),
-                    e,
-                )
-            })?;
+        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                format!("TLS handshake failed: {}", e),
+                e,
+            )
+        })?;
+        if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            let message = "TLS peer did not negotiate ALPN h2".to_string();
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ));
+        }
 
         let io = TokioIo::new(tls_stream);
-        let pool_config = self.global_pool_config.for_proxy(proxy);
-        let builder = Self::build_h2_builder(&pool_config);
+        let builder = Self::build_h2_builder(pool_config);
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2Handshake,
+                format!("h2 handshake failed: {}", e),
+                e,
+            )
+        })?;
 
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "h2 handshake"));
-        };
-
-        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2 handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::H2Handshake,
-                    format!("h2 handshake failed: {}", e),
-                    e,
-                )
-            })?;
-
-        // Spawn the connection driver
+        // TLS negotiation already proved H2 via ALPN.
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);
