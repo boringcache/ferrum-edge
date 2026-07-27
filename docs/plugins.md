@@ -3568,6 +3568,16 @@ rule should block. Invalid WAF configuration is security-fatal at
 startup/reload, so the gateway does not silently serve without the intended
 inspection.
 
+**Admission.** Fixed-shape objects reject unknown keys with path-qualified
+diagnostics and spelling suggestions before defaults apply (top-level config,
+`scoring`, custom rules, object-form targets, conditions, global exemptions,
+stream config/signatures, and rule-override values). Intentionally open maps
+remain open: `rule_modes` and `rule_overrides` (rule-id keys; override values
+are closed), `conditions.headers`, and `global_exemptions.header_present`.
+Registration policy is `FailClosed`: an invalid enabled config rejects
+publication so the gateway retains the last-known-good instance instead of
+admitting a typo'd weaker policy.
+
 Request metadata inspection (path, query, headers, cookies, and method) runs
 in the `authorize` phase after authentication and earlier authorization
 plugins such as `access_control`, `mesh_authz`, and consumer-aware

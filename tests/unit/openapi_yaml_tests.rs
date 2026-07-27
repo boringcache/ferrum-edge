@@ -1616,6 +1616,101 @@ fn waf_scoring_weights_reject_unknown_severities() {
 }
 
 #[test]
+fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for schema in [
+        "WafPluginConfig",
+        "WafStreamConfig",
+        "WafStreamSignature",
+        "WafRule",
+        "WafExemptions",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][schema]["additionalProperties"],
+            json!(false),
+            "{schema} must reject unknown properties"
+        );
+    }
+
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["scoring"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["additionalProperties"],
+        json!(false)
+    );
+
+    // Intentionally open operator-defined maps.
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_modes"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "rule_modes must remain an open rule-id map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
+            .get("additionalProperties")
+            .is_some_and(|v| v.is_object()),
+        "rule_overrides must remain an open rule-id map of closed objects"
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]["additionalProperties"]
+            ["additionalProperties"],
+        json!(false),
+        "rule_overrides values must be closed"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["properties"]
+            ["headers"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "conditions.headers must remain an open header-name map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafExemptions"]["properties"]["header_present"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "global_exemptions.header_present must remain an open header-name map"
+    );
+
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/WafPluginConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&root)
+        .expect("WafPluginConfig schema compiles");
+    assert!(
+        validator
+            .validate(&json!({
+                "mode": "enforce",
+                "default_rule_action": "enforce",
+                "rule_modes": { "FE-XSS-001": "enforce" },
+                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+            }))
+            .is_ok()
+    );
+    assert!(
+        validator
+            .validate(&json!({ "default_rule_actoin": "enforce" }))
+            .is_err(),
+        "schema must reject top-level enforcement typo"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "stream": { "tcp_require_tsl": true }
+            }))
+            .is_err(),
+        "schema must reject stream guard typo"
+    );
+}
+
+#[test]
 fn access_control_schema_matches_runtime_validation() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -45,6 +45,44 @@ use super::{
     UdpDatagramVerdict,
 };
 use crate::config::types::BackendScheme;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Exhaustive top-level WAF config keys. Unknown properties are rejected before
+/// defaults apply so typos cannot silently weaken enforcement (for example
+/// `default_rule_actoin` leaving built-ins monitor-only).
+const WAF_CONFIG_KEYS: &[&str] = &[
+    "mode",
+    "default_rule_action",
+    "paranoia_level",
+    "request_inspection",
+    "request_body_inspection",
+    "response_inspection",
+    "response_body_inspection",
+    "log_to_metadata",
+    "log_to_stdout",
+    "scan_budget_ms",
+    "max_scan_bytes",
+    "on_scan_timeout",
+    "on_body_too_large",
+    "include_default_rules",
+    "disabled_default_rules",
+    "rule_modes",
+    "rule_overrides",
+    "custom_rules",
+    "scoring",
+    "global_exemptions",
+    "body_methods",
+    "body_content_types",
+    "inspect_multipart",
+    "inspect_binary_body",
+    "disallowed_methods",
+    "reject_status_code",
+    "reject_content_type",
+    "reject_body",
+    "stream",
+];
+
+const SCORING_CONFIG_KEYS: &[&str] = &["enabled", "block_threshold", "weights"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobalMode {
@@ -201,6 +239,10 @@ impl Waf {
         let object = config
             .as_object()
             .ok_or_else(|| "waf: config must be an object".to_string())?;
+
+        // Reject unknown keys before any defaults so a typo cannot admit a
+        // weaker policy while construction reports success.
+        reject_unknown_keys(object, "config", WAF_CONFIG_KEYS, "waf: ")?;
 
         let mode = parse_global_mode(
             optional_string(object, "mode")?
@@ -1337,6 +1379,7 @@ fn parse_scoring(value: Option<&Value>) -> Result<Option<ScoringConfig>, String>
     let object = value
         .as_object()
         .ok_or_else(|| "waf: 'scoring' must be an object".to_string())?;
+    reject_unknown_keys(object, "config.scoring", SCORING_CONFIG_KEYS, "waf: ")?;
     if !optional_bool(object, "enabled")?.unwrap_or(true) {
         return Ok(None);
     }
@@ -1409,7 +1452,14 @@ fn parse_custom_rules(
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(values)) => values
             .iter()
-            .map(|value| parse_custom_rule(value, default_action))
+            .enumerate()
+            .map(|(idx, value)| {
+                parse_custom_rule(
+                    value,
+                    default_action,
+                    &format!("config.custom_rules[{idx}]"),
+                )
+            })
             .collect(),
         Some(other) => Err(format!("waf: 'custom_rules' must be an array, got {other}")),
     }

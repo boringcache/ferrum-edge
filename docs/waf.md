@@ -63,6 +63,29 @@ below), the recommended starting posture for active blocking is:
 
 This enforces only the low-false-positive core of the rule pack.
 
+### Strict configuration admission
+
+Every fixed-shape WAF object rejects unknown keys **before** defaults apply:
+top-level config, `scoring`, each `custom_rules[]` entry, object-form `target`,
+`conditions`, `global_exemptions`, `stream`, each `stream.signatures[]` entry,
+and each `rule_overrides[<id>]` value. A typo such as `default_rule_actoin`,
+`conditions.path`, `global_exemptions.header_presnt`, or `stream.tcp_require_tsl`
+fails construction so Admin, file, database, CP/DP, and reload paths keep
+last-known-good configuration under the plugin's `FailClosed` policy.
+
+Intentionally open maps (operator-defined keys) remain open and are not closed
+by a blanket `additionalProperties: false` on the map itself:
+
+| Map | Why it stays open |
+| --- | --- |
+| `rule_modes` | keys are rule ids |
+| `rule_overrides` | keys are rule ids; **values** are fixed-shape and closed |
+| `conditions.headers` | keys are header names |
+| `global_exemptions.header_present` | keys are header names |
+
+`scoring.weights` accepts only the severity names `info` / `low` / `medium` /
+`high` / `critical`.
+
 ## Paranoia levels
 
 `paranoia_level` (1–4, default 1) gates which rules are active. Each rule has a
