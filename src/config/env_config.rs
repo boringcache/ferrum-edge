@@ -1954,9 +1954,10 @@ pub struct EnvConfig {
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
-    /// TLS session resumption cache size for TLS 1.2 stateful session IDs.
-    /// TLS 1.3 uses stateless tickets (unlimited). Applies to inbound listeners
-    /// and outbound/backend client configs that opt into rustls session caching.
+    /// TLS stateful session cache size. Applies to inbound TLS 1.2 session IDs,
+    /// outbound/backend client configs that opt into rustls session caching,
+    /// and HTTP/3 server 0-RTT sessions when early data is enabled on a
+    /// non-mTLS listener. Ordinary inbound TLS 1.3 uses stateless tickets.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
     /// Number of days before certificate expiration to emit a warning log.
@@ -5010,7 +5011,7 @@ impl EnvConfig {
                 .map_err(|e| e.to_string())?;
         }
         if let Some(ref path) = self.tls_ca_bundle_path {
-            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+            crate::config::types::validate_pem_ca_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
                 .map_err(|e| e.to_string())?;
         }
 

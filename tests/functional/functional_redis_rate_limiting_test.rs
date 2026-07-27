@@ -1991,6 +1991,118 @@ plugin_configs:
     println!("test_rate_limiting_redis_shared_across_instances PASSED");
 }
 
+/// GHSA-f72h-jm2p-mc73: the ownership fence that backs `request_deduplication`
+/// Redis publication. A completion may only replace the publisher's own
+/// still-current in-flight record; an expired or superseded owner writes
+/// nothing, in either completion order.
+#[tokio::test]
+#[ignore]
+async fn test_request_deduplication_redis_publication_is_ownership_fenced() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+
+    if !redis_is_available().await {
+        if std::env::var_os("FERRUM_REDIS_REQUIRED").is_some() {
+            panic!("Redis is required for the request deduplication fencing CI gate");
+        }
+        return;
+    }
+
+    let prefix = format!("ferrum:test:dedupfence:{}", Uuid::new_v4().simple());
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": REDIS_URL,
+            "redis_key_prefix": prefix,
+        }),
+        &prefix,
+    )
+    .expect("redis config parses")
+    .expect("redis mode enabled");
+    let client = RedisRateLimitClient::new(config, None, false, None);
+
+    let key = client.make_key(&["fence"]);
+    let owner_a = b"owner-a-inflight-record".to_vec();
+    let owner_b = b"owner-b-inflight-record".to_vec();
+    let result_a = b"owner-a-completed-record".to_vec();
+    let result_b = b"owner-b-completed-record".to_vec();
+
+    // Owner A acquires the operation with a short lease.
+    assert!(
+        client
+            .set_bytes_nx_with_expire(&key, &owner_a, 60)
+            .await
+            .expect("acquire"),
+    );
+
+    // A successor cannot acquire while A owns it.
+    assert!(
+        !client
+            .set_bytes_nx_with_expire(&key, &owner_b, 60)
+            .await
+            .expect("contended acquire")
+    );
+
+    // Simulate lease expiry plus successor acquisition.
+    client.delete(&key).await.expect("expire owner A lease");
+    assert!(
+        client
+            .set_bytes_nx_with_expire(&key, &owner_b, 60)
+            .await
+            .expect("successor acquire")
+    );
+
+    // Expired owner A must not publish over the successor's ownership.
+    assert!(
+        !client
+            .set_bytes_with_expire_if_value_matches(&key, &owner_a, &result_a, 60)
+            .await
+            .expect("stale publication"),
+        "an expired owner must not publish while a successor owns the operation"
+    );
+    assert_eq!(
+        client.get_bytes(&key).await.expect("read record"),
+        Some(owner_b.clone())
+    );
+
+    // The successor's own publication is the ownership transition.
+    assert!(
+        client
+            .set_bytes_with_expire_if_value_matches(&key, &owner_b, &result_b, 60)
+            .await
+            .expect("successor publication")
+    );
+    assert_eq!(
+        client.get_bytes(&key).await.expect("read record"),
+        Some(result_b.clone())
+    );
+
+    // Reversed completion order: the stale owner still cannot overwrite the
+    // successor's completed result.
+    assert!(
+        !client
+            .set_bytes_with_expire_if_value_matches(&key, &owner_a, &result_a, 60)
+            .await
+            .expect("stale overwrite")
+    );
+    assert_eq!(
+        client.get_bytes(&key).await.expect("read record"),
+        Some(result_b)
+    );
+
+    // A completely absent record cannot be resurrected by a stale owner.
+    client.delete(&key).await.expect("drop record");
+    assert!(
+        !client
+            .set_bytes_with_expire_if_value_matches(&key, &owner_a, &result_a, 60)
+            .await
+            .expect("resurrect attempt")
+    );
+    assert_eq!(client.get_bytes(&key).await.expect("read record"), None);
+
+    delete_redis_keys_by_prefix(&prefix).await;
+    println!("test_request_deduplication_redis_publication_is_ownership_fenced PASSED");
+}
+
 /// Request deduplication must use Redis for in-flight exclusion, not only for
 /// completed response replay. Two gateway instances sharing Redis should not
 /// both execute the same idempotent POST concurrently.
@@ -2181,11 +2293,14 @@ plugin_configs:
             .await
     });
 
-    let inflight_prefix = format!("{unique_prefix}:inflight:");
+    // Ownership and completion share one operation record per logical key, so
+    // the in-flight lease is visible as that record rather than a separate
+    // `:inflight:` key (GHSA-f72h-jm2p-mc73).
+    let record_prefix = format!("{unique_prefix}:");
     let deadline = SystemTime::now() + Duration::from_secs(5);
     loop {
         let backend_started = backend_blocked.load(Ordering::SeqCst);
-        let redis_lock_visible = redis_key_count_by_prefix(&inflight_prefix).await > 0;
+        let redis_lock_visible = redis_key_count_by_prefix(&record_prefix).await > 0;
         if backend_started && redis_lock_visible {
             break;
         }
@@ -2306,8 +2421,8 @@ plugin_configs:
     );
     assert_eq!(function_hits.load(Ordering::SeqCst), 1);
     assert!(
-        redis_key_count_by_prefix(&inflight_prefix).await > 0,
-        "oversized Redis serialization must retain the distributed in-flight lock"
+        redis_key_count_by_prefix(&record_prefix).await > 0,
+        "oversized Redis serialization must publish a non-replayable completion record"
     );
 
     let local_replay = client
@@ -2350,7 +2465,7 @@ plugin_configs:
     assert_eq!(
         peer_retry.status().as_u16(),
         409,
-        "a peer without the local completion must honor the retained Redis lock"
+        "a peer without the local completion must honor the non-replayable completion record"
     );
     assert_eq!(function_hits.load(Ordering::SeqCst), 1);
 
@@ -2476,8 +2591,8 @@ plugin_configs:
 /// the shared default Redis prefix (`{FERRUM_NAMESPACE}:dedup`).
 ///
 /// Before #2379, sibling instances hashed the same logical key (proxy +
-/// identity + idempotency value only). The first acquired
-/// `{prefix}:inflight:<digest>` and the second treated that lock as a peer
+/// identity + idempotency value only). The first acquired the operation record
+/// at `{prefix}:<digest>` and the second treated that ownership as a peer
 /// request, returning 409 before the backend ran. Stable `plugin_config_id`
 /// partitioning keeps each instance's Redis ownership isolated while the
 /// companion cross-gateway test still proves corresponding copies share state.
@@ -2625,7 +2740,7 @@ plugin_configs:
 
     // Both instances should have published independent completed keys under the
     // shared default prefix (partitioned by plugin_config_id in the digest).
-    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v3:")).await;
+    let completed_keys = redis_key_count_by_prefix(&format!("{default_prefix}:v4:")).await;
     assert!(
         completed_keys >= 2,
         "expected at least two completed Redis keys under the shared default prefix, got {completed_keys}"
@@ -2762,23 +2877,26 @@ plugin_configs:
         "fresh dual-header request must reach the backend exactly once"
     );
 
-    // Both instances must have published completed values and released locks.
+    // Both instances must have transitioned their operation record from
+    // in-flight ownership to a published completion under their own prefix.
+    // There is no separate `:inflight:` key: publication is the ownership
+    // transition (GHSA-f72h-jm2p-mc73).
     assert_eq!(
         redis_key_count_by_prefix(&format!("{prefix_a}:inflight:")).await,
         0,
-        "instance A must token-release its Redis in-flight lock after buffered completion"
+        "no separate in-flight key may exist for instance A"
     );
     assert_eq!(
         redis_key_count_by_prefix(&format!("{prefix_b}:inflight:")).await,
         0,
-        "instance B must token-release its Redis in-flight lock after buffered completion"
+        "no separate in-flight key may exist for instance B"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_a}:v3:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_a}:v4:")).await >= 1,
         "instance A must publish a completed Redis value under its unique prefix"
     );
     assert!(
-        redis_key_count_by_prefix(&format!("{prefix_b}:v3:")).await >= 1,
+        redis_key_count_by_prefix(&format!("{prefix_b}:v4:")).await >= 1,
         "instance B must publish a completed Redis value under its unique prefix"
     );
 

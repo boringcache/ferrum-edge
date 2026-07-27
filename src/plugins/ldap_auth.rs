@@ -45,7 +45,9 @@ use hmac::{Hmac, KeyInit, Mac};
 use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, Scope, SearchEntry, SearchOptions, StdStream};
 use ring::rand::SecureRandom;
 use rustls::ClientConfig;
-use rustls::pki_types::{CertificateDer, CertificateRevocationListDer};
+#[cfg(test)]
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::CertificateRevocationListDer;
 use serde_json::Map;
 use serde_json::Value;
 use sha2::Sha256;
@@ -1374,6 +1376,13 @@ fn build_ldap_tls_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("ldap_auth: failed to build rustls client config: {e}"))?;
 
+    // An explicit CA remains a configuration requirement when verification is
+    // disabled. Materialize it before branching so no-verify cannot hide a
+    // malformed, empty, or unusable custom trust store.
+    let custom_root_store = ca_bundle_path
+        .map(|ca_path| build_ldap_root_store(Some(ca_path)))
+        .transpose()?;
+
     let config = if no_verify {
         warn!("ldap_auth: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
         builder
@@ -1388,7 +1397,9 @@ fn build_ldap_tls_config(
         // equivalent to the default root-store verifier. `build_server_verifier_with_crls`
         // uses `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
         // so certs from CAs without a matching CRL are still accepted.
-        let root_store = build_ldap_root_store(ca_bundle_path)?;
+        let root_store = custom_root_store.unwrap_or_else(|| {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        });
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|e| format!("ldap_auth: failed to build TLS verifier: {e}"))?;
         builder.with_webpki_verifier(verifier).with_no_client_auth()
@@ -1415,45 +1426,17 @@ fn build_ldap_root_store(ca_bundle_path: Option<&str>) -> Result<rustls::RootCer
     let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
         .map_err(|e| format!("ldap_auth: failed to load CA bundle: {e}"))?;
     let source_id = ca_material.display_source_id.clone();
+    let root_store = crate::tls::root_cert_store_from_pem_bundle(
+        ca_material.bytes.expose_secret(),
+        "ldap_auth CA bundle",
+        &source_id,
+    )
+    .map_err(|error| error.to_string())?;
 
-    // Parse only X.509 entries; tolerate other PEM blocks (private keys, etc.)
-    // by ignoring them, but log them so operators can spot malformed bundles.
-    let mut certs: Vec<CertificateDer<'static>> = Vec::new();
-    let mut reader = ca_material.bytes.expose_secret();
-    for item in std::iter::from_fn(move || rustls_pemfile::read_one(&mut reader).transpose()) {
-        match item {
-            Ok(rustls_pemfile::Item::X509Certificate(cert_der)) => {
-                certs.push(cert_der);
-            }
-            Ok(_) => {} // Skip non-cert PEM items
-            Err(e) => {
-                warn!(
-                    "ldap_auth: skipping malformed PEM item in '{}': {e}",
-                    source_id
-                );
-            }
-        }
-    }
-
-    // CA exclusivity: empty store, then load only the configured bundle.
-    let mut root_store = rustls::RootCertStore::empty();
-    let (added, ignored) = root_store.add_parsable_certificates(certs);
-
-    if added == 0 {
-        return Err(format!(
-            "ldap_auth: no valid CA certificates found in '{}'",
-            source_id
-        ));
-    }
-    if ignored > 0 {
-        warn!(
-            "ldap_auth: ignored {} invalid CA certificate(s) while loading '{}'",
-            ignored, source_id
-        );
-    }
     debug!(
         "ldap_auth: loaded {} CA certificate(s) from '{}' (CA exclusivity enforced)",
-        added, source_id
+        root_store.len(),
+        source_id
     );
     Ok(root_store)
 }
@@ -2038,7 +2021,18 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid CA certificates"),
+            err.contains("no valid PEM certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn no_verify_still_rejects_empty_declared_ca_bundle() {
+        ensure_crypto_provider();
+        let f = must(NamedTempFile::new(), "create empty temp CA file");
+        let err = build_ldap_tls_config(true, f.path().to_str(), &[]).unwrap_err();
+        assert!(
+            err.contains("no valid PEM certificates"),
             "unexpected error: {err}"
         );
     }

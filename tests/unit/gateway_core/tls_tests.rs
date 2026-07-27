@@ -94,6 +94,10 @@ fn write_pem(dir: &TempDir, name: &str, data: &str) -> String {
     path.to_str().unwrap().to_string()
 }
 
+fn malformed_certificate_record() -> &'static str {
+    "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
+}
+
 fn default_env_config() -> EnvConfig {
     EnvConfig::default()
 }
@@ -200,6 +204,50 @@ fn test_check_cert_expiry_invalid_pem_fails() {
             .to_string()
             .contains("no valid PEM certificates")
     );
+}
+
+#[test]
+fn test_check_cert_expiry_rejects_malformed_later_record_with_original_index() {
+    let dir = TempDir::new().unwrap();
+    let (valid_pem, _key_pem) = generate_self_signed_cert(&["localhost"]);
+    let bundle = format!("{valid_pem}{}", malformed_certificate_record());
+    let path = write_pem(&dir, "mixed-later.pem", &bundle);
+
+    let error = check_cert_expiry(&path, "expiry bundle", 30)
+        .expect_err("a malformed later certificate record must reject the complete bundle")
+        .to_string();
+    assert!(error.contains("expiry bundle"), "got: {error}");
+    assert!(error.contains("record #2"), "got: {error}");
+    assert!(error.contains("mixed-later.pem"), "got: {error}");
+}
+
+#[test]
+fn test_check_cert_expiry_rejects_malformed_first_record_without_compressing_index() {
+    let dir = TempDir::new().unwrap();
+    let (valid_pem, _key_pem) = generate_self_signed_cert(&["localhost"]);
+    let bundle = format!("{}{valid_pem}", malformed_certificate_record());
+    let path = write_pem(&dir, "mixed-first.pem", &bundle);
+
+    let error = check_cert_expiry(&path, "expiry bundle", 30)
+        .expect_err("a malformed first certificate record must reject the complete bundle")
+        .to_string();
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[test]
+fn test_check_cert_expiry_rejects_all_malformed_certificate_records() {
+    let dir = TempDir::new().unwrap();
+    let bundle = format!(
+        "{}{}",
+        malformed_certificate_record(),
+        malformed_certificate_record()
+    );
+    let path = write_pem(&dir, "all-malformed.pem", &bundle);
+
+    let error = check_cert_expiry(&path, "expiry bundle", 30)
+        .expect_err("an all-malformed bundle must fail")
+        .to_string();
+    assert!(error.contains("record #1"), "got: {error}");
 }
 
 #[test]

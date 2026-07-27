@@ -606,24 +606,42 @@ async fn start_h3_validation_gateway_with_config(
     config: String,
     extra_env: &[(&str, &str)],
 ) -> (TestGateway, u16) {
-    let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let https_port = https_reservation.local_addr().unwrap().port();
-    drop(https_reservation);
+    // The harness retries its own admin/proxy ports, but an HTTPS override
+    // selected outside that retry loop remains fixed. If the just-released TCP
+    // port is reused for admin/proxy allocation, all internal retries collide
+    // with the same HTTPS listener. Own the retry here so every attempt gets a
+    // fresh HTTPS TCP/UDP port as well.
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        let https_reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let https_port = https_reservation.local_addr().unwrap().port();
+        drop(https_reservation);
 
-    let mut builder = TestGateway::builder()
-        .mode_file(config)
-        .log_level("warn")
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key");
+        let mut builder = TestGateway::builder()
+            .mode_file(config.clone())
+            .log_level("warn")
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key");
 
-    for (key, value) in extra_env {
-        builder = builder.env(*key, *value);
+        for (key, value) in extra_env {
+            builder = builder.env(*key, *value);
+        }
+        match builder.spawn().await {
+            Ok(gateway) => return (gateway, https_port),
+            Err(error) => {
+                eprintln!("H3 validation gateway attempt {attempt}/3 failed: {error}");
+                last_error = Some(error.to_string());
+            }
+        }
     }
 
-    let gateway = builder.spawn().await.expect("start gateway with h3");
-    (gateway, https_port)
+    panic!(
+        "failed to start H3 validation gateway after 3 attempts: {}",
+        last_error.unwrap_or_else(|| "no error recorded".to_string())
+    );
 }
 
 async fn h3_get_with_startup_retry(

@@ -73,6 +73,7 @@ impl BenchMetrics {
         let p50 = self.histogram.value_at_quantile(0.50);
         let p75 = self.histogram.value_at_quantile(0.75);
         let p90 = self.histogram.value_at_quantile(0.90);
+        let p95 = self.histogram.value_at_quantile(0.95);
         let p99 = self.histogram.value_at_quantile(0.99);
 
         // Calculate +/- Stdev percentage
@@ -102,6 +103,7 @@ impl BenchMetrics {
              \x20    50%    {}\n\
              \x20    75%    {}\n\
              \x20    90%    {}\n\
+             \x20    95%    {}\n\
              \x20    99%    {}\n\
              \n\
              \x20 {} requests in {:.2}s, {:.2}MB read\n\
@@ -116,6 +118,7 @@ impl BenchMetrics {
             format_duration_us(p50),
             format_duration_us(p75),
             format_duration_us(p90),
+            format_duration_us(p95),
             format_duration_us(p99),
             self.total_requests,
             duration_secs as f64,
@@ -159,6 +162,7 @@ impl BenchMetrics {
             p50_us: self.histogram.value_at_quantile(0.50),
             p75_us: self.histogram.value_at_quantile(0.75),
             p90_us: self.histogram.value_at_quantile(0.90),
+            p95_us: self.histogram.value_at_quantile(0.95),
             p99_us: self.histogram.value_at_quantile(0.99),
             total_bytes: self.total_bytes,
             throughput_mbps,
@@ -182,6 +186,7 @@ pub struct BenchReport {
     pub p50_us: u64,
     pub p75_us: u64,
     pub p90_us: u64,
+    pub p95_us: u64,
     pub p99_us: u64,
     pub total_bytes: u64,
     pub throughput_mbps: f64,

@@ -3,6 +3,7 @@
 pub mod client;
 pub mod config;
 pub mod cross_protocol;
+pub mod peer_identity;
 pub mod server;
 pub(crate) mod stream_util;
 pub(crate) mod websocket;

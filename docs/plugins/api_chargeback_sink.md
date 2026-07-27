@@ -56,6 +56,21 @@ exported categorical field on the resulting `ChargeEvent`:
   bounded sentinel)
 - `protocol` (`http`, `grpc`, `ws`, stream protocol labels, etc.)
 
+**Identity fields are never prefix-truncated (GHSA-m28c-f3v5-26qg).** Every
+field above is bounded, but a bound that kept only a prefix would merge two
+distinct authenticated principals sharing that prefix into one accumulator entry
+and one exported `consumer_id` — one invoice covering two customers. A verified
+external identity above 512 bytes is rejected at authentication, and any value
+that still needs bounding here (for example a long operator-configured Consumer
+username or display name) is stored as a readable prefix plus a
+domain-separated SHA-256 digest of the complete value: `<prefix>~sha256:<hex>`.
+That mapping is injective, so two identities collide only on a SHA-256
+collision. A within-bound value that itself contains the `~sha256:` marker is
+also stored in digest form, so a representation cannot be replayed as a short
+identity to land in another principal's row. The original of a digested value
+must be resolved at the identity provider; the gateway does not retain
+oversized credential-derived identities.
+
 Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
 same key. Display-name changes (consumer or proxy rename on reload) and
 distinct routes or protocols therefore produce separate snapshot rows instead of

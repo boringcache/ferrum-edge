@@ -29,9 +29,9 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 #[cfg(unix)]
 use tower::service_fn;
+use tracing::debug;
 #[cfg(unix)]
 use tracing::info;
-use tracing::{debug, warn};
 
 use super::latest_wins;
 use super::proto::X509svidRequest;
@@ -332,6 +332,18 @@ fn svid_response_to_bundle(
         .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
     crate::identity::file_loader::verify_leaf_key_match(leaf_der, &first.x509_svid_key)
         .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    for (index, intermediate) in cert_chain_der.iter().enumerate().skip(1) {
+        crate::identity::file_loader::validate_cert_is_current(
+            intermediate,
+            &format!("SVID intermediate certificate #{index}"),
+        )
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    }
+    crate::identity::file_loader::validate_certificate_chain_order(
+        &cert_chain_der,
+        "SVID certificate chain",
+    )
+    .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
 
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
@@ -346,6 +358,15 @@ fn svid_response_to_bundle(
                 .into(),
         ));
     }
+    crate::tls::root_cert_store_from_certificates(
+        local_bundle_der
+            .iter()
+            .cloned()
+            .map(rustls::pki_types::CertificateDer::from),
+        "Workload API local trust bundle",
+        trust_domain.as_str(),
+    )
+    .map_err(|error| WorkloadApiClientError::Rpc(error.to_string()))?;
 
     let mut trust_bundles = TrustBundleSet {
         local: TrustBundle {
@@ -363,26 +384,41 @@ fn svid_response_to_bundle(
     };
 
     for (td_str, bundle_bytes) in msg.federated_bundles {
-        match parse_trust_domain_key(&td_str) {
-            Ok(td) => match split_concatenated_der(&bundle_bytes) {
-                Ok(certs) => {
-                    trust_bundles.federated.insert(
-                        td.clone(),
-                        TrustBundle {
-                            trust_domain: td,
-                            x509_authorities: certs,
-                            jwt_authorities: Vec::new(),
-                            refresh_hint_seconds: None,
-                        },
-                    );
-                }
-                Err(e) => warn!("federated bundle for '{}' is malformed: {}", td_str, e),
-            },
-            Err(e) => warn!(
-                "federated bundle key '{}' is not a trust domain: {}",
-                td_str, e
-            ),
+        let td = parse_trust_domain_key(&td_str).map_err(|_error| {
+            WorkloadApiClientError::Rpc(
+                "Workload API response contains an invalid federated trust-domain key".to_string(),
+            )
+        })?;
+        if td == trust_domain || trust_bundles.federated.contains_key(&td) {
+            return Err(WorkloadApiClientError::Rpc(format!(
+                "Workload API response declares trust domain '{}' more than once",
+                td
+            )));
         }
+        let certs = split_concatenated_der(&bundle_bytes).map_err(|_error| {
+            WorkloadApiClientError::Rpc(format!(
+                "Workload API federated trust bundle for '{}' contains malformed DER",
+                td
+            ))
+        })?;
+        crate::tls::root_cert_store_from_certificates(
+            certs
+                .iter()
+                .cloned()
+                .map(rustls::pki_types::CertificateDer::from),
+            "Workload API federated trust bundle",
+            td.as_str(),
+        )
+        .map_err(|error| WorkloadApiClientError::Rpc(error.to_string()))?;
+        let _ = trust_bundles.federated.insert(
+            td.clone(),
+            TrustBundle {
+                trust_domain: td,
+                x509_authorities: certs,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
     }
 
     Ok(SvidBundle {
@@ -403,9 +439,23 @@ fn svid_response_to_bundle(
 /// indefinite-length here would yield an empty (zero-length) cert that
 /// blows up downstream with a less clear error.
 fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    const MAX_DER_LENGTH_OCTETS: usize = std::mem::size_of::<usize>();
+
+    if buf.len() > crate::tls::MAX_PEM_MATERIAL_BYTES {
+        return Err(format!(
+            "certificate material exceeds the {} byte admission limit",
+            crate::tls::MAX_PEM_MATERIAL_BYTES
+        ));
+    }
     let mut out = Vec::new();
     let mut cursor = 0;
     while cursor < buf.len() {
+        if out.len() >= crate::tls::MAX_PEM_CERTIFICATE_RECORDS {
+            return Err(format!(
+                "certificate material exceeds the {} record admission limit",
+                crate::tls::MAX_PEM_CERTIFICATE_RECORDS
+            ));
+        }
         if buf[cursor] != 0x30 {
             return Err(format!("expected SEQUENCE tag at offset {cursor}"));
         }
@@ -423,21 +473,43 @@ fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             (2, first_len as usize)
         } else {
             let n = (first_len & 0x7f) as usize;
+            if n == 0 {
+                return Err(
+                    "BER indefinite-length encoding is not allowed in DER-encoded certificates"
+                        .to_string(),
+                );
+            }
+            if n > MAX_DER_LENGTH_OCTETS {
+                return Err(format!(
+                    "DER length uses {n} octets (cannot represent length safely on this platform)"
+                ));
+            }
             if cursor + 2 + n > buf.len() {
                 return Err("buffer ends inside multi-byte length".to_string());
             }
             let mut content_len = 0usize;
             for i in 0..n {
-                content_len = (content_len << 8) | buf[cursor + 2 + i] as usize;
+                content_len = content_len
+                    .checked_shl(8)
+                    .and_then(|v| v.checked_add(buf[cursor + 2 + i] as usize))
+                    .ok_or_else(|| "DER declared length overflows usize".to_string())?;
             }
-            (2 + n, content_len)
+            let header_len = 2usize
+                .checked_add(n)
+                .ok_or_else(|| "DER length encoding overflows usize".to_string())?;
+            (header_len, content_len)
         };
-        let total = header_len + content_len;
-        if cursor + total > buf.len() {
+        let total = header_len
+            .checked_add(content_len)
+            .ok_or_else(|| "DER object length overflows usize".to_string())?;
+        let end = cursor
+            .checked_add(total)
+            .ok_or_else(|| "DER object bounds overflow usize".to_string())?;
+        if end > buf.len() {
             return Err("DER length exceeds buffer".to_string());
         }
-        out.push(buf[cursor..cursor + total].to_vec());
-        cursor += total;
+        out.push(buf[cursor..end].to_vec());
+        cursor = end;
     }
     Ok(out)
 }
@@ -470,6 +542,44 @@ mod der_split_tests {
         // SEQUENCE, claimed length=10, only 1 content byte present.
         let buf = [0x30u8, 0x0A, 0xAA];
         assert!(split_concatenated_der(&buf).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_length_encoding() {
+        // Long-form length declares 2 octets but only 1 is present.
+        let buf = [0x30u8, 0x82, 0x01];
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(err.contains("multi-byte length"));
+    }
+
+    #[test]
+    fn rejects_oversized_length_of_length_count() {
+        let max_safe = std::mem::size_of::<usize>();
+        let mut buf = vec![0x30u8, 0x80 | ((max_safe + 1) as u8)];
+        buf.extend(std::iter::repeat_n(0u8, max_safe + 1));
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(err.contains("cannot represent length safely"));
+    }
+
+    #[test]
+    fn rejects_non_representable_declared_length() {
+        let n = std::mem::size_of::<usize>();
+        let mut buf = vec![0x30u8, 0x80 | (n as u8)];
+        buf.extend(std::iter::repeat_n(0xFF, n));
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(
+            err.contains("overflows usize") || err.contains("exceeds buffer"),
+            "expected overflow or bounds rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_long_form_length() {
+        // 0x30 0x81 0x05 followed by 5 content bytes.
+        let blob = [0x30, 0x81, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let out = split_concatenated_der(&blob).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 8);
     }
 }
 

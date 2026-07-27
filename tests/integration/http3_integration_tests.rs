@@ -7,6 +7,7 @@ use ferrum_edge::config::types::{BackendScheme, DispatchKind, GatewayConfig, Pro
 use ferrum_edge::config::{EnvConfig, PoolConfig};
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::DnsCache;
+use ferrum_edge::http3::peer_identity::{H3ConnectionIdentity, server_0rtt_handshake_succeeded};
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
@@ -1650,4 +1651,290 @@ async fn h3_injected_sticky_cookie_survives_committed_hook_grpc_deadline() {
         !surviving.contains("backend_sid"),
         "the backend cookie present at injection must not ride the DEADLINE_EXCEEDED response"
     );
+}
+
+// ============================================================================
+// Issue #2938 — H3 frontend mTLS peer identity vs the 0-RTT accept path
+// ============================================================================
+//
+// Quinn's `Connecting::into_0rtt()` always succeeds on the server side
+// (`conn.inner.side().is_server()`), so with `FERRUM_TLS_EARLY_DATA_METHODS`
+// configured the H3 listener used to materialize every connection at 0.5-RTT
+// and snapshot `peer_identity()` right there — before the client's
+// `Certificate`/`Finished` flight had arrived. These tests pin the real
+// quinn/rustls lifecycle the fix depends on:
+//
+//   * at 0.5-RTT the peer certificate genuinely is not knowable yet, so a
+//     pre-handshake snapshot must expose nothing (fail closed), and
+//   * once the handshake-completion future resolves the certificate IS
+//     available, so publishing it there restores frontend H3 mTLS.
+//
+// The gateway additionally refuses the 0.5-RTT accept path outright whenever a
+// client-cert verifier is configured (`zero_rtt_admitted`), which is what makes
+// the ordinary 1-RTT mTLS request below work with early-data methods enabled.
+
+struct H3MtlsFixture {
+    ca_der: rustls::pki_types::CertificateDer<'static>,
+    server_cert_der: rustls::pki_types::CertificateDer<'static>,
+    server_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    client_cert_der: rustls::pki_types::CertificateDer<'static>,
+    client_key_der: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+fn pkcs8(key: &rcgen::KeyPair) -> rustls::pki_types::PrivateKeyDer<'static> {
+    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into())
+}
+
+fn build_h3_mtls_fixture() -> H3MtlsFixture {
+    let ca_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate CA key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ferrum-h3-mtls-test-ca");
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
+    let ca_der = ca_cert.der().clone();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let server_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("gen server key");
+    let sans = vec!["localhost".to_string()];
+    let mut server_params = rcgen::CertificateParams::new(sans).expect("server params");
+    server_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+    let server_cert = server_params
+        .signed_by(&server_key, &issuer)
+        .expect("sign server cert");
+
+    let client_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("gen client key");
+    let mut client_params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ferrum-h3-mtls-test-client");
+    client_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let client_cert = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("sign client cert");
+
+    H3MtlsFixture {
+        ca_der,
+        server_cert_der: server_cert.der().clone(),
+        server_key_der: pkcs8(&server_key),
+        client_cert_der: client_cert.der().clone(),
+        client_key_der: pkcs8(&client_key),
+    }
+}
+
+/// Build a quinn server endpoint that requires a client certificate, mirroring
+/// `build_h3_quinn_server_config`: TLS 1.3 only, `h3` ALPN, a WebPKI client-cert
+/// verifier, and the same disabled QUIC early-data posture the gateway installs
+/// when client authentication is configured. The test still calls
+/// `into_0rtt()` directly to pin quinn's server-side 0.5-RTT behavior, which is
+/// independent of whether the client actually offered 0-RTT data.
+fn h3_mtls_server_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(fixture.ca_der.clone()).expect("trust CA");
+    let verifier_builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        ring_provider(),
+    );
+    let verifier = verifier_builder.build().expect("client cert verifier");
+
+    let base = rustls::ServerConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 only");
+    let certs = vec![fixture.server_cert_der.clone()];
+    let key = fixture.server_key_der.clone_key();
+    let mut server_tls = base
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .expect("server TLS config");
+    server_tls.alpn_protocols = vec![b"h3".to_vec()];
+    // Production disables the TLS early-data advertisement on every mTLS
+    // listener, in addition to refusing the application-level 0.5-RTT path.
+    server_tls.max_early_data_size = 0;
+
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quic cfg");
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+    quinn::Endpoint::server(server_config, addr).expect("bind QUIC server")
+}
+
+/// Build a quinn client endpoint that presents the fixture's client certificate.
+fn h3_mtls_client_endpoint(fixture: &H3MtlsFixture) -> quinn::Endpoint {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(fixture.ca_der.clone()).expect("trust CA");
+    let base = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 only")
+        .with_root_certificates(roots);
+    let certs = vec![fixture.client_cert_der.clone()];
+    let key = fixture.client_key_der.clone_key();
+    let mut client_tls = base
+        .with_client_auth_cert(certs, key)
+        .expect("client TLS config");
+    client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).expect("quic cfg");
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("bind addr");
+    let mut endpoint = quinn::Endpoint::client(addr).expect("bind QUIC client");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    endpoint
+}
+
+/// Mirrors production's `quinn_peer_cert_chain` (private to `http3::server`).
+fn peer_cert_chain(connection: &quinn::Connection) -> Option<Vec<Vec<u8>>> {
+    connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
+}
+
+#[tokio::test]
+async fn h3_zero_rtt_accept_has_no_peer_identity_until_the_handshake_completes() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let expected_leaf = fixture.client_cert_der.to_vec();
+    let server = h3_mtls_server_endpoint(&fixture);
+    let server_addr = server.local_addr().expect("server addr");
+    let client = h3_mtls_client_endpoint(&fixture);
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming connection");
+        // The 0.5-RTT accept path the gateway used to take unconditionally.
+        let accepted = incoming.accept().expect("accept");
+        let Ok((connection, zero_rtt_accepted)) = accepted.into_0rtt() else {
+            panic!("quinn always returns Ok from into_0rtt on the server side");
+        };
+
+        // Snapshot the way the pre-fix code did: immediately, before the
+        // client's Certificate flight can possibly have arrived.
+        let slot = H3ConnectionIdentity::pre_handshake();
+        let at_half_rtt_chain = peer_cert_chain(&connection);
+        let at_half_rtt = slot.snapshot();
+
+        let zero_rtt_accepted = zero_rtt_accepted.await;
+        let handshake_succeeded =
+            server_0rtt_handshake_succeeded(zero_rtt_accepted, connection.close_reason().is_none());
+        // Refresh exactly when the handshake-completion future resolves.
+        slot.publish_handshake_result(handshake_succeeded, peer_cert_chain(&connection));
+        let after_handshake = slot.snapshot();
+
+        (at_half_rtt_chain, at_half_rtt, after_handshake, connection)
+    });
+
+    let connecting = client
+        .connect(server_addr, "localhost")
+        .expect("start connect");
+    let timeout = std::time::Duration::from_secs(10);
+    let client_conn = tokio::time::timeout(timeout, connecting)
+        .await
+        .expect("client handshake did not time out")
+        .expect("client handshake succeeded");
+
+    let joined = tokio::time::timeout(timeout, server_task)
+        .await
+        .expect("server task did not time out")
+        .expect("server task did not panic");
+    let (at_half_rtt_chain, at_half_rtt, after_handshake, _server_conn) = joined;
+
+    assert!(
+        at_half_rtt_chain.is_none(),
+        "quinn cannot report a peer certificate at 0.5-RTT — capturing it there is the #2938 bug"
+    );
+    assert!(
+        at_half_rtt.is_early_data,
+        "a request admitted inside the 0.5-RTT window is early data"
+    );
+    assert!(
+        at_half_rtt.client_cert_der.is_none(),
+        "early data must never gain an mTLS identity"
+    );
+    assert!(
+        at_half_rtt.peer_spiffe_extraction_cache.is_none(),
+        "SPIFFE metadata must not be derivable before the handshake completes"
+    );
+
+    assert!(
+        !after_handshake.is_early_data,
+        "publishing the established identity clears the early-data flag in the same swap"
+    );
+    assert_eq!(
+        after_handshake.client_cert_der.as_deref(),
+        Some(&expected_leaf),
+        "the peer certificate becomes available once the handshake future resolves"
+    );
+    assert!(
+        after_handshake.peer_spiffe_extraction_cache.is_some(),
+        "SPIFFE metadata becomes available only after the authenticated handshake"
+    );
+
+    client_conn.close(0u32.into(), b"done");
+    client.wait_idle().await;
+}
+
+#[tokio::test]
+async fn h3_full_handshake_exposes_peer_identity_before_any_stream_is_accepted() {
+    init_crypto_provider();
+    let fixture = build_h3_mtls_fixture();
+    let expected_leaf = fixture.client_cert_der.to_vec();
+    let server = h3_mtls_server_endpoint(&fixture);
+    let server_addr = server.local_addr().expect("server addr");
+    let client = h3_mtls_client_endpoint(&fixture);
+
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.expect("incoming connection");
+        // The path the gateway now always takes for a client-authenticated H3
+        // listener: full handshake first, identity published before the accept
+        // loop can hand a single stream to a request task.
+        let accepted = incoming.accept().expect("accept");
+        let connection = accepted.await.expect("full handshake");
+        let slot = H3ConnectionIdentity::pre_handshake();
+        slot.publish_handshake_result(true, peer_cert_chain(&connection));
+        (slot.snapshot(), connection)
+    });
+
+    let connecting = client
+        .connect(server_addr, "localhost")
+        .expect("start connect");
+    let timeout = std::time::Duration::from_secs(10);
+    let client_conn = tokio::time::timeout(timeout, connecting)
+        .await
+        .expect("client handshake did not time out")
+        .expect("client handshake succeeded");
+
+    let joined = tokio::time::timeout(timeout, server_task)
+        .await
+        .expect("server task did not time out")
+        .expect("server task did not panic");
+    let (identity, _server_conn) = joined;
+
+    assert!(!identity.is_early_data);
+    assert_eq!(
+        identity.client_cert_der.as_deref(),
+        Some(&expected_leaf),
+        "a normal 1-RTT H3 mTLS request must see the presented client certificate"
+    );
+    assert!(identity.mtls_auth_connection_cache.is_some());
+    assert!(identity.peer_spiffe_extraction_cache.is_some());
+
+    client_conn.close(0u32.into(), b"done");
+    client.wait_idle().await;
 }

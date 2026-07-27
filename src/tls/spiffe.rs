@@ -39,7 +39,7 @@ use rustls::pki_types::{
     UnixTime,
 };
 use rustls::server::{WantsServerCert, WebPkiClientVerifier};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, ServerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -325,13 +325,12 @@ impl rustls::server::danger::ClientCertVerifier for SpiffeClientCertVerifier {
         _now: UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
+        snapshot.as_ref().as_ref().ok_or_else(|| {
             rustls::Error::General("SPIFFE inbound verifier: no SVID bundle yet".into())
         })?;
         verify_peer_against_cached_snapshot(
             &self.peer_verifier_cache,
             snapshot.clone(),
-            &bundle.trust_bundles,
             end_entity,
             intermediates,
             None,
@@ -439,13 +438,12 @@ impl rustls::client::danger::ServerCertVerifier for SpiffeServerCertVerifier {
         _now: UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let snapshot = self.slot.load_full();
-        let bundle = snapshot.as_ref().as_ref().ok_or_else(|| {
+        snapshot.as_ref().as_ref().ok_or_else(|| {
             rustls::Error::General("SPIFFE outbound verifier: no SVID bundle yet".into())
         })?;
         verify_peer_against_cached_snapshot(
             &self.peer_verifier_cache,
             snapshot.clone(),
-            &bundle.trust_bundles,
             end_entity,
             intermediates,
             self.expected_peer.as_ref(),
@@ -560,7 +558,6 @@ type PeerVerifierMap = HashMap<TrustDomain, PeerChainVerifier>;
 fn verify_peer_against_cached_snapshot(
     cache_slot: &ArcSwap<Option<SpiffePeerVerifierCache>>,
     source: Arc<Option<SvidBundle>>,
-    trust_bundles: &TrustBundleSet,
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     expected_peer: Option<&SpiffeId>,
@@ -570,10 +567,10 @@ fn verify_peer_against_cached_snapshot(
     let peer_id = extract_and_check_peer_spiffe_id(end_entity, expected_peer)?;
     // Scope to the target's trust domain when requested (cross-cluster east-west:
     // no pod pin possible across the SNI-passthrough gateway). This is an
-    // ADDITIONAL constraint, evaluated BEFORE the federated-bundle check below —
-    // it never removes the requirement that a trust bundle exist for the peer's
-    // domain. `expected_peer` (when set) is strictly stronger, so the scope is
-    // skipped under a pin (mutually exclusive in practice; peer wins).
+    // ADDITIONAL constraint, evaluated before selecting the cached verifier —
+    // it never removes the requirement that the admitted all-or-nothing trust
+    // set contain the peer's domain. `expected_peer` (when set) is strictly
+    // stronger, so the scope is skipped under a pin.
     if expected_peer.is_none()
         && let Some(td) = expected_trust_domain
         && peer_id.trust_domain() != td
@@ -585,18 +582,31 @@ fn verify_peer_against_cached_snapshot(
             td
         ));
     }
+    // Select the admitted verifier snapshot first (including last-known-good
+    // when a partial/invalid candidate is rejected). Membership and chain
+    // verification must consult that same snapshot — never the rejected
+    // candidate's declared trust set.
+    let cache_snapshot = peer_verifier_cache(cache_slot, source, crls)?;
+    let cache = cache_snapshot
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| "SPIFFE verifier cache unexpectedly empty".to_string())?;
+    // With atomic admission, a declared domain that has no usable roots
+    // rejects the complete candidate at cache build time; a missing domain in
+    // the selected snapshot is therefore the trust-domain membership failure
+    // (not an unusable-root admission failure).
+    let trust_bundles = &cache
+        .source
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| "SPIFFE verifier: no SVID bundle yet".to_string())?
+        .trust_bundles;
     if trust_bundles.get(peer_id.trust_domain()).is_none() {
         return Err(format!(
             "no trust bundle for peer's trust domain '{}'",
             peer_id.trust_domain()
         ));
     }
-
-    let cache_snapshot = peer_verifier_cache(cache_slot, source, crls)?;
-    let cache = cache_snapshot
-        .as_ref()
-        .as_ref()
-        .ok_or_else(|| "SPIFFE verifier cache unexpectedly empty".to_string())?;
     let verifier = cache
         .verifiers
         .get(peer_id.trust_domain())
@@ -626,9 +636,21 @@ fn peer_verifier_cache(
         return Ok(cached);
     }
 
-    let next = Arc::new(Some(SpiffePeerVerifierCache::build(source, crls)?));
-    cache_slot.store(next.clone());
-    Ok(next)
+    match SpiffePeerVerifierCache::build(source, crls) {
+        Ok(next) => {
+            let next = Arc::new(Some(next));
+            cache_slot.store(next.clone());
+            Ok(next)
+        }
+        Err(error) if cached.is_some() => {
+            warn!(
+                error = %error,
+                "SPIFFE verifier cache: candidate trust update rejected; keeping last-known-good set"
+            );
+            Ok(cached)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl SpiffePeerVerifierCache {
@@ -642,50 +664,60 @@ impl SpiffePeerVerifierCache {
             .ok_or_else(|| "SPIFFE verifier cache: no SVID bundle yet".to_string())?;
         let mut verifiers = HashMap::new();
 
-        insert_trust_bundle_verifier(&mut verifiers, &bundle.trust_bundles.local, crls);
+        insert_trust_bundle_verifier(&mut verifiers, &bundle.trust_bundles.local, crls)?;
         for trust_bundle in bundle.trust_bundles.federated.values() {
-            insert_trust_bundle_verifier(&mut verifiers, trust_bundle, crls);
+            insert_trust_bundle_verifier(&mut verifiers, trust_bundle, crls)?;
         }
 
         Ok(Self { source, verifiers })
     }
 }
 
+/// Validate every X.509 trust domain as one candidate set.
+///
+/// Call reload/admission paths before publishing a new `SvidBundle` or trust
+/// overlay. A single empty or unusable domain rejects the complete candidate.
+pub(crate) fn validate_trust_bundle_set(trust_bundles: &TrustBundleSet) -> Result<(), String> {
+    let mut verifiers = HashMap::new();
+    insert_trust_bundle_verifier(&mut verifiers, &trust_bundles.local, &[])?;
+    for trust_bundle in trust_bundles.federated.values() {
+        insert_trust_bundle_verifier(&mut verifiers, trust_bundle, &[])?;
+    }
+    Ok(())
+}
+
 fn insert_trust_bundle_verifier(
     verifiers: &mut PeerVerifierMap,
     trust_bundle: &TrustBundle,
     crls: &[CertificateRevocationListDer<'static>],
-) {
+) -> Result<(), String> {
     if verifiers.contains_key(&trust_bundle.trust_domain) {
-        return;
+        return Err(format!(
+            "SPIFFE trust bundle declares trust domain '{}' more than once",
+            trust_bundle.trust_domain
+        ));
     }
 
-    match build_peer_chain_verifier(trust_bundle, crls) {
-        Ok(verifier) => {
-            verifiers.insert(trust_bundle.trust_domain.clone(), verifier);
-        }
-        Err(e) => warn!(
-            trust_domain = %trust_bundle.trust_domain,
-            error = %e,
-            "SPIFFE verifier cache: skipping unusable trust bundle"
-        ),
-    }
+    let verifier = build_peer_chain_verifier(trust_bundle, crls)?;
+    verifiers.insert(trust_bundle.trust_domain.clone(), verifier);
+    Ok(())
 }
 
 fn build_peer_chain_verifier(
     trust_bundle: &TrustBundle,
     crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<PeerChainVerifier, String> {
-    let mut roots = RootCertStore::empty();
-    let added = roots.add_parsable_certificates(
+    let display_source = format!("SPIFFE trust domain {}", trust_bundle.trust_domain);
+    let roots = crate::tls::root_cert_store_from_certificates(
         trust_bundle
             .x509_authorities
             .iter()
-            .map(|d| CertificateDer::from(d.clone())),
-    );
-    if added.0 == 0 {
-        return Err("trust bundle for peer's domain has no usable roots".to_string());
-    }
+            .cloned()
+            .map(CertificateDer::from),
+        "SPIFFE trust bundle",
+        &display_source,
+    )
+    .map_err(|error| error.to_string())?;
 
     // SPIFFE peer verification is chain-only: the peer's identity is its
     // SPIFFE URI SAN, not a DNS / IP name. `WebPkiClientVerifier` performs
@@ -964,6 +996,178 @@ mod tests {
             !Arc::ptr_eq(&first, &third),
             "a new SVID snapshot pointer must rebuild CertifiedKey material"
         );
+    }
+
+    #[test]
+    fn peer_verifier_cache_rejects_partial_trust_update_and_keeps_last_good() {
+        let local_td = TrustDomain::new("cache.local").unwrap();
+        let federated_td = TrustDomain::new("cache.federated").unwrap();
+        let id = SpiffeId::from_parts(&local_td, "ns/default/sa/gateway").unwrap();
+        let (root_der, root_pem, root_key_pem) = synthetic_root(&local_td);
+        let leaf = issue_leaf(&id, &root_pem, &root_key_pem, None);
+        let valid_source = Arc::new(Some(svid_bundle_for(
+            id.clone(),
+            bundle_for(local_td.clone(), root_der.clone()),
+            leaf.clone(),
+        )));
+        let cache = ArcSwap::new(Arc::new(None));
+
+        peer_verifier_cache(&cache, valid_source.clone(), &[])
+            .expect("initial trust bundle must build");
+        let last_good = cache.load_full();
+
+        let mut partial = bundle_for(local_td, root_der);
+        partial.federated.insert(
+            federated_td.clone(),
+            TrustBundle {
+                trust_domain: federated_td,
+                x509_authorities: vec![vec![1, 2, 3, 4]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
+        let rejected_source = Arc::new(Some(svid_bundle_for(id, partial, leaf)));
+        let rejected_bundles = &rejected_source
+            .as_ref()
+            .as_ref()
+            .expect("candidate SVID")
+            .trust_bundles;
+        let error = validate_trust_bundle_set(rejected_bundles)
+            .expect_err("one unusable federated root must reject the complete update");
+        let retained = peer_verifier_cache(&cache, rejected_source, &[])
+            .expect("a failed reload with an existing cache must retain last-known-good");
+
+        assert!(error.contains("certificate record #1"), "got: {error}");
+        assert!(Arc::ptr_eq(&retained, &last_good));
+        assert!(
+            Arc::ptr_eq(&cache.load_full(), &last_good),
+            "failed candidate must not replace the last-good verifier cache"
+        );
+    }
+
+    #[test]
+    fn rejected_candidate_lkg_membership_uses_retained_snapshot() {
+        // After a rejected trust update, membership and chain verification must
+        // both use the retained last-known-good snapshot — not the candidate
+        // that failed admission.
+        let local_td = TrustDomain::new("lkg.local").unwrap();
+        let federated_td = TrustDomain::new("lkg.federated").unwrap();
+        let only_in_candidate_td = TrustDomain::new("lkg.candidate-only").unwrap();
+        let gateway_id = SpiffeId::from_parts(&local_td, "ns/default/sa/gateway").unwrap();
+        let federated_peer = SpiffeId::from_parts(&federated_td, "ns/remote/sa/peer").unwrap();
+        let candidate_only_peer = SpiffeId::from_parts(&only_in_candidate_td, "ns/x/sa/y").unwrap();
+
+        let (local_root_der, local_root_pem, local_key_pem) = synthetic_root(&local_td);
+        let (federated_root_der, federated_root_pem, federated_key_pem) =
+            synthetic_root(&federated_td);
+        let (_candidate_root_der, candidate_root_pem, candidate_key_pem) =
+            synthetic_root(&only_in_candidate_td);
+        let gateway_leaf = issue_leaf(&gateway_id, &local_root_pem, &local_key_pem, None);
+        let federated_leaf = issue_leaf(
+            &federated_peer,
+            &federated_root_pem,
+            &federated_key_pem,
+            None,
+        );
+        let candidate_only_leaf = issue_leaf(
+            &candidate_only_peer,
+            &candidate_root_pem,
+            &candidate_key_pem,
+            None,
+        );
+
+        let mut admitted = bundle_for(local_td.clone(), local_root_der.clone());
+        admitted.federated.insert(
+            federated_td.clone(),
+            TrustBundle {
+                trust_domain: federated_td,
+                x509_authorities: vec![federated_root_der],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
+        let valid_source = Arc::new(Some(svid_bundle_for(
+            gateway_id.clone(),
+            admitted,
+            gateway_leaf.clone(),
+        )));
+        let cache = ArcSwap::new(Arc::new(None));
+        peer_verifier_cache(&cache, valid_source, &[])
+            .expect("admitted multi-domain trust set must build");
+        let last_good = cache.load_full();
+
+        // Candidate drops the federated domain and corrupts the local root so
+        // the complete update is rejected and LKG is retained.
+        let rejected_drop = Arc::new(Some(svid_bundle_for(
+            gateway_id.clone(),
+            bundle_for(local_td.clone(), vec![1, 2, 3, 4]),
+            gateway_leaf.clone(),
+        )));
+        let retained_after_drop = peer_verifier_cache(&cache, rejected_drop.clone(), &[])
+            .expect("rejected candidate must keep last-known-good");
+        assert!(Arc::ptr_eq(&retained_after_drop, &last_good));
+
+        // Domain present only in LKG (removed by rejected candidate) must still
+        // pass membership + chain verification against the retained snapshot.
+        let still_trusted = verify_peer_against_cached_snapshot(
+            &cache,
+            rejected_drop,
+            &CertificateDer::from(federated_leaf),
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .expect("LKG-federated peer must remain trusted after rejected drop");
+        assert_eq!(still_trusted.as_str(), federated_peer.as_str());
+        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
+
+        // Candidate declares an extra domain that LKG never admitted, but the
+        // extra domain's authority is unusable so the whole candidate fails.
+        let mut adds_unusable = bundle_for(local_td, local_root_der);
+        adds_unusable.federated.insert(
+            only_in_candidate_td.clone(),
+            TrustBundle {
+                trust_domain: only_in_candidate_td.clone(),
+                x509_authorities: vec![vec![9, 9, 9, 9]],
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
+        let rejected_add = Arc::new(Some(svid_bundle_for(
+            gateway_id,
+            adds_unusable,
+            gateway_leaf,
+        )));
+        let retained_after_add = peer_verifier_cache(&cache, rejected_add.clone(), &[])
+            .expect("rejected candidate must keep last-known-good");
+        assert!(Arc::ptr_eq(&retained_after_add, &last_good));
+
+        // Membership must deny against the retained snapshot with the unknown-
+        // domain diagnostic — not pass candidate membership then fail with
+        // "no usable roots" against LKG.
+        let err = verify_peer_against_cached_snapshot(
+            &cache,
+            rejected_add,
+            &CertificateDer::from(candidate_only_leaf),
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .expect_err("candidate-only domain must not pass LKG membership");
+        assert!(
+            err.contains(&format!(
+                "no trust bundle for peer's trust domain '{}'",
+                only_in_candidate_td
+            )),
+            "expected unknown-domain membership error, got: {err}"
+        );
+        assert!(
+            !err.contains("no usable roots"),
+            "candidate-only domain must not surface the unusable-roots path: {err}"
+        );
+        assert!(Arc::ptr_eq(&cache.load_full(), &last_good));
     }
 
     /// Issue a leaf SVID under `root` with a known serial so a CRL can revoke
