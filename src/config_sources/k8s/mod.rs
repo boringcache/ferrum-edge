@@ -10,6 +10,10 @@ mod istio;
 mod mesh_config;
 
 pub(crate) use core::secret_object_is_valid_tls_certificate;
+pub(crate) use gateway_api::{
+    allowed_route_namespaces as parse_gateway_listener_allowed_route_namespaces,
+    namespace_selector_matches,
+};
 // Shared with the Istio status writer (`crate::k8s_controller::istio_status`) so
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
@@ -118,6 +122,50 @@ pub struct K8sTranslationOptions {
     pub mesh_sidecar_ingress_enforced: bool,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
+}
+
+/// A stable, value-redacted validation error for a Gateway listener's
+/// `allowedRoutes` namespace policy.
+///
+/// The field path identifies the invalid selector surface without echoing a
+/// user-supplied label key, label value, or operator into status or logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayApiListenerValidationError {
+    field: &'static str,
+    message: &'static str,
+}
+
+impl GatewayApiListenerValidationError {
+    const fn new(field: &'static str, message: &'static str) -> Self {
+        Self { field, message }
+    }
+
+    pub const fn field(&self) -> &'static str {
+        self.field
+    }
+
+    pub const fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl std::fmt::Display for GatewayApiListenerValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.field, self.message)
+    }
+}
+
+impl std::error::Error for GatewayApiListenerValidationError {}
+
+/// Validate the namespace attachment policy for one unstructured Gateway
+/// listener.
+///
+/// Translation and status use the same underlying fallible parser so a
+/// malformed AND selector cannot be weakened differently on either surface.
+pub fn validate_gateway_listener_allowed_routes(
+    listener: &Value,
+) -> Result<(), GatewayApiListenerValidationError> {
+    gateway_api::allowed_route_namespaces(listener).map(|_| ())
 }
 
 impl K8sTranslationOptions {
@@ -345,6 +393,7 @@ pub(crate) enum GatewayApiAllowedRoutesNamespaces {
     Same,
     All,
     Selector(GatewayApiNamespaceSelector),
+    Invalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -360,7 +409,7 @@ pub(crate) struct GatewayApiNamespaceSelectorExpression {
     pub values: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GatewayApiNamespaceSelectorOperator {
     In,
     NotIn,
@@ -371,6 +420,7 @@ pub(crate) enum GatewayApiNamespaceSelectorOperator {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct GatewayApiListenerPolicy {
     pub namespaces: GatewayApiAllowedRoutesNamespaces,
+    pub validation_error: Option<GatewayApiListenerValidationError>,
     pub hostname: Option<String>,
     pub port: Option<u64>,
     pub route_kinds: HashSet<String>,

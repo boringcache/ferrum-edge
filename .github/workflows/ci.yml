@@ -640,6 +640,7 @@ jobs:
               integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
+              integration::gateway_allowed_routes_selector_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
@@ -693,6 +694,7 @@ jobs:
               integration::frontend_tls_live_reload_tests
               integration::tcp_frontend_tls_order_tests
               integration::tcp_fast_path_l4_plugins_tests
+              integration::udp_hook_concurrency_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests
@@ -879,6 +881,7 @@ jobs:
         run: |
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
           cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+          cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
         run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
@@ -1112,7 +1115,8 @@ jobs:
           # advertised. Behind a `-p` mapping it would advertise the container
           # port and the driver would dial the wrong process.
           docker run -d --name ferrum-ci-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            --setParameter enableTestCommands=1
           docker run -d --name ferrum-ci-postgres \
             -e POSTGRES_DB=ferrum \
             -e POSTGRES_USER=ferrum \

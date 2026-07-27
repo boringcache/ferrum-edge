@@ -72,6 +72,7 @@ mod tls_offload_tests;
 mod tls_tests;
 mod udp_reply_stop_tests;
 mod websocket_auth_tests;
+mod websocket_auto_pong_tests;
 mod websocket_backend_tests;
 mod websocket_connection_limit_tests;
 mod websocket_drain_accounting_tests;

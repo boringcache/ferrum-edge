@@ -33,17 +33,17 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
-use crate::config::db_backend::NamespacedResourceId;
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
     MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, PassiveHealthCheck, PluginAssociation,
-    PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
-    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
-    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
+    PluginConfig, PluginScope, Proxy, ResolvedSubsetTrafficPolicy, ResponseBodyMode,
+    SubsetDefinition, SubsetTrafficPolicy, UPSTREAM_TARGET_SERVICE_NAME_TAG,
+    UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -61,9 +61,9 @@ use crate::modes::mesh::config_consumer::xds_client::XdsClientConfig;
 use crate::modes::mesh::dns_proxy::MeshDnsProxy;
 use crate::modes::mesh::runtime::MeshRuntimeState;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
-use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::tls::{self, TlsPolicy};
 
 const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:15006";
@@ -203,7 +203,7 @@ pub enum MeshTopology {
 }
 
 impl MeshTopology {
-    fn parse(raw: &str) -> Result<Self, String> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "sidecar" => Ok(Self::Sidecar),
             "ambient" => Ok(Self::Ambient),
@@ -216,6 +216,15 @@ impl MeshTopology {
                 crate::secrets::quoted_env_value("FERRUM_MESH_TOPOLOGY", other)
             )),
         }
+    }
+
+    /// Whether this topology runs an inbound TLS-terminating listener.
+    ///
+    /// Matches [`MeshRuntimeConfig::has_inbound_tls_termination_listener`]:
+    /// EastWestGateway is SNI passthrough-only and is the sole topology that
+    /// returns `false`.
+    pub(crate) fn has_inbound_tls_termination_listener(self) -> bool {
+        !matches!(self, Self::EastWestGateway)
     }
 
     fn as_str(self) -> &'static str {
@@ -937,12 +946,7 @@ impl MeshRuntimeConfig {
     /// apply task key their "is there anything to fail closed on?" check off it,
     /// so the exempt set can never drift between the two.
     fn has_inbound_tls_termination_listener(&self) -> bool {
-        self.listener_plan().iter().any(|listener| {
-            matches!(
-                listener.kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            )
-        })
+        self.topology.has_inbound_tls_termination_listener()
     }
 
     pub fn mesh_slice_request(&self) -> MeshSliceRequest {
@@ -6837,10 +6841,8 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
-            let upstream_owner_key = NamespacedResourceId::new(
-                upstream.namespace.as_str(),
-                upstream.id.as_str(),
-            );
+            let upstream_owner_key =
+                NamespacedResourceId::new(upstream.namespace.as_str(), upstream.id.as_str());
             // Captured owned (like `upstream_base_tls`) so the per-port
             // `entry()` mutable borrow below does not conflict with reading the
             // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
@@ -9560,8 +9562,10 @@ async fn serve_mesh_runtime(
         node_waypoint_dns_slice_for_prepared_config(&runtime, slice.as_ref(), &config)
     });
 
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
+    // drift between the two commands (issue #2976).
+    let tls_policy = startup_security::load_tls_policy(&env_config)?;
+    let crls = startup_security::load_crls_from_env(&env_config)?;
     // GAP-3D: on node-waypoint topology, create the SOCK_OPS metrics
     // state up front so plugin construction inside `ProxyState::new`
     // picks it up via PluginHttpClient and the spawned ringbuf consumer
@@ -10600,17 +10604,8 @@ fn start_mesh_admin_listeners(
         serving_degraded,
         listener_failures: serving_listener_failures,
     } = serving_signals;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(
-            &env_config.admin_allowed_cidrs,
-            "FERRUM_ADMIN_ALLOWED_CIDRS",
-        )
-        .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(env_config)
-            .map_err(|err| anyhow::anyhow!(err))?,
-    );
+    let admin_allowed_cidrs = Arc::new(startup_security::load_admin_allowed_cidrs(env_config)?);
+    let metrics_auth = Arc::new(startup_security::load_metrics_auth(env_config)?);
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
         Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
@@ -10722,23 +10717,14 @@ fn start_mesh_admin_listeners(
             "{} — mesh admin HTTPS listener disabled",
             crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
         );
-    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
+    } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
+        let admin_tls_config = startup_security::load_admin_tls_material(
+            env_config,
             tls_policy,
-            env_config.tls_cert_expiry_warning_days,
             crls,
-        )
-        .map_err(|err| anyhow::anyhow!("Invalid mesh admin TLS configuration: {err}"))?;
+            "Invalid mesh admin TLS configuration",
+        )?;
         let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
             env_config,
@@ -11985,26 +11971,17 @@ fn mesh_inbound_tls_reload_snapshot(
     mtls_mode: config::MtlsMode,
     port_modes: std::collections::BTreeMap<u16, config::MtlsMode>,
 ) -> Result<MeshInboundTlsReloadSnapshot, anyhow::Error> {
-    let any_mode_needs_client_ca = mtls_mode != config::MtlsMode::Disable
-        || port_modes
+    let any_mode_needs_client_ca = startup_security::mesh_inbound_modes_need_client_ca(
+        mtls_mode != config::MtlsMode::Disable,
+        port_modes
             .values()
-            .any(|mode| *mode != config::MtlsMode::Disable);
+            .any(|mode| *mode != config::MtlsMode::Disable),
+    );
     let client_ca_bundle = if !any_mode_needs_client_ca {
         None
     } else if let Some(path) = env_config.frontend_tls_client_ca_bundle_path.as_deref() {
-        let source = CertSource::parse(path, MaterialKind::CaBundle);
-        let material =
-            load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
-                format!(
-                    "failed to load mesh frontend client CA bundle at {}",
-                    source.redacted_source_id()
-                )
-            })?;
-        let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
-        Some(MeshInboundClientCaBundle {
-            path: material.display_source_id,
-            pem,
-        })
+        let (path, pem) = startup_security::load_mesh_inbound_client_ca_bundle(path)?;
+        Some(MeshInboundClientCaBundle { path, pem })
     } else {
         None
     };
@@ -16618,16 +16595,22 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
+        // Scoped fail-closed is driven by mesh_authz plugin config with
+        // per_pod_policy_scoping, not by MeshConfig.mesh_policies alone.
+        let operator_authz = global_mesh_authz_plugin(
+            "operator-mesh-authz",
+            serde_json::json!({
+                "per_pod_policy_scoping": true,
+                "mesh_policies": [scoped_node_waypoint_deny_policy()],
+            }),
+        );
         let mut config = GatewayConfig {
             proxies: vec![udp_proxy, other_proxy],
             plugin_configs: vec![
                 plugin("default-shared-plugin", "default"),
                 plugin("tenant-b-shared-plugin", "tenant-b"),
+                operator_authz,
             ],
-            mesh: Some(Box::new(MeshConfig {
-                mesh_policies: vec![scoped_node_waypoint_deny_policy()],
-                ..MeshConfig::default()
-            })),
             ..GatewayConfig::default()
         };
         let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
@@ -16637,8 +16620,20 @@ mod tests {
         assert_eq!(config.proxies.len(), 1);
         assert_eq!(config.proxies[0].namespace, "tenant-b");
         assert_eq!(config.proxies[0].id, "shared");
-        assert_eq!(config.plugin_configs.len(), 1);
-        assert_eq!(config.plugin_configs[0].namespace, "tenant-b");
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "tenant-b" && plugin.id == "tenant-b-shared-plugin"),
+            "same-id proxy plugin in another namespace must survive UDP fail-closed pruning"
+        );
+        assert!(
+            !config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "default" && plugin.id == "default-shared-plugin"),
+            "UDP proxy-scoped plugins must prune only within the UDP proxy's namespace"
+        );
     }
 
     #[test]
@@ -24603,6 +24598,9 @@ mod tests {
     fn mesh_runtime_updates_mesh_managed_global_plugin_by_id() {
         let runtime = test_mesh_runtime_config();
         let now = chrono::Utc::now();
+        // Reserved mesh IDs are illegal on the operator-input prepare boundary.
+        // Re-injection against prior materializer output updates the existing
+        // `(namespace, id)` row instead of duplicating it.
         let existing = PluginConfig {
             id: MESH_REQUEST_AUTH_PLUGIN_ID.to_string(),
             plugin_name: "jwks_auth".to_string(),
@@ -24620,20 +24618,19 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let config = GatewayConfig {
-            mesh: Some(Box::new(MeshConfig {
-                request_authentications: vec![test_request_authentication(
-                    "fresh",
-                    PolicyScope::MeshWide,
-                )],
-                ..MeshConfig::default()
-            })),
+        let fresh = test_request_authentication("fresh", PolicyScope::MeshWide);
+        let mut config = GatewayConfig {
             plugin_configs: vec![existing],
             ..GatewayConfig::default()
         };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            request_authentications: vec![fresh],
+            ..MeshSlice::default()
+        };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
-        let jwks_plugins: Vec<_> = prepared
+        inject_mesh_request_auth_plugin(&mut config, &runtime, &mesh_slice);
+        let jwks_plugins: Vec<_> = config
             .plugin_configs
             .iter()
             .filter(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)
