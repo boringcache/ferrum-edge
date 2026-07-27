@@ -1113,7 +1113,8 @@ jobs:
           # advertised. Behind a `-p` mapping it would advertise the container
           # port and the driver would dial the wrong process.
           docker run -d --name ferrum-ci-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all
+            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            --setParameter enableTestCommands=1
           docker run -d --name ferrum-ci-postgres \
             -e POSTGRES_DB=ferrum \
             -e POSTGRES_USER=ferrum \

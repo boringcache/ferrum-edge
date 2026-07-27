@@ -3892,7 +3892,9 @@ paths:
         graph's current upstream, plugin-composition, and named-schema
         dependencies are revalidated before commit with the configured backend
         egress policy and real-IP header. Standalone MongoDB fails closed before
-        multi-document compensation writes.
+        multi-document compensation writes. It also refuses direct deletion of
+        an API-spec-owned proxy with `501` before the first ownership-graph
+        mutation; configure a replica set and retry.
       tags: [Proxies]
       responses:
         "204":
@@ -3911,6 +3913,16 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "501":
+          description: |
+            Standalone MongoDB cannot atomically delete the proxy, scoped
+            plugins, owning API-spec row, generated upstreams, and config-change
+            records. The operation is refused before any of those documents are
+            mutated; `detail` names the replica-set configuration to enable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -11553,6 +11565,21 @@ components:
           description: |
             Always `not_needed`. Persistence is one transaction, so a failure
             never leaves a partial graph to compensate for.
+
+    ProxyDeleteAtomicityFailureResponse:
+      type: object
+      required: [error, detail]
+      description: |
+        A direct delete of an API-spec-owned proxy that was refused before any
+        proxy ownership resource or config-change document was mutated.
+      properties:
+        error:
+          type: string
+          description: Stable, redacted reason the deletion was not applied
+        detail:
+          type: string
+          description: |
+            Replica-set configuration to enable before retrying the deletion.
 
     BackupResponse:
       type: object

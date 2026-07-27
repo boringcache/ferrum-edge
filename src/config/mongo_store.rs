@@ -50,9 +50,12 @@ mod inner {
         DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
         MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend,
         NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-        SnapshotDataIntegrityError, SortOrder, TcpConnectionThrottleAttachmentConflict,
+        ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SortOrder,
+        TcpConnectionThrottleAttachmentConflict,
     };
-    use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
+    use crate::config::db_loader::{
+        credential_value_hash, mark_row_decode_rejection, proxy_route_key_hash,
+    };
     use crate::config::types::{
         ApiSpec, Consumer, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
         Upstream,
@@ -946,10 +949,11 @@ mod inner {
             if !replica_set_configured {
                 warn!(
                     "MongoDB connected without a replica set (FERRUM_MONGO_REPLICA_SET is unset). \
-                     Multi-document writes (proxy delete/update, api_spec submit/replace) will \
-                     fall back to compensating rollback instead of transactions, leaving a small \
-                     window where partial failure may require operator reconciliation. Atomic \
-                     late API-spec delete compensation is unavailable and fails before writing. \
+                     Multi-document writes (hand-managed proxy delete/update, api_spec \
+                     submit/replace) will fall back to compensating rollback instead of \
+                     transactions, leaving a small window where partial failure may require \
+                     operator reconciliation. Direct deletion of an API-spec-owned proxy and \
+                     atomic late API-spec delete compensation are unavailable and fail before writing. \
                      Configure FERRUM_MONGO_REPLICA_SET to enable transactions."
                 );
             }
@@ -4216,6 +4220,56 @@ mod inner {
             )
         }
 
+        /// Why standalone MongoDB cannot delete an API-spec-owned proxy.
+        ///
+        /// That ownership graph spans the proxy, scoped plugins, API-spec
+        /// metadata, generated upstreams, and runtime change records. Refuse
+        /// before the first graph mutation rather than risk a successful
+        /// partial delete when any later collection command fails.
+        fn atomic_proxy_delete_standalone_refusal() -> ProxyDeleteAtomicityUnsupported {
+            ProxyDeleteAtomicityUnsupported::new(
+                "configure FERRUM_MONGO_REPLICA_SET (or use ?replicaSet=... in \
+                 FERRUM_DB_URL) and retry; no proxy ownership resources were modified",
+            )
+        }
+
+        /// Refuse an API-spec ownership cascade before any standalone mutation.
+        ///
+        /// The proxy stamp and the owner metadata are checked independently so
+        /// a repairable mismatch cannot silently reopen the partial-delete
+        /// path. The caller repeats this check after taking the namespace
+        /// mutation lease to close the preflight-to-write race.
+        async fn preflight_standalone_proxy_delete(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<Document>, anyhow::Error> {
+            let proxy_doc = self
+                .proxies()
+                .find_one(doc! { "_id": id, "namespace": namespace })
+                .await?;
+            let Some(proxy_doc) = proxy_doc else {
+                return Ok(None);
+            };
+            let has_api_spec_owner = self
+                .api_specs()
+                .find_one(doc! { "proxy_id": id, "namespace": namespace })
+                .projection(doc! { "_id": 1 })
+                .await?
+                .is_some();
+            // The field is omitted for hand-managed proxies. Any stored value,
+            // including malformed/non-string BSON, is an ownership or
+            // corruption signal and must keep the destructive standalone path
+            // closed.
+            let has_api_spec_stamp = proxy_doc.contains_key("api_spec_id");
+            if has_api_spec_owner || has_api_spec_stamp {
+                return Err(anyhow::Error::new(
+                    Self::atomic_proxy_delete_standalone_refusal(),
+                ));
+            }
+            Ok(Some(proxy_doc))
+        }
+
         /// Translate a failed atomic-batch transaction back into a typed error.
         ///
         /// The convenient-transaction runner only aborts when the callback
@@ -6230,6 +6284,14 @@ mod inner {
 
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
+            if !self.replica_set_configured()
+                && self
+                    .preflight_standalone_proxy_delete(namespace, id)
+                    .await?
+                    .is_none()
+            {
+                return Ok(false);
+            }
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
             self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
                 candidate.proxies.retain(|proxy| proxy.id != id);
@@ -6285,9 +6347,15 @@ mod inner {
                                     .await
                                     .map_err(|e| mongodb::error::Error::custom(e.to_string()))?;
 
+                                // Namespace-predicated: a same proxy_id owner row
+                                // in another namespace must not classify or cascade
+                                // this delete (parity with standalone preflight).
                                 let spec_owner: Option<(String, String)> = this
                                     .api_specs()
-                                    .find_one(mongodb::bson::doc! { "proxy_id": id.as_str() })
+                                    .find_one(mongodb::bson::doc! {
+                                        "proxy_id": id.as_str(),
+                                        "namespace": namespace.as_str(),
+                                    })
                                     .session(&mut *s)
                                     .await?
                                     .map(|doc| {
@@ -6502,103 +6570,38 @@ mod inner {
                 return Ok(deleted);
             }
 
-            let proxy_doc_for_changes = self
-                .proxies()
-                .find_one(doc! { "_id": id, "namespace": namespace })
-                .await?;
-            if proxy_doc_for_changes.is_none() {
+            let Some(proxy_doc) = self
+                .preflight_standalone_proxy_delete(namespace, id)
+                .await?
+            else {
                 return Ok(false);
             };
+
             let proxy_namespace_for_changes = namespace.to_string();
             let proxy_scoped_plugin_ids_for_changes = self
                 .load_collection_ids_filtered("plugin_configs", doc! { "proxy_id": id })
                 .await?;
-            let spec_owner_for_changes: Option<(String, String)> =
-                match self.api_specs().find_one(doc! { "proxy_id": id }).await? {
-                    Some(doc) => {
-                        let sid = doc.get_str("_id").map(str::to_string).map_err(|e| {
-                            anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", id, e)
-                        })?;
-                        let namespace = doc
-                            .get_str("namespace")
-                            .map(str::to_string)
-                            .unwrap_or_else(|_| crate::config::types::default_namespace());
-                        Some((sid, namespace))
-                    }
-                    None => None,
-                };
-            let spec_upstream_ids_for_changes =
-                if let Some((ref sid, ref namespace)) = spec_owner_for_changes {
-                    self.load_collection_ids_filtered(
-                        "upstreams",
-                        doc! { "api_spec_id": sid, "namespace": namespace },
-                    )
-                    .await?
-                } else {
-                    HashSet::new()
-                };
 
             // Non-replica-set best-effort path.
-            let proxy_doc = self
-                .proxies()
-                .find_one(doc! { "_id": id, "namespace": namespace })
-                .await?;
+            // This path is for hand-managed proxies only. API-spec ownership
+            // was refused above before the first graph mutation, so no
+            // owner/spec-upstream cascade can enter it.
             let proxy_namespace = namespace.to_string();
             let upstream_id_to_check: Option<String> = proxy_doc
-                .as_ref()
-                .and_then(|doc| doc.get_str("upstream_id").ok().map(str::to_string));
-            if proxy_doc.is_none() {
-                return Ok(false);
-            }
-            let spec_owner: Option<(String, String)> =
-                match self.api_specs().find_one(doc! { "proxy_id": id }).await? {
-                    Some(doc) => {
-                        let sid = doc.get_str("_id").map(str::to_string).map_err(|e| {
-                            anyhow::anyhow!("api_spec for proxy {} is missing _id: {}", id, e)
-                        })?;
-                        let namespace = doc
-                            .get_str("namespace")
-                            .map(str::to_string)
-                            .unwrap_or_else(|_| crate::config::types::default_namespace());
-                        Some((sid, namespace))
-                    }
-                    None => None,
-                };
-            if let Some((ref sid, ref namespace)) = spec_owner {
-                self.ensure_no_external_spec_upstream_refs(namespace, sid, id)
-                    .await?;
-            }
+                .get_str("upstream_id")
+                .ok()
+                .map(str::to_string);
 
             let result = self
                 .proxies()
                 .delete_one(doc! { "_id": id, "namespace": namespace })
                 .await?;
-            let mut deleted_spec_upstream_ids_for_changes = HashSet::new();
             let mut deleted_orphaned_upstream_id_for_changes = None;
             if result.deleted_count > 0 {
                 self.plugin_configs()
                     .delete_many(doc! { "proxy_id": id })
                     .await?;
-                let _ = self.api_specs().delete_one(doc! { "proxy_id": id }).await;
-                if let Some((ref sid, ref namespace)) = spec_owner {
-                    match self
-                        .upstreams()
-                        .delete_many(doc! { "api_spec_id": sid, "namespace": namespace })
-                        .await
-                    {
-                        Ok(_) => {
-                            deleted_spec_upstream_ids_for_changes =
-                                spec_upstream_ids_for_changes.clone();
-                        }
-                        Err(e) => warn!(
-                            "MongoDB best-effort upstream cascade delete failed for api_spec {}: {}",
-                            sid, e
-                        ),
-                    }
-                }
-                if spec_owner.is_none()
-                    && let Some(ref uid) = upstream_id_to_check
-                {
+                if let Some(ref uid) = upstream_id_to_check {
                     let still_referenced = self
                         .proxies()
                         .count_documents(doc! { "upstream_id": uid })
@@ -6643,12 +6646,6 @@ mod inner {
                     )
                     .await?;
                 }
-                if let Some((_, ref namespace)) = spec_owner_for_changes {
-                    for upstream_id in deleted_spec_upstream_ids_for_changes {
-                        self.record_config_change(namespace, "upstream", &upstream_id, "delete")
-                            .await?;
-                    }
-                }
                 if let Some(ref upstream_id) = deleted_orphaned_upstream_id_for_changes {
                     self.record_config_change(
                         &proxy_namespace_for_changes,
@@ -6683,7 +6680,14 @@ mod inner {
                 .await?;
             self.check_slow_query("get_proxy", start);
             match result {
-                Some(doc) => Ok(Some(doc_to_proxy(doc)?)),
+                // Mark decode failures like SQL `row_to_proxy` so admin DELETE
+                // can take the undecodable-row repair path. That path still
+                // runs `delete_proxy`, whose standalone ownership preflight
+                // reads raw BSON and refuses malformed `api_spec_id` stamps
+                // with `501` before any graph mutation.
+                Some(doc) => Ok(Some(doc_to_proxy(doc).map_err(|error| {
+                    mark_row_decode_rejection("proxy", Some(id.to_string()), error)
+                })?)),
                 None => Ok(None),
             }
         }
@@ -13838,30 +13842,6 @@ mod inner {
                 ),
                 vec!["proxy-a", "proxy-c"],
                 "unordered batch rollback must target only successful inserts"
-            );
-        }
-
-        #[test]
-        fn delete_proxy_guards_external_spec_upstream_refs_before_spec_upstream_delete() {
-            let source = include_str!("mongo_store.rs");
-            let delete_proxy_start = source
-                .find("async fn delete_proxy(&self, namespace: &str, id: &str)")
-                .expect("delete_proxy function");
-            let delete_proxy_body = &source[delete_proxy_start..];
-            let non_replica_start = delete_proxy_body
-                .find("// Non-replica-set best-effort path.")
-                .expect("delete_proxy non-replica path marker");
-            let non_replica_path = &delete_proxy_body[non_replica_start..];
-            let guard = non_replica_path
-                .find("ensure_no_external_spec_upstream_refs(namespace, sid, id)")
-                .expect("delete_proxy guard call");
-            let upstream_delete = non_replica_path
-                .find(".delete_many(doc! { \"api_spec_id\": sid, \"namespace\": namespace })")
-                .expect("delete_proxy spec-owned upstream delete");
-            assert!(
-                guard < upstream_delete,
-                "delete_proxy must guard external references before deleting \
-                 upstreams tagged with the spec id"
             );
         }
 
