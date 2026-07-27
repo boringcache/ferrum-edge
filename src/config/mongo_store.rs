@@ -1534,6 +1534,9 @@ mod inner {
                     "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
                 )
             })?;
+            if topology == MongoReconnectTopology::Primary {
+                self.failover_topology.ensure_primary_failback_allowed()?;
+            }
             if topology == MongoReconnectTopology::Failover {
                 self.failover_topology.mark_failover(url_redacted);
             }
@@ -4353,9 +4356,14 @@ mod inner {
                     .await?;
                 while upstream_cursor.advance(&mut *s).await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    if let Ok(id) = doc.get_str("_id") {
-                        upstream_ids.push(id.to_string());
-                    }
+                    let id = doc.get_str("_id").map_err(|error| {
+                        anyhow::Error::new(error).context(format!(
+                            "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             failed to decode spec-owned upstream id required for external reference checks"
+                        ))
+                    })?;
+                    upstream_ids.push(id.to_string());
                 }
                 drop(upstream_cursor);
 
@@ -4417,9 +4425,14 @@ mod inner {
                     .await?;
                 while upstream_cursor.advance().await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    if let Ok(id) = doc.get_str("_id") {
-                        upstream_ids.push(id.to_string());
-                    }
+                    let id = doc.get_str("_id").map_err(|error| {
+                        anyhow::Error::new(error).context(format!(
+                            "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             failed to decode spec-owned upstream id required for external reference checks"
+                        ))
+                    })?;
+                    upstream_ids.push(id.to_string());
                 }
 
                 if upstream_ids.is_empty() {
@@ -5555,6 +5568,10 @@ mod inner {
 
         fn set_failover_allow_writes(&mut self, allow: bool) {
             self.failover_topology.set_allow_writes(allow);
+        }
+
+        fn note_failover_admin_write(&self) {
+            self.failover_topology.note_admin_write();
         }
 
         async fn acquire_write_topology_permit(
@@ -10006,9 +10023,8 @@ mod inner {
             // Try primary first. `reconnect()` rebuilds the underlying
             // `Client` against the primary URL and pings it; on success
             // the swap is committed and the gateway is back on the
-            // primary. Opt-in failover windows emit one divergence-risk
-            // marker via mark_primary (issue #3001 contract B); failback
-            // is not fenced.
+            // primary. A failover-window Admin write fences publication of a
+            // recovered primary until reconciliation or restart.
             match self.reconnect(primary_url).await {
                 Ok(()) => {
                     info!(

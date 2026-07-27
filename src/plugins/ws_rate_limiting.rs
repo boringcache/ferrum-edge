@@ -13,9 +13,37 @@ use uuid::Uuid;
 
 use super::utils::rate_limit::{
     RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp,
-    apply_rate_limit_cleanup,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, validate_ws_frame_rate_params,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// `ws_rate_limiting`-specific top-level config keys (excludes Redis fields).
+const WS_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
+    &["frames_per_second", "burst_size", "close_reason"];
+
+/// Closed top-level key set for `ws_rate_limiting` plugin config.
+///
+/// Must stay aligned with OpenAPI `WsRateLimitingConfig`,
+/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
+/// `frames_per_secod`/`redis_tsl` otherwise loaded silently as the default
+/// frame budget or plaintext Redis transport.
+pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
+    "frames_per_second",
+    "burst_size",
+    "close_reason",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_tls",
+    "redis_url",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
@@ -51,27 +79,30 @@ impl WsRateLimiting {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ws_rate_limiting: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ws_rate_limiting: config must be an object".to_string())?;
+        debug_assert_closed_root_keys(
+            WS_RATE_LIMITING_CONFIG_KEYS,
+            WS_RATE_LIMITING_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            WS_RATE_LIMITING_CONFIG_KEYS,
+            "ws_rate_limiting: ",
+        )?;
 
-        let frames_per_second =
-            optional_positive_u64(config, "frames_per_second")?.unwrap_or(100) as f64;
+        let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
+        let burst_size = optional_positive_u64(config, "burst_size")?.unwrap_or(frames_per_second);
 
-        let burst_size = optional_positive_u64(config, "burst_size")?
-            .map_or(frames_per_second, |value| value as f64);
-
-        // The Redis sliding-window approximation assumes burst >= fps so the
-        // derived window length stays >= 1 second and the average sustained
-        // rate matches frames_per_second. Without this, burst<fps configs
-        // would diverge between local (token bucket refills independently of
-        // capacity) and Redis (window floors to 1s, sustained = burst fps).
-        if burst_size < frames_per_second {
-            return Err(format!(
-                "ws_rate_limiting: 'burst_size' ({}) must be >= 'frames_per_second' ({})",
-                burst_size as u64, frames_per_second as u64
-            ));
-        }
+        // Local token-bucket and Redis two-window enforcement must share the
+        // same sustained rate for every accepted config (including Redis
+        // failure/recovery). Reject values Redis cannot represent without
+        // over-admitting or under-admitting relative to the local policy
+        // (GHSA-cjcm-546w-696v).
+        validate_ws_frame_rate_params(frames_per_second, burst_size)?;
 
         let mut close_reason = optional_string(config, "close_reason")?
             .unwrap_or("Frame rate exceeded")
@@ -96,7 +127,7 @@ impl WsRateLimiting {
                 config_id,
                 config,
                 &http_client,
-                WsFrameRateAlgorithm::new(frames_per_second, burst_size),
+                WsFrameRateAlgorithm::new(frames_per_second as f64, burst_size as f64),
             )?,
             epoch_base: Instant::now(),
             last_periodic_sweep_secs: AtomicU64::new(0),
