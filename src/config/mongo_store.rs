@@ -1512,11 +1512,8 @@ mod inner {
             topology: MongoReconnectTopology,
             url_redacted: &str,
         ) -> Result<(), anyhow::Error> {
-            self.invoke_reconnect_transition_hook(
-                |hooks| hooks.before_lock.as_ref(),
-                topology,
-            )
-            .await;
+            self.invoke_reconnect_transition_hook(|hooks| hooks.before_lock.as_ref(), topology)
+                .await;
             // Fail-fast: never wait for Admin mutation topology pins.
             let _admin_topology_guard = self.admin_write_topology.try_write().map_err(|_| {
                 anyhow::anyhow!(
@@ -1542,11 +1539,8 @@ mod inner {
             // Test seam: hold publication guards across the primary
             // mark_primary window so a concurrent failover cannot interleave
             // and then be overwritten only in metadata.
-            self.invoke_reconnect_transition_hook(
-                |hooks| hooks.while_holding.as_ref(),
-                topology,
-            )
-            .await;
+            self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology)
+                .await;
             if topology == MongoReconnectTopology::Primary {
                 self.failover_topology.mark_primary(url_redacted);
             }

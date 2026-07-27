@@ -1290,7 +1290,8 @@ async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
 
     // Fail-fast: concurrent failover cannot acquire the publication guards.
     let deferred = failover_task.await.expect("join deferred failover");
-    let deferred_err = deferred.expect_err("failover racing under primary publication must fail-fast defer");
+    let deferred_err =
+        deferred.expect_err("failover racing under primary publication must fail-fast defer");
     let deferred_msg = deferred_err.to_string();
     assert!(
         deferred_msg.contains("Admin write-topology permit")
