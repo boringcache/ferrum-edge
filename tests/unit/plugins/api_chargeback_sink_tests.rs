@@ -1431,7 +1431,9 @@ fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
 
     let mut planted = Vec::new();
     for index in 0..file_count {
-        let path = day.join(owned_data_name(&format!("000000000000000000000000{index:02}")));
+        let path = day.join(owned_data_name(&format!(
+            "000000000000000000000000{index:02}"
+        )));
         fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
         planted.push(path);
     }
@@ -1461,7 +1463,10 @@ fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
                 "oldest planted file {index} must be reclaimed"
             );
         } else {
-            assert!(path.exists(), "newest planted file {index} must be retained");
+            assert!(
+                path.exists(),
+                "newest planted file {index} must be retained"
+            );
         }
     }
     let after = spool.scan_stats().unwrap();
@@ -1490,7 +1495,9 @@ fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
     fs::create_dir_all(&day).unwrap();
 
     for index in 0..file_count {
-        let path = day.join(owned_data_name(&format!("01ARZ3NDEKTSV4RRFFQ69G{index:05}")));
+        let path = day.join(owned_data_name(&format!(
+            "01ARZ3NDEKTSV4RRFFQ69G{index:05}"
+        )));
         fs::write(&path, vec![b'y'; file_len as usize]).unwrap();
     }
 
