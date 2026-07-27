@@ -12,15 +12,23 @@
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
 //!      - Docker: `docker run -d --name mongo-test -p 27017:27017 mongo:7`
-//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs
-//!      - Run `tests/scripts/setup_mongo_tls.sh` (if available) or configure manually
+//!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs under
+//!      `FERRUM_TEST_MONGO_CERT_DIR` (defaults to `/tmp/ferrum-mongo-tls-certs`)
+//!      listening on 27018 (TLS) / 27019 (mTLS). Hosted data-plane CI
+//!      provisions these fixtures inline; local runs skip unless present.
 //!   3. Build the gateway: `cargo build`
+//!
+//! Hosted data-plane sets `FERRUM_DB_TLS_REQUIRED=1` with explicit
+//! `FERRUM_TEST_MONGO_TLS_*` / `FERRUM_TEST_MONGO_CERT_DIR` values so missing
+//! TLS fixtures fail closed. Local runs leave that flag unset and skip.
 //!
 //! Run with:
 //!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
 use crate::common::{
-    configure_coverage_gateway_command, explicit_test_binary, shutdown_gateway_child,
+    configure_coverage_gateway_command, continue_if_backend_available,
+    continue_if_tls_fixture_available, explicit_test_binary, host_port_from_db_url,
+    shutdown_gateway_child, tcp_endpoint_reachable,
 };
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -34,33 +42,9 @@ const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
 
 /// Check if MongoDB is reachable at the expected address.
-/// Returns false if MongoDB is down — tests will be skipped gracefully.
 async fn mongodb_is_available(url: &str) -> bool {
-    // Extract host:port from the MongoDB URL (mongodb://host:port/db)
-    let host_port = url
-        .strip_prefix("mongodb://")
-        .or_else(|| url.strip_prefix("mongodb+srv://"))
-        .and_then(|s| s.split('/').next())
-        .and_then(|s| {
-            // Strip credentials if present (user:pass@host:port)
-            if s.contains('@') {
-                s.split('@').next_back()
-            } else {
-                Some(s)
-            }
-        })
-        .unwrap_or("localhost:27017");
-
-    match tokio::net::TcpStream::connect(host_port).await {
-        Ok(_) => true,
-        Err(_) => {
-            eprintln!(
-                "MongoDB not available at {} — skipping MongoDB functional tests",
-                host_port
-            );
-            false
-        }
-    }
+    let host_port = host_port_from_db_url(url);
+    tcp_endpoint_reachable(&host_port).await
 }
 
 /// Default certificate directory for TLS tests.
@@ -729,7 +713,12 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
 
-    if !mongodb_is_available(&mongo_url).await {
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
@@ -767,22 +756,25 @@ async fn test_mongodb_plaintext_full_lifecycle() {
 #[tokio::test]
 #[ignore]
 async fn test_mongodb_tls_connection() {
-    println!("\n=== MongoDB TLS Functional Test ===\n");
+    println!("\n=== MongoDB TLS Functional Test (verify-full) ===\n");
 
     let mongo_url = std::env::var("FERRUM_TEST_MONGO_TLS_URL")
         .unwrap_or_else(|_| "mongodb://localhost:27018/ferrum_test".to_string());
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !std::path::Path::new(&format!("{}/ca.crt", cert_dir)).exists() {
-        println!(
-            "SKIP: TLS certs not found at {}. Run setup_mongo_tls.sh first.",
-            cert_dir
-        );
-        return;
-    }
-
-    if !mongodb_is_available(&mongo_url).await {
+    let ca_path = format!("{cert_dir}/ca.crt");
+    let ca_exists = std::path::Path::new(&ca_path).exists();
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        ca_exists && reachable,
+        &format!(
+            "verify-full fixture unavailable (ca_exists={ca_exists}, reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo TLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -819,7 +811,16 @@ async fn test_mongodb_tls_require_connection() {
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !mongodb_is_available(&mongo_url).await {
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        reachable,
+        &format!(
+            "require-mode fixture unavailable (reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo TLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -855,15 +856,22 @@ async fn test_mongodb_mtls_connection() {
     let cert_dir = std::env::var("FERRUM_TEST_MONGO_CERT_DIR")
         .unwrap_or_else(|_| DEFAULT_CERT_DIR.to_string());
 
-    if !std::path::Path::new(&format!("{}/client.crt", cert_dir)).exists() {
-        println!(
-            "SKIP: mTLS client certs not found at {}. Run setup_mongo_tls.sh first.",
-            cert_dir
-        );
-        return;
-    }
-
-    if !mongodb_is_available(&mongo_url).await {
+    let client_cert = format!("{cert_dir}/client.crt");
+    let client_key = format!("{cert_dir}/client.key");
+    let ca_path = format!("{cert_dir}/ca.crt");
+    let certs_present = std::path::Path::new(&client_cert).exists()
+        && std::path::Path::new(&client_key).exists()
+        && std::path::Path::new(&ca_path).exists();
+    let host_port = host_port_from_db_url(&mongo_url);
+    let reachable = mongodb_is_available(&mongo_url).await;
+    if !continue_if_tls_fixture_available(
+        "mongodb",
+        certs_present && reachable,
+        &format!(
+            "mTLS fixture unavailable (certs_present={certs_present}, reachable at {host_port}); \
+             hosted data-plane CI provisions Mongo mTLS inline"
+        ),
+    ) {
         return;
     }
 
@@ -950,7 +958,15 @@ async fn test_mongodb_batch_atomicity_refused_on_standalone() {
 
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
+    // Same required standalone backend as the plaintext lifecycle cell, so it
+    // takes the same fail-closed gate: a missing container must fail the hosted
+    // job rather than return success after a silent skip.
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
@@ -1023,7 +1039,15 @@ async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
     let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
         .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
         .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
-    if !mongodb_is_available(&mongo_url).await {
+    // The env opt-in above stays a plain skip (a replica set is not part of the
+    // required-backend set). But once it is declared, an unreachable member is a
+    // provisioning failure, not a reason to report success.
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb-replica-set",
+        mongodb_is_available(&mongo_url).await,
+        &format!("declared but not available at {mongo_host_port}"),
+    ) {
         return;
     }
 
