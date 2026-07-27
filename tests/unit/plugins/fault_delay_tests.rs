@@ -368,7 +368,10 @@ fn serving_mode_shutdown_cancels_outstanding_fault_delays() {
     for (mode, source) in [
         ("database", include_str!("../../../src/modes/database.rs")),
         ("file", include_str!("../../../src/modes/file.rs")),
-        ("data_plane", include_str!("../../../src/modes/data_plane.rs")),
+        (
+            "data_plane",
+            include_str!("../../../src/modes/data_plane.rs"),
+        ),
         ("mesh", include_str!("../../../src/modes/mesh/mod.rs")),
     ] {
         assert!(

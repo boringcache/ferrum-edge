@@ -1247,7 +1247,10 @@ mod peer_departure {
             }
             other => panic!("expected a 499 reject, got {other:?}"),
         }
-        assert_eq!(ctx.metadata.get("fault_delay_outcome").unwrap(), "peer_gone");
+        assert_eq!(
+            ctx.metadata.get("fault_delay_outcome").unwrap(),
+            "peer_gone"
+        );
         assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
         assert_eq!(ctx.metadata.get("fault_delay_ms").unwrap(), "60000");
     }
@@ -1276,7 +1279,10 @@ mod peer_departure {
                 ..
             }
         ));
-        assert_eq!(ctx.metadata.get("fault_delay_outcome").unwrap(), "peer_gone");
+        assert_eq!(
+            ctx.metadata.get("fault_delay_outcome").unwrap(),
+            "peer_gone"
+        );
     }
 
     /// A departed peer preempts a co-triggered abort: the abort's status is a

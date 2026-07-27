@@ -991,11 +991,10 @@ async fn handle_h3_connection(
     // accepted request stream. Watching connection close needs no access to
     // the request stream, so nothing here can race the proxy path for request
     // bytes or mask a stream-accounting failure.
-    let peer_connection = crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(
-        QuicPeerConnectionWatch {
+    let peer_connection =
+        crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(QuicPeerConnectionWatch {
             connection: connection.clone(),
-        },
-    ));
+        }));
     // RFC 9220: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3 clients can
     // bootstrap a WebSocket via Extended CONNECT (:method=CONNECT,
     // :protocol=websocket). Mirrors the H2 listener's `enable_connect_protocol()`
