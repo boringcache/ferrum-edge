@@ -13,9 +13,37 @@ use uuid::Uuid;
 
 use super::utils::rate_limit::{
     RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp,
-    apply_rate_limit_cleanup, validate_ws_frame_rate_params,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, validate_ws_frame_rate_params,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// `ws_rate_limiting`-specific top-level config keys (excludes Redis fields).
+const WS_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
+    &["frames_per_second", "burst_size", "close_reason"];
+
+/// Closed top-level key set for `ws_rate_limiting` plugin config.
+///
+/// Must stay aligned with OpenAPI `WsRateLimitingConfig`,
+/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
+/// `frames_per_secod`/`redis_tsl` otherwise loaded silently as the default
+/// frame budget or plaintext Redis transport.
+pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
+    "frames_per_second",
+    "burst_size",
+    "close_reason",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_tls",
+    "redis_url",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
@@ -49,9 +77,20 @@ impl WsRateLimiting {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ws_rate_limiting: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ws_rate_limiting: config must be an object".to_string())?;
+        debug_assert_closed_root_keys(
+            WS_RATE_LIMITING_CONFIG_KEYS,
+            WS_RATE_LIMITING_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            WS_RATE_LIMITING_CONFIG_KEYS,
+            "ws_rate_limiting: ",
+        )?;
 
         let frames_per_second = optional_positive_u64(config, "frames_per_second")?.unwrap_or(100);
         let burst_size = optional_positive_u64(config, "burst_size")?.unwrap_or(frames_per_second);

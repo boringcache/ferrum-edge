@@ -160,8 +160,8 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
   `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
   timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
-  rate-limit plugin roots are closed key sets; AI and WebSocket rate-limit
-  roots remain intentionally open and must stay in parity with OpenAPI.
+  rate-limit plugin roots are closed key sets; the AI rate-limit root remains
+  intentionally open and must stay in parity with OpenAPI.
 - Redis outage falls back to in-memory and reconnects in the background.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
