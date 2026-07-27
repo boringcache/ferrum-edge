@@ -3928,9 +3928,19 @@ impl Plugin for AiTranscriptAudit {
         };
         // Retain a slot reserved by the final pre-commit stream admission; the
         // terminal hook or log fallback consumes it after the response ends.
-        // Other streams still release any conservative buffered-response slot.
+        // A scan-limited request may only be *conservatively* marked as a
+        // stream. When streaming capture is disabled, its request-phase
+        // fail-closed reservation must likewise survive stream selection so
+        // the eventual log fallback cannot lose the audit record after the
+        // response has committed.
+        let fallback_reservation = self.capture.streaming == StreamingCapture::Off
+            && flag(&ctx.metadata, MD_STREAM_REQUEST)
+            && self.staging.get(record_id).is_some_and(|staging| {
+                staging.commit_permit.is_some() && staging.commit_lease.is_some()
+            });
         if self.stream_commit_selected(ctx, response_status, content_type)
             || self.stream_inspector_selected(ctx, response_status, content_type)
+            || fallback_reservation
         {
             self.arm_stream_reservation(record_id);
             return;
