@@ -1660,8 +1660,7 @@ pub(crate) async fn dial_h2_connect_sender(
             tokio::spawn(async move {
                 let mut driver_polled_tx = Some(driver_polled_tx);
                 let result = std::future::poll_fn(|cx| {
-                    let poll =
-                        std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
+                    let poll = std::future::Future::poll(std::pin::Pin::new(&mut connection), cx);
                     if let Some(tx) = driver_polled_tx.take() {
                         let _ = tx.send(poll.is_pending());
                     }
