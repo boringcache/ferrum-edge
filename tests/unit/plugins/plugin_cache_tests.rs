@@ -2197,6 +2197,56 @@ async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
 }
 
 #[tokio::test]
+async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "request-mirror-1",
+            "request_mirror",
+            json!({
+                "mirror_host": "mirror.local",
+                "percentage": 0,
+                "mirror_request_body": false
+            }),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&valid).expect("valid request_mirror must admit");
+    let before = cache.get_plugins("ferrum", "p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "request_mirror");
+
+    let typo = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "request-mirror-1",
+            "request_mirror",
+            json!({
+                "mirror_host": "mirror.local",
+                "mirror_protcol": "https",
+                "percentage": 0,
+                "mirror_request_body": false
+            }),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let error = cache
+        .rebuild(&typo)
+        .expect_err("unknown request_mirror key must reject cache publication");
+    assert!(error.contains("mirror_protcol"), "got: {error}");
+
+    let after = cache.get_plugins("ferrum", "p1");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].name(), "request_mirror");
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted request_mirror instance"
+    );
+}
+
+#[tokio::test]
 async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
