@@ -25,6 +25,19 @@ use std::collections::HashSet;
 
 use super::rules::{RuleAction, Severity, parse_rule_action};
 use super::{optional_bool, optional_string, parse_severity};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Fixed-shape `stream` block keys.
+const STREAM_CONFIG_KEYS: &[&str] = &[
+    "tcp_require_tls",
+    "inspect_tcp",
+    "inspect_udp",
+    "inspect_response",
+    "signatures",
+];
+
+/// Fixed-shape stream signature object keys.
+const STREAM_SIGNATURE_KEYS: &[&str] = &["id", "pattern", "severity", "action"];
 
 /// One compiled stream signature's metadata, indexed in lockstep with the
 /// `RegexSet` so a match index maps straight back to its id/severity/action.
@@ -116,6 +129,7 @@ pub(super) fn parse_stream_config(
     let stream = raw
         .as_object()
         .ok_or_else(|| "waf: 'stream' must be an object".to_string())?;
+    reject_unknown_keys(stream, "config.stream", STREAM_CONFIG_KEYS, "waf: ")?;
 
     let tcp_require_tls = optional_bool(stream, "tcp_require_tls")?.unwrap_or(false);
     let inspect_tcp = optional_bool(stream, "inspect_tcp")?.unwrap_or(true);
@@ -155,6 +169,8 @@ fn compile_stream_signatures(
             let obj = entry
                 .as_object()
                 .ok_or_else(|| format!("waf: 'stream.signatures[{idx}]' must be an object"))?;
+            let path = format!("config.stream.signatures[{idx}]");
+            reject_unknown_keys(obj, &path, STREAM_SIGNATURE_KEYS, "waf: ")?;
             let id = optional_string(obj, "id")?
                 .ok_or_else(|| format!("waf: 'stream.signatures[{idx}]' requires 'id'"))?;
             if !seen_ids.insert(id.clone()) {

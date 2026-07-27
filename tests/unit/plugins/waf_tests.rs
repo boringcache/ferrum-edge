@@ -1385,6 +1385,208 @@ fn waf_is_security_critical() {
     );
 }
 
+#[test]
+fn unknown_keys_are_rejected_before_defaults_weaken_policy() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    // Representative typos across every fixed-shape boundary named by
+    // GHSA-6jg8-fjwq-gw8j. Construction must fail before defaults can leave
+    // built-ins monitor-only or omit stream/exemption guards.
+    let cases: &[(&str, serde_json::Value, &str, Option<&str>)] = &[
+        (
+            "default_rule_actoin",
+            json!({
+                "mode": "enforce",
+                "default_rule_actoin": "enforce"
+            }),
+            "config.default_rule_actoin",
+            Some("default_rule_action"),
+        ),
+        (
+            "custom_rules.actoin",
+            json!({
+                "include_default_rules": false,
+                "custom_rules": [{
+                    "id": "CUSTOM-1",
+                    "category": "custom",
+                    "target": "query_values",
+                    "pattern": "x",
+                    "actoin": "enforce"
+                }]
+            }),
+            "config.custom_rules[0].actoin",
+            Some("action"),
+        ),
+        (
+            "target.namse",
+            json!({
+                "include_default_rules": false,
+                "custom_rules": [{
+                    "id": "CUSTOM-2",
+                    "category": "custom",
+                    "target": { "type": "header_values", "namse": ["x-api-key"] },
+                    "pattern": "x"
+                }]
+            }),
+            "config.custom_rules[0].target.namse",
+            Some("names"),
+        ),
+        (
+            "conditions.path",
+            json!({
+                "include_default_rules": false,
+                "custom_rules": [{
+                    "id": "CUSTOM-3",
+                    "category": "custom",
+                    "target": "query_values",
+                    "pattern": "x",
+                    "action": "enforce",
+                    "conditions": { "path": ["/admin"] }
+                }]
+            }),
+            "config.custom_rules[0].conditions.path",
+            Some("paths"),
+        ),
+        (
+            "global_exemptions.header_presnt",
+            json!({
+                "global_exemptions": { "header_presnt": { "x-skip-waf": null } }
+            }),
+            "config.global_exemptions.header_presnt",
+            Some("header_present"),
+        ),
+        (
+            "scoring.block_threshhold",
+            json!({
+                "scoring": { "enabled": true, "block_threshhold": 5 }
+            }),
+            "config.scoring.block_threshhold",
+            Some("block_threshold"),
+        ),
+        (
+            "stream.tcp_require_tsl",
+            json!({
+                "include_default_rules": false,
+                "stream": { "tcp_require_tsl": true }
+            }),
+            "config.stream.tcp_require_tsl",
+            Some("tcp_require_tls"),
+        ),
+        (
+            "stream.signatures.actoin",
+            json!({
+                "include_default_rules": false,
+                "stream": {
+                    "signatures": [{
+                        "id": "SIG-1",
+                        "pattern": "evil",
+                        "actoin": "enforce"
+                    }]
+                }
+            }),
+            "config.stream.signatures[0].actoin",
+            Some("action"),
+        ),
+        (
+            "rule_overrides.severty",
+            json!({
+                "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
+            }),
+            "config.rule_overrides['FE-SQLI-001'].severty",
+            Some("severity"),
+        ),
+    ];
+
+    for (label, config, path, suggestion) in cases {
+        let err = Waf::new(config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: constructor must reject unknown key"));
+        assert!(
+            err.contains("unknown configuration key"),
+            "{label}: expected unknown-key error, got {err}"
+        );
+        assert!(
+            err.contains(path),
+            "{label}: expected path {path} in {err}"
+        );
+        if let Some(hint) = suggestion {
+            assert!(
+                err.contains(hint),
+                "{label}: expected suggestion {hint} in {err}"
+            );
+        }
+        let shared = validate_plugin_config("waf", config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: shared admission must reject"));
+        assert!(
+            shared.contains(path),
+            "{label}: shared admission path mismatch: {shared}"
+        );
+    }
+
+    assert_eq!(
+        plugin_failure_policy("waf"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
+}
+
+#[test]
+fn intentional_open_maps_and_valid_closed_configs_still_construct() {
+    // rule_modes / rule_overrides keys are operator-defined rule ids.
+    // conditions.headers and global_exemptions.header_present keys are
+    // operator-defined header names. Closing those maps would reject
+    // legitimate dynamic keys.
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce",
+        "paranoia_level": 1,
+        "rule_modes": { "FE-XSS-001": "monitor" },
+        "rule_overrides": {
+            "FE-SQLI-001": {
+                "action": "enforce",
+                "conditions": {
+                    "paths": ["/api*"],
+                    "headers": { "x-tenant": "prod" }
+                }
+            }
+        },
+        "scoring": {
+            "enabled": true,
+            "block_threshold": 7,
+            "weights": { "high": 5, "critical": 10 }
+        },
+        "global_exemptions": {
+            "paths": ["/health"],
+            "header_present": { "x-skip-waf": null }
+        },
+        "custom_rules": [{
+            "id": "CUSTOM-OPEN",
+            "category": "custom",
+            "target": { "type": "header_values", "names": ["x-api-key"] },
+            "match_kind": "contains",
+            "pattern": "needle",
+            "action": "enforce",
+            "conditions": {
+                "methods": ["POST"],
+                "headers": { "content-type": "application/json" },
+                "consumers": ["alice"]
+            }
+        }],
+        "stream": {
+            "tcp_require_tls": true,
+            "inspect_tcp": true,
+            "signatures": [{
+                "id": "SIG-OK",
+                "pattern": "GET /",
+                "severity": "high",
+                "action": "enforce"
+            }]
+        }
+    }))
+    .expect("valid closed + intentional open-map config must construct");
+    assert_eq!(plugin.name(), "waf");
+}
+
 #[tokio::test]
 async fn duplicate_query_key_cannot_smuggle_payload_past_query_values_rule() {
     // Regression: `materialize_query_params()` collapses duplicate keys into a
@@ -2423,7 +2625,7 @@ fn unknown_rule_override_field_fails_construction() {
         "rule_overrides": { "FE-SQLI-001": { "severty": "critical" } }
     }))
     .unwrap_err();
-    assert!(err.contains("unsupported field"));
+    assert!(err.contains("unknown configuration key"));
     assert!(err.contains("severty"));
 }
 

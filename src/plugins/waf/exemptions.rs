@@ -3,8 +3,20 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::plugins::RequestContext;
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::rules::IpCidr;
+
+/// Fixed-shape global exemption object keys. `header_present` remains an
+/// intentionally open map of operator-defined header names.
+const GLOBAL_EXEMPTION_KEYS: &[&str] = &[
+    "paths",
+    "methods",
+    "consumers",
+    "ips",
+    "header_present",
+    "fp_capture_filters",
+];
 
 #[derive(Debug, Default)]
 pub struct CompiledExemptions {
@@ -27,6 +39,7 @@ impl CompiledExemptions {
         let object = config
             .as_object()
             .ok_or_else(|| "waf: global_exemptions must be an object".to_string())?;
+        reject_unknown_keys(object, "config.global_exemptions", GLOBAL_EXEMPTION_KEYS, "waf: ")?;
 
         let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
         let path_set = if paths.is_empty() {
@@ -150,6 +163,7 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
     match value {
         None | Some(Value::Null) => Ok(HashMap::new()),
         Some(Value::Object(map)) => {
+            // Intentionally open: keys are operator-defined header names.
             let mut parsed = HashMap::new();
             for (key, value) in map {
                 let expected = if value.is_null() {
