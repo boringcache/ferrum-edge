@@ -1617,7 +1617,7 @@ fn waf_scoring_weights_reject_unknown_severities() {
 
 #[test]
 fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
-    let spec: Value =
+    let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
 
     for schema in [
