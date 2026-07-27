@@ -1,3 +1,4 @@
+use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
     openapi_validator::OpenapiValidator,
@@ -8,6 +9,7 @@ use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject};
 
@@ -5728,6 +5730,104 @@ fn config_error(config: Value) -> String {
 }
 
 #[test]
+fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
+    let base = json!({
+        "enforcement_mode": "block",
+        "validate_request": true,
+        "validate_response": true,
+        "fail_on_unknown_operation": true,
+        "fail_on_missing_response_schema": true,
+        "max_body_bytes": 1024,
+        "request_content_types": ["application/json"],
+        "response_content_types": ["application/json"],
+        "schema_draft": "draft2020-12",
+        "bypass": {
+            "paths": [],
+            "methods": [],
+            "consumers": [],
+            "header_present": {}
+        },
+        "error_response": {
+            "request_status_code": 400,
+            "response_status_code": 502,
+            "content_type": "application/problem+json"
+        },
+        "error_truncate_chars": 1024,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "operation_label": "create item",
+            "request_required": true,
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {
+                "200": {"application/json": {"type": "object"}}
+            }
+        }]
+    });
+    for pointer in [
+        "/enforcement_mode",
+        "/validate_request",
+        "/validate_response",
+        "/fail_on_unknown_operation",
+        "/fail_on_missing_response_schema",
+        "/max_body_bytes",
+        "/request_content_types",
+        "/response_content_types",
+        "/schema_draft",
+        "/bypass",
+        "/error_response",
+        "/error_truncate_chars",
+        "/operations/0/operation_label",
+        "/operations/0/request_required",
+        "/operations/0/request_body",
+        "/operations/0/responses",
+        "/bypass/paths",
+        "/bypass/methods",
+        "/bypass/consumers",
+        "/bypass/header_present",
+        "/error_response/request_status_code",
+        "/error_response/response_status_code",
+        "/error_response/content_type",
+    ] {
+        let mut config = base.clone();
+        *config
+            .pointer_mut(pointer)
+            .expect("test pointer must address a fixed config field") = Value::Null;
+        let error = config_error(config);
+        assert!(
+            error.contains("must"),
+            "explicit null at {pointer} must fail type admission: {error}"
+        );
+    }
+
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {"title": {"contentType": null}}
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        error.contains("contentType must be a string"),
+        "explicit null Encoding Object fields must fail type admission: {error}"
+    );
+}
+
+#[test]
 fn unknown_root_config_key_is_rejected_with_a_suggestion() {
     // The typo would otherwise leave the documented `false` default in force
     // while construction, admission, and reload all reported success.
@@ -6108,6 +6208,25 @@ fn removed_config_aliases_are_unknown_keys() {
     }
 }
 
+#[test]
+fn undocumented_schema_draft_value_aliases_are_rejected() {
+    for alias in ["draft-7", "draft202012", "2020-12"] {
+        let error = config_error(json!({
+            "schema_draft": alias,
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {"200": {"application/json": {"type": "object"}}}
+            }]
+        }));
+        assert!(
+            error.contains("must be auto, draft7, or draft2020-12"),
+            "undocumented schema_draft alias {alias:?} must fail closed: {error}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Exact response contracts (GHSA-cjqx-p554-5rx9)
 // ---------------------------------------------------------------------------
@@ -6178,6 +6297,78 @@ async fn empty_response_body_is_parsed_against_the_selected_schema() {
         response_error(&ctx).is_some(),
         "an empty JSON body must record a response error: {:?}",
         ctx.metadata
+    );
+}
+
+#[tokio::test]
+async fn empty_synthetic_response_runs_the_shared_final_body_validator() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        OpenapiValidator::new(&exact_status_and_default_config(false)).unwrap(),
+    )];
+    let mut ctx = post_ctx("/items");
+    let mut status = 200;
+    let mut headers = json_headers();
+    let mut body = Vec::new();
+
+    finalize_synthetic_response_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 502);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("rejected_response"),
+        "the shared synthetic gate must not bypass zero-byte response validation"
+    );
+    assert!(
+        !body.is_empty(),
+        "the validator rejection must replace the invalid empty response"
+    );
+}
+
+#[tokio::test]
+async fn empty_synthetic_response_honors_an_explicit_no_content_contract() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        OpenapiValidator::new(&json!({
+            "fail_on_missing_response_schema": true,
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {"200": {}}
+            }]
+        }))
+        .unwrap(),
+    )];
+    let mut ctx = post_ctx("/items");
+    let mut status = 200;
+    let mut headers = HashMap::new();
+    let mut body = Vec::new();
+
+    finalize_synthetic_response_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("no_response_content"),
+        "the strict synthetic response hook must run and accept declared no-content"
     );
 }
 

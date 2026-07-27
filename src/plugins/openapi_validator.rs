@@ -1025,6 +1025,14 @@ impl Plugin for OpenapiValidator {
             })
     }
 
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        !response_has_no_body_semantics(&ctx.method, response_status)
+    }
+
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
         self.should_buffer_response_body(ctx)
     }
@@ -1300,7 +1308,9 @@ fn parse_request_validators(
         return Ok(AHashMap::new());
     };
     if value.is_null() {
-        return Ok(AHashMap::new());
+        return Err(format!(
+            "openapi_validator: operations[{operation_index}].request_body must be an object"
+        ));
     }
     let object = value.as_object().ok_or_else(|| {
         format!("openapi_validator: operations[{operation_index}].request_body must be an object")
@@ -1386,7 +1396,9 @@ fn parse_response_validators(
         return Ok(ResponseValidators::default());
     };
     if value.is_null() {
-        return Ok(ResponseValidators::default());
+        return Err(format!(
+            "openapi_validator: operations[{operation_index}].responses must be an object"
+        ));
     }
     let object = value.as_object().ok_or_else(|| {
         format!("openapi_validator: operations[{operation_index}].responses must be an object")
@@ -1838,7 +1850,7 @@ fn parse_property_encoding(
     }
 
     let content_type = match object.get("contentType") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -4363,7 +4375,7 @@ fn optional_object<'a>(
     key: &'static str,
 ) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Object(value)) => Ok(Some(value)),
         Some(_) => Err(format!("{ERROR_PREFIX}'{key}' must be an object")),
     }
@@ -4990,8 +5002,8 @@ fn parse_mode(raw: &str) -> Result<EnforcementMode, String> {
 fn parse_schema_draft(raw: &str) -> Result<SchemaDraft, String> {
     match raw {
         "auto" => Ok(SchemaDraft::Auto),
-        "draft7" | "draft-7" => Ok(SchemaDraft::Draft7),
-        "draft202012" | "draft2020-12" | "2020-12" => Ok(SchemaDraft::Draft202012),
+        "draft7" => Ok(SchemaDraft::Draft7),
+        "draft2020-12" => Ok(SchemaDraft::Draft202012),
         other => Err(format!(
             "openapi_validator: 'schema_draft' must be auto, draft7, or draft2020-12; got {other:?}"
         )),
@@ -5002,9 +5014,6 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
     let Some(value) = value else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
     let values = value
         .as_array()
         .ok_or_else(|| format!("openapi_validator: '{field}' must be an array"))?;
@@ -5032,7 +5041,7 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
 
 fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {
     match value {
-        None | Some(Value::Null) => Ok(HashMap::new()),
+        None => Ok(HashMap::new()),
         Some(Value::Object(map)) => {
             let mut parsed = HashMap::new();
             for (key, value) in map {
@@ -5074,7 +5083,7 @@ fn optional_string<'a>(
     key: &'static str,
 ) -> Result<Option<&'a str>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
         Some(Value::String(_)) => Err(format!("openapi_validator: '{key}' must not be empty")),
         Some(_) => Err(format!("openapi_validator: '{key}' must be a string")),
@@ -5096,7 +5105,7 @@ fn optional_bool_from_object(
         return Ok(None);
     };
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(_) => Err(format!("openapi_validator: '{key}' must be a boolean")),
     }
@@ -5107,7 +5116,7 @@ fn optional_usize(
     key: &'static str,
 ) -> Result<Option<usize>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
             .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
@@ -5130,7 +5139,7 @@ fn optional_u16_from_object(
         return Ok(None);
     };
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
             .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
@@ -5159,7 +5168,7 @@ fn optional_string_vec(
     key: &'static str,
 ) -> Result<Option<Vec<String>>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Array(values)) => parse_string_array(values, key),
         Some(_) => Err(format!("openapi_validator: '{key}' must be an array")),
     }

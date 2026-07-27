@@ -6786,6 +6786,23 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this plugin must run the buffered response-body
+    /// pipeline for a zero-byte synthetic response.
+    ///
+    /// Gateway-generated short-circuits normally skip body hooks when their
+    /// body is empty. Validators whose contract distinguishes an absent/empty
+    /// representation from a valid one can opt in here so the same final-body
+    /// policy runs as on an empty buffered backend response. The synthetic
+    /// gate calls this only after the plugin's config-time and per-request
+    /// buffering predicates both return `true`.
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when this active buffering plugin may release an
     /// inherently streaming response after headers arrive even though retries
     /// are configured.

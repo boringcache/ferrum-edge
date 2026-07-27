@@ -935,6 +935,9 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             let Some(operation) = path_object.get(*method).and_then(Value::as_object) else {
                 continue;
             };
+            let mut operation_budget = GeneratedOperationBudget {
+                remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+            };
             let effective_bases = if version == "2.0" {
                 root_server_bases.clone()
             } else {
@@ -951,14 +954,40 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                 }
             };
             let request_body = if version == "2.0" {
-                extract_swagger_request_body(root, path_object, operation, version, &resolver)?
+                extract_swagger_request_body(
+                    root,
+                    path_object,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             } else {
-                extract_openapi_request_body(root, operation, version, &resolver)?
+                extract_openapi_request_body(
+                    root,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             };
             let responses = if version == "2.0" {
-                extract_swagger_responses(root, path_object, operation, version, &resolver)?
+                extract_swagger_responses(
+                    root,
+                    path_object,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             } else {
-                extract_openapi_responses(root, operation, version, &resolver)?
+                extract_openapi_responses(
+                    root,
+                    operation,
+                    version,
+                    &resolver,
+                    &mut operation_budget,
+                )?
             };
 
             // One matcher per distinct effective pathname. Equivalent server
@@ -1394,6 +1423,7 @@ fn extract_openapi_request_body(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let Some(request_body) = operation.get("requestBody") else {
         return Ok(None);
@@ -1436,15 +1466,23 @@ fn extract_openapi_request_body(
             let encoding = match media_object.get("encoding") {
                 None | Some(Value::Null) => None,
                 Some(encoding) => Some(normalize_request_body_encoding(
-                    root, media_type, encoding, &schema, version, resolver,
+                    root, media_type, encoding, &schema, version, resolver, budget,
                 )?),
             };
             let media_value = match encoding {
-                Some(encoding) => json!({
-                    "schema": schema,
-                    "encoding": encoding,
-                }),
-                None => schema,
+                Some(encoding) => {
+                    budget.consume_key(media_type, media_type)?;
+                    budget.consume_map_entry("schema", &schema, media_type)?;
+                    budget.consume_key("encoding", media_type)?;
+                    json!({
+                        "schema": schema,
+                        "encoding": encoding,
+                    })
+                }
+                None => {
+                    budget.consume_map_entry(media_type, &schema, media_type)?;
+                    schema
+                }
             };
             content_schemas.insert(media_type.clone(), media_value);
         }
@@ -1467,6 +1505,7 @@ fn normalize_request_body_encoding(
     schema: &Value,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Value, ExtractError> {
     const HEADER_OBJECT_KEYS: &[&str] = &[
         "description",
@@ -1507,6 +1546,9 @@ fn normalize_request_body_encoding(
 
     let mut out = Map::new();
     for (property, value) in object {
+        let property_location =
+            format!("requestBody.content['{media_type}'].encoding['{property}']");
+        budget.consume_key(property, &property_location)?;
         let property_schema = request_body_property_schema(schema, property).ok_or_else(|| {
             ExtractError::MalformedExtension {
                 which: "requestBody.content.encoding",
@@ -1532,6 +1574,11 @@ fn normalize_request_body_encoding(
                     which: "requestBody.content.encoding",
                     error: format!("encoding['{property}'] contains unsupported field '{key}'"),
                 });
+            }
+        }
+        for key in ["style", "explode", "allowReserved", "contentType"] {
+            if let Some(value) = property_object.get(key) {
+                budget.consume_map_entry(key, value, &property_location)?;
             }
         }
 
@@ -1640,6 +1687,7 @@ fn normalize_request_body_encoding(
             }
         }
         if let Some(headers) = property_object.get("headers") {
+            budget.consume_key("headers", &property_location)?;
             if base != "multipart/form-data" {
                 return Err(ExtractError::MalformedExtension {
                     which: "requestBody.content.encoding",
@@ -1812,7 +1860,9 @@ fn normalize_request_body_encoding(
                         SchemaDirection::Request,
                     ),
                 );
-                normalized_headers.insert(header_name.clone(), Value::Object(normalized_header));
+                let normalized_header = Value::Object(normalized_header);
+                budget.consume_map_entry(header_name, &normalized_header, &location)?;
+                normalized_headers.insert(header_name.clone(), normalized_header);
             }
             property_object.insert("headers".to_string(), Value::Object(normalized_headers));
         }
@@ -1896,12 +1946,14 @@ fn extract_openapi_responses(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
         return Ok(out);
     };
     for (status, response) in responses {
+        budget.consume_key(status, status)?;
         let resolved = resolve_refs(
             root,
             response,
@@ -1927,10 +1979,10 @@ fn extract_openapi_responses(
                         resolver,
                         ResolveContext::Schema,
                     )?;
-                    content_schemas.insert(
-                        media_type.clone(),
-                        normalize_schema_for_openapi(schema, version, SchemaDirection::Response),
-                    );
+                    let schema =
+                        normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
+                    budget.consume_map_entry(media_type, &schema, status)?;
+                    content_schemas.insert(media_type.clone(), schema);
                 }
             }
         }
@@ -1949,6 +2001,7 @@ fn extract_swagger_request_body(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let parameters = operation
         .get("parameters")
@@ -1997,6 +2050,7 @@ fn extract_swagger_request_body(
             .unwrap_or(false);
         let mut content = Map::new();
         for media_type in swagger_media_types(root, path_item, operation, "consumes") {
+            budget.consume_map_entry(&media_type, &schema, "body")?;
             content.insert(media_type, schema.clone());
         }
         return Ok(Some((required, content)));
@@ -2010,6 +2064,7 @@ fn extract_swagger_responses(
     operation: &Map<String, Value>,
     version: &str,
     resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
@@ -2017,6 +2072,7 @@ fn extract_swagger_responses(
     };
     let produces = swagger_media_types(root, path_item, operation, "produces");
     for (status, response) in responses {
+        budget.consume_key(status, status)?;
         let resolved = resolve_refs(
             root,
             response,
@@ -2044,6 +2100,7 @@ fn extract_swagger_responses(
             )?;
             let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
             for media_type in &produces {
+                budget.consume_map_entry(media_type, &schema, status)?;
                 content.insert(media_type.clone(), schema.clone());
             }
         }
@@ -2089,6 +2146,54 @@ const MAX_PATH_ITEM_INDEX_DEPTH: usize = 24;
 /// Synthetic document base for local-only URI resolution. Never fetched.
 const LOCAL_SCHEMA_DOCUMENT_BASE: &str = "https://ferrum.invalid/local-schema";
 type ExtractedRequestBodySchemas = Option<(bool, Map<String, Value>)>;
+
+/// Incremental cap for all materialized request/response entries in one
+/// generated operation.
+///
+/// Each individual `$ref` expansion has its own resolver budget, but a hostile
+/// operation can repeat the same bounded expansion under many media types or
+/// statuses. Charge every emitted map entry before retaining it so those
+/// individually valid expansions cannot accumulate far beyond the generated
+/// config ceiling before the final serialized-entry check runs.
+struct GeneratedOperationBudget {
+    remaining_bytes: usize,
+}
+
+impl GeneratedOperationBudget {
+    fn consume_key(&mut self, key: &str, location: &str) -> Result<(), ExtractError> {
+        // Quoted key plus `:` / `,` structural bytes. The trailing comma is a
+        // one-byte overestimate for the final entry and therefore fail-safe.
+        self.consume_bytes(
+            json_string_serialized_len(key).saturating_add(2),
+            location,
+        )
+    }
+
+    fn consume_map_entry(
+        &mut self,
+        key: &str,
+        value: &Value,
+        location: &str,
+    ) -> Result<(), ExtractError> {
+        let (_, value_bytes) = opaque_value_weight(value);
+        self.consume_bytes(
+            json_string_serialized_len(key)
+                .saturating_add(2)
+                .saturating_add(value_bytes),
+            location,
+        )
+    }
+
+    fn consume_bytes(&mut self, bytes: usize, location: &str) -> Result<(), ExtractError> {
+        let Some(remaining) = self.remaining_bytes.checked_sub(bytes) else {
+            return Err(ExtractError::SchemaTooLarge {
+                location: location.to_string(),
+            });
+        };
+        self.remaining_bytes = remaining;
+        Ok(())
+    }
+}
 
 /// Indexes local schema resources and plain-name anchors for `$ref` resolution.
 ///
@@ -3215,7 +3320,7 @@ fn opaque_value_weight(value: &Value) -> (usize, usize) {
         Value::Bool(true) => (1, 4),
         Value::Bool(false) => (1, 5),
         Value::Number(number) => (1, number.to_string().len()),
-        Value::String(value) => (1, value.len().saturating_add(2)),
+        Value::String(value) => (1, json_string_serialized_len(value)),
         Value::Array(values) => values.iter().fold((1usize, 2usize), |weight, child| {
             let child = opaque_value_weight(child);
             (
@@ -3231,12 +3336,29 @@ fn opaque_value_weight(value: &Value) -> (usize, usize) {
                     weight.0.saturating_add(child.0),
                     weight
                         .1
-                        .saturating_add(key.len())
+                        .saturating_add(json_string_serialized_len(key))
                         .saturating_add(child.1)
-                        .saturating_add(4),
+                        .saturating_add(2),
                 )
             }),
     }
+}
+
+/// Exact byte length of a string after `serde_json` quoting/escaping.
+///
+/// Resolver and operation budgets must count the representation that will
+/// actually be serialized. Counting decoded UTF-8 bytes alone underestimates
+/// attacker-controlled quotes, backslashes, and control characters by up to
+/// six bytes each.
+fn json_string_serialized_len(value: &str) -> usize {
+    value.chars().fold(2usize, |bytes, character| {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        bytes.saturating_add(encoded)
+    })
 }
 
 fn shallow_value_bytes(value: &Value) -> usize {
@@ -3245,10 +3367,12 @@ fn shallow_value_bytes(value: &Value) -> usize {
         Value::Bool(true) => 4,
         Value::Bool(false) => 5,
         Value::Number(number) => number.to_string().len(),
-        Value::String(value) => value.len().saturating_add(2),
+        Value::String(value) => json_string_serialized_len(value),
         Value::Array(values) => values.len().saturating_add(2),
         Value::Object(object) => object.keys().fold(2usize, |bytes, key| {
-            bytes.saturating_add(key.len()).saturating_add(4)
+            bytes
+                .saturating_add(json_string_serialized_len(key))
+                .saturating_add(2)
         }),
     }
 }

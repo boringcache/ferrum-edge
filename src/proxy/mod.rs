@@ -15476,14 +15476,16 @@ pub(crate) async fn apply_plugin_rejection_response(
 ///
 /// General rule: these hooks (`on_response_body`,
 /// `transform_response_body_with_context`, `on_final_response_body`) run over a
-/// governed short-circuit body **only** when there is a body to inspect and the
-/// same response-body-buffering capability gate the normal response path uses
-/// is satisfied. Specifically we skip when:
+/// governed short-circuit body **only** when there is a body to inspect (or a
+/// validator explicitly requires zero-byte inspection) and the same
+/// response-body-buffering capability gate the normal response path uses is
+/// satisfied. Specifically we skip when:
 /// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
 /// - the status is neither 2xx nor a marked final serverless response,
 /// - the status is 204, 205, or 304 (a body-emitting transform there is
 ///   protocol-incorrect),
-/// - the synthetic body is empty (nothing to inspect/transform), or
+/// - the synthetic body is empty and no active plugin explicitly requires
+///   zero-byte inspection, or
 /// - no active plugin wants to buffer this response. We mirror the normal
 ///   response path's two-tier gate exactly: a plugin's per-request
 ///   `should_buffer_response_body(ctx)` is only consulted when that plugin
@@ -15494,7 +15496,9 @@ pub(crate) async fn apply_plugin_rejection_response(
 ///   contract and keeps preflight/mock-heavy proxies from paying three extra
 ///   async plugin sweeps per request.
 ///
-/// Empty 200 and 204/205 successes still finalize through
+/// Empty 200 successes normally skip this pipeline unless an active validator
+/// explicitly requires zero-byte inspection. Empty 200 and 204/205 successes
+/// still finalize through
 /// [`apply_reject_after_proxy_and_synthetic_body_hooks`], which records
 /// [`FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY`] so ownership plugins can
 /// release in-flight markers from `on_response_committed` without depending on
@@ -15510,11 +15514,22 @@ fn should_apply_synthetic_response_body_hooks(
 ) -> bool {
     let governed_synthetic_status = (200..300).contains(&status_code)
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
-    !is_grpc_request
-        && governed_synthetic_status
-        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
-        && !response_body.is_empty()
-        && response_body_plugins_process_body(plugins, ctx)
+    if is_grpc_request
+        || !governed_synthetic_status
+        || crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
+    {
+        return false;
+    }
+    if response_body.is_empty()
+        && !plugins.iter().any(|plugin| {
+            plugin.requires_response_body_buffering()
+                && plugin.should_buffer_response_body(ctx)
+                && plugin.should_process_empty_synthetic_response_body(ctx, status_code)
+        })
+    {
+        return false;
+    }
+    response_body_plugins_process_body(plugins, ctx)
 }
 
 /// Whether a response-body-capable plugin phase actually processes THIS
@@ -15873,14 +15888,15 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         strip_websocket_transport_managed_response_header_map(headers);
     }
 
-    // Body-independent finalized-synthetic signal. Empty 200 and 204/205
-    // short-circuits skip the synthetic body-hook pipeline (and therefore never
-    // see `SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`), but ownership plugins still
-    // need a durable success signal through `on_response_committed`. Gate on the
-    // *final* status after body-hook replacement and reject-path `after_proxy`
-    // so a downstream non-2xx rejection replacement remains TTL-backed instead
-    // of clearing in-flight ownership. H1/H2 and H3 share this finalizer, so
-    // local and Redis request-dedup modes observe the same lifecycle.
+    // Body-independent finalized-synthetic signal. Empty responses normally
+    // skip the synthetic body-hook pipeline (unless a validator explicitly
+    // opts into zero-byte inspection), and 204/205 always skip it, so ownership
+    // plugins still need a durable success signal through
+    // `on_response_committed`. Gate on the *final* status after body-hook
+    // replacement and reject-path `after_proxy` so a downstream non-2xx
+    // rejection replacement remains TTL-backed instead of clearing in-flight
+    // ownership. H1/H2 and H3 share this finalizer, so local and Redis
+    // request-dedup modes observe the same lifecycle.
     if (200..300).contains(status) {
         ctx.metadata.insert(
             FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY.to_string(),

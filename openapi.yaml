@@ -17494,7 +17494,9 @@ components:
         Every fixed-field object in this schema is closed: an unknown key at the
         root or in `bypass`, `error_response`, an `operations[]` entry, or
         `request_body` is rejected at construction so a misspelled enforcement
-        control cannot silently fall back to a weaker default. Free-form maps
+        control cannot silently fall back to a weaker default. An explicit
+        `null` for a non-null field is likewise rejected instead of selecting
+        its omission default. Free-form maps
         (media types, response status keys, `bypass.header_present`, encoding
         property names) stay open but their keys are shape-validated.
         Response schema failures emit only a fixed generic message plus the

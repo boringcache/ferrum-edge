@@ -2841,6 +2841,27 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the complete shared H1/H2/H3 synthetic-response finalizer,
+    /// including the empty-body scheduling gate and rejection replacement.
+    pub async fn finalize_synthetic_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+    ) {
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            false,
+            false,
+        )
+        .await
+    }
+
     /// Build the log metadata a transaction summary is rendered from, exactly as
     /// every logger sink does.
     ///

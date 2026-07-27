@@ -404,6 +404,59 @@ fn exponential_ref_fanout_hits_the_expansion_limit() {
 }
 
 #[test]
+fn repeated_escape_heavy_media_expansions_hit_the_operation_budget_incrementally() {
+    // Every individual reference is comfortably below the resolver's byte
+    // ceiling. NUL bytes serialize as six-byte JSON escapes, so the budget must
+    // count the encoded representation as well as reject repeated expansions
+    // before they accumulate into an oversized in-memory operation.
+    let mut content = serde_json::Map::new();
+    for index in 0..3 {
+        content.insert(
+            format!("application/vnd.ferrum-{index}+json"),
+            json!({"schema": {"$ref": "#/components/schemas/Large"}}),
+        );
+    }
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Aggregate Expansion API", "version": "1.0.0"},
+        "x-ferrum-validate": true,
+        "x-ferrum-proxy": {
+            "id": "aggregate-expansion-proxy",
+            "backend_host": "backend.internal",
+            "backend_port": 443
+        },
+        "components": {
+            "schemas": {
+                "Large": {
+                    "type": "string",
+                    "const": "\0".repeat(1_000_000)
+                }
+            }
+        },
+        "paths": {
+            "/items": {
+                "post": {
+                    "requestBody": {
+                        "content": Value::Object(content)
+                    },
+                    "responses": {"204": {"description": "ok"}}
+                }
+            }
+        }
+    });
+    let spec = spec.to_string();
+    let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("aggregate media expansion must fail closed");
+    let ExtractError::SchemaTooLarge { location } = error else {
+        panic!("unexpected error: {error}");
+    };
+    assert!(
+        location.starts_with("application/vnd.ferrum-"),
+        "the incremental media-entry budget must fire before whole-operation serialization: {location}"
+    );
+}
+
+#[test]
 fn x_ferrum_validate_operations_key_is_rejected() {
     // `operations` is always regenerated from the document; accepting and then
     // discarding it looks like a successful deployment of operator intent.
