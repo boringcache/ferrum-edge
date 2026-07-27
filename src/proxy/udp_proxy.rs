@@ -75,8 +75,9 @@ pub struct UdpProxyMetrics {
     /// `on_udp_datagram` ingress queue was full or closed. Fail-closed:
     /// overload never bypasses required hooks.
     pub hook_ingress_drops: AtomicU64,
-    /// Payload bytes retained across all established-session hook queues for
-    /// this listener. Used as a listener-wide admission budget.
+    /// Payload bytes retained across all established-session hook queues and
+    /// in-flight hook awaits for this listener. Used as a listener-wide
+    /// admission budget.
     hook_ingress_queued_bytes: AtomicUsize,
 }
 
@@ -448,6 +449,34 @@ fn enqueue_session_hook_datagram(
     true
 }
 
+fn release_hook_ingress_retained_bytes(
+    session: &UdpSession,
+    metrics: &UdpProxyMetrics,
+    len: usize,
+) {
+    session
+        .hook_ingress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+    metrics
+        .hook_ingress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+}
+
+/// Keeps one admitted payload charged until it is no longer retained by either
+/// the queue or an in-flight hook/forward future. Drop-based release covers
+/// every early-exit and hook-cancellation path without duplicated decrements.
+struct HookIngressRetainedBytesGuard<'a> {
+    session: &'a UdpSession,
+    metrics: &'a UdpProxyMetrics,
+    len: usize,
+}
+
+impl Drop for HookIngressRetainedBytesGuard<'_> {
+    fn drop(&mut self) {
+        release_hook_ingress_retained_bytes(self.session, self.metrics, self.len);
+    }
+}
+
 /// Per-session worker: drain hook-ingress FIFO, enforce `on_udp_datagram`, then
 /// forward. One task per session (not per datagram). Idle wake / cancellation
 /// is the bounded channel's sender drop ([`UdpSession::close_hook_ingress`]),
@@ -477,12 +506,11 @@ fn spawn_session_hook_ingress_worker(
             };
 
             let len = data.len();
-            session
-                .hook_ingress_queued_bytes
-                .fetch_sub(len, Ordering::Relaxed);
-            metrics
-                .hook_ingress_queued_bytes
-                .fetch_sub(len, Ordering::Relaxed);
+            let _retained_bytes = HookIngressRetainedBytesGuard {
+                session: session.as_ref(),
+                metrics: metrics.as_ref(),
+                len,
+            };
 
             // Cleanup/expiry may have raced the receive; do not run hooks for a
             // stopped session (residuals are drained below without hooks).
@@ -540,12 +568,7 @@ fn spawn_session_hook_ingress_worker(
         // worker exits while the channel still holds payloads (sender may
         // already be closed). Never run hooks or forward after stop.
         while let Ok(data) = rx.try_recv() {
-            session
-                .hook_ingress_queued_bytes
-                .fetch_sub(data.len(), Ordering::Relaxed);
-            metrics
-                .hook_ingress_queued_bytes
-                .fetch_sub(data.len(), Ordering::Relaxed);
+            release_hook_ingress_retained_bytes(&session, &metrics, data.len());
         }
     });
 }
@@ -5877,7 +5900,13 @@ backend_tls_verify_server_cert: false
         ));
         assert_eq!(
             queued_bytes.load(Ordering::Relaxed),
-            b"second".len() + b"third".len()
+            b"first".len() + b"second".len() + b"third".len(),
+            "the in-flight hook payload must remain charged with queued residuals"
+        );
+        assert_eq!(
+            metrics.hook_ingress_queued_bytes.load(Ordering::Relaxed),
+            b"first".len() + b"second".len() + b"third".len(),
+            "listener admission must include the in-flight hook payload"
         );
 
         session
