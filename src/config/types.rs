@@ -3257,9 +3257,10 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
     let mut local_names: HashSet<&str> = HashSet::new();
     for assoc in &proxy.plugins {
-        let Some(pc) = plugin_configs.iter().find(|pc| {
-            pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id
-        }) else {
+        let Some(pc) = plugin_configs
+            .iter()
+            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
+        else {
             continue;
         };
         match pc.scope {

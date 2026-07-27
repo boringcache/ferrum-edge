@@ -2824,9 +2824,7 @@ fn backend_tls_sni_buffering_screen_unconstructable_local_does_not_shadow_enable
     let global_hit = rejections.iter().any(|m| m.contains("global-compression"));
     let inherited = rejections.iter().any(|m| m.contains("inherits"));
     let local_hit = rejections.iter().any(|m| m.contains("local-compression"));
-    let msg = format!(
-        "enabled buffering global shadowed by unconstructable local: {rejections:?}"
-    );
+    let msg = format!("enabled buffering global shadowed by unconstructable local: {rejections:?}");
     assert!(global_hit && inherited && !local_hit, "{msg}");
 }
 
