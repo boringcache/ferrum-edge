@@ -112,10 +112,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 /// `.der` / `.bin` and any future unknown extension — return `false` so they
 /// are hashed byte-for-byte (fail-closed for unrecognized data).
 fn vendor_path_uses_lf_normalization(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     match name {
         "LICENSE" | "LICENSE-MIT" | "LICENSE-APACHE" | ".gitignore" | ".cargo-ok" => {
             return true;
@@ -192,9 +189,7 @@ fn parse_manifest(s: &str) -> BTreeMap<String, String> {
 
 fn render_manifest(entries: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
-    out.push_str(
-        "# Vendor integrity manifest — SHA-256 of governed vendor file contents.\n",
-    );
+    out.push_str("# Vendor integrity manifest — SHA-256 of governed vendor file contents.\n");
     out.push_str(
         "# Text (allowlisted) paths: LF-normalized (CR stripped). Binary/unrecognized: byte-exact.\n",
     );
