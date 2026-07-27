@@ -505,9 +505,12 @@ paths:
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
         Creates an ACME order through the optional `acme` Cargo feature and
-        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material. When
-        Ferrum is built without that feature this endpoint returns
-        `501 Not Implemented`.
+        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material.
+        Every ACME URL must be HTTPS and remain on the configured directory's
+        normalized host and effective port. Ferrum rejects credential-directory
+        drift, legacy embedded endpoint sets, redirects, and any fresh DNS answer
+        containing a non-public address. When Ferrum is built without the feature
+        this endpoint returns `501 Not Implemented`.
       tags: [TLS]
       requestBody:
         required: true
@@ -570,7 +573,9 @@ paths:
         `acme://certificates/{id}` record. Ferrum reuses persisted account
         credentials from the latest order for the certificate when available,
         or uses credentials supplied in the request. Finalize the returned
-        order after the selected challenge is reachable.
+        order after the selected challenge is reachable. The same HTTPS,
+        same-origin, fresh-DNS public-egress boundary used for initial issuance
+        applies to this renewal.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -648,6 +653,9 @@ paths:
         the order, fetches the issued certificate, and stores it as an
         `acme://certificates/{id}` record. The endpoint requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
+        Persisted order and server-provided authorization, challenge, finalize,
+        and certificate URLs remain subject to the directory's HTTPS same-origin
+        policy and fresh-DNS public-address connector.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -5939,12 +5947,10 @@ components:
         directory_url:
           type: string
           description: >-
-            ACME directory URL. Must be an absolute `https` URL with a host. Literal
-            IP hosts must be public addresses; private/reserved literals (loopback,
-            RFC1918, link-local, ULA, and the `169.254.169.254` metadata address) are
-            rejected to limit SSRF. Hostnames are not resolved here, so a hostname that
-            points at a private IP is not blocked by this check — apply network-level
-            egress controls as well.
+            ACME directory URL. Must be an absolute `https` URL without userinfo or
+            a fragment. Every resolved A/AAAA candidate must be public, and all
+            server-provided resource URLs must retain this URL's normalized host
+            and effective port.
         contact:
           type: array
           items:
@@ -5960,7 +5966,10 @@ components:
           description: ACME challenge type to prepare for this order.
         existing_account_credentials_json:
           type: string
-          description: Previously persisted instant-acme account credentials JSON. Persisted but never returned.
+          description: >-
+            Previously persisted instant-acme account credentials JSON. Its directory
+            must exactly match `directory_url`; legacy embedded `urls` sets are
+            rejected. Persisted but never returned.
         allow_overwrite:
           type: boolean
           default: false
@@ -6021,7 +6030,10 @@ components:
           description: ACME challenge type to prepare for the renewal order.
         existing_account_credentials_json:
           type: string
-          description: Optional instant-acme account credentials JSON. Persisted in the renewal order but never returned.
+          description: >-
+            Optional instant-acme account credentials JSON. Its directory must match
+            the certificate directory and legacy embedded `urls` sets are rejected.
+            Persisted in the renewal order but never returned.
         allow_overwrite:
           type: boolean
           default: false

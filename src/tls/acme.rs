@@ -1185,106 +1185,133 @@ fn validate_acme_directory_url(directory_url: &str) -> Result<(), AcmeError> {
     Ok(())
 }
 
-/// Detects non-canonical numeric IPv4 representations that `IpAddr::parse()` rejects
-/// but system resolvers (getaddrinfo) interpret as real addresses: decimal integers
-/// (`2130706433`), hex integers (`0x7f000001`), hex-dotted (`0x7f.0.0.1`), abbreviated
-/// dotted (`127.1`), and octal dotted (`0177.0.0.1`).
-fn is_non_canonical_numeric_host(host: &str) -> bool {
-    if host.is_empty() {
-        return false;
-    }
-    if (host.starts_with("0x") || host.starts_with("0X"))
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() || b == b'.' || b == b'x' || b == b'X')
-    {
-        return true;
-    }
-    if host.bytes().all(|b| b.is_ascii_digit()) {
-        return true;
-    }
-    if !host.contains('.') {
-        return false;
-    }
-    host.split('.').all(|segment| {
-        if segment.is_empty() {
-            return false;
-        }
-        if segment.bytes().all(|b| b.is_ascii_digit()) {
-            return true;
-        }
-        if let Some(hex) = segment
-            .strip_prefix("0x")
-            .or_else(|| segment.strip_prefix("0X"))
-            && !hex.is_empty()
-            && hex.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return true;
-        }
-        false
-    })
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcmeEndpointOrigin {
+    host: String,
+    port: u16,
 }
 
-/// Enforces SSRF policy on an operator-supplied ACME `directory_url` before any
-/// outbound ACME network activity.
+#[derive(Debug, Clone)]
+struct AcmeEndpointPolicy {
+    directory: url::Url,
+    origin: AcmeEndpointOrigin,
+}
+
+fn acme_public_egress_policy() -> crate::config::BackendEgressPolicy {
+    crate::config::BackendEgressPolicy::from_allow_ips(crate::config::BackendAllowIps::Public)
+}
+
+fn parse_acme_https_endpoint(raw: &str, label: &'static str) -> Result<url::Url, AcmeError> {
+    let uri = raw.parse::<http::Uri>().map_err(|_| {
+        AcmeError::BlockedDirectoryUrl(format!("{label} must be a valid absolute URL"))
+    })?;
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must be an absolute HTTPS URL with an authority"
+        )));
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| {
+        AcmeError::BlockedDirectoryUrl(format!("{label} must be a valid absolute URL"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must use the https scheme"
+        )));
+    }
+    if parsed.host().is_none() {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must include a host"
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must not include userinfo"
+        )));
+    }
+    if parsed.fragment().is_some() {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must not include a fragment"
+        )));
+    }
+    if let Some(ip) = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    } && let Some(reason) = acme_public_egress_policy().deny_reason(&ip)
+    {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} host IP is denied by ACME egress policy: {reason}"
+        )));
+    }
+    Ok(parsed)
+}
+
+impl AcmeEndpointPolicy {
+    fn new(directory_url: &str) -> Result<Self, AcmeError> {
+        let directory = parse_acme_https_endpoint(directory_url.trim(), "directory URL")?;
+        let host = directory
+            .host_str()
+            .ok_or_else(|| {
+                AcmeError::BlockedDirectoryUrl(
+                    "directory URL must include a host".to_string(),
+                )
+            })?
+            .to_ascii_lowercase();
+        let port = directory.port_or_known_default().ok_or_else(|| {
+            AcmeError::BlockedDirectoryUrl(
+                "directory URL must include a valid HTTPS port".to_string(),
+            )
+        })?;
+        Ok(Self {
+            directory,
+            origin: AcmeEndpointOrigin { host, port },
+        })
+    }
+
+    fn validate_endpoint(
+        &self,
+        endpoint: &str,
+        label: &'static str,
+    ) -> Result<url::Url, AcmeError> {
+        let parsed = parse_acme_https_endpoint(endpoint, label)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| {
+                AcmeError::BlockedDirectoryUrl(format!("{label} must include a host"))
+            })?
+            .to_ascii_lowercase();
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            AcmeError::BlockedDirectoryUrl(format!(
+                "{label} must include a valid HTTPS port"
+            ))
+        })?;
+        if host != self.origin.host || port != self.origin.port {
+            return Err(AcmeError::BlockedDirectoryUrl(format!(
+                "{label} must use the configured ACME directory origin"
+            )));
+        }
+        Ok(parsed)
+    }
+
+    fn validate_directory_match(&self, embedded: &str) -> Result<(), AcmeError> {
+        let embedded = self.validate_endpoint(embedded, "credential directory URL")?;
+        if embedded != self.directory {
+            return Err(AcmeError::BlockedDirectoryUrl(
+                "credential directory URL does not match the configured directory URL".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate an operator-supplied ACME directory before any outbound activity.
 ///
-/// This is the single chokepoint guarding directory URLs: it is invoked at order
-/// preparation in [`client::prepare_order`] — which covers both interactive order
-/// creation and the automatic renewal scheduler — and again at the certificate
-/// import boundary, so a stored URL is validated both at rest and immediately
-/// before use regardless of how the record was persisted.
-///
-/// Policy:
-/// - must parse as an absolute URL with the `https` scheme and a non-empty host;
-/// - if the host is a literal IP, it must be a public address (hard-coded
-///   [`BackendAllowIps::Public`](crate::config::BackendAllowIps)). Public CAs are
-///   always reachable, while private/reserved literals — loopback, RFC1918,
-///   link-local, ULA, and the cloud metadata address `169.254.169.254` — are
-///   rejected. `Public` is hard-coded rather than reusing `FERRUM_BACKEND_ALLOW_IPS`
-///   (which defaults to `both`, a no-op) so the guard is effective on stock installs.
-///
-/// Known gap: hostnames are not resolved here, so a hostname whose A/AAAA record
-/// resolves to a private IP (e.g. `localhost`, `*.nip.io`, `metadata.google.internal`)
-/// is not blocked by this check; the downstream ACME client resolves and connects
-/// without an IP gate, so operators must still enforce network-level egress controls.
-/// This mirrors the literal-only enforcement used elsewhere for
-/// `FERRUM_BACKEND_ALLOW_IPS`.
+/// Hostnames receive their authoritative public-only decision later, from the
+/// Ferrum-controlled connector after fresh whole-answer DNS resolution.
 pub(crate) fn validate_acme_directory_url_ssrf_policy(
     directory_url: &str,
 ) -> Result<(), AcmeError> {
-    let uri: hyper::Uri = directory_url
-        .trim()
-        .parse()
-        .map_err(|_| AcmeError::BlockedDirectoryUrl("must be a valid absolute URL".to_string()))?;
-    if uri.scheme_str() != Some("https") {
-        return Err(AcmeError::BlockedDirectoryUrl(
-            "must use https scheme".to_string(),
-        ));
-    }
-    let host = uri
-        .host()
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| AcmeError::BlockedDirectoryUrl("must include a host".to_string()))?;
-    // hyper::Uri::host() strips userinfo, so `https://name@127.0.0.1/` resolves to the
-    // literal `127.0.0.1` here rather than the userinfo, closing that bypass. IPv6
-    // literals are returned bracketed (`[::1]`); strip the brackets before parsing so
-    // private IPv6 literals cannot slip past the IP gate as if they were hostnames.
-    let host_ip = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
-        if !crate::config::check_backend_ip_allowed(&ip, &crate::config::BackendAllowIps::Public) {
-            return Err(AcmeError::BlockedDirectoryUrl(format!(
-                "host IP {ip} is not a public address"
-            )));
-        }
-    } else if is_non_canonical_numeric_host(host_ip) {
-        return Err(AcmeError::BlockedDirectoryUrl(format!(
-            "non-standard numeric host '{host_ip}' is not permitted; use a hostname or standard dotted-decimal IP"
-        )));
-    }
-    Ok(())
+    AcmeEndpointPolicy::new(directory_url).map(|_| ())
 }
 
 fn validate_acme_account_identifier(account_id: &str) -> Result<(), AcmeError> {
@@ -1648,7 +1675,7 @@ impl AcmeRenewalChallengeType {
 }
 
 #[cfg(feature = "acme")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AcmeRenewalSchedulerConfig {
     pub enabled: bool,
     pub renew_when_remaining_days: u64,
@@ -1657,6 +1684,7 @@ pub struct AcmeRenewalSchedulerConfig {
     pub challenge_type: AcmeRenewalChallengeType,
     pub dns01_hook_command: Option<String>,
     pub dns01_propagation: Duration,
+    pub dns_cache: crate::dns::DnsCache,
 }
 
 #[cfg(feature = "acme")]
@@ -1867,6 +1895,7 @@ async fn prepare_renewal_order(
             )),
         },
         domains: certificate.domains.clone(),
+        dns_cache: config.dns_cache.clone(),
     };
     let prepared = match config.challenge_type {
         AcmeRenewalChallengeType::Http01 => client::prepare_http01_order(order_config).await,
@@ -1939,9 +1968,11 @@ async fn complete_prepared_renewal_order(
         .clone()
         .ok_or_else(|| AcmeError::InvalidId("ACME order has no order URL".to_string()))?;
     let complete_config = client::CompleteAcmeHttp01OrderConfig {
+        directory_url: order.directory_url.clone(),
         account_credentials_json: crate::tls::source::SecretString::new(account_credentials_json),
         order_url,
         poll_timeout: config.poll_timeout,
+        dns_cache: config.dns_cache.clone(),
     };
     match config.challenge_type {
         AcmeRenewalChallengeType::Http01 => client::complete_http01_order(complete_config).await,
@@ -2041,15 +2072,29 @@ pub mod client {
     //! expose HTTP-01, TLS-ALPN-01, or DNS-01 material before calling ACME
     //! challenge readiness/finalization in follow-on manager work.
 
+    use std::future::{Future, ready};
+    use std::io;
+    use std::net::{IpAddr, SocketAddr};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use http::header::LOCATION;
+    use http::{Request, Uri};
+    use hyper_rustls::HttpsConnectorBuilder;
+    use hyper_util::client::legacy::Client as HyperClient;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
     use instant_acme::{
-        Account, AccountCredentials, ChallengeStatus, ChallengeType, Identifier, NewAccount,
-        NewOrder, OrderStatus, RetryPolicy,
+        Account, AccountCredentials, BodyWrapper, BytesResponse, ChallengeStatus, ChallengeType,
+        HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
     };
     use serde::Serialize;
     use thiserror::Error;
+    use tower::Service;
 
+    use crate::config::BackendEgressPolicy;
+    use crate::dns::{DnsCache, DnsConfig};
     use crate::tls::source::SecretString;
 
     #[derive(Debug, Clone)]
@@ -2060,10 +2105,11 @@ pub mod client {
         pub existing_credentials_json: Option<SecretString>,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct AcmeOrderConfig {
         pub account: AcmeAccountConfig,
         pub domains: Vec<String>,
+        pub dns_cache: DnsCache,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -2082,11 +2128,13 @@ pub mod client {
         pub challenges: Vec<AcmeHttp01Challenge>,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct CompleteAcmeHttp01OrderConfig {
+        pub directory_url: String,
         pub account_credentials_json: SecretString,
         pub order_url: String,
         pub poll_timeout: Duration,
+        pub dns_cache: DnsCache,
     }
 
     #[derive(Debug, Clone)]
@@ -2112,8 +2160,348 @@ pub mod client {
         SerializeCredentials(String),
         #[error("failed to deserialize ACME account credentials: {0}")]
         DeserializeCredentials(String),
+        #[error("ACME outbound boundary rejected the request: {0}")]
+        EgressPolicy(String),
         #[error("ACME client error: {0}")]
         Client(String),
+    }
+
+    const ACME_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[derive(Clone)]
+    struct ScreenedAcmeConnector {
+        dns_cache: DnsCache,
+        egress_policy: BackendEgressPolicy,
+    }
+
+    impl ScreenedAcmeConnector {
+        fn new(dns_cache: DnsCache) -> Self {
+            let egress_policy = super::acme_public_egress_policy();
+            Self {
+                dns_cache: dns_cache.with_backend_egress_policy(egress_policy.clone()),
+                egress_policy,
+            }
+        }
+
+        fn screen_candidates(&self, candidates: Vec<IpAddr>) -> Result<Vec<IpAddr>, io::Error> {
+            if candidates.is_empty() {
+                return Err(io::Error::other(
+                    "ACME DNS resolution returned no addresses",
+                ));
+            }
+            for candidate in &candidates {
+                if let Some(reason) = self.egress_policy.deny_reason(candidate) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("ACME resolved address denied by egress policy: {reason}"),
+                    ));
+                }
+            }
+            Ok(candidates)
+        }
+
+        async fn resolve_candidates(&self, host: &str) -> Result<Vec<IpAddr>, io::Error> {
+            let candidates = self
+                .dns_cache
+                .resolve_all_fresh(host)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            self.screen_candidates(candidates)
+        }
+    }
+
+    impl Service<Uri> for ScreenedAcmeConnector {
+        type Response = TokioIo<tokio::net::TcpStream>;
+        type Error = io::Error;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, destination: Uri) -> Self::Future {
+            let connector = self.clone();
+            let egress_policy = self.egress_policy.clone();
+            Box::pin(async move {
+                if destination.scheme_str() != Some("https") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "ACME connector requires HTTPS",
+                    ));
+                }
+                let host = destination
+                    .host()
+                    .filter(|host| !host.is_empty())
+                    .ok_or_else(|| io::Error::other("ACME endpoint is missing a host"))?;
+                let host = host
+                    .strip_prefix('[')
+                    .and_then(|host| host.strip_suffix(']'))
+                    .unwrap_or(host)
+                    .to_string();
+                let port = destination.port_u16().unwrap_or(443);
+
+                // Bypass both cache layers on every new connection. The DNS
+                // resolver screens the complete A+AAAA answer atomically, so a
+                // mixed public/private answer cannot be laundered by an allowed
+                // first address.
+                let candidates = connector.resolve_candidates(&host).await?;
+
+                let mut last_error = None;
+                for candidate in candidates {
+                    // Keep the policy decision adjacent to the concrete socket
+                    // open. Only this already-screened address is handed to
+                    // Tokio, so no downstream resolver can rebind the dial.
+                    if let Some(reason) = egress_policy.deny_reason(&candidate) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!("ACME dial candidate denied by egress policy: {reason}"),
+                        ));
+                    }
+                    let address = SocketAddr::new(candidate, port);
+                    match tokio::time::timeout(
+                        ACME_CONNECT_TIMEOUT,
+                        tokio::net::TcpStream::connect(address),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => return Ok(TokioIo::new(stream)),
+                        Ok(Err(error)) => last_error = Some(error),
+                        Err(_) => {
+                            last_error = Some(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "ACME TCP connection timed out",
+                            ));
+                        }
+                    }
+                }
+                Err(last_error.unwrap_or_else(|| {
+                    io::Error::other("all approved ACME connection candidates failed")
+                }))
+            })
+        }
+    }
+
+    type AcmeHttpsConnector = hyper_rustls::HttpsConnector<ScreenedAcmeConnector>;
+    type AcmeHyperClient = HyperClient<AcmeHttpsConnector, BodyWrapper<Bytes>>;
+
+    struct HyperAcmeHttpClient(AcmeHyperClient);
+
+    impl HttpClient for HyperAcmeHttpClient {
+        fn request(
+            &self,
+            request: Request<BodyWrapper<Bytes>>,
+        ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
+        {
+            let future = self.0.request(request);
+            Box::pin(async move {
+                future
+                    .await
+                    .map(BytesResponse::from)
+                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))
+            })
+        }
+    }
+
+    struct PolicyAcmeHttpClient {
+        inner: Box<dyn HttpClient>,
+        endpoint_policy: super::AcmeEndpointPolicy,
+    }
+
+    impl PolicyAcmeHttpClient {
+        fn reject(message: impl Into<String>) -> instant_acme::Error {
+            instant_acme::Error::Other(Box::new(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                message.into(),
+            )))
+        }
+    }
+
+    impl HttpClient for PolicyAcmeHttpClient {
+        fn request(
+            &self,
+            request: Request<BodyWrapper<Bytes>>,
+        ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
+        {
+            let endpoint_policy = self.endpoint_policy.clone();
+            let endpoint = request.uri().to_string();
+            let validated = match endpoint_policy.validate_endpoint(&endpoint, "request URL") {
+                Ok(validated) => validated,
+                Err(error) => return Box::pin(ready(Err(Self::reject(error.to_string())))),
+            };
+            let is_directory = validated == endpoint_policy.directory;
+            let future = self.inner.request(request);
+            Box::pin(async move {
+                let response = future.await?;
+                if response.parts.status.is_redirection() {
+                    return Err(Self::reject(
+                        "ACME redirects are disabled; redirect responses are rejected",
+                    ));
+                }
+                if let Some(location) = response.parts.headers.get(LOCATION) {
+                    let location = location.to_str().map_err(|_| {
+                        Self::reject("ACME Location header is not valid visible ASCII")
+                    })?;
+                    endpoint_policy
+                        .validate_endpoint(location, "Location URL")
+                        .map_err(|error| Self::reject(error.to_string()))?;
+                }
+
+                let BytesResponse { parts, mut body } = response;
+                let bytes = body.into_bytes().await.map_err(instant_acme::Error::Other)?;
+                validate_response_endpoint_fields(&endpoint_policy, &bytes, is_directory)
+                    .map_err(|error| Self::reject(error.to_string()))?;
+                Ok(BytesResponse {
+                    parts,
+                    body: Box::new(bytes),
+                })
+            })
+        }
+    }
+
+    fn validate_response_endpoint_fields(
+        policy: &super::AcmeEndpointPolicy,
+        body: &[u8],
+        is_directory: bool,
+    ) -> Result<(), AcmeClientError> {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Ok(());
+        };
+        let Some(object) = value.as_object() else {
+            return Ok(());
+        };
+
+        let validate_string =
+            |value: &serde_json::Value, label: &'static str| -> Result<(), AcmeClientError> {
+                let endpoint = value.as_str().ok_or_else(|| {
+                    AcmeClientError::EgressPolicy(format!(
+                        "{label} must be an absolute URL string"
+                    ))
+                })?;
+                policy
+                    .validate_endpoint(endpoint, label)
+                    .map(|_| ())
+                    .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))
+            };
+
+        if is_directory {
+            for (field, label) in [
+                ("newNonce", "newNonce URL"),
+                ("newAccount", "newAccount URL"),
+                ("newOrder", "newOrder URL"),
+                ("newAuthz", "newAuthz URL"),
+                ("revokeCert", "revokeCert URL"),
+                ("keyChange", "keyChange URL"),
+                ("renewalInfo", "renewalInfo URL"),
+            ] {
+                if let Some(value) = object.get(field) {
+                    validate_string(value, label)?;
+                }
+            }
+        }
+
+        for (field, label) in [
+            ("finalize", "finalize URL"),
+            ("certificate", "certificate URL"),
+        ] {
+            if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
+                validate_string(value, label)?;
+            }
+        }
+        if let Some(authorizations) = object.get("authorizations") {
+            let authorizations = authorizations.as_array().ok_or_else(|| {
+                AcmeClientError::EgressPolicy(
+                    "authorizations must be an array of absolute URLs".to_string(),
+                )
+            })?;
+            for authorization in authorizations {
+                validate_string(authorization, "authorization URL")?;
+            }
+        }
+        if let Some(challenges) = object.get("challenges") {
+            let challenges = challenges.as_array().ok_or_else(|| {
+                AcmeClientError::EgressPolicy("challenges must be an array".to_string())
+            })?;
+            for challenge in challenges {
+                let challenge_url = challenge
+                    .as_object()
+                    .and_then(|challenge| challenge.get("url"))
+                    .ok_or_else(|| {
+                        AcmeClientError::EgressPolicy(
+                            "challenge entry must include an absolute URL".to_string(),
+                        )
+                    })?;
+                validate_string(challenge_url, "challenge URL")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_and_deserialize_credentials(
+        credentials_json: &SecretString,
+        endpoint_policy: &super::AcmeEndpointPolicy,
+    ) -> Result<AccountCredentials, AcmeClientError> {
+        let value = serde_json::from_str::<serde_json::Value>(credentials_json.expose_secret())
+            .map_err(|error| AcmeClientError::DeserializeCredentials(error.to_string()))?;
+        let object = value.as_object().ok_or_else(|| {
+            AcmeClientError::DeserializeCredentials(
+                "credentials must be a JSON object".to_string(),
+            )
+        })?;
+        if object.get("urls").is_some_and(|urls| !urls.is_null()) {
+            return Err(AcmeClientError::EgressPolicy(
+                "legacy ACME credentials with embedded endpoint URLs are not accepted; recreate the account credentials from the configured directory".to_string(),
+            ));
+        }
+        let embedded_directory = object
+            .get("directory")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AcmeClientError::EgressPolicy(
+                    "ACME credentials must contain their directory URL".to_string(),
+                )
+            })?;
+        endpoint_policy
+            .validate_directory_match(embedded_directory)
+            .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+        let account_id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AcmeClientError::EgressPolicy(
+                    "ACME credentials must contain an account URL".to_string(),
+                )
+            })?;
+        endpoint_policy
+            .validate_endpoint(account_id, "account URL")
+            .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+        serde_json::from_value::<AccountCredentials>(value)
+            .map_err(|error| AcmeClientError::DeserializeCredentials(error.to_string()))
+    }
+
+    fn build_policy_http_client(
+        endpoint_policy: super::AcmeEndpointPolicy,
+        dns_cache: DnsCache,
+    ) -> Result<Box<dyn HttpClient>, AcmeClientError> {
+        let connector = ScreenedAcmeConnector::new(dns_cache);
+        let https = HttpsConnectorBuilder::new()
+            .try_with_platform_verifier()
+            .map_err(|error| AcmeClientError::Client(error.to_string()))?
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(connector);
+        let client = HyperClient::builder(TokioExecutor::new()).build(https);
+        Ok(Box::new(PolicyAcmeHttpClient {
+            inner: Box::new(HyperAcmeHttpClient(client)),
+            endpoint_policy,
+        }))
+    }
+
+    pub(crate) fn default_acme_dns_cache() -> DnsCache {
+        DnsCache::new(DnsConfig {
+            backend_allow_ips: super::acme_public_egress_policy(),
+            ..DnsConfig::default()
+        })
     }
 
     pub async fn prepare_http01_order(
@@ -2139,13 +2527,16 @@ pub mod client {
         challenge_type: ChallengeType,
         challenge_name: &'static str,
     ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
-        // SSRF chokepoint: validate the operator-supplied directory URL before any
-        // outbound ACME activity. Both interactive order creation and the automatic
-        // renewal scheduler funnel through here, so this also closes the renewal path.
-        super::validate_acme_directory_url_ssrf_policy(&config.account.directory_url)
+        let endpoint_policy =
+            super::AcmeEndpointPolicy::new(&config.account.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
-        let account = resolve_account(&config.account).await?;
+        let account = resolve_account(
+            &config.account,
+            endpoint_policy.clone(),
+            config.dns_cache,
+        )
+        .await?;
         let identifiers = domains
             .iter()
             .cloned()
@@ -2157,18 +2548,26 @@ pub mod client {
             .await
             .map_err(|error| AcmeClientError::Client(error.to_string()))?;
         let order_url = order.url().to_string();
+        endpoint_policy
+            .validate_endpoint(&order_url, "order URL")
+            .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
         let mut challenges = Vec::new();
         let mut authorizations = order.authorizations();
         while let Some(authorization) = authorizations.next().await {
             let mut authorization =
                 authorization.map_err(|error| AcmeClientError::Client(error.to_string()))?;
             let authorization_url = authorization.url().to_string();
+            endpoint_policy
+                .validate_endpoint(&authorization_url, "authorization URL")
+                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
             let Some(challenge) = authorization.challenge(challenge_type.clone()) else {
                 return Err(AcmeClientError::InvalidRequest(format!(
-                    "ACME authorization '{}' does not offer {}",
-                    authorization_url, challenge_name
+                    "ACME authorization does not offer {challenge_name}"
                 )));
             };
+            endpoint_policy
+                .validate_endpoint(&challenge.url, "challenge URL")
+                .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
             let key_authorization = challenge.key_authorization();
             challenges.push(AcmeHttp01Challenge {
                 identifier: challenge.identifier().to_string(),
@@ -2209,13 +2608,23 @@ pub mod client {
         challenge_type: ChallengeType,
         challenge_name: &'static str,
     ) -> Result<CompletedAcmeHttp01Order, AcmeClientError> {
-        let account = restore_account(&config.account_credentials_json).await?;
+        let endpoint_policy = super::AcmeEndpointPolicy::new(&config.directory_url)
+            .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let order_url = config.order_url.trim();
         if order_url.is_empty() {
             return Err(AcmeClientError::InvalidRequest(
                 "order_url must not be empty".to_string(),
             ));
         }
+        endpoint_policy
+            .validate_endpoint(order_url, "persisted order URL")
+            .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
+        let account = restore_account(
+            &config.account_credentials_json,
+            endpoint_policy.clone(),
+            config.dns_cache,
+        )
+        .await?;
         let mut order = account
             .order(order_url.to_string())
             .await
@@ -2227,12 +2636,17 @@ pub mod client {
                 let mut authorization =
                     authorization.map_err(|error| AcmeClientError::Client(error.to_string()))?;
                 let authorization_url = authorization.url().to_string();
+                endpoint_policy
+                    .validate_endpoint(&authorization_url, "authorization URL")
+                    .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
                 let Some(mut challenge) = authorization.challenge(challenge_type.clone()) else {
                     return Err(AcmeClientError::InvalidRequest(format!(
-                        "ACME authorization '{}' does not offer {}",
-                        authorization_url, challenge_name
+                        "ACME authorization does not offer {challenge_name}"
                     )));
                 };
+                endpoint_policy
+                    .validate_endpoint(&challenge.url, "challenge URL")
+                    .map_err(|error| AcmeClientError::EgressPolicy(error.to_string()))?;
                 if challenge.status == ChallengeStatus::Valid {
                     continue;
                 }
@@ -2273,6 +2687,8 @@ pub mod client {
 
     async fn resolve_account(
         config: &AcmeAccountConfig,
+        endpoint_policy: super::AcmeEndpointPolicy,
+        dns_cache: DnsCache,
     ) -> Result<ResolvedAccount, AcmeClientError> {
         if config.directory_url.trim().is_empty() {
             return Err(AcmeClientError::InvalidRequest(
@@ -2280,15 +2696,18 @@ pub mod client {
             ));
         }
         if let Some(credentials_json) = config.existing_credentials_json.as_ref() {
-            let account = restore_account(credentials_json).await?;
+            let account =
+                restore_account(credentials_json, endpoint_policy, dns_cache).await?;
             return Ok(ResolvedAccount {
                 account,
                 credentials_json: credentials_json.clone(),
             });
         }
 
-        let builder =
-            Account::builder().map_err(|error| AcmeClientError::Client(error.to_string()))?;
+        let builder = Account::builder_with_http(build_policy_http_client(
+            endpoint_policy,
+            dns_cache,
+        )?);
         let contact = config
             .contact
             .iter()
@@ -2311,12 +2730,14 @@ pub mod client {
         })
     }
 
-    async fn restore_account(credentials_json: &SecretString) -> Result<Account, AcmeClientError> {
+    async fn restore_account(
+        credentials_json: &SecretString,
+        endpoint_policy: super::AcmeEndpointPolicy,
+        dns_cache: DnsCache,
+    ) -> Result<Account, AcmeClientError> {
         let credentials =
-            serde_json::from_str::<AccountCredentials>(credentials_json.expose_secret())
-                .map_err(|error| AcmeClientError::DeserializeCredentials(error.to_string()))?;
-        Account::builder()
-            .map_err(|error| AcmeClientError::Client(error.to_string()))?
+            validate_and_deserialize_credentials(credentials_json, &endpoint_policy)?;
+        Account::builder_with_http(build_policy_http_client(endpoint_policy, dns_cache)?)
             .from_credentials(credentials)
             .await
             .map_err(|error| AcmeClientError::Client(error.to_string()))
@@ -2359,6 +2780,79 @@ pub mod client {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http::{Response, StatusCode};
+
+        struct FakeHttpClient {
+            status: StatusCode,
+            location: Option<&'static str>,
+            body: Bytes,
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl HttpClient for FakeHttpClient {
+            fn request(
+                &self,
+                _request: Request<BodyWrapper<Bytes>>,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>,
+            > {
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                let mut builder = Response::builder().status(self.status);
+                if let Some(location) = self.location {
+                    builder = builder.header(LOCATION, location);
+                }
+                let response = builder
+                    .body(self.body.clone())
+                    .expect("valid fake ACME response");
+                let (parts, body) = response.into_parts();
+                Box::pin(ready(Ok(BytesResponse {
+                    parts,
+                    body: Box::new(body),
+                })))
+            }
+        }
+
+        fn fake_boundary(
+            body: serde_json::Value,
+            status: StatusCode,
+            location: Option<&'static str>,
+        ) -> (PolicyAcmeHttpClient, Arc<AtomicUsize>) {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let inner = FakeHttpClient {
+                status,
+                location,
+                body: Bytes::from(serde_json::to_vec(&body).expect("serialize fake response")),
+                requests: requests.clone(),
+            };
+            (
+                PolicyAcmeHttpClient {
+                    inner: Box::new(inner),
+                    endpoint_policy: super::super::AcmeEndpointPolicy::new(
+                        "https://acme.example/directory",
+                    )
+                    .expect("endpoint policy"),
+                },
+                requests,
+            )
+        }
+
+        async fn boundary_request(
+            client: &PolicyAcmeHttpClient,
+            endpoint: &str,
+        ) -> Result<BytesResponse, instant_acme::Error> {
+            HttpClient::request(
+                client,
+                Request::builder()
+                    .uri(endpoint)
+                    .body(BodyWrapper::default())
+                    .expect("request"),
+            )
+            .await
+        }
 
         #[test]
         fn normalize_order_domains_trims_lowercases_and_deduplicates() {
@@ -2373,6 +2867,268 @@ pub mod client {
                 domains,
                 vec!["example.com".to_string(), "www.example.com".to_string()]
             );
+        }
+
+        #[test]
+        fn credential_directory_mismatch_and_legacy_urls_fail_closed() {
+            let policy =
+                super::super::AcmeEndpointPolicy::new("https://acme.example/directory")
+                    .expect("policy");
+            let mismatch = SecretString::new(
+                serde_json::json!({
+                    "id": "https://acme.example/account/1",
+                    "key_pkcs8": "not-reached",
+                    "directory": "https://other.example/directory"
+                })
+                .to_string(),
+            );
+            let error = validate_and_deserialize_credentials(&mismatch, &policy)
+                .err()
+                .expect("credential-directory drift must be rejected");
+            assert!(error.to_string().contains("does not match"), "{error}");
+
+            let legacy = SecretString::new(
+                serde_json::json!({
+                    "id": "https://acme.example/account/1",
+                    "key_pkcs8": "not-reached",
+                    "urls": {
+                        "newNonce": "https://169.254.169.254/nonce",
+                        "newAccount": "https://acme.example/account",
+                        "newOrder": "https://acme.example/order"
+                    }
+                })
+                .to_string(),
+            );
+            let error = validate_and_deserialize_credentials(&legacy, &policy)
+                .err()
+                .expect("legacy embedded endpoint set must be rejected");
+            assert!(error.to_string().contains("legacy ACME credentials"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn private_dns_answer_is_rejected_before_connect() {
+            let dns_cache = DnsCache::new(DnsConfig {
+                global_overrides: HashMap::from([(
+                    "rebind.acme.test".to_string(),
+                    "169.254.169.254".to_string(),
+                )]),
+                ..DnsConfig::default()
+            });
+            let connector = ScreenedAcmeConnector::new(dns_cache);
+            let error = connector
+                .resolve_candidates("rebind.acme.test")
+                .await
+                .expect_err("private DNS answer must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(
+                error.to_string().contains("denied by backend egress policy"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn public_multi_address_answer_preserves_every_approved_candidate() {
+            let connector = ScreenedAcmeConnector::new(default_acme_dns_cache());
+            let candidates = vec![
+                "1.1.1.1".parse::<IpAddr>().expect("public IPv4"),
+                "2606:4700:4700::1111"
+                    .parse::<IpAddr>()
+                    .expect("public IPv6"),
+            ];
+            assert_eq!(
+                connector
+                    .screen_candidates(candidates.clone())
+                    .expect("public candidates"),
+                candidates,
+                "the connector must not first-answer-pin a multi-address result"
+            );
+        }
+
+        #[tokio::test]
+        async fn same_origin_absolute_endpoints_are_allowed() {
+            let (client, requests) = fake_boundary(
+                serde_json::json!({
+                    "authorizations": ["https://acme.example/authz/1?attempt=2"],
+                    "finalize": "https://acme.example/finalize/1",
+                    "certificate": "https://acme.example/certificate/1"
+                }),
+                StatusCode::OK,
+                Some("https://acme.example/order/1"),
+            );
+            assert!(
+                boundary_request(&client, "https://acme.example/order/1")
+                    .await
+                    .is_ok(),
+                "same-origin paths and queries must remain valid"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn private_directory_and_order_resource_urls_never_reach_transport() {
+            let (client, requests) =
+                fake_boundary(serde_json::json!({}), StatusCode::OK, None);
+            for endpoint in [
+                "https://127.0.0.1/directory",
+                "https://169.254.169.254/order/1",
+                "https://10.0.0.1/authz/1",
+                "https://[::1]/challenge/1",
+                "https://[fe80::1]/finalize/1",
+                "https://[fc00::1]/certificate/1",
+            ] {
+                assert!(
+                    boundary_request(&client, endpoint).await.is_err(),
+                    "private endpoint must be rejected"
+                );
+            }
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "hostile endpoints must fail at their request consumption boundary"
+            );
+        }
+
+        #[tokio::test]
+        async fn private_directory_new_nonce_and_new_order_are_rejected_in_response() {
+            for body in [
+                serde_json::json!({
+                    "newNonce": "https://169.254.169.254/nonce",
+                    "newAccount": "https://acme.example/account",
+                    "newOrder": "https://acme.example/order"
+                }),
+                serde_json::json!({
+                    "newNonce": "https://acme.example/nonce",
+                    "newAccount": "https://acme.example/account",
+                    "newOrder": "https://127.0.0.1/order"
+                }),
+            ] {
+                let (client, requests) = fake_boundary(body, StatusCode::OK, None);
+                assert!(
+                    boundary_request(&client, "https://acme.example/directory")
+                        .await
+                        .is_err(),
+                    "private directory endpoint must be rejected"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn private_order_authorization_challenge_finalize_and_certificate_fields_are_rejected()
+        {
+            let cases = [
+                (
+                    serde_json::json!({}),
+                    Some("https://169.254.169.254/order/1"),
+                ),
+                (
+                    serde_json::json!({
+                        "authorizations": ["https://10.0.0.1/authz/1"]
+                    }),
+                    None,
+                ),
+                (
+                    serde_json::json!({
+                        "challenges": [{
+                            "type": "http-01",
+                            "url": "https://127.0.0.1/challenge/1",
+                            "status": "pending",
+                            "token": "token"
+                        }]
+                    }),
+                    None,
+                ),
+                (
+                    serde_json::json!({
+                        "finalize": "https://[::1]/finalize/1"
+                    }),
+                    None,
+                ),
+                (
+                    serde_json::json!({
+                        "certificate": "https://[fe80::1]/certificate/1"
+                    }),
+                    None,
+                ),
+            ];
+            for (body, location) in cases {
+                let (client, requests) = fake_boundary(body, StatusCode::OK, location);
+                assert!(
+                    boundary_request(&client, "https://acme.example/order/1")
+                        .await
+                        .is_err(),
+                    "private server-supplied endpoint must be rejected"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn https_and_redirect_invariants_fail_closed() {
+            let (client, requests) =
+                fake_boundary(serde_json::json!({}), StatusCode::FOUND, None);
+            assert!(
+                boundary_request(&client, "http://acme.example/directory")
+                    .await
+                    .is_err(),
+                "plaintext ACME endpoint must be rejected"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+            assert!(
+                boundary_request(&client, "https://acme.example/directory")
+                    .await
+                    .is_err(),
+                "redirect response must be rejected"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn renewal_completion_uses_credential_and_persisted_order_boundary() {
+            let config = CompleteAcmeHttp01OrderConfig {
+                directory_url: "https://acme.example/directory".to_string(),
+                account_credentials_json: SecretString::new(
+                    serde_json::json!({
+                        "id": "https://acme.example/account/1",
+                        "key_pkcs8": "not-reached",
+                        "directory": "https://other.example/directory"
+                    })
+                    .to_string(),
+                ),
+                order_url: "https://acme.example/order/1".to_string(),
+                poll_timeout: Duration::from_secs(1),
+                dns_cache: default_acme_dns_cache(),
+            };
+            let error = complete_order(config, ChallengeType::Http01, "http-01")
+                .await
+                .expect_err("renewal restore must reject credential drift before network");
+            assert!(matches!(error, AcmeClientError::EgressPolicy(_)));
+        }
+
+        #[tokio::test]
+        async fn renewal_preparation_uses_the_same_credential_boundary() {
+            let config = AcmeOrderConfig {
+                account: AcmeAccountConfig {
+                    directory_url: "https://acme.example/directory".to_string(),
+                    contact: Vec::new(),
+                    terms_of_service_agreed: true,
+                    existing_credentials_json: Some(SecretString::new(
+                        serde_json::json!({
+                            "id": "https://acme.example/account/1",
+                            "key_pkcs8": "not-reached",
+                            "directory": "https://other.example/directory"
+                        })
+                        .to_string(),
+                    )),
+                },
+                domains: vec!["example.com".to_string()],
+                dns_cache: default_acme_dns_cache(),
+            };
+            let error = prepare_order(config, ChallengeType::Http01, "http-01")
+                .await
+                .expect_err("renewal preparation must reject credential drift before network");
+            assert!(matches!(error, AcmeClientError::EgressPolicy(_)));
         }
     }
 }
@@ -2442,46 +3198,15 @@ mod tests {
     }
 
     #[test]
-    fn non_canonical_numeric_host_detection() {
-        for (host, expected) in [
-            ("2130706433", true),         // decimal integer
-            ("0x7f000001", true),         // hex integer
-            ("0XA9FEA9FE", true),         // hex integer uppercase prefix
-            ("0x7f.0.0.1", true),         // hex-dotted
-            ("127.0.0x1", true),          // mixed-base dotted
-            ("127.0x1", true),            // mixed-base abbreviated
-            ("1.2.3.0x4", true),          // mixed-base 4-segment
-            ("0177.0.0.1", true),         // octal-dotted
-            ("127.1", true),              // abbreviated dotted
-            ("192.168.1", true),          // abbreviated 3-segment
-            ("beef.cafe", false),         // hex-only hostname
-            ("dead.cab", false),          // hex-only hostname
-            ("abc.def.1a2b", false),      // mixed hex hostname
-            ("localhost", false),         // alpha hostname
-            ("example.com", false),       // normal hostname
-            ("0x-ca.example.com", false), // 0x-prefixed hostname with non-hex chars
-            ("0xlab.io", false),          // 0x-prefixed hostname with non-hex chars
-            ("0xproject.com", false),     // 0x-prefixed hostname with non-hex chars
-            ("", false),                  // empty
-        ] {
-            assert_eq!(
-                is_non_canonical_numeric_host(host),
-                expected,
-                "is_non_canonical_numeric_host({host:?}) should be {expected}"
-            );
-        }
-    }
-
-    #[test]
     fn directory_url_ssrf_policy_accepts_public_ips_and_hostnames() {
-        // Public CAs (hostnames) and public IP literals are permitted. Hostnames
-        // resolving to private IPs are a documented gap (no DNS resolution here).
+        // Syntactically valid hostnames pass the admission layer. The controlled
+        // connector makes the authoritative public-only decision after fresh DNS.
         for ok in [
             "https://acme-v02.api.letsencrypt.org/directory",
             " https://acme-staging-v02.api.letsencrypt.org/directory ", // trimmed
             "https://1.1.1.1/dir",                                      // public IPv4 literal
             "https://[2606:4700:4700::1111]/dir",                       // public IPv6 literal
-            "https://localhost/dir",    // hostname gap: not blocked here
+            "https://localhost/dir",    // rejected later when it resolves to loopback
             "https://beef.cafe/dir",    // hex-only hostname is not a numeric IP
             "https://dead.cab/dir",     // hex-only hostname is not a numeric IP
             "https://abc.def.1a2b/dir", // mixed hex hostname
@@ -2491,6 +3216,43 @@ mod tests {
                 "expected acceptance for {ok}"
             );
         }
+    }
+
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn automatic_renewal_preparation_uses_the_acme_outbound_boundary() {
+        let certificate = AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+            id: "renewal-boundary".to_string(),
+            domains: vec!["example.com".to_string()],
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: Some("https://acme.example/account/1".to_string()),
+            order_url: None,
+            cert_pem: String::new(),
+            key_pem: String::new(),
+            chain_pem: None,
+        })
+        .expect("certificate record");
+        let credentials = serde_json::json!({
+            "id": "https://acme.example/account/1",
+            "key_pkcs8": "not-reached",
+            "directory": "https://other.example/directory"
+        })
+        .to_string();
+        let config = AcmeRenewalSchedulerConfig {
+            enabled: true,
+            renew_when_remaining_days: 30,
+            check_interval: Duration::from_secs(60),
+            poll_timeout: Duration::from_secs(1),
+            challenge_type: AcmeRenewalChallengeType::Http01,
+            dns01_hook_command: None,
+            dns01_propagation: Duration::ZERO,
+            dns_cache: client::default_acme_dns_cache(),
+        };
+
+        let error = prepare_renewal_order(&certificate, credentials, &config)
+            .await
+            .expect_err("automatic renewal must reject credential-directory drift");
+        assert!(error.to_string().contains("does not match"), "{error}");
     }
 
     fn generated_cert_and_key() -> (String, String) {

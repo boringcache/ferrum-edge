@@ -2266,6 +2266,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "hyper 1.9.0",
+ "hyper-rustls 0.27.9",
  "hyper-util",
  "instant-acme",
  "instant-distance",

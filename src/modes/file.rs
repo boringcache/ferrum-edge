@@ -905,7 +905,11 @@ pub async fn serve(
         shutdown_tx.subscribe(),
     );
     let acme_renewal_handle =
-        crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
+        crate::modes::start_acme_renewal_scheduler(
+            &env_config,
+            dns_cache.clone(),
+            shutdown_tx.subscribe(),
+        );
 
     let mut background_handles: Vec<JoinHandle<()>> = vec![
         dns_handle,

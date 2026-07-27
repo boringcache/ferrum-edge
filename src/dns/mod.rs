@@ -300,6 +300,23 @@ impl DnsCache {
         self.backend_allow_ips.clone()
     }
 
+    /// Clone this resolver while replacing only its dial-time egress policy.
+    ///
+    /// Security-sensitive helper clients such as ACME need the gateway's
+    /// configured resolver, hosts file, and static overrides, but deliberately
+    /// enforce a stricter address boundary than ordinary proxy backends. The
+    /// resolver/cache internals stay shared; every fresh result is evaluated
+    /// against the replacement policy before it is returned.
+    #[cfg(feature = "acme")]
+    pub(crate) fn with_backend_egress_policy(
+        &self,
+        backend_allow_ips: crate::config::BackendEgressPolicy,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.backend_allow_ips = backend_allow_ips;
+        cloned
+    }
+
     pub fn new(config: DnsConfig) -> Self {
         let resolver_label: Arc<str> = match &config.resolver_addresses {
             Some(addrs) => Arc::from(addrs.as_str()),

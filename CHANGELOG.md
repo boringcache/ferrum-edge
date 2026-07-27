@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- ACME issuance and renewal now route every connection through a
+  Ferrum-controlled, public-only fresh-DNS connector; reject mixed/private DNS
+  answers, endpoint origin drift, credential-directory mismatch, legacy
+  credential URL sets, hostile order resource URLs, and redirects while
+  preserving HTTPS hostname/certificate verification. **Breaking:** ACME
+  servers that advertise endpoints on another host or port, and pre-0.4
+  `instant-acme` credentials with embedded `urls`, must be migrated to the
+  configured directory origin (#2407).
 - `response_caching` now applies RFC 9111 §3.5 shared-cache admission to the
   live request credential rather than only to a gateway-minted identity, so a
   gateway that forwards `Authorization` to a backend that validates it no longer
