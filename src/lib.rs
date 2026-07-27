@@ -298,12 +298,17 @@ pub mod _test_support {
     /// DTLS frontend listener without widening the production plugin catalog.
     /// Build the request epoch after calling this so the published snapshot
     /// includes the injected plugin.
+    ///
+    /// `namespace` is required: the plugin cache is keyed by the full
+    /// `(namespace, proxy_id)` identity, so an injection under a bare id would
+    /// never be resolved by the request path.
     pub fn prepend_proxy_plugin_for_test(
         cache: &crate::PluginCache,
+        namespace: &str,
         proxy_id: &str,
         plugin: Arc<dyn Plugin>,
     ) -> Result<(), String> {
-        cache.prepend_proxy_plugin_for_test(proxy_id, plugin)
+        cache.prepend_proxy_plugin_for_test(namespace, proxy_id, plugin)
     }
 
     /// Deterministic allocator helper for proxy lifecycle ownership generations.
@@ -341,9 +346,99 @@ pub mod _test_support {
     pub fn incremental_plugin_rebuild_targets_for_test(
         current: &crate::config::types::GatewayConfig,
         candidate: &crate::config::types::GatewayConfig,
-    ) -> HashSet<String> {
+    ) -> HashSet<crate::config::db_backend::NamespacedResourceId> {
         let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
         crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
+    }
+
+    /// Whether the published plugin cache still holds a proxy plugin list for
+    /// `(namespace, id)`.
+    pub fn plugin_cache_contains_proxy_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> bool {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id);
+        cache.load_inner().proxy_plugins.contains_key(&key)
+    }
+
+    /// Resolve a proxy's protocol-filtered plugin list the way the TCP/UDP/mesh
+    /// stream paths do: through the namespace-composing `PluginCacheInner`
+    /// accessor (thread-local key scratch, no per-lookup `String`).
+    pub fn plugins_for_protocol_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .plugins_for_protocol(namespace, proxy_id, protocol)
+    }
+
+    /// Resolve the same protocol plugin list with a BARE proxy ID — the
+    /// spelling that misses every namespace-keyed protocol entry and silently
+    /// falls back to the global chain (issue #3094). Exposed only so
+    /// regression coverage can pin that difference; production stream paths
+    /// must never look up by raw ID.
+    pub fn plugins_for_protocol_by_bare_proxy_id_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .get_plugins_for_protocol(proxy_id, protocol)
+    }
+
+    /// Resolve a proxy's initial-response-header policy chain the way the
+    /// HTTP/3 request path does: through the namespace-composing
+    /// `PluginCacheInner` accessor.
+    pub fn initial_response_header_policy_plugins_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .initial_response_header_policy_plugins(namespace, proxy_id, protocol)
+    }
+
+    /// Resolve the same chain with a BARE proxy ID — the spelling that misses
+    /// every namespace-keyed protocol entry and silently falls back to the
+    /// global chain (issue #3094). Exposed only so regression coverage can pin
+    /// that difference; production code must never look up by raw ID.
+    pub fn initial_response_header_policy_plugins_by_bare_proxy_id_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .get_initial_response_header_policy_plugins(proxy_id, protocol)
+    }
+
+    /// Whether the service-discovery loop would prune `proxy`'s passive-health
+    /// state for a discovery update on upstream `(upstream_namespace,
+    /// upstream_id)`. Exposes the namespace-qualified proxy-selection predicate
+    /// so regression coverage can prove a discovery update in one tenant never
+    /// prunes a same-id upstream's proxy in another tenant (issue #3094).
+    pub fn proxy_targets_discovered_upstream_for_test(
+        proxy: &crate::config::types::Proxy,
+        upstream_namespace: &str,
+        upstream_id: &str,
+    ) -> bool {
+        crate::service_discovery::proxy_targets_discovered_upstream(
+            proxy,
+            upstream_namespace,
+            upstream_id,
+        )
+    }
+
+    /// Service-discovery task ownership key for a namespace-scoped upstream.
+    pub fn service_discovery_task_key_for_test(namespace: &str, upstream_id: &str) -> String {
+        crate::service_discovery::service_discovery_task_key(namespace, upstream_id)
     }
 
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
@@ -475,7 +570,7 @@ pub mod _test_support {
         proxy_id: &str,
     ) -> GrpcWebPluginViewForTest {
         let inner = cache.load_inner();
-        let view = inner.grpc_web_request_view(proxy_id);
+        let view = inner.grpc_web_request_view("ferrum", proxy_id);
         GrpcWebPluginViewForTest {
             plugins: view
                 .plugins()
@@ -1204,6 +1299,14 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    pub fn tcp_listener_proxy_for_test(
+        config: &crate::config::types::GatewayConfig,
+        proxy_namespace: &str,
+        proxy_id: &str,
+    ) -> Option<crate::config::types::Proxy> {
+        crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
     }
 
     /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
@@ -3945,6 +4048,34 @@ pub mod _test_support {
             crate::proxy::LoadBalancerConnectionGuard::new(None, None),
         ));
         crate::proxy::body::inspected_streaming_body(rx)
+    }
+
+    pub fn mesh_tcp_egress_connection_accounting_for_test(
+        cache: &crate::load_balancer::LoadBalancerCache,
+        namespace: &str,
+        upstream_id: &str,
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<(i64, i64)> {
+        let snapshot = cache.load_inner();
+        let balancer =
+            crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
+        let target_key = crate::load_balancer::target_host_port_key(target);
+        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(Arc::new(target.clone())),
+            Some(Arc::clone(&balancer)),
+        );
+        let during = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        drop(guard);
+        let after = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        Some((during, after))
     }
 
     pub fn h3_plugin_protocol_for_request_for_test(

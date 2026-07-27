@@ -6554,7 +6554,13 @@ async fn validate_restore_candidate_on_blocking_pool(
     backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
     let (candidate, result) = tokio::task::spawn_blocking(move || {
+        // Identity first: restore stamps namespaces from the already-validated
+        // X-Ferrum-Namespace header, but payload resource IDs are hostile
+        // boundary input. Reject malformed IDs before any other domain check so
+        // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
+        // that would later collide after `namespace|id` encoding (issue #3094).
         let result = ValidationPipeline::new(&mut candidate)
+            .validate_resource_ids(ValidationAction::Collect)
             .validate_all_fields_with_ip_policy(
                 cert_expiry_days,
                 &backend_allow_ips,

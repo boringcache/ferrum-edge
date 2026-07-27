@@ -1620,14 +1620,16 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
-        `proxy_name` is live display metadata for the stable `proxy_id` and is
-        not part of the registry key, so name-only reloads keep accumulated
-        counter values. Both formats resolve active IDs through the same
-        snapshot of the published configuration, so late retired-generation
-        traffic cannot restore an old name. As a Prometheus label, a rename
-        creates a controlled label transition whose new series carries the
-        existing cumulative value. Overlapping pricing generations collapse
-        under that authoritative current name.
+        Charge identity is the matched proxy's `(namespace, proxy_id)`, including
+        for gateway-wide global plugin instances. `proxy_name` is live display
+        metadata and is not part of the registry key, so name-only reloads keep
+        accumulated counter values. Both formats resolve active identities
+        through the same namespace-qualified snapshot of the published
+        configuration, so late retired-generation traffic cannot restore an old
+        name. As a Prometheus label, a rename creates a controlled label
+        transition whose new series carries the existing cumulative value.
+        Overlapping pricing generations collapse under that authoritative
+        current name.
 
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
@@ -11020,8 +11022,14 @@ components:
                 listener is serving.
               items:
                 type: object
-                required: [proxy_id, listen_port, error, kind]
+                required: [namespace, proxy_id, listen_port, error, kind]
                 properties:
+                  namespace:
+                    type: string
+                    description: |
+                      Namespace owning the proxy. Proxy IDs are unique only
+                      within a namespace, so `(namespace, proxy_id, listen_port)`
+                      is the identity of an entry.
                   proxy_id:
                     type: string
                     description: ID of the proxy whose stream listener is not serving.
@@ -11681,11 +11689,19 @@ components:
         Direct-backend proxies (no upstream) emit one per-proxy entry without
         `target`. Proxies with upstream targets emit one independent breaker per
         target and include `target` as `host:port`.
-      required: [proxy_id, state, failure_count, success_count]
+
+        Runtime cache keys are namespace-qualified; authenticated admin output
+        keeps the original resource id in `proxy_id` and exposes `namespace`
+        separately so same-id tenants remain distinguishable.
+      required: [namespace, proxy_id, state, failure_count, success_count]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this proxy
+          example: ferrum
         proxy_id:
           type: string
-          description: ID of the proxy this circuit breaker protects
+          description: ID of the proxy this circuit breaker protects (not namespace-qualified)
         target:
           type: string
           description: |
@@ -11711,15 +11727,26 @@ components:
       type: object
       description: |
         One unhealthy target excluded from load balancing. Active health checks
-        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
-        are proxy-scoped (`type=passive` and always include `proxy_id`).
-      required: [target, type, since_epoch_ms]
+        are upstream-scoped (`type=active`, `upstream_id` present, no `proxy_id`).
+        Passive health checks are proxy-scoped (`type=passive`, `proxy_id` present,
+        no `upstream_id`). Namespace is always explicit so same-id resources in
+        different tenants remain distinguishable.
+      required: [namespace, target, type, since_epoch_ms]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this health entry
+          example: ferrum
         proxy_id:
           type: string
           description: |
             Proxy that owns this passive health entry. Required when
             `type` is `passive`; omitted when `type` is `active`.
+        upstream_id:
+          type: string
+          description: |
+            Upstream that owns this active health entry. Required when
+            `type` is `active`; omitted when `type` is `passive`.
         target:
           type: string
           description: "Target in host:port format"
@@ -11742,12 +11769,15 @@ components:
             required: [type]
           then:
             required: [proxy_id]
+            not:
+              required: [upstream_id]
         - if:
             properties:
               type:
                 const: active
             required: [type]
           then:
+            required: [upstream_id]
             not:
               required: [proxy_id]
 
@@ -11766,6 +11796,29 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
+    AdminMetricsUpstreamConnections:
+      type: object
+      description: |
+        Active connection counts for one upstream. Namespace and upstream_id are
+        separate fields so same-id upstreams in different tenants stay distinct.
+      required: [namespace, upstream_id, targets]
+      properties:
+        namespace:
+          type: string
+          description: Namespace that owns this upstream
+          example: ferrum
+        upstream_id:
+          type: string
+          description: Upstream ID (not namespace-qualified)
+          example: upstream-users
+        targets:
+          type: object
+          additionalProperties:
+            type: integer
+          description: |
+            Map of `host:port` → active_connection_count. Only targets with
+            count > 0 are included.
+
     AdminMetricsLoadBalancers:
       type: object
       description: |
@@ -11774,14 +11827,12 @@ components:
         distribution across targets and spotting hot targets.
       properties:
         active_connections:
-          type: object
-          additionalProperties:
-            type: object
-            additionalProperties:
-              type: integer
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminMetricsUpstreamConnections"
           description: |
-            Nested map: upstream_id → { "host:port" → active_connection_count }.
-            Only targets with count > 0 are included.
+            One entry per upstream that currently has active connections.
+            Identity is `(namespace, upstream_id)`; target keys remain `host:port`.
 
     AdminMetricsCaches:
       type: object
@@ -12597,7 +12648,7 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload. Requires a fully-open backend egress policy: librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned client exposes no connect/resolve callback, so those addresses cannot be screened. Admission returns 400 whenever FERRUM_BACKEND_* policy can deny any address (including the default posture). broker_list is parsed with librdkafka's [proto://]host[:port] grammar, so protocol-prefixed denied literals and protocol prefixes that disagree with security_protocol are rejected."
       required:
         - broker_list
         - topic
@@ -22752,13 +22803,19 @@ components:
                 additionalProperties:
                   type: object
                   properties:
+                    proxy_id:
+                      type: string
+                      description: Stable ID of the matched proxy within `namespace`.
+                    namespace:
+                      type: string
+                      description: Namespace of the matched proxy for this charge row.
                     proxy_name:
                       type: string
                       description: |
-                        Live display name for the stable `proxy_id`. Not part of
-                        the in-memory chargeback key, so name-only reloads
+                        Live display name for the stable `(namespace, proxy_id)`.
+                        Not part of the in-memory chargeback key, so name-only reloads
                         preserve accumulated counter values. JSON and Prometheus
-                        resolve active IDs through the same snapshot of the
+                        resolve active identities through the same snapshot of the
                         published configuration; late retired-generation traffic
                         cannot restore an old name. As a Prometheus label, a
                         rename creates a controlled label transition whose new
