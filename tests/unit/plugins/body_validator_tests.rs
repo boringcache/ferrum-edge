@@ -4174,10 +4174,7 @@ fn non_string_schema_keywords_fail_closed() {
         let error = BodyValidator::new(&json!({"json_schema": schema}))
             .err()
             .expect("non-string schema keyword must fail closed");
-        assert!(
-            error.contains(needle),
-            "expected {needle:?} in {error}"
-        );
+        assert!(error.contains(needle), "expected {needle:?} in {error}");
     }
 }
 
@@ -4193,10 +4190,7 @@ fn draft7_schema_mismatch_names_the_configured_draft() {
     let error = BodyValidator::new(&mismatched)
         .err()
         .expect("draft mismatch must fail closed");
-    assert!(
-        error.contains("unsupported '$schema'"),
-        "{error}"
-    );
+    assert!(error.contains("unsupported '$schema'"), "{error}");
     assert!(
         error.contains("draft7"),
         "rejection must name the configured draft: {error}"
