@@ -61,7 +61,10 @@ fn test_unknown_config_keys_rejected_with_spelling_suggestion() {
     .expect("misspelled strict-check key must be rejected");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("require_buffered_checks"), "{err}");
-    assert!(err.contains("did you mean 'require_buffered_check'?"), "{err}");
+    assert!(
+        err.contains("did you mean 'require_buffered_check'?"),
+        "{err}"
+    );
 
     let shared = validate_plugin_config(
         "response_size_limiting",

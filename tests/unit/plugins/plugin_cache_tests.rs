@@ -2208,10 +2208,7 @@ fn test_response_size_limiting_rebuild_rejects_unknown_keys_and_keeps_last_known
     let error = cache
         .rebuild(&malformed)
         .expect_err("unknown response_size_limiting key must reject cache publication");
-    assert!(
-        error.contains("require_buffered_checks"),
-        "got: {error}"
-    );
+    assert!(error.contains("require_buffered_checks"), "got: {error}");
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);

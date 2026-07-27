@@ -65,9 +65,7 @@ fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<bool, String>
     match config.get(key) {
         None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!(
-            "response_size_limiting: '{key}' must be a boolean"
-        )),
+        Some(_) => Err(format!("response_size_limiting: '{key}' must be a boolean")),
     }
 }
 
