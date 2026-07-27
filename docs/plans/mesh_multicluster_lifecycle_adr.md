@@ -73,10 +73,76 @@ secret, a posture now warned-as-deprecated in production multi-cluster. Because
 the remote CP validates the HS256 signature with its own secret, a token issued
 for one cluster cannot authenticate to another.
 
-The remaining auth hardening step is **explicit JWT audience-claim binding**:
-minting the discovery token with an `aud` scoped to the target cluster plus
-remote-CP-side audience validation, as defense-in-depth layered on top of the
-per-remote secret isolation (the per-remote secret already provides the cluster
-binding). The minted-token issuer continues to follow the shared
+Explicit JWT **audience-claim binding** is now **implemented** (issue #2475),
+as defense-in-depth layered on top of — never instead of — the per-remote
+secret isolation. The minted-token issuer continues to follow the shared
 `FERRUM_CP_DP_GRPC_JWT_ISSUER` because the remote CP pins the issuer, not a
 per-remote one.
+
+## Decision — Remote-Discovery Audience Binding
+
+Signature, issuer, and expiry bind a discovery token to a *credential*, not to
+a *destination*. Under the supported (deprecated) shared-secret fallback, two
+clusters sharing `FERRUM_CP_DP_GRPC_JWT_SECRET` and the same issuer accepted
+each other's discovery tokens. Ferrum binds each token to its target cluster:
+
+- The **target-cluster identifier** is stable, operator-visible, and
+  deliberately independent of the mutable `control_plane_url`: the polling data
+  plane uses `RemoteCluster.name`, and the receiving control plane declares the
+  same identifier as `FERRUM_MESH_CLUSTER_AUDIENCE`. Neither value is a secret
+  and neither is derived from one, so nothing credential-bearing is added to
+  `RemoteCluster` or serialized into a mesh slice.
+- The poller mints `aud = "ferrum-mesh-discovery:<RemoteCluster.name>"` as a
+  **single-valued string** claim and marks the subscription
+  `MeshSubscribeRequest.remote_discovery = true`.
+- The receiving control plane requires exactly one `aud` equal to
+  `ferrum-mesh-discovery:<FERRUM_MESH_CLUSTER_AUDIENCE>`. Missing, malformed,
+  multiple/ambiguous, and mismatched audiences are refused, and a control plane
+  with **no** `FERRUM_MESH_CLUSTER_AUDIENCE` refuses every cross-cluster
+  subscription rather than accepting an unbound one.
+
+**Token-purpose separation.** Ordinary local mesh `MeshSubscribe` tokens carry
+the stable fixed audience `ferrum-mesh-subscribe:local`; discovery tokens carry
+the target-specific `ferrum-mesh-discovery:<cluster>` audience. The server
+requires the exact audience selected by the request class, so clearing
+`remote_discovery` cannot downgrade a discovery token, setting it cannot
+upgrade a local token, and the false/default branch cannot admit a legacy
+no-audience token. Ordinary CP↔DP `ConfigSync` and xDS ADS remain unchanged:
+their tokens carry **no** audience and their verifiers refuse every
+audience-bearing token, preserving `jsonwebtoken`'s strict `validate_aud`
+posture.
+
+Every other check is unchanged and still applies first: HS256 signature against
+the per-remote or shared secret, required `exp`/`iat`/`sub`/`iss`, pinned
+issuer, the `ns` namespace claim, TLS/production transport posture, and
+fail-closed per-remote credential resolution. (DP tokens still *mint* a
+`role: data_plane` claim for operator/tooling conventions; the CP gRPC
+verifier does not authorize on it.) A refused subscription fails the whole poll, so the data
+plane keeps that cluster's last-good endpoints under the existing
+`FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS` window. Refusals are counted
+as `ferrum_mesh_subscribe_audience_rejections_total{subscription,reason}` with
+compile-time-constant labels and audited as
+`audit.event="mesh_subscribe_audience_rejected"`; no token, claim value, or
+expected audience is ever logged or exported.
+
+### Compatibility
+
+This decision intentionally breaks mixed-version native `MeshSubscribe`.
+Pre-change local clients and pre-#3202 remote pollers both present
+`remote_discovery=false` with no `aud`; a new receiver cannot distinguish those
+wire shapes and refuses both. New local clients present
+`ferrum-mesh-subscribe:local`, and new remote pollers present a
+`ferrum-mesh-discovery:<cluster>` audience; an old receiver refuses either
+audience-bearing token. Control planes and all native local/remote
+MeshSubscribe clients must therefore be upgraded as one compatibility unit.
+Ordinary ConfigSync and xDS remain audience-less and are not part of this
+breaking change.
+
+### Residual
+
+`RemoteCluster.name` is reused as the target-cluster identifier rather than
+introducing a separate per-cluster audience override field. That requires the
+name to be the identifier the peer knows itself by (the Istio cluster-id
+convention) instead of a local-only alias. An explicit override on
+`RemoteCluster` can be added later without changing the wire contract or the
+verifier.
