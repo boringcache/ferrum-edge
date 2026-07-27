@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
@@ -32,6 +33,74 @@ const MAX_CONTENT_CODINGS: usize = 4;
 /// decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
 static INSTANCE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Error prefix shared by every construction diagnostic.
+const ERROR_PREFIX: &str = "openapi_validator: ";
+
+/// Exhaustive fixed-field key sets. Every object below is a *fixed-field*
+/// object: an unrecognized key is a typo that would otherwise silently select a
+/// weaker default (GHSA-692x-352q-6gm8). Intentionally free-form maps -- media
+/// type maps, response status maps, `bypass.header_present`, encoding property
+/// maps, and JSON Schema values -- are structurally distinguished instead of
+/// key-enumerated: their keys are validated for shape (media type, status key,
+/// header name) rather than membership.
+const CONFIG_KEYS: &[&str] = &[
+    "enforcement_mode",
+    "validate_request",
+    "validate_response",
+    "fail_on_unknown_operation",
+    "fail_on_missing_response_schema",
+    "max_body_bytes",
+    "request_content_types",
+    "response_content_types",
+    "schema_draft",
+    "operations",
+    "bypass",
+    "error_response",
+    "error_truncate_chars",
+];
+const OPERATION_KEYS: &[&str] = &[
+    "method",
+    "path_template",
+    "path_regex",
+    "operation_label",
+    "request_required",
+    "request_body",
+    "responses",
+];
+const BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"];
+const ERROR_RESPONSE_KEYS: &[&str] = &[
+    "request_status_code",
+    "response_status_code",
+    "content_type",
+];
+/// Alternate single-schema request-body form.
+const REQUEST_BODY_INLINE_KEYS: &[&str] = &["content_type", "schema", "encoding"];
+/// Canonical request-body form.
+const REQUEST_BODY_CONTENT_KEYS: &[&str] = &["content"];
+/// Media Type Object wrapper inside a content map.
+const MEDIA_TYPE_OBJECT_KEYS: &[&str] = &["schema", "encoding"];
+/// Fixed fields retained on a generated response object that carries `content`.
+const RESPONSE_OBJECT_KEYS: &[&str] = &["description", "content"];
+/// OpenAPI Header Object fields accepted inside request-body Encoding Objects.
+///
+/// A Header Object is distinguished from the supported bare-schema form by its
+/// `schema` or `content` field. Once that wrapper shape is selected, it is a
+/// fixed-field object: accepting a misspelled `required` would silently make a
+/// required multipart header optional.
+const ENCODING_HEADER_OBJECT_KEYS: &[&str] = &[
+    "description",
+    "required",
+    "deprecated",
+    "allowEmptyValue",
+    "style",
+    "explode",
+    "allowReserved",
+    "schema",
+    "example",
+    "examples",
+    "content",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -315,13 +384,27 @@ impl OperationEntry {
         !self.response_validators.is_empty()
     }
 
-    fn response_validator(
-        &self,
-        status: u16,
-        content_type: Option<&str>,
-    ) -> Option<&MediaValidator> {
-        self.response_validators.validator(status, content_type)
+    fn select_response(&self, status: u16, content_type: Option<&str>) -> ResponseSelection<'_> {
+        self.response_validators.select(status, content_type)
     }
+}
+
+/// Outcome of OpenAPI response-object selection.
+///
+/// Selection is status-first: an exact status declaration precludes range
+/// (`4XX`) and `default` fallback, because `default` covers status codes that
+/// are *not otherwise declared*. Media selection then happens only inside the
+/// selected response object, so a media miss can never reach another response
+/// object's schema (GHSA-cjqx-p554-5rx9).
+enum ResponseSelection<'a> {
+    /// A response object was selected and one of its media entries matched.
+    Media(&'a MediaValidator),
+    /// A response object was selected but none of its media entries matched.
+    MediaMismatch,
+    /// A response object was selected and declares no content at all.
+    NoContentDeclared,
+    /// No response object covers this status.
+    NoResponseObject,
 }
 
 impl ResponseValidators {
@@ -334,21 +417,33 @@ impl ResponseValidators {
                 .is_none_or(|validators| validators.is_empty())
     }
 
-    fn validator(&self, status: u16, content_type: Option<&str>) -> Option<&MediaValidator> {
-        self.exact
+    /// Select the response object by status, then the media entry inside it.
+    ///
+    /// Precedence is exact status, then the narrowest declared range, then
+    /// `default`. A miss on media type inside the selected object never falls
+    /// through to a less specific response object.
+    fn select(&self, status: u16, content_type: Option<&str>) -> ResponseSelection<'_> {
+        let selected = self
+            .exact
             .get(&status)
-            .and_then(|validators| validator_for_content_type(validators, content_type))
             .or_else(|| {
                 self.ranges
                     .iter()
-                    .find(|range| (range.start..=range.end).contains(&status))
-                    .and_then(|range| validator_for_content_type(&range.validators, content_type))
+                    .filter(|range| (range.start..=range.end).contains(&status))
+                    .min_by_key(|range| range.end.saturating_sub(range.start))
+                    .map(|range| &range.validators)
             })
-            .or_else(|| {
-                self.default
-                    .as_ref()
-                    .and_then(|validators| validator_for_content_type(validators, content_type))
-            })
+            .or(self.default.as_ref());
+        let Some(validators) = selected else {
+            return ResponseSelection::NoResponseObject;
+        };
+        if validators.is_empty() {
+            return ResponseSelection::NoContentDeclared;
+        }
+        match validator_for_content_type(validators, content_type) {
+            Some(validator) => ResponseSelection::Media(validator),
+            None => ResponseSelection::MediaMismatch,
+        }
     }
 }
 
@@ -380,6 +475,10 @@ impl OpenapiValidator {
         let object = config
             .as_object()
             .ok_or_else(|| "openapi_validator: config must be an object".to_string())?;
+        // Fail closed on typos before any default is applied: a misspelled
+        // enforcement control would otherwise construct successfully with the
+        // weaker default still in force (GHSA-692x-352q-6gm8).
+        reject_unknown_keys(object, "config", CONFIG_KEYS, ERROR_PREFIX)?;
 
         let mode = parse_mode(optional_string(object, "enforcement_mode")?.unwrap_or("block"))?;
         let validate_request = optional_bool(object, "validate_request")?.unwrap_or(true);
@@ -395,22 +494,18 @@ impl OpenapiValidator {
                 "openapi_validator: 'max_body_bytes' must be greater than zero".to_string(),
             );
         }
-        let request_content_types = optional_string_vec(object, "request_content_types")?
-            .unwrap_or_else(default_content_types)
-            .into_iter()
-            .map(|value| normalize_media_type(&value))
-            .collect();
-        let response_content_types = optional_string_vec(object, "response_content_types")?
-            .unwrap_or_else(default_content_types)
-            .into_iter()
-            .map(|value| normalize_media_type(&value))
-            .collect();
-        let schema_draft = match optional_string(object, "schema_draft")? {
-            Some(value) => parse_schema_draft(value)?,
-            None => {
-                parse_schema_draft(optional_string(object, "json_schema_draft")?.unwrap_or("auto"))?
-            }
-        };
+        let request_content_types = normalize_configured_media_types(
+            optional_string_vec(object, "request_content_types")?
+                .unwrap_or_else(default_content_types),
+            "request_content_types",
+        )?;
+        let response_content_types = normalize_configured_media_types(
+            optional_string_vec(object, "response_content_types")?
+                .unwrap_or_else(default_content_types),
+            "response_content_types",
+        )?;
+        let schema_draft =
+            parse_schema_draft(optional_string(object, "schema_draft")?.unwrap_or("auto"))?;
 
         let operations_value = object
             .get("operations")
@@ -462,7 +557,10 @@ impl OpenapiValidator {
             );
         }
 
-        let bypass = object.get("bypass").and_then(Value::as_object);
+        let bypass = optional_object(object, "bypass")?;
+        if let Some(bypass) = bypass {
+            reject_unknown_keys(bypass, "config.bypass", BYPASS_KEYS, ERROR_PREFIX)?;
+        }
         let bypass_paths = parse_regex_set(bypass.and_then(|b| b.get("paths")), "bypass.paths")?;
         let bypass_methods = optional_string_vec_from_object(bypass, "methods")?
             .unwrap_or_default()
@@ -476,7 +574,15 @@ impl OpenapiValidator {
         let bypass_header_present =
             parse_header_present(bypass.and_then(|b| b.get("header_present")))?;
 
-        let error_response = object.get("error_response").and_then(Value::as_object);
+        let error_response = optional_object(object, "error_response")?;
+        if let Some(error_response) = error_response {
+            reject_unknown_keys(
+                error_response,
+                "config.error_response",
+                ERROR_RESPONSE_KEYS,
+                ERROR_PREFIX,
+            )?;
+        }
         let request_error_status =
             optional_u16_from_object(error_response, "request_status_code")?.unwrap_or(400);
         let response_error_status =
@@ -485,6 +591,7 @@ impl OpenapiValidator {
         validate_status(response_error_status, "error_response.response_status_code")?;
         let error_content_type = optional_string_from_object(error_response, "content_type")?
             .unwrap_or_else(|| "application/problem+json".to_string());
+        validate_concrete_media_type(&error_content_type, "error_response.content_type")?;
         let error_truncate_chars =
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
@@ -723,6 +830,30 @@ impl OpenapiValidator {
         }
     }
 
+    /// Strict-mode outcome when the response contract selected no schema.
+    ///
+    /// `fail_on_missing_response_schema` covers missing, out-of-scope, and
+    /// unmatched content types after status selection; permissive mode records
+    /// the skip reason and continues (GHSA-cjqx-p554-5rx9).
+    fn missing_response_schema(
+        &self,
+        ctx: &mut RequestContext,
+        operation: &OperationEntry,
+        skip_reason: &'static str,
+        detail: String,
+    ) -> PluginResult {
+        if self.fail_on_missing_response_schema {
+            return self.handle_violation(
+                ctx,
+                ValidationSide::Response,
+                Some(&operation.operation_label),
+                detail,
+            );
+        }
+        self.mark_skip(ctx, skip_reason);
+        PluginResult::Continue
+    }
+
     fn request_validator<'a>(
         &'a self,
         operation: &'a OperationEntry,
@@ -801,6 +932,12 @@ impl Plugin for OpenapiValidator {
         if !operation.has_request_schema() {
             return false;
         }
+        if operation.request_required {
+            // Presence is independent of representation selection. Buffering is
+            // required to distinguish an actually empty chunked body from a
+            // non-empty body whose Content-Type is absent or out of scope.
+            return true;
+        }
         let content_type = header_value(&ctx.headers, "content-type");
         self.request_validator(operation, content_type).is_some()
     }
@@ -856,7 +993,14 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "content_type");
             return PluginResult::Continue;
         };
-        match validate_media_body(headers, body, content_type, validator, self.max_body_bytes) {
+        match validate_media_body(
+            headers,
+            body,
+            content_type,
+            validator,
+            self.max_body_bytes,
+            ValidationSide::Request,
+        ) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
@@ -868,15 +1012,25 @@ impl Plugin for OpenapiValidator {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.active() && self.validate_response && self.has_any_response_schema
+        self.active()
+            && self.validate_response
+            && (self.has_any_response_schema || self.fail_on_missing_response_schema)
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
             && self.bypass_reason(ctx).is_none()
-            && self
-                .operation_for_context(ctx)
-                .is_some_and(OperationEntry::has_response_schema)
+            && self.operation_for_context(ctx).is_some_and(|operation| {
+                operation.has_response_schema() || self.fail_on_missing_response_schema
+            })
+    }
+
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        !response_has_no_body_semantics(&ctx.method, response_status)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -967,29 +1121,76 @@ impl Plugin for OpenapiValidator {
             return PluginResult::Continue;
         };
         self.mark_operation_entry(ctx, operation);
-        if body.is_empty() {
+        // Explicit body-absence semantics. RFC 9110 forbids a body for these,
+        // so no representation is expected and none of the strict paths below
+        // apply. Every other status reaches media selection even with an empty
+        // body, so an empty payload under a schema-bearing content type is
+        // parsed and rejected rather than silently continuing.
+        if response_has_no_body_semantics(&ctx.method, response_status) {
+            self.mark_skip(ctx, "no_body_expected");
             return PluginResult::Continue;
         }
         let content_type = header_value(response_headers, "content-type");
-        if !content_type_in_scope(&self.response_content_types, content_type) {
-            self.mark_skip(ctx, "content_type");
-            return PluginResult::Continue;
-        }
-        let Some(validator) = operation.response_validator(response_status, content_type) else {
-            if self.fail_on_missing_response_schema {
-                return self.handle_violation(
+        let missing_schema_detail = |reason: &str| {
+            // `Content-Type` is backend-controlled. Report only whether it was
+            // present; never reflect its raw value into the client problem body
+            // or transaction metadata.
+            let content_type_state = if content_type.is_some() {
+                "present"
+            } else {
+                "missing"
+            };
+            format!("{reason} for status {response_status} (Content-Type {content_type_state})")
+        };
+        // Status selection first, so an exact declared status can never fall
+        // through to a range or `default` response object on a media miss.
+        let validator = match operation.select_response(response_status, content_type) {
+            ResponseSelection::Media(validator) => {
+                // Scope is a deployment-side filter applied after the contract
+                // selected a schema; strict mode still rejects out-of-scope
+                // representations rather than skipping them.
+                if !content_type_in_scope(&self.response_content_types, content_type) {
+                    return self.missing_response_schema(
+                        ctx,
+                        operation,
+                        "content_type",
+                        missing_schema_detail(
+                            "Response content type is outside the configured validation scope",
+                        ),
+                    );
+                }
+                validator
+            }
+            ResponseSelection::NoContentDeclared if body.is_empty() => {
+                self.mark_skip(ctx, "no_response_content");
+                return PluginResult::Continue;
+            }
+            ResponseSelection::NoContentDeclared => {
+                return self.missing_response_schema(
                     ctx,
-                    ValidationSide::Response,
-                    Some(&operation.operation_label),
-                    format!(
-                        "No response schema matched status {} and content type {}",
-                        response_status,
-                        content_type.unwrap_or("<missing>")
+                    operation,
+                    "no_schema",
+                    missing_schema_detail(
+                        "Response declares no content but the backend returned a body",
                     ),
                 );
             }
-            self.mark_skip(ctx, "no_schema");
-            return PluginResult::Continue;
+            ResponseSelection::MediaMismatch => {
+                return self.missing_response_schema(
+                    ctx,
+                    operation,
+                    "content_type",
+                    missing_schema_detail("No declared response media type matched"),
+                );
+            }
+            ResponseSelection::NoResponseObject => {
+                return self.missing_response_schema(
+                    ctx,
+                    operation,
+                    "no_schema",
+                    missing_schema_detail("No response schema matched"),
+                );
+            }
         };
         match validate_media_body(
             response_headers,
@@ -997,6 +1198,7 @@ impl Plugin for OpenapiValidator {
             content_type,
             validator,
             self.max_body_bytes,
+            ValidationSide::Response,
         ) {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
@@ -1019,6 +1221,18 @@ fn anchor_path_regex(raw: &str) -> String {
     format!("^(?:{raw})$")
 }
 
+/// Statuses and methods for which HTTP defines no response body.
+///
+/// A HEAD response, an informational status, `204 No Content`, `205 Reset
+/// Content`, and `304 Not Modified` carry no representation, so response schema
+/// selection is skipped instead of treating an absent body as a contract
+/// violation.
+fn response_has_no_body_semantics(method: &str, status: u16) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || matches!(status, 204 | 205 | 304)
+}
+
 fn parse_operation(
     value: &Value,
     index: usize,
@@ -1027,6 +1241,12 @@ fn parse_operation(
     let object = value
         .as_object()
         .ok_or_else(|| format!("openapi_validator: operations[{index}] must be an object"))?;
+    reject_unknown_keys(
+        object,
+        &format!("config.operations[{index}]"),
+        OPERATION_KEYS,
+        ERROR_PREFIX,
+    )?;
     let method = optional_string(object, "method")?
         .ok_or_else(|| format!("openapi_validator: operations[{index}].method is required"))?
         .to_ascii_uppercase();
@@ -1054,12 +1274,15 @@ fn parse_operation(
     let operation_label = optional_string(object, "operation_label")?
         .map(str::to_string)
         .unwrap_or_else(|| format!("{method} {path_template}"));
-    let request_required = match optional_bool_from_object(Some(object), "request_required")? {
-        Some(value) => value,
-        None => optional_bool_from_object(Some(object), "request_body_required")?.unwrap_or(false),
-    };
+    let request_required =
+        optional_bool_from_object(Some(object), "request_required")?.unwrap_or(false);
     let request_validators =
         parse_request_validators(object.get("request_body"), index, schema_draft)?;
+    if request_required && request_validators.is_empty() {
+        return Err(format!(
+            "openapi_validator: operations[{index}].request_required requires at least one request-body schema"
+        ));
+    }
     let response_validators =
         parse_response_validators(object.get("responses"), index, schema_draft)?;
 
@@ -1085,19 +1308,39 @@ fn parse_request_validators(
         return Ok(AHashMap::new());
     };
     if value.is_null() {
-        return Ok(AHashMap::new());
+        return Err(format!(
+            "openapi_validator: operations[{operation_index}].request_body must be an object"
+        ));
     }
     let object = value.as_object().ok_or_else(|| {
         format!("openapi_validator: operations[{operation_index}].request_body must be an object")
     })?;
+    let path = format!("config.operations[{operation_index}].request_body");
     let mut validators = AHashMap::new();
-    if let (Some(content_type), Some(schema)) = (
-        object.get("content_type").and_then(Value::as_str),
-        object.get("schema"),
-    ) {
+    // The two request-body forms are structurally disjoint so unknown keys are
+    // detectable in both: the alternate single-schema form is keyed by
+    // `content_type`/`schema`/`encoding`, the canonical form by `content`.
+    // The old "the object *is* the media map" fallback made every typo look
+    // like a media type and is no longer accepted (GHSA-692x-352q-6gm8).
+    let is_inline_form = REQUEST_BODY_INLINE_KEYS
+        .iter()
+        .any(|key| object.contains_key(*key));
+    if is_inline_form {
+        reject_unknown_keys(object, &path, REQUEST_BODY_INLINE_KEYS, ERROR_PREFIX)?;
+        let content_type = object
+            .get("content_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("openapi_validator: {path}.content_type is required and must be a string")
+            })?;
+        let schema = object
+            .get("schema")
+            .ok_or_else(|| format!("openapi_validator: {path}.schema is required"))?;
+        validate_media_type_key(content_type, &path)?;
         let media_type = normalize_media_type(content_type);
         let encoding = object.get("encoding");
-        validators.insert(
+        insert_media_validator(
+            &mut validators,
             media_type.clone(),
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
@@ -1106,27 +1349,30 @@ fn parse_request_validators(
                     )
                 },
             )?,
-        );
+            &path,
+        )?;
         return Ok(validators);
     }
+    reject_unknown_keys(object, &path, REQUEST_BODY_CONTENT_KEYS, ERROR_PREFIX)?;
     let content = object
         .get("content")
         .and_then(Value::as_object)
-        .unwrap_or(object);
+        .ok_or_else(|| format!("openapi_validator: {path}.content must be an object"))?;
+    if content.is_empty() {
+        return Err(format!(
+            "openapi_validator: {path}.content must not be empty"
+        ));
+    }
     for (content_type, media_value) in content {
-        if matches!(
-            content_type.as_str(),
-            "content_type" | "schema" | "encoding"
-        ) {
-            continue;
-        }
+        validate_media_type_key(content_type, &format!("{path}.content"))?;
         let media_type = normalize_media_type(content_type);
         let (schema, encoding) = split_media_type_value(media_value).map_err(|error| {
             format!(
                 "openapi_validator: operations[{operation_index}].request_body content['{content_type}'] is invalid: {error}"
             )
         })?;
-        validators.insert(
+        insert_media_validator(
+            &mut validators,
             media_type.clone(),
             compile_media_validator(schema, encoding, &media_type, schema_draft).map_err(
                 |error| {
@@ -1135,7 +1381,8 @@ fn parse_request_validators(
                     )
                 },
             )?,
-        );
+            &format!("{path}.content"),
+        )?;
     }
     Ok(validators)
 }
@@ -1149,7 +1396,9 @@ fn parse_response_validators(
         return Ok(ResponseValidators::default());
     };
     if value.is_null() {
-        return Ok(ResponseValidators::default());
+        return Err(format!(
+            "openapi_validator: operations[{operation_index}].responses must be an object"
+        ));
     }
     let object = value.as_object().ok_or_else(|| {
         format!("openapi_validator: operations[{operation_index}].responses must be an object")
@@ -1162,15 +1411,40 @@ fn parse_response_validators(
                 "openapi_validator: operations[{operation_index}].responses['{status_raw}'] must be an object"
             )
         })?;
-        let content = response_object
-            .get("content")
-            .and_then(Value::as_object)
-            .unwrap_or(response_object);
+        let response_path =
+            format!("config.operations[{operation_index}].responses['{status_raw}']");
+        // Two structurally distinct shapes: a Response Object carrying `content`
+        // (fixed fields, key-enumerated) or the canonical generated media map
+        // (free-form media-type keys, shape-validated). `description` stays
+        // accepted in the media map form and is skipped.
+        let content = match response_object.get("content") {
+            Some(content) => {
+                reject_unknown_keys(
+                    response_object,
+                    &response_path,
+                    RESPONSE_OBJECT_KEYS,
+                    ERROR_PREFIX,
+                )?;
+                content.as_object().ok_or_else(|| {
+                    format!("openapi_validator: {response_path}.content must be an object")
+                })?
+            }
+            None => response_object,
+        };
+        if let Some(description) = response_object.get("description")
+            && !description.is_null()
+            && !description.is_string()
+        {
+            return Err(format!(
+                "openapi_validator: {response_path}.description must be a string"
+            ));
+        }
         let mut validators = AHashMap::new();
         for (content_type, media_value) in content {
             if content_type == "description" {
                 continue;
             }
+            validate_media_type_key(content_type, &response_path)?;
             let (schema, encoding) = split_media_type_value(media_value).map_err(|error| {
                 format!(
                     "openapi_validator: operations[{operation_index}].responses['{status_raw}'] content['{content_type}'] is invalid: {error}"
@@ -1181,8 +1455,10 @@ fn parse_response_validators(
                     "openapi_validator: operations[{operation_index}].responses['{status_raw}'] content['{content_type}'] must not contain an Encoding Object"
                 ));
             }
-            validators.insert(
-                normalize_media_type(content_type),
+            let media_type = normalize_media_type(content_type);
+            insert_media_validator(
+                &mut validators,
+                media_type,
                 compile_media_validator(schema, None, content_type, schema_draft).map_err(
                     |error| {
                         format!(
@@ -1190,13 +1466,28 @@ fn parse_response_validators(
                         )
                     },
                 )?,
-            );
+                &response_path,
+            )?;
         }
         match status {
             ResponseStatusKey::Exact(status) => {
+                if statuses.exact.contains_key(&status) {
+                    return Err(format!(
+                        "openapi_validator: operations[{operation_index}].responses contains duplicate status declarations for '{status}'"
+                    ));
+                }
                 statuses.exact.insert(status, validators);
             }
             ResponseStatusKey::Range(start, end) => {
+                if statuses
+                    .ranges
+                    .iter()
+                    .any(|range| range.start == start && range.end == end)
+                {
+                    return Err(format!(
+                        "openapi_validator: operations[{operation_index}].responses contains duplicate status-range declarations for '{status_raw}'"
+                    ));
+                }
                 statuses.ranges.push(ResponseRangeValidators {
                     start,
                     end,
@@ -1204,6 +1495,11 @@ fn parse_response_validators(
                 });
             }
             ResponseStatusKey::Default => {
+                if statuses.default.is_some() {
+                    return Err(format!(
+                        "openapi_validator: operations[{operation_index}].responses contains duplicate default declarations"
+                    ));
+                }
                 statuses.default = Some(validators);
             }
         }
@@ -1234,14 +1530,37 @@ fn parse_response_status_key(
         let start = class * 100;
         return Ok(ResponseStatusKey::Range(start, start + 99));
     }
-    status_raw
-        .parse::<u16>()
-        .map(ResponseStatusKey::Exact)
-        .map_err(|_| {
-            format!(
-                "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
-            )
-        })
+    if bytes.len() == 3
+        && matches!(bytes[0], b'1'..=b'5')
+        && bytes[1..].iter().all(|byte| byte.is_ascii_digit())
+    {
+        return status_raw
+            .parse::<u16>()
+            .map(ResponseStatusKey::Exact)
+            .map_err(|_| {
+                format!(
+                    "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
+                )
+            });
+    }
+    Err(format!(
+        "openapi_validator: operations[{operation_index}].responses contains invalid status '{status_raw}'"
+    ))
+}
+
+fn insert_media_validator(
+    validators: &mut AHashMap<String, MediaValidator>,
+    media_type: String,
+    validator: MediaValidator,
+    path: &str,
+) -> Result<(), String> {
+    if validators.contains_key(&media_type) {
+        return Err(format!(
+            "{ERROR_PREFIX}'{path}' contains duplicate media type '{media_type}' after normalization"
+        ));
+    }
+    validators.insert(media_type, validator);
+    Ok(())
 }
 
 fn compile_schema(
@@ -1288,7 +1607,7 @@ fn split_media_type_value(value: &Value) -> Result<(&Value, Option<&Value>), Str
     }
     let only_media_type_fields = object
         .keys()
-        .all(|key| matches!(key.as_str(), "schema" | "encoding"));
+        .all(|key| MEDIA_TYPE_OBJECT_KEYS.contains(&key.as_str()));
     if !only_media_type_fields {
         return Err(
             "media type object with encoding may contain only 'schema' and 'encoding'".to_string(),
@@ -1531,7 +1850,7 @@ fn parse_property_encoding(
     }
 
     let content_type = match object.get("contentType") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -1592,6 +1911,11 @@ fn parse_property_encoding(
                     "encoding['{property}'].headers must not redefine '{name}'"
                 ));
             }
+            if headers.contains_key(&name) {
+                return Err(format!(
+                    "encoding['{property}'].headers contains duplicate header name '{name}'"
+                ));
+            }
             // Header Object may wrap `schema`; accept either that public OAS
             // shape or the internal bare-schema representation. Header Object
             // `required` defaults to false (OAS 3.1 §4.8.21), while the
@@ -1605,6 +1929,38 @@ fn parse_property_encoding(
             let is_header_object = header_object.is_some_and(|object| {
                 object.contains_key("schema") || object.contains_key("content")
             });
+            if is_header_object && let Some(header_object) = header_object {
+                reject_unknown_keys(
+                    header_object,
+                    &format!("encoding['{property}'].headers['{header_name}']"),
+                    ENCODING_HEADER_OBJECT_KEYS,
+                    ERROR_PREFIX,
+                )?;
+                if let Some(description) = header_object.get("description")
+                    && !description.is_null()
+                    && !description.is_string()
+                {
+                    return Err(format!(
+                        "encoding['{property}'].headers['{header_name}'].description must be a string"
+                    ));
+                }
+                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
+                    if let Some(value) = header_object.get(key)
+                        && !value.is_boolean()
+                    {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
+                        ));
+                    }
+                }
+                if let Some(examples) = header_object.get("examples")
+                    && !examples.is_object()
+                {
+                    return Err(format!(
+                        "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                    ));
+                }
+            }
             let required = if is_header_object {
                 match header_object.and_then(|object| object.get("required")) {
                     None => false,
@@ -1737,12 +2093,25 @@ fn validate_media_body(
     content_type: Option<&str>,
     validator: &MediaValidator,
     max_body_bytes: usize,
+    side: ValidationSide,
 ) -> Result<(), String> {
-    match body_to_schema_instance(headers, body, content_type, validator, max_body_bytes)? {
+    let instance = body_to_schema_instance(headers, body, content_type, validator, max_body_bytes)
+        .map_err(|error| match side {
+            ValidationSide::Request => error,
+            ValidationSide::Response => {
+                // Conversion errors can contain backend-controlled scalar,
+                // multipart, XML, or header values. Schema failures below have a
+                // structured safe formatter; conversion failures deliberately
+                // expose no backend bytes.
+                "Response body could not be safely decoded or converted for schema validation"
+                    .to_string()
+            }
+        })?;
+    match instance {
         SchemaInstance::Value(instance) => validator
             .validator
             .validate(&instance)
-            .map_err(|error| format_schema_error(&error)),
+            .map_err(|error| format_schema_error(&error, side)),
         SchemaInstance::BinaryLengthOnly => Ok(()),
     }
 }
@@ -3886,11 +4255,35 @@ fn validator_for_content_type<'a>(
     content_type: Option<&str>,
 ) -> Option<&'a MediaValidator> {
     let base = content_type_base(content_type)?;
+    // OpenAPI media-range specificity: the most specific declared entry wins.
+    // Concrete media types (exact, then Ferrum's `+json` / `+xml` / `text/*`
+    // family fallbacks) outrank `type/*`, which outranks `*/*`.
     validators
         .iter()
         .find(|(expected, _)| expected.eq_ignore_ascii_case(base))
         .map(|(_, validator)| validator)
         .or_else(|| fallback_validator_for_media_type(validators, base))
+        .or_else(|| media_range_validator(validators, base))
+}
+
+/// Match a declared `type/*` range, then `*/*`.
+fn media_range_validator<'a>(
+    validators: &'a AHashMap<String, MediaValidator>,
+    actual: &str,
+) -> Option<&'a MediaValidator> {
+    let (actual_type, _) = actual.split_once('/')?;
+    for (expected, validator) in validators {
+        let Some((expected_type, expected_subtype)) = expected.split_once('/') else {
+            continue;
+        };
+        if expected_subtype != "*" || expected_type == "*" {
+            continue;
+        }
+        if expected_type.eq_ignore_ascii_case(actual_type) {
+            return Some(validator);
+        }
+    }
+    validators.get("*/*")
 }
 
 fn content_type_in_scope(configured: &[String], content_type: Option<&str>) -> bool {
@@ -3903,9 +4296,89 @@ fn content_type_in_scope(configured: &[String], content_type: Option<&str>) -> b
             .any(|expected| media_type_matches(expected, base))
 }
 
+fn normalize_configured_media_types(
+    values: Vec<String>,
+    field: &'static str,
+) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        validate_media_type_key(&value, &format!("config.{field}[{index}]"))?;
+        let value = normalize_media_type(&value);
+        if !seen.insert(value.clone()) {
+            return Err(format!(
+                "{ERROR_PREFIX}'{field}' contains duplicate media type '{value}' after normalization"
+            ));
+        }
+        normalized.push(value);
+    }
+    Ok(normalized)
+}
+
 fn content_type_base(content_type: Option<&str>) -> Option<&str> {
     let base = content_type?.split(';').next().unwrap_or("").trim();
     (!base.is_empty()).then_some(base)
+}
+
+/// Structural gate for free-form media-type map keys.
+///
+/// Media-type maps cannot be key-enumerated, so a typo is caught by shape
+/// instead: the key must be `type/subtype`, `type/*`, or `*/*` built from RFC
+/// 9110 tokens. This is what keeps a misspelled fixed field from masquerading
+/// as a media type once the "object is its own content map" fallback is gone.
+fn validate_media_type_key(key: &str, path: &str) -> Result<(), String> {
+    if key.chars().any(char::is_control) {
+        return Err(format!(
+            "{ERROR_PREFIX}'{path}' contains a media type with control characters"
+        ));
+    }
+    let base = key.split(';').next().unwrap_or("").trim();
+    if is_media_type_or_range(base) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{ERROR_PREFIX}'{path}' contains '{key}', which is not a media type or media range"
+        ))
+    }
+}
+
+fn is_media_type_or_range(base: &str) -> bool {
+    let Some((type_, subtype)) = base.split_once('/') else {
+        return false;
+    };
+    if type_ == "*" {
+        return subtype == "*";
+    }
+    is_mime_token(type_) && (subtype == "*" || is_mime_token(subtype))
+}
+
+fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
+    if value.parse::<http::HeaderValue>().is_err() {
+        return Err(format!(
+            "{ERROR_PREFIX}'{path}' must be a valid HTTP header value"
+        ));
+    }
+    let base = value.split(';').next().unwrap_or("").trim();
+    let Some((type_, subtype)) = base.split_once('/') else {
+        return Err(format!("{ERROR_PREFIX}'{path}' must be a media type"));
+    };
+    if type_ == "*" || subtype == "*" || !is_mime_token(type_) || !is_mime_token(subtype) {
+        return Err(format!(
+            "{ERROR_PREFIX}'{path}' must be a concrete media type"
+        ));
+    }
+    Ok(())
+}
+
+fn optional_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::Object(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{ERROR_PREFIX}'{key}' must be an object")),
+    }
 }
 
 fn normalize_media_type(value: &str) -> String {
@@ -3936,10 +4409,10 @@ fn fallback_validator_for_media_type<'a>(
             .get("application/xml")
             .or_else(|| validators.get("text/xml"));
     }
-    if actual == "application/x-www-form-urlencoded" {
+    if actual.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
         return validators.get("application/x-www-form-urlencoded");
     }
-    if actual == "multipart/form-data" {
+    if actual.eq_ignore_ascii_case("multipart/form-data") {
         return validators.get("multipart/form-data");
     }
     if is_text_media_type(actual) {
@@ -3949,7 +4422,16 @@ fn fallback_validator_for_media_type<'a>(
 }
 
 fn media_type_matches(expected: &str, actual: &str) -> bool {
+    let range_matches = expected == "*/*"
+        || expected.split_once('/').is_some_and(|(type_, subtype)| {
+            subtype == "*"
+                && type_ != "*"
+                && actual
+                    .split_once('/')
+                    .is_some_and(|(actual_type, _)| type_.eq_ignore_ascii_case(actual_type))
+        });
     expected.eq_ignore_ascii_case(actual)
+        || range_matches
         || (expected == "application/json" && is_json_media_type(actual))
         || ((expected == "application/xml" || expected == "text/xml") && is_xml_media_type(actual))
         || (expected == "text/plain" && is_text_media_type(actual))
@@ -3957,26 +4439,44 @@ fn media_type_matches(expected: &str, actual: &str) -> bool {
 }
 
 fn is_json_media_type(media_type: &str) -> bool {
-    media_type == "application/json" || media_type.ends_with("+json")
+    media_type.eq_ignore_ascii_case("application/json")
+        || ascii_ends_with_ignore_case(media_type, "+json")
 }
 
 fn is_xml_media_type(media_type: &str) -> bool {
-    media_type == "application/xml" || media_type == "text/xml" || media_type.ends_with("+xml")
+    media_type.eq_ignore_ascii_case("application/xml")
+        || media_type.eq_ignore_ascii_case("text/xml")
+        || ascii_ends_with_ignore_case(media_type, "+xml")
 }
 
 fn is_text_media_type(media_type: &str) -> bool {
-    media_type == "text/plain" || media_type.starts_with("text/")
+    media_type.eq_ignore_ascii_case("text/plain")
+        || ascii_starts_with_ignore_case(media_type, "text/")
 }
 
 fn is_binary_media_type(media_type: &str) -> bool {
-    media_type == "application/octet-stream"
-        || media_type.starts_with("image/")
-        || media_type.starts_with("audio/")
-        || media_type.starts_with("video/")
-        || (media_type.starts_with("application/")
+    media_type.eq_ignore_ascii_case("application/octet-stream")
+        || ascii_starts_with_ignore_case(media_type, "image/")
+        || ascii_starts_with_ignore_case(media_type, "audio/")
+        || ascii_starts_with_ignore_case(media_type, "video/")
+        || (ascii_starts_with_ignore_case(media_type, "application/")
             && !is_json_media_type(media_type)
             && !is_xml_media_type(media_type)
-            && media_type != "application/x-www-form-urlencoded")
+            && !media_type.eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+}
+
+fn ascii_starts_with_ignore_case(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(value.len().saturating_sub(suffix.len())..)
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
 fn multipart_boundary(content_type: &str) -> Result<Option<String>, String> {
@@ -4448,7 +4948,22 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
     })
 }
 
-fn format_schema_error(error: &jsonschema::ValidationError<'_>) -> String {
+/// Render a schema violation for metadata and the problem body.
+///
+/// Response-side details are redacted: the `jsonschema` message embeds the
+/// offending instance value, and JSON Pointer object-key segments in the
+/// instance path are derived from backend JSON property names. Neither may
+/// cross the client boundary or land in transaction logs. Response failures
+/// therefore emit only a fixed generic message plus the operator/schema-
+/// controlled `schema_path()`. Request-side details keep the full message
+/// because the instance is the caller's own submitted body.
+fn format_schema_error(error: &jsonschema::ValidationError<'_>, side: ValidationSide) -> String {
+    if side == ValidationSide::Response {
+        return format!(
+            "response body does not satisfy the response schema at {}",
+            error.schema_path()
+        );
+    }
     let path = error.instance_path().to_string();
     if path.is_empty() {
         error.to_string()
@@ -4487,8 +5002,8 @@ fn parse_mode(raw: &str) -> Result<EnforcementMode, String> {
 fn parse_schema_draft(raw: &str) -> Result<SchemaDraft, String> {
     match raw {
         "auto" => Ok(SchemaDraft::Auto),
-        "draft7" | "draft-7" => Ok(SchemaDraft::Draft7),
-        "draft202012" | "draft2020-12" | "2020-12" => Ok(SchemaDraft::Draft202012),
+        "draft7" => Ok(SchemaDraft::Draft7),
+        "draft2020-12" => Ok(SchemaDraft::Draft202012),
         other => Err(format!(
             "openapi_validator: 'schema_draft' must be auto, draft7, or draft2020-12; got {other:?}"
         )),
@@ -4499,9 +5014,6 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
     let Some(value) = value else {
         return Ok(None);
     };
-    if value.is_null() {
-        return Ok(None);
-    }
     let values = value
         .as_array()
         .ok_or_else(|| format!("openapi_validator: '{field}' must be an array"))?;
@@ -4529,7 +5041,7 @@ fn parse_regex_set(value: Option<&Value>, field: &'static str) -> Result<Option<
 
 fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<String>>, String> {
     match value {
-        None | Some(Value::Null) => Ok(HashMap::new()),
+        None => Ok(HashMap::new()),
         Some(Value::Object(map)) => {
             let mut parsed = HashMap::new();
             for (key, value) in map {
@@ -4539,6 +5051,11 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
                             .to_string(),
                     );
                 }
+                if http::header::HeaderName::from_bytes(key.as_bytes()).is_err() {
+                    return Err(format!(
+                        "openapi_validator: bypass.header_present contains invalid header name '{key}'"
+                    ));
+                }
                 let expected = if value.is_null() {
                     None
                 } else {
@@ -4547,7 +5064,13 @@ fn parse_header_present(value: Option<&Value>) -> Result<HashMap<String, Option<
                             .to_string()
                     })?)
                 };
-                parsed.insert(key.to_ascii_lowercase(), expected.map(str::to_string));
+                let normalized = key.to_ascii_lowercase();
+                if parsed.contains_key(&normalized) {
+                    return Err(format!(
+                        "openapi_validator: bypass.header_present contains duplicate header name '{normalized}'"
+                    ));
+                }
+                parsed.insert(normalized, expected.map(str::to_string));
             }
             Ok(parsed)
         }
@@ -4560,7 +5083,7 @@ fn optional_string<'a>(
     key: &'static str,
 ) -> Result<Option<&'a str>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
         Some(Value::String(_)) => Err(format!("openapi_validator: '{key}' must not be empty")),
         Some(_) => Err(format!("openapi_validator: '{key}' must be a string")),
@@ -4582,7 +5105,7 @@ fn optional_bool_from_object(
         return Ok(None);
     };
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
         Some(_) => Err(format!("openapi_validator: '{key}' must be a boolean")),
     }
@@ -4593,7 +5116,7 @@ fn optional_usize(
     key: &'static str,
 ) -> Result<Option<usize>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
             .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
@@ -4616,7 +5139,7 @@ fn optional_u16_from_object(
         return Ok(None);
     };
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Number(value)) => value
             .as_u64()
             .ok_or_else(|| format!("openapi_validator: '{key}' must be an unsigned integer"))
@@ -4645,7 +5168,7 @@ fn optional_string_vec(
     key: &'static str,
 ) -> Result<Option<Vec<String>>, String> {
     match object.get(key) {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Array(values)) => parse_string_array(values, key),
         Some(_) => Err(format!("openapi_validator: '{key}' must be an array")),
     }

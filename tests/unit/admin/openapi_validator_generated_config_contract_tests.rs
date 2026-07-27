@@ -320,6 +320,78 @@ fn importer_resolves_multipart_encoding_header_and_schema_refs() {
     assert_eq!(header["schema"]["type"], "string");
     assert_eq!(header["schema"]["pattern"], "^[A-Z]{8}$");
     assert_valid_against_admin_schema(&config, "resolved multipart header refs");
+
+    let invalid_spec = spec.replacen(
+        "\"required\": true,\n        \"schema\": {\"$ref\": \"#/components/schemas/PartTokenValue\"}",
+        "\"requred\": true,\n        \"schema\": {\"$ref\": \"#/components/schemas/PartTokenValue\"}",
+        1,
+    );
+    let error = extract(invalid_spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("an unknown Header Object field must fail import");
+    assert!(
+        error.to_string().contains("requred"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn importer_rejects_case_equivalent_duplicate_multipart_encoding_headers() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Upload API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "upload-api",
+    "backend_host": "upload.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/upload": {
+      "post": {
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": {"type": "string", "format": "binary"}
+                }
+              },
+              "encoding": {
+                "file": {
+                  "headers": {
+                    "X-Part-Token": {
+                      "required": true,
+                      "schema": {"type": "string", "minLength": 8}
+                    },
+                    "x-part-token": {
+                      "schema": {"type": "string"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {"204": {"description": "ok"}}
+      }
+    }
+  }
+}"##;
+
+    let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("case-equivalent multipart encoding headers must fail import");
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate header name"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("encoding") && message.contains("headers"),
+        "error must be path-qualified: {message}"
+    );
 }
 
 #[test]
@@ -423,4 +495,65 @@ fn published_schema_rejects_ambiguous_media_type_objects() {
             "ambiguous media type object must fail the published schema: {config}"
         );
     }
+}
+
+#[test]
+fn published_schema_enforces_request_body_shape_and_response_keys() {
+    let validator = openapi_validator_config_validator();
+    for request_body in [
+        json!({}),
+        json!({"content": {}}),
+        json!({"content_type": "application/json"}),
+        json!({
+            "content": {"application/json": {"type": "object"}},
+            "content_type": "application/json",
+            "schema": {"type": "object"}
+        }),
+    ] {
+        let config = json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/strict",
+                "path_regex": "^/strict$",
+                "request_body": request_body
+            }]
+        });
+        assert!(
+            validator.validate(&config).is_err(),
+            "invalid request_body shape must fail: {config}"
+        );
+    }
+
+    let response_object_config = json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/strict",
+            "path_regex": "^/strict$",
+            "responses": {
+                "200": {
+                    "description": "ok",
+                    "content": {"application/json": {"type": "object"}}
+                }
+            }
+        }]
+    });
+    assert!(
+        validator.validate(&response_object_config).is_ok(),
+        "the documented Response Object form must validate"
+    );
+
+    let invalid_status_config = json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/strict",
+            "path_regex": "^/strict$",
+            "responses": {
+                "0200": {"application/json": {"type": "object"}}
+            }
+        }]
+    });
+    assert!(
+        validator.validate(&invalid_status_config).is_err(),
+        "non-canonical status keys must fail the published schema"
+    );
 }

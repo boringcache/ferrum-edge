@@ -293,6 +293,170 @@ async fn functional_cli_validate_with_settings() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Validation passed."));
+    assert!(stdout.contains("Startup security (env TLS/CIDRs/metrics): OK"));
+}
+
+// ── validate: startup security parity with run (issue #2976) ────────────────
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_missing_frontend_tls_cert() {
+    let temp_dir = TempDir::new().unwrap();
+    let settings_path = temp_dir.path().join("ferrum.conf");
+    std::fs::write(&settings_path, "FERRUM_MODE = file\n").unwrap();
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    // Valid key paired with a nonexistent cert — mirrors run refuse-to-start.
+    let key_src = std::fs::canonicalize("tests/certs/server.key")
+        .expect("canonicalize tests/certs/server.key");
+    let missing_cert = temp_dir.path().join("missing-frontend.crt");
+
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &[
+            "--settings",
+            settings_path.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+        ],
+    )
+    .env("FERRUM_FRONTEND_TLS_CERT_PATH", &missing_cert)
+    .env("FERRUM_FRONTEND_TLS_KEY_PATH", &key_src)
+    .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "validate must fail on missing frontend cert; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Startup security validation failed")
+            || combined.contains("Invalid TLS configuration"),
+        "expected startup-security TLS failure, got: {combined}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_expired_frontend_tls_cert() {
+    use rcgen::{CertificateParams, KeyPair};
+
+    let temp_dir = TempDir::new().unwrap();
+    let settings_path = temp_dir.path().join("ferrum.conf");
+    std::fs::write(&settings_path, "FERRUM_MODE = file\n").unwrap();
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(30);
+    params.not_after = now - time::Duration::days(1);
+    let cert = params.self_signed(&key_pair).unwrap();
+
+    let cert_path = temp_dir.path().join("expired.crt");
+    let key_path = temp_dir.path().join("expired.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &[
+            "--settings",
+            settings_path.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+        ],
+    )
+    .env("FERRUM_FRONTEND_TLS_CERT_PATH", &cert_path)
+    .env("FERRUM_FRONTEND_TLS_KEY_PATH", &key_path)
+    .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        !output.status.success(),
+        "validate must fail on expired frontend cert; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Startup security validation failed")
+            || combined.contains("Invalid TLS configuration"),
+        "expected startup-security TLS failure, got: {combined}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_accepts_valid_frontend_tls_pair() {
+    let temp_dir = TempDir::new().unwrap();
+    let settings_path = temp_dir.path().join("ferrum.conf");
+    std::fs::write(&settings_path, "FERRUM_MODE = file\n").unwrap();
+    let spec_path = temp_dir.path().join("resources.yaml");
+    std::fs::write(
+        &spec_path,
+        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+    )
+    .unwrap();
+
+    let cert_src = std::fs::canonicalize("tests/certs/server.crt")
+        .expect("canonicalize tests/certs/server.crt");
+    let key_src = std::fs::canonicalize("tests/certs/server.key")
+        .expect("canonicalize tests/certs/server.key");
+
+    let output = hermetic_validate_command(
+        &temp_dir,
+        &[
+            "--settings",
+            settings_path.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+        ],
+    )
+    .env("FERRUM_FRONTEND_TLS_CERT_PATH", &cert_src)
+    .env("FERRUM_FRONTEND_TLS_KEY_PATH", &key_src)
+    .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        output.status.success(),
+        "validate failed with valid frontend TLS: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Startup security (env TLS/CIDRs/metrics): OK"));
+    assert!(stdout.contains("Validation passed."));
 }
 
 // ── validate: external secret suffixes ──────────────────────────────────────

@@ -209,13 +209,13 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Feature | Standalone | Replica Set |
 |---|---|---|
 | Single-document CRUD | Atomic | Atomic |
-| Multi-document operations (e.g., delete proxy + plugins) | Fail-safe sequential ordering (partial failures leave recoverable orphans) | Transactional (ACID) via `ClientSession::start_transaction` |
+| Multi-document operations (e.g., delete proxy + plugins) | Hand-managed proxy deletes use fail-safe sequential ordering; direct API-spec-owned proxy deletes are **rejected with `501` before mutation** | Transactional (ACID) via `ClientSession::start_transaction` |
 | `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
 | Change streams (future) | Not available | Available |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
 
-For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, and the orphaned-proxy_group cleanup all commit atomically.
+For production, a **replica set is strongly recommended**. Setting `FERRUM_MONGO_REPLICA_SET` (or `?replicaSet=...` in the connection string) enables true multi-document ACID transactions for `delete_proxy` / `update_proxy` — the proxy document, its proxy-scoped plugin configs, API-spec owner metadata and generated upstreams when applicable, config-change records, and the orphaned-proxy_group cleanup all commit atomically.
 
 It is also **required for `POST /batch`**. That endpoint guarantees the submitted
 dependency graph is applied all-or-nothing (issue #2401), which needs a single
@@ -232,7 +232,21 @@ default) and `transactionLifetimeLimitSeconds`; a request that exceeds either
 fails atomically (nothing applied), so split very large imports into several
 `POST /batch` requests.
 
-Without a replica set, the gateway falls back to a fail-safe sequential ordering: the proxy document is deleted **before** its plugin configs, so a partial failure can only leave orphaned plugin configs (no proxy references them). Orphans are recoverable; the previous order — plugin configs first — could leave a proxy in the DB referencing now-deleted plugin_config IDs, which validation rejects on every subsequent polling cycle until manually cleaned up.
+Without a replica set, hand-managed proxies still use a fail-safe sequential
+ordering: the proxy document is deleted **before** its plugin configs, so a
+partial failure can only leave orphaned plugin configs (no proxy references
+them). Orphans are recoverable; the previous order — plugin configs first —
+could leave a proxy in the DB referencing now-deleted plugin_config IDs, which
+validation rejects on every subsequent polling cycle until manually cleaned up.
+
+A direct `DELETE /proxies/{id}` for an API-spec-owned proxy is different: its
+ownership cascade spans the proxy, scoped plugins, the `api_specs` owner
+document, generated upstreams, and their `config_changes`. Standalone MongoDB
+now returns `501 Not Implemented` before the first ownership-graph mutation and
+names `FERRUM_MONGO_REPLICA_SET` (or the `replicaSet` URL option) as the
+remediation. The response is redacted and no resource IDs, BSON documents, or
+database URL are exposed. Ordinary hand-managed proxy deletion remains
+available.
 
 ### Minimum Replica Set (Development)
 

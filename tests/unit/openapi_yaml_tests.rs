@@ -7217,6 +7217,23 @@ fn namespace_admission_contention_is_documented_as_retryable() {
 }
 
 #[test]
+fn proxy_delete_documents_atomicity_refusal_for_standalone_mongodb() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let response = spec
+        .pointer("/paths/~1proxies~1{id}/delete/responses/501")
+        .expect("proxy DELETE is missing standalone MongoDB atomicity refusal");
+    assert_eq!(
+        response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
+    );
+    let schema = spec
+        .pointer("/components/schemas/ProxyDeleteAtomicityFailureResponse")
+        .expect("proxy delete atomicity refusal schema");
+    assert_eq!(schema["required"], json!(["error", "detail"]));
+}
+
+#[test]
 fn oidc_relying_party_schema_matches_strict_runtime_surface() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

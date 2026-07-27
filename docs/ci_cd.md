@@ -11,6 +11,7 @@ Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, buildi
 - [How Releases Work](#how-releases-work)
 - [Creating a New Release](#creating-a-new-release)
 - [Binaries and Downloads](#binaries-and-downloads)
+- [Image Signatures, SBOMs, and Provenance](#image-signatures-sboms-and-provenance)
 - [GitHub Actions Secrets](#github-actions-secrets)
 
 ## Pipeline Overview
@@ -93,7 +94,13 @@ Push tag v* (e.g., v0.2.0)
                 macos-aarch64 / windows-x86_64) + isolated linux-aarch64 Cross job
                     └─► Push versioned Docker images to Docker Hub and GHCR
                             └─► Create Docker manifest tags
-                                    └─► Create GitHub Release with binaries and checksums
+                                    ├─► Sign and attest final manifest digests,
+                                    │   then verify signatures, subjects,
+                                    │   provenance, and SPDX SBOMs
+                                    └─► Create GitHub Release with binaries
+                                            └─► Fail-closed publication gate
+                                                requires attestation success
+                                                (retracts an unverified release)
 ```
 
 ## CI Pipeline (ci.yml)
@@ -813,6 +820,19 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   the CI publishers' success conditions are protected too. Only those direct
   publication-control fields are frozen, so unrelated implementation changes
   inside the publishing jobs remain permitted.
+- Trusted Cross also freezes Cross-sensitive release jobs by whole-job digest
+  under opaque-shell comparison, so `create-release.needs` cannot gain an
+  attestation edge from an ordinary pull request. Release image attestation
+  therefore stays a dedicated post-manifest job, and
+  `release-attestation-gate` joins `create-release` with
+  `attest-release-images` so the workflow cannot succeed unless verification
+  succeeded. If a GitHub Release is created before attestation finishes and
+  attestation then fails, the gate deletes that release. The attestation job's
+  dependencies and exact `id-token`/`packages` permission block remain part of
+  the required-CI static contract.
+- The required-CI static attestation contract separately validates the complete
+  signing, SBOM, provenance, verification, and fail-closed publication-gate
+  flow.
 - The Docker jobs never name the ARM64 artifact literally; they select it
   through matrix values. Their `strategy` block and the two steps that consume
   it — `Download Linux binary` (`name: binary-${{ matrix.binary_target }}` /
@@ -1091,9 +1111,15 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 
 ### Create Release Job
 
-**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest Job
+**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest
+Job
 
-Creates a GitHub Release with all binaries and checksums only after the versioned Docker manifests have been pushed. A Docker Hub or GHCR manifest failure blocks GitHub Release creation.
+Creates a GitHub Release with all binaries and checksums after the versioned
+Docker manifests have been pushed. Durable release publication still fails
+closed on attestation: `release-attestation-gate` requires
+`attest-release-images` to succeed and deletes the GitHub Release if
+attestation verification fails. Trusted Cross freezes `create-release.needs`,
+so attestation cannot be added there directly.
 
 **Release Content**:
 1. Release title: Version tag (e.g., `v0.2.0`)
@@ -1422,6 +1448,126 @@ The Docker `latest` tag tracks the latest successful `main` publish, not necessa
 
 The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto-tracks the GitHub repository owner/name if the repository is moved or forked. The Docker Hub repo `ferrumedge/ferrum-edge` is hardcoded in both `ci.yml` and `release.yml`; forks must edit that `name=` value (and configure their own `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`) before Docker Hub pushes will succeed.
 
+## Image Signatures, SBOMs, and Provenance
+
+Every version-tag release signs and attests the final standard and `-ebpf`
+multi-architecture image digests in both Docker Hub and GHCR. The per-platform
+push-by-digest builds deliberately retain `provenance: false`: enabling BuildKit
+provenance there turns each platform output into a manifest list and breaks the
+existing `docker buildx imagetools create` assembly contract. The dedicated
+`attest-release-images` job instead runs after both final manifests exist and:
+
+1. resolves each canonical `vX.Y.Z` / `vX.Y.Z-ebpf` tag to an immutable digest;
+2. requires exactly the `linux/amd64` and `linux/arm64` descriptors and verifies
+   that Docker Hub and GHCR contain the same per-platform manifests;
+3. scans each registry's immutable platform images with the digest-pinned Syft
+   image and produces two SPDX JSON inventories for each final manifest;
+4. creates SLSA provenance v1 describing the tag, source commit, GitHub Actions
+   workflow invocation, final registry repository, and assembled platform
+   digests;
+5. keylessly signs each immutable final digest and attaches the provenance plus
+   both platform SBOMs with Cosign; and
+6. verifies the Fulcio identity and GitHub OIDC claims, transparency-log-backed
+   signature, provenance type and source commit, attestation subject digest,
+   and at least two non-empty SPDX predicates.
+
+Because trusted Cross freezes `create-release.needs`, GitHub Release creation
+cannot gain a direct attestation dependency from this pull request. The
+`release-attestation-gate` job therefore joins `create-release` with
+`attest-release-images` under `if: always()`: the release workflow cannot
+succeed unless attestation verification succeeded, and a GitHub Release created
+before attestation finishes is deleted when attestation fails.
+
+The signatures and attestations are stored beside the immutable subject in each
+registry; neither registry is treated as a mutable pointer or as a fallback for
+the other. Only `attest-release-images` receives `id-token: write`. Its other
+permission is `packages: write` for GHCR, while the manifest and release jobs
+retain their existing least-privilege grants. The static contract in
+`.github/scripts/verify_release_image_attestations.py`, invoked by required CI,
+guards these properties and requires all external actions and the Syft runtime
+image to remain immutable.
+
+### Consumer verification
+
+Install Cosign 3.x and Docker Buildx, then verify an immutable digest rather
+than a tag. Set `IMAGE` to either registry. For the eBPF variant, append
+`-ebpf` to `IMAGE_TAG`; the signing identity still uses the release tag because
+the workflow itself runs at `refs/tags/vX.Y.Z`.
+
+```bash
+RELEASE_TAG=v1.2.3
+IMAGE=ferrumedge/ferrum-edge
+# Alternative registry:
+# IMAGE=ghcr.io/ferrum-edge/ferrum-edge
+IMAGE_TAG="$RELEASE_TAG"
+# eBPF variant:
+# IMAGE_TAG="${RELEASE_TAG}-ebpf"
+
+DIGEST="$(
+  docker buildx imagetools inspect \
+    "${IMAGE}:${IMAGE_TAG}" \
+    --format '{{json .Manifest}}' |
+    jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))'
+)"
+IMAGE_REF="${IMAGE}@${DIGEST}"
+CERT_IDENTITY="https://github.com/ferrum-edge/ferrum-edge/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+cosign verify \
+  --certificate-identity "$CERT_IDENTITY" \
+  --certificate-oidc-issuer "$OIDC_ISSUER" \
+  "$IMAGE_REF"
+```
+
+Verify SLSA provenance and require its authenticated statement to name the
+expected manifest digest:
+
+```bash
+EXPECTED_SHA256="${DIGEST#sha256:}"
+cosign verify-attestation \
+  --certificate-identity "$CERT_IDENTITY" \
+  --certificate-oidc-issuer "$OIDC_ISSUER" \
+  --type slsaprovenance1 \
+  "$IMAGE_REF" |
+  jq -e --arg digest "$EXPECTED_SHA256" '
+    [
+      .[].payload
+      | @base64d
+      | fromjson
+      | select(.predicateType == "https://slsa.dev/provenance/v1")
+      | select(any(.subject[]?; .digest.sha256 == $digest))
+    ] | length > 0
+  '
+```
+
+Verify the SPDX attestations and require both platform inventories to be
+non-empty and bound to the same final manifest digest:
+
+```bash
+cosign verify-attestation \
+  --certificate-identity "$CERT_IDENTITY" \
+  --certificate-oidc-issuer "$OIDC_ISSUER" \
+  --type spdxjson \
+  "$IMAGE_REF" |
+  jq -e --arg digest "$EXPECTED_SHA256" '
+    [
+      .[].payload
+      | @base64d
+      | fromjson
+      | select(any(.subject[]?; .digest.sha256 == $digest))
+      | select(.predicate.spdxVersion | startswith("SPDX-"))
+      | select(.predicate.packages | type == "array" and length > 0)
+    ] | length >= 2
+  '
+```
+
+To inspect the authenticated predicates after verification, replace the final
+`jq` program with:
+
+```jq
+.[].payload | @base64d | fromjson | .predicate
+```
+
 ## GitHub Actions Secrets
 
 Configure secrets for Docker image publishing and releases.
@@ -1447,7 +1593,13 @@ Required for pushing Docker Hub images. The workflows unconditionally run the Do
 3. Create new access token
 4. Copy token to `DOCKERHUB_TOKEN`
 
-For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare job-level `permissions: { contents: write }` for release creation and `permissions: { contents: read, packages: write }` for Docker/GHCR publishing. Repository **Settings → Actions → General → Workflow permissions** must allow read/write access (including `packages: write`) for those per-job grants to take effect.
+For GHCR publishing, the workflows use `GITHUB_TOKEN`. The workflows declare
+job-level `permissions: { contents: write }` for release creation,
+`permissions: { contents: read, packages: write }` for Docker/GHCR publishing,
+and `permissions: { id-token: write, packages: write }` only for release image
+signing and attestation. Repository **Settings → Actions → General → Workflow
+permissions** must allow read/write access (including `packages: write`) for
+those per-job grants to take effect.
 
 ### Secret Usage in Workflows
 

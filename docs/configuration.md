@@ -480,6 +480,15 @@ Gateway API `HTTPRoute` path matches preserve Kubernetes semantics: `PathPrefix`
 
 Gateway API cross-namespace `backendRefs` require an exact matching `ReferenceGrant`, including the source API group/kind and target group/kind. Ferrum currently supports core Kubernetes `Service` backend references and fails closed for other backend target kinds in both same-namespace and cross-namespace routes.
 
+Gateway listener `allowedRoutes.namespaces.selector` is parsed atomically.
+`matchLabels` values must be strings, label keys and values must satisfy
+Kubernetes syntax, and every `matchExpressions` entry must have a valid key,
+operator, value type, and cardinality (`In`/`NotIn` require at least one value;
+`Exists`/`DoesNotExist` require none). A malformed component invalidates only
+that listener, attaches zero routes, and withdraws any attachment from an older
+valid snapshot. Status uses reason `Invalid` with a stable field path and never
+echoes selector keys, values, or unknown operator text.
+
 When the Kubernetes controller watches Gateway API resources, it also patches the Gateway API status subresource for Ferrum-owned `GatewayClass` objects plus `Gateway`, `HTTPRoute`, and `GRPCRoute` objects. Ferrum writes `Accepted`, `Programmed`, `ResolvedRefs`, and `Conflicted` conditions using controller name `ferrum.io/gateway-controller`; translation failures such as invalid ports, missing Services, or missing cross-namespace `ReferenceGrant` permissions are reflected as rejected/unresolved route conditions. Gateway status includes listener conditions and, when `FERRUM_GATEWAY_API_STATUS_ADDRESS` is set, `status.addresses`. If `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE` and `FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME` are set, Gateway `Programmed=True` is gated on that serving data-plane Service having at least one ready EndpointSlice endpoint; otherwise `Programmed` reflects translation/materialization only. Conflicting HTTP-family routes are resolved deterministically: the oldest `creationTimestamp` wins, with route namespace/name as the tiebreaker.
 
 Kubernetes Gateway API and Istio mesh translators fail closed when a resource declares a port outside the Kubernetes service-port range (`1`-`65535`). Invalid ports are rejected during translation instead of wrapping into an unintended backend/listener port. Istio `AuthorizationPolicy.rules[].to[].operation.ports` also preserves wildcard string matches such as `"*"` and `"8*"` through Ferrum mesh policy `port_patterns`; non-numeric, non-pattern port strings still fail closed.
