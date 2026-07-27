@@ -46,10 +46,10 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
-    ClientResponseFraming,
+    ClientResponseFraming, apply_response_headers, is_backend_request_strip_header,
+    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
+    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,

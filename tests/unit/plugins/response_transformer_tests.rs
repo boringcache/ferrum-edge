@@ -1010,10 +1010,7 @@ async fn test_response_transformer_rejects_protocol_managed_add_update_and_renam
     }))
     .err()
     .expect("rename to Transfer-Encoding must be rejected");
-    assert!(
-        rename_err.contains("protocol-managed"),
-        "got: {rename_err}"
-    );
+    assert!(rename_err.contains("protocol-managed"), "got: {rename_err}");
 
     // remove of protocol-managed names remains allowed (harmless after origin strip).
     ResponseTransformer::new(&json!({

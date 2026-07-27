@@ -122,9 +122,9 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
-    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
-    ClientResponseFraming,
+    ClientResponseFraming, apply_response_headers, is_backend_response_strip_header,
+    parse_connection_listed_headers, sanitize_client_response_headers_for_wire,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -6748,14 +6748,14 @@ where
         is_head: false,
     };
     let mut owned_headers;
-    let headers = if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing)
-    {
-        owned_headers = headers.clone();
-        sanitize_client_response_headers_for_wire(&mut owned_headers, framing);
-        &owned_headers
-    } else {
-        headers
-    };
+    let headers =
+        if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing) {
+            owned_headers = headers.clone();
+            sanitize_client_response_headers_for_wire(&mut owned_headers, framing);
+            &owned_headers
+        } else {
+            headers
+        };
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(status_code),

@@ -77,7 +77,9 @@ plugin_configs:
 }
 
 async fn start_scripted_backend(hits: Arc<AtomicUsize>) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind backend");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move {
         loop {
@@ -207,7 +209,10 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         .expect("H1 ordinary");
     assert_eq!(h1_resp.status(), StatusCode::OK);
     assert_eq!(
-        h1_resp.headers().get("x-gateway").and_then(|v| v.to_str().ok()),
+        h1_resp
+            .headers()
+            .get("x-gateway")
+            .and_then(|v| v.to_str().ok()),
         Some("1")
     );
     assert!(h1_resp.headers().get("x-backend-only").is_none());
@@ -250,7 +255,10 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         mock.headers().get("x-request-id").is_some(),
         "correlation echo on mock reject path"
     );
-    assert_eq!(mock.bytes().await.expect("mock body").as_ref(), b"mock-body");
+    assert_eq!(
+        mock.bytes().await.expect("mock body").as_ref(),
+        b"mock-body"
+    );
 
     // --- H2 (h2c prior knowledge on the plaintext proxy port) ---
     let h2 = reqwest::Client::builder()

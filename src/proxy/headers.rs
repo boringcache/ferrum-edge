@@ -692,7 +692,10 @@ pub enum ClientResponseFraming {
     /// `HEAD` response: preserve representation metadata length without
     /// implying a message body. Statuses that forbid a body still strip
     /// `Content-Length`.
-    HeadRepresentation { status: u16, representation_len: u64 },
+    HeadRepresentation {
+        status: u16,
+        representation_len: u64,
+    },
     /// Streaming / unknown final length. Preserves a valid decimal
     /// `Content-Length` (backend-authored) when the status may carry a body;
     /// strips invalid values and strips entirely when the status forbids a
@@ -1725,7 +1728,9 @@ mod tests {
             );
         }
         assert!(!is_protocol_managed_plugin_response_destination("x-custom"));
-        assert!(!is_protocol_managed_plugin_response_destination("content-type"));
+        assert!(!is_protocol_managed_plugin_response_destination(
+            "content-type"
+        ));
     }
 
     #[test]
