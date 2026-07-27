@@ -4,8 +4,11 @@
 //! directory fsync so readers observe either the prior durable file or the fully
 //! committed replacement. Temporary files are removed on every failure path
 //! without masking the primary error. Post-rename durability failures roll the
-//! visible destination back and fsync the parent directory so the rollback is
-//! itself durable.
+//! visible destination back; only after that rollback succeeds is the parent
+//! directory fsynced so the rollback itself is durable. A failed rollback keeps
+//! the primary publish error, appends the restore failure as secondary context,
+//! and does not attempt a parent durability sync that could commit the failed
+//! destination.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -24,6 +27,9 @@ use std::cell::Cell;
 /// [`inject_private_file_fault_for_tests`]. [`PrivateFileFault::DirSync`] is
 /// one-shot: after the initial post-rename parent sync fails, the fault clears
 /// so rollback can attempt a real parent-directory durability sync.
+/// [`PrivateFileFault::Restore`] also fails that initial parent sync, but keeps
+/// itself armed so the subsequent rollback restore fails (and no rollback
+/// parent sync is attempted).
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PrivateFileFault {
@@ -34,6 +40,7 @@ pub(crate) enum PrivateFileFault {
     Sync,
     Rename,
     DirSync,
+    Restore,
 }
 
 #[cfg(test)]
@@ -127,7 +134,10 @@ fn write_private_file_inner(path: &Path, bytes: &[u8]) -> io::Result<()> {
                 ),
             ));
         }
-        PrivateFileFault::None | PrivateFileFault::Rename | PrivateFileFault::DirSync => {}
+        PrivateFileFault::None
+        | PrivateFileFault::Rename
+        | PrivateFileFault::DirSync
+        | PrivateFileFault::Restore => {}
     }
 
     let mut file = create_private_file(path)?;
@@ -157,9 +167,11 @@ fn create_private_file(path: &Path) -> io::Result<File> {
 /// Sequence: private temp → write → fsync → rename → parent-directory fsync.
 /// Temporary files are removed on every failure. If rename succeeded but the
 /// parent-directory fsync failed, the prior durable contents of `final_path`
-/// are restored (or the new file is removed on create) and the parent directory
-/// is fsynced again so the rollback itself is durable, before returning the
-/// primary error.
+/// are restored (or the new file is removed on create). When that rollback
+/// succeeds, the parent directory is fsynced again so the rollback itself is
+/// durable. When rollback fails, the primary error is preserved with the
+/// restore failure as secondary context and no rollback parent sync is
+/// attempted.
 pub(crate) fn replace_private_file(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = final_path.parent().ok_or_else(|| {
         io::Error::new(
@@ -268,10 +280,26 @@ fn sync_parent_dir_inner(parent: &Path, allow_injected_fault: bool) -> io::Resul
 }
 
 /// Consume a pending DirSync fault (one-shot) so rollback can sync for real.
+///
+/// [`PrivateFileFault::Restore`] also trips this path but stays armed so the
+/// rollback restore can fail afterward.
 #[cfg(test)]
 fn take_dir_sync_fault() -> bool {
+    INJECTED_FAULT.with(|cell| match cell.get() {
+        PrivateFileFault::DirSync => {
+            cell.set(PrivateFileFault::None);
+            true
+        }
+        PrivateFileFault::Restore => true,
+        _ => false,
+    })
+}
+
+/// Consume a pending Restore fault so rollback restore fails deterministically.
+#[cfg(test)]
+fn take_restore_fault() -> bool {
     INJECTED_FAULT.with(|cell| {
-        if cell.get() == PrivateFileFault::DirSync {
+        if cell.get() == PrivateFileFault::Restore {
             cell.set(PrivateFileFault::None);
             true
         } else {
@@ -287,46 +315,74 @@ fn restore_previous_after_publish_failure(
 ) -> io::Result<()> {
     let restore_result = match previous {
         Some(bytes) => restore_private_file_best_effort(final_path, bytes),
-        None => match fs::remove_file(final_path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        },
+        None => rollback_failed_create_publish(final_path),
     };
 
-    let mut extras = Vec::new();
     match restore_result {
-        Ok(()) => {}
-        Err(restore_error) => extras.push(format!(
-            "also failed to restore prior state: {restore_error}"
+        Ok(()) => {
+            // Only fsync the parent after rollback itself succeeded. Syncing
+            // after a failed restore can durably commit the failed destination.
+            let mut extras = Vec::new();
+            if let Some(parent) = final_path.parent() {
+                if let Err(sync_error) = sync_parent_dir_after_rollback(parent) {
+                    extras.push(format!(
+                        "also failed to fsync parent directory after rollback: {sync_error}"
+                    ));
+                }
+            }
+            if extras.is_empty() {
+                Err(primary)
+            } else {
+                Err(io::Error::new(
+                    primary.kind(),
+                    format!("{primary}; {}", extras.join("; ")),
+                ))
+            }
+        }
+        Err(restore_error) => Err(io::Error::new(
+            primary.kind(),
+            format!("{primary}; also failed to restore prior state: {restore_error}"),
         )),
     }
+}
 
-    if let Some(parent) = final_path.parent() {
-        if let Err(sync_error) = sync_parent_dir_after_rollback(parent) {
-            extras.push(format!(
-                "also failed to fsync parent directory after rollback: {sync_error}"
-            ));
-        }
+/// Remove a just-published create when post-rename parent sync failed.
+fn rollback_failed_create_publish(final_path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if take_restore_fault() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "injected fault: failed to remove published private file '{}' during create rollback",
+                final_path.display()
+            ),
+        ));
     }
-
-    if extras.is_empty() {
-        Err(primary)
-    } else {
-        Err(io::Error::new(
-            primary.kind(),
-            format!("{primary}; {}", extras.join("; ")),
-        ))
+    match fs::remove_file(final_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
 /// Best-effort rewrite used only to undo a post-rename durability failure.
 ///
-/// Does not consult injected faults: the caller is already returning the
-/// primary durability error. Parent-directory durability sync is performed by
-/// [`restore_previous_after_publish_failure`] after this restore (or a create
-/// rollback removal) so both paths share one durable rollback contract.
+/// Does not consult create/write/sync/rename faults: the caller is already
+/// returning the primary durability error. The test-only
+/// [`PrivateFileFault::Restore`] seam can still fail this path. Parent-directory
+/// durability sync is performed by [`restore_previous_after_publish_failure`]
+/// only after this restore (or a create rollback removal) succeeds.
 fn restore_private_file_best_effort(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if take_restore_fault() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "injected fault: failed to restore prior private file '{}'",
+                final_path.display()
+            ),
+        ));
+    }
     let parent = match final_path.parent() {
         Some(parent) => parent,
         None => {
@@ -458,6 +514,39 @@ mod tests {
             !path.exists(),
             "failed create must remove the visible destination"
         );
+        assert!(
+            private_temp_artifacts_for_tests(dir.path())
+                .expect("list temps")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dir_sync_then_restore_failure_preserves_primary_without_rollback_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("material.json");
+        replace_private_file(&path, b"version-a").expect("seed");
+
+        let err = with_fault(PrivateFileFault::Restore, || {
+            replace_private_file(&path, b"version-b")
+        })
+        .expect_err("restore fault must fail publish after dir sync");
+        let message = err.to_string();
+        assert!(
+            message.contains("injected fault: failed to fsync parent directory"),
+            "primary dir-sync error must be preserved: {message}"
+        );
+        assert!(
+            message.contains("also failed to restore prior state")
+                && message.contains("injected fault: failed to restore prior private file"),
+            "rollback failure must be secondary context: {message}"
+        );
+        assert!(
+            !message.contains("also failed to fsync parent directory after rollback"),
+            "failed rollback must not attempt or claim a rollback durability sync: {message}"
+        );
+        // Restore failed, so the renamed destination remains at the unpublished bytes.
+        assert_eq!(fs::read(&path).expect("destination"), b"version-b");
         assert!(
             private_temp_artifacts_for_tests(dir.path())
                 .expect("list temps")
