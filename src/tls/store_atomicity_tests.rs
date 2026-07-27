@@ -2,19 +2,21 @@
 //!
 //! Failed create/update/delete must leave live readers and a reopened store on
 //! the exact prior snapshot, with no private temporary artifacts left behind.
+//! Lives under `#[cfg(test)]` in the `tls` crate module so fault-injection and
+//! temp-artifact helpers stay crate-private / test-only.
 
-use ferrum_edge::tls::acme::{
+use crate::tls::acme::{
     AcmeAccountStore, AcmeCertificateRecord, AcmeCertificateStore, AcmeError,
     AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeIssuedCertificateInput, AcmeOrderRecord,
     AcmeOrderStatus, AcmeOrderStore,
 };
-use ferrum_edge::tls::managed::{
+use crate::tls::managed::{
     ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord, ManagedTlsStore,
 };
-use ferrum_edge::tls::private_file::{
+use crate::tls::private_file::{
     PrivateFileFault, inject_private_file_fault_for_tests, private_temp_artifacts_for_tests,
 };
-use ferrum_edge::tls::source::MaterialKind;
+use crate::tls::source::MaterialKind;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -237,6 +239,24 @@ fn managed_tls_failed_dir_sync_restores_prior_snapshot_and_cleans_temps() {
         store.get("edge-ca").expect("live").ca_bundle_pem.as_deref(),
         Some("version-a")
     );
+    assert_live_matches_reopened_managed(&store, dir.path(), "edge-ca");
+}
+
+#[test]
+fn managed_tls_failed_dir_sync_on_create_leaves_store_empty_and_durable() {
+    let dir = TempDir::new().expect("tempdir");
+    let store = ManagedTlsStore::open(dir.path()).expect("open");
+
+    let err = with_fault(PrivateFileFault::DirSync, || {
+        store.upsert(sample_managed_ca("edge-ca", "brand-new"), false)
+    })
+    .expect_err("dir sync fault must fail create");
+    assert!(matches!(err, ManagedTlsError::Write(_)));
+    assert!(matches!(
+        store.get("edge-ca"),
+        Err(ManagedTlsError::NotFound(_))
+    ));
+    assert!(store.list(ManagedTlsMaterialKind::CaBundle).is_empty());
     assert_live_matches_reopened_managed(&store, dir.path(), "edge-ca");
 }
 
