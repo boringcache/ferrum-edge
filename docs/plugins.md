@@ -2721,6 +2721,11 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
 
+The configuration object is closed. Unknown or misspelled root properties,
+including shared Redis settings, reject the candidate configuration instead of
+silently selecting defaults. A rejected reload leaves the last-known-good
+plugin generation active.
+
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
 **Behavior by mode:**

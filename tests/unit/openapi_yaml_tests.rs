@@ -1813,12 +1813,13 @@ fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     }
 }
 
-/// GHSA-q3p3-94cj-8wh6 / GHSA-jjjw-rqjm-fvf3: the remaining rate-limiter
-/// components must expose closed root objects and bounded numeric ranges that
-/// match the runtime allowlists, so a typo or an extreme value is rejected by
-/// schema-driven authoring tools and by admission alike.
+/// GHSA-q3p3-94cj-8wh6 / GHSA-5h4h-3qcv-f3rw /
+/// GHSA-jjjw-rqjm-fvf3: rate-limiter components must expose closed root objects
+/// and bounded numeric ranges that match the runtime allowlists, so a typo or
+/// an extreme value is rejected by schema-driven authoring tools and admission.
 #[test]
 fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_rate_limiter::AI_RATE_LIMITER_CONFIG_KEYS;
     use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
     use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
@@ -1833,6 +1834,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
         ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
         ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("AiRateLimiterConfig", AI_RATE_LIMITER_CONFIG_KEYS),
     ] {
         let schema = spec
             .pointer(&format!("/components/schemas/{schema_name}"))
@@ -1855,20 +1857,17 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         );
     }
 
-    // The typo advisory's affected-component list is limited to ordinary HTTP,
-    // GraphQL, and gRPC-method limiter roots. AI and WebSocket remain
-    // intentionally open in runtime admission, so OpenAPI must not close them.
-    for schema_name in ["AiRateLimiterConfig", "WsRateLimitingConfig"] {
-        let schema = spec
-            .pointer(&format!("/components/schemas/{schema_name}"))
-            .unwrap_or_else(|| panic!("{schema_name} component exists"));
-        assert!(
-            schema
-                .get("additionalProperties")
-                .is_none_or(|value| value == &json!(true)),
-            "{schema_name} must remain open in parity with runtime admission"
-        );
-    }
+    // WebSocket remains outside the affected components and intentionally open
+    // in runtime admission, so OpenAPI must not close it.
+    let ws_schema = spec
+        .pointer("/components/schemas/WsRateLimitingConfig")
+        .expect("WsRateLimitingConfig component exists");
+    assert!(
+        ws_schema
+            .get("additionalProperties")
+            .is_none_or(|value| value == &json!(true)),
+        "WsRateLimitingConfig must remain open in parity with runtime admission"
+    );
 
     let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
     let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);
