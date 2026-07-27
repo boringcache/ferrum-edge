@@ -439,6 +439,8 @@ fn svid_response_to_bundle(
 /// indefinite-length here would yield an empty (zero-length) cert that
 /// blows up downstream with a less clear error.
 fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    const MAX_DER_LENGTH_OCTETS: usize = std::mem::size_of::<usize>();
+
     if buf.len() > crate::tls::MAX_PEM_MATERIAL_BYTES {
         return Err(format!(
             "certificate material exceeds the {} byte admission limit",
@@ -471,21 +473,43 @@ fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             (2, first_len as usize)
         } else {
             let n = (first_len & 0x7f) as usize;
+            if n == 0 {
+                return Err(
+                    "BER indefinite-length encoding is not allowed in DER-encoded certificates"
+                        .to_string(),
+                );
+            }
+            if n > MAX_DER_LENGTH_OCTETS {
+                return Err(format!(
+                    "DER length uses {n} octets (cannot represent length safely on this platform)"
+                ));
+            }
             if cursor + 2 + n > buf.len() {
                 return Err("buffer ends inside multi-byte length".to_string());
             }
             let mut content_len = 0usize;
             for i in 0..n {
-                content_len = (content_len << 8) | buf[cursor + 2 + i] as usize;
+                content_len = content_len
+                    .checked_shl(8)
+                    .and_then(|v| v.checked_add(buf[cursor + 2 + i] as usize))
+                    .ok_or_else(|| "DER declared length overflows usize".to_string())?;
             }
-            (2 + n, content_len)
+            let header_len = 2usize
+                .checked_add(n)
+                .ok_or_else(|| "DER length encoding overflows usize".to_string())?;
+            (header_len, content_len)
         };
-        let total = header_len + content_len;
-        if cursor + total > buf.len() {
+        let total = header_len
+            .checked_add(content_len)
+            .ok_or_else(|| "DER object length overflows usize".to_string())?;
+        let end = cursor
+            .checked_add(total)
+            .ok_or_else(|| "DER object bounds overflow usize".to_string())?;
+        if end > buf.len() {
             return Err("DER length exceeds buffer".to_string());
         }
-        out.push(buf[cursor..cursor + total].to_vec());
-        cursor += total;
+        out.push(buf[cursor..end].to_vec());
+        cursor = end;
     }
     Ok(out)
 }
@@ -518,6 +542,44 @@ mod der_split_tests {
         // SEQUENCE, claimed length=10, only 1 content byte present.
         let buf = [0x30u8, 0x0A, 0xAA];
         assert!(split_concatenated_der(&buf).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_length_encoding() {
+        // Long-form length declares 2 octets but only 1 is present.
+        let buf = [0x30u8, 0x82, 0x01];
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(err.contains("multi-byte length"));
+    }
+
+    #[test]
+    fn rejects_oversized_length_of_length_count() {
+        let max_safe = std::mem::size_of::<usize>();
+        let mut buf = vec![0x30u8, 0x80 | ((max_safe + 1) as u8)];
+        buf.extend(std::iter::repeat_n(0u8, max_safe + 1));
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(err.contains("cannot represent length safely"));
+    }
+
+    #[test]
+    fn rejects_non_representable_declared_length() {
+        let n = std::mem::size_of::<usize>();
+        let mut buf = vec![0x30u8, 0x80 | (n as u8)];
+        buf.extend(std::iter::repeat_n(0xFF, n));
+        let err = split_concatenated_der(&buf).unwrap_err();
+        assert!(
+            err.contains("overflows usize") || err.contains("exceeds buffer"),
+            "expected overflow or bounds rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_long_form_length() {
+        // 0x30 0x81 0x05 followed by 5 content bytes.
+        let blob = [0x30, 0x81, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05];
+        let out = split_concatenated_der(&blob).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), 8);
     }
 }
 
