@@ -2,7 +2,7 @@ use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
@@ -812,10 +812,10 @@ fn gateway_listener_statuses(
                 "Ferrum rejected this Gateway"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
-            } else if let Some(message) = validation_message.as_deref() {
-                message
             } else {
-                "Ferrum accepted this listener"
+                validation_message
+                    .as_deref()
+                    .unwrap_or("Ferrum accepted this listener")
             };
             let conditions = vec![
                 condition_at(
@@ -842,9 +842,7 @@ fn gateway_listener_statuses(
                     },
                     if resolved_refs {
                         "All listener references accepted by Ferrum"
-                    } else if accepted {
-                        unresolved_message
-                    } else if listener_validation_error.is_some() {
+                    } else if accepted || listener_validation_error.is_some() {
                         unresolved_message
                     } else {
                         "Ferrum could not resolve this listener"
@@ -870,9 +868,9 @@ fn gateway_listener_statuses(
                     },
                     if programmed {
                         "Ferrum programmed this listener"
-                    } else if accepted && !resolved_refs {
-                        unresolved_message
-                    } else if listener_validation_error.is_some() {
+                    } else if (accepted && !resolved_refs)
+                        || listener_validation_error.is_some()
+                    {
                         unresolved_message
                     } else if accepted && !materialized {
                         "Ferrum accepted this listener but found no materialized listener"
