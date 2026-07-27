@@ -122,9 +122,9 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    apply_response_headers, has_client_response_hop_by_hop_headers,
-    is_backend_response_strip_header, parse_connection_listed_headers,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    apply_response_headers, is_backend_response_strip_header, parse_connection_listed_headers,
+    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
+    ClientResponseFraming,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -6740,13 +6740,18 @@ where
     // accepts both the full bidi stream and a `split()` send half.
     S: SendStream<Bytes>,
 {
-    // Final hop-by-hop strip after after_proxy: connection-specific fields are
-    // malformed on HTTP/3 (RFC 9114 §4.2). Clone only when stripping is needed
-    // so the common clean map stays allocation-free on this path.
+    // Final protocol-aware strip after after_proxy: connection-specific fields
+    // are malformed on HTTP/3 (RFC 9114 §4.2). Clone only when sanitization is
+    // needed so the common clean map stays allocation-free on this path.
+    let framing = ClientResponseFraming::Streaming {
+        status,
+        is_head: false,
+    };
     let mut owned_headers;
-    let headers = if has_client_response_hop_by_hop_headers(headers) {
+    let headers = if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing)
+    {
         owned_headers = headers.clone();
-        strip_client_response_hop_by_hop_headers(&mut owned_headers);
+        sanitize_client_response_headers_for_wire(&mut owned_headers, framing);
         &owned_headers
     } else {
         headers
@@ -7030,7 +7035,18 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     let mut headers = headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    let framing = if body.is_empty() {
+        ClientResponseFraming::Streaming {
+            status: status.as_u16(),
+            is_head: false,
+        }
+    } else {
+        ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        }
+    };
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
     let mut resp_builder = Response::builder().status(status);
     let mut has_content_type = false;
     for (k, v) in &headers {
@@ -7372,7 +7388,13 @@ where
         "normalized gRPC rejects should be trailers-only"
     );
     let mut headers = reject.headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    sanitize_client_response_headers_for_wire(
+        &mut headers,
+        ClientResponseFraming::Streaming {
+            status: reject.http_status.as_u16(),
+            is_head: false,
+        },
+    );
     let mut resp_builder = Response::builder().status(reject.http_status);
     for (key, value) in &headers {
         let sanitized_grpc_message;
@@ -7721,7 +7743,13 @@ where
         &grpc_message,
         initial_response_header_policy_plugins,
     );
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    sanitize_client_response_headers_for_wire(
+        &mut headers,
+        ClientResponseFraming::Streaming {
+            status: StatusCode::OK.as_u16(),
+            is_head: false,
+        },
+    );
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;

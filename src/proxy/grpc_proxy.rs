@@ -2373,6 +2373,13 @@ pub fn build_grpc_error_response_with_policy(
         message,
         initial_response_header_policy_plugins,
     );
+    crate::proxy::headers::sanitize_client_response_headers_for_wire(
+        &mut response_headers,
+        crate::proxy::headers::ClientResponseFraming::Streaming {
+            status: StatusCode::OK.as_u16(),
+            is_head: false,
+        },
+    );
     crate::proxy::headers::apply_response_headers(
         hyper::Response::builder().status(StatusCode::OK),
         &response_headers,

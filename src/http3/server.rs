@@ -47,8 +47,9 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, strip_client_response_hop_by_hop_headers,
-    strip_response_hop_by_hop_trailers,
+    parse_connection_listed_from_str_map, sanitize_client_response_headers_for_wire,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    ClientResponseFraming,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -5273,9 +5274,17 @@ async fn handle_h3_request(
             response_headers.remove("content-length");
         }
 
-        // Final hop-by-hop strip after after_proxy: plugins (e.g. SSE) must not
-        // reintroduce connection-specific fields onto the H3 wire (RFC 9114 §4.2).
-        strip_client_response_hop_by_hop_headers(&mut response_headers);
+        // Final protocol-aware strip after after_proxy: plugins must not
+        // reintroduce connection-specific or framing fields onto the H3 wire
+        // (RFC 9114 §4.2). Streaming framing preserves a valid backend
+        // Content-Length and strips invalid / no-body lengths.
+        sanitize_client_response_headers_for_wire(
+            &mut response_headers,
+            ClientResponseFraming::Streaming {
+                status: response_status,
+                is_head: false,
+            },
+        );
 
         // Send response headers on the H3 stream
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -6981,8 +6990,22 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
-        // Final hop-by-hop strip after after_proxy / committed hooks (RFC 9114 §4.2).
-        strip_client_response_hop_by_hop_headers(&mut response_headers);
+        // Final protocol-aware strip after after_proxy / committed hooks
+        // (RFC 9114 §4.2): hop-by-hop / Connection-listed fields plus
+        // Content-Length derived from the buffered body (HEAD preserves a
+        // valid representation length instead of inventing 0).
+        let framing = if ctx.method.eq_ignore_ascii_case("HEAD") {
+            ClientResponseFraming::Streaming {
+                status: response_status,
+                is_head: true,
+            }
+        } else {
+            ClientResponseFraming::ExactBody {
+                status: response_status,
+                len: response_body.len() as u64,
+            }
+        };
+        sanitize_client_response_headers_for_wire(&mut response_headers, framing);
 
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -8507,8 +8530,14 @@ async fn stream_h3_open_response_to_client(
         &mut response_headers,
     );
 
-    // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
-    strip_client_response_hop_by_hop_headers(&mut response_headers);
+    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2).
+    sanitize_client_response_headers_for_wire(
+        &mut response_headers,
+        ClientResponseFraming::Streaming {
+            status: response_status,
+            is_head: false,
+        },
+    );
 
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder =
@@ -9439,13 +9468,18 @@ async fn dispatch_grpc_native_h3(
     response_headers
         .retain(|k, _| !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(k.as_str()));
 
-    // RFC 9110 §7.6.1 response-direction hop-by-hop strip — `connection`,
-    // `keep-alive`, `te`, `transfer-encoding`, `upgrade`, etc. must never reach the
-    // H3 client (and could make the response malformed). The plain native H3
-    // streaming path applies the same predicate; the gRPC response path must too,
-    // since `response_headers` here comes straight from the backend / after_proxy
-    // hooks.
-    strip_client_response_hop_by_hop_headers(&mut response_headers);
+    // Final protocol-aware response-header boundary — hop-by-hop /
+    // Connection-listed fields plus Content-Length repair. The plain native H3
+    // streaming path applies the same sanitizer; the gRPC response path must
+    // too, since `response_headers` here comes straight from the backend /
+    // after_proxy hooks. Trailer *frames* are untouched.
+    sanitize_client_response_headers_for_wire(
+        &mut response_headers,
+        ClientResponseFraming::Streaming {
+            status: response_status,
+            is_head: false,
+        },
+    );
 
     // Send response headers. gRPC carries its own `content-type`
     // (`application/grpc`); never override it with the plain JSON default.
@@ -10457,8 +10491,14 @@ async fn proxy_to_backend_h3_streaming(
         &mut response_headers,
     );
 
-    // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
-    strip_client_response_hop_by_hop_headers(&mut response_headers);
+    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2).
+    sanitize_client_response_headers_for_wire(
+        &mut response_headers,
+        ClientResponseFraming::Streaming {
+            status: response_status,
+            is_head: false,
+        },
+    );
 
     // Send response headers on the H3 stream
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -11054,7 +11094,18 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
     let mut headers = headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    let framing = if body.is_empty() {
+        ClientResponseFraming::Streaming {
+            status: status.as_u16(),
+            is_head: false,
+        }
+    } else {
+        ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        }
+    };
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
     let mut builder = Response::builder().status(status);
     builder = apply_response_headers(builder, &headers);
     let resp = builder
@@ -11568,7 +11619,13 @@ async fn send_h3_grpc_error_with_recv_halt(
         grpc_message,
         initial_response_header_policy_plugins,
     );
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    sanitize_client_response_headers_for_wire(
+        &mut headers,
+        ClientResponseFraming::Streaming {
+            status: StatusCode::OK.as_u16(),
+            is_head: false,
+        },
+    );
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC error response: {}", e))?;
@@ -11970,10 +12027,18 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         .await;
     }
 
-    // gRPC flavor only — strip plugin-synthesized connection-specific fields at
-    // the final H3 boundary before they can affect signalling or reach the wire.
+    // gRPC flavor only — strip plugin-synthesized connection-specific and
+    // framing fields at the final H3 boundary before they can affect
+    // signalling or reach the wire. Do not invent Content-Length: 0 on
+    // trailers-only responses.
     let mut sanitized_headers = headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
+    sanitize_client_response_headers_for_wire(
+        &mut sanitized_headers,
+        ClientResponseFraming::Streaming {
+            status: StatusCode::OK.as_u16(),
+            is_head: false,
+        },
+    );
     let headers = &sanitized_headers;
 
     // Derive signalling from the sanitized response metadata.

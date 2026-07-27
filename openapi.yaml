@@ -16988,13 +16988,21 @@ components:
         unknown per-rule keys are rejected at plugin load time. Header
         rules enforce operation-exact fields (only add/update accept
         `value`; only rename accepts `new_key`; remove accepts neither).
-        Every configured header `value` must be a valid HTTP `HeaderValue`
-        (same complete syntax accepted at emission), including rejection of
-        non-CR/LF forbidden control bytes. Unknown operations / targets and
-        missing required fields are also rejected. Every rule must set an
-        explicit `target` (`header` or `body`); there is no default. Valid
-        targets are `header` and `body` only — unlike request_transformer,
-        there is no `query` target.
+        Protocol-managed hop-by-hop and framing destinations are rejected
+        for add/update and as rename destinations (`Connection`,
+        `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`,
+        `Trailer`, `Transfer-Encoding`, `Upgrade`, `Content-Length`,
+        case-insensitive); remove of those names remains allowed. The
+        gateway derives Content-Length and strips connection/framing
+        fields at the final H1/H2/H3 response boundary after every
+        mutable hook. Every configured header `value` must be a valid
+        HTTP `HeaderValue` (same complete syntax accepted at emission),
+        including rejection of non-CR/LF forbidden control bytes. Unknown
+        operations / targets and missing required fields are also
+        rejected. Every rule must set an explicit `target` (`header` or
+        `body`); there is no default. Valid targets are `header` and
+        `body` only — unlike request_transformer, there is no `query`
+        target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -17054,7 +17062,12 @@ components:
           const: header
         key:
           type: string
-          description: HTTP header name.
+          description: |
+            HTTP header name. For add/update, must not be a protocol-managed
+            hop-by-hop or framing destination (`connection`, `content-length`,
+            `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`,
+            `trailer`, `transfer-encoding`, `upgrade`). Remove may target
+            those names.
         value:
           type: string
           description: |
@@ -17066,6 +17079,10 @@ components:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not be a protocol-managed hop-by-hop or framing destination
+            (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`).
 
     ResponseTransformerBodyRule:
       type: object
@@ -18734,15 +18751,20 @@ components:
         (`application/grpc` on H2/H3) is unsupported — the plugin is not
         selected for that protocol because Reject results normalize to
         trailers-only gRPC errors that discard configured bodies. Unknown
-        top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Status codes must be
-        final (200–599) or 101 for a synthetic WebSocket handshake; other
-        informational statuses are rejected. A configured 101 fails closed
-        with 500 when the matching request is not an actual WebSocket
-        handshake. HEAD omits content bytes while keeping representation
-        Content-Length; 204/205/304 omit body and Content-Length on every
-        frontend (H1/H2/H3). Runtime construction and request-flavor
-        enforcement are the authoritative final boundaries.
+        top-level and per-rule keys are rejected. The free-form headers map
+        accepts string-valued response headers but rejects protocol-managed
+        hop-by-hop and framing names (`Connection`, `Keep-Alive`,
+        `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+        `Transfer-Encoding`, `Upgrade`, `Content-Length`, including case
+        variants); the gateway derives Content-Length from the mock
+        body/status/method and strips connection/framing fields at the final
+        H1/H2/H3 response boundary. Status codes must be final (200–599) or
+        101 for a synthetic WebSocket handshake; other informational statuses
+        are rejected. A configured 101 fails closed with 500 when the matching
+        request is not an actual WebSocket handshake. HEAD omits content bytes
+        while keeping representation Content-Length; 204/205/304 omit body and
+        Content-Length on every frontend (H1/H2/H3). Runtime construction and
+        request-flavor enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -18792,7 +18814,12 @@ components:
                 type: object
                 additionalProperties:
                   type: string
-                description: Response headers (default content-type application/json)
+                description: >-
+                  Response headers (default content-type application/json).
+                  Protocol-managed hop-by-hop and framing names (`connection`,
+                  `content-length`, `keep-alive`, `proxy-authenticate`,
+                  `proxy-connection`, `te`, `trailer`, `transfer-encoding`,
+                  `upgrade`) are rejected at construction.
               body:
                 type: string
                 description: >-

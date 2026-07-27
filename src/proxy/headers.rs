@@ -645,12 +645,140 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// Closed set of response header destinations that plugins must not configure
+/// as write targets. Framing (`content-length`, `transfer-encoding`,
+/// `trailer`) and connection control (`connection`, `upgrade`, …) are owned by
+/// the gateway's final protocol boundary, not by `response_transformer` /
+/// `response_mock` static rules.
+///
+/// `remove` of these names remains allowed (it is a no-op after origin strip).
+/// Rename sources may still name them so a rule can move a value *away* from a
+/// protocol-managed field; only the rename *destination* is rejected.
+pub const PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Case-insensitive membership in
+/// [`PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES`].
+#[inline]
+pub fn is_protocol_managed_plugin_response_destination(name: &str) -> bool {
+    let lower = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    };
+    PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES.contains(&lower.as_ref())
+}
+
+/// How the final client-wire boundary should derive `Content-Length`.
+///
+/// Hop-by-hop and Connection-listed fields are always stripped. Body framing
+/// is then repaired from this hint so a plugin cannot leave a stale or hostile
+/// length on the map after `after_proxy`.
+#[derive(Debug, Clone, Copy)]
+pub enum ClientResponseFraming {
+    /// Buffered / synthetic body whose wire length is known. Sets
+    /// `Content-Length` to `len` unless the status forbids a body (then
+    /// strips it). Not for `HEAD` — use [`Self::HeadRepresentation`].
+    ExactBody { status: u16, len: u64 },
+    /// `HEAD` response: preserve representation metadata length without
+    /// implying a message body. Statuses that forbid a body still strip
+    /// `Content-Length`.
+    HeadRepresentation { status: u16, representation_len: u64 },
+    /// Streaming / unknown final length. Preserves a valid decimal
+    /// `Content-Length` (backend-authored) when the status may carry a body;
+    /// strips invalid values and strips entirely when the status forbids a
+    /// body. `HEAD` streaming keeps a valid representation length.
+    Streaming { status: u16, is_head: bool },
+}
+
+/// Whether a plugin-produced map needs the full wire sanitizer for `framing`.
+///
+/// Hot paths that can share an immutable header map use this to avoid cloning
+/// when the map is already clean and framing requires no `Content-Length`
+/// rewrite.
+pub fn needs_client_response_wire_sanitization(
+    headers: &std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> bool {
+    if has_client_response_hop_by_hop_headers(headers)
+        || headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length")
+    {
+        return true;
+    }
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                headers.contains_key("content-length")
+            } else {
+                headers.get("content-length").map(String::as_str) != Some(&len.to_string())
+            }
+        }
+        ClientResponseFraming::HeadRepresentation {
+            status,
+            representation_len,
+        } => {
+            if status_forbids_response_body(status) {
+                headers.contains_key("content-length")
+            } else {
+                headers.get("content-length").map(String::as_str)
+                    != Some(&representation_len.to_string())
+            }
+        }
+        ClientResponseFraming::Streaming { status, is_head } => {
+            if status_forbids_response_body(status) {
+                headers.contains_key("content-length")
+            } else if is_head {
+                content_length_value_is_invalid(headers)
+            } else {
+                content_length_value_is_invalid(headers)
+            }
+        }
+    }
+}
+
+#[inline]
+fn status_forbids_response_body(status: u16) -> bool {
+    matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
+}
+
+fn content_length_value_is_invalid(headers: &std::collections::HashMap<String, String>) -> bool {
+    match headers.get("content-length") {
+        None => false,
+        Some(value) => {
+            let trimmed = value.trim();
+            trimmed.is_empty() || trimmed.parse::<u64>().is_err()
+        }
+    }
+}
+
+fn remove_content_length_header(headers: &mut std::collections::HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("content-length"));
+}
+
+fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
+    remove_content_length_header(headers);
+    headers.insert("content-length".to_string(), len.to_string());
+}
+
 /// Strip response-direction hop-by-hop names from a plugin header map.
 ///
-/// Used as a final sanitation pass on HTTP/3 client-facing responses after
+/// Used as the hop-by-hop half of the final client-wire boundary after
 /// `after_proxy` hooks (which may reintroduce connection-specific fields such
-/// as `Connection: keep-alive`) and before every H3 response writer. H1 may
-/// still carry intentional connection options; H3 must not (RFC 9114 §4.2).
+/// as `Connection: keep-alive`) and before every H1/H2/H3 response builder.
+/// Gateway-owned connection options (`Connection: close` during drain, WebSocket
+/// `Upgrade`/`Connection`) are applied only after this strip returns.
+/// Prefer [`sanitize_client_response_headers_for_wire`] when body framing is known.
 pub fn strip_client_response_hop_by_hop_headers(
     headers: &mut std::collections::HashMap<String, String>,
 ) {
@@ -664,6 +792,59 @@ pub fn strip_client_response_hop_by_hop_headers(
                 .iter()
                 .any(|listed| name.eq_ignore_ascii_case(listed))
     });
+}
+
+/// Authoritative final protocol-aware response-header sanitizer.
+///
+/// Runs after every mutable response hook and before every H1/H2/H3 builder:
+/// strips hop-by-hop / Connection-listed fields, then derives or repairs
+/// `Content-Length` from [`ClientResponseFraming`]. Does not touch trailer
+/// frames (gRPC metadata); only the `Trailer` *header* is removed with the
+/// hop-by-hop set.
+pub fn sanitize_client_response_headers_for_wire(
+    headers: &mut std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) {
+    strip_client_response_hop_by_hop_headers(headers);
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                remove_content_length_header(headers);
+            } else {
+                set_content_length_header(headers, len);
+            }
+        }
+        ClientResponseFraming::HeadRepresentation {
+            status,
+            representation_len,
+        } => {
+            if status_forbids_response_body(status) {
+                remove_content_length_header(headers);
+            } else {
+                set_content_length_header(headers, representation_len);
+            }
+        }
+        ClientResponseFraming::Streaming { status, is_head } => {
+            if status_forbids_response_body(status) {
+                remove_content_length_header(headers);
+            } else if content_length_value_is_invalid(headers) {
+                remove_content_length_header(headers);
+            } else if is_head {
+                // Preserve a valid backend representation length; nothing else
+                // to derive without the representation body.
+            }
+        }
+    }
+}
+
+/// Sanitize then apply headers onto a response builder.
+pub fn apply_sanitized_response_headers(
+    builder: http::response::Builder,
+    headers: &mut std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> http::response::Builder {
+    sanitize_client_response_headers_for_wire(headers, framing);
+    apply_response_headers(builder, headers)
 }
 
 /// Append a cookie to the proxy's newline-separated multi-value representation.
@@ -1523,5 +1704,94 @@ mod tests {
             resp.headers().get("x-other").and_then(|v| v.to_str().ok()),
             Some("v")
         );
+    }
+
+    #[test]
+    fn protocol_managed_plugin_destinations_cover_framing_and_connection_control() {
+        for name in [
+            "Connection",
+            "CONTENT-LENGTH",
+            "keep-alive",
+            "Proxy-Authenticate",
+            "proxy-connection",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+        ] {
+            assert!(
+                is_protocol_managed_plugin_response_destination(name),
+                "{name} must be protocol-managed"
+            );
+        }
+        assert!(!is_protocol_managed_plugin_response_destination("x-custom"));
+        assert!(!is_protocol_managed_plugin_response_destination("content-type"));
+    }
+
+    #[test]
+    fn sanitize_client_response_strips_hop_by_hop_connection_listed_and_repairs_length() {
+        let mut headers = std::collections::HashMap::from([
+            ("connection".to_string(), "close, x-internal".to_string()),
+            ("x-internal".to_string(), "leak".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            ("content-length".to_string(), "999".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::ExactBody {
+                status: 200,
+                len: 4,
+            },
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-internal"));
+        assert!(!headers.contains_key("transfer-encoding"));
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("4"));
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn sanitize_client_response_strips_content_length_for_no_body_status() {
+        let mut headers = std::collections::HashMap::from([
+            ("content-length".to_string(), "12".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::ExactBody {
+                status: 204,
+                len: 12,
+            },
+        );
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn sanitize_streaming_strips_invalid_content_length_and_preserves_valid() {
+        let mut bad = std::collections::HashMap::from([(
+            "content-length".to_string(),
+            "not-a-number".to_string(),
+        )]);
+        sanitize_client_response_headers_for_wire(
+            &mut bad,
+            ClientResponseFraming::Streaming {
+                status: 200,
+                is_head: false,
+            },
+        );
+        assert!(!bad.contains_key("content-length"));
+
+        let mut good =
+            std::collections::HashMap::from([("content-length".to_string(), "42".to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut good,
+            ClientResponseFraming::Streaming {
+                status: 200,
+                is_head: true,
+            },
+        );
+        assert_eq!(good.get("content-length").map(String::as_str), Some("42"));
     }
 }

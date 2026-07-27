@@ -16719,16 +16719,35 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
 
 fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
-    let builder = headers_mod::apply_response_headers(
+    let status = reject.http_status.as_u16();
+    let mut headers = reject.headers;
+    // Final protocol-aware boundary after reject after_proxy hooks: strip
+    // hop-by-hop / Connection-listed fields and derive Content-Length from the
+    // synthetic body. Empty bodies (HEAD representation CL from
+    // prepare_synthetic, trailers-only gRPC, 204/205/304) must not gain an
+    // invented Content-Length: 0.
+    let framing = if is_grpc_error || reject.body.is_empty() {
+        headers_mod::ClientResponseFraming::Streaming {
+            status,
+            is_head: false,
+        }
+    } else {
+        headers_mod::ClientResponseFraming::ExactBody {
+            status,
+            len: reject.body.len() as u64,
+        }
+    };
+    let builder = headers_mod::apply_sanitized_response_headers(
         Response::builder().status(reject.http_status),
-        &reject.headers,
+        &mut headers,
+        framing,
     );
 
     let body = if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
-        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
+        ProxyBody::empty_for_response_status(status)
     } else {
         ProxyBody::full(Bytes::from(reject.body))
     };
@@ -23525,6 +23544,17 @@ async fn handle_proxy_request_inner(
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
 
+                // Final protocol-aware boundary before the H2 gRPC streaming
+                // builder. Trailer frames are filtered separately by
+                // StripHopByHopTrailers.
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    headers_mod::ClientResponseFraming::Streaming {
+                        status: grpc_streaming.status,
+                        is_head: false,
+                    },
+                );
+
                 // Build the response with the live Incoming body — hyper will forward
                 // DATA frames and TRAILERS to the downstream client as they arrive.
                 // Split any newline-joined Set-Cookie into separate header lines.
@@ -24390,6 +24420,15 @@ async fn handle_proxy_request_inner(
 
                 // Build gRPC response with headers and trailers (splitting any
                 // newline-joined Set-Cookie into separate header lines).
+                // Streaming framing: do not invent Content-Length on trailers-only
+                // RPCs; preserve a valid backend length when present.
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    headers_mod::ClientResponseFraming::Streaming {
+                        status: response_status,
+                        is_head: false,
+                    },
+                );
                 let resp_builder = headers_mod::apply_response_headers(
                     Response::builder()
                         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::OK)),
@@ -26218,9 +26257,31 @@ async fn handle_proxy_request_inner(
     let mut resp_builder = Response::builder()
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
-    // Apply backend/plugin response headers, splitting newline-joined Set-Cookie
-    // into separate header lines (RFC 6265).
-    resp_builder = headers_mod::apply_response_headers(resp_builder, &response_headers);
+    // Final protocol-aware response-header boundary after every mutable hook
+    // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
+    // and derive or repair Content-Length from the actual body/status/method.
+    // Gateway-owned Connection: close (drain/overload) is applied below.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let framing = match &response_body {
+        // HEAD keeps a valid backend representation length; do not invent
+        // Content-Length: 0 from the empty wire body.
+        ResponseBody::Buffered(_) if is_head => headers_mod::ClientResponseFraming::Streaming {
+            status: response_status,
+            is_head: true,
+        },
+        ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
+            status: response_status,
+            len: data.len() as u64,
+        },
+        ResponseBody::Streaming { .. }
+        | ResponseBody::StreamingH2(_)
+        | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming {
+            status: response_status,
+            is_head,
+        },
+    };
+    resp_builder =
+        headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
 
     // Add gateway error categorization headers so clients and ops teams
     // can distinguish different failure modes:
