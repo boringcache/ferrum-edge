@@ -4469,6 +4469,18 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
     const MAX_BYTES: usize = 4_096; // MIN_NONCE_MAX_TOTAL_CACHE_BYTES
     const NONCE_LEN: usize = 64;
     const BYTE_CAP_ENTRIES: usize = MAX_BYTES / NONCE_LEN;
+    // Mirrors soap_ws_security::evict_oldest_nonces_locked: target =
+    // max_cache_size/10, clamped to [1, NONCE_EVICTION_BATCH] (64).
+    const EVICTION_BATCH: usize = {
+        let target = MAX_ENTRIES / 10;
+        if target < 1 {
+            1
+        } else if target > 64 {
+            64
+        } else {
+            target
+        }
+    };
     const THREADS: usize = 32;
     const PER_THREAD: usize = 64;
 
@@ -4549,9 +4561,43 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
         THREADS * PER_THREAD,
         "bounded eviction must admit every distinct fresh nonce"
     );
+    // Amortized oldest-first eviction frees up to EVICTION_BATCH entries then
+    // admits one, so a flood that repeatedly trips the byte cap ends with
+    // retained count in [BYTE_CAP_ENTRIES - EVICTION_BATCH + 1, BYTE_CAP_ENTRIES]
+    // rather than always exactly full. Refill that intentional headroom and
+    // require an exact pin at the byte-derived ceiling.
+    let min_after_batch = BYTE_CAP_ENTRIES
+        .saturating_sub(EVICTION_BATCH)
+        .saturating_add(1);
+    assert!(
+        entries >= min_after_batch,
+        "batch eviction under-retained: entries {entries} < floor {min_after_batch}"
+    );
+    let mut refill = 0usize;
+    while plugin.nonce_replay_retained_bytes().saturating_add(NONCE_LEN) <= MAX_BYTES
+        && plugin.nonce_replay_entry_count() < BYTE_CAP_ENTRIES
+    {
+        let nonce = format!("rf-{:061}", refill);
+        debug_assert_eq!(nonce.len(), NONCE_LEN);
+        assert!(
+            plugin.check_nonce_replay(&nonce).is_ok(),
+            "headroom refill must admit distinct fresh nonce {refill}"
+        );
+        refill = refill.saturating_add(1);
+        assert!(
+            refill <= EVICTION_BATCH.saturating_sub(1),
+            "refill count {refill} exceeds amortized eviction headroom"
+        );
+    }
     assert_eq!(
-        entries, BYTE_CAP_ENTRIES,
-        "byte cap must pin the retained set after the flood"
+        plugin.nonce_replay_entry_count(),
+        BYTE_CAP_ENTRIES,
+        "byte cap must pin the retained set once amortized headroom is refilled"
+    );
+    assert_eq!(
+        plugin.nonce_replay_retained_bytes(),
+        MAX_BYTES,
+        "byte cap must pin retained bytes once amortized headroom is refilled"
     );
 }
 
