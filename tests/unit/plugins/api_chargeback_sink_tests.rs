@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
-    SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault, SpoolManager,
-    SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
+    QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
+    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
@@ -1414,6 +1414,108 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let after = spool.scan_stats().unwrap();
     assert_eq!(after.files, 1);
     assert_eq!(after.bytes, encoded_len);
+}
+
+#[test]
+fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    // Keep room for two resident files after reclaim; admitting one more
+    // file_len requires deleting eight oldest files from one snapshot.
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!("000000000000000000000000{index:02}")));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+    let before = spool.scan_stats().unwrap();
+    assert_eq!(before.files, file_count);
+    assert_eq!(before.bytes, file_len.saturating_mul(file_count));
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("multi-file reclaim must succeed from one inventory");
+    assert_eq!(
+        report,
+        QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: file_count,
+            bytes_before: file_len.saturating_mul(file_count),
+            files_deleted: 8,
+            bytes_freed: file_len.saturating_mul(8),
+        },
+        "eviction must inventory/sort once and delete enough files in that pass"
+    );
+
+    for (index, path) in planted.iter().enumerate() {
+        if index < 8 {
+            assert!(
+                !path.exists(),
+                "oldest planted file {index} must be reclaimed"
+            );
+        } else {
+            assert!(path.exists(), "newest planted file {index} must be retained");
+        }
+    }
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 2);
+    assert_eq!(after.bytes, file_len.saturating_mul(2));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "remaining owned bytes must leave room for the incoming batch"
+    );
+}
+
+#[test]
+fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 32u64;
+    // Large enough to prove reclaim work is not O(K) inventory passes, small
+    // enough for deterministic CI unit coverage (not a local benchmark).
+    let file_count = 1_024u64;
+    let max_bytes = file_len.saturating_mul(4);
+    // remaining + incoming <= max_bytes => remaining <= 3 * file_len.
+    let retain_after = 3u64;
+    let expected_deleted = file_count.saturating_sub(retain_after);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!("01ARZ3NDEKTSV4RRFFQ69G{index:05}")));
+        fs::write(&path, vec![b'y'; file_len as usize]).unwrap();
+    }
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("large spool reclaim must succeed");
+    assert_eq!(
+        report.inventory_passes, 1,
+        "large file-count eviction must still be one inventory/sort planning pass"
+    );
+    assert_eq!(report.files_inventoried, file_count);
+    assert_eq!(report.bytes_before, file_len.saturating_mul(file_count));
+    assert_eq!(report.files_deleted, expected_deleted);
+    assert_eq!(
+        report.bytes_freed,
+        file_len.saturating_mul(expected_deleted)
+    );
+
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, retain_after);
+    assert_eq!(after.bytes, file_len.saturating_mul(retain_after));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "post-eviction usage must admit the planned incoming batch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
