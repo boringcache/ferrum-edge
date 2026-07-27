@@ -6982,10 +6982,7 @@ impl DatabaseStore {
 
         // Try failover URLs in order
         for (i, url) in self.failover_urls.iter().enumerate() {
-            match self
-                .reconnect_for_topology(url, DatabaseTopology::Failover)
-                .await
-            {
+            match self.reconnect_as_failover(url).await {
                 Ok(()) => {
                     info!(
                         "Reconnected to failover database #{} ({})",

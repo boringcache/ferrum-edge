@@ -77,14 +77,18 @@ pub struct DbWriteTopologyPermit {
 impl DbWriteTopologyPermit {
     /// Construct a pin that holds `guard` until dropped.
     pub(crate) fn pinned(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
-        Self {
+        let permit = Self {
             _guard: Some(guard),
-        }
+        };
+        debug_assert!(permit.is_pinned());
+        permit
     }
 
     /// No-op permit for backends / modes without a reconnect topology gate.
     pub fn noop() -> Self {
-        Self { _guard: None }
+        let permit = Self { _guard: None };
+        debug_assert!(!permit.is_pinned());
+        permit
     }
 
     /// Whether this permit holds a live topology pin (test/observe helper).

@@ -443,7 +443,7 @@ impl AdminState {
     /// Whether admin mutations are currently blocked (same policy as
     /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
     pub fn admin_writes_currently_blocked(&self) -> bool {
-        self.evaluate_write_gate().is_some()
+        self.check_write_allowed().is_some()
     }
 
     /// Admit an Admin API mutation under a write-topology pin (issue #3001).
