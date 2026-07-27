@@ -640,6 +640,7 @@ jobs:
               integration::ai_stream_router_normalization_tests
               integration::ai_token_metrics_contract_tests
               integration::api_chargeback_sink_tests
+              integration::gateway_allowed_routes_selector_tests
               integration::k8s_controller_gateway_status_tests
               integration::k8s_controller_istio_status_tests
               integration::mesh_telemetry_k8s_provider_lookup_tests
