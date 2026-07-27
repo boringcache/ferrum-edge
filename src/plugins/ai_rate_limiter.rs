@@ -34,8 +34,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// drop idle keys without waiting for the next cool-down window. Live
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
-const CAPACITY_REJECT_BODY: &str =
-    r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
+const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
