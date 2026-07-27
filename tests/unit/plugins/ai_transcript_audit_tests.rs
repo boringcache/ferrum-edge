@@ -8089,7 +8089,9 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     if let Some(record) = records.first() {
         if record.get("request_body").is_none() {
             assert_eq!(
-                record.get("request_body_omitted_reason").and_then(|v| v.as_str()),
+                record
+                    .get("request_body_omitted_reason")
+                    .and_then(|v| v.as_str()),
                 Some("retained_byte_budget"),
                 "withheld excerpt must use the compiled-in retained-byte reason"
             );
@@ -8183,7 +8185,10 @@ async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadat
             < 1_024,
         "budget must be saturated below one staging overhead charge"
     );
-    assert!(!fillers.is_empty(), "fillers must hold the retained-byte leases");
+    assert!(
+        !fillers.is_empty(),
+        "fillers must hold the retained-byte leases"
+    );
 
     // Fresh context: refusal must leave no candidate/hash/stream metadata from
     // this failing instance (final-phase fallback must not see a false owner).

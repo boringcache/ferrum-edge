@@ -2838,8 +2838,7 @@ impl AiTranscriptAudit {
         );
 
         // Local staging owns this candidate: only now publish shared metadata.
-        ctx.metadata
-            .insert(MD_RECORD_ID.to_string(), record_id);
+        ctx.metadata.insert(MD_RECORD_ID.to_string(), record_id);
         ctx.metadata
             .insert(MD_CANDIDATE.to_string(), "true".to_string());
         ctx.metadata
@@ -2970,8 +2969,7 @@ impl AiTranscriptAudit {
                         staged.retained_bytes = without_excerpt;
                     } else {
                         apply_metadata = false;
-                        let prior_model_bytes =
-                            staged.request_model.as_deref().map_or(0, str::len);
+                        let prior_model_bytes = staged.request_model.as_deref().map_or(0, str::len);
                         let prior_tool_bytes = tool_names_bytes(&staged.tool_names);
                         let prior_without_excerpt =
                             staged_retained_bytes(0, prior_model_bytes, prior_tool_bytes);
