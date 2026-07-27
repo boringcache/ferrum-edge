@@ -2964,7 +2964,7 @@ async fn test_empty_body_rejects() {
 // ── Nonce cache cap enforcement tests ───────────────────────────────────────
 
 #[test]
-fn test_nonce_cache_enforces_max_size_by_evicting_oldest() {
+fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
     let max_size: usize = 20;
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
@@ -2973,25 +2973,31 @@ fn test_nonce_cache_enforces_max_size_by_evicting_oldest() {
     }))
     .unwrap();
 
-    // Insert nonces well past the cap
-    for i in 0..(max_size + 50) {
+    // Fill the cache with live nonces.
+    for i in 0..max_size {
         let nonce = format!("nonce-{}", i);
-        let _ = plugin.check_nonce_replay(&nonce);
+        assert!(
+            plugin.check_nonce_replay(&nonce).is_ok(),
+            "nonce {i} must fill an available slot"
+        );
     }
 
-    // The oldest nonces should have been evicted to enforce the cap.
-    // Verify by checking that the first nonce is no longer tracked as a replay.
-    assert!(
-        plugin.check_nonce_replay("nonce-0").is_ok(),
-        "nonce-0 should have been evicted by cap enforcement"
-    );
+    // Fresh nonces fail closed while every retained entry is still live.
+    for i in max_size..(max_size + 50) {
+        let nonce = format!("nonce-{}", i);
+        let error = plugin
+            .check_nonce_replay(&nonce)
+            .expect_err("capacity must reject instead of evicting a live nonce");
+        assert!(error.contains("at capacity"), "{error}");
+    }
 
-    // But recent nonces should still be detected as replays
-    let last_nonce = format!("nonce-{}", max_size + 49);
-    assert!(
-        plugin.check_nonce_replay(&last_nonce).is_err(),
-        "most recent nonce should still be in cache"
-    );
+    // Oldest and newest retained claims remain protected for their full TTL.
+    for nonce in ["nonce-0", "nonce-19"] {
+        let error = plugin
+            .check_nonce_replay(nonce)
+            .expect_err("live nonce must remain replay-protected");
+        assert!(error.contains("replay detected"), "{error}");
+    }
 }
 
 #[test]
@@ -4358,9 +4364,8 @@ fn test_oversized_nonce_is_rejected_before_retention() {
 #[test]
 fn test_nonce_cache_is_bounded_by_total_retained_bytes() {
     // The byte cap is deliberately far tighter than the entry cap: 4096 bytes
-    // of 64-byte nonces is ~64 entries against a 100,000-entry cap. Retention
-    // must be bounded by the byte axis, so an early nonce is evicted long
-    // before the entry cap is anywhere near reached.
+    // of 64-byte nonces is 64 entries against a 100,000-entry cap. Retention
+    // must be bounded by the byte axis without evicting any live claim.
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
@@ -4375,25 +4380,26 @@ fn test_nonce_cache_is_bounded_by_total_retained_bytes() {
 
     let first = format!("{:064}", 0);
     assert!(plugin.check_nonce_replay(&first).is_ok());
-    for index in 1..5_000 {
+    for index in 1..64 {
         let nonce = format!("{:064}", index);
         assert!(
             plugin.check_nonce_replay(&nonce).is_ok(),
-            "bounded eviction must keep admitting fresh nonces at index {index}"
+            "available byte budget must admit nonce at index {index}"
         );
     }
 
-    // Check the retained entry first: a replay rejection does not mutate the
-    // cache, so the subsequent eviction assertion cannot disturb it.
-    let last = format!("{:064}", 4_999);
-    assert!(
-        plugin.check_nonce_replay(&last).is_err(),
-        "the most recent nonce must still be retained for replay detection"
-    );
-    assert!(
-        plugin.check_nonce_replay(&first).is_ok(),
-        "the byte cap must have evicted the earliest nonce well before the entry cap"
-    );
+    let rejected = format!("{:064}", 64);
+    let error = plugin
+        .check_nonce_replay(&rejected)
+        .expect_err("full byte budget must reject instead of evicting");
+    assert!(error.contains("at capacity"), "{error}");
+
+    for nonce in [first, format!("{:064}", 63)] {
+        let error = plugin
+            .check_nonce_replay(&nonce)
+            .expect_err("retained nonce must remain replay-protected");
+        assert!(error.contains("replay detected"), "{error}");
+    }
 }
 
 #[tokio::test]
