@@ -181,17 +181,58 @@ fn udp_rate_limiting_accepts_every_documented_root_key() {
 }
 
 #[test]
-fn websocket_root_remains_intentionally_open() {
-    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
-    // limiter roots; WebSocket does not appear in its affected components.
+fn ws_rate_limiting_rejects_misspelled_frame_and_redis_keys() {
+    let fps_error = create_plugin("ws_rate_limiting", &json!({"frames_per_secod": 1}))
+        .err()
+        .expect("misspelled frames_per_second must fail admission");
+    assert!(
+        fps_error.contains("unknown configuration key(s)"),
+        "{fps_error}"
+    );
+    assert!(fps_error.contains("frames_per_secod"), "{fps_error}");
+    assert!(fps_error.contains("frames_per_second"), "{fps_error}");
+
+    for key in [
+        "sync_mdoe",
+        "redis_tsl",
+        "redis_key_prefx",
+        "redis_pool_sze",
+        "redis_connect_timeout_second",
+        "redis_health_check_interval_second",
+        "redis_usernam",
+        "redis_passwrd",
+    ] {
+        let mut config = serde_json::Map::new();
+        config.insert("frames_per_second".to_string(), json!(10));
+        config.insert(key.to_string(), json!("redis"));
+        let error = create_plugin("ws_rate_limiting", &Value::Object(config))
+            .err()
+            .expect("a misspelled root key must fail admission");
+        assert!(error.contains("unknown configuration key(s)"), "{error}");
+        assert!(error.contains(key), "{error}");
+    }
+}
+
+#[test]
+fn ws_rate_limiting_accepts_every_documented_root_key() {
     create_plugin(
         "ws_rate_limiting",
         &json!({
             "frames_per_second": 10,
-            "future_policy_field": {"enabled": true}
+            "burst_size": 20,
+            "close_reason": "slow down",
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tls": false,
+            "redis_key_prefix": "explicit:prefix",
+            "redis_pool_size": 4,
+            "redis_connect_timeout_seconds": 5,
+            "redis_health_check_interval_seconds": 5,
+            "redis_username": "user",
+            "redis_password": "pass",
         }),
     )
-    .expect("WebSocket root remains forward-compatible");
+    .expect("the documented root key set must remain accepted");
 }
 
 #[test]

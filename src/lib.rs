@@ -283,6 +283,43 @@ pub mod _test_support {
         crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
     }
 
+    /// Frontend-DTLS / UDP idle-expiry predicate on virtual monotonic timestamps.
+    pub fn udp_idle_expired_for_test(
+        now_mono_ms: u64,
+        last_activity_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_idle_expired(now_mono_ms, last_activity_ms, idle_timeout_ms)
+    }
+
+    /// Whether an application-datagram outcome should refresh the shared idle
+    /// watermark (policy-admitted + successful forward/delivery).
+    pub fn udp_idle_activity_should_refresh_for_test(
+        policy_admitted: bool,
+        forward_or_deliver_succeeded: bool,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_idle_activity_should_refresh(
+            policy_admitted,
+            forward_or_deliver_succeeded,
+        )
+    }
+
+    /// Apply the production idle-watermark refresh decision against a virtual
+    /// clock instant (used by frontend-DTLS relay regression coverage).
+    pub fn maybe_touch_udp_idle_activity_for_test(
+        activity_ms: &std::sync::atomic::AtomicU64,
+        now_ms: u64,
+        policy_admitted: bool,
+        forward_or_deliver_succeeded: bool,
+    ) {
+        crate::proxy::udp_proxy::maybe_touch_udp_idle_activity(
+            activity_ms,
+            now_ms,
+            policy_admitted,
+            forward_or_deliver_succeeded,
+        )
+    }
+
     pub fn plugin_cache_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,
@@ -1225,7 +1262,6 @@ pub mod _test_support {
         pub recomputed_key_bytes: usize,
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
-        pub last_forced_candidates: usize,
         pub max_maintenance_entries: usize,
     }
 
@@ -1267,7 +1303,6 @@ pub mod _test_support {
                 recomputed_key_bytes: snapshot.recomputed_key_bytes,
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
-                last_forced_candidates: snapshot.last_forced_candidates,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
             })
         }

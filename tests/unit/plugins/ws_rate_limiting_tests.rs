@@ -510,6 +510,86 @@ fn test_burst_size_smaller_than_fps_returns_error() {
 }
 
 #[test]
+fn test_nonintegral_burst_fps_ratio_returns_error() {
+    // GHSA-cjcm-546w-696v: ceil(burst/fps) windows under-admit non-integral
+    // ratios on Redis (e.g. 75/50 → 37.5 fps). Reject them so accepted
+    // configs keep local/Redis sustained-rate parity.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 50, "burst_size": 75}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("integer multiple"),
+        "expected integer-multiple rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_overlong_refill_window_returns_error() {
+    // GHSA-cjcm-546w-696v: clamping window to 3600s while retaining burst as
+    // the limit over-admits (e.g. 3601 / 3600 ≈ 1.0003 fps vs configured 1,
+    // or historically 10_000_000 / 3600 ≈ 2778 fps). Keep burst within the
+    // operational ceiling so this asserts the window-parity gate specifically.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 3601}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("Redis-representable maximum"),
+        "expected overlong-window rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_pathological_advisory_burst_is_rejected() {
+    // Advisory reproduction values exceed both the operational burst ceiling
+    // and the Redis-representable refill window; either gate is fail-closed.
+    let result = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 10_000_000}),
+        PluginHttpClient::default(),
+    );
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.contains("burst_size") || err.contains("Redis-representable"),
+        "expected fail-closed rejection of advisory reproduction, got: {err}"
+    );
+}
+
+#[test]
+fn test_integral_ratio_at_max_window_is_accepted() {
+    let plugin = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "burst_size": 3600}),
+        PluginHttpClient::default(),
+    );
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+}
+
+#[test]
+fn test_fps_and_burst_upper_bounds_are_enforced() {
+    let over = 1_000_001u64;
+    let err = WsRateLimiting::new(
+        &json!({"frames_per_second": over}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("fps above operational ceiling must be rejected");
+    assert!(err.contains("frames_per_second"), "{err}");
+
+    let err = WsRateLimiting::new(
+        &json!({"frames_per_second": 100, "burst_size": over}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("burst above operational ceiling must be rejected");
+    assert!(err.contains("burst_size"), "{err}");
+}
+
+#[test]
 fn test_non_object_config_returns_error() {
     let result = WsRateLimiting::new(&json!("bad"), PluginHttpClient::default());
     assert!(result.is_err());
@@ -537,6 +617,71 @@ fn test_invalid_close_reason_type_returns_error() {
     );
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("close_reason"));
+}
+
+#[test]
+fn test_rejects_unknown_root_keys() {
+    let error = WsRateLimiting::new(&json!({"frames_per_secod": 1}), PluginHttpClient::default())
+        .err()
+        .expect("misspelled frames_per_second must fail admission");
+    assert!(error.contains("unknown configuration key(s)"), "{error}");
+    assert!(error.contains("frames_per_secod"), "{error}");
+    assert!(error.contains("frames_per_second"), "{error}");
+
+    let error = WsRateLimiting::new(
+        &json!({
+            "frames_per_second": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tsl": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("misspelled redis_tls must fail admission");
+    assert!(error.contains("redis_tsl"), "{error}");
+    assert!(error.contains("redis_tls"), "{error}");
+}
+
+#[test]
+fn test_accepts_every_documented_root_key() {
+    WsRateLimiting::new(
+        &json!({
+            "frames_per_second": 10,
+            "burst_size": 20,
+            "close_reason": "slow down",
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tls": false,
+            "redis_key_prefix": "explicit:prefix",
+            "redis_pool_size": 4,
+            "redis_connect_timeout_seconds": 5,
+            "redis_health_check_interval_seconds": 5,
+            "redis_username": "user",
+            "redis_password": "pass",
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("the documented root key set must remain accepted");
+}
+
+#[test]
+fn test_redis_tls_posture_is_parsed_without_echoing_credentials() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisConfig;
+
+    let cfg = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://user:secret@cache.internal:6379/0",
+            "redis_tls": true,
+        }),
+        "test",
+    )
+    .expect("redis config must parse")
+    .expect("redis mode must produce a config");
+    assert!(cfg.tls);
+    assert_eq!(cfg.redacted_url(), "redis://redacted@cache.internal:6379/0");
+    assert_eq!(cfg.hostname(), Some("cache.internal".to_string()));
 }
 
 // === Eviction logic ===
@@ -698,6 +843,7 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
     let ws_schema = &spec["components"]["schemas"]["WsRateLimitingConfig"];
+    assert_eq!(ws_schema["additionalProperties"], json!(false));
     let schema_description = ws_schema["description"]
         .as_str()
         .expect("WsRateLimitingConfig description");
@@ -723,6 +869,7 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
 
     assert!(
         plugins.contains("does not make per-connection limits portable across reconnects")
+            && plugins.contains("Unknown top-level keys are rejected")
             && order.contains("rather than sharing a portable connection budget across reconnects"),
         "detailed plugin docs must keep the non-portable Redis semantics that public surfaces mirror"
     );
