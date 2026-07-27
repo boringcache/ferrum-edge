@@ -3467,18 +3467,20 @@ pub async fn run(
     .await;
 
     // Kubernetes controller teardown (#3220). The handle owns every CRD
-    // watcher, the reconciler, and the CRD reprobe task; dropping those
-    // `JoinHandle`s would *detach* the tasks, so CP mode would return without
-    // any happens-before boundary proving watchers, status writers, and
-    // reconciler broadcasts had stopped. `shutdown()` signals the watch
-    // channel first, then awaits every task under one bounded grace budget,
-    // aborting whatever is still running at the deadline and confirming those
-    // aborts in a bounded settle phase.
+    // watcher, the reconciler, the CRD reprobe task, and every replacement
+    // watcher that reprobe registered later; dropping those `JoinHandle`s
+    // would *detach* the tasks, so CP mode would return without any
+    // happens-before boundary proving watchers, status writers, and reconciler
+    // broadcasts had stopped. `shutdown()` signals the watch channel, closes
+    // the registry against further dynamic registration, then awaits every
+    // task under one bounded grace budget, aborting whatever is still running
+    // at the deadline and confirming those aborts in a bounded settle phase.
     //
     // Note the global shutdown watch is already `true` by the time we get here
     // (`wait_for_cp_listeners_until_shutdown_or_exit` observed or fired it), so
-    // "did this task exit early?" is decided by each task's supervisor at its
-    // own completion boundary, not by inspecting handles now.
+    // "did this task exit early?" cannot be decided here at all: each task
+    // recorded the watch's value inside itself, at the point its own future
+    // returned.
     //
     // Ordering: after the listeners, so no DP stream is still consuming
     // reconciler broadcasts while the controller winds down, and before the

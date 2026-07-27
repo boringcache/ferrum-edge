@@ -4422,26 +4422,58 @@ pub mod _test_support {
         K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
     };
 
-    /// Build a controller handle over synthetic, already-spawned tasks so
-    /// external tests can drive the real
-    /// [`K8sControllerHandle::shutdown`] path (delayed exit, panic
-    /// propagation, grace-period abort, early exit) without a live Kubernetes
-    /// API server and without making the task list a production-public field.
+    /// Test-only view of the crate-private controller task registry.
     ///
-    /// `shutdown` must be the same watch channel the synthetic tasks observe,
-    /// exactly as `start_k8s_controller` passes the receiver its real tasks
-    /// watch: the per-task supervisors read it at each completion boundary.
-    /// Must be called from within a tokio runtime (the supervisors spawn
-    /// immediately, mirroring production).
-    pub fn k8s_controller_handle_for_test(
-        tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> K8sControllerHandle {
-        K8sControllerHandle::from_named_tasks(
-            Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
-            tasks,
-            shutdown,
-        )
+    /// External tests register synthetic tasks through the **production**
+    /// `spawn_named` — the same lifecycle wrapper that records the shutdown
+    /// watch at each task's own completion boundary, and the same
+    /// close-on-shutdown ownership transfer the CRD reprobe loop races — rather
+    /// than through a parallel mock classifier. A regression in either would
+    /// therefore fail them.
+    #[derive(Clone)]
+    pub struct K8sControllerRegistryForTest(Arc<crate::k8s_controller::ControllerTaskRegistry>);
+
+    impl K8sControllerRegistryForTest {
+        /// Register a synthetic controller task exactly as the CRD watchers,
+        /// the reconciler, and the CRD reprobe loop do. The resulting task name
+        /// is `{label}#{registration sequence}`.
+        ///
+        /// Returns `false` when shutdown has already closed the registry, in
+        /// which case the future is dropped and never spawned. Must be called
+        /// from within a tokio runtime.
+        pub fn spawn<F>(
+            &self,
+            label: &str,
+            shutdown: tokio::sync::watch::Receiver<bool>,
+            fut: F,
+        ) -> bool
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            self.0.spawn_named(label, fut, shutdown)
+        }
+
+        /// `true` once a `shutdown()` has taken ownership of the task set.
+        pub fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+
+        /// The handle control-plane mode owns, over this exact registry, so
+        /// tasks registered after this call are still drained by `shutdown()`.
+        pub fn handle(&self) -> K8sControllerHandle {
+            K8sControllerHandle::new(
+                Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+                self.0.clone(),
+            )
+        }
+    }
+
+    /// Fresh controller task registry for external shutdown-supervision tests
+    /// (delayed exit, panic propagation, grace-period abort, early exit,
+    /// dynamic registration) without a live Kubernetes API server and without
+    /// making the task set a production-public field.
+    pub fn k8s_controller_registry_for_test() -> K8sControllerRegistryForTest {
+        K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
     }
 
     /// Thin wrapper over the production CP full-reload publication so external

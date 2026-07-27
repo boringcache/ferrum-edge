@@ -12,6 +12,7 @@ pub mod resource_store;
 pub mod status;
 pub mod watcher;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -161,31 +162,37 @@ impl K8sControllerShutdownOutcome {
 /// this only matters for a task wedged in a blocking `Drop`.
 const ABORT_SETTLE_BUDGET: Duration = Duration::from_secs(1);
 
-/// What a supervisor observed at its task's completion boundary.
+/// What a controller task's own lifecycle wrapper observed when the task
+/// returned.
 struct TaskCompletion {
-    result: Result<(), tokio::task::JoinError>,
-    /// The shutdown receiver's value read *at the instant the task's join
-    /// resolved*. Reading it later (e.g. in `shutdown()`) would be useless in
-    /// the real control-plane lifecycle, where the global watch is already
-    /// `true` long before the handle is torn down.
+    /// The shutdown watch's value, read inside the controller task itself in
+    /// the same poll that resolved the task's future — there is no `.await`
+    /// between the two, so the task cannot be descheduled in the window.
+    ///
+    /// Sampling it anywhere else (a separate supervisor task awaiting an
+    /// already-spawned `JoinHandle`, `is_finished()`, a teardown-time scan)
+    /// races the global watch flip: a task that returned while the watch was
+    /// still `false` would be re-read as `true` on another runtime thread's
+    /// timeline, and a silently dead watcher would be reported as a clean
+    /// shutdown.
     shutdown_observed: bool,
 }
 
-/// One owned controller task plus its supervisor.
+/// One controller task owned by [`ControllerTaskRegistry`].
 struct SupervisedTask {
     name: String,
-    /// Join handle of the **supervisor**, which owns the underlying task's
-    /// `JoinHandle`. Never abort or drop this while the underlying task is
-    /// live: dropping the inner `JoinHandle` would *detach* the real task,
-    /// which is precisely the bug this path exists to fix.
-    supervisor: tokio::task::JoinHandle<TaskCompletion>,
-    /// Abort handle of the **underlying** task, kept separate so the deadline
-    /// path can stop the real work without touching the supervisor.
+    /// Join handle of the controller task itself, running inside
+    /// [`run_supervised_task`]. Never drop this while the task is live:
+    /// dropping a `JoinHandle` *detaches* the task, which is precisely the
+    /// defect #3220 exists to close.
+    handle: tokio::task::JoinHandle<TaskCompletion>,
+    /// Abort handle for the same task, kept separately so the grace-deadline
+    /// path can stop the work while `handle` is owned by the join set.
     abort: tokio::task::AbortHandle,
 }
 
 /// Terminal classification of a single controller task, resolved once and then
-/// materialized into [`K8sControllerShutdownOutcome`] in spawn order.
+/// materialized into [`K8sControllerShutdownOutcome`] in registration order.
 enum TaskDisposition {
     Completed,
     ExitedBeforeShutdown,
@@ -193,50 +200,140 @@ enum TaskDisposition {
     TimedOut { abort_confirmed: bool },
 }
 
-pub struct K8sControllerHandle {
-    pub metrics: Arc<ControllerMetrics>,
+/// Run a controller task and record the shutdown state at its own completion
+/// boundary.
+///
+/// `fut.await` and the `borrow()` below run in one poll of this future: when
+/// `fut` resolves, control returns here synchronously, so the read happens
+/// before the task yields back to the scheduler.
+async fn run_supervised_task<F>(fut: F, shutdown: watch::Receiver<bool>) -> TaskCompletion
+where
+    F: Future<Output = ()>,
+{
+    fut.await;
+    TaskCompletion {
+        shutdown_observed: *shutdown.borrow(),
+    }
+}
+
+/// Shared owner of every task the Kubernetes controller spawns (#3220).
+///
+/// Controller tasks are never `tokio::spawn`ed directly. They go through
+/// [`Self::spawn_named`], which wraps the future in [`run_supervised_task`] and
+/// keeps the resulting `JoinHandle` here, so:
+///
+/// * the CRD reprobe loop's *dynamically created* replacement watchers are
+///   owned exactly like the startup ones. They used to be spawned and dropped
+///   on the floor, so a watcher created after startup outlived control-plane
+///   teardown with no terminal join boundary at all;
+/// * registration and the shutdown-time close are one atomic step under the
+///   same lock, so a reprobe racing teardown either hands its watcher over
+///   (and it is awaited) or is refused *before the task is ever spawned*.
+///   There is no window in which a just-created watcher exists unowned.
+pub(crate) struct ControllerTaskRegistry {
+    state: std::sync::Mutex<RegistryState>,
+}
+
+struct RegistryState {
+    /// Set once by [`ControllerTaskRegistry::close_and_take`]; refuses new
+    /// registrations from then on.
+    closed: bool,
+    next_seq: u64,
     tasks: Vec<SupervisedTask>,
 }
 
-impl K8sControllerHandle {
-    /// Assemble a handle from already-spawned, named controller tasks.
+impl ControllerTaskRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(RegistryState {
+                closed: false,
+                next_seq: 0,
+                tasks: Vec::new(),
+            }),
+        })
+    }
+
+    /// Recover a poisoned guard instead of propagating the panic: every
+    /// critical section here is a handful of infallible field writes plus
+    /// `tokio::spawn`, and shutdown must not panic.
+    fn state(&self) -> std::sync::MutexGuard<'_, RegistryState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Spawn `fut` as an owned controller task named `{label}#{seq}`.
     ///
-    /// Each task is immediately wrapped in a supervisor that awaits its real
-    /// `JoinHandle` and records the shutdown-receiver state at the completion
-    /// boundary. Doing it here — rather than inspecting `is_finished()` during
-    /// teardown — is what makes an early successful exit detectable at all:
-    /// by the time CP mode calls [`Self::shutdown`], the global shutdown watch
-    /// has already fired, so a later inspection can no longer tell "returned
-    /// while running normally" from "returned because we asked it to".
+    /// `label` must be built from compile-time identifiers only (the task's
+    /// role plus a static Kubernetes kind from `ISTIO_CRDS` /
+    /// `GATEWAY_API_CRDS` / the core resource tables) — never from cluster
+    /// object contents — because the name is logged and carried in shutdown
+    /// errors. `seq` is a monotonic registration counter, so names are unique
+    /// and the shutdown outcome is reported in a deterministic order.
     ///
-    /// Kept crate-visible plus a `_test_support` re-export so external tests
-    /// can drive the real shutdown path with synthetic tasks without widening
-    /// the production API.
-    pub(crate) fn from_named_tasks(
-        metrics: Arc<ControllerMetrics>,
-        tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    /// Returns `false` when shutdown has already closed the registry. The task
+    /// is **not** spawned in that case, so a caller that loses the race leaks
+    /// nothing and should abandon whatever it was setting up.
+    pub(crate) fn spawn_named<F>(
+        &self,
+        label: &str,
+        fut: F,
         shutdown: watch::Receiver<bool>,
+    ) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Spawn *inside* the lock so registration is atomic with the closed
+        // check: shutdown can never observe a task that exists but is unowned.
+        let mut state = self.state();
+        if state.closed {
+            return false;
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let handle = tokio::spawn(run_supervised_task(fut, shutdown));
+        let abort = handle.abort_handle();
+        state.tasks.push(SupervisedTask {
+            name: format!("{label}#{seq}"),
+            handle,
+            abort,
+        });
+        true
+    }
+
+    /// `true` once shutdown has taken ownership of the task set. Lets a
+    /// long-running producer (the CRD reprobe loop) stop promptly instead of
+    /// looping on refusals.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state().closed
+    }
+
+    /// Stop accepting new tasks and take everything registered so far.
+    /// Idempotent: a second call returns an empty set.
+    fn close_and_take(&self) -> Vec<SupervisedTask> {
+        let mut state = self.state();
+        state.closed = true;
+        std::mem::take(&mut state.tasks)
+    }
+}
+
+pub struct K8sControllerHandle {
+    pub metrics: Arc<ControllerMetrics>,
+    registry: Arc<ControllerTaskRegistry>,
+}
+
+impl K8sControllerHandle {
+    /// Take terminal ownership of a controller task registry.
+    ///
+    /// Kept crate-visible plus a `_test_support` seam so external tests can
+    /// drive the real registry and the real shutdown path with synthetic tasks
+    /// without widening the production API.
+    pub(crate) fn new(
+        metrics: Arc<ControllerMetrics>,
+        registry: Arc<ControllerTaskRegistry>,
     ) -> Self {
-        let tasks = tasks
-            .into_iter()
-            .map(|(name, handle)| {
-                let abort = handle.abort_handle();
-                let shutdown_rx = shutdown.clone();
-                let supervisor = tokio::spawn(async move {
-                    let result = handle.await;
-                    TaskCompletion {
-                        result,
-                        shutdown_observed: *shutdown_rx.borrow(),
-                    }
-                });
-                SupervisedTask {
-                    name,
-                    supervisor,
-                    abort,
-                }
-            })
-            .collect();
-        Self { metrics, tasks }
+        Self { metrics, registry }
     }
 
     /// Signal shutdown, then await every owned task with a bounded grace
@@ -246,8 +343,8 @@ impl K8sControllerHandle {
     /// The signal is sent here (idempotently — `watch::Sender::send` on an
     /// already-`true` channel still notifies) so the ordering is structural:
     /// no caller can await controller tasks that were never told to stop.
-    /// Whether a task exited early is decided by its supervisor at the
-    /// completion boundary, not by the state of the channel at this point.
+    /// Whether a task exited early was already decided inside the task itself
+    /// at its completion boundary, not by the state of the channel here.
     pub async fn shutdown(
         self,
         shutdown_tx: &watch::Sender<bool>,
@@ -257,8 +354,16 @@ impl K8sControllerHandle {
         // notify, and every task is already gone or about to be joined.
         let _ = shutdown_tx.send(true);
 
+        // Signal first, then close. Closing stops the CRD reprobe loop from
+        // registering further watchers, and the two steps together drain the
+        // reprobe race: a probe already inside `start_crd_watchers` either
+        // registered its replacement watcher before this point (so it is in
+        // `tasks` and awaited below) or is refused after it (so the watcher is
+        // never spawned). Neither outcome loses a live task.
+        let tasks = self.registry.close_and_take();
+
         let mut outcome = K8sControllerShutdownOutcome::default();
-        for (name, disposition) in await_controller_tasks(self.tasks, grace).await {
+        for (name, disposition) in await_controller_tasks(tasks, grace).await {
             match disposition {
                 TaskDisposition::Completed => outcome.completed.push(name),
                 TaskDisposition::ExitedBeforeShutdown => {
@@ -299,9 +404,10 @@ impl K8sControllerHandle {
 /// then abort and settle whatever is left.
 ///
 /// Concurrent (rather than sequential) so a slow watcher does not hide a
-/// reconciler panic behind it, and so the whole set shares one grace budget.
-/// Returns dispositions in spawn order (watchers, reconciler, reprobe)
-/// regardless of completion order, so the outcome is deterministic.
+/// reconciler panic behind it, and so the whole set — startup watchers,
+/// reconciler, reprobe, and any watcher the reprobe registered later — shares
+/// one grace budget. Returns dispositions in registration order regardless of
+/// completion order, so the outcome is deterministic.
 async fn await_controller_tasks(
     tasks: Vec<SupervisedTask>,
     grace: Duration,
@@ -315,16 +421,16 @@ async fn await_controller_tasks(
 
     let mut names: Vec<String> = Vec::with_capacity(tasks.len());
     let mut dispositions: BTreeMap<usize, TaskDisposition> = BTreeMap::new();
-    // Underlying-task abort handles, keyed by spawn index. The supervisor
-    // futures below are never aborted or dropped early, so the real tasks are
-    // never detached.
+    // Task abort handles, keyed by registration index. The `JoinHandle`s
+    // themselves move into `futures` below and are never dropped while their
+    // task is still live, so no controller task is ever detached here.
     let mut pending: BTreeMap<usize, tokio::task::AbortHandle> = BTreeMap::new();
     let mut futures = FuturesUnordered::new();
     for (index, task) in tasks.into_iter().enumerate() {
         names.push(task.name.clone());
         pending.insert(index, task.abort);
-        let supervisor = task.supervisor;
-        futures.push(async move { (index, supervisor.await) });
+        let handle = task.handle;
+        futures.push(async move { (index, handle.await) });
     }
 
     let deadline = tokio::time::Instant::now() + grace;
@@ -355,8 +461,8 @@ async fn await_controller_tasks(
     }
 
     // Bounded abort-settle phase: an aborted task's `JoinHandle` resolves only
-    // after its future has actually been dropped, so awaiting the supervisors
-    // here is what turns "abort was requested" into "termination happened".
+    // after its future has actually been dropped, so awaiting the handles here
+    // is what turns "abort was requested" into "termination happened".
     // Dropping `futures` without this would reintroduce detach-on-drop.
     if !timed_out.is_empty() {
         let mut confirmed: BTreeSet<usize> = BTreeSet::new();
@@ -370,8 +476,7 @@ async fn await_controller_tasks(
                     // abort is logged but keeps the `timed_out` classification
                     // for the same reason.
                     let name = names.get(index).cloned().unwrap_or_default();
-                    if let Ok(completion) = &joined
-                        && let Err(err) = &completion.result
+                    if let Err(err) = &joined
                         && err.is_panic()
                     {
                         error!(
@@ -397,9 +502,8 @@ async fn await_controller_tasks(
         }
     }
 
-    // Anything still unresolved here is a *supervisor* whose underlying task
-    // was already aborted above, so dropping `futures` now detaches only the
-    // supervisor — never live controller work — and the situation is reported
+    // Anything still unresolved here was already aborted above, so its future
+    // is being torn down rather than left running. The situation is reported
     // as `abort_unconfirmed` rather than claimed as a settled termination.
     drop(futures);
 
@@ -419,31 +523,24 @@ async fn await_controller_tasks(
     resolved
 }
 
-/// Turn a supervisor's join result into a terminal disposition.
+/// Turn a controller task's join result into a terminal disposition.
 fn classify_completion(
     name: String,
     joined: Result<TaskCompletion, tokio::task::JoinError>,
 ) -> TaskDisposition {
     match joined {
-        Ok(completion) => match completion.result {
-            Ok(()) if completion.shutdown_observed => TaskDisposition::Completed,
-            // Returned successfully while the shutdown watch was still
-            // `false`: that part of the controller stopped reconciling on its
-            // own.
-            Ok(()) => TaskDisposition::ExitedBeforeShutdown,
-            Err(err) => TaskDisposition::Failed(K8sControllerTaskFailure {
-                task: name,
-                panicked: err.is_panic(),
-                detail: err.to_string(),
-            }),
-        },
-        // The supervisor only awaits a `JoinHandle`, so it cannot panic and is
-        // never aborted; treat a join failure as an abnormal termination of
-        // the task it was supervising rather than swallowing it.
+        Ok(completion) if completion.shutdown_observed => TaskDisposition::Completed,
+        // Returned successfully while the shutdown watch was still `false` at
+        // the task's own completion boundary: that part of the controller
+        // stopped reconciling on its own.
+        Ok(_) => TaskDisposition::ExitedBeforeShutdown,
+        // A panic inside the task unwinds through the lifecycle wrapper, so it
+        // never records a completion; the same arm also covers a cancellation
+        // from outside this shutdown path.
         Err(err) => TaskDisposition::Failed(K8sControllerTaskFailure {
             task: name,
             panicked: err.is_panic(),
-            detail: format!("supervisor join failed: {err}"),
+            detail: err.to_string(),
         }),
     }
 }
@@ -504,7 +601,13 @@ pub async fn start_k8s_controller(
         .gateway_api_data_plane_service_namespace
         .clone();
 
-    let watcher_handles = start_crd_watchers(
+    // Every controller task — startup watchers, the reconciler, the CRD
+    // reprobe loop, and the replacement watchers that loop creates later — is
+    // registered here, so `K8sControllerHandle::shutdown` has a terminal join
+    // boundary for all of them (#3220).
+    let registry = ControllerTaskRegistry::new();
+
+    let watchers_started = start_crd_watchers(
         client.clone(),
         store_set.clone(),
         watcher_selection,
@@ -513,10 +616,12 @@ pub async fn start_k8s_controller(
         istio_root_namespace.clone(),
         gateway_api_data_plane_service_namespace.clone(),
         shutdown.clone(),
+        &registry,
+        STARTUP_WATCHER_LABEL,
     )
     .await;
 
-    info!(watchers = watcher_handles.len(), "CRD watchers started");
+    info!(watchers = watchers_started, "CRD watchers started");
 
     let reconciler_config = ReconcilerConfig {
         namespace: controller_config.namespace,
@@ -545,7 +650,7 @@ pub async fn start_k8s_controller(
         .watch_istio
         .then(|| IstioStatusWriter::new(client.clone()));
 
-    let reconciler_handle = spawn_reconcile_loop(
+    let reconciler_registered = spawn_reconcile_loop(
         store_set.clone(),
         config_arc,
         overlay_slot,
@@ -562,9 +667,11 @@ pub async fn start_k8s_controller(
         istio_status_writer,
         metrics.clone(),
         shutdown.clone(),
+        &registry,
     );
+    report_if_unregistered(reconciler_registered, "reconciler");
 
-    let reprobe_handle = spawn_crd_reprobe_task(
+    let reprobe_registered = spawn_crd_reprobe_task(
         client,
         store_set,
         watcher_selection,
@@ -572,24 +679,36 @@ pub async fn start_k8s_controller(
         controller_namespace,
         istio_root_namespace,
         gateway_api_data_plane_service_namespace,
-        shutdown.clone(),
+        shutdown,
         Duration::from_secs(300),
+        &registry,
     );
+    report_if_unregistered(reprobe_registered, "crd-reprobe");
 
-    let mut tasks: Vec<(String, tokio::task::JoinHandle<()>)> = watcher_handles
-        .into_iter()
-        .enumerate()
-        .map(|(index, handle)| (format!("crd-watcher-{index}"), handle))
-        .collect();
-    tasks.push(("reconciler".to_string(), reconciler_handle));
-    tasks.push(("crd-reprobe".to_string(), reprobe_handle));
+    Ok(K8sControllerHandle::new(metrics, registry))
+}
 
-    // The same shutdown receiver the tasks themselves watch: each supervisor
-    // reads it at its task's completion boundary, so a watcher/reconciler that
-    // returns during normal operation is recorded as an early exit even though
-    // CP mode only tears the handle down long after the global watch fired.
-    let handle = K8sControllerHandle::from_named_tasks(metrics, tasks, shutdown);
-    Ok(handle)
+/// Label prefix for the watchers started during controller startup.
+pub(crate) const STARTUP_WATCHER_LABEL: &str = "crd-watcher";
+
+/// Label prefix for the replacement watchers the CRD reprobe loop creates when
+/// a CRD group shows up after startup. Distinguishing them keeps a shutdown
+/// report readable without putting any cluster-supplied text in a task name.
+pub(crate) const REPROBE_WATCHER_LABEL: &str = "crd-watcher-reprobe";
+
+/// Startup registration is expected to always succeed: the registry is created
+/// in [`start_k8s_controller`] and is only closed by
+/// [`K8sControllerHandle::shutdown`], which consumes a handle that does not
+/// exist yet. A refusal means the task was never spawned — nothing is detached
+/// — but the controller would be silently missing a component, so say so.
+fn report_if_unregistered(registered: bool, task: &str) {
+    if !registered {
+        error!(
+            task,
+            "Kubernetes controller task was refused by a closed task registry; \
+             the controller is running without it"
+        );
+    }
 }
 
 async fn build_kube_client(
