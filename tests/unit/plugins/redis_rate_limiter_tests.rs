@@ -1,6 +1,6 @@
 use ferrum_edge::_test_support::{
-    MAX_REDIS_POOL_SIZE, RedisConfig, redis_client_credentials, redis_config_url_with_ip,
-    redis_rate_limit_client_for_test,
+    MAX_REDIS_POOL_SIZE, RedisConfig, RedisRateLimitClient, redis_client_credentials,
+    redis_config_url_with_ip, redis_rate_limit_client_for_test,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1043,4 +1043,262 @@ async fn repeated_failover_replacement_leaves_only_active_observer() {
         !active_abort.is_finished(),
         "only the active generation observer may remain"
     );
+}
+
+// ── WATCH fencing connection type + fail-closed disconnect (GHSA-f72h) ────
+
+/// Static pin: ownership CAS helpers must dial a non-reconnecting
+/// `MultiplexedConnection`, never a transparently-reconnecting
+/// `ConnectionManager` that can drop WATCH state across a reconnect.
+#[test]
+fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains(
+            "async fn get_dedicated_connection(&self) -> Option<redis::aio::MultiplexedConnection>"
+        ),
+        "get_dedicated_connection must return MultiplexedConnection"
+    );
+    assert!(
+        !source.contains(
+            "async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager>"
+        ),
+        "get_dedicated_connection must not return ConnectionManager"
+    );
+    assert!(
+        source.contains("client.get_multiplexed_async_connection_with_config"),
+        "dedicated path must dial MultiplexedConnection directly"
+    );
+
+    let type_name = RedisRateLimitClient::dedicated_watch_connection_type_name_for_test();
+    assert_eq!(
+        type_name,
+        std::any::type_name::<redis::aio::MultiplexedConnection>()
+    );
+    assert!(
+        !type_name.contains("ConnectionManager"),
+        "WATCH helper type must not be ConnectionManager: {type_name}"
+    );
+
+    for marker in [
+        "pub async fn delete_if_value_matches",
+        "pub async fn set_bytes_with_expire_if_value_matches",
+    ] {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing helper {marker}"));
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\n    pub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len().min(12_000));
+        let body = &rest[..end];
+        assert!(
+            body.contains("get_dedicated_connection()"),
+            "{marker} must use get_dedicated_connection"
+        );
+        let brace = body
+            .find('{')
+            .unwrap_or_else(|| panic!("{marker} missing body"));
+        let impl_body = &body[brace..];
+        assert!(
+            !impl_body.contains("get_connection()"),
+            "{marker} must not use the pooled ConnectionManager path"
+        );
+        assert!(
+            !impl_body.contains("ConnectionManager"),
+            "{marker} implementation must not reference ConnectionManager"
+        );
+        // Mismatch path + GET-error path must both attempt UNWATCH (fail closed).
+        assert!(
+            impl_body.matches("UNWATCH").count() >= 2,
+            "{marker} must UNWATCH on pre-MULTI mismatch and GET failure"
+        );
+    }
+}
+
+/// Accept TCP, complete the redis-rs handshake with +OK replies, answer the
+/// first WATCH with +OK, then drop the socket before GET/EXEC. Counts SET/DEL
+/// payloads so a fail-open unconditional write would be observable.
+async fn spawn_watch_then_drop_redis_server() -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let writes_task = Arc::clone(&writes);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    let writes = Arc::clone(&writes_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        let mut pending = Vec::new();
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            if pending
+                                .windows(b"$3\r\nSET\r\n".len())
+                                .any(|w| w == b"$3\r\nSET\r\n")
+                                || pending
+                                    .windows(b"$3\r\nDEL\r\n".len())
+                                    .any(|w| w == b"$3\r\nDEL\r\n")
+                            {
+                                writes.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if pending
+                                .windows(b"$5\r\nWATCH\r\n".len())
+                                .any(|w| w == b"$5\r\nWATCH\r\n")
+                            {
+                                let _ = stream.write_all(b"+OK\r\n").await;
+                                // Drop after acknowledging WATCH so GET/EXEC
+                                // observe a dead socket with no watch state.
+                                break;
+                            }
+                            let commands =
+                                pending.iter().filter(|&&b| b == b'*').count().max(1);
+                            let mut reply = Vec::new();
+                            for _ in 0..commands {
+                                reply.extend_from_slice(b"+OK\r\n");
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                            pending.clear();
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx, writes)
+}
+
+#[tokio::test]
+async fn watch_cas_helpers_fail_closed_when_connection_drops_after_watch() {
+    let (port, shutdown, writes) = spawn_watch_then_drop_redis_server().await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let set_result = client
+        .set_bytes_with_expire_if_value_matches("fence-key", b"expected", b"stale", 60)
+        .await;
+    assert!(
+        set_result.is_err(),
+        "disconnect after WATCH must fail closed, got {set_result:?}"
+    );
+
+    let delete_result = client
+        .delete_if_value_matches("fence-key", b"expected")
+        .await;
+    assert!(
+        delete_result.is_err(),
+        "disconnect after WATCH must fail closed on delete, got {delete_result:?}"
+    );
+
+    assert_eq!(
+        writes.load(Ordering::Relaxed),
+        0,
+        "a dropped WATCH sequence must not publish SET/DEL"
+    );
+    assert!(
+        !client.is_available(),
+        "I/O failure must mark Redis unavailable"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// Validation diagnostics on the shared Redis admission path must name the
+/// field/shape without echoing rejected values, URLs, or credential-bearing
+/// config objects (request_deduplication reaches this helper).
+#[test]
+fn redis_config_validation_diagnostics_are_value_redacted() {
+    const PASSWORD: &str = "sentinel-redis-password-9f21c8a4";
+    const USER: &str = "sentinel-redis-user-6c38";
+    const TOKEN: &str = "sentinel-query-token-4a57";
+
+    let leaked_shape = json!(format!(
+        "redis://{USER}:{PASSWORD}@cache.internal:6379/0?auth={TOKEN}"
+    ));
+    let err = RedisConfig::from_plugin_config(&leaked_shape, "ferrum:test")
+        .expect_err("non-object config must be rejected");
+    assert!(
+        err.contains("must be a JSON object"),
+        "unexpected non-object diagnostic: {err}"
+    );
+    for secret in [PASSWORD, USER, TOKEN, "redis://", "cache.internal"] {
+        assert!(
+            !err.contains(secret),
+            "non-object diagnostic must not echo {secret:?}: {err}"
+        );
+    }
+
+    let sync_err = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": format!("redis-with-{PASSWORD}"),
+            "redis_url": format!("redis://{USER}:{PASSWORD}@cache.internal:6379/0"),
+        }),
+        "ferrum:test",
+    )
+    .expect_err("invalid sync_mode must be rejected");
+    assert!(
+        sync_err.contains("'sync_mode'") && sync_err.contains("'local' or 'redis'"),
+        "unexpected sync_mode diagnostic: {sync_err}"
+    );
+    for secret in [PASSWORD, USER] {
+        assert!(
+            !sync_err.contains(secret),
+            "sync_mode diagnostic must not echo {secret:?}: {sync_err}"
+        );
+    }
+
+    let url_err = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": format!(
+                "http://{USER}:{PASSWORD}@cache.internal:6379/0?auth={TOKEN}#{PASSWORD}"
+            ),
+        }),
+        "ferrum:test",
+    )
+    .expect_err("non-redis scheme must be rejected");
+    assert!(
+        url_err.contains("'redis_url'") && url_err.contains("scheme"),
+        "unexpected url diagnostic: {url_err}"
+    );
+    for secret in [PASSWORD, USER, TOKEN, "http://", "cache.internal"] {
+        assert!(
+            !url_err.contains(secret),
+            "redis_url diagnostic must not echo {secret:?}: {url_err}"
+        );
+    }
+
+    let parse_err = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": format!("not a url {USER}:{PASSWORD}?auth={TOKEN}"),
+        }),
+        "ferrum:test",
+    )
+    .expect_err("unparseable redis_url must be rejected");
+    assert!(
+        parse_err.contains("'redis_url'") && parse_err.contains("valid URL"),
+        "unexpected parse diagnostic: {parse_err}"
+    );
+    for secret in [PASSWORD, USER, TOKEN] {
+        assert!(
+            !parse_err.contains(secret),
+            "parse diagnostic must not echo {secret:?}: {parse_err}"
+        );
+    }
 }

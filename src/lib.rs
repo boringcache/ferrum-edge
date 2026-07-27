@@ -962,6 +962,10 @@ pub mod _test_support {
         crate::plugins::request_deduplication::redis_cached_response_payload_is_valid_for_test(data)
     }
 
+    pub fn request_deduplication_redis_record_payload_is_valid(data: &[u8]) -> bool {
+        crate::plugins::request_deduplication::redis_record_payload_is_valid_for_test(data)
+    }
+
     pub fn request_deduplication_completed_size_snapshot_for_test(
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) -> (usize, usize) {
@@ -1003,6 +1007,12 @@ pub mod _test_support {
         plugin: &crate::plugins::request_deduplication::RequestDeduplication,
     ) {
         plugin.expire_inflight_entries_for_tests();
+    }
+
+    pub fn request_deduplication_expire_execution_barriers_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) {
+        plugin.expire_execution_barriers_for_tests();
     }
 
     pub fn request_deduplication_redis_payload_for_test(
