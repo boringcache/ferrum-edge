@@ -9418,6 +9418,52 @@ async fn serve_mesh_runtime(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+
+    // Once ProxyState (and its tasks) exist, every later initialization error
+    // must signal shared shutdown and run bounded teardown before returning.
+    let mut owner = MeshStartupOwner::new(
+        shutdown_tx,
+        proxy_state,
+        health_check_handles,
+        mesh_background_handles,
+        env_config.shutdown_drain_seconds,
+    );
+    if let Err(err) = arm_mesh_runtime_startup(
+        &mut owner,
+        &env_config,
+        &runtime,
+        &dns_cache,
+        hostnames,
+        initial_dns_slice,
+        initial_applied_mesh_slice,
+        mesh_state,
+        tls_policy,
+        crls,
+    )
+    .await
+    {
+        return Err(owner.fail_with(err).await);
+    }
+    owner.serve_until_shutdown().await
+}
+
+/// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
+/// via [`MeshStartupOwner::fail_with`] so spawned tasks/netns managers drain.
+#[allow(clippy::too_many_arguments)]
+async fn arm_mesh_runtime_startup(
+    owner: &mut MeshStartupOwner,
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    dns_cache: &DnsCache,
+    mut hostnames: Vec<(String, Option<String>, Option<u64>)>,
+    initial_dns_slice: Option<Arc<MeshSlice>>,
+    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    mesh_state: MeshRuntimeState,
+    tls_policy: TlsPolicy,
+    crls: tls::CrlList,
+) -> Result<(), anyhow::Error> {
+    let shutdown_tx = owner.shutdown_tx.clone();
+    let proxy_state = owner.proxy_state.clone();
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!(
             "Node-waypoint identity resolver enabled; unknown outbound capture socket cookies fail closed"
@@ -9435,14 +9481,14 @@ async fn serve_mesh_runtime(
             env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
             shutdown_tx.subscribe(),
         ) {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
             resolver.clone(),
             env_config.mesh_node_waypoint_idle_gc_interval_secs,
             shutdown_tx.subscribe(),
         ) {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
         // is not pinned (no node-agent on this host, kernel < 5.7, or
@@ -9451,7 +9497,7 @@ async fn serve_mesh_runtime(
         if let Some(state) = bpf_metrics_state.as_ref()
             && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
         {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         // Spawn the orig-dst → identity bridge. It reads the pinned
         // FERRUM_ORIG_DST4/6 maps the node-agent populated, mirrors each
@@ -9469,11 +9515,12 @@ async fn serve_mesh_runtime(
         // code and CI-verified at the load/attach level (`ebpf-live`); it stays
         // unexercised on a live multi-pod datapath, where a tuple/byte-order or
         // enrollment miss fails closed (never misattributes).
-        mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
+        owner.push_mesh_background(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
     };
+    owner.set_proxy_state(proxy_state.clone());
     // Node-waypoint in-netns outbound capture listeners (opt-in). The default
     // outbound listener binds in the HOST netns, which a pod's loopback-rewritten
     // capture (`connect4` → 127.0.0.1:15001, `connect6` → [::1]:15001) can never
@@ -9567,7 +9614,7 @@ async fn serve_mesh_runtime(
                 ),
                 "Node-waypoint dual-family in-netns outbound capture listeners enabled"
             );
-            mesh_background_handles.push(tokio::spawn(async move {
+            owner.push_mesh_background(tokio::spawn(async move {
                 manager.run(manager_shutdown).await;
             }));
         }
@@ -9669,7 +9716,7 @@ async fn serve_mesh_runtime(
                     capture_port = settings.udp_outbound_port,
                     "Ambient per-pod-netns UDP capture producer enabled"
                 );
-                mesh_background_handles.push(tokio::spawn(async move {
+                owner.push_mesh_background(tokio::spawn(async move {
                     manager.run(manager_shutdown).await;
                 }));
             }
@@ -9692,7 +9739,7 @@ async fn serve_mesh_runtime(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
                 "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
             );
-            mesh_background_handles.push(tokio::spawn(async move {
+            owner.push_mesh_background(tokio::spawn(async move {
                 manager.run(manager_shutdown).await;
             }));
         }
@@ -9708,7 +9755,7 @@ async fn serve_mesh_runtime(
         handles: admin_handles,
         startup_signals: admin_startup_signals,
     } = start_mesh_admin_listeners(
-        &env_config,
+        env_config,
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
@@ -9720,7 +9767,15 @@ async fn serve_mesh_runtime(
         &tls_policy,
         &crls,
     )?;
-    mesh_background_handles.extend(admin_handles);
+    owner.extend_mesh_background(admin_handles);
+    // Injected SVID/TLS/DNS-bind-class failures land after admin/netns side
+    // effects exist and before the final listener start-signal gate.
+    if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeStartupGate {
+        let _ = take_mesh_startup_fault_inject();
+        return Err(anyhow::anyhow!(
+            "injected mesh startup failure before startup_result gate"
+        ));
+    }
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -9753,7 +9808,7 @@ async fn serve_mesh_runtime(
     // `prepare_gateway_config_for_native_slice` before `ProxyState::new`
     // existed, so the apply-loop wiring would otherwise miss it.
     if let Some(ref slice) = initial_applied_mesh_slice {
-        refresh_mesh_outbound_enforcement(&proxy_state, &runtime, slice);
+        refresh_mesh_outbound_enforcement(&proxy_state, runtime, slice);
     }
 
     // Resolve mTLS mode and start any CA-backed runtime SVID source before pool
@@ -9761,8 +9816,8 @@ async fn serve_mesh_runtime(
     // gateway SVID; if the first refresh runs while the slot is empty, HBONE
     // targets can remain Unknown until the next periodic refresh.
     let inbound_mtls_mode =
-        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
-    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), runtime)?;
+    validate_egress_gateway_mtls_config(runtime, env_config)?;
     // Loud warning when stream egress is opted out of SVID-mTLS. The default
     // (false) terminates SVID-mTLS + runs mesh_authz on stream egress listeners
     // (parity with HTTP egress); enabling plaintext means any pod that can reach
@@ -9783,15 +9838,15 @@ async fn serve_mesh_runtime(
     let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
-        &runtime,
-        &env_config,
+        runtime,
+        env_config,
         mesh_runtime_trust_overlay_slot.clone(),
-        &mut mesh_background_handles,
+        owner.mesh_background_mut(),
         shutdown_tx.subscribe(),
     )
     .await?;
     let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
-        || gateway_svid_material_configured(&env_config))
+        || gateway_svid_material_configured(env_config))
     .then_some(mesh_runtime_trust_overlay_slot);
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
@@ -9808,35 +9863,37 @@ async fn serve_mesh_runtime(
     );
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
-    let dns_handle =
-        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
-    let per_ip_cleanup_handle =
-        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
-    let overload_handle = crate::overload::start_monitor(
+    owner.push_core_handle(
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe())),
+    );
+    owner.set_dns_retry_handle(dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe())));
+    owner.set_per_ip_cleanup_handle(
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe())),
+    );
+    owner.push_core_handle(crate::overload::start_monitor(
         proxy_state.overload.clone(),
         env_config.overload_config(),
         env_config.max_connections,
         env_config.max_requests,
         shutdown_tx.subscribe(),
-    );
-    let metrics_handle = crate::metrics::start_metrics_monitor(
+    ));
+    owner.push_core_handle(crate::metrics::start_metrics_monitor(
         proxy_state.request_count.clone(),
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
         shutdown_tx.subscribe(),
-    );
-    let runtime_system_handle = crate::system_metrics::start_sampler(
+    ));
+    owner.push_core_handle(crate::system_metrics::start_sampler(
         Some(proxy_state.clone()),
         env_config.runtime_metrics_system_sample_interval_ms,
         shutdown_tx.subscribe(),
-    );
-    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+    ));
+    owner.push_core_handle(crate::runtime_metrics::start_window_rotator(
         env_config.runtime_metrics_window_1m_seconds,
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
-    );
+    ));
     // Start mesh DNS proxy if enabled
     let dns_proxy_handle = if runtime.dns_enabled {
         let dns_proxy = Arc::new(MeshDnsProxy::new(
@@ -9859,7 +9916,7 @@ async fn serve_mesh_runtime(
         })?;
         let dns_shutdown = shutdown_tx.subscribe();
         let dns_runner = dns_proxy.clone();
-        mesh_background_handles.push(tokio::spawn(async move {
+        owner.push_mesh_background(tokio::spawn(async move {
             dns_runner.run_bound(dns_sockets, dns_shutdown).await;
         }));
         info!(
@@ -9888,9 +9945,9 @@ async fn serve_mesh_runtime(
     // so the SVID-rotating server identity reads the live leaf and fails closed
     // when the slot is empty.
     let mesh_frontend_identity =
-        load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
+        load_mesh_frontend_server_identity(env_config, &proxy_state.gateway_svid_bundle)?;
     let inbound_mtls_modes_by_port =
-        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref(), &runtime);
+        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref(), runtime);
     let inbound_app_port_by_orig_dst_port =
         resolve_inbound_app_ports_by_orig_dst_port(initial_applied_mesh_slice.as_deref());
     let has_inbound_tls_termination_listener = runtime.has_inbound_tls_termination_listener();
@@ -9900,7 +9957,7 @@ async fn serve_mesh_runtime(
     // leave STRICT/PERMISSIVE overrides unable to build on the default path.
     // Passthrough-only topologies remain exempt through the listener-aware helper.
     let mut initial_inbound_tls_snapshot = mesh_inbound_tls_reload_snapshot_for_listener(
-        &env_config,
+        env_config,
         inbound_mtls_mode,
         inbound_mtls_modes_by_port.clone(),
         has_inbound_tls_termination_listener,
@@ -9912,10 +9969,10 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let federation_activation = FederationActivation::from_env_config(&env_config);
+    let federation_activation = FederationActivation::from_env_config(env_config);
     let initial_federation_snapshot = mesh_state.federation_store().snapshot();
     let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot_with_federation(
-        &env_config,
+        env_config,
         initial_applied_mesh_slice.as_deref(),
         Some(&initial_federation_snapshot),
         federation_activation,
@@ -9944,7 +10001,7 @@ async fn serve_mesh_runtime(
         mesh_inbound_spiffe_slot.clone(),
         mesh_runtime_trust_overlay_slot.clone(),
     ) {
-        mesh_background_handles.push(start_mesh_inbound_svid_rotation_republisher(
+        owner.push_mesh_background(start_mesh_inbound_svid_rotation_republisher(
             proxy_state.clone(),
             inbound_slot,
             trust_overlay_slot,
@@ -9953,7 +10010,7 @@ async fn serve_mesh_runtime(
         ));
     }
     let frontend_tls = load_mesh_frontend_tls(
-        &env_config,
+        env_config,
         &tls_policy,
         &crls,
         inbound_mtls_mode,
@@ -9964,7 +10021,7 @@ async fn serve_mesh_runtime(
     )?;
     let frontend_tls_by_port = if has_inbound_tls_termination_listener {
         load_mesh_frontend_tls_by_port(
-            &env_config,
+            env_config,
             &tls_policy,
             &crls,
             &inbound_mtls_modes_by_port,
@@ -9990,8 +10047,8 @@ async fn serve_mesh_runtime(
     let effective_inbound_mtls_modes_by_port =
         effective_inbound_mtls_modes_for_topology(&inbound_mtls_modes_by_port, runtime.topology);
     enforce_mesh_inbound_fail_closed(
-        &runtime,
-        &env_config,
+        runtime,
+        env_config,
         effective_inbound_mtls_mode,
         frontend_tls.as_ref(),
         mesh_inbound_spiffe_slot.as_ref(),
@@ -9999,8 +10056,8 @@ async fn serve_mesh_runtime(
     )?;
     for (&port, tls_config) in &frontend_tls_by_port {
         enforce_mesh_inbound_fail_closed(
-            &runtime,
-            &env_config,
+            runtime,
+            env_config,
             effective_inbound_mtls_modes_by_port[&port],
             tls_config.as_ref(),
             mesh_inbound_spiffe_slot.as_ref(),
@@ -10076,7 +10133,7 @@ async fn serve_mesh_runtime(
         proxy_state.plugin_cache.http_client().clone(),
         mesh_state.federation_store().clone(),
     );
-    mesh_background_handles.push(start_federation_poller_reconcile_task(
+    owner.push_mesh_background(start_federation_poller_reconcile_task(
         mesh_state.clone(),
         federation_manager,
         shutdown_tx.subscribe(),
@@ -10103,7 +10160,7 @@ async fn serve_mesh_runtime(
         });
         let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
             tls_urls: build_dp_grpc_tls_config(
-                &env_config,
+                env_config,
                 &["https://remote-control-plane.invalid".to_string()],
                 "MeshRemoteDiscovery",
             )?,
@@ -10195,7 +10252,7 @@ async fn serve_mesh_runtime(
             multicluster::native_source_factory,
         )
         .with_credentials(remote_discovery_credentials);
-        mesh_background_handles.push(start_remote_cluster_discovery_reconcile_task(
+        owner.push_mesh_background(start_remote_cluster_discovery_reconcile_task(
             mesh_state.clone(),
             remote_discovery_manager,
             federation_activation,
@@ -10204,7 +10261,7 @@ async fn serve_mesh_runtime(
         info!("Cross-cluster endpoint discovery reconciler running");
     }
 
-    let mesh_apply_handle = start_mesh_slice_apply_task(
+    owner.push_core_handle(start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
         runtime.clone(),
@@ -10218,14 +10275,14 @@ async fn serve_mesh_runtime(
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
-    );
+    ));
 
     info!(
         listeners = runtime.listener_plan().len(),
         ?inbound_mtls_mode,
         "Mesh listener plan prepared"
     );
-    let mut listener_handles = Vec::new();
+    // Listener handles track through `owner` as they are spawned.
     // Admin listeners are startup-critical in mesh mode just like traffic
     // listeners. Keeping their bind signals in the same gate ensures a failed
     // admin bind cannot be hidden by the unconditional readiness store below.
@@ -10337,11 +10394,19 @@ async fn serve_mesh_runtime(
                 );
             }
         });
-        listener_handles.push(handle);
+        owner.push_listener(handle);
         startup_signals.push((label, started_rx));
     }
 
     let startup_result: Result<(), anyhow::Error> = async {
+
+        if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::InsideStartupGate {
+            let _ = take_mesh_startup_fault_inject();
+            return Err(anyhow::anyhow!(
+                "injected mesh startup failure inside startup_result gate"
+            ));
+        }
+
         proxy_state.initial_reconcile_stream_listeners().await?;
         wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
         proxy_state
@@ -10353,63 +10418,10 @@ async fn serve_mesh_runtime(
         Ok(())
     }
     .await;
-    if let Err(e) = startup_result {
-        warn!(
-            "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
-            e
-        );
-        let _ = shutdown_tx.send(true);
-        let _ =
-            await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "startup failure")
-                .await;
-        shutdown_and_join_mesh(
-            proxy_state,
-            MeshBackgroundTasks {
-                handles: vec![
-                    dns_handle,
-                    overload_handle,
-                    metrics_handle,
-                    runtime_system_handle,
-                    runtime_window_handle,
-                    mesh_apply_handle,
-                ],
-                dns_retry_handle,
-                per_ip_cleanup_handle,
-                health_check_handles,
-                mesh_background_handles,
-            },
-            env_config.shutdown_drain_seconds,
-        )
-        .await;
-        return Err(e);
-    }
-
-    let listener_result =
-        await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "shutdown").await;
-
-    shutdown_and_join_mesh(
-        proxy_state,
-        MeshBackgroundTasks {
-            handles: vec![
-                dns_handle,
-                overload_handle,
-                metrics_handle,
-                runtime_system_handle,
-                runtime_window_handle,
-                mesh_apply_handle,
-            ],
-            dns_retry_handle,
-            per_ip_cleanup_handle,
-            health_check_handles,
-            mesh_background_handles,
-        },
-        env_config.shutdown_drain_seconds,
-    )
-    .await;
-    info!("Mesh runtime mode shutting down");
-    listener_result?;
+    startup_result?;
     Ok(())
 }
+
 
 struct MeshAdminListeners {
     handles: Vec<JoinHandle<()>>,
@@ -10509,6 +10521,53 @@ fn start_mesh_admin_listeners(
         env_config.admin_max_connections_per_ip,
     ));
 
+    // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a
+    // bad cert/key cannot orphan an already-running plaintext admin task
+    // (issue #2372 — handles must be known to the startup rollback owner).
+    let admin_https_plan = if env_config.admin_https_port == 0 {
+        info!(
+            "{} — mesh admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
+        None
+    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
+        &env_config.admin_tls_cert_path,
+        &env_config.admin_tls_key_path,
+    ) {
+        let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
+        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
+        let admin_tls_config = tls::load_tls_config_with_client_auth_and_ocsp(
+            admin_cert_path,
+            admin_key_path,
+            admin_client_ca_bundle,
+            env_config.admin_tls_ocsp_response_source.as_deref(),
+            env_config.admin_tls_no_verify,
+            tls_policy,
+            env_config.tls_cert_expiry_warning_days,
+            crls,
+        )
+        .map_err(|err| anyhow::anyhow!("Invalid mesh admin TLS configuration: {err}"))?;
+        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            env_config,
+            tls_policy,
+            crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+        }
+        Some((
+            admin_https_addr,
+            admin_tls_config,
+            admin_reload_handles.slot.clone(),
+            admin_reload_handles.watcher_handle,
+        ))
+    } else {
+        info!("Mesh admin TLS not configured - HTTPS listener disabled");
+        None
+    };
+
     if env_config.admin_http_port != 0 {
         let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
         let shutdown = shutdown_tx.subscribe();
@@ -10554,41 +10613,12 @@ fn start_mesh_admin_listeners(
         );
     }
 
-    // Admin HTTPS listener (only if TLS is configured and the port is not
-    // disabled — port 0 is the repository-wide disable sentinel).
-    if env_config.admin_https_port == 0 {
-        info!(
-            "{} — mesh admin HTTPS listener disabled",
-            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
-        );
-    } else if let (Some(admin_cert_path), Some(admin_key_path)) = (
-        &env_config.admin_tls_cert_path,
-        &env_config.admin_tls_key_path,
-    ) {
-        let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert_path,
-            admin_key_path,
-            admin_client_ca_bundle,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
-            tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            crls,
-        )
-        .map_err(|err| anyhow::anyhow!("Invalid mesh admin TLS configuration: {err}"))?;
-        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-            admin_tls_config.clone(),
-            env_config,
-            tls_policy,
-            crls,
-            Some(shutdown_tx.subscribe()),
-        );
-        if admin_reload_handles.watcher_handle.is_some() {
-            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+    if let Some((admin_https_addr, admin_tls_config, admin_tls_slot, watcher_handle)) =
+        admin_https_plan
+    {
+        if let Some(handle) = watcher_handle {
+            handles.push(handle);
         }
-        let admin_tls_slot = admin_reload_handles.slot.clone();
         let shutdown = shutdown_tx.subscribe();
         let admin_https_limiter = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -10637,8 +10667,6 @@ fn start_mesh_admin_listeners(
             }
         }));
         startup_signals.push(("Mesh admin HTTPS listener".to_string(), started_rx));
-    } else {
-        info!("Mesh admin TLS not configured - HTTPS listener disabled");
     }
 
     if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
@@ -13551,6 +13579,129 @@ struct MeshBackgroundTasks {
     mesh_background_handles: Vec<JoinHandle<()>>,
 }
 
+/// Accumulates mesh startup side effects (tasks / listeners) as they are
+/// created so any later initialization error can signal shared shutdown and
+/// run bounded teardown before returning the original cause (issue #2372).
+struct MeshStartupOwner {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    proxy_state: ProxyState,
+    tasks: MeshBackgroundTasks,
+    listener_handles: Vec<JoinHandle<()>>,
+    drain_seconds: u64,
+}
+
+impl MeshStartupOwner {
+    fn new(
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        proxy_state: ProxyState,
+        health_check_handles: Vec<JoinHandle<()>>,
+        mesh_background_handles: Vec<JoinHandle<()>>,
+        drain_seconds: u64,
+    ) -> Self {
+        Self {
+            shutdown_tx,
+            proxy_state,
+            tasks: MeshBackgroundTasks {
+                handles: Vec::new(),
+                dns_retry_handle: None,
+                per_ip_cleanup_handle: None,
+                health_check_handles,
+                mesh_background_handles,
+            },
+            listener_handles: Vec::new(),
+            drain_seconds,
+        }
+    }
+
+    fn set_proxy_state(&mut self, proxy_state: ProxyState) {
+        self.proxy_state = proxy_state;
+    }
+
+    fn mesh_background_mut(&mut self) -> &mut Vec<JoinHandle<()>> {
+        &mut self.tasks.mesh_background_handles
+    }
+
+    fn push_mesh_background(&mut self, handle: JoinHandle<()>) {
+        self.tasks.mesh_background_handles.push(handle);
+    }
+
+    fn extend_mesh_background(&mut self, handles: impl IntoIterator<Item = JoinHandle<()>>) {
+        self.tasks.mesh_background_handles.extend(handles);
+    }
+
+    fn push_core_handle(&mut self, handle: JoinHandle<()>) {
+        self.tasks.handles.push(handle);
+    }
+
+    fn set_dns_retry_handle(&mut self, handle: Option<JoinHandle<()>>) {
+        self.tasks.dns_retry_handle = handle;
+    }
+
+    fn set_per_ip_cleanup_handle(&mut self, handle: Option<JoinHandle<()>>) {
+        self.tasks.per_ip_cleanup_handle = handle;
+    }
+
+    fn push_listener(&mut self, handle: JoinHandle<()>) {
+        self.listener_handles.push(handle);
+    }
+
+    /// Signal shutdown, drain listeners/tasks with a bound, preserve `err`.
+    async fn fail_with(self, err: anyhow::Error) -> anyhow::Error {
+        warn!(
+            "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
+            err
+        );
+        let _ = self.shutdown_tx.send(true);
+        let _ = await_mesh_listener_handles(
+            self.listener_handles,
+            self.shutdown_tx.clone(),
+            "startup failure",
+        )
+        .await;
+        shutdown_and_join_mesh(self.proxy_state, self.tasks, self.drain_seconds).await;
+        err
+    }
+
+    /// Normal post-readiness serve path: wait for listeners, then graceful join.
+    async fn serve_until_shutdown(self) -> Result<(), anyhow::Error> {
+        let listener_result = await_mesh_listener_handles(
+            self.listener_handles,
+            self.shutdown_tx.clone(),
+            "shutdown",
+        )
+        .await;
+        shutdown_and_join_mesh(self.proxy_state, self.tasks, self.drain_seconds).await;
+        info!("Mesh runtime mode shutting down");
+        listener_result?;
+        Ok(())
+    }
+}
+
+/// Test-only fault injection for issue #2372 external probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MeshStartupFaultInject {
+    #[default]
+    None,
+    /// After side effects exist, before the final `startup_result` gate
+    /// (SVID / TLS / DNS-bind class failures).
+    BeforeStartupGate,
+    /// Inside the existing listener/start-signal `startup_result` gate.
+    InsideStartupGate,
+}
+
+std::thread_local! {
+    static MESH_STARTUP_FAULT_INJECT: std::cell::Cell<MeshStartupFaultInject> =
+        const { std::cell::Cell::new(MeshStartupFaultInject::None) };
+}
+
+fn take_mesh_startup_fault_inject() -> MeshStartupFaultInject {
+    MESH_STARTUP_FAULT_INJECT.with(|cell| cell.replace(MeshStartupFaultInject::None))
+}
+
+fn peek_mesh_startup_fault_inject() -> MeshStartupFaultInject {
+    MESH_STARTUP_FAULT_INJECT.with(|cell| cell.get())
+}
+
 async fn await_mesh_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -13573,6 +13724,26 @@ async fn await_mesh_listener_handles(
             let _ = shutdown_tx.send(true);
         };
         crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+    }
+}
+
+/// Join background tasks with a bound; abort any still-running tasks when the
+/// timeout elapses so startup rollback cannot leave them detached forever.
+async fn join_mesh_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let abort_handles: Vec<_> = handles.iter().map(|handle| handle.abort_handle()).collect();
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "Mesh background tasks did not drain within {}s; aborting stragglers",
+            timeout.as_secs()
+        );
+        for abort in abort_handles {
+            abort.abort();
+        }
     }
 }
 
@@ -13600,13 +13771,179 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.health_check_handles);
     tasks.handles.extend(tasks.mesh_background_handles);
 
-    crate::modes::file::join_background_handles(tasks.handles, Duration::from_secs(5)).await;
+    join_mesh_background_handles(tasks.handles, Duration::from_secs(5)).await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         proxy_state.env_config.log_shutdown_drain_timeout_ms,
     ))
     .await;
     crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
     crate::plugins::kafka_logging::finalize_all_generations().await;
+}
+
+/// External coverage seams for issue #2372 mesh startup rollback.
+///
+/// `src/main.rs` re-declares modules without the `_test_support` bridge, so this
+/// module is unused in the binary target — hence the module-scoped
+/// `allow(dead_code)`. Production code is not suppressed.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod startup_rollback_test_seams {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Observable result for the external #2372 startup-rollback probes.
+    #[derive(Debug, Clone)]
+    pub struct MeshStartupRollbackProbe {
+        pub ok: bool,
+        pub error: Option<String>,
+        /// The netns-style sentinel observed the shared shutdown signal.
+        pub shutdown_observed: bool,
+        /// The sentinel finished its post-loop async teardown before return.
+        pub teardown_completed: bool,
+    }
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn probe_runtime_config() -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            cp_urls: vec!["http://127.0.0.1:1".to_string()],
+            config_protocol: MeshConfigProtocol::Native,
+            file_config_path: None,
+            topology: MeshTopology::Sidecar,
+            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
+            egress_hbone_port: hbone::ISTIO_HBONE_PORT,
+            egress_mtls_port: crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT,
+            egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            xds_node_cluster: "ferrum".to_string(),
+            xds_stream_channel_capacity: 32,
+            xds_primary_retry_secs: 300,
+            xds_connect_timeout_seconds: 10,
+            trust_domain_aliases: Vec::new(),
+            trusted_hbone_assertors: Vec::new(),
+            workload_labels: HashMap::new(),
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+            capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            outbound_registry_reject_status: 502,
+            sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
+            sidecar_identity_narrowing: false,
+            egress_stream_enabled: false,
+            egress_stream_allow_plaintext: false,
+            request_auth_require_exp: true,
+            locality_lb_strict: false,
+        }
+    }
+
+    fn probe_env_config() -> EnvConfig {
+        EnvConfig {
+            mode: crate::config::OperatingMode::Mesh,
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            accept_threads: 1,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        }
+    }
+
+    /// Spawn a netns-manager-shaped sentinel: wait for shutdown, then run an
+    /// async teardown step before exiting. Rollback must await this completion.
+    fn spawn_netns_style_sentinel(
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_observed: Arc<AtomicBool>,
+        teardown_completed: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            shutdown_observed.store(true, Ordering::Release);
+            // Mimic NetnsUdpCaptureManager's post-loop async `shutdown_all`.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            teardown_completed.store(true, Ordering::Release);
+        })
+    }
+
+    async fn probe_with_fault(fault: MeshStartupFaultInject) -> MeshStartupRollbackProbe {
+        ensure_crypto_provider();
+        let env = probe_env_config();
+        let runtime = probe_runtime_config();
+        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(MeshSlice {
+            version: chrono::Utc::now().to_rfc3339(),
+            ..MeshSlice::default()
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let shutdown_observed = Arc::new(AtomicBool::new(false));
+        let teardown_completed = Arc::new(AtomicBool::new(false));
+        let sentinel = spawn_netns_style_sentinel(
+            &shutdown_tx,
+            shutdown_observed.clone(),
+            teardown_completed.clone(),
+        );
+
+        MESH_STARTUP_FAULT_INJECT.with(|cell| cell.set(fault));
+        let result = serve_mesh_runtime(
+            env,
+            runtime,
+            config,
+            shutdown_tx,
+            mesh_state,
+            None,
+            vec![sentinel],
+        )
+        .await;
+        // Clear any unused inject so later tests cannot observe a stale fault.
+        let _ = take_mesh_startup_fault_inject();
+
+        MeshStartupRollbackProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            shutdown_observed: shutdown_observed.load(Ordering::Acquire),
+            teardown_completed: teardown_completed.load(Ordering::Acquire),
+        }
+    }
+
+    /// Failure after admin/netns side effects, before the final startup_result gate.
+    pub async fn probe_failure_before_startup_result_gate_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::BeforeStartupGate).await
+    }
+
+    /// Failure inside the existing listener/start-signal startup_result gate.
+    pub async fn probe_failure_inside_startup_result_gate_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::InsideStartupGate).await
+    }
 }
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {

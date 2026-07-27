@@ -91,6 +91,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
@@ -4102,6 +4103,21 @@ pub mod _test_support {
     pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
     -> NodeAgentStartupCleanupProbe {
         node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
+    }
+
+    // ── mesh startup-rollback seams (issue #2372) ────────────────────────────
+    pub type MeshStartupRollbackProbe = mesh_startup_rollback_seams::MeshStartupRollbackProbe;
+
+    /// Failure after admin/netns side effects, before the final startup_result gate.
+    pub async fn mesh_startup_failure_before_startup_result_gate_probe_for_test()
+    -> MeshStartupRollbackProbe {
+        mesh_startup_rollback_seams::probe_failure_before_startup_result_gate_for_test().await
+    }
+
+    /// Failure inside the existing listener/start-signal startup_result gate.
+    pub async fn mesh_startup_failure_inside_startup_result_gate_probe_for_test()
+    -> MeshStartupRollbackProbe {
+        mesh_startup_rollback_seams::probe_failure_inside_startup_result_gate_for_test().await
     }
 
     // ── load_balancer first-wave counter seams ───────────────────────────────
