@@ -979,7 +979,7 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     // Forbid code expressions that acquire/read the admission lock. Comments may
     // still name `connection_generation` when explaining why the locks are distinct.
     assert!(
-        !mongo_acquire.contains("connection_generation."),
+        !mongo_acquire.contains("self.connection_generation"),
         "Mongo write admit must not acquire/read connection_generation:\n{mongo_acquire}"
     );
 
