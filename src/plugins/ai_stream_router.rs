@@ -1125,10 +1125,7 @@ fn resolve_anthropic_tool_choice(
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
-        if !tools
-            .as_ref()
-            .is_some_and(|names| names.contains(&name))
-        {
+        if !tools.as_ref().is_some_and(|names| names.contains(&name)) {
             return Err("named tool_choice does not match any declared tool".to_string());
         }
     }
