@@ -1988,11 +1988,18 @@ pub async fn handle_admin_request(
 
     // API chargeback endpoint. Chargeback output contains customer/business data,
     // so it stays behind the standard admin JWT gate even though it is scrapeable.
+    // Non-owning: an authenticated scrape before any `api_chargeback` plugin is
+    // configured must not claim the process-global OnceLock with auto sharding,
+    // or a later accepted generation cannot honor its configured pool shard count.
     if path == "/charges" && method == Method::GET {
-        let registry = crate::plugins::api_chargeback::global_registry();
+        let registry = crate::plugins::api_chargeback::try_global_registry();
         match parse_chargeback_format(req.uri().query()) {
             Ok(ChargebackFormat::Json) => {
-                match registry.render_json() {
+                let json_result = match registry.as_ref() {
+                    Some(registry) => registry.render_json(),
+                    None => crate::plugins::api_chargeback::empty_charges_json(),
+                };
+                match json_result {
                     Ok(json_output) => {
                         let resp = Response::builder()
                             .status(StatusCode::OK)
@@ -2014,7 +2021,11 @@ pub async fn handle_admin_request(
                 }
             }
             Ok(ChargebackFormat::Prometheus) => {
-                match registry.render_prometheus() {
+                let prom_result = match registry.as_ref() {
+                    Some(registry) => registry.render_prometheus(),
+                    None => crate::plugins::api_chargeback::empty_charges_prometheus(),
+                };
+                match prom_result {
                     Ok(prom_output) => {
                         let resp = Response::builder()
                             .status(StatusCode::OK)

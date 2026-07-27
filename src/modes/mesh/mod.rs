@@ -11316,6 +11316,8 @@ async fn issue_and_install_mesh_ca_svid(
             refresh_hint_seconds: trust_bundle.refresh_hint_secs,
         }),
     };
+    crate::tls::spiffe::validate_trust_bundle_set(&bundle.trust_bundles)
+        .map_err(anyhow::Error::msg)?;
     let installed_spiffe_id = bundle.spiffe_id.clone();
     proxy_state.install_gateway_runtime_svid_bundle(bundle);
     publish_runtime_svid_to_inbound_slot(proxy_state, inbound_slot, trust_overlay_slot);
@@ -11541,7 +11543,16 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
 
     let effective_trust_bundles =
         slice.and_then(|slice| effective_trust_bundles_for_slice(slice, federation, activation));
-    merge_effective_trust_bundles_into_svid_bundle(&mut bundle, effective_trust_bundles.as_ref());
+    if let Err(error) = merge_effective_trust_bundles_into_svid_bundle(
+        &mut bundle,
+        effective_trust_bundles.as_ref(),
+    ) {
+        warn!(
+            %error,
+            "Unable to build complete mesh inbound SPIFFE trust bundle; keeping previous trust"
+        );
+        return None;
+    }
 
     Some(Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(bundle)))))
 }
@@ -11554,23 +11565,14 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
 fn merge_effective_trust_bundles_into_svid_bundle(
     bundle: &mut crate::identity::SvidBundle,
     trust_bundles: Option<&config::TrustBundleSet>,
-) {
+) -> Result<(), String> {
     retain_svid_local_trust_only(bundle);
     let Some(serialized) = trust_bundles else {
-        return;
+        return Ok(());
     };
-    let runtime = match serialized.to_runtime() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            warn!(
-                %error,
-                "Ignoring malformed slice trust bundles when building mesh inbound \
-                 SPIFFE verifier; using gateway SVID local bundle only"
-            );
-            return;
-        }
-    };
+    let runtime = serialized.to_runtime()?;
     merge_trust_overlay_into_svid_bundle(bundle, &runtime);
+    Ok(())
 }
 
 fn retain_svid_local_trust_only(bundle: &mut crate::identity::SvidBundle) {

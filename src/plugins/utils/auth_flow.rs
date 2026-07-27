@@ -64,6 +64,39 @@ pub struct HmacAuthCredential {
     pub request_body_sha512: [u8; 64],
 }
 
+/// Canonical maximum size, in UTF-8 bytes, of an authenticated principal.
+///
+/// A verified external identity claim is attacker- or issuer-selectable: JWT,
+/// OIDC, and introspection paths accept a claim value as the request principal
+/// even when no configured Consumer matches. Every downstream consumer of that
+/// principal (billing, rate-limit keys, cache keys, log summaries, backend
+/// identity headers) needs a bounded value, and any component that bounds it
+/// itself by truncation would merge two distinct principals that share a
+/// prefix. Ferrum therefore rejects an oversized principal at the one place it
+/// becomes authoritative — [`commit_authentication_attempt`] — instead of
+/// letting a later stage silently shorten it.
+///
+/// 512 bytes is far above any realistic `sub`/`email`/SPIFFE-style identifier
+/// while keeping every per-principal key, index entry, and exported column
+/// bounded.
+pub const MAX_AUTHENTICATED_IDENTITY_BYTES: usize = 512;
+
+/// Reject an authenticated principal whose identity exceeds
+/// [`MAX_AUTHENTICATED_IDENTITY_BYTES`].
+///
+/// The error body carries the limit and the observed length only. The identity
+/// itself is credential-derived and is never echoed to the client or logged.
+fn identity_within_limit(identity: &str, field: &'static str) -> Result<(), VerifyOutcome> {
+    if identity.len() <= MAX_AUTHENTICATED_IDENTITY_BYTES {
+        return Ok(());
+    }
+    Err(VerifyOutcome::Forbidden(format!(
+        "Authenticated identity rejected: {field} is {} bytes, which exceeds the \
+         {MAX_AUTHENTICATED_IDENTITY_BYTES}-byte limit for an authenticated principal",
+        identity.len()
+    )))
+}
+
 /// Shared auth verification result, mapped to PluginResult by the dispatcher.
 #[derive(Debug, Clone)]
 pub enum VerifyOutcome {
@@ -269,6 +302,18 @@ pub fn commit_authentication_attempt(
         return Ok(false);
     }
 
+    // Fail closed on an oversized verified principal BEFORE any staged
+    // mutation is committed, so no credential cleanup, principal state, or
+    // identity value is applied for a request that is about to be rejected.
+    // Truncating here instead would let two distinct principals sharing a
+    // prefix collapse into one downstream billing identity.
+    if let Some(identity) = external_identity.as_deref() {
+        identity_within_limit(identity, "external identity claim")?;
+    }
+    if let Some(identity_header) = external_identity_header.as_deref() {
+        identity_within_limit(identity_header, "external identity display claim")?;
+    }
+
     let principal_already_committed = request_principal_is_committed(ctx);
 
     // Cleanup is additive for every accepted credential that reaches this
@@ -311,18 +356,45 @@ pub fn authentication_attempt_can_commit(
     let VerifyOutcome::Success {
         consumer,
         external_identity,
-        ..
+        external_identity_header,
     } = outcome
     else {
         return false;
     };
-    consumer
+
+    // Mirror commit_authentication_attempt's principal filtering exactly: a
+    // display/header claim is meaningful only when the same attempt supplies a
+    // permitted nonblank external principal, and either principal-bearing field
+    // that would fail the size bound there must fail preflight here too.
+    let has_consumer = consumer
         .as_ref()
-        .is_some_and(|consumer| !consumer.username.trim().is_empty())
-        || (allow_external_identity
-            && external_identity
-                .as_deref()
-                .is_some_and(|identity| !identity.trim().is_empty()))
+        .is_some_and(|consumer| !consumer.username.trim().is_empty());
+    let external_identity = if allow_external_identity {
+        external_identity
+            .as_deref()
+            .filter(|identity| !identity.trim().is_empty())
+    } else {
+        None
+    };
+    let external_identity_header = external_identity.and_then(|_| {
+        external_identity_header
+            .as_deref()
+            .filter(|header| !header.trim().is_empty())
+    });
+
+    if !has_consumer && external_identity.is_none() {
+        return false;
+    }
+    if external_identity.is_some_and(|identity| identity.len() > MAX_AUTHENTICATED_IDENTITY_BYTES) {
+        return false;
+    }
+    if external_identity_header
+        .is_some_and(|header| header.len() > MAX_AUTHENTICATED_IDENTITY_BYTES)
+    {
+        return false;
+    }
+
+    true
 }
 
 fn request_principal_is_committed(ctx: &RequestContext) -> bool {
