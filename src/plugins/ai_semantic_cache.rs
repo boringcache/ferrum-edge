@@ -5692,6 +5692,7 @@ mod tests {
         SemanticConfig {
             provider,
             endpoint: "http://127.0.0.1:1/embeddings".to_string(),
+            redacted_endpoint: "http://127.0.0.1:1/embeddings".to_string(),
             warmup_hostname: None,
             model: Some("test-embedding-model".to_string()),
             api_key: Some("test-key".to_string()),
