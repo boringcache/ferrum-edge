@@ -1848,7 +1848,17 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        if is_mtls_dns_admission_unavailable(error) {
+        if let Some(unsupported) =
+            crate::config::db_backend::proxy_delete_atomicity_unsupported(error)
+        {
+            super::json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                &json!({
+                    "error": crate::config::db_backend::PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE,
+                    "detail": unsupported.detail(),
+                }),
+            )
+        } else if is_mtls_dns_admission_unavailable(error) {
             super::mtls_dns_admission_unavailable_response()
         } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             Self::map_after_validate_errors(conflict.errors())
@@ -3218,6 +3228,12 @@ impl AdminResource for Upstream {
     const RESOURCE_LABEL: &'static str = "Upstream";
     const VALIDATION_ERROR_LABEL: &'static str = "upstream fields";
     const NOT_FOUND_MESSAGE: &'static str = "Upstream not found";
+    // Serialize same-namespace upstream creates/updates/deletes through the
+    // durable namespace config admission lease (local mutex + DB lease) so the
+    // name precheck is authoritative across admin instances. The SQL/Mongo
+    // unique `(namespace, name)` indexes remain the cross-process persistence
+    // backstop when a writer bypasses this path.
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id

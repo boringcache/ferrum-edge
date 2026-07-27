@@ -170,7 +170,22 @@ impl BodyValidator {
     /// Mode-aware file dependency validation is performed separately by
     /// `GatewayConfig::validate_plugin_file_dependencies`.
     pub fn validate_config(config: &Value) -> Result<(), String> {
-        Self::new_inner(config, DescriptorLoadMode::ShapeOnly).map(|_| ())
+        Self::new_shape_only(config).map(|_| ())
+    }
+
+    /// Build an instance from configuration shape alone, without opening
+    /// node-local descriptor files.
+    ///
+    /// The returned instance derives the same `has_request_validation` /
+    /// `has_pre_proxy_request_validation` flags as the runtime instance: the
+    /// protobuf request/response *targets* come from the parsed config shape,
+    /// not from the descriptor file, and only the resolved descriptors differ.
+    /// `Plugin::requires_request_body_buffering()` on this instance is
+    /// therefore the authoritative runtime answer, which is what the
+    /// backend-TLS SNI buffering screen
+    /// (`plugins::RequestBodyBufferingScreener`) needs.
+    pub fn new_shape_only(config: &Value) -> Result<Self, String> {
+        Self::new_inner(config, DescriptorLoadMode::ShapeOnly)
     }
 
     fn new_inner(config: &Value, descriptor_mode: DescriptorLoadMode) -> Result<Self, String> {

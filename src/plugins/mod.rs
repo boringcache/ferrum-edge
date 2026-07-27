@@ -6786,6 +6786,23 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this plugin must run the buffered response-body
+    /// pipeline for a zero-byte synthetic response.
+    ///
+    /// Gateway-generated short-circuits normally skip body hooks when their
+    /// body is empty. Validators whose contract distinguishes an absent/empty
+    /// representation from a valid one can opt in here so the same final-body
+    /// policy runs as on an empty buffered backend response. The synthetic
+    /// gate calls this only after the plugin's config-time and per-request
+    /// buffering predicates both return `true`.
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when this active buffering plugin may release an
     /// inherently streaming response after headers arrive even though retries
     /// are configured.
@@ -7677,6 +7694,12 @@ pub fn create_plugin_with_http_client_and_config_id(
     // LDAP repeats this screen at every dial; config admission remains useful for
     // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+    // Rate limiters partition their default Redis key space by this id so two
+    // independent policies of one plugin type in a namespace never share
+    // counters (GHSA-gr3x-g777-hm78). Validation/direct construction has no
+    // resource id and uses the standalone placeholder.
+    let rate_limit_config_id =
+        plugin_config_id.unwrap_or(utils::rate_limit::STANDALONE_RATE_LIMIT_CONFIG_ID);
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -7792,20 +7815,32 @@ pub fn create_plugin_with_http_client_and_config_id(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "graphql" => {
+            let plugin = graphql::GraphqlPlugin::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "grpc_method_router" => {
+            let plugin = grpc_method_router::GrpcMethodRouter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "rate_limiting" => {
+            let plugin = rate_limiting::RateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_mirror" => Ok(Some(Arc::new(
             request_mirror::RequestMirror::new_with_config_id(
                 config,
@@ -7894,10 +7929,14 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )?))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "ai_rate_limiter" => {
+            let plugin = ai_rate_limiter::AiRateLimiter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
@@ -7941,13 +7980,22 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
             config,
         )?))),
-        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "udp_rate_limiting" => Ok(Some(Arc::new(
-            udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http_client.clone())?,
-        ))),
+        "ws_rate_limiting" => {
+            let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "udp_rate_limiting" => {
+            let plugin = udp_rate_limiting::UdpRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
             config,
             http_client,
@@ -7988,6 +8036,194 @@ pub fn create_plugin_with_http_client_and_config_id(
                 tracing::warn!("Unknown plugin: {}", name);
             }
             Ok(result)
+        }
+    }
+}
+
+/// Built-in plugins that the request-body-buffering screen must never
+/// construct, because their constructors reach node-local state that a
+/// config-admission screen has no business touching:
+///
+/// - `geo_restriction` opens the configured MaxMind `.mmdb` database,
+/// - `udp_logging` opens node-local DTLS key material,
+/// - `oidc_relying_party` performs OIDC discovery / JWKS work and retains
+///   background refresh state.
+///
+/// None of them can ever require request-body buffering, so the screen answers
+/// [`RequestBodyBufferingScreen::Streams`] for them without construction. That
+/// claim is not free-floating: the drift coverage in
+/// `tests/unit/plugins/request_body_buffering_screen_tests.rs` fails if any
+/// entry here ever gains a buffering-related `Plugin` override, and fails if a
+/// new shape-only carve-out appears in
+/// [`validate_plugin_config_with_http_client`] without being classified here or
+/// in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`].
+pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] =
+    &["geo_restriction", "oidc_relying_party", "udp_logging"];
+
+/// Built-in plugins the screen constructs through a shape-only path instead of
+/// the ordinary factory.
+///
+/// `body_validator`'s runtime constructor reads the configured protobuf
+/// `FileDescriptorSet` off local disk. Its shape-only constructor parses the
+/// same config and derives the identical `has_request_validation` flag (the
+/// protobuf request/response *targets* come from the config shape, not from the
+/// descriptor file), so `Plugin::requires_request_body_buffering()` on the
+/// shape-only instance is the authoritative runtime answer.
+pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] = &["body_validator"];
+
+/// Why the request-body-buffering screen could not evaluate a plugin config.
+///
+/// Deliberately value-free: the variants classify the gap without echoing any
+/// configuration value back into logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyBufferingScreenGap {
+    /// Not a built-in plugin — a `custom_plugins/` build-time plugin, or an
+    /// unknown / retired name. The screen refuses to instantiate third-party
+    /// constructors during config admission.
+    NotBuiltin,
+    /// A built-in plugin whose configuration did not construct. The
+    /// configuration is rejected on its own merits by plugin-config validation;
+    /// the buffering question is simply unanswerable here.
+    ConstructionFailed,
+}
+
+impl RequestBodyBufferingScreenGap {
+    /// Stable, value-redacted reason token for structured diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBuiltin => "plugin is not a built-in plugin",
+            Self::ConstructionFailed => "plugin configuration did not construct",
+        }
+    }
+}
+
+/// Result of the config-time request-body-buffering screen for one plugin
+/// config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyBufferingScreen {
+    /// The constructed plugin reports
+    /// `Plugin::requires_request_body_buffering() == true`.
+    Buffers,
+    /// The constructed plugin reports
+    /// `Plugin::requires_request_body_buffering() == false`.
+    Streams,
+    /// The screen could not evaluate this plugin config.
+    Indeterminate(RequestBodyBufferingScreenGap),
+}
+
+impl RequestBodyBufferingScreen {
+    fn from_trait_answer(buffers: bool) -> Self {
+        if buffers {
+            Self::Buffers
+        } else {
+            Self::Streams
+        }
+    }
+}
+
+/// Side-effect-free screen for "does this plugin config force request-body
+/// buffering", derived from the authoritative
+/// [`Plugin::requires_request_body_buffering`] implementation.
+///
+/// Backend-TLS SNI admission uses this: plain HTTPS SNI overrides require the
+/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
+/// The screen builds a plugin instance from the SAME parsed configuration the
+/// runtime `PluginCache` builds and asks the same trait method, so there is no
+/// second implementation of "which plugins buffer" to drift out of sync.
+///
+/// Construction here is deliberately inert:
+///
+/// - the plugin is dropped immediately and never enters a cache, so no
+///   candidate state is published,
+/// - `Plugin::start_background_tasks()` is never called, which is where every
+///   built-in defers its workers, timers, spool files, and registry
+///   publication,
+/// - the node-local / networked constructors are carved out entirely
+///   ([`REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT`]) or routed through their
+///   existing shape-only constructor
+///   ([`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]),
+/// - custom (`custom_plugins/`) and unknown names are never instantiated.
+///
+/// The HTTP client carries a default-open egress policy on purpose: the screen
+/// asks a buffering question, and endpoint egress admission is owned by
+/// [`validate_plugin_config_with_policy`]. Screening must not invent a
+/// rejection for an unrelated policy reason.
+pub struct RequestBodyBufferingScreener {
+    http_client: PluginHttpClient,
+}
+
+impl Default for RequestBodyBufferingScreener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestBodyBufferingScreener {
+    /// Build a screener. The client construction is the same one
+    /// [`create_plugin`] uses, so a plugin whose construction depends on
+    /// process-wide compression admission resolves identically here and at
+    /// config-load validation.
+    pub fn new() -> Self {
+        Self {
+            http_client: PluginHttpClient::default().with_process_compression_admission_policy(),
+        }
+    }
+
+    /// Screen one plugin config.
+    pub fn screen(&self, plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
+        if REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT.contains(&plugin_name) {
+            return RequestBodyBufferingScreen::Streams;
+        }
+        if REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY.contains(&plugin_name) {
+            return Self::screen_shape_only(plugin_name, config);
+        }
+        if !is_builtin_plugin_name(plugin_name) {
+            return RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::NotBuiltin,
+            );
+        }
+        let client = self.http_client.clone();
+        match create_plugin_with_http_client(plugin_name, config, client) {
+            // The instance is dropped right here: nothing is published and
+            // `Plugin::start_background_tasks()` is never called.
+            Ok(Some(plugin)) => {
+                let buffers = plugin.requires_request_body_buffering();
+                RequestBodyBufferingScreen::from_trait_answer(buffers)
+            }
+            // A registered built-in that yields `None` is a retired/fail-closed
+            // alias; treat it like any other unanswerable name.
+            Ok(None) => {
+                RequestBodyBufferingScreen::Indeterminate(RequestBodyBufferingScreenGap::NotBuiltin)
+            }
+            // The constructor message can echo configured values, so it is
+            // deliberately dropped here — plugin-config validation surfaces the
+            // detailed error on its own path.
+            Err(_) => RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::ConstructionFailed,
+            ),
+        }
+    }
+
+    /// Screen a plugin listed in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]
+    /// through its shape-only constructor.
+    fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
+        let answer = match plugin_name {
+            "body_validator" => body_validator::BodyValidator::new_shape_only(config)
+                .map(|plugin| plugin.requires_request_body_buffering()),
+            // Unreachable today. A name added to the shape-only list without a
+            // branch here must fail unanswerable rather than be silently
+            // mis-screened as non-buffering; the drift test also fails.
+            _ => {
+                return RequestBodyBufferingScreen::Indeterminate(
+                    RequestBodyBufferingScreenGap::ConstructionFailed,
+                );
+            }
+        };
+        match answer {
+            Ok(buffers) => RequestBodyBufferingScreen::from_trait_answer(buffers),
+            Err(_) => RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::ConstructionFailed,
+            ),
         }
     }
 }

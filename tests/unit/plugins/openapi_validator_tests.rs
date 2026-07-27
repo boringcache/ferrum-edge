@@ -1,13 +1,22 @@
+use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
+    openapi_validator::OpenapiValidator,
     priority,
+    utils::content_encoding::{DecodeLimits, decode_content_encoding},
 };
 use flate2::{Compression, write::GzEncoder};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject};
+
+/// Stable client/log message for response-side decode/conversion failures.
+/// Backend-controlled encoding details must not cross this boundary.
+const SAFE_RESPONSE_DECODE_ERROR: &str =
+    "Response body could not be safely decoded or converted for schema validation";
 
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -408,6 +417,23 @@ async fn request_validation_blocks_or_logs_by_mode() {
             .get("openapi_validator.action")
             .map(String::as_str),
         Some("logged_request_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn required_request_body_is_checked_without_a_content_type() {
+    let plugin = OpenapiValidator::new(&validator_config("block")).unwrap();
+    let mut ctx = post_ctx("/items");
+    ctx.headers.clear();
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "required-body presence must be checked independently of media selection"
+    );
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &HashMap::new(), b"")
+            .await,
+        Some(400),
     );
 }
 
@@ -3160,7 +3186,26 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     );
     assert_eq!(
         response_error(&ctx),
-        Some("unsupported content-encoding 'zstd'")
+        Some(SAFE_RESPONSE_DECODE_ERROR),
+        "response-side encoding failures must stay redacted at the public boundary"
+    );
+    // Internal classification still names the unsupported coding; that detail
+    // must not appear in response_error metadata.
+    let internal = decode_content_encoding(
+        Some("zstd"),
+        br#"{"ok":true}"#,
+        DecodeLimits {
+            max_decoded_bytes: 1024,
+            max_cumulative_bytes: 1024,
+            max_codings: 4,
+            max_amplification_ratio: 0,
+        },
+    )
+    .expect_err("unsupported response coding must fail closed internally");
+    assert_eq!(internal, "unsupported content-encoding 'zstd'");
+    assert!(
+        !response_error(&ctx).unwrap_or_default().contains("zstd"),
+        "unsupported coding name must not leak into response_error metadata"
     );
 
     // Corrupt outer layer of a gzip,br chain.
@@ -3341,12 +3386,33 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
             .await,
         Some(502),
     );
+    assert_eq!(
+        response_error(&ctx),
+        Some(SAFE_RESPONSE_DECODE_ERROR),
+        "response expansion over max_body_bytes must stay redacted at the public boundary"
+    );
+    // Prove the decoder itself enforces the per-layer ceiling with a precise
+    // classification that response_error deliberately withholds.
+    let internal = decode_content_encoding(
+        Some("gzip"),
+        &response_gzip,
+        DecodeLimits {
+            max_decoded_bytes: 64,
+            max_cumulative_bytes: 64,
+            max_codings: 4,
+            max_amplification_ratio: 0,
+        },
+    )
+    .expect_err("oversized decoded response layer must fail closed internally");
     assert!(
-        response_error(&ctx)
+        internal.contains("exceeds 64 bytes") || internal.contains("max_decoded_bytes"),
+        "internal decode must name the size ceiling, got {internal:?}"
+    );
+    assert!(
+        !response_error(&ctx)
             .unwrap_or_default()
             .contains("exceeds 64 bytes"),
-        "response expansion must honor max_body_bytes, got {:?}",
-        response_error(&ctx)
+        "size-ceiling detail must not leak into response_error metadata"
     );
 }
 
@@ -5651,4 +5717,990 @@ fn exploded_free_form_object_cannot_coexist_with_declared_exploded_object() {
         "a lone free-form exploded object must remain valid: {:?}",
         plugin.err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Strict config admission (GHSA-692x-352q-6gm8)
+// ---------------------------------------------------------------------------
+
+fn config_error(config: Value) -> String {
+    OpenapiValidator::new(&config)
+        .err()
+        .unwrap_or_else(|| panic!("config should have been rejected: {config}"))
+}
+
+#[test]
+fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
+    let base = json!({
+        "enforcement_mode": "block",
+        "validate_request": true,
+        "validate_response": true,
+        "fail_on_unknown_operation": true,
+        "fail_on_missing_response_schema": true,
+        "max_body_bytes": 1024,
+        "request_content_types": ["application/json"],
+        "response_content_types": ["application/json"],
+        "schema_draft": "draft2020-12",
+        "bypass": {
+            "paths": [],
+            "methods": [],
+            "consumers": [],
+            "header_present": {}
+        },
+        "error_response": {
+            "request_status_code": 400,
+            "response_status_code": 502,
+            "content_type": "application/problem+json"
+        },
+        "error_truncate_chars": 1024,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "operation_label": "create item",
+            "request_required": true,
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {
+                "200": {"application/json": {"type": "object"}}
+            }
+        }]
+    });
+    for pointer in [
+        "/enforcement_mode",
+        "/validate_request",
+        "/validate_response",
+        "/fail_on_unknown_operation",
+        "/fail_on_missing_response_schema",
+        "/max_body_bytes",
+        "/request_content_types",
+        "/response_content_types",
+        "/schema_draft",
+        "/bypass",
+        "/error_response",
+        "/error_truncate_chars",
+        "/operations/0/operation_label",
+        "/operations/0/request_required",
+        "/operations/0/request_body",
+        "/operations/0/responses",
+        "/bypass/paths",
+        "/bypass/methods",
+        "/bypass/consumers",
+        "/bypass/header_present",
+        "/error_response/request_status_code",
+        "/error_response/response_status_code",
+        "/error_response/content_type",
+    ] {
+        let mut config = base.clone();
+        *config
+            .pointer_mut(pointer)
+            .expect("test pointer must address a fixed config field") = Value::Null;
+        let error = config_error(config);
+        assert!(
+            error.contains("must"),
+            "explicit null at {pointer} must fail type admission: {error}"
+        );
+    }
+
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {"title": {"contentType": null}}
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        error.contains("contentType must be a string"),
+        "explicit null Encoding Object fields must fail type admission: {error}"
+    );
+}
+
+#[test]
+fn unknown_root_config_key_is_rejected_with_a_suggestion() {
+    // The typo would otherwise leave the documented `false` default in force
+    // while construction, admission, and reload all reported success.
+    let error = config_error(json!({
+        "fail_on_missing_response_scehma": true,
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("config.fail_on_missing_response_scehma"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.contains("fail_on_missing_response_schema"),
+        "the typo should carry a spelling suggestion: {error}"
+    );
+}
+
+#[test]
+fn unknown_nested_config_keys_are_rejected() {
+    let cases = [
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_requred": true,
+                "request_body": {"content": {"application/json": {"type": "object"}}}
+            }]
+        }),
+        json!({
+            "bypass": {"pathz": ["^/health$"]},
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_body": {"content": {"application/json": {"type": "object"}}}
+            }]
+        }),
+        json!({
+            "error_response": {"request_status_codes": 400},
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_body": {"content": {"application/json": {"type": "object"}}}
+            }]
+        }),
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_body": {
+                    "contents": {"application/json": {"type": "object"}}
+                }
+            }]
+        }),
+    ];
+    for config in cases {
+        let error = config_error(config.clone());
+        assert!(
+            error.contains("unknown configuration key"),
+            "unexpected error for {config}: {error}"
+        );
+    }
+}
+
+#[test]
+fn non_media_type_map_keys_are_rejected() {
+    // Free-form media maps cannot be key-enumerated, so a typo is caught by
+    // shape. The object is also never treated as its own media map any more.
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {"applicationjson": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("not a media type or media range"),
+        "unexpected error: {error}"
+    );
+
+    let error = config_error(json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"applicationjson": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("not a media type or media range"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn request_body_requires_one_of_the_two_documented_forms() {
+    // Alternate single-schema form without its `content_type` partner.
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"schema": {"type": "object"}}
+        }]
+    }));
+    assert!(error.contains("content_type"), "unexpected error: {error}");
+
+    // Neither form.
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"description": "body"}
+        }]
+    }));
+    assert!(
+        error.contains("unknown configuration key"),
+        "unexpected error: {error}"
+    );
+
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {"content": {}}
+        }]
+    }));
+    assert!(
+        error.contains("must not be empty"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn response_status_keys_are_canonical_and_unambiguous() {
+    for status in ["099", "600", "0200", "20", "2X0"] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {(status): {"application/json": {"type": "object"}}}
+            }]
+        }));
+        assert!(
+            error.contains("invalid status"),
+            "unexpected error for {status}: {error}"
+        );
+    }
+
+    for responses in [
+        json!({
+            "2XX": {"application/json": {"type": "object"}},
+            "2xx": {"text/plain": {"type": "string"}}
+        }),
+        json!({
+            "default": {"application/json": {"type": "object"}},
+            "DEFAULT": {"text/plain": {"type": "string"}}
+        }),
+    ] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": responses
+            }]
+        }));
+        assert!(
+            error.contains("duplicate"),
+            "ambiguous status keys must fail: {error}"
+        );
+    }
+}
+
+#[test]
+fn normalized_duplicate_media_types_are_rejected() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "Application/Json": {"type": "object"},
+                    "application/json": {"type": "object"}
+                }
+            }
+        }]
+    }));
+    assert!(
+        error.contains("duplicate media type"),
+        "unexpected error: {error}"
+    );
+
+    let error = config_error(json!({
+        "error_response": {
+            "content_type": "application/problem+json;\r\nx-injected: true"
+        },
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("valid HTTP header value"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn multipart_header_object_rejects_unknown_fields() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {
+                                        "schema": {"type": "string"},
+                                        "requred": true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(error.contains("requred"), "unexpected error: {error}");
+}
+
+#[test]
+fn case_equivalent_duplicate_bypass_headers_are_rejected() {
+    let error = config_error(json!({
+        "bypass": {
+            "header_present": {
+                "X-Policy": "strict-token",
+                "x-policy": null
+            }
+        },
+        "operations": [{
+            "method": "GET",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }));
+    assert!(
+        error.contains("bypass.header_present") && error.contains("duplicate"),
+        "case-equivalent bypass headers must fail closed: {error}"
+    );
+    assert!(
+        error.contains("x-policy"),
+        "error must name the canonical duplicate: {error}"
+    );
+}
+
+#[test]
+fn case_equivalent_duplicate_multipart_encoding_headers_are_rejected() {
+    let error = config_error(json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {
+                                        "required": true,
+                                        "schema": {"type": "string", "minLength": 8}
+                                    },
+                                    "x-part-token": {
+                                        "schema": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }));
+    assert!(
+        error.contains("duplicate header name") && error.contains("x-part-token"),
+        "case-equivalent multipart encoding headers must fail closed: {error}"
+    );
+}
+
+#[tokio::test]
+async fn bypass_header_matching_remains_case_insensitive() {
+    let plugin = OpenapiValidator::new(&json!({
+        "bypass": {"header_present": {"x-bypass-validator": null}},
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "request_body": {
+                "content": {"application/json": {"type": "object"}}
+            },
+            "responses": {"200": {"application/json": {"type": "object"}}}
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    ctx.headers
+        .insert("X-Bypass-Validator".to_string(), "any-value".to_string());
+    let mut headers = ctx.headers.clone();
+
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("bypass_header")
+    );
+}
+
+#[test]
+fn removed_config_aliases_are_unknown_keys() {
+    for config in [
+        json!({
+            "json_schema_draft": "draft7",
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {"200": {"application/json": {"type": "object"}}}
+            }]
+        }),
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "request_body_required": true,
+                "request_body": {"content": {"application/json": {"type": "object"}}}
+            }]
+        }),
+    ] {
+        let error = config_error(config.clone());
+        assert!(
+            error.contains("unknown configuration key"),
+            "unexpected error for {config}: {error}"
+        );
+    }
+}
+
+#[test]
+fn undocumented_schema_draft_value_aliases_are_rejected() {
+    for alias in ["draft-7", "draft202012", "2020-12"] {
+        let error = config_error(json!({
+            "schema_draft": alias,
+            "operations": [{
+                "method": "GET",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {"200": {"application/json": {"type": "object"}}}
+            }]
+        }));
+        assert!(
+            error.contains("must be auto, draft7, or draft2020-12"),
+            "undocumented schema_draft alias {alias:?} must fail closed: {error}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Exact response contracts (GHSA-cjqx-p554-5rx9)
+// ---------------------------------------------------------------------------
+
+fn exact_status_and_default_config(strict: bool) -> Value {
+    json!({
+        "fail_on_missing_response_schema": strict,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {"application/json": {"type": "object", "required": ["ok"]}},
+                "default": {"text/plain": {"type": "string"}}
+            }
+        }]
+    })
+}
+
+#[tokio::test]
+async fn exact_status_precludes_default_response_on_media_miss() {
+    // `default` covers status codes that are not otherwise declared, not
+    // alternate media types for an already-declared exact response.
+    let permissive = OpenapiValidator::new(&exact_status_and_default_config(false)).unwrap();
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        permissive
+            .on_final_response_body(&mut ctx, 200, &content_type_headers("text/plain"), b"free")
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("content_type"),
+        "the exact response must not be validated against the default schema"
+    );
+
+    let strict = OpenapiValidator::new(&exact_status_and_default_config(true)).unwrap();
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        strict
+            .on_final_response_body(&mut ctx, 200, &content_type_headers("text/plain"), b"free")
+            .await,
+        Some(502),
+    );
+
+    // An undeclared status still reaches `default`.
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        permissive
+            .on_final_response_body(&mut ctx, 503, &content_type_headers("text/plain"), b"down")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn empty_response_body_is_parsed_against_the_selected_schema() {
+    let plugin = OpenapiValidator::new(&exact_status_and_default_config(false)).unwrap();
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"")
+            .await,
+        Some(502),
+    );
+    assert!(
+        response_error(&ctx).is_some(),
+        "an empty JSON body must record a response error: {:?}",
+        ctx.metadata
+    );
+}
+
+#[tokio::test]
+async fn empty_synthetic_response_runs_the_shared_final_body_validator() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        OpenapiValidator::new(&exact_status_and_default_config(false)).unwrap(),
+    )];
+    let mut ctx = post_ctx("/items");
+    let mut status = 200;
+    let mut headers = json_headers();
+    let mut body = Vec::new();
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 502);
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("rejected_response"),
+        "the shared synthetic gate must not bypass zero-byte response validation"
+    );
+    assert!(
+        !body.is_empty(),
+        "the validator rejection must replace the invalid empty response"
+    );
+}
+
+#[tokio::test]
+async fn empty_synthetic_response_honors_an_explicit_no_content_contract() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        OpenapiValidator::new(&json!({
+            "fail_on_missing_response_schema": true,
+            "operations": [{
+                "method": "POST",
+                "path_template": "/items",
+                "path_regex": "^/items$",
+                "responses": {"200": {}}
+            }]
+        }))
+        .unwrap(),
+    )];
+    let mut ctx = post_ctx("/items");
+    let mut status = 200;
+    let mut headers = HashMap::new();
+    let mut body = Vec::new();
+
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
+
+    assert_eq!(status, 200);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("no_response_content"),
+        "the strict synthetic response hook must run and accept declared no-content"
+    );
+}
+
+#[tokio::test]
+async fn statuses_without_body_semantics_are_skipped() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"application/json": {"type": "object", "required": ["ok"]}}}
+        }]
+    }))
+    .unwrap();
+    for status in [204u16, 205, 304] {
+        let mut ctx = post_ctx("/items");
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, status, &HashMap::new(), b"")
+                .await,
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("openapi_validator.skip_reason")
+                .map(String::as_str),
+            Some("no_body_expected")
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_empty_response_contract_still_schedules_validation() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {}}
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/items");
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx));
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"unexpected")
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn strict_mode_covers_missing_and_out_of_scope_content_types() {
+    let strict = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "response_content_types": ["application/json"],
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {"type": "object"},
+                    "text/plain": {"type": "string"}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    // No Content-Type at all: previously skipped before the strict policy ran.
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        strict
+            .on_final_response_body(&mut ctx, 200, &HashMap::new(), b"{}")
+            .await,
+        Some(502),
+    );
+
+    // Declared by the contract but configured out of validation scope.
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        strict
+            .on_final_response_body(&mut ctx, 200, &content_type_headers("text/plain"), b"hi")
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn structured_media_suffix_matching_is_ascii_case_insensitive() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["ok"]
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("Application/Vnd.Example+JSON"),
+                br#"{"ok":true}"#,
+            )
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn declared_status_without_content_rejects_a_body_in_strict_mode() {
+    let strict = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {},
+                "default": {"application/json": {"type": "object"}}
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        strict
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"{}")
+            .await,
+        Some(502),
+    );
+
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        strict
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"")
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.skip_reason")
+            .map(String::as_str),
+        Some("no_response_content")
+    );
+}
+
+#[tokio::test]
+async fn declared_media_ranges_are_matched_by_specificity() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {"application/*": {"type": "object", "required": ["ok"]}},
+                "201": {"*/*": {"type": "string", "pattern": "^ok"}}
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"{}")
+            .await,
+        Some(502),
+    );
+
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
+            .await,
+    );
+
+    let mut ctx = post_ctx("/items");
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 201, &content_type_headers("text/plain"), b"ok!")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn response_validation_errors_do_not_echo_backend_values() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &json_headers(),
+            br#"{"ok":"leaked-backend-secret"}"#,
+        )
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    assert!(
+        !body.contains("leaked-backend-secret"),
+        "backend response content must not cross the client boundary: {body}"
+    );
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(
+        !detail.contains("leaked-backend-secret"),
+        "backend response content must not land in transaction logs: {detail}"
+    );
+    assert!(
+        detail.contains("response body does not satisfy the response schema at"),
+        "unexpected detail: {detail}"
+    );
+    assert!(
+        detail.contains("properties") || detail.contains("type"),
+        "schema location evidence must remain: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn response_schema_errors_do_not_echo_backend_property_names() {
+    // JSON Pointer object-key segments are derived from backend property names,
+    // so a sensitive or attacker-chosen key must never appear in the client
+    // problem body or response-error metadata.
+    const BACKEND_SECRET_PROPERTY: &str = "backend-secret-prop-r3-9f2a7c";
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"ok": {"type": "boolean"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let body_bytes = format!(r#"{{"{BACKEND_SECRET_PROPERTY}":true}}"#);
+    let mut ctx = post_ctx("/items");
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &json_headers(), body_bytes.as_bytes())
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    assert!(
+        !body.contains(BACKEND_SECRET_PROPERTY),
+        "backend JSON property names must not cross the client boundary: {body}"
+    );
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(
+        !detail.contains(BACKEND_SECRET_PROPERTY),
+        "backend JSON property names must not land in transaction logs: {detail}"
+    );
+    assert!(
+        detail.contains("response body does not satisfy the response schema at"),
+        "unexpected detail: {detail}"
+    );
+    assert!(
+        detail.contains("additionalProperties"),
+        "operator/schema location evidence must remain: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn response_conversion_and_media_errors_do_not_echo_backend_values() {
+    let plugin = OpenapiValidator::new(&json!({
+        "fail_on_missing_response_schema": true,
+        "operations": [{
+            "method": "POST",
+            "path_template": "/items",
+            "path_regex": "^/items$",
+            "responses": {"200": {"text/plain": {"type": "boolean"}}}
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = post_ctx("/items");
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &content_type_headers("text/plain"),
+            b"backend-secret",
+        )
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(!body.contains("backend-secret"));
+    assert!(!detail.contains("backend-secret"));
+
+    let mut ctx = post_ctx("/items");
+    let secret_content_type = "application/backend-secret";
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &content_type_headers(secret_content_type),
+            b"value",
+        )
+        .await;
+    let PluginResult::Reject { body, .. } = &result else {
+        panic!("expected a blocked response: {result:?}");
+    };
+    let detail = response_error(&ctx).expect("response error metadata must be recorded");
+    assert!(!body.contains(secret_content_type));
+    assert!(!detail.contains(secret_content_type));
 }

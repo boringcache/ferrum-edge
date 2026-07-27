@@ -70,6 +70,18 @@ use tokio::task::AbortHandle;
 use tracing::{info, warn};
 use url::{Host, Url};
 
+/// Clamp a TTL into the signed range redis-rs sends for `EXPIRE`.
+///
+/// A raw `as i64` cast of a TTL above `i64::MAX` wraps negative, and Redis
+/// treats a zero/negative `EXPIRE` as an immediate `DEL` — every increment
+/// would then delete its own counter and silently remove rate enforcement.
+/// Callers already bound the window (see
+/// [`crate::plugins::utils::rate_limit::MAX_RATE_LIMIT_WINDOW_SECONDS`]); this
+/// is the last-line conversion guard.
+fn expire_seconds(ttl_seconds: u64) -> i64 {
+    i64::try_from(ttl_seconds).unwrap_or(i64::MAX).max(1)
+}
+
 /// Operational upper bound for Redis ConnectionManager pool slots per plugin.
 ///
 /// Each slot owns an ArcSwap, a Tokio mutex, and may lazily establish one
@@ -120,7 +132,13 @@ pub struct RedisConfig {
     /// Enable TLS for the Redis connection. When true and the URL uses `redis://`,
     /// it is automatically upgraded to `rediss://`.
     pub tls: bool,
-    /// Key prefix for all Redis keys (e.g., `"ferrum:rate_limiting"`).
+    /// Key prefix for all Redis keys.
+    ///
+    /// Rate-limit consumers default to
+    /// `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` (for example
+    /// `ferrum:rate_limiting:rl-public-api`) so independent policies of one
+    /// plugin type never share counters. An explicit `redis_key_prefix` is the
+    /// documented opt-in for a deliberately shared budget.
     pub key_prefix: String,
     /// Bounded pool size: number of multiplexed [`redis::aio::ConnectionManager`]
     /// instances established lazily and selected round-robin on the hot path.
@@ -1312,7 +1330,7 @@ impl RedisRateLimitClient {
             .arg(key)
             .cmd("EXPIRE")
             .arg(key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .query_async(&mut conn)
             .await;
@@ -1356,7 +1374,7 @@ impl RedisRateLimitClient {
             .arg(current_key)
             .cmd("EXPIRE")
             .arg(current_key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .query_async(&mut conn)
             .await;
@@ -1399,7 +1417,7 @@ impl RedisRateLimitClient {
             .arg(amount)
             .cmd("EXPIRE")
             .arg(key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .query_async(&mut conn)
             .await;
@@ -1505,11 +1523,11 @@ impl RedisRateLimitClient {
             .arg(amount)
             .cmd("EXPIRE")
             .arg(count_key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .cmd("EXPIRE")
             .arg(total_key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .query_async(&mut conn)
             .await;
@@ -1727,7 +1745,7 @@ impl RedisRateLimitClient {
             .ignore()
             .cmd("EXPIRE")
             .arg(key)
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .ignore()
             .query_async(&mut conn)
             .await;
@@ -1766,7 +1784,7 @@ impl RedisRateLimitClient {
             .arg(value)
             .arg("NX")
             .arg("EX")
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .query_async(&mut conn)
             .await;
 
@@ -1928,7 +1946,7 @@ impl RedisRateLimitClient {
             .arg(key)
             .arg(value)
             .arg("EX")
-            .arg(ttl_seconds as i64)
+            .arg(expire_seconds(ttl_seconds))
             .query_async(&mut conn)
             .await;
 

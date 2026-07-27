@@ -26,10 +26,18 @@
 //!   `mongodb://localhost:27017/ferrum_test` is reachable, matching
 //!   `functional_mongodb_test` conventions)
 //!
+//! Hosted CI sets `FERRUM_DB_BACKENDS_REQUIRED=1` so a missing expected
+//! backend fails instead of silently skipping. Local developers keep the
+//! historical opt-out by leaving that variable unset.
+//!
 //! All tests are `#[ignore]` — invoke with `cargo test --test functional_tests
 //! -- --ignored namespace`.
 
-use crate::common::{DbType, TestGateway};
+use crate::common::{
+    DbType, IsolatedSqlDatabase, TestGateway, continue_if_backend_available,
+    ensure_shared_sql_containers_resumed, host_port_from_db_url, mysql_test_url, postgres_test_url,
+    provision_isolated_sql_database, tcp_endpoint_reachable,
+};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -62,39 +70,55 @@ impl Backend {
 }
 
 /// Resolve the DB URL for the requested backend. Returns `None` when an
-/// external backend's env var is unset and no default is reachable — the
-/// calling test should skip in that case.
-async fn resolve_db(backend: Backend) -> Option<DbType> {
+/// external backend is unavailable and backends are not required — the
+/// calling test should skip in that case. When `FERRUM_DB_BACKENDS_REQUIRED`
+/// is set, missing/unreachable backends panic instead of returning `None`.
+///
+/// SQL backends also return an optional isolation guard so each cell uses a
+/// dedicated database on the shared CI container.
+async fn resolve_db(backend: Backend) -> Option<(DbType, Option<IsolatedSqlDatabase>)> {
     match backend {
-        Backend::Sqlite => Some(DbType::Sqlite),
-        Backend::Postgres => std::env::var("FERRUM_TEST_POSTGRES_URL")
-            .ok()
-            .map(DbType::Postgres),
-        Backend::Mysql => std::env::var("FERRUM_TEST_MYSQL_URL")
-            .ok()
-            .map(DbType::MySql),
+        Backend::Sqlite => Some((DbType::Sqlite, None)),
+        Backend::Postgres => {
+            ensure_shared_sql_containers_resumed();
+            let url = postgres_test_url()?;
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "postgres",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
+            }
+            let (url, isolated) = provision_isolated_sql_database(&url);
+            Some((DbType::Postgres(url), isolated))
+        }
+        Backend::Mysql => {
+            ensure_shared_sql_containers_resumed();
+            let url = mysql_test_url()?;
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "mysql",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
+            }
+            let (url, isolated) = provision_isolated_sql_database(&url);
+            Some((DbType::MySql(url), isolated))
+        }
         Backend::Mongodb => {
             let url = std::env::var("FERRUM_TEST_MONGO_URL")
                 .unwrap_or_else(|_| "mongodb://localhost:27017/ferrum_test".to_string());
-            // Probe TCP reachability before returning the URL.
-            let host_port = url
-                .strip_prefix("mongodb://")
-                .or_else(|| url.strip_prefix("mongodb+srv://"))
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| {
-                    if s.contains('@') {
-                        s.split('@').next_back()
-                    } else {
-                        Some(s)
-                    }
-                })
-                .unwrap_or("localhost:27017")
-                .to_string();
-            if tokio::net::TcpStream::connect(&host_port).await.is_ok() {
-                Some(DbType::Mongo(url))
-            } else {
-                None
+            let host_port = host_port_from_db_url(&url);
+            if !continue_if_backend_available(
+                "mongodb",
+                tcp_endpoint_reachable(&host_port).await,
+                &format!("not reachable at {host_port}"),
+            ) {
+                return None;
             }
+            Some((DbType::Mongo(url), None))
         }
     }
 }
@@ -123,6 +147,9 @@ struct NsHarness {
     _gw: TestGateway,
     admin_base_url: String,
     proxy_base_url: String,
+    // Struct fields drop in declaration order. Keep this after the gateway so
+    // its pool releases every DB connection before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
 }
 
 /// Two independent gateway processes sharing one persistent backend. The
@@ -134,11 +161,14 @@ struct SharedAdminHarness {
     _sqlite_dir: Option<tempfile::TempDir>,
     admin_a: String,
     admin_b: String,
+    // Struct fields drop in declaration order. Keep this after both gateways
+    // so their pools release every DB connection before DROP DATABASE.
+    _isolated_db: Option<IsolatedSqlDatabase>,
 }
 
 impl SharedAdminHarness {
     async fn start(backend: Backend) -> Option<Self> {
-        let (db, sqlite_dir) = match backend {
+        let (db, sqlite_dir, isolated_db) = match backend {
             Backend::Sqlite => {
                 let temp_dir = tempfile::TempDir::new().expect("shared SQLite tempdir");
                 let db_path = temp_dir.path().join("shared-admin.db");
@@ -149,9 +179,13 @@ impl SharedAdminHarness {
                         db_url,
                     },
                     Some(temp_dir),
+                    None,
                 )
             }
-            _ => (resolve_db(backend).await?, None),
+            _ => {
+                let (db, isolated) = resolve_db(backend).await?;
+                (db, None, isolated)
+            }
         };
 
         let builder = || {
@@ -182,6 +216,7 @@ impl SharedAdminHarness {
             _gateway_a: gateway_a,
             _gateway_b: gateway_b,
             _sqlite_dir: sqlite_dir,
+            _isolated_db: isolated_db,
         })
     }
 }
@@ -201,7 +236,7 @@ impl NsHarness {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            let db = match resolve_db(backend).await {
+            let (db, isolated_db) = match resolve_db(backend).await {
                 Some(db) => db,
                 None => return None,
             };
@@ -245,6 +280,7 @@ impl NsHarness {
                 admin_base_url: gw.admin_base_url.clone(),
                 proxy_base_url: gw.proxy_base_url.clone(),
                 _gw: gw,
+                _isolated_db: isolated_db,
             });
         }
         panic!("namespace harness failed to start: {last_err}");
