@@ -639,17 +639,17 @@ fn concurrent_insert_prune_and_cap_keep_exact_entry_count() {
     assert_eq!(h.udp_tracked(), Some(0));
     assert_eq!(h.udp_map_len(), 0);
 
-    // Refill through the cap gate, then deliberately use the uncapped test seed
-    // to model legacy/repair pressure and verify forced eviction reconciles the
-    // count without crossing the configured steady-admission cap afterward.
+    // Refill through the cap gate. Uncapped test seeds model legacy/repair
+    // pressure above the steady admission cap; cleanup must not delete live
+    // budgets, and previously unseen keys remain denied.
     let active = epoch + Duration::from_secs(200);
     for i in 0..96 {
         h.seed_udp(&format!("192.0.2.{i}"), active);
     }
     assert_eq!(h.udp_tracked(), Some(96));
     let _ = h.maybe_evict_udp_at_with_cap(active, 32);
-    assert_eq!(h.udp_tracked(), Some(32));
-    assert_eq!(h.udp_map_len(), 32);
+    assert_eq!(h.udp_tracked(), Some(96));
+    assert_eq!(h.udp_map_len(), 96);
     assert!(!h.seed_udp_with_cap("198.51.100.1", active, 32));
 }
 
