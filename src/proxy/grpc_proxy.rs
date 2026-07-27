@@ -990,6 +990,9 @@ impl GrpcPoolManager {
                 debug!("gRPC h2c connection closed: {}", e);
             }
         });
+        // The SETTINGS readiness poll above registered this creator task's
+        // waker. Yield so the driver can install its own waker before use.
+        tokio::task::yield_now().await;
 
         Ok(sender)
     }
@@ -1054,6 +1057,9 @@ impl GrpcPoolManager {
                 debug!("gRPC h2 TLS connection closed: {}", e);
             }
         });
+        // The SETTINGS readiness poll above registered this creator task's
+        // waker. Yield so the driver can install its own waker before use.
+        tokio::task::yield_now().await;
 
         Ok(sender)
     }

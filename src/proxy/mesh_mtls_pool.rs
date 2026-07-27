@@ -1452,6 +1452,10 @@ impl MeshMtlsConnectionPool {
                         );
                     }
                 });
+                // The SETTINGS readiness poll above registered this creator
+                // task's waker. Yield so the driver can install its own waker
+                // before the sender escapes this candidate attempt.
+                tokio::task::yield_now().await;
                 Ok(sender)
             }
         })

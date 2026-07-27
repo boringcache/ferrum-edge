@@ -1661,6 +1661,10 @@ pub(crate) async fn dial_h2_connect_sender(
                     debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
                 }
             });
+            // The SETTINGS readiness poll above registered this creator task's
+            // waker on the connection. Yield once so the newly spawned driver
+            // can poll and replace it before the sender is used.
+            tokio::task::yield_now().await;
             Ok(sender)
         }
     })
