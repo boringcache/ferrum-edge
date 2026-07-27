@@ -685,15 +685,7 @@ fn rejection_warn_emits_once_per_window_under_identical_timestamp_flood() {
 
     let mut emissions = 0usize;
     for _ in 0..10_000 {
-        if record_rejection_warn(
-            &plugin,
-            &global,
-            "datagram_count",
-            "proxy-1",
-            1_000,
-        )
-        .emitted
-        {
+        if record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000).emitted {
             emissions += 1;
         }
     }
@@ -709,13 +701,7 @@ fn rejection_warn_rolls_window_and_carries_suppressed_count() {
     let global = rejection_warn_global();
     reset_udp_rejection_warn_state(&plugin);
 
-    let first = record_rejection_warn(
-        &plugin,
-        &global,
-        "datagram_count",
-        "proxy-1",
-        0,
-    );
+    let first = record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 0);
     assert!(first.emitted);
     assert_eq!(first.instance_suppressed, Some(0));
     assert_eq!(first.global_suppressed, Some(0));
@@ -739,8 +725,7 @@ fn rejection_warn_rolls_window_and_carries_suppressed_count() {
         "global suppressed accounting must retain every in-window rejection"
     );
 
-    let rollover =
-        record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000);
+    let rollover = record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000);
     assert!(rollover.emitted, "window rollover must emit a summary");
     assert_eq!(rollover.instance_suppressed, Some(999));
     assert_eq!(rollover.global_suppressed, Some(999));
@@ -779,26 +764,10 @@ async fn datagram_and_byte_limit_rejections_share_bounded_diagnostics() {
     let mut count_emissions = 0usize;
     let mut byte_emissions = 0usize;
     for t in 0..5_000 {
-        if record_rejection_warn(
-            &count_plugin,
-            &global,
-            "datagram_count",
-            "proxy-1",
-            t,
-        )
-        .emitted
-        {
+        if record_rejection_warn(&count_plugin, &global, "datagram_count", "proxy-1", t).emitted {
             count_emissions += 1;
         }
-        if record_rejection_warn(
-            &byte_plugin,
-            &global,
-            "byte_count",
-            "proxy-1",
-            t,
-        )
-        .emitted
-        {
+        if record_rejection_warn(&byte_plugin, &global, "byte_count", "proxy-1", t).emitted {
             byte_emissions += 1;
         }
     }
@@ -820,16 +789,8 @@ fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
     reset_udp_rejection_warn_state(&plugin_a);
     reset_udp_rejection_warn_state(&plugin_b);
 
-    assert!(
-        record_rejection_warn(&plugin_a, &global, "datagram_count", "proxy-a", 0).emitted
-    );
-    let denied = record_rejection_warn(
-        &plugin_b,
-        &global,
-        "datagram_count",
-        "proxy-b",
-        0,
-    );
+    assert!(record_rejection_warn(&plugin_a, &global, "datagram_count", "proxy-a", 0).emitted);
+    let denied = record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", 0);
     assert!(
         !denied.emitted,
         "global gate must deny the second instance's first rejection in the same window"
@@ -858,8 +819,7 @@ fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
         "instance aggregate must carry every rejection through a denied rollover"
     );
 
-    let rollover =
-        record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", 1_000);
+    let rollover = record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", 1_000);
     assert!(rollover.emitted);
     assert_eq!(rollover.instance_suppressed, Some(1_000));
     assert_eq!(rollover.global_suppressed, Some(1_000));
@@ -897,17 +857,12 @@ fn concurrent_rejection_warns_stay_bounded_with_preserved_accounting() {
             let mut instance_reported = 0u64;
             let mut global_reported = 0u64;
             for _ in 0..2_000 {
-                let decision = record_rejection_warn(
-                    &plugin,
-                    &global,
-                    "datagram_count",
-                    "proxy-1",
-                    1_000,
-                );
+                let decision =
+                    record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000);
                 if decision.emitted {
                     emissions += 1;
-                    instance_reported = instance_reported
-                        .saturating_add(decision.instance_suppressed.unwrap_or(0));
+                    instance_reported =
+                        instance_reported.saturating_add(decision.instance_suppressed.unwrap_or(0));
                     global_reported =
                         global_reported.saturating_add(decision.global_suppressed.unwrap_or(0));
                 }
@@ -940,7 +895,9 @@ fn concurrent_rejection_warns_stay_bounded_with_preserved_accounting() {
     );
     assert_eq!(
         global_reported
-            + ferrum_edge::_test_support::atomic_log_rate_limiter_suppressed_count_for_test(&global),
+            + ferrum_edge::_test_support::atomic_log_rate_limiter_suppressed_count_for_test(
+                &global
+            ),
         (8 * 2_000 - 1) as u64,
         "reported plus pending global accounting must cover every suppressed rejection"
     );

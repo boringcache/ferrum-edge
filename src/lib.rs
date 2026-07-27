@@ -2445,9 +2445,8 @@ pub mod _test_support {
         proxy_id: &str,
         now_ms: u64,
     ) -> UdpRejectionWarnDecisionForTest {
-        let detail = plugin.record_rate_limit_rejection_warn_detail_for_test(
-            global, limit_kind, proxy_id, now_ms,
-        );
+        let detail = plugin
+            .record_rate_limit_rejection_warn_detail_for_test(global, limit_kind, proxy_id, now_ms);
         UdpRejectionWarnDecisionForTest {
             emitted: detail.emitted,
             instance_suppressed: detail.instance_suppressed,
