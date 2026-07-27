@@ -310,6 +310,10 @@ fn entry_retained_bytes(
         .saturating_add(ENTRY_FIXED_OVERHEAD_BYTES)
 }
 
+// Keep the hot-path key fields as borrowed scalars: wrapping them in an
+// aggregate would add ceremony without reducing the call-site data flow, and
+// this helper deliberately writes directly into a reused thread-local buffer.
+#[allow(clippy::too_many_arguments)]
 fn write_chargeback_key(
     buf: &mut String,
     consumer: &str,
