@@ -65,7 +65,7 @@ impl TransactionLogSchema {
             // Register into the active staging area. Isolated constructor
             // validation is a no-op; graph validation and cache reloads open
             // explicit abort/commit brackets respectively.
-            registry::register_named(name, raw, compiled)?;
+            registry::register_named(&name, raw, compiled)?;
         }
 
         Ok(Self { schemas })
