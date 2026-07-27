@@ -919,6 +919,16 @@ impl Plugin for WorkloadMetrics {
             && ctx.metadata.contains_key(TRACEPARENT_HEADER)
     }
 
+    /// Same contract as `otel_tracing`: the echoed `traceparent` is the
+    /// gateway's, an identical backend echo hides the write from
+    /// observed-mutation reconciliation, and a backend `traceparent` TRAILER
+    /// must not replace it after the fact.
+    fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
+        crate::plugins::ResponseTrailerPolicy::Names(
+            &crate::plugins::TRACEPARENT_RESPONSE_POLICY_NAMES,
+        )
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
         let peer_identity = ctx

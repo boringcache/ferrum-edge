@@ -231,11 +231,13 @@ fn unbounded_policy_drops_every_reconcilable_trailer() {
 }
 
 #[test]
-fn grpc_control_trailers_survive_the_inferred_governance_signals() {
-    // The fail-closed arm and observed-mutation diff say nothing about RPC
-    // status; dropping these would strand the client without a `grpc-status`.
-    let before = headers(&[("grpc-message", "backend said so")]);
-    let after = headers(&[]);
+fn a_grpc_named_trailer_gets_no_exemption_from_the_unbounded_arm() {
+    // Every path that reaches this reconciliation is a PLAIN-flavor HTTP/3 relay
+    // — native gRPC finishes its own trailers in `dispatch_grpc_native_h3` and is
+    // never reconciled. So a `grpc-*` trailer here is an ordinary backend field,
+    // and exempting it by NAME would hand any non-gRPC backend a one-word bypass
+    // of a fail-closed response-header policy.
+    let backend = headers(&[("content-type", "text/plain")]);
     let surviving = reconcile(
         &[
             ("grpc-status", "0"),
@@ -243,23 +245,46 @@ fn grpc_control_trailers_survive_the_inferred_governance_signals() {
             ("grpc-status-details-bin", "AAAA"),
             ("x-powered-by", "backend/1.2"),
         ],
-        &before,
-        &after,
+        &backend,
+        &backend,
         &[],
         true,
     );
-    assert_eq!(surviving.len(), 3, "surviving trailers: {surviving:?}");
-    assert!(has(&surviving, "grpc-status"));
-    assert!(has(&surviving, "grpc-message"));
-    assert!(has(&surviving, "grpc-status-details-bin"));
-    assert!(!has(&surviving, "x-powered-by"));
+    assert!(
+        surviving.is_empty(),
+        "a grpc-* name must not bypass the unbounded arm: {surviving:?}"
+    );
+}
+
+#[test]
+fn a_grpc_named_trailer_gets_no_exemption_from_observed_mutation() {
+    // The mirror bypass: a non-gRPC backend names its smuggled field
+    // `grpc-status` and the gateway's observed removal of that same field from
+    // the initial header map would be undone by the trailer copy.
+    let before = headers(&[
+        ("grpc-status", "13"),
+        ("x-internal-token", "leaked"),
+        ("content-type", "text/plain"),
+    ]);
+    let after = headers(&[("content-type", "text/plain")]);
+    let surviving = reconcile(
+        &[
+            ("grpc-status", "13"),
+            ("x-internal-token", "leaked"),
+            ("x-keep", "yes"),
+        ],
+        &before,
+        &after,
+        &[],
+        false,
+    );
+    assert_eq!(surviving, vec![("x-keep".to_string(), "yes".to_string())]);
 }
 
 #[test]
 fn an_explicitly_named_grpc_control_trailer_is_still_removed() {
-    // Naming `grpc-status` in a response-header policy is a deliberate operator
-    // declaration, and it wins over the exemption — the same precedence the
-    // buffered gRPC-Web trailer boundary already applies.
+    // Naming `grpc-status` in a response-header policy remains a deliberate
+    // operator declaration and removes it, exactly as any other declared name.
     let backend = headers(&[]);
     let surviving = reconcile(
         &[("grpc-status", "0"), ("grpc-message", "ok")],
@@ -272,6 +297,67 @@ fn an_explicitly_named_grpc_control_trailer_is_still_removed() {
         surviving,
         vec![("grpc-message".to_string(), "ok".to_string())]
     );
+}
+
+#[test]
+fn sse_style_trailer_only_content_length_removal_is_bound_by_the_declaration() {
+    // The load-bearing built-in-ownership case. `sse` with
+    // `strip_content_length` removes `content-length` from the INITIAL map; when
+    // the backend sent the field only as a TRAILER that removal is a no-op, so
+    // the observed-mutation witness proves absent -> absent and forwards the
+    // trailer. Only the config-time declaration closes it.
+    let backend = headers(&[("content-type", "text/event-stream")]);
+
+    let undeclared = reconcile(
+        &[("content-length", "4096"), ("x-keep", "yes")],
+        &backend,
+        &backend,
+        &[],
+        false,
+    );
+    assert!(
+        has(&undeclared, "content-length"),
+        "without a declaration the no-op removal is invisible: {undeclared:?}"
+    );
+
+    let declared = reconcile(
+        &[("content-length", "4096"), ("x-keep", "yes")],
+        &backend,
+        &backend,
+        &names(&[
+            "content-type",
+            "cache-control",
+            "x-accel-buffering",
+            "content-length",
+        ]),
+        false,
+    );
+    assert_eq!(declared, vec![("x-keep".to_string(), "yes".to_string())]);
+}
+
+#[test]
+fn an_idempotent_gateway_write_is_bound_by_the_declaration_only() {
+    // The second shape the witness cannot see: the gateway writes a value the
+    // backend already sent verbatim (`response_caching`'s guessable
+    // `x-cache-status: MISS`, an echoed `traceparent`, an already-nominated
+    // `vary` token). Before == after, so the diff is empty.
+    let before = headers(&[("x-cache-status", "MISS")]);
+    let after = headers(&[("x-cache-status", "MISS")]);
+
+    let undeclared = reconcile(&[("x-cache-status", "HIT")], &before, &after, &[], false);
+    assert!(
+        has(&undeclared, "x-cache-status"),
+        "an idempotent write leaves no observable diff: {undeclared:?}"
+    );
+
+    let declared = reconcile(
+        &[("x-cache-status", "HIT")],
+        &before,
+        &after,
+        &names(&["x-cache-status"]),
+        false,
+    );
+    assert!(declared.is_empty(), "surviving trailers: {declared:?}");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -355,10 +441,57 @@ fn streaming_relay_unbounded_policy_fails_closed_without_evidence() {
         true,
         true,
     );
+    assert!(
+        surviving.is_empty(),
+        "the streaming fail-closed arm exempts no name, grpc-* included: {surviving:?}"
+    );
+}
+
+#[test]
+fn streaming_relay_binds_the_gateway_synthesized_default_content_type() {
+    // Wire parity for the relays' `content-type: application/json` default. The
+    // relay writes that field into the response-header MAP before building the
+    // response, and counts the synthesis as a header phase, so the pre-policy
+    // snapshot (backend: no content-type) versus the final map (gateway:
+    // application/json) is a visible mutation and the backend's conflicting
+    // `content-type` TRAILER is dropped.
+    //
+    // If the default only ever reached the builder, the final map would still
+    // lack the field, reconciliation would prove absent -> absent, and the
+    // trailer would land on the wire contradicting a header the gateway sent.
+    let backend_without_content_type = headers(&[("x-backend", "1")]);
+    let wire_headers = headers(&[("x-backend", "1"), ("content-type", "application/json")]);
+    let surviving = reconcile_streaming(
+        &[("content-type", "text/html"), ("x-keep", "yes")],
+        &backend_without_content_type,
+        &wire_headers,
+        &[],
+        false,
+        // The relay passes `true` here precisely because it will synthesize the
+        // default, even for an auth/logging-only chain.
+        true,
+    );
+    assert_eq!(surviving, vec![("x-keep".to_string(), "yes".to_string())]);
+}
+
+#[test]
+fn streaming_relay_keeps_trailers_when_the_backend_supplied_content_type() {
+    // The mirror case: the backend already sent `content-type`, so the relay
+    // synthesizes nothing, `header_phases_can_mutate` stays false for an
+    // auth/logging-only chain, no snapshot is retained, and the #2941
+    // pass-through is preserved with zero clones.
+    let backend = headers(&[("content-type", "text/plain")]);
+    let surviving = reconcile_streaming(
+        &[("x-backend-finished", "true")],
+        &backend,
+        &backend,
+        &[],
+        false,
+        false,
+    );
     assert_eq!(
         surviving,
-        vec![("grpc-status".to_string(), "0".to_string())],
-        "gRPC control trailers stay exempt from the streaming fail-closed arm"
+        vec![("x-backend-finished".to_string(), "true".to_string())]
     );
 }
 

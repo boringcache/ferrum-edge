@@ -1687,3 +1687,114 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "native gRPC H3 trailer status must not be reconciled as header policy"
     );
 }
+
+#[test]
+fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
+    let src = include_str!("../../../src/http3/server.rs");
+
+    // The default `content-type` must reach the response-header MAP, not just
+    // the response builder. `H3StreamingTrailerPolicy.final_headers` points at
+    // that map, so a builder-only default would leave the trailer boundary
+    // reconciling a field set the client never actually received: a backend
+    // `content-type` trailer would prove absent -> absent and land on the wire
+    // contradicting the media type the gateway itself synthesized.
+    assert!(
+        !src.contains(r#"resp_builder = resp_builder.header("content-type", "application/json");"#),
+        "no streaming relay may add the default content-type to the builder alone"
+    );
+    // Per relay: the pre-policy capture comes first, then the default lands in
+    // the header map, then the response is built from that same map, and only
+    // then does the trailer frame bind the policy. Bounded to each relay's own
+    // region rather than counted across the file.
+    let relays: Vec<&str> = src
+        .split("PrePolicyResponseHeaders::capture_for_streaming(")
+        .skip(1)
+        .map(|tail| {
+            tail.split("H3StreamingTrailerPolicy {")
+                .next()
+                .expect("bounded streaming relay region")
+        })
+        .collect();
+    assert_eq!(relays.len(), 3, "three plain native/refined streaming relays");
+    for relay in &relays {
+        let map_write = relay
+            .find(r#".entry("content-type".to_string())"#)
+            .expect("streaming relay must default content-type onto the header map");
+        let build = relay
+            .find("apply_response_headers(Response::builder().status(")
+            .expect("streaming relay must build its response");
+        assert!(
+            map_write < build,
+            "the default content-type must be in the header map BEFORE the \
+             response is built, so the map and the wire agree"
+        );
+        assert!(
+            relay[map_write..build].contains(r#""application/json".to_string()"#),
+            "the map write must carry the same default the builder used to add"
+        );
+    }
+
+    // Synthesizing that field is a gateway-authored wire mutation, so it counts
+    // as a response-header phase for the pre-policy capture decision. Without
+    // that, an auth/logging-only chain would take the no-clone #2941
+    // pass-through and forward a conflicting backend `content-type` trailer.
+    for tail in src
+        .split("PrePolicyResponseHeaders::capture_for_streaming(")
+        .skip(1)
+    {
+        let args = tail.split(");").next().expect("capture argument list");
+        assert!(
+            args.contains("gateway_synthesizes_content_type"),
+            "the capture predicate must fold in the synthesized default \
+             content-type: {args}"
+        );
+    }
+    let flags: Vec<&str> = src
+        .split("let gateway_synthesizes_content_type = ")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        flags.len(),
+        3,
+        "each streaming relay decides the synthesis for itself"
+    );
+    for tail in flags {
+        assert!(
+            tail.starts_with("!response_headers.contains_key(\"content-type\");"),
+            "the synthesis flag must come from this relay's own backend headers"
+        );
+    }
+}
+
+#[test]
+fn the_trailer_reconciliation_exempts_no_field_name() {
+    let src = include_str!("../../../src/proxy/headers.rs");
+    let body = src
+        .split("pub(crate) fn reconcile_backend_trailers_with_response_policy(")
+        .nth(1)
+        .expect("reconciliation function")
+        .split("\n/// ")
+        .next()
+        .expect("bounded reconciliation function");
+
+    // A name-based exemption here is a bypass, not a protocol accommodation:
+    // every reconciled path is a PLAIN-flavor H3 relay (`use_native_h3_pool` and
+    // the buffered send path both require `HttpFlavor::Plain`), and native gRPC
+    // finishes its own trailers in `dispatch_grpc_native_h3`. So a non-gRPC
+    // backend could otherwise smuggle a governed field past an observed or
+    // unbounded policy by naming its trailer `grpc-status`.
+    assert!(
+        !body.contains("grpc-status")
+            && !body.contains("grpc-message")
+            && !body.contains("GRPC_CONTROL_TRAILER_NAMES"),
+        "the reconciliation must not exempt any field name: {body}"
+    );
+    assert!(
+        !body.contains("continue;"),
+        "the reconciliation must reach the governance decision for every trailer name"
+    );
+    assert!(
+        body.contains("explicitly_named || unbounded_policy || witness.was_mutated("),
+        "governance stays the union of declaration, fail-closed arm, and observed mutation"
+    );
+}

@@ -645,16 +645,19 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
-/// gRPC control trailers. These are protocol status carried only on the
-/// trailer channel, so dropping one strands the client without a `grpc-status`
-/// (a hung or `Unknown` RPC). They are exempt from the two INFERRED governance
-/// signals — the fail-closed unbounded arm and observed header mutation —
-/// because neither expresses intent about RPC status. An operator who names one
-/// of them explicitly in a response-header policy still wins: that is a
-/// deliberate declaration, and it is how the buffered gRPC-Web trailer boundary
-/// (`Plugin::requires_buffered_grpc_web_trailer_policy`) already behaves.
-const GRPC_CONTROL_TRAILER_NAMES: &[&str] =
-    &["grpc-status", "grpc-message", "grpc-status-details-bin"];
+// Deliberately NO name-based exemption for gRPC control trailers
+// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`).
+//
+// Every path that reaches this reconciliation is a PLAIN-flavor HTTP/3 relay:
+// `use_native_h3_pool` and the buffered native-H3 send path both require
+// `backend_http_flavor == HttpFlavor::Plain`, and a native gRPC dispatch goes to
+// `dispatch_grpc_native_h3`, which inlines its own trailer finish and is never
+// reconciled. No reconciled path therefore carries protocol-required native gRPC
+// status, and a name-only exemption would instead let ANY non-gRPC backend
+// smuggle a governed field past an observed or unbounded response-header policy
+// simply by naming its trailer `grpc-status`. Native gRPC status correctness is
+// preserved where it actually lives — in `dispatch_grpc_native_h3` and the H2
+// cross-protocol gRPC bridge, neither of which calls this function.
 
 /// Outcome of a case-insensitive lookup into a plugin-facing header map.
 ///
@@ -830,7 +833,10 @@ impl PrePolicyResponseHeaders {
     ///   and none is retained.
     /// * A chain with no response-header phase (`header_phases_can_mutate` is
     ///   false) cannot have changed anything, so the snapshot would be a clone
-    ///   compared against itself.
+    ///   compared against itself. Callers must fold their own CORE response-header
+    ///   mutations into that flag, not just the plugin chain — the HTTP/3 relays
+    ///   pass `true` when they will synthesize a default `content-type`, because
+    ///   that field goes on the wire exactly like a plugin write.
     /// * Otherwise the snapshot is the only way to tell a policy mutation from
     ///   an untouched backend field once the trailers arrive.
     pub(crate) fn capture_for_streaming(
@@ -905,9 +911,13 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 ///
 /// `unbounded_policy` is the fail-closed arm for a chain containing a plugin
 /// whose governed field set is not enumerable at config time: every field is
-/// treated as governed. gRPC control trailers are exempt from that arm and from
-/// the observed-mutation signal — neither expresses intent about RPC status —
-/// but an explicit `policy_names` entry still removes them.
+/// treated as governed.
+///
+/// There is NO field-name exemption of any kind, gRPC control trailers included.
+/// Every reconciled path is plain-flavor HTTP/3 (see the module-level note above
+/// this function), so a `grpc-*` trailer here is an ordinary backend-supplied
+/// field, and exempting it by name would hand any backend a one-word bypass of
+/// the response-header policy.
 ///
 /// Removal is loop-until-absent so a trailer name repeated across several field
 /// lines cannot leave a surviving duplicate behind.
@@ -923,9 +933,6 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
         let explicitly_named = policy_names
             .iter()
             .any(|policy| policy.eq_ignore_ascii_case(name.as_str()));
-        if !explicitly_named && GRPC_CONTROL_TRAILER_NAMES.contains(&name.as_str()) {
-            continue;
-        }
         let governed =
             explicitly_named || unbounded_policy || witness.was_mutated(name, response_headers);
         if governed {

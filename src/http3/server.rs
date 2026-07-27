@@ -495,6 +495,11 @@ fn build_h3_quinn_server_config(
 struct H3StreamingTrailerPolicy<'a> {
     /// The response headers exactly as they went on the wire, after every
     /// response-header phase for this path.
+    ///
+    /// This map is the WIRE header set, not a subset of it: each relay writes
+    /// its synthesized default `content-type` into the map before building the
+    /// response, so reconciliation can never report absent->absent for a field
+    /// the gateway actually sent.
     final_headers: &'a std::collections::HashMap<String, String>,
     /// Evidence captured before the first response-header phase ran.
     pre_policy: &'a PrePolicyResponseHeaders,
@@ -5191,10 +5196,19 @@ async fn handle_h3_request(
         // backend field. One clone per streaming RESPONSE, skipped entirely
         // when no response-header phase can run or when the chain already fails
         // closed; never touched per body frame.
+        //
+        // The default `content-type` this relay synthesizes below is a
+        // gateway-authored wire mutation just like a plugin write, so it counts
+        // as a header phase for the capture decision. Without it an
+        // auth/logging-only chain would keep the no-clone #2941 pass-through
+        // AND forward a backend `content-type` TRAILER that contradicts the
+        // media type the gateway itself put on the wire. Costs one map lookup
+        // and retains evidence only when the backend actually omitted the field.
+        let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
         let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
             &response_headers,
             response_trailer_governance,
-            !plugins.is_empty() || sticky_cookie_needed,
+            !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
         );
 
         // after_proxy hooks run before streaming begins so headers can be
@@ -5341,13 +5355,23 @@ async fn handle_h3_request(
         // reintroduce connection-specific fields onto the H3 wire (RFC 9114 §4.2).
         strip_client_response_hop_by_hop_headers(&mut response_headers);
 
-        // Send response headers on the H3 stream
+        // Send response headers on the H3 stream.
+        //
+        // The default `content-type` is a real gateway mutation of the response
+        // header set, so it is written into `response_headers` BEFORE the
+        // builder rather than onto the builder alone. That keeps the map the
+        // trailer boundary later treats as "the final headers" identical to the
+        // field set the client actually received; otherwise a backend
+        // `content-type` TRAILER would reconcile absent->absent and land on the
+        // wire contradicting a header the gateway itself synthesized. The
+        // lookup stays case-sensitive on the already-lowercased H3 header map,
+        // exactly as the previous builder-side check was.
+        response_headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder =
+        let resp_builder =
             apply_response_headers(Response::builder().status(status_code), &response_headers);
-        if !response_headers.contains_key("content-type") {
-            resp_builder = resp_builder.header("content-type", "application/json");
-        }
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
@@ -8583,11 +8607,13 @@ async fn stream_h3_open_response_to_client(
     // Same pre-policy capture as the inline native-H3 streaming relay: this
     // path also commits its initial HEADERS before the backend's trailers
     // exist, so the trailer frame needs evidence of what the response-header
-    // phases actually changed.
+    // phases actually changed — including the default `content-type` this relay
+    // synthesizes below, which is a gateway-authored wire mutation.
+    let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
     let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
         &response_headers,
         trailer_governance,
-        !plugins.is_empty() || sticky_cookie_needed,
+        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
     );
 
     if let Some(reject) = run_h3_streaming_after_proxy_hooks(
@@ -8637,12 +8663,15 @@ async fn stream_h3_open_response_to_client(
     // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
     strip_client_response_hop_by_hop_headers(&mut response_headers);
 
+    // Default `content-type` goes into the header MAP, not just the builder, so
+    // the map handed to the trailer boundary below is the field set the client
+    // actually received. See the matching note in the inline native-H3 relay.
+    response_headers
+        .entry("content-type".to_string())
+        .or_insert_with(|| "application/json".to_string());
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder =
+    let resp_builder =
         apply_response_headers(Response::builder().status(status), &response_headers);
-    if !response_headers.contains_key("content-type") {
-        resp_builder = resp_builder.header("content-type", "application/json");
-    }
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
@@ -10536,11 +10565,13 @@ async fn proxy_to_backend_h3_streaming(
     // Same pre-policy capture as the inline native-H3 streaming relay: the
     // initial HEADERS frame is committed before the backend's trailers exist,
     // so the trailer frame needs evidence of what the response-header phases
-    // actually changed.
+    // actually changed — including the default `content-type` this relay
+    // synthesizes below, which is a gateway-authored wire mutation.
+    let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
     let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
         &response_headers,
         trailer_governance,
-        !plugins.is_empty() || sticky_cookie_needed,
+        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
     );
 
     // after_proxy hooks run before streaming begins so headers can be modified
@@ -10603,13 +10634,16 @@ async fn proxy_to_backend_h3_streaming(
     // Final hop-by-hop strip after after_proxy (RFC 9114 §4.2).
     strip_client_response_hop_by_hop_headers(&mut response_headers);
 
-    // Send response headers on the H3 stream
+    // Send response headers on the H3 stream. Default `content-type` goes into
+    // the header MAP, not just the builder, so the map handed to the trailer
+    // boundary below is the field set the client actually received. See the
+    // matching note in the inline native-H3 relay.
+    response_headers
+        .entry("content-type".to_string())
+        .or_insert_with(|| "application/json".to_string());
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder =
+    let resp_builder =
         apply_response_headers(Response::builder().status(status), &response_headers);
-    if !response_headers.contains_key("content-type") {
-        resp_builder = resp_builder.header("content-type", "application/json");
-    }
 
     let resp = resp_builder
         .body(())

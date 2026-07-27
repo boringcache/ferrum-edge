@@ -24,11 +24,35 @@ use http::header::HeaderName;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
 use url::Url;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Every response field `finalize_cors_response` can write, in canonical
+/// lowercase form. Built once per process and shared by both the per-instance
+/// plugin and the cache-internal finalizer, so declaring trailer ownership
+/// allocates nothing and scans nothing per request.
+///
+/// This is the enumerable form of the `access-control-` prefix test in
+/// `owns_deadline_response_header`, plus `vary` — which `cors_headers` also
+/// writes (a merged token list) and which a backend trailer could otherwise
+/// overwrite after the merge.
+static CORS_RESPONSE_POLICY_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-expose-headers",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+        "access-control-max-age",
+        "vary",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect()
+});
 
 const DEFAULT_ALLOWED_METHODS: &[&str] =
     &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -754,6 +778,16 @@ impl Plugin for CorsPlugin {
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
     }
+
+    /// The CORS response headers are the browser's entire cross-origin
+    /// authorization decision. A backend trailer repeating one of them lands
+    /// after `after_proxy` and could hand the client a second, contradictory
+    /// `Access-Control-Allow-Origin` — and a backend that echoes the identical
+    /// value is invisible to observed-mutation reconciliation. Bounded to the
+    /// enumerated set `finalize_cors_response` writes.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&CORS_RESPONSE_POLICY_NAMES)
+    }
 }
 
 /// Cache-internal boundary after a contiguous set of CORS instances.
@@ -805,6 +839,13 @@ impl Plugin for CorsFinalizer {
             && name
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
+    }
+
+    /// Same ownership contract as the per-instance plugin: this finalizer is
+    /// the phase that actually writes the deferred CORS response headers, so it
+    /// declares the same bounded field set.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&CORS_RESPONSE_POLICY_NAMES)
     }
 }
 

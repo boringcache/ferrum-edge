@@ -278,23 +278,48 @@ them against the response-header policy actually in force for the request:
 - **Declared policy names.** Plugins classify their reach with
   `Plugin::response_trailer_policy()`, and the plugin cache unions the names once
   per reload so the request path reads a precomputed list instead of scanning the
-  chain. `security_headers` declares every name it sets or removes. This is the
-  only signal that can bind a **removal that was a no-op on the initial map**,
-  because the backend sent the field only as a trailer.
+  chain. This is the only signal that can bind the two mutation shapes the
+  per-request witness below cannot see: a **removal that was a no-op on the
+  initial map** (the backend sent the field only as a trailer), and an
+  **idempotent write** (the gateway wrote a value the backend already sent
+  verbatim). Built-in coverage:
+
+  | Plugin | Declared names |
+  | --- | --- |
+  | `security_headers` | every configured `set` / `remove` name |
+  | `sse` | `content-type` (when relabeling), `cache-control`, `x-accel-buffering` (when enabled), `content-length` (when `strip_content_length`) |
+  | `compression` | `content-encoding`, `content-length`, `vary` |
+  | `grpc_web` | the two internal bridge headers, `content-type`, `x-grpc-web`, `vary`, `access-control-expose-headers` |
+  | `cors` (and its cache-internal finalizer) | the six `access-control-*` response fields and `vary` |
+  | `correlation_id` | the configured header name, when `echo_downstream` |
+  | `otel_tracing`, `workload_metrics` | `traceparent` |
+  | `response_caching` | `x-cache-status`, when `add_cache_status_header` |
+  | `ai_semantic_cache` | `x-ai-cache-status` |
+  | `rate_limiting`, `ai_rate_limiter` | the exposed `x-*ratelimit-*` fields, when `expose_headers` |
+
+  Plugins that only observe, log, authenticate, or authorize declare nothing.
 - **Observed mutation.** Independently, the path witnesses the backend's
   pre-policy value for each field name the trailer section carries and drops any
   trailer whose header counterpart the chain added, changed, or removed. This
   covers plugins that declare nothing at all, including custom plugins and
-  transforms published at request time.
+  transforms published at request time. It also covers the gateway's own core
+  response-header writes — sticky-session cookie injection, and the default
+  `content-type: application/json` a relay synthesizes when the backend sent
+  none.
 - **Fail-closed arm.** A plugin whose governed field set is not enumerable at
   config time declares `ResponseTrailerPolicy::Unbounded` and the whole trailer
   section is dropped. `response_transformer` is in this class: its `after_proxy`
   also applies `mesh_route_dispatch` route overrides, whose field names do not
   exist until the request runs.
-- **gRPC control trailers are exempt** in every arm. `grpc-status`,
-  `grpc-message`, and `grpc-status-details-bin` are protocol status, not header
-  policy; gRPC-specific trailer policy has its own boundary (see
-  [gRPC trailers over H3](#grpc-trailers-over-h3)).
+
+**No field name is exempt, `grpc-*` included.** Every reconciled path is a
+plain-flavor H3 relay — the native H3 pool branches require
+`HttpFlavor::Plain`, and a native gRPC dispatch inlines its own trailer finish in
+`dispatch_grpc_native_h3` and is never reconciled here (see
+[gRPC trailers over H3](#grpc-trailers-over-h3)). A `grpc-status` trailer on a
+reconciled path is therefore an ordinary backend-supplied field, and exempting it
+by name would let any non-gRPC backend bypass an observed or fail-closed
+response-header policy with a single well-chosen trailer name.
 
 An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, rate limits —
 declares no names and mutates no response headers, so its backend trailers are
@@ -310,15 +335,26 @@ The plain native/refined H3 streaming relays cross the same boundary later: the
 initial HEADERS frame is on the wire before the backend's trailer section even
 exists. They therefore reconcile at the trailer frame, inside the shared
 trailer-finish helper and immediately before `send_trailers`, using the same
-three signals. Two details differ from the buffered path:
+three signals. Three details differ from the buffered path:
 
 - **Evidence shape.** The set of trailer field names is unknown when the headers
   go out, so a streaming relay retains the backend's **pre-policy header map**
   for the response and derives the per-trailer witness once the trailers arrive.
   That is one snapshot per streaming *response* — never per body frame — and it
   is skipped entirely when no response-header phase can run for the request (no
-  plugins and no sticky-cookie injection), or when the chain already fails
-  closed under `ResponseTrailerPolicy::Unbounded`.
+  plugins, no sticky-cookie injection, and the backend already supplied a
+  `content-type`), or when the chain already fails closed under
+  `ResponseTrailerPolicy::Unbounded`.
+- **Wire parity of the final header map.** Each relay writes its synthesized
+  default `content-type` into the response-header map before building the
+  response, not onto the response builder alone, so the map the reconciliation
+  treats as "the final headers" is exactly the field set the client received. A
+  builder-only default would let a backend `content-type` trailer reconcile as
+  absent-to-absent and land on the wire contradicting a header the gateway
+  itself sent. Synthesizing that field also counts as a response-header phase
+  for the evidence decision above, so the parity holds even for an
+  auth/logging-only chain. The special native-gRPC content-type path is
+  untouched: it lives in `dispatch_grpc_native_h3`, which is not reconciled.
 - **Ambiguous duplicates fail closed.** A plugin may synthesize several case
   variants of one field name (`x-name` beside `X-Name`) in the string header
   map. A field counts as untouched only when the pre-policy and final maps each
@@ -330,7 +366,8 @@ Everything else is unchanged: the trailer read timeout and its error
 classification, connection/accounting release, H3 capability downgrade on
 trailer-boundary transport faults, and client-disconnect semantics all behave
 exactly as before. Native gRPC over H3 inlines its own trailer finish and is not
-reconciled here, so `grpc-status` stays protocol-correct.
+reconciled here, so `grpc-status` stays protocol-correct on the path that
+actually carries it.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

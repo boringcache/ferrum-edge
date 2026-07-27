@@ -1176,6 +1176,13 @@ pub enum ResponseTrailerPolicy<'a> {
     Unbounded,
 }
 
+/// Shared one-element declaration for the plugins whose `after_proxy` echoes
+/// the gateway-authored `traceparent` (`otel_tracing`, and `workload_metrics`
+/// when it is the mesh tracing plugin). Built once per process so both can hand
+/// out a bounded slice with no per-request allocation.
+pub(crate) static TRACEPARENT_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["traceparent".to_string()]);
+
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginFailurePolicy {
@@ -6760,14 +6767,31 @@ pub trait Plugin: Send + Sync {
     ///
     /// Protocol paths that forward backend trailers after the response-header
     /// phases (buffered and streaming native HTTP/3) reconcile the trailer
-    /// section against the union of these declarations. Override this only when
-    /// the policy can be a NO-OP on the initial header map while still needing
-    /// to bind the trailer channel — a conditional removal, or a rejection
-    /// gated on a field the backend supplied only as a trailer. Mutations that
-    /// actually land on the initial headers are reconciled per request without
-    /// any declaration, so observers, authentication, and authorization plugins
-    /// correctly keep the [`ResponseTrailerPolicy::None`] default and preserve
-    /// backend trailers.
+    /// section against the union of these declarations.
+    ///
+    /// Override this whenever the plugin OWNS a response field — that is,
+    /// whenever a backend trailer carrying the same name would contradict or
+    /// undo the decision — AND the per-request mutation witness could fail to
+    /// see it. The witness only proves "this field changed on the initial header
+    /// map", so it misses exactly two shapes, and both are common:
+    ///
+    /// * A **no-op removal**: the policy removes a field the backend sent only
+    ///   as a trailer, so nothing changes on the initial map (`sse` with
+    ///   `strip_content_length`, `security_headers` with a configured `remove`,
+    ///   `grpc_web` stripping its internal bridge headers).
+    /// * An **idempotent write**: the gateway writes a value the backend already
+    ///   sent verbatim, so the diff is empty (`response_caching`'s guessable
+    ///   `x-cache-status: MISS`, an echoed `traceparent`, a `vary` token merge
+    ///   that was already nominated).
+    ///
+    /// Mutations that do land visibly on the initial headers are reconciled per
+    /// request without any declaration, so plugins that only observe, log,
+    /// authenticate, or authorize correctly keep the
+    /// [`ResponseTrailerPolicy::None`] default and preserve backend trailers
+    /// (issue #2941). Declare the enumerable name set wherever it is
+    /// enumerable; reserve [`ResponseTrailerPolicy::Unbounded`] for governed
+    /// names that only exist at request time (`response_transformer`'s
+    /// route-override transforms).
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
     }

@@ -2963,6 +2963,14 @@ pub struct PluginPhaseData {
     /// TRAILER section, unioned from `Plugin::response_trailer_policy()`.
     /// Trailer-forwarding paths drop exactly these names, so an
     /// auth/logging-only chain contributes nothing and keeps its trailers.
+    ///
+    /// Built-in coverage is the response-header owners, not a partial sample:
+    /// `security_headers`, `sse`, `compression`, `grpc_web`, `cors` (+ the
+    /// cache-internal finalizer), `correlation_id`, `otel_tracing`,
+    /// `workload_metrics`, `response_caching`, `ai_semantic_cache`,
+    /// `rate_limiting`, and `ai_rate_limiter` all declare bounded name sets;
+    /// `response_transformer` declares `Unbounded` because its route-override
+    /// transforms are published at request time.
     pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,

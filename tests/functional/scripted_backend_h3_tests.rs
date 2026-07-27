@@ -4112,6 +4112,25 @@ async fn spawn_h3_trailer_policy_harness(
     ca_name: &str,
     build_config: impl FnOnce(u16) -> serde_json::Value,
 ) -> (GatewayHarness, u16, (ScriptedTlsBackend, ScriptedH3Backend)) {
+    spawn_h3_trailer_policy_harness_with_trailers(
+        ca_name,
+        &[
+            ("x-powered-by", "backend/1.2"),
+            ("x-backend-finished", "true"),
+        ],
+        build_config,
+    )
+    .await
+}
+
+/// [`spawn_h3_trailer_policy_harness`] with a caller-chosen backend trailer
+/// section, so a test can prove that a specific field NAME earns no special
+/// treatment from the reconciliation.
+async fn spawn_h3_trailer_policy_harness_with_trailers(
+    ca_name: &str,
+    backend_trailers: &[(&'static str, &'static str)],
+    build_config: impl FnOnce(u16) -> serde_json::Value,
+) -> (GatewayHarness, u16, (ScriptedTlsBackend, ScriptedH3Backend)) {
     let ca = TestCa::new(ca_name).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -4143,10 +4162,12 @@ async fn spawn_h3_trailer_policy_harness(
             ("content-type", "text/plain".to_string()),
         ]))
         .step(H3Step::RespondData(body.clone()))
-        .step(H3Step::RespondTrailers(vec![
-            ("x-powered-by", "backend/1.2".to_string()),
-            ("x-backend-finished", "true".to_string()),
-        ]))
+        .step(H3Step::RespondTrailers(
+            backend_trailers
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_string()))
+                .collect(),
+        ))
         .step(H3Step::StallFor(Duration::from_millis(100)))
         .spawn()
         .expect("spawn h3");
@@ -4318,4 +4339,88 @@ async fn h3_streaming_unbounded_response_policy_drops_backend_trailers() {
         resp.trailers
     );
     assert_eq!(resp.trailer("x-powered-by"), None);
+}
+
+// A `grpc-*` trailer NAME earns no exemption on a reconciled path. Every path
+// that reaches the reconciliation is plain-flavor H3 — a native gRPC dispatch
+// finishes its own trailers in `dispatch_grpc_native_h3` and is never
+// reconciled — so this backend is an ordinary HTTP backend that merely happens
+// to name its trailer `grpc-status`. Without the fix that one word would carry
+// it past a fail-closed response-header policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_grpc_named_trailer_from_a_plain_backend_is_not_exempt() {
+    let (harness, https_port, _keep) = spawn_h3_trailer_policy_harness_with_trailers(
+        "h3-streaming-trailers-grpc-name",
+        &[
+            ("grpc-status", "0"),
+            ("grpc-message", "smuggled"),
+            ("x-backend-finished", "true"),
+        ],
+        |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        },
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming path must still succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("grpc-status"),
+        None,
+        "a grpc-named trailer from a plain backend must not bypass the \
+         fail-closed response header policy; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("grpc-message"), None);
+    assert_eq!(resp.trailer("x-backend-finished"), None);
 }

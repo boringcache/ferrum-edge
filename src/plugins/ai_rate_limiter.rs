@@ -141,6 +141,18 @@ const EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
     ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
 ];
 
+/// The same table in the bounded `&[String]` form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Derived from
+/// [`EXPOSED_RATELIMIT_HEADERS`] so the two cannot drift, built once per
+/// process, and never allocated per request.
+static EXPOSED_RATELIMIT_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        EXPOSED_RATELIMIT_HEADERS
+            .iter()
+            .map(|(_, header_name)| (*header_name).to_string())
+            .collect()
+    });
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -1813,6 +1825,18 @@ impl Plugin for AiRateLimiter {
             }
         }
         false
+    }
+
+    /// Config-time form of the same ownership. Mirrors `rate_limiting`: the
+    /// exposed token budget is gateway accounting, an identical backend echo is
+    /// invisible to observed-mutation reconciliation, and `expose_headers: false`
+    /// writes nothing and therefore governs no trailers.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        if self.expose_headers {
+            super::ResponseTrailerPolicy::Names(&EXPOSED_RATELIMIT_POLICY_NAMES)
+        } else {
+            super::ResponseTrailerPolicy::None
+        }
     }
 
     async fn on_response_body(

@@ -2526,6 +2526,68 @@ async fn test_request_view_classifies_response_trailer_policy_by_capability() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_unions_builtin_response_trailer_policy_names() {
+    // `sse` is the case the per-request mutation witness cannot see: its
+    // `strip_content_length` removal is a NO-OP on the initial header map
+    // whenever the backend sends `content-length` only as a trailer, so only
+    // this config-time declaration binds the trailer channel. The other three
+    // fields are gateway writes a trailer copy would contradict.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"force_sse_content_type": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let mut names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "cache-control",
+            "content-length",
+            "content-type",
+            "x-accel-buffering",
+        ],
+        "sse must declare every response field its after_proxy owns"
+    );
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "an enumerable declaration must not fail closed"
+    );
+
+    // Turning the owning knobs off narrows the declaration instead of widening
+    // it: a plugin that no longer writes the field governs no trailer for it.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"strip_content_length": false, "add_no_buffering_header": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["cache-control"]);
+}
+
 #[test]
 fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     let mut deadline = make_plugin_config_with_json(
