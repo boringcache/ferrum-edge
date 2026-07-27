@@ -246,7 +246,7 @@ impl Http2PoolManager {
 
                 let io = TokioIo::new(tls_stream);
                 let builder = Self::build_h2_builder(pool_config);
-                let (mut sender, conn) = builder.handshake(io).await.map_err(|e| {
+                let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("h2 handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Hyper(e)),
@@ -258,9 +258,27 @@ impl Http2PoolManager {
                 // Wait for readiness before treating this DNS candidate as
                 // established so a TLS-successful non-H2 peer cannot suppress
                 // failover to a later address.
-                sender.ready().await.map_err(|e| Http2PoolError::BackendUnavailable {
-                    message: format!("h2 handshake failed: {}", e),
-                    source: Some(BackendUnavailableSource::Hyper(e)),
+                std::future::poll_fn(|cx| {
+                    if conn.current_max_send_streams() > 0 {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
+                        std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
+                            "h2 connection closed before peer SETTINGS".to_string(),
+                        )),
+                        std::task::Poll::Ready(Err(e)) => {
+                            std::task::Poll::Ready(Err(format!("h2 handshake failed: {e}")))
+                        }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+                .map_err(|message| Http2PoolError::BackendUnavailable {
+                    message: message.clone(),
+                    source: Some(BackendUnavailableSource::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        message,
+                    ))),
                 })?;
 
                 // Spawn only after the complete candidate establishment
@@ -336,14 +354,12 @@ impl Http2PoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) AND advertise our local
-            // initial cap on locally-initiated streams. The server's SETTINGS
-            // frame can raise the local cap later, but the initial value
-            // gives operators a starting bound that maps onto Istio's
-            // `http2MaxRequests` semantics for outbound concurrent requests.
+            // Cap server-initiated streams (push).
             builder.max_concurrent_streams(max_streams);
-            builder.initial_max_send_streams(max_streams as usize);
         }
+        // Zero is a pre-SETTINGS sentinel only. The peer's initial SETTINGS
+        // replaces it, including the RFC default when the parameter is absent.
+        builder.initial_max_send_streams(0);
 
         builder
     }

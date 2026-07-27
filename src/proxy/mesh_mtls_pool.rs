@@ -1398,11 +1398,13 @@ impl MeshMtlsConnectionPool {
                     .max_frame_size(pool_config.http2_max_frame_size);
                 if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
                     builder.max_concurrent_streams(max_streams);
-                    builder.initial_max_send_streams(max_streams as usize);
                 }
+                // Zero is a pre-SETTINGS sentinel used to prove the peer
+                // preface was received before this DNS candidate is accepted.
+                builder.initial_max_send_streams(0);
 
                 let io = TokioIo::new(tls_stream);
-                let (mut sender, connection) =
+                let (sender, mut connection) =
                     builder
                         .handshake(io)
                         .await
@@ -1415,9 +1417,24 @@ impl MeshMtlsConnectionPool {
                 // written; wait for peer SETTINGS before accepting this
                 // candidate so a TLS-successful non-H2 peer cannot suppress
                 // DNS failover.
-                sender.ready().await.map_err(|e| HbonePoolError::H2Handshake {
+                std::future::poll_fn(|cx| {
+                    if connection.current_max_send_streams() > 0 {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    match std::future::Future::poll(std::pin::Pin::new(&mut connection), cx) {
+                        std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
+                            "H2 connection closed before peer SETTINGS".to_string(),
+                        )),
+                        std::task::Poll::Ready(Err(e)) => {
+                            std::task::Poll::Ready(Err(e.to_string()))
+                        }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+                .map_err(|message| HbonePoolError::H2Handshake {
                     host: target_host.to_string(),
-                    message: e.to_string(),
+                    message,
                 })?;
 
                 // Spawn only after complete protocol establishment. Failed or

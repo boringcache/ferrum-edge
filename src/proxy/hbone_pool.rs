@@ -1606,8 +1606,11 @@ pub(crate) async fn dial_h2_connect_sender(
             if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
                 builder.max_concurrent_streams(max_streams);
             }
+            // Zero is a pre-SETTINGS sentinel used to prove the peer preface
+            // was received before this DNS candidate is accepted.
+            builder.initial_max_send_streams(0);
 
-            let (mut sender, mut connection) =
+            let (sender, mut connection) =
                 builder
                     .handshake(tls_stream)
                     .await
@@ -1617,30 +1620,28 @@ pub(crate) async fn dial_h2_connect_sender(
                     })?;
 
             // Raw h2 `handshake()` returns after writing the client preface;
-            // peer SETTINGS require polling `connection`. Drive it until
-            // `ready()` succeeds so a TLS-successful non-H2 peer cannot
-            // suppress DNS failover, then detach the driver.
-            tokio::select! {
-                ready = sender.ready() => {
-                    ready.map_err(|e| HbonePoolError::H2Handshake {
-                        host: target_host.to_string(),
-                        message: e.to_string(),
-                    })?;
+            // peer SETTINGS require polling `connection`. The zero initial
+            // stream limit changes only after that frame is processed, so a
+            // TLS-successful non-H2 peer cannot suppress DNS failover.
+            std::future::poll_fn(|cx| {
+                if connection.max_concurrent_send_streams() > 0 {
+                    return std::task::Poll::Ready(Ok(()));
                 }
-                conn = &mut connection => {
-                    return Err(match conn {
-                        Ok(()) => HbonePoolError::H2Handshake {
-                            host: target_host.to_string(),
-                            message: "H2 connection closed before handshake completed"
-                                .to_string(),
-                        },
-                        Err(e) => HbonePoolError::H2Handshake {
-                            host: target_host.to_string(),
-                            message: e.to_string(),
-                        },
-                    });
+                match std::future::Future::poll(std::pin::Pin::new(&mut connection), cx) {
+                    std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Err(
+                        "H2 connection closed before peer SETTINGS".to_string(),
+                    )),
+                    std::task::Poll::Ready(Err(e)) => {
+                        std::task::Poll::Ready(Err(e.to_string()))
+                    }
+                    std::task::Poll::Pending => std::task::Poll::Pending,
                 }
-            }
+            })
+            .await
+            .map_err(|message| HbonePoolError::H2Handshake {
+                host: target_host.to_string(),
+                message,
+            })?;
 
             if pool_config.enable_http2
                 && let Some(ping_pong) = connection.ping_pong()
