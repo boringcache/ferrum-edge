@@ -10480,7 +10480,6 @@ async fn arm_mesh_runtime_startup(
     }
 
     let startup_result: Result<(), anyhow::Error> = async {
-
         if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::InsideStartupGate {
             let _ = take_mesh_startup_fault_inject();
             return Err(anyhow::anyhow!(
@@ -10502,7 +10501,6 @@ async fn arm_mesh_runtime_startup(
     startup_result?;
     Ok(())
 }
-
 
 struct MeshAdminListeners {
     handles: Vec<JoinHandle<()>>,
