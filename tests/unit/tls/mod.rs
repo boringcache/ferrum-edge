@@ -6,3 +6,4 @@ mod pkcs11_key_encoding_tests;
 mod pkcs11_softhsm_tests;
 mod san_allow_list_verifier_tests;
 mod source_redaction_tests;
+mod store_atomicity_tests;

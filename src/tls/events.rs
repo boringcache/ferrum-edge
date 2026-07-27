@@ -14,7 +14,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterialSource};
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
@@ -407,15 +406,7 @@ fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "TLS event log path has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    let tmp_path = parent.join(format!(
-        ".{}.tmp-{}",
-        EVENT_LOG_FILE_NAME,
-        Uuid::new_v4().simple()
-    ));
-    crate::tls::private_file::write_private_file(&tmp_path, bytes)
-        .map_err(|error| error.to_string())?;
-    std::fs::rename(&tmp_path, path).map_err(|error| error.to_string())?;
-    Ok(())
+    crate::tls::private_file::replace_private_file(path, bytes).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
