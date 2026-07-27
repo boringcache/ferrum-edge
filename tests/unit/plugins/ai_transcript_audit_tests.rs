@@ -9096,9 +9096,12 @@ async fn oversized_redacted_json_skips_parse_work_and_remains_fail_closed() {
         !plugin.should_buffer_response_body(&ctx),
         "an unparsed oversized request is conservatively treated as potentially streaming"
     );
+    plugin.on_response_stream_selected(&ctx, 200, Some("application/json"));
 
-    // The first candidate holds the full fail-closed serialized-entry
-    // reservation. A second oversized request must not bypass that same gate.
+    // Stream selection must not release the first candidate's full fail-closed
+    // serialized-entry reservation. The response is already committed by the
+    // time the log fallback runs, so a late admission failure cannot reject it.
+    // A second oversized request must therefore remain rejected here.
     let mut saturated = make_ctx();
     let rejected = plugin
         .on_final_request_body_with_context(&mut saturated, &headers, body.as_bytes())
