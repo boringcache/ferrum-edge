@@ -7,7 +7,7 @@ use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestCon
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 // ── Helper functions ────────────────────────────────────────────────────────
@@ -4563,7 +4563,6 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(before.recomputed_key_bytes, 48);
     assert_eq!(before.shared_key_entries, 3);
     assert_eq!(before.last_expired_removals, 0);
-    assert_eq!(before.last_forced_candidates, 0);
 
     harness
         .claim_at("nonce-d-00000004", Duration::from_secs(11))
@@ -4575,7 +4574,6 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(after_expiry.recomputed_key_bytes, 48);
     assert_eq!(after_expiry.shared_key_entries, 3);
     assert_eq!(after_expiry.last_expired_removals, 1);
-    assert_eq!(after_expiry.last_forced_candidates, 0);
 
     harness
         .claim_at("nonce-b-00000002", Duration::from_secs(11))
@@ -4587,11 +4585,16 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(after_refresh.recomputed_key_bytes, 48);
     assert_eq!(after_refresh.shared_key_entries, 3);
     assert_eq!(after_refresh.last_expired_removals, 0);
-    assert_eq!(after_refresh.last_forced_candidates, 0);
 }
 
+// ── Live entries are never evicted (GHSA-54mh-v348-j878) ───────────────────
+//
+// The remediation these tests pin is deliberate: replay coverage promised for
+// `cache_ttl_seconds` is honoured for the whole window. Capacity exhaustion is
+// a *rejection*, never a licence to unprotect an already-claimed nonce.
+
 #[test]
-fn test_nonce_age_index_forced_eviction_is_exact_oldest() {
+fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
@@ -4613,9 +4616,11 @@ fn test_nonce_age_index_forced_eviction_is_exact_oldest() {
             .claim_at(nonce, Duration::from_secs(seconds))
             .expect("fresh nonce must admit");
     }
-    harness
+
+    let err = harness
         .claim_at("nonce-d-00000004", Duration::from_secs(3))
-        .expect("bounded exact-oldest eviction must make room");
+        .expect_err("entry cap full of live entries must fail closed");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
 
     let snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(snapshot.entry_count, 3);
@@ -4624,23 +4629,28 @@ fn test_nonce_age_index_forced_eviction_is_exact_oldest() {
     assert_eq!(snapshot.recomputed_key_bytes, 48);
     assert_eq!(snapshot.shared_key_entries, 3);
     assert_eq!(snapshot.last_expired_removals, 0);
-    assert_eq!(snapshot.last_forced_candidates, 1);
-    assert!(
-        harness
-            .claim_at("nonce-c-00000003", Duration::from_secs(4))
-            .is_err(),
-        "newer retained nonce must still be a replay"
-    );
-    assert!(
-        harness
-            .claim_at("nonce-a-00000001", Duration::from_secs(4))
-            .is_ok(),
-        "the exact oldest nonce must have been evicted"
-    );
+
+    // Every live nonce — including the exact oldest — is still a replay.
+    for nonce in ["nonce-a-00000001", "nonce-b-00000002", "nonce-c-00000003"] {
+        assert_eq!(
+            harness
+                .claim_at(nonce, Duration::from_secs(4))
+                .expect_err("live nonce must remain replay-protected"),
+            "WS-Security: nonce replay detected",
+            "{nonce} lost replay protection to a capacity admission"
+        );
+    }
+    // The rejected nonce was not recorded, so it never became a silent replay.
+    let after = harness.snapshot().expect("snapshot");
+    assert_eq!(after.entry_count, 3);
+    assert_eq!(after.retained_key_bytes, 48);
 }
 
 #[test]
-fn test_nonce_byte_cap_evicts_when_cache_has_fewer_than_amortized_target() {
+fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
+    // A single maximum-length nonce pins the whole byte budget. The previous
+    // behaviour evicted it and re-admitted it one second later; that is the
+    // replay this test forbids.
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
@@ -4658,18 +4668,137 @@ fn test_nonce_byte_cap_evicts_when_cache_has_fewer_than_amortized_target() {
     harness
         .claim_at(&first, Duration::ZERO)
         .expect("first maximum-length nonce must admit");
-    harness
+
+    let err = harness
         .claim_at(&second, Duration::from_secs(1))
-        .expect("the only cached nonce must be evicted to satisfy the byte cap");
+        .expect_err("byte cap must reject rather than unprotect the live nonce");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
+    assert!(
+        !err.contains(second.as_str()) && !err.contains(first.as_str()),
+        "saturation diagnostic must never include the nonce"
+    );
 
     let snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(snapshot.entry_count, 1);
     assert_eq!(snapshot.retained_key_bytes, 4_096);
-    assert_eq!(snapshot.last_forced_candidates, 1);
-    assert!(
-        harness.claim_at(&first, Duration::from_secs(2)).is_ok(),
-        "the evicted nonce must no longer pin replay state"
+    assert_eq!(snapshot.recomputed_key_bytes, 4_096);
+    assert_eq!(snapshot.last_expired_removals, 0);
+
+    assert_eq!(
+        harness
+            .claim_at(&first, Duration::from_secs(2))
+            .expect_err("the live nonce must still be a replay"),
+        "WS-Security: nonce replay detected"
     );
+    // The rejected nonce was never recorded, so a retry is still a fresh claim
+    // decision rather than a replay hit.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(3))
+            .expect_err("retry while still saturated must stay rejected"),
+        "WS-Security: replay protection state is at capacity"
+    );
+}
+
+#[test]
+fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
+    const TTL: u64 = 60;
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 100_000,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": 4_096,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("tight byte cap must admit");
+
+    let first = "A".repeat(4_096);
+    let second = "B".repeat(4_096);
+    harness
+        .claim_at(&first, Duration::ZERO)
+        .expect("first maximum-length nonce must admit");
+
+    // Inside the TTL the second nonce is refused and the first stays protected.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(TTL - 1))
+            .expect_err("saturated inside the TTL must reject"),
+        "WS-Security: replay protection state is at capacity"
+    );
+
+    // Once the first entry is provably expired the retry reclaims it and wins.
+    harness
+        .claim_at(&second, Duration::from_secs(TTL))
+        .expect("expired entry must be reclaimed for the retry");
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, 4_096);
+    assert_eq!(snapshot.recomputed_key_bytes, 4_096);
+    assert_eq!(snapshot.shared_key_entries, 1);
+    assert_eq!(snapshot.last_expired_removals, 1);
+
+    // The freshly claimed nonce now owns the whole budget and is protected.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(TTL + 1))
+            .expect_err("the newly claimed nonce must be replay-protected"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[test]
+fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
+    const TTL: u64 = 10;
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 4,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": 16,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    // Two old entries and two recent ones fill the entry cap.
+    for (nonce, seconds) in [
+        ("nonce-a-00000001", 0),
+        ("nonce-b-00000002", 1),
+        ("nonce-c-00000003", 8),
+        ("nonce-d-00000004", 9),
+    ] {
+        harness
+            .claim_at(nonce, Duration::from_secs(seconds))
+            .expect("fresh nonce must admit");
+    }
+
+    // At t=11 only the first two entries are past the 10s TTL. Admitting one
+    // nonce needs exactly one slot, so exactly one expired entry is reclaimed.
+    harness
+        .claim_at("nonce-e-00000005", Duration::from_secs(11))
+        .expect("an expired entry must make room");
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.last_expired_removals, 1);
+    assert_eq!(snapshot.entry_count, 4);
+    assert_eq!(snapshot.age_index_entry_count, 4);
+    assert_eq!(snapshot.retained_key_bytes, 64);
+    assert_eq!(snapshot.recomputed_key_bytes, 64);
+
+    // The still-live entries kept their protection; only the expired head went.
+    for nonce in ["nonce-c-00000003", "nonce-d-00000004", "nonce-e-00000005"] {
+        assert_eq!(
+            harness
+                .claim_at(nonce, Duration::from_secs(12))
+                .expect_err("live nonce must remain replay-protected"),
+            "WS-Security: nonce replay detected",
+            "{nonce} lost replay protection"
+        );
+    }
 }
 
 #[test]
@@ -4705,13 +4834,14 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
     let large_nonce = "Z".repeat(4_096);
     let err = harness
         .claim_at(&large_nonce, Duration::from_secs(1))
-        .expect_err("bounded work cannot free 4096 bytes from 64 tiny entries");
+        .expect_err("live entries must not be evicted to seat a 4096-byte nonce");
     assert_eq!(err, "WS-Security: replay protection state is at capacity");
     assert!(
         !err.contains(large_nonce.as_str()),
         "saturation diagnostic must never include the nonce"
     );
 
+    // Nothing was reclaimed: every live entry survived the saturation probe.
     let after = harness.snapshot().expect("snapshot");
     assert_eq!(after.entry_count, ENTRY_COUNT);
     assert_eq!(after.age_index_entry_count, ENTRY_COUNT);
@@ -4719,15 +4849,133 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
     assert_eq!(after.recomputed_key_bytes, 4_096);
     assert_eq!(after.shared_key_entries, ENTRY_COUNT);
     assert_eq!(after.last_expired_removals, 0);
-    assert_eq!(after.last_forced_candidates, after.max_maintenance_entries);
     assert_eq!(after.max_maintenance_entries, 64);
+    assert_eq!(
+        harness
+            .claim_at("0000000000000000", Duration::from_secs(2))
+            .expect_err("the oldest live entry must still be a replay"),
+        "WS-Security: nonce replay detected"
+    );
 }
 
 #[test]
-fn test_nonce_maintenance_source_has_no_lookup_map_scan_or_unbounded_candidates() {
+fn test_nonce_reclaim_over_bounded_budget_rejects_then_retries_to_success() {
+    // 256 tiny entries saturate the byte cap. Reclaiming all of them for one
+    // maximum-length nonce needs more than the 64-entry per-request budget, so
+    // early attempts fail closed and later retries succeed once enough proven
+    // expired entries have been reclaimed. No live entry is ever discarded.
+    const ENTRY_LEN: usize = 16;
+    const MAX_BYTES: usize = 4_096;
+    const ENTRY_COUNT: usize = MAX_BYTES / ENTRY_LEN;
+    const TTL: u64 = 30;
+
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 1_000_000,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": MAX_BYTES,
+            "max_total_cache_bytes": MAX_BYTES
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    for index in 0..ENTRY_COUNT {
+        let nonce = format!("{index:016x}");
+        assert_eq!(nonce.len(), ENTRY_LEN);
+        harness
+            .claim_at(&nonce, Duration::ZERO)
+            .expect("initial fill must admit");
+    }
+
+    let large_nonce = "Z".repeat(MAX_BYTES);
+    // Still inside the TTL: nothing is reclaimable and the claim fails closed.
+    assert_eq!(
+        harness
+            .claim_at(&large_nonce, Duration::from_secs(TTL - 1))
+            .expect_err("live entries must not be reclaimed"),
+        "WS-Security: replay protection state is at capacity"
+    );
+    let live = harness.snapshot().expect("snapshot");
+    assert_eq!(live.entry_count, ENTRY_COUNT);
+    assert_eq!(live.last_expired_removals, 0);
+
+    // Past the TTL every entry is provably expired. Each attempt reclaims at
+    // most the maintenance budget, so the claim succeeds only after enough
+    // retries — and never by discarding unexpired state.
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 16, "reclamation failed to converge");
+        let snapshot_before = harness.snapshot().expect("snapshot");
+        match harness.claim_at(&large_nonce, Duration::from_secs(TTL)) {
+            Ok(()) => break,
+            Err(err) => {
+                assert_eq!(err, "WS-Security: replay protection state is at capacity");
+                let after = harness.snapshot().expect("snapshot");
+                assert_eq!(
+                    after.last_expired_removals, after.max_maintenance_entries,
+                    "a rejected attempt must have spent the whole bounded budget"
+                );
+                assert_eq!(
+                    snapshot_before.entry_count - after.entry_count,
+                    after.max_maintenance_entries,
+                    "only budget-bounded expired reclamation may occur"
+                );
+                assert_eq!(after.retained_key_bytes, after.recomputed_key_bytes);
+            }
+        }
+    }
+    assert!(attempts > 1, "one bounded batch must not free the whole cap");
+
+    let final_snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(final_snapshot.entry_count, 1);
+    assert_eq!(final_snapshot.retained_key_bytes, MAX_BYTES);
+    assert_eq!(final_snapshot.recomputed_key_bytes, MAX_BYTES);
+    assert_eq!(final_snapshot.shared_key_entries, 1);
+}
+
+#[test]
+fn test_nonce_fail_closed_contract_is_documented_in_openapi_and_docs() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let config = &spec["components"]["schemas"]["SoapWsSecurityConfig"];
+    let nonce = &config["properties"]["nonce"]["properties"];
+    let max_cache_size = nonce["max_cache_size"]["description"]
+        .as_str()
+        .expect("max_cache_size description");
+    let max_total_cache_bytes = nonce["max_total_cache_bytes"]["description"]
+        .as_str()
+        .expect("max_total_cache_bytes description");
+    assert!(
+        max_cache_size.contains("never evicted"),
+        "max_cache_size must advertise that in-TTL nonces are never evicted: {max_cache_size}"
+    );
+    assert!(
+        max_cache_size.contains("401") && max_total_cache_bytes.contains("401"),
+        "both nonce caps must advertise the fail-closed rejection"
+    );
+
+    let plugins_doc = include_str!("../../../docs/plugins.md");
+    let cache_doc = include_str!("../../../docs/cache_management.md");
+    for (label, text) in [("plugins", plugins_doc), ("cache", cache_doc)] {
+        assert!(
+            text.contains("the walk stops at the first still-live entry"),
+            "{label} docs must state that reclamation stops at the first live entry"
+        );
+        assert!(
+            !text.contains("selects exact-oldest live entries"),
+            "{label} docs must not describe forced eviction of live nonces"
+        );
+    }
+}
+
+#[test]
+fn test_nonce_maintenance_source_reclaims_only_expired_entries() {
     let source = include_str!("../../../src/plugins/soap_ws_security.rs");
     let start = source
-        .find("fn make_nonce_room_locked(")
+        .find("fn reclaim_expired_nonce_room_locked(")
         .expect("maintenance function");
     let end = source[start..]
         .find("pub(crate) fn check_nonce_replay_at_for_tests")
@@ -4735,15 +4983,25 @@ fn test_nonce_maintenance_source_has_no_lookup_map_scan_or_unbounded_candidates(
         .expect("maintenance function end");
     let maintenance = &source[start..end];
 
-    assert!(maintenance.contains("age_index.first_key_value()"));
     assert!(
-        maintenance.contains(".age_index.iter().take(remaining_budget)"),
-        "forced candidates must come from a bounded ordered-index prefix"
+        maintenance.contains("age_index.first_key_value()"),
+        "reclamation must walk the ordered index from its oldest end"
     );
     assert!(
-        maintenance.contains("Vec::with_capacity(remaining_budget)"),
-        "candidate memory must use the explicit bounded budget"
+        maintenance.contains("state.last_expired_removals < NONCE_MAX_MAINTENANCE_ENTRIES"),
+        "reclamation must stay inside the per-request maintenance budget"
     );
+    assert!(
+        maintenance.contains("if Self::nonce_age_seconds(now, age_key.0) < ttl_seconds {")
+            && maintenance.contains("break;"),
+        "reclamation must stop at the first still-live entry"
+    );
+    // No forced eviction of live replay state may return (GHSA-54mh-v348-j878).
+    assert!(!maintenance.contains("amortized_target"));
+    assert!(!maintenance.contains("candidates"));
+    assert!(!maintenance.contains("remaining_budget"));
+    assert!(!maintenance.contains("Vec::with_capacity"));
+    // And no lookup-map scan may creep back in.
     assert!(!maintenance.contains("state.cache.iter("));
     assert!(!maintenance.contains("state.cache.retain("));
     assert!(!maintenance.contains("for (key, entry) in &state.cache"));
@@ -4767,23 +5025,11 @@ fn test_nonce_inconsistent_age_index_fails_closed() {
 // ── Concurrent nonce-cap invariants (GHSA-3ffh-5842-8m92 residual) ──────────
 
 #[test]
-fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
+fn test_concurrent_nonce_admission_saturates_without_unprotecting_live_claims() {
     const MAX_ENTRIES: usize = 128;
     const MAX_BYTES: usize = 4_096; // MIN_NONCE_MAX_TOTAL_CACHE_BYTES
     const NONCE_LEN: usize = 64;
-    const BYTE_CAP_ENTRIES: usize = MAX_BYTES / NONCE_LEN;
-    // Mirrors the age-index amortization target: max_cache_size/10, clamped
-    // to [1, NONCE_MAX_MAINTENANCE_ENTRIES] (64).
-    const EVICTION_BATCH: usize = {
-        let target = MAX_ENTRIES / 10;
-        if target < 1 {
-            1
-        } else if target > 64 {
-            64
-        } else {
-            target
-        }
-    };
+    const BYTE_CAP_ENTRIES: usize = MAX_BYTES / NONCE_LEN; // 64, the binding cap
     const THREADS: usize = 32;
     const PER_THREAD: usize = 64;
 
@@ -4802,21 +5048,24 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
     );
 
     let barrier = Arc::new(Barrier::new(THREADS));
-    let accepted = Arc::new(AtomicUsize::new(0));
+    let admitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rejected = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::with_capacity(THREADS);
     for thread_id in 0..THREADS {
         let harness = Arc::clone(&harness);
         let barrier = Arc::clone(&barrier);
-        let accepted = Arc::clone(&accepted);
+        let admitted = Arc::clone(&admitted);
+        let rejected = Arc::clone(&rejected);
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             for index in 0..PER_THREAD {
                 // Fixed-width distinct keys so byte accounting is exact.
-                let nonce = format!("t{thread_id:02}-{:060}", index);
+                let nonce = format!("t{thread_id:02}-{index:060}");
                 debug_assert_eq!(nonce.len(), NONCE_LEN);
                 match harness.claim(&nonce) {
-                    Ok(()) => {
-                        accepted.fetch_add(1, Ordering::Relaxed);
+                    Ok(()) => admitted.lock().expect("admitted").push(nonce),
+                    Err(err) if err == "WS-Security: replay protection state is at capacity" => {
+                        rejected.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(err) => panic!("unexpected nonce outcome: {err}"),
                 }
@@ -4844,72 +5093,36 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
         handle.join().expect("worker");
     }
 
+    let admitted = admitted.lock().expect("admitted").clone();
     let snapshot = harness.snapshot().expect("snapshot");
-    let entries = snapshot.entry_count;
-    let bytes = snapshot.retained_key_bytes;
-    assert!(
-        entries <= MAX_ENTRIES,
-        "final entry count {entries} > {MAX_ENTRIES}"
-    );
-    assert!(
-        entries <= BYTE_CAP_ENTRIES,
-        "final entry count {entries} > byte cap {BYTE_CAP_ENTRIES}"
-    );
-    assert!(
-        bytes <= MAX_BYTES,
-        "final retained bytes {bytes} > {MAX_BYTES}"
+    // Nothing expires inside the flood, so exactly the byte-derived cap of
+    // distinct nonces can ever be admitted and every later claim fails closed.
+    assert_eq!(
+        admitted.len(),
+        BYTE_CAP_ENTRIES,
+        "only the byte cap's worth of distinct nonces may be admitted"
     );
     assert_eq!(
-        bytes,
-        entries.saturating_mul(NONCE_LEN),
-        "byte accounting must match retained keys exactly"
+        rejected.load(Ordering::Relaxed),
+        THREADS * PER_THREAD - BYTE_CAP_ENTRIES,
+        "every claim past capacity must fail closed"
     );
-    assert_eq!(
-        accepted.load(Ordering::Relaxed),
-        THREADS * PER_THREAD,
-        "bounded eviction must admit every distinct fresh nonce"
-    );
-    // Amortized oldest-first eviction frees up to EVICTION_BATCH entries then
-    // admits one, so a flood that repeatedly trips the byte cap ends with
-    // retained count in [BYTE_CAP_ENTRIES - EVICTION_BATCH + 1, BYTE_CAP_ENTRIES]
-    // rather than always exactly full. Refill that intentional headroom and
-    // require an exact pin at the byte-derived ceiling.
-    let min_after_batch = BYTE_CAP_ENTRIES
-        .saturating_sub(EVICTION_BATCH)
-        .saturating_add(1);
-    assert!(
-        entries >= min_after_batch,
-        "batch eviction under-retained: entries {entries} < floor {min_after_batch}"
-    );
-    let mut refill = 0usize;
-    loop {
-        let snapshot = harness.snapshot().expect("snapshot");
-        if snapshot.retained_key_bytes.saturating_add(NONCE_LEN) > MAX_BYTES
-            || snapshot.entry_count >= BYTE_CAP_ENTRIES
-        {
-            break;
-        }
-        let nonce = format!("rf-{:061}", refill);
-        debug_assert_eq!(nonce.len(), NONCE_LEN);
-        assert!(
-            harness.claim(&nonce).is_ok(),
-            "headroom refill must admit distinct fresh nonce {refill}"
-        );
-        refill = refill.saturating_add(1);
-        assert!(
-            refill <= EVICTION_BATCH.saturating_sub(1),
-            "refill count {refill} exceeds amortized eviction headroom"
+    assert_eq!(snapshot.entry_count, BYTE_CAP_ENTRIES);
+    assert_eq!(snapshot.retained_key_bytes, MAX_BYTES);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+    assert_eq!(snapshot.entry_count, snapshot.shared_key_entries);
+
+    // The security property: no admitted nonce was ever evicted to seat a
+    // later one, so replaying any of them is still detected.
+    for nonce in &admitted {
+        assert_eq!(
+            harness
+                .claim(nonce)
+                .expect_err("an admitted nonce must stay replay-protected"),
+            "WS-Security: nonce replay detected",
+            "an admitted nonce lost replay protection under a concurrent flood"
         );
     }
-    let snapshot = harness.snapshot().expect("snapshot");
-    assert_eq!(
-        snapshot.entry_count, BYTE_CAP_ENTRIES,
-        "byte cap must pin the retained set once amortized headroom is refilled"
-    );
-    assert_eq!(
-        snapshot.retained_key_bytes, MAX_BYTES,
-        "byte cap must pin retained bytes once amortized headroom is refilled"
-    );
 }
 
 #[test]

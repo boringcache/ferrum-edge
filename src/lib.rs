@@ -1225,7 +1225,6 @@ pub mod _test_support {
         pub recomputed_key_bytes: usize,
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
-        pub last_forced_candidates: usize,
         pub max_maintenance_entries: usize,
     }
 
@@ -1267,7 +1266,6 @@ pub mod _test_support {
                 recomputed_key_bytes: snapshot.recomputed_key_bytes,
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
-                last_forced_candidates: snapshot.last_forced_candidates,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
             })
         }

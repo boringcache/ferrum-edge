@@ -43,18 +43,26 @@
 //! length, retained entries, and total retained key payload bytes — and a nonce
 //! is only retained *after* its PasswordDigest verifies. The encoded-length
 //! ceiling is checked before Base64 decoding. A `BTreeMap` age index makes
-//! expiry and oldest eviction O(log n) per examined entry without scanning the
-//! lookup map. Each index handle shares the lookup map's one immutable
-//! nonce-string allocation. Maintenance examines at most
-//! `NONCE_MAX_MAINTENANCE_ENTRIES` oldest entries per request; if that bounded
-//! work cannot make room, the request fails closed rather than admitting a
-//! nonce whose replay window cannot be recorded. Entry/byte admission,
-//! eviction, and accounting share one narrow mutex held only for
-//! security-state updates so concurrent PasswordDigest claims cannot overshoot
-//! either hard cap (including same-key races); length checks and all
-//! credential/XML/base64/crypto work stay outside that critical section.
-//! Diagnostics use fixed-cardinality failure classes and never include the
-//! nonce.
+//! expiry reclamation O(log n) per examined entry without scanning the lookup
+//! map. Each index handle shares the lookup map's one immutable nonce-string
+//! allocation.
+//!
+//! **A claimed nonce is never evicted while it is still inside its TTL.** The
+//! only entries capacity maintenance may reclaim are ones proven expired by the
+//! configured `cache_ttl_seconds`, so the replay window a client was promised is
+//! always honoured. When entry or byte capacity is still exhausted after that
+//! bounded reclamation, the claim is rejected and the nonce is *not* admitted;
+//! replay protection degrades into refusal, never into silent unprotection.
+//! Maintenance examines at most `NONCE_MAX_MAINTENANCE_ENTRIES` oldest entries
+//! per request, which keeps the work per request constant while the two hard
+//! caps keep memory bounded.
+//!
+//! Entry/byte admission, expiry reclamation, and accounting share one narrow
+//! mutex held only for security-state updates so concurrent PasswordDigest
+//! claims cannot overshoot either hard cap (including same-key races); length
+//! checks and all credential/XML/base64/crypto work stay outside that critical
+//! section. Diagnostics use fixed-cardinality failure classes and never include
+//! the nonce.
 //!
 //! ## Request body character encoding
 //!
@@ -178,10 +186,11 @@ const DEFAULT_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 const MIN_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 4_096;
 const MAX_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Hard ceiling on exact oldest-index entries examined by one request,
-/// independent of `max_cache_size`. Expiry and forced eviction share this
-/// budget. Each examined entry costs O(log n) tree/map work, and forced
-/// eviction stages at most this many fixed-width age keys before committing.
+/// Hard ceiling on exact oldest-index entries reclaimed by one request,
+/// independent of `max_cache_size`. Only entries proven older than the
+/// configured TTL are ever reclaimed; each costs O(log n) tree/map work. When
+/// this budget is spent without freeing room the request fails closed rather
+/// than reaching for a live entry.
 const NONCE_MAX_MAINTENANCE_ENTRIES: usize = 64;
 
 /// Representable-year window for parsed WS-Security / SAML instants.
@@ -565,7 +574,6 @@ struct NonceReplayState {
     retained_key_bytes: usize,
     next_sequence: u64,
     last_expired_removals: usize,
-    last_forced_candidates: usize,
 }
 
 impl NonceReplayState {
@@ -576,7 +584,6 @@ impl NonceReplayState {
             retained_key_bytes: 0,
             next_sequence: 0,
             last_expired_removals: 0,
-            last_forced_candidates: 0,
         }
     }
 
@@ -639,7 +646,6 @@ pub(crate) struct NonceReplayObservationForTests {
     pub(crate) recomputed_key_bytes: usize,
     pub(crate) shared_key_entries: usize,
     pub(crate) last_expired_removals: usize,
-    pub(crate) last_forced_candidates: usize,
     pub(crate) max_maintenance_entries: usize,
 }
 
@@ -1383,9 +1389,14 @@ impl SoapWsSecurity {
     /// and every age-index update is O(log n). At capacity, at most
     /// `NONCE_MAX_MAINTENANCE_ENTRIES` exact oldest entries are examined; there
     /// is no lookup-map scan and no stale FIFO that can grow beyond the entry
-    /// cap. Forced candidates are committed only if the bounded batch makes
-    /// room, so a rejected saturation probe does not discard live replay
-    /// coverage.
+    /// cap.
+    ///
+    /// **Live entries are never evicted.** Only entries older than the
+    /// configured TTL can be reclaimed, so every nonce claimed inside its TTL
+    /// stays replay-protected for the whole window. If bounded expiry
+    /// reclamation cannot free entry *and* byte room, this returns the fixed
+    /// saturation rejection without admitting the nonce — the cache never
+    /// unprotects an already-claimed nonce in order to accept a new one.
     ///
     /// **Concurrency.** Encoded-length rejection and all XML/base64/credential/
     /// crypto work run outside the lock. Admission, exact-oldest maintenance,
@@ -1416,7 +1427,6 @@ impl SoapWsSecurity {
             Err(_) => return Err(Self::nonce_state_saturated()),
         };
         state.last_expired_removals = 0;
-        state.last_forced_candidates = 0;
 
         if !state.structurally_consistent() {
             return Err(Self::nonce_state_saturated_after_unlock(state));
@@ -1465,7 +1475,7 @@ impl SoapWsSecurity {
             self.max_nonce_cache_size,
             self.max_nonce_cache_bytes,
         ) {
-            let made_room = match Self::make_nonce_room_locked(
+            let made_room = match Self::reclaim_expired_nonce_room_locked(
                 &mut state,
                 incoming_bytes,
                 self.max_nonce_cache_size,
@@ -1514,12 +1524,23 @@ impl SoapWsSecurity {
         Ok(())
     }
 
-    /// Reclaim enough exact-oldest state for one incoming nonce without ever
-    /// walking the lookup map. Expiry removals commit immediately. Live forced
-    /// candidates are staged as fixed-width age keys and commit only when the
-    /// bounded batch can make room; otherwise the caller fails closed without
-    /// discarding live replay entries.
-    fn make_nonce_room_locked(
+    /// Reclaim capacity for one incoming nonce using **only** entries proven
+    /// older than the configured TTL, walking the ordered age index from the
+    /// oldest end and never touching the lookup map.
+    ///
+    /// The age index is ordered by `(insertion instant, sequence)`, so the first
+    /// key is always the oldest live-or-expired entry. Once that head is inside
+    /// the TTL every remaining entry is too, and the walk stops: an unexpired
+    /// nonce is never removed to make space. Each removal commits immediately
+    /// and is charged against a per-request `NONCE_MAX_MAINTENANCE_ENTRIES`
+    /// budget, so hostile traffic cannot turn maintenance into a CPU sink.
+    ///
+    /// Returns `Ok(true)` only when both hard caps can now accommodate
+    /// `incoming_bytes`. `Ok(false)` means the cache is genuinely full of live
+    /// replay coverage (or the bounded budget ran out) and the caller must fail
+    /// closed. `Err(())` reports impossible map/index drift, which also fails
+    /// closed.
+    fn reclaim_expired_nonce_room_locked(
         state: &mut NonceReplayState,
         incoming_bytes: usize,
         max_entries: usize,
@@ -1530,6 +1551,9 @@ impl SoapWsSecurity {
         while !state.has_capacity(incoming_bytes, max_entries, max_bytes)
             && state.last_expired_removals < NONCE_MAX_MAINTENANCE_ENTRIES
         {
+            // An empty index with no capacity is impossible for admitted
+            // configuration (`max_encoded_length <= max_total_cache_bytes` and
+            // `max_cache_size >= 1`), so treat it as drift and fail closed.
             let Some((&age_key, nonce)) = state.age_index.first_key_value() else {
                 return Err(());
             };
@@ -1537,58 +1561,14 @@ impl SoapWsSecurity {
                 return Err(());
             }
             if Self::nonce_age_seconds(now, age_key.0) < ttl_seconds {
+                // Oldest retained nonce is still inside its replay window, and
+                // every newer entry is too. Reclaim nothing.
                 break;
             }
             state.remove_age_entry(&age_key)?;
             state.last_expired_removals += 1;
         }
 
-        if state.has_capacity(incoming_bytes, max_entries, max_bytes) {
-            return Ok(true);
-        }
-
-        let remaining_budget =
-            NONCE_MAX_MAINTENANCE_ENTRIES.saturating_sub(state.last_expired_removals);
-        if remaining_budget == 0 {
-            return Ok(false);
-        }
-
-        let amortized_target = (max_entries / 10)
-            .clamp(1, NONCE_MAX_MAINTENANCE_ENTRIES)
-            .min(remaining_budget)
-            .min(state.age_index.len());
-        let mut candidates = Vec::with_capacity(remaining_budget);
-        let mut projected_entries = state.cache.len();
-        let mut projected_bytes = state.retained_key_bytes;
-        let mut candidates_make_room = false;
-        let mut forced_candidates = 0usize;
-
-        for (age_key, nonce) in state.age_index.iter().take(remaining_budget) {
-            if !state.age_entry_matches(age_key, nonce) {
-                return Err(());
-            }
-            projected_entries = projected_entries.checked_sub(1).ok_or(())?;
-            projected_bytes = projected_bytes.checked_sub(nonce.len()).ok_or(())?;
-            candidates.push(*age_key);
-            forced_candidates += 1;
-
-            let entry_room = projected_entries < max_entries;
-            let byte_room = projected_bytes
-                .checked_add(incoming_bytes)
-                .is_some_and(|total| total <= max_bytes);
-            if candidates.len() >= amortized_target && entry_room && byte_room {
-                candidates_make_room = true;
-                break;
-            }
-        }
-        state.last_forced_candidates = forced_candidates;
-
-        if !candidates_make_room {
-            return Ok(false);
-        }
-        for age_key in candidates {
-            state.remove_age_entry(&age_key)?;
-        }
         Ok(state.has_capacity(incoming_bytes, max_entries, max_bytes))
     }
 
@@ -1641,7 +1621,6 @@ impl SoapWsSecurity {
             recomputed_key_bytes,
             shared_key_entries,
             last_expired_removals: state.last_expired_removals,
-            last_forced_candidates: state.last_forced_candidates,
             max_maintenance_entries: NONCE_MAX_MAINTENANCE_ENTRIES,
         })
     }
