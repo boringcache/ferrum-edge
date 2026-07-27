@@ -999,11 +999,11 @@ where
             break PodWatcherLoopExit::ShutdownRequested;
         }
         tokio::select! {
-            // Prefer an operator-requested shutdown when it becomes ready in
-            // the same poll as watcher exhaustion. The None arm rechecks the
-            // watch value as well, closing the race where shutdown arrives
-            // after this arm was polled but before the stream is polled.
-            biased;
+            // Keep selection fair so a continuously-ready pod stream cannot
+            // starve CNI work or the security-relevant maintenance timers.
+            // The None arm rechecks the watch value, closing the race where
+            // shutdown arrives after this arm was polled but before the stream
+            // is polled without imposing priority on every select branch.
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     break PodWatcherLoopExit::ShutdownRequested;
