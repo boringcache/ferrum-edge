@@ -1996,3 +1996,139 @@ fn h1_h2_h3_paths_reach_shared_body_transform_finalize() {
         "H3 cross-protocol path must finalize after a body rewrite"
     );
 }
+
+// ── Header mutation tracing must never emit configured values ─────────────
+
+use std::future::Future;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+async fn capture_debug_logs<F, Fut>(operation: F) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    operation().await;
+    String::from_utf8(writer.0.lock().unwrap().clone()).unwrap()
+}
+
+fn assert_secret_absent_from_logs(logs: &str, secret: &str) {
+    assert!(
+        !logs.contains(secret),
+        "configured header value must not appear in tracing output: {secret:?}\nlogs:\n{logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_response_transformer_header_mutations_never_log_configured_values() {
+    let cases = [
+        (
+            "add",
+            json!({"operation": "add", "target": "header", "key": "Authorization", "value": "Bearer backend-token-never-log"}),
+            HashMap::new(),
+            "authorization",
+            "Bearer backend-token-never-log",
+        ),
+        (
+            "update",
+            json!({"operation": "update", "target": "header", "key": "Set-Cookie", "value": "session=opaque-cookie-never-log"}),
+            HashMap::from([("set-cookie".to_string(), "old=discard".to_string())]),
+            "set-cookie",
+            "session=opaque-cookie-never-log",
+        ),
+        (
+            "api-key add",
+            json!({"operation": "add", "target": "header", "key": "X-Api-Key", "value": "api-key-secret-never-log"}),
+            HashMap::new(),
+            "x-api-key",
+            "api-key-secret-never-log",
+        ),
+        (
+            "signature update",
+            json!({"operation": "update", "target": "header", "key": "X-Signature", "value": "sha256=sig-never-log"}),
+            HashMap::new(),
+            "x-signature",
+            "sha256=sig-never-log",
+        ),
+        (
+            "custom add",
+            json!({"operation": "add", "target": "header", "key": "X-Tenant-Credential", "value": "arbitrary-custom-never-log"}),
+            HashMap::new(),
+            "x-tenant-credential",
+            "arbitrary-custom-never-log",
+        ),
+    ];
+
+    for (label, rule, mut seed_headers, expected_key, secret) in cases {
+        let plugin = ResponseTransformer::new(&json!({ "rules": [rule] })).unwrap();
+        let logs = capture_debug_logs(|| async {
+            let mut ctx = make_ctx();
+            let mut headers = std::mem::take(&mut seed_headers);
+            let _ = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+            assert_eq!(
+                headers.get(expected_key).map(String::as_str),
+                Some(secret),
+                "{label}: header mutation must still apply"
+            );
+        })
+        .await;
+        assert_secret_absent_from_logs(&logs, secret);
+        assert!(
+            logs.contains("response_transformer:"),
+            "{label}: expected transformer debug event, got:\n{logs}"
+        );
+    }
+
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "Authorization"}
+        ]
+    }))
+    .unwrap();
+    let logs = capture_debug_logs(|| async {
+        let mut ctx = make_ctx();
+        let mut headers = HashMap::from([(
+            "authorization".to_string(),
+            "Bearer existing-token-never-log".to_string(),
+        )]);
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+        assert!(!headers.contains_key("authorization"));
+    })
+    .await;
+    assert_secret_absent_from_logs(&logs, "Bearer existing-token-never-log");
+    assert!(
+        logs.contains("response_transformer: removed header authorization"),
+        "remove should still emit a name-only diagnostic"
+    );
+}
