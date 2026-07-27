@@ -2081,8 +2081,8 @@ async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
     );
 }
 
-#[test]
-fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
+#[tokio::test]
+async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let dir = tempfile::tempdir().expect("tempdir");

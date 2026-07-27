@@ -582,6 +582,23 @@ fn verify_peer_against_cached_snapshot(
             td
         ));
     }
+    // Membership is evaluated against the declared trust set before selecting a
+    // cached chain verifier. With atomic admission, a declared domain that has
+    // no usable roots rejects the complete candidate at cache build time; a
+    // missing domain here is therefore the trust-domain membership failure
+    // (not an unusable-root admission failure).
+    let trust_bundles = &source
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| "SPIFFE verifier: no SVID bundle yet".to_string())?
+        .trust_bundles;
+    if trust_bundles.get(peer_id.trust_domain()).is_none() {
+        return Err(format!(
+            "no trust bundle for peer's trust domain '{}'",
+            peer_id.trust_domain()
+        ));
+    }
+
     let cache_snapshot = peer_verifier_cache(cache_slot, source, crls)?;
     let cache = cache_snapshot
         .as_ref()
