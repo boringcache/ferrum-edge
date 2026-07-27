@@ -1587,23 +1587,30 @@ impl ZeroizingDtlsKeyDer {
     fn adopt(
         mut key: rustls::pki_types::PrivateKeyDer<'static>,
         drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         use zeroize::Zeroize;
 
         let encoding = match &key {
-            rustls::pki_types::PrivateKeyDer::Pkcs1(_) => DtlsKeyDerEncoding::Pkcs1,
-            rustls::pki_types::PrivateKeyDer::Sec1(_) => DtlsKeyDerEncoding::Sec1,
-            rustls::pki_types::PrivateKeyDer::Pkcs8(_) => DtlsKeyDerEncoding::Pkcs8,
+            rustls::pki_types::PrivateKeyDer::Pkcs1(_) => Some(DtlsKeyDerEncoding::Pkcs1),
+            rustls::pki_types::PrivateKeyDer::Sec1(_) => Some(DtlsKeyDerEncoding::Sec1),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(_) => Some(DtlsKeyDerEncoding::Pkcs8),
+            _ => None,
+        };
+        let Some(encoding) = encoding else {
+            key.zeroize();
+            return Err(anyhow::anyhow!(
+                "Unsupported DTLS private key DER encoding"
+            ));
         };
         let bytes = key.secret_der().to_vec();
         // rustls-pki-types does not clear on Drop; wipe the PEM-parsed owner now
         // that Ferrum owns the only live DER copy used by the loader.
         key.zeroize();
-        Self {
+        Ok(Self {
             bytes,
             encoding,
             drop_hook,
-        }
+        })
     }
 
     fn private_key_der(&self) -> rustls::pki_types::PrivateKeyDer<'_> {
@@ -1703,7 +1710,7 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
         })?;
     // Adopt immediately so every subsequent success/error return clears the
     // Ferrum-managed DER owner without relying on manual zeroize call sites.
-    let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook);
+    let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook)?;
 
     // Ferrum pins rustls's ring provider. Parse from a borrow — do not
     // `clone_key()` into `CertifiedKey::from_der`, which would create another
