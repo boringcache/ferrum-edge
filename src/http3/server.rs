@@ -7184,9 +7184,9 @@ async fn handle_h3_request(
         // Backend trailers survive to here only when no response-body plugin
         // phase processed this response (gate above), no mutation / reject /
         // normalize arm replaced the bytes, and the response-policy
-        // reconciliation above kept the remaining fields. Auth/logging-only
-        // plugins must not wipe trailers merely because the plugin chain is
-        // nonempty (#2941).
+        // reconciliation above kept the remaining fields.
+        // Auth/logging-only plugins must not wipe trailers merely because the
+        // plugin chain is nonempty (#2941).
 
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
