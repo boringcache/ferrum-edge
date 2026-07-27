@@ -17895,11 +17895,48 @@ components:
 
     BodyValidatorConfig:
       type: object
-      description: "Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation for request/response bodies."
+      additionalProperties: false
+      description: >-
+        Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation
+        for request/response bodies. Unknown top-level keys and unknown keys
+        inside a protobuf_method_messages entry are rejected at construction, so
+        a typo can never silently disable an intended rule; the plugin is
+        fail-closed, and a rejected configuration keeps the last known-good
+        generation. Configured JSON Schemas are compiled once at construction
+        under an explicit draft, XML bodies are parsed by a real XML parser, and
+        decoded protobuf messages must satisfy proto2 required-field
+        initialization. Configuration errors use value-free field and category
+        messages; supplied keys, paths, URIs, schema values, XML entries, and
+        compiler diagnostics are not reproduced.
       properties:
         json_schema:
           type: object
-          description: JSON Schema for request body validation
+          description: >-
+            JSON Schema for request body validation. Compiled at plugin
+            construction under json_schema_draft; a malformed schema, an unknown
+            or unsupported keyword shape, an invalid type name, a non-local
+            $ref/$dynamicRef, a non-fragment $id/id, a $vocabulary declaration,
+            a $schema naming another draft, or a schema exceeding the 32-level /
+            20000-node budget fails construction. Reference and identifier
+            policy applies only at actual schema positions; property/definition
+            names and unreferenced literal annotation/instance objects are not
+            interpreted as keywords. A supported local URI-fragment JSON Pointer
+            makes its object/boolean target an actual schema even under a
+            normally literal or unknown container; pointer percent-decoding,
+            escaping, root handling, and cycles match the validator library.
+            Draft 7 walks definitions but not $defs unless directly referenced;
+            Draft 2020-12 walks both. Budgets count every JSON node in the
+            supplied value.
+        json_schema_draft:
+          type: string
+          enum: [draft2020-12, draft7]
+          default: draft2020-12
+          description: >-
+            JSON Schema dialect used to compile json_schema and
+            response_json_schema. There is no auto-detect mode; a schema whose
+            $schema names a different draft is rejected. $dynamicRef has
+            reference semantics only under draft2020-12 and remains an unknown,
+            inert keyword under draft7.
         required_fields:
           type: array
           items:
@@ -17909,13 +17946,24 @@ components:
         validate_xml:
           type: boolean
           default: false
-          description: Enable XML well-formedness validation
+          description: >-
+            Enable XML well-formedness validation. The body must parse as a
+            single well-formed XML document (one root element, valid names,
+            attribute grammar and uniqueness, valid characters, declared entity
+            references, no text outside the root). The original text is parsed
+            without Unicode whitespace trimming. External SYSTEM/PUBLIC
+            identifiers on the DOCTYPE or an entity declaration are always
+            rejected; external entities are never retrieved.
         required_xml_elements:
           type: array
           items:
             type: string
           default: []
-          description: Required XML element names
+          description: >-
+            Required XML element names, matched against parsed element names.
+            A bare name matches that local name in any namespace; Clark notation
+            ("{http://example.com/ns}item") requires the expanded namespace URI
+            and local name to match, and "{}item" requires no namespace.
         xml_max_entities:
           type: integer
           format: uint64
@@ -17945,7 +17993,11 @@ components:
             actual headers do not match and are skipped.
         response_json_schema:
           type: object
-          description: JSON Schema for response body validation
+          description: >-
+            JSON Schema for response body validation. Compiled at plugin
+            construction under json_schema_draft with the same fail-closed rules
+            as json_schema. Response-side violations are reported to the client
+            without the rejected upstream value or its instance location.
         response_required_fields:
           type: array
           items:
@@ -17955,6 +18007,10 @@ components:
         response_validate_xml:
           type: boolean
           default: false
+          description: >-
+            Enable response XML well-formedness validation with the same exact-
+            text parsing and external DOCTYPE/entity identifier rejection as
+            validate_xml.
         response_required_xml_elements:
           type: array
           items:
@@ -17987,6 +18043,7 @@ components:
           type: object
           additionalProperties:
             type: object
+            additionalProperties: false
             properties:
               request:
                 type: string
@@ -17994,11 +18051,19 @@ components:
               response:
                 type: string
                 description: Fully-qualified protobuf message type for response validation
-          description: Per-method message type overrides keyed by gRPC path
+          description: >-
+            Per-method message type overrides keyed by gRPC path. Each entry
+            accepts only 'request' and 'response'; any other key rejects the
+            configuration.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
-          description: Reject messages containing field numbers not in the descriptor
+          description: >-
+            Reject messages containing field numbers not in the descriptor. This
+            is independent of proto2 required-field initialization, which is
+            always enforced: a decoded message that omits any proto2 required
+            field, at the top level or inside a present nested/repeated/map/
+            extension message value, is rejected regardless of this setting.
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
