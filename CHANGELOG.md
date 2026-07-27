@@ -37,6 +37,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `host:port`-only screen. Entries whose protocol prefix disagrees with
   `security_protocol` are rejected rather than silently truncating the broker
   list the way librdkafka would.
+- **`request_deduplication` Redis ownership is now atomically fenced**
+  (GHSA-f72h-jm2p-mc73). Ownership and completion share one versioned operation
+  record per logical key. Completion is a compare-and-set on the owner's exact
+  in-flight record, so an owner whose `inflight_ttl_seconds` lease expired can
+  neither overwrite a successor's completed response nor publish while a
+  successor owns the operation; such a completion is discarded locally too
+  instead of being replayed as a non-authoritative result. Redis-mode logical
+  keys move to `v4`, unconditionally include the matched proxy namespace even
+  under an explicitly shared Redis prefix, and the record format is versioned,
+  so a rolling upgrade reads and writes disjoint keys instead of mixing
+  formats. Current-version records with missing ownership fences, impossible
+  state fields, or mismatched inner/outer fingerprints fail closed. A new
+  `on_redis_unavailable` field decides outage behavior and **defaults to
+  `fail_closed` (HTTP 503)**; deployments that prefer the previous
+  process-local fallback must set `on_redis_unavailable: "local_only"`.
+- **`request_deduplication` rejects unknown configuration keys**
+  (GHSA-h2c3-j3cm-7ghh). The runtime constructor and the OpenAPI
+  `RequestDeduplicationConfig` schema now share one closed allowlist, so a
+  misspelled `enforce_required` or `sync_mode` fails admission with a
+  path-qualified diagnostic instead of silently reverting to a permissive
+  default. Redis-only keys are additionally rejected outside
+  `sync_mode: "redis"`. Existing configurations carrying stray keys, or
+  `redis_*` fields in local mode, must be corrected before upgrade.
+- **Completed external operations behind a synthetic response now leave a
+  durable completion** (GHSA-8cr6-rw38-7j59). `serverless_function` terminate
+  mode and `ai_federation` provider calls declare that their short-circuit
+  performed the protected billable operation; deduplication publishes a
+  non-replayable 409 completion tombstone — fenced in Redis mode — on buffered,
+  empty/HEAD, streamed-fallthrough, and interrupted-delivery outcomes alike.
+  Previously an interrupted delivery only held a bare in-flight marker, so an
+  identical retry re-executed the operation once `inflight_ttl_seconds` elapsed.
+  The tombstone is retained for `max(ttl_seconds, inflight_ttl_seconds)`: it
+  replaces a marker that blocked duplicates for `inflight_ttl_seconds`, so a
+  deployment configured with `inflight_ttl_seconds > ttl_seconds` never becomes
+  re-executable sooner than it was before. Ordinary replayable completions keep
+  `ttl_seconds`. The barrier also covers the case where the committed response
+  itself cannot be retained as a replay — its request straddled a
+  response-presentation-policy publication, or that policy is incomplete or
+  `Dynamic` — instead of falling back to the bare in-flight lease. Local
+  response-byte admission failure and later protected-completion eviction now
+  use an explicit fixed-size execution barrier carrying the completion's own
+  authoritative retention clock; neither path can silently restart a shorter
+  `inflight_ttl_seconds` lease. Stale owner hooks cannot clear the barrier or a
+  successor because every transition remains fingerprint/token fenced. Per-key
+  execution barriers are hard-capped at `max_entries`; overflow extends one
+  fixed process-global deadline that returns 503 for applicable idempotency-key
+  requests, preserving fail-closed retention without unbounded key storage.
+  Serverless responses with stable, complete policy provenance are still stored
+  as ordinary replays. The provenance contract is documented in
+  `docs/plugin_execution_order.md`.
 - Versioned standard and `-ebpf` multi-architecture images are now keylessly
   signed in Docker Hub and GHCR and carry final-manifest SLSA provenance plus
   per-platform SPDX SBOM attestations. A fail-closed publication gate requires

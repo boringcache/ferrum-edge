@@ -4,14 +4,18 @@ use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
     finalized_response_replay_for_test, request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
+    request_deduplication_expire_execution_barriers_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
-    request_deduplication_redis_payload_for_test, request_deduplication_request_identity_for_test,
+    request_deduplication_redis_payload_for_test,
+    request_deduplication_redis_record_payload_is_valid,
+    request_deduplication_request_identity_for_test,
     request_deduplication_set_request_state_for_test,
     request_deduplication_with_instance_id_for_test,
     set_response_presentation_policy_digest_for_test,
 };
+use ferrum_edge::config::types::Proxy;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
 use ferrum_edge::plugins::ai_response_guard::AiResponseGuard;
 use ferrum_edge::plugins::ai_tool_governor::AiToolGovernor;
@@ -223,6 +227,9 @@ fn make_redis_sibling(header_name: &str, config_id: &str, prefix: &str) -> Reque
             "redis_url": "redis://127.0.0.1:1/0",
             "redis_connect_timeout_seconds": 1,
             "redis_key_prefix": prefix,
+            // Redis mode fails closed with 503 by default; these lifecycle
+            // fixtures deliberately exercise the opt-in local-only fallback.
+            "on_redis_unavailable": "local_only",
         }),
         PluginHttpClient::default(),
         config_id,
@@ -487,6 +494,48 @@ async fn production_factory_partitions_logical_keys_by_plugin_config_id() {
     );
 }
 
+/// A custom Redis prefix is allowed to be shared by multiple namespaces, so
+/// namespace must remain part of the hashed operation identity even when all
+/// resource IDs and request bytes are equal.
+#[tokio::test]
+async fn explicit_shared_redis_prefix_still_partitions_proxy_namespaces() {
+    let plugin = make_redis_sibling(
+        "idempotency-key",
+        "shared-dedup-config",
+        "ferrum:dedup:shared",
+    );
+
+    async fn logical_key(plugin: &RequestDeduplication, namespace: &str) -> String {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": "orders",
+            "namespace": namespace,
+            "hosts": ["api.example"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8080
+        }))
+        .expect("proxy fixture");
+        let mut ctx = body_ctx("POST", "/api/orders", b"{}");
+        ctx.matched_proxy = Some(Arc::new(proxy));
+        let mut headers = keyed_headers("shared-key", "api.example", 2);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
+        assert_eq!(keys.len(), 1, "expected one acquired logical key");
+        keys.into_iter().next().expect("logical key")
+    }
+
+    let blue = logical_key(&plugin, "blue").await;
+    let green = logical_key(&plugin, "green").await;
+    assert_ne!(
+        blue, green,
+        "equal proxy/config IDs under an explicit shared Redis prefix must remain namespace-scoped"
+    );
+}
+
 #[test]
 fn test_new_rejects_invalid_header_name() {
     let config = json!({
@@ -582,6 +631,230 @@ fn test_new_with_redis_config() {
         plugin.warmup_hostnames(),
         vec!["dedup-redis.internal".to_string()]
     );
+}
+
+/// GHSA-h2c3-j3cm-7ghh: unknown root keys must fail closed with a
+/// path-qualified diagnostic instead of being replaced by permissive defaults.
+#[test]
+fn unknown_root_keys_are_rejected_with_path_qualified_diagnostics() {
+    for (config, unknown, suggestion) in [
+        (
+            json!({"enforce_requred": true}),
+            "enforce_requred",
+            "enforce_required",
+        ),
+        (json!({"sync_mod": "redis"}), "sync_mod", "sync_mode"),
+        (
+            json!({"scope_by_consumers": false}),
+            "scope_by_consumers",
+            "scope_by_consumer",
+        ),
+        (json!({"ttl_second": 30}), "ttl_second", "ttl_seconds"),
+        (
+            json!({"redis_ur": "redis://host:6379"}),
+            "redis_ur",
+            "redis_url",
+        ),
+    ] {
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("unknown key must be rejected");
+        };
+        assert!(
+            error.contains("request_deduplication: unknown configuration key(s)"),
+            "{error}"
+        );
+        assert!(error.contains(&format!("'config.{unknown}'")), "{error}");
+        assert!(error.contains(suggestion), "{error}");
+    }
+
+    // Also rejected through the shared admission entrypoint used by file,
+    // database, and CP/DP validation.
+    assert!(
+        ferrum_edge::plugins::validate_plugin_config(
+            "request_deduplication",
+            &json!({"enforce_requred": true})
+        )
+        .is_err(),
+        "shared plugin-config validation must reject unknown keys"
+    );
+}
+
+/// Every documented field is accepted, so the closed allowlist cannot drift
+/// into rejecting a legitimate configuration.
+#[test]
+fn every_documented_config_key_is_accepted() {
+    let config = json!({
+        "header_name": "X-Idempotency-Key",
+        "ttl_seconds": 120,
+        "inflight_ttl_seconds": 30,
+        "max_entries": 100,
+        "max_entry_size_bytes": 4096,
+        "max_total_size_bytes": 65536,
+        "applicable_methods": ["POST", "PUT"],
+        "scope_by_consumer": false,
+        "enforce_required": true,
+        "sync_mode": "redis",
+        "redis_url": "redis://dedup-redis.internal:6379/0",
+        "redis_tls": false,
+        "redis_key_prefix": "ferrum:dedup",
+        "redis_pool_size": 2,
+        "redis_connect_timeout_seconds": 2,
+        "redis_health_check_interval_seconds": 2,
+        "redis_username": "dedup",
+        "redis_password": "unused-in-tests",
+        "on_redis_unavailable": "local_only"
+    });
+    assert!(RequestDeduplication::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+/// GHSA-h2c3-j3cm-7ghh: a Redis-only field supplied outside Redis mode is the
+/// signature of a misspelled `sync_mode`, and must fail rather than leaving the
+/// deployment silently process-local.
+#[test]
+fn redis_only_keys_outside_redis_mode_are_rejected() {
+    for config in [
+        json!({"redis_url": "redis://host:6379"}),
+        json!({"sync_mode": "local", "redis_url": "redis://host:6379"}),
+        json!({"sync_mode": "local", "redis_key_prefix": "dedup"}),
+        json!({"on_redis_unavailable": "local_only"}),
+    ] {
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("Redis-only key outside Redis mode must be rejected");
+        };
+        assert!(
+            error.contains("require sync_mode='redis'"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn on_redis_unavailable_requires_a_known_policy() {
+    const SENTINEL: &str = "sentinel-on-redis-unavailable-fallback-2d84";
+    let Err(error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://host:6379",
+            "on_redis_unavailable": SENTINEL
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("unknown policy must be rejected");
+    };
+    assert!(error.contains("'on_redis_unavailable'"), "{error}");
+    assert!(
+        error.contains("'fail_closed'") && error.contains("'local_only'"),
+        "diagnostic must name accepted values: {error}"
+    );
+    assert!(
+        !error.contains(SENTINEL),
+        "diagnostic must not echo the rejected value: {error}"
+    );
+    assert!(
+        !error.contains("got:"),
+        "diagnostic must stay value-redacted: {error}"
+    );
+}
+
+/// request_deduplication's Redis admission path must not leak credential-bearing
+/// values through shared `RedisConfig` validation diagnostics.
+#[test]
+fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
+    const PASSWORD: &str = "sentinel-dedup-redis-password-aa11";
+    const USER: &str = "sentinel-dedup-redis-user-bb22";
+
+    // No Redis-only keys: admission reaches RedisConfig sync_mode validation.
+    let Err(sync_error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": format!("redsi-{PASSWORD}"),
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("invalid sync_mode must be rejected");
+    };
+    assert!(
+        sync_error.contains("'sync_mode'") && sync_error.contains("'local' or 'redis'"),
+        "expected RedisConfig sync_mode diagnostic: {sync_error}"
+    );
+    assert!(
+        !sync_error.contains(PASSWORD),
+        "dedup sync_mode diagnostic must not echo sentinel: {sync_error}"
+    );
+
+    // Redis-only keys outside Redis mode: reject without echoing URL credentials.
+    let Err(mode_error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "local",
+            "redis_url": format!("redis://{USER}:{PASSWORD}@cache.internal:6379/0"),
+            "redis_password": PASSWORD,
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("Redis-only keys outside Redis mode must be rejected");
+    };
+    assert!(
+        mode_error.contains("require sync_mode='redis'"),
+        "expected redis-only-key diagnostic: {mode_error}"
+    );
+    for secret in [PASSWORD, USER, "cache.internal"] {
+        assert!(
+            !mode_error.contains(secret),
+            "redis-only-key diagnostic must not echo {secret:?}: {mode_error}"
+        );
+    }
+
+    let Err(url_error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": format!("http://{USER}:{PASSWORD}@cache.internal:6379/0#{PASSWORD}"),
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("invalid redis_url scheme must be rejected");
+    };
+    assert!(
+        url_error.contains("'redis_url'") && url_error.contains("scheme"),
+        "expected redis_url diagnostic: {url_error}"
+    );
+    for secret in [PASSWORD, USER, "http://", "cache.internal"] {
+        assert!(
+            !url_error.contains(secret),
+            "dedup redis_url diagnostic must not echo {secret:?}: {url_error}"
+        );
+    }
+}
+
+/// GHSA-f72h-jm2p-mc73: an unreachable coordination store must not silently
+/// downgrade to a per-process ownership decision. The default refuses; the
+/// opt-in policy preserves the previous availability behavior.
+#[tokio::test]
+async fn unreachable_redis_fails_closed_by_default_and_local_only_on_request() {
+    let fail_closed = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1
+    }));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":1}"#);
+    let mut headers = keyed_headers("outage-key", "api.example.test", 12);
+    match fail_closed.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+        other => panic!("expected fail-closed 503, got {other:?}"),
+    }
+    assert!(request_identity(&fail_closed, &ctx).is_none());
+
+    let local_only = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only"
+    }));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":1}"#);
+    let mut headers = keyed_headers("outage-key", "api.example.test", 12);
+    assert!(matches!(
+        local_only.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&local_only, &ctx).is_some());
 }
 
 #[tokio::test]
@@ -1948,6 +2221,397 @@ async fn external_operation_completed_publishes_non_replayable_tombstone_at_comm
     }
 }
 
+/// GHSA-8cr6-rw38-7j59: the external-operation tombstone replaces an in-flight
+/// marker that blocked duplicates for `inflight_ttl_seconds`, so it must never
+/// expire sooner than that lease. `inflight_ttl_seconds` may legitimately exceed
+/// `ttl_seconds` (a long-running backend with a short replay-retention window);
+/// retaining the barrier for only `ttl_seconds` there would make an
+/// already-performed billable operation executable again EARLIER than the bare
+/// marker did.
+#[tokio::test]
+async fn external_operation_tombstone_outlives_a_shorter_ttl_than_the_inflight_lease() {
+    // Short replay retention, long in-flight protection.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 1,
+        "inflight_ttl_seconds": 60
+    }));
+
+    let mut ctx1 = new_ctx("POST", "/api");
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "barrier-key".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx1, &mut headers1).await,
+        PluginResult::Continue
+    ));
+
+    ctx1.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx1.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+            .await,
+        PluginResult::Continue
+    ));
+    ctx1.metadata.remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+    plugin
+        .on_response_committed(&mut ctx1, 200, &response_headers, b"{\"synthetic\": true}")
+        .await;
+
+    // Past `ttl_seconds`, well inside `inflight_ttl_seconds`. An ordinary
+    // completed replay would legitimately have expired here; the execution
+    // barrier must not.
+    tokio::time::sleep(std::time::Duration::from_millis(1_300)).await;
+
+    let mut ctx2 = new_ctx("POST", "/api");
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "barrier-key".to_string());
+    match plugin.before_proxy(&mut ctx2, &mut headers2).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "unexpected barrier body: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        other => panic!(
+            "the external-operation barrier must outlive ttl_seconds when \
+             inflight_ttl_seconds is longer, got {other:?}"
+        ),
+    }
+}
+
+/// GHSA-8cr6-rw38-7j59: neither response-byte admission limit may demote a
+/// completed external operation back to an `InFlight` lease. The fixed-size
+/// fallback barrier owns the longer completion deadline and consumes no
+/// completed-response byte budget.
+#[tokio::test]
+async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets() {
+    for (label, config) in [
+        (
+            "entry",
+            json!({
+                "ttl_seconds": 60,
+                "inflight_ttl_seconds": 1,
+                "max_entry_size_bytes": 1,
+                "max_total_size_bytes": 8192
+            }),
+        ),
+        (
+            "total",
+            json!({
+                "ttl_seconds": 60,
+                "inflight_ttl_seconds": 1,
+                "max_entry_size_bytes": 8192,
+                "max_total_size_bytes": 1
+            }),
+        ),
+    ] {
+        let plugin = make_plugin(config);
+        let key = format!("tiny-{label}-barrier");
+        let mut owner_ctx = new_ctx("POST", "/api");
+        let mut owner_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(matches!(
+            plugin
+                .before_proxy(&mut owner_ctx, &mut owner_headers)
+                .await,
+            PluginResult::Continue
+        ));
+
+        owner_ctx.metadata.insert(
+            SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        owner_ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        assert!(matches!(
+            plugin
+                .on_final_response_body(
+                    &mut owner_ctx,
+                    200,
+                    &HashMap::new(),
+                    b"externally-executed"
+                )
+                .await,
+            PluginResult::Continue
+        ));
+        owner_ctx
+            .metadata
+            .remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        plugin
+            .on_response_committed(&mut owner_ctx, 200, &HashMap::new(), b"externally-executed")
+            .await;
+
+        assert_eq!(plugin.tracked_keys_count(), Some(1));
+        assert_eq!(
+            assert_completed_size_exact(&plugin),
+            0,
+            "{label} budget must retain no response bytes"
+        );
+
+        // If admission had merely retained the old in-flight marker, this
+        // deterministic expiry would reopen the operation. It must not affect
+        // the explicit completion barrier.
+        request_deduplication_expire_inflight_entries_for_test(&plugin);
+        let mut protected_ctx = new_ctx("POST", "/api");
+        let mut protected_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut protected_ctx, &mut protected_headers)
+                    .await,
+                PluginResult::Reject {
+                    status_code: 409,
+                    ..
+                }
+            ),
+            "{label} budget shortened the completion barrier to inflight_ttl_seconds"
+        );
+
+        // The key becomes executable only after the barrier's own authoritative
+        // max(ttl, inflight_ttl) deadline.
+        request_deduplication_expire_execution_barriers_for_test(&plugin);
+        let mut expired_ctx = new_ctx("POST", "/api");
+        let mut expired_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut expired_ctx, &mut expired_headers)
+                    .await,
+                PluginResult::Continue
+            ),
+            "{label} barrier did not expire at its own retention deadline"
+        );
+    }
+}
+
+/// Per-key execution barriers are hard-capped. Additional completed operations
+/// collapse into one fixed process-global refusal deadline rather than growing
+/// attacker-influenced key storage or failing open.
+#[tokio::test]
+async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
+    let plugin = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1,
+        "max_entry_size_bytes": 1
+    }));
+
+    for key in ["barrier-cap-a", "barrier-cap-b"] {
+        let mut ctx = new_ctx("POST", "/api");
+        let mut headers = HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        plugin
+            .on_response_committed(&mut ctx, 200, &HashMap::new(), b"done")
+            .await;
+    }
+
+    // Only the first per-key barrier persists. The second remains a raw lease
+    // only until its ordinary in-flight expiry; the fixed global deadline is
+    // the durable fail-closed protection.
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut blocked_ctx = new_ctx("POST", "/api");
+    let mut blocked_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-cap-c".to_string())]);
+    match plugin
+        .before_proxy(&mut blocked_ctx, &mut blocked_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.contains("execution-barrier capacity"));
+        }
+        _ => panic!("execution-barrier overflow must fail closed"),
+    }
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(1),
+        "overflow must not retain an additional long-lived per-key barrier"
+    );
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut expired_ctx = new_ctx("POST", "/api");
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut expired_ctx, &mut blocked_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// A stale terminal hook must not publish over or clear the successor that
+/// acquired after the execution barrier's authoritative deadline.
+#[tokio::test]
+async fn expired_execution_barrier_stale_owner_cannot_touch_successor() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1,
+        "max_entry_size_bytes": 1
+    }));
+    let mut original_ctx = new_ctx("POST", "/api");
+    let mut original_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "barrier-stale-owner".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut original_ctx, &mut original_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let (logical_key, fingerprint) =
+        request_identity(&plugin, &original_ctx).expect("owner identity");
+    original_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut original_ctx, 200, &HashMap::new(), b"done")
+        .await;
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut successor_ctx = new_ctx("POST", "/api");
+    let mut successor_headers = original_headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut successor_ctx, &mut successor_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut stale_ctx = new_ctx("POST", "/api");
+    request_deduplication_set_request_state_for_test(
+        &plugin,
+        &mut stale_ctx,
+        &logical_key,
+        &fingerprint,
+        "stale-owner-token",
+        None,
+    );
+    stale_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut stale_ctx, 200, &HashMap::new(), b"stale")
+        .await;
+
+    let mut duplicate_ctx = new_ctx("POST", "/api");
+    let mut duplicate_headers = original_headers;
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut duplicate_ctx, &mut duplicate_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "stale barrier owner cleared or published over its successor"
+    );
+}
+
+/// Capacity eviction must inherit the protected completion's original
+/// retention clock. Starting a fresh in-flight clock at eviction would shorten
+/// a `ttl_seconds > inflight_ttl_seconds` completion under later pressure.
+#[tokio::test]
+async fn protected_completion_eviction_preserves_original_barrier_deadline() {
+    let plugin = make_plugin(json!({
+        "max_entries": 1,
+        "ttl_seconds": 60,
+        "inflight_ttl_seconds": 1
+    }));
+
+    let mut protected_ctx = new_ctx("POST", "/api");
+    let mut protected_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "evicted-protected-completion".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut protected_ctx, &mut protected_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    protected_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut protected_ctx, 200, &HashMap::new(), b"done")
+        .await;
+    assert!(assert_completed_size_exact(&plugin) > 0);
+
+    // A later ordinary completion creates pressure. The protected completion
+    // becomes a fixed-size barrier; trimming continues to remove the ordinary
+    // replay because barrier conversion releases bytes but not a map slot.
+    let mut pressure_ctx = new_ctx("POST", "/pressure");
+    let mut pressure_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "ordinary-pressure".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut pressure_ctx, &mut pressure_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    complete_response(&plugin, &mut pressure_ctx).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert_eq!(assert_completed_size_exact(&plugin), 0);
+
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut still_protected_ctx = new_ctx("POST", "/api");
+    let mut still_protected_headers = protected_headers.clone();
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut still_protected_ctx, &mut still_protected_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "capacity eviction shortened ttl_seconds to a fresh inflight_ttl_seconds lease"
+    );
+
+    request_deduplication_expire_execution_barriers_for_test(&plugin);
+    let mut expired_ctx = new_ctx("POST", "/api");
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut expired_ctx, &mut protected_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "evicted barrier did not expire at the protected completion deadline"
+    );
+}
+
 #[tokio::test]
 async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
     use wiremock::matchers::method;
@@ -2012,6 +2676,277 @@ async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
         other => panic!("retry must replay without invoking again, got {other:?}"),
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// Assert an idempotency key is still owned by a durable, non-executable
+/// completion after its in-flight lease was expired.
+///
+/// The refusal may be the fixed non-replayable barrier, or the policy-mismatch
+/// refusal a stored completion produces when the live policy moved or cannot be
+/// established. Both are 409 barriers; what must never happen is admission of a
+/// fresh execution, or handing back the externally executed response as a replay.
+fn assert_barrier_refusal(result: PluginResult, context: &str) {
+    let (status_code, body) = match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => (status_code, Bytes::from(body)),
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => (status_code, body),
+        other => panic!("{context}; got {other:?}"),
+    };
+    assert_eq!(status_code, 409, "{context}");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        !body.contains("charged-once"),
+        "{context}; the externally executed representation must not be replayed: {body}"
+    );
+    assert!(
+        !body.contains("already in progress"),
+        "{context}; the barrier must be a durable completion, not a surviving in-flight lease: \
+         {body}"
+    );
+}
+
+/// Terminate-mode serverless invocation whose committed response is refused for
+/// replay because the request straddled a response-side gate publication.
+///
+/// GHSA-8cr6-rw38-7j59: the function already ran, so giving up only the replay
+/// would leave the raw `inflight_ttl_seconds` lease as the sole protection and
+/// make the billable operation executable again the moment it expired. The
+/// committed hook must convert that exact ownership into the durable
+/// non-replayable 409 execution barrier instead.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
+async fn serverless_commit_straddling_a_policy_publication_publishes_a_durable_barrier() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "straddled-side-effect".to_string(),
+    )]);
+    // Pins this request's response-policy stamp.
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+    assert_eq!(status, 200);
+
+    // A response-side gate publication lands after the function executed and
+    // before the response is committed: the representation straddles it, so it
+    // belongs to no provable policy and cannot be retained as a replay.
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.response_transformer.redaction.enabled".to_string(),
+        RuntimeValue::Bool(true),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+
+    // The barrier must not be the bounded in-flight lease.
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "straddled-side-effect".to_string(),
+    )]);
+    // A durable completion now owns the key. Whether it is refused as the fixed
+    // non-replayable barrier or as a completion stored under a policy the retry
+    // no longer shares, it is a 409 refusal rather than a fresh execution, and it
+    // never hands back the real function response.
+    assert_barrier_refusal(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        "a committed serverless side effect whose response straddled a policy publication must \
+         leave a durable execution barrier, not become executable again",
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the protected operation must not be re-executed"
+    );
+    runtime_overlay::reset_for_test();
+}
+
+/// Same barrier requirement for the other refusal shape: the effective static
+/// response-presentation policy could not be established at all (no plugin-cache
+/// view, or a `ResponsePresentationPolicy::Dynamic` plugin on the proxy), so the
+/// provenance is incomplete and the committed response is not replayable.
+#[tokio::test]
+async fn serverless_commit_without_provable_policy_publishes_a_durable_barrier() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Incomplete provenance: no effective presentation-policy digest.
+    let mut ctx = policy_bound_ctx(None);
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "dynamic-policy-side-effect".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = policy_bound_ctx(None);
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "dynamic-policy-side-effect".to_string(),
+    )]);
+    assert_barrier_refusal(
+        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
+        "a committed serverless side effect with unprovable replay provenance must leave a \
+         durable execution barrier",
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "the protected operation must not be re-executed"
+    );
+}
+
+/// The control for the two barrier tests above: a serverless response with
+/// stable, complete policy provenance must still be published as an ordinary
+/// replayable completion. Barrier conversion is the exception, not a blanket
+/// downgrade of every externally executed response.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // `test_lock()` must span plugin awaits to serialize overlay state
+async fn serverless_commit_with_provable_policy_stays_replayable() {
+    use ferrum_edge::plugins::response_transformer::runtime_overlay;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("charged-once"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "provable-side-effect".to_string(),
+    )]);
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let (status, response_headers, body) =
+        match serverless.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
+
+    // No policy publication between invocation and commit.
+    dedup
+        .on_response_committed(&mut ctx, status, &response_headers, &body)
+        .await;
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "provable-side-effect".to_string(),
+    )]);
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"charged-once");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("a provable serverless completion must stay replayable, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    runtime_overlay::reset_for_test();
 }
 
 #[tokio::test]
@@ -2513,8 +3448,9 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
 
     // Once the other request completes, strict capacity can no longer retain
     // both responses. Evicting the protected terminal replay must leave an
-    // in-flight tombstone, so a later Redis outage/lock expiry cannot allow the
-    // external side effect to execute again.
+    // fixed-size execution barrier with the completion's original retention,
+    // so a later Redis outage/lock expiry cannot allow the external side effect
+    // to execute again.
     complete_response(&dedup, &mut second_ctx).await;
     let mut tombstone_ctx = new_ctx("POST", "/api");
     let mut tombstone_headers =
@@ -3257,7 +4193,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
     assert_eq!(
         dedup.tracked_keys_count(),
         Some(1),
-        "an uncertain serverless side effect must retain the streamed fallback marker until TTL"
+        "an uncertain serverless side effect must retain a completion for the streamed fallback"
     );
 
     let mut retry_ctx = new_ctx("POST", "/api");
@@ -3266,13 +4202,83 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
         "idempotency-key".to_string(),
         "serverless-stream-key".to_string(),
     );
-    assert!(matches!(
-        dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
-        PluginResult::Reject {
-            status_code: 409,
-            ..
+    // GHSA-8cr6-rw38-7j59: the streamed fallback publishes a durable
+    // non-replayable tombstone rather than a bare in-flight marker, so the
+    // retry is refused for the completed-response TTL instead of becoming
+    // executable again the moment `inflight_ttl_seconds` elapses.
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409);
+            assert!(
+                String::from_utf8_lossy(&body).contains("cannot be replayed safely"),
+                "unexpected tombstone body"
+            );
         }
+        other => panic!("expected a non-replayable completion tombstone, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+/// GHSA-8cr6-rw38-7j59: an interrupted stream (client disconnect) behind a
+/// terminate-mode serverless invocation must also leave a durable completion,
+/// not merely an in-flight marker that expires into a fresh execution.
+#[tokio::test]
+async fn interrupted_stream_after_serverless_side_effect_publishes_durable_tombstone() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(600).set_body_string("invalid status"))
+        .mount(&server)
+        .await;
+    let dedup = make_plugin(json!({}));
+    let serverless = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/mutate", server.uri()),
+            "mode": "terminate",
+            "on_error": "continue"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = new_ctx("POST", "/api");
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-interrupted-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
     ));
+    assert!(matches!(
+        serverless.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    dedup
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(8))
+        .await;
+
+    // The completion outlives the in-flight lease: expiring in-flight markers
+    // must not resurrect an executable key.
+    request_deduplication_expire_inflight_entries_for_test(&dedup);
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "serverless-interrupted-key".to_string(),
+    );
+    match dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 409),
+        other => panic!("expected a non-replayable completion tombstone, got {other:?}"),
+    }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
@@ -3582,6 +4588,7 @@ async fn test_redis_total_cap_publish_failure_keeps_local_inflight() {
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
         "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only",
         "max_entry_size_bytes": 2048,
         "max_total_size_bytes": 768
     }));
@@ -4517,6 +5524,99 @@ fn test_redis_cached_response_byte_array_body_with_provenance_is_accepted() {
     assert!(request_deduplication_redis_cached_response_payload_is_valid(byte_array_body));
 }
 
+/// Current-version operation records have a strict state-dependent shape.
+/// Missing fences, impossible field combinations, and a replay whose inner
+/// fingerprint disagrees with its owning record are unknown writer state and
+/// must fail closed rather than being interpreted optimistically.
+#[test]
+fn redis_operation_record_rejects_malformed_current_version_shapes() {
+    let fingerprint = "sha256-request-a";
+    let valid_replay = json!({
+        "fingerprint": fingerprint,
+        "response_policy": {
+            "gate": "00".repeat(32),
+            "presentation": "11".repeat(32)
+        },
+        "status_code": 201,
+        "headers": {},
+        "body": "e30="
+    });
+
+    for valid in [
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": "owner-a"
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "replay": valid_replay.clone()
+        }),
+    ] {
+        let bytes = serde_json::to_vec(&valid).expect("record JSON");
+        assert!(
+            request_deduplication_redis_record_payload_is_valid(&bytes),
+            "valid current record rejected: {valid}"
+        );
+    }
+
+    for malformed in [
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint
+        }),
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": ""
+        }),
+        json!({
+            "record_version": 1,
+            "state": "inflight",
+            "fingerprint": fingerprint,
+            "owner_token": "owner-a",
+            "replay": valid_replay.clone()
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "owner_token": "stale-owner"
+        }),
+        json!({
+            "record_version": 1,
+            "state": "completed",
+            "fingerprint": fingerprint,
+            "replay": {
+                "fingerprint": "sha256-request-b",
+                "response_policy": {
+                    "gate": "00".repeat(32),
+                    "presentation": "11".repeat(32)
+                },
+                "status_code": 201,
+                "headers": {},
+                "body": "e30="
+            }
+        }),
+    ] {
+        let bytes = serde_json::to_vec(&malformed).expect("record JSON");
+        assert!(
+            !request_deduplication_redis_record_payload_is_valid(&bytes),
+            "malformed current record accepted: {malformed}"
+        );
+    }
+}
+
 #[test]
 fn test_redis_payload_admission_respects_entry_size_limit() {
     let mut headers = HashMap::new();
@@ -4684,7 +5784,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v3:"));
+    assert!(logical_key.starts_with("v4:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -4780,7 +5880,8 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
     let redis_plugin = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:1/0",
-        "redis_connect_timeout_seconds": 1
+        "redis_connect_timeout_seconds": 1,
+        "on_redis_unavailable": "local_only"
     }));
 
     let mut local_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");

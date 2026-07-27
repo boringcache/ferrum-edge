@@ -2113,6 +2113,10 @@ fn graphql_config_schema_matches_runtime_validation() {
 #[test]
 fn request_deduplication_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
+    use ferrum_edge::plugins::request_deduplication::{
+        REQUEST_DEDUPLICATION_CONFIG_KEYS, REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2158,6 +2162,67 @@ fn request_deduplication_schema_matches_runtime_validation() {
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
 
+    // GHSA-h2c3-j3cm-7ghh: the published schema closes the root object and
+    // refuses Redis-only fields outside Redis mode, matching the runtime
+    // allowlist exactly.
+    assert_eq!(schema["additionalProperties"], json!(false));
+    for redis_only in [
+        "redis_url",
+        "redis_tls",
+        "redis_key_prefix",
+        "redis_pool_size",
+        "redis_connect_timeout_seconds",
+        "redis_health_check_interval_seconds",
+        "redis_username",
+        "redis_password",
+        "on_redis_unavailable",
+    ] {
+        assert_eq!(
+            redis_guard["else"]["properties"][redis_only],
+            json!(false),
+            "{redis_only} must be refused outside sync_mode=redis"
+        );
+    }
+
+    // GHSA-h2c3-j3cm-7ghh: the runtime allowlist, the published schema, and the
+    // documented parameter table must name exactly the same keys.
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("RequestDeduplicationConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = REQUEST_DEDUPLICATION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "request_deduplication OpenAPI/runtime key drift"
+    );
+    for key in REDIS_PLUGIN_CONFIG_KEYS {
+        assert!(
+            REQUEST_DEDUPLICATION_CONFIG_KEYS.contains(key),
+            "REQUEST_DEDUPLICATION_CONFIG_KEYS must include Redis key {key}"
+        );
+    }
+    assert_eq!(
+        REQUEST_DEDUPLICATION_CONFIG_KEYS.len(),
+        REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS.len() + REDIS_PLUGIN_CONFIG_KEYS.len(),
+        "the closed allowlist must be exactly policy keys plus shared Redis keys"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `request_deduplication`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("request_deduplication docs section");
+    for key in REQUEST_DEDUPLICATION_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md request_deduplication section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("Unknown top-level keys are rejected"));
+
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$ref": "#/components/schemas/RequestDeduplicationConfig",
@@ -2185,8 +2250,9 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "rediss://cache.internal:6390"
         }),
         json!({
-            "sync_mode": "local",
-            "redis_url": "redis://cache.internal:6379"
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379",
+            "on_redis_unavailable": "local_only"
         }),
     ];
     for config in &accepted {
@@ -2216,6 +2282,19 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"sync_mode": "redis", "redis_url": null}),
         json!({"sync_mode": "local", "redis_url": "https://example.invalid"}),
         json!({"sync_mode": "local", "redis_url": "redis://"}),
+        // GHSA-h2c3-j3cm-7ghh reproduction shapes: misspelled policy keys and
+        // Redis-only fields outside Redis mode.
+        json!({"enforce_requred": true}),
+        json!({"sync_mod": "redis", "redis_url": "redis://cache.internal:6379"}),
+        json!({"scope_by_consumers": false}),
+        json!({"sync_mode": "local", "redis_url": "redis://cache.internal:6379"}),
+        json!({"redis_key_prefix": "ferrum:dedup"}),
+        json!({"on_redis_unavailable": "local_only"}),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379",
+            "on_redis_unavailable": "fallback"
+        }),
         json!({
             "sync_mode": "redis",
             "redis_url": "redis://host:6379",
