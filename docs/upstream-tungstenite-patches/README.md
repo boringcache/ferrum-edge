@@ -23,6 +23,7 @@ correct close reason when frame and reassembled-message ceilings are equal.
 |---|---|---|---|
 | `tungstenite` | <https://github.com/snapview/tungstenite-rs/pull/556> | `117597cbfccf2af44e97561cb2efa713d8454ed2`, `78db146fb240776a3082621ce054927488423e86` | 0.29.0 |
 | `tungstenite` frame-limit origin | **Deliberate fork — not yet filed upstream** | Ferrum local | 0.29.0 |
+| `tungstenite` optional auto-pong | **Deliberate fork — not yet filed upstream** ([003](003-optional-auto-pong/)) | Ferrum local | 0.29.0 |
 | `tokio-tungstenite` | <https://github.com/snapview/tokio-tungstenite/pull/380> | `ba1d8f8897a09e4cdf1088456667e8c24ee15832` | 0.29.0 |
 
 Both PRs were open when vendored. The local API names and return types match the
@@ -53,6 +54,11 @@ upstream proposals:
   upstream or explicitly re-affirmed before the first stable release under the
   dependency-policy SLA. It preserves frame-vs-reassembly attribution without
   weakening either parser ceiling.
+- Added `WebSocketConfig::auto_pong` (default `true`) so the shared H1/H2/H3
+  WebSocket relay can disable local auto-Pong while forwarding Ping frames
+  (issue #2963). Documented under
+  [003-optional-auto-pong](003-optional-auto-pong/). This is a deliberate
+  Ferrum extension owned by `@jeremyjpj0916` under the same SLA.
 - Wired both crates through root `[patch.crates-io]`.
 
 ## Direct vendor-test commands
@@ -60,6 +66,7 @@ upstream proposals:
 ```bash
 cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
 cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
+cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
 cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
 ```
 
@@ -82,9 +89,10 @@ The parsed relay maps `FrameTooLong` only to the effective frame rule and
 Do not retire these vendor directories merely because the PRs merge. Retire
 only after **both** upstream takeover changes are present in published
 compatible releases consumed by ferrum-edge and the consumed tungstenite
-surface preserves an equivalent frame-vs-message capacity origin. If the
-origin has not shipped upstream, carry forward only that documented minimal
-extension until its own retirement condition is met.
+surface preserves an equivalent frame-vs-message capacity origin **and** an
+equivalent opt-out for automatic Ping replies (`auto_pong` or successor). If
+an extension has not shipped upstream, carry forward only that documented
+minimal extension until its own retirement condition is met.
 
 At retirement:
 

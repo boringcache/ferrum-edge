@@ -1848,7 +1848,17 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        if is_mtls_dns_admission_unavailable(error) {
+        if let Some(unsupported) =
+            crate::config::db_backend::proxy_delete_atomicity_unsupported(error)
+        {
+            super::json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                &json!({
+                    "error": crate::config::db_backend::PROXY_DELETE_ATOMICITY_UNSUPPORTED_MESSAGE,
+                    "detail": unsupported.detail(),
+                }),
+            )
+        } else if is_mtls_dns_admission_unavailable(error) {
             super::mtls_dns_admission_unavailable_response()
         } else if let Some(conflict) = tcp_connection_throttle_attachment_conflict(error) {
             Self::map_after_validate_errors(conflict.errors())
