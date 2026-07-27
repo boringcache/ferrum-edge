@@ -14387,6 +14387,7 @@ mod inner {
     }
 }
 
+#[allow(unused_imports)] // The binary target has no `_test_support` consumer for these test seams.
 pub use inner::{
     MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
     MongoStore,
