@@ -9425,7 +9425,7 @@ fn prepare_mesh_runtime_before_owner(
     (
         DnsCache,
         Vec<(String, Option<String>, Option<u64>)>,
-        Option<Arc<MeshSlice>>,
+        Option<MeshSlice>,
         TlsPolicy,
         tls::CrlList,
         Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
@@ -9536,7 +9536,7 @@ async fn arm_mesh_runtime_startup(
     runtime: &MeshRuntimeConfig,
     dns_cache: &DnsCache,
     mut hostnames: Vec<(String, Option<String>, Option<u64>)>,
-    initial_dns_slice: Option<Arc<MeshSlice>>,
+    initial_dns_slice: Option<MeshSlice>,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mesh_state: MeshRuntimeState,
     tls_policy: TlsPolicy,
