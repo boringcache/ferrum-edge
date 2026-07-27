@@ -694,7 +694,10 @@ fn recursive_anchor_refs_are_rejected_as_cycles() {
     let ExtractError::SchemaReferenceCycle { path } = &err else {
         panic!("recursive anchor refs must fail as SchemaReferenceCycle: {err}");
     };
-    assert!(path.contains("#Node"), "cycle path must name the anchor: {path}");
+    assert!(
+        path.contains("#Node"),
+        "cycle path must name the anchor: {path}"
+    );
 }
 
 #[test]
