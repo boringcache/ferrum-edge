@@ -201,12 +201,24 @@ impl PartialEq for CertSourceUri {
 
 impl fmt::Debug for CertSourceUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CertSourceUri")
-            .field("scheme", &self.scheme)
-            .field("identifier", &self.identifier)
-            .field("kind", &self.kind)
-            .field("options", &self.options)
-            .finish()
+        let redact =
+            self.scheme.is_secret_provider()
+                || self.has_uri_userinfo()
+                || crate::secrets::is_external_secret_value(&self.raw);
+        let mut debug = f.debug_struct("CertSourceUri");
+        debug.field("scheme", &self.scheme);
+        if redact {
+            debug
+                .field("identifier", &REDACTED_IDENTIFIER)
+                .field("kind", &self.kind)
+                .field("options", &"<redacted>");
+        } else {
+            debug
+                .field("identifier", &self.identifier)
+                .field("kind", &self.kind)
+                .field("options", &self.options);
+        }
+        debug.finish()
     }
 }
 
@@ -255,11 +267,19 @@ impl CertSourceUri {
     /// discloses nothing the configuration does not already state. Only the
     /// identifier is withheld.
     pub fn redacted_source_id(&self) -> String {
-        if self.scheme.is_secret_provider() {
+        if self.scheme.is_secret_provider() || self.has_uri_userinfo() {
             format!("{}://{}", self.scheme.as_str(), REDACTED_IDENTIFIER)
         } else {
             self.source_id()
         }
+    }
+
+    fn has_uri_userinfo(&self) -> bool {
+        let authority = self
+            .identifier
+            .split_once('/')
+            .map_or(self.identifier.as_str(), |(authority, _)| authority);
+        authority.contains('@')
     }
 
     /// Render one of this URI's query-option values for an operator-facing
@@ -583,6 +603,12 @@ pub fn load_material_blocking(
             None,
         )),
         CertSource::Uri(uri) if uri.scheme == SourceScheme::File => {
+            if uri.has_uri_userinfo() {
+                return Err(MaterialError::InvalidSource {
+                    source_id: uri.redacted_source_id(),
+                    details: "file URI credentials are not permitted".to_string(),
+                });
+            }
             let path =
                 uri_file_path(&uri.identifier).ok_or_else(|| MaterialError::InvalidSource {
                     source_id: uri.redacted_source_id(),

@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -542,30 +541,20 @@ pub fn build_root_cert_store(
     global_ca: Option<&Path>,
 ) -> Result<RootCertStore, TlsError> {
     let ca_path = proxy_ca.or(global_ca);
-    let mut root_store = if ca_path.is_some() {
-        RootCertStore::empty()
-    } else {
-        RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
-    };
-
     if let Some(ca_path) = ca_path {
-        let certs = load_cert_chain(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
-        let source_value = ca_path.to_string_lossy();
-        let display_source =
-            CertSource::parse(source_value.as_ref(), MaterialKind::CaBundle).redacted_source_id();
-        for (index, certificate) in certs.into_iter().enumerate() {
-            root_store.add(certificate).map_err(|error| {
-                TlsError::Rustls(format!(
-                    "backend CA bundle: certificate record #{} in '{}' is not a usable trust root: {}",
-                    index + 1,
-                    display_source,
-                    error
-                ))
-            })?;
-        }
+        let material =
+            load_backend_material(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
+        return crate::tls::root_cert_store_from_pem_bundle(
+            material.bytes.expose_secret(),
+            "backend CA bundle",
+            &material.display_source_id,
+        )
+        .map_err(|error| TlsError::Rustls(error.to_string()));
     }
 
-    Ok(root_store)
+    Ok(RootCertStore::from_iter(
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+    ))
 }
 
 pub struct BackendTlsConfigBuilder<'a> {
@@ -634,6 +623,11 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         let client_auth = self.load_client_auth()?;
 
         let mut client_config = if self.skip_verification() {
+            if self.custom_ca_path().is_some() {
+                // No-verify disables use of the verifier, not admission of an
+                // explicitly declared CA source.
+                build_root_cert_store(self.custom_ca_path(), self.global_ca)?;
+            }
             tracing::warn!("{}", skip_verify_warning);
             if !self.proxy.resolved_tls.san_allow_list.is_empty() {
                 tracing::warn!(
@@ -862,17 +856,13 @@ fn load_cert_chain(
 fn load_private_key(path: &Path, kind: &'static str) -> Result<PrivateKeyDer<'static>, TlsError> {
     let material = load_backend_material(path, MaterialKind::Key, kind)?;
     let source_id = material.display_source_id.clone();
-    rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
-        .map_err(|e| TlsError::Pem {
+    crate::tls::parse_pem_private_key(material.bytes.expose_secret(), kind, &source_id).map_err(
+        |error| TlsError::Pem {
             kind,
             path: PathBuf::from(&source_id),
-            details: format!("PEM private key: {}", e),
-        })?
-        .ok_or_else(|| TlsError::Pem {
-            kind,
-            path: PathBuf::from(source_id),
-            details: "no private key found".to_string(),
-        })
+            details: error.to_string(),
+        },
+    )
 }
 
 fn load_backend_material(

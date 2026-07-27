@@ -62,6 +62,7 @@ pub fn load_svid_bundle_from_sources(
             &format!("gateway SVID intermediate certificate #{idx}"),
         )?;
     }
+    validate_certificate_chain_order(&cert_chain_der, "gateway SVID certificate chain")?;
     for (idx, ca) in x509_authorities.iter().enumerate() {
         validate_cert_is_current(ca, &format!("gateway SVID trust bundle cert #{}", idx + 1))?;
     }
@@ -112,25 +113,24 @@ fn read_cert_chain_source(
     let material = load_material_blocking(&source, kind)
         .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("{label}: {e}")))?;
     let source_id = material.display_source_id.clone();
-    let mut reader = material.bytes.expose_secret();
-    let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut reader)
-        .map(|cert| {
-            cert.map(|cert| cert.as_ref().to_vec()).map_err(|e| {
-                SpiffeTlsError::BadKeyMaterial(format!(
-                    "{label}: failed to parse PEM certificate in '{}': {e}",
-                    source_id
-                ))
-            })
-        })
-        .collect::<Result<_, _>>()?;
-
-    if certs.is_empty() {
-        return Err(SpiffeTlsError::BadKeyMaterial(format!(
-            "{label}: no CERTIFICATE blocks found in '{}'",
-            source_id
-        )));
+    let certificates = crate::tls::parse_pem_certificate_bundle(
+        material.bytes.expose_secret(),
+        label,
+        &source_id,
+    )
+    .map_err(|error| SpiffeTlsError::BadKeyMaterial(error.to_string()))?;
+    if kind == MaterialKind::CaBundle {
+        crate::tls::root_cert_store_from_certificates(
+            certificates.iter().cloned(),
+            label,
+            &source_id,
+        )
+        .map_err(|error| SpiffeTlsError::BadKeyMaterial(error.to_string()))?;
     }
-    Ok(certs)
+    Ok(certificates
+        .into_iter()
+        .map(|certificate| certificate.as_ref().to_vec())
+        .collect())
 }
 
 fn read_pkcs8_key_source(source_value: &str) -> Result<Vec<u8>, SpiffeTlsError> {
@@ -138,36 +138,24 @@ fn read_pkcs8_key_source(source_value: &str) -> Result<Vec<u8>, SpiffeTlsError> 
     let material = load_material_blocking(&source, MaterialKind::Key)
         .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("gateway SVID key: {e}")))?;
     let source_id = material.display_source_id.clone();
-    let mut reader = material.bytes.expose_secret();
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader);
-    let key = keys
-        .next()
-        .ok_or_else(|| {
-            SpiffeTlsError::BadKeyMaterial(format!(
-                "gateway SVID key: no PKCS#8 PRIVATE KEY block found in '{}'",
-                source_id
-            ))
-        })?
-        .map_err(|e| {
-            SpiffeTlsError::BadKeyMaterial(format!(
-                "gateway SVID key: failed to parse PKCS#8 key in '{}': {e}",
-                source_id
-            ))
-        })?;
-
-    if keys.next().is_some() {
-        return Err(SpiffeTlsError::BadKeyMaterial(format!(
-            "gateway SVID key: '{}' contains more than one PKCS#8 private key",
+    let key = crate::tls::parse_pem_private_key(
+        material.bytes.expose_secret(),
+        "gateway SVID key",
+        &source_id,
+    )
+    .map_err(|error| SpiffeTlsError::BadKeyMaterial(error.to_string()))?;
+    match key {
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key) => Ok(key.secret_pkcs8_der().to_vec()),
+        _ => Err(SpiffeTlsError::BadKeyMaterial(format!(
+            "gateway SVID key: '{}' must contain a PKCS#8 private key",
             source_id
-        )));
+        ))),
     }
-
-    Ok(key.secret_pkcs8_der().to_vec())
 }
 
 pub(crate) fn validate_cert_is_current(cert_der: &[u8], label: &str) -> Result<(), SpiffeTlsError> {
-    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!("{label}: failed to parse certificate DER: {e}"))
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|_error| {
+        SpiffeTlsError::BadKeyMaterial(format!("{label}: certificate failed X.509 validation"))
     })?;
     let validity = cert.validity();
     if validity.is_valid() {
@@ -177,25 +165,25 @@ pub(crate) fn validate_cert_is_current(cert_der: &[u8], label: &str) -> Result<(
     let now_ts = x509_parser::time::ASN1Time::now().timestamp();
     if now_ts < validity.not_before.timestamp() {
         Err(SpiffeTlsError::BadKeyMaterial(format!(
-            "{label}: certificate is not yet valid (notBefore: {})",
-            validity.not_before
+            "{label}: certificate is not yet valid"
         )))
     } else {
         Err(SpiffeTlsError::BadKeyMaterial(format!(
-            "{label}: certificate has expired (notAfter: {})",
-            validity.not_after
+            "{label}: certificate has expired"
         )))
     }
 }
 
 pub(crate) fn validate_leaf_is_not_ca(leaf_der: &[u8]) -> Result<(), SpiffeTlsError> {
-    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!("gateway SVID leaf certificate parse failed: {e}"))
+    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|_error| {
+        SpiffeTlsError::BadKeyMaterial(
+            "gateway SVID leaf certificate failed X.509 validation".to_string(),
+        )
     })?;
-    let basic_constraints = leaf.basic_constraints().map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!(
-            "gateway SVID leaf certificate basic constraints are invalid: {e}"
-        ))
+    let basic_constraints = leaf.basic_constraints().map_err(|_error| {
+        SpiffeTlsError::BadKeyMaterial(
+            "gateway SVID leaf certificate basic constraints are invalid".to_string(),
+        )
     })?;
 
     if basic_constraints.is_some_and(|ext| ext.value.ca) {
@@ -207,11 +195,13 @@ pub(crate) fn validate_leaf_is_not_ca(leaf_der: &[u8]) -> Result<(), SpiffeTlsEr
 }
 
 pub(crate) fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(), SpiffeTlsError> {
-    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!("gateway SVID leaf certificate parse failed: {e}"))
+    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|_error| {
+        SpiffeTlsError::BadKeyMaterial(
+            "gateway SVID leaf certificate failed X.509 validation".to_string(),
+        )
     })?;
-    let key_pair = rcgen::KeyPair::try_from(key_der).map_err(|e| {
-        SpiffeTlsError::BadKeyMaterial(format!("gateway SVID private key is invalid: {e}"))
+    let key_pair = rcgen::KeyPair::try_from(key_der).map_err(|_error| {
+        SpiffeTlsError::BadKeyMaterial("gateway SVID private key is invalid".to_string())
     })?;
     // Compare canonical DER SubjectPublicKeyInfo bytes. x509-parser preserves
     // the certificate SPKI DER and rcgen emits canonical SPKI DER for the key.
@@ -222,6 +212,41 @@ pub(crate) fn verify_leaf_key_match(leaf_der: &[u8], key_der: &[u8]) -> Result<(
             "gateway SVID certificate public key does not match the supplied private key"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Require every certificate after the leaf to be its immediate issuer.
+///
+/// The final root may be omitted, as is conventional for TLS presentation
+/// chains. Issuer/subject equality plus signature verification prevents an
+/// otherwise parseable but reordered or unrelated chain from being published.
+pub(crate) fn validate_certificate_chain_order(
+    chain_der: &[Vec<u8>],
+    label: &str,
+) -> Result<(), SpiffeTlsError> {
+    for (index, pair) in chain_der.windows(2).enumerate() {
+        let (_, child) = X509Certificate::from_der(&pair[0]).map_err(|_error| {
+            SpiffeTlsError::BadKeyMaterial(format!(
+                "{label}: certificate record #{} failed X.509 validation",
+                index + 1
+            ))
+        })?;
+        let (_, issuer) = X509Certificate::from_der(&pair[1]).map_err(|_error| {
+            SpiffeTlsError::BadKeyMaterial(format!(
+                "{label}: certificate record #{} failed X.509 validation",
+                index + 2
+            ))
+        })?;
+        if child.issuer() != issuer.subject()
+            || child.verify_signature(Some(issuer.public_key())).is_err()
+        {
+            return Err(SpiffeTlsError::BadKeyMaterial(format!(
+                "{label}: certificate record #{} is not issued by record #{}",
+                index + 1,
+                index + 2
+            )));
+        }
     }
     Ok(())
 }

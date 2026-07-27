@@ -435,6 +435,13 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 
 All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
 
+Certificate/key PEM parsing is capped at 4 MiB per source and certificate
+bundles at 4096 records. A configured client-CA is still fully admitted when a
+testing-only no-verify mode disables use of its verifier. DTLS server identity
+sources must contain exactly one certificate because the DTLS stack cannot
+present an intermediate chain; Ferrum rejects a multi-certificate DTLS identity
+instead of publishing only its first record.
+
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller swaps the active DTLS server material for new DTLS sessions. Existing TLS/DTLS sessions keep the config they negotiated with. A failed reload keeps the previous config in service and logs a warning without exposing PEM contents.
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.

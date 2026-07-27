@@ -1128,6 +1128,12 @@ The east-west gateway routes purely by the ClientHello SNI, which carries a host
 
 X.509 authorities are stored as base64-encoded DER for serialization-friendly persistence. JWT authorities carry `key_id` and `public_key_pem`.
 
+X.509 trust updates are admitted as complete sets: every local and federated
+authority must decode and be usable as a rustls trust root, and every declared
+trust domain must contain a usable root. A malformed Workload API response or
+slice/file trust candidate never activates only its surviving domains; an
+already-running verifier retains its last-known-good set.
+
 A background poller hits each `RemoteCluster.federation_endpoint` over HTTPS at
 `FERRUM_MESH_FEDERATION_POLL_INTERVAL_SECONDS` (default 300; `0` disables) and
 overlays the fetched bundle onto `TrustBundleSet.federated` for cross-cluster

@@ -6,7 +6,7 @@
 //! - **Stream proxy routing**: TCP/UDP proxies are matched by `listen_port`,
 //!   not `listen_path`, so path validation and router invalidation skip them.
 //! - **Validation deduplication**: TLS cert/key paths are validated via a
-//!   `validated_tls_paths` cache so each unique file is parsed only once.
+//!   `validated_tls_paths` cache so each unique source/role is parsed only once.
 //! - **Control character rejection**: Resource IDs, hostnames, and paths reject
 //!   control characters to prevent log injection attacks.
 
@@ -14,7 +14,6 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
@@ -5131,6 +5130,36 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
     Ok(())
 }
 
+/// Validate that a PEM CA source is readable and every declared certificate is
+/// admissible as a trust anchor. Syntax-only success is insufficient for a
+/// selected exclusive custom store.
+pub fn validate_pem_ca_file(field_name: &str, path: &str) -> Result<(), String> {
+    let source =
+        crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::CaBundle);
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::CaBundle,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load CA source '{}': {}",
+                field_name,
+                source.redacted_source_id(),
+                e
+            ));
+        }
+    };
+    crate::tls::root_cert_store_from_pem_bundle(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 /// Validate that a private key source is usable for backend mTLS.
 ///
 /// Materializable sources must contain a PEM private key. PKCS#11 sources are
@@ -5157,20 +5186,17 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
             ));
         }
     };
-    let key = rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
-        .map_err(|e| {
-            format!(
-                "{}: failed to parse private key from '{}': {}",
-                field_name, material.display_source_id, e
-            )
-        })?;
-    if key.is_none() {
-        return Err(format!(
-            "{}: no valid private keys found in '{}'",
-            field_name, material.display_source_id
-        ));
-    }
+    crate::tls::parse_pem_private_key(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn tls_validation_cache_key(kind: crate::tls::source::MaterialKind, path: &str) -> String {
+    format!("{}:{path}", kind.as_str())
 }
 
 #[cfg(feature = "pkcs11")]
@@ -7018,9 +7044,11 @@ impl Proxy {
         // Also checks certificate expiration: expired certs are rejected,
         // near-expiry certs emit a warning log.
         if let Some(ref path) = self.backend_tls_client_cert_path {
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
@@ -7031,28 +7059,32 @@ impl Proxy {
                 ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path {
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::CaBundle, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
-                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
@@ -7061,7 +7093,7 @@ impl Proxy {
                 ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
@@ -8322,7 +8354,9 @@ impl Upstream {
 
         // TLS file content validation with deduplication.
         if let Some(ref path) = self.backend_tls_client_cert_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
@@ -8333,24 +8367,28 @@ impl Upstream {
                 ) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::CaBundle, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
-                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
@@ -8359,7 +8397,7 @@ impl Upstream {
                 ) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
@@ -9312,32 +9350,43 @@ impl GatewayConfig {
                         )),
                         _ => {}
                     }
-                    if let Some(path) = client_cert
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_cert_file(
-                            "mesh_route_dispatch.backend_tls.client_cert_path",
-                            path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    if let Some(path) = client_cert {
+                        let cache_key =
+                            tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_cert_file(
+                                "mesh_route_dispatch.backend_tls.client_cert_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
-                    if let Some(path) = client_key
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_key_file(
-                            "mesh_route_dispatch.backend_tls.client_key_path",
-                            path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    if let Some(path) = client_key {
+                        let cache_key =
+                            tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_key_file(
+                                "mesh_route_dispatch.backend_tls.client_key_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
-                    if let Some(path) = server_ca.filter(|path| !path.is_empty())
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_cert_file(
-                            "mesh_route_dispatch.backend_tls.server_ca_cert_path",
+                    if let Some(path) = server_ca.filter(|path| !path.is_empty()) {
+                        let cache_key = tls_validation_cache_key(
+                            crate::tls::source::MaterialKind::CaBundle,
                             path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        );
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_ca_file(
+                                "mesh_route_dispatch.backend_tls.server_ca_cert_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
                 }
             }

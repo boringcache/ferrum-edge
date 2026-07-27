@@ -163,14 +163,30 @@ pub fn build_backend_dtls_config(
     let skip_verify = !proxy.resolved_tls.verify_server_cert || tls_no_verify;
 
     // Load client certificate for mutual TLS, or generate an ephemeral one.
-    let certificate = if let (Some(cert_path), Some(key_path)) = (
+    let certificate = match (
         &proxy.resolved_tls.client_cert_path,
         &proxy.resolved_tls.client_key_path,
     ) {
-        load_dtls_certificate(cert_path, key_path)?
-    } else {
-        generate_ephemeral_cert()?
+        (Some(cert_path), Some(key_path)) => load_dtls_certificate(cert_path, key_path)?,
+        (None, None) => generate_ephemeral_cert()?,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "DTLS backend mTLS client certificate and private key must be configured together"
+            ));
+        }
     };
+
+    // A declared custom trust source remains an admission requirement even
+    // when no-verify disables use of the resulting verifier.
+    if skip_verify
+        && let Some(ca_path) = proxy
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref()
+            .or(global_ca_bundle_path)
+    {
+        load_root_store_from_pem(ca_path)?;
+    }
 
     let config = Arc::new(Config::default());
     let (server_name, server_cert_verifier) = if skip_verify {
@@ -1584,28 +1600,31 @@ pub fn load_dtls_certificate(
         )
     })?;
 
-    // dimpl presents one certificate, but validate every declared record so a
-    // malformed later chain entry cannot be silently ignored.
-    let cert_der = crate::tls::parse_pem_certificate_bundle(
+    // dimpl can present exactly one certificate. Reject a declared chain
+    // instead of validating every record and then publishing only the leaf.
+    let cert_chain = crate::tls::parse_pem_certificate_bundle(
         cert_material.bytes.expose_secret(),
         "DTLS certificate",
         &cert_material.display_source_id,
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| {
+    )?;
+    if cert_chain.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "DTLS certificate source '{}' must contain exactly one CERTIFICATE record because the DTLS stack cannot present a chain",
+            cert_material.display_source_id
+        ));
+    }
+    let cert_der = cert_chain.into_iter().next().ok_or_else(|| {
         anyhow::anyhow!(
             "DTLS certificate: no certificate found in {}",
             cert_material.display_source_id
         )
     })?;
 
-    let mut key_reader = key_material.bytes.expose_secret();
-    let key_der = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
-        })?;
+    let key_der = crate::tls::parse_pem_private_key(
+        key_material.bytes.expose_secret(),
+        "DTLS private key",
+        &key_material.display_source_id,
+    )?;
 
     rustls::sign::CertifiedKey::from_der(
         vec![cert_der.clone()],

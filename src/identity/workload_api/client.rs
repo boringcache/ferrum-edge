@@ -31,7 +31,7 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 #[cfg(unix)]
 use tracing::info;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::latest_wins;
 use super::proto::X509svidRequest;
@@ -332,6 +332,18 @@ fn svid_response_to_bundle(
         .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
     crate::identity::file_loader::verify_leaf_key_match(leaf_der, &first.x509_svid_key)
         .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    for (index, intermediate) in cert_chain_der.iter().enumerate().skip(1) {
+        crate::identity::file_loader::validate_cert_is_current(
+            intermediate,
+            &format!("SVID intermediate certificate #{index}"),
+        )
+        .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+    }
+    crate::identity::file_loader::validate_certificate_chain_order(
+        &cert_chain_der,
+        "SVID certificate chain",
+    )
+    .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
 
     let local_bundle_der = split_concatenated_der(&first.bundle)
         .map_err(|e| WorkloadApiClientError::Rpc(format!("trust bundle parse failed: {e}")))?;
@@ -346,6 +358,15 @@ fn svid_response_to_bundle(
                 .into(),
         ));
     }
+    crate::tls::root_cert_store_from_certificates(
+        local_bundle_der
+            .iter()
+            .cloned()
+            .map(rustls::pki_types::CertificateDer::from),
+        "Workload API local trust bundle",
+        trust_domain.as_str(),
+    )
+    .map_err(|error| WorkloadApiClientError::Rpc(error.to_string()))?;
 
     let mut trust_bundles = TrustBundleSet {
         local: TrustBundle {
@@ -363,26 +384,41 @@ fn svid_response_to_bundle(
     };
 
     for (td_str, bundle_bytes) in msg.federated_bundles {
-        match parse_trust_domain_key(&td_str) {
-            Ok(td) => match split_concatenated_der(&bundle_bytes) {
-                Ok(certs) => {
-                    trust_bundles.federated.insert(
-                        td.clone(),
-                        TrustBundle {
-                            trust_domain: td,
-                            x509_authorities: certs,
-                            jwt_authorities: Vec::new(),
-                            refresh_hint_seconds: None,
-                        },
-                    );
-                }
-                Err(e) => warn!("federated bundle for '{}' is malformed: {}", td_str, e),
-            },
-            Err(e) => warn!(
-                "federated bundle key '{}' is not a trust domain: {}",
-                td_str, e
-            ),
+        let td = parse_trust_domain_key(&td_str).map_err(|_error| {
+            WorkloadApiClientError::Rpc(
+                "Workload API response contains an invalid federated trust-domain key".to_string(),
+            )
+        })?;
+        if td == trust_domain || trust_bundles.federated.contains_key(&td) {
+            return Err(WorkloadApiClientError::Rpc(format!(
+                "Workload API response declares trust domain '{}' more than once",
+                td
+            )));
         }
+        let certs = split_concatenated_der(&bundle_bytes).map_err(|_error| {
+            WorkloadApiClientError::Rpc(format!(
+                "Workload API federated trust bundle for '{}' contains malformed DER",
+                td
+            ))
+        })?;
+        crate::tls::root_cert_store_from_certificates(
+            certs
+                .iter()
+                .cloned()
+                .map(rustls::pki_types::CertificateDer::from),
+            "Workload API federated trust bundle",
+            td.as_str(),
+        )
+        .map_err(|error| WorkloadApiClientError::Rpc(error.to_string()))?;
+        let _ = trust_bundles.federated.insert(
+            td.clone(),
+            TrustBundle {
+                trust_domain: td,
+                x509_authorities: certs,
+                jwt_authorities: Vec::new(),
+                refresh_hint_seconds: None,
+            },
+        );
     }
 
     Ok(SvidBundle {
@@ -403,9 +439,21 @@ fn svid_response_to_bundle(
 /// indefinite-length here would yield an empty (zero-length) cert that
 /// blows up downstream with a less clear error.
 fn split_concatenated_der(buf: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if buf.len() > crate::tls::MAX_PEM_MATERIAL_BYTES {
+        return Err(format!(
+            "certificate material exceeds the {} byte admission limit",
+            crate::tls::MAX_PEM_MATERIAL_BYTES
+        ));
+    }
     let mut out = Vec::new();
     let mut cursor = 0;
     while cursor < buf.len() {
+        if out.len() >= crate::tls::MAX_PEM_CERTIFICATE_RECORDS {
+            return Err(format!(
+                "certificate material exceeds the {} record admission limit",
+                crate::tls::MAX_PEM_CERTIFICATE_RECORDS
+            ));
+        }
         if buf[cursor] != 0x30 {
             return Err(format!("expected SEQUENCE tag at offset {cursor}"));
         }

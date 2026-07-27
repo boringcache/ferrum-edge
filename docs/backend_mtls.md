@@ -65,6 +65,12 @@ The gateway resolves backend CA trust in the following order:
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 
+No-verify changes handshake verification only. Ferrum still materializes and
+atomically validates any explicitly declared custom CA for HTTP-family, gRPC
+health-probe, DTLS, LDAP, TCP logging, and WebSocket logging clients. An empty,
+malformed, or unusable selected bundle is therefore a configuration error even
+when verification is disabled.
+
 > **Trust roots — backend proxy path.**
 > The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
@@ -95,7 +101,9 @@ declared `CERTIFICATE` record must parse, every custom CA record must be usable
 as a trust root, and a selected custom bundle must contain at least one
 certificate. A failure rejects the complete startup/reload candidate; Ferrum
 never installs only the surviving subset, and existing live pools/health
-clients keep their last-known-good generation.
+clients keep their last-known-good generation. Shared PEM admission limits each
+certificate/key source to 4 MiB and each certificate bundle to 4096 records so
+provider- or file-controlled input cannot drive unbounded parsing work.
 
 ### Per-Proxy Configuration
 

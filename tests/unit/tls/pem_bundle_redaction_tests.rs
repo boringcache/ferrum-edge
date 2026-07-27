@@ -1,6 +1,8 @@
 //! PEM bundle parse and trust-root admission diagnostics must not echo malformed
 //! PEM lines, DER bytes, or rustls library error text.
 
+use ferrum_edge::config::types::validate_pem_key_file;
+use ferrum_edge::tls::source::{CertSource, MaterialKind};
 use ferrum_edge::tls::{build_client_cert_verifier, check_cert_expiry};
 use rcgen::{CertificateParams, KeyPair};
 use tempfile::TempDir;
@@ -69,6 +71,42 @@ fn malformed_pem_section_start_error_withholds_marker_bearing_line() {
         error.contains("malformed PEM certificate record"),
         "got: {error}"
     );
+}
+
+#[test]
+fn malformed_private_key_error_withholds_marker_bearing_input() {
+    let dir = TempDir::new().unwrap();
+    let key = format!(
+        "-----BEGIN PRIVATE KEY-----\n{PEM_MARKER}\n-----END PRIVATE KEY-----\n"
+    );
+    let path = write_pem(&dir, "malformed-key.pem", &key);
+
+    let error = validate_pem_key_file("backend TLS client key", &path)
+        .expect_err("malformed private key must fail admission");
+
+    assert!(
+        !error.contains(PEM_MARKER),
+        "malformed key input must not echo in diagnostics: {error}"
+    );
+    assert!(error.contains("private key"), "got: {error}");
+    assert!(error.contains("malformed-key.pem"), "got: {error}");
+    assert!(error.contains("malformed"), "got: {error}");
+}
+
+#[test]
+fn file_uri_credentials_are_rejected_without_echoing_them() {
+    let source = format!("file://operator:{PEM_MARKER}@localhost/key.pem");
+    let debug = format!("{:?}", CertSource::parse(&source, MaterialKind::Key));
+    let error = validate_pem_key_file("backend TLS client key", &source)
+        .expect_err("credential-bearing file URI must be rejected");
+
+    assert!(!debug.contains(PEM_MARKER), "debug output leaked: {debug}");
+    assert!(
+        !error.contains(PEM_MARKER),
+        "file URI credential must not echo in diagnostics: {error}"
+    );
+    assert!(error.contains("file URI credentials are not permitted"));
+    assert!(error.contains("<redacted source reference>"));
 }
 
 #[test]

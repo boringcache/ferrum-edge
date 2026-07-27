@@ -1764,20 +1764,34 @@ async fn build_grpc_probe_channel_no_verify(
     let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
     let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let certs = load_probe_tls_certificates(
-            cert_path,
-            MaterialKind::Cert,
-            "gRPC health probe client cert",
-        )
-        .map_err(std::io::Error::other)?;
-        let key_data =
-            load_probe_tls_material(key_path, MaterialKind::Key, "gRPC health probe client key")
-                .map_err(std::io::Error::other)?;
-        let key = rustls_pemfile::private_key(&mut &key_data[..])?.ok_or("No private key found")?;
-        builder.with_client_auth_cert(certs, key)?
-    } else {
-        builder.with_no_client_auth()
+    let mut client_config = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = load_probe_tls_certificates(
+                cert_path,
+                MaterialKind::Cert,
+                "gRPC health probe client cert",
+            )
+            .map_err(std::io::Error::other)?;
+            let key_source = CertSource::parse(key_path, MaterialKind::Key);
+            let key_material = load_material_blocking(&key_source, MaterialKind::Key)
+                .map_err(|error| {
+                    std::io::Error::other(format!("gRPC health probe client key: {error}"))
+                })?;
+            let key = crate::tls::parse_pem_private_key(
+                key_material.bytes.expose_secret(),
+                "gRPC health probe client key",
+                &key_material.display_source_id,
+            )
+            .map_err(std::io::Error::other)?;
+            builder.with_client_auth_cert(certs, key)?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(std::io::Error::other(
+                "gRPC health probe mTLS client certificate and private key must be configured together",
+            )
+            .into());
+        }
     };
 
     // Disable server cert verification

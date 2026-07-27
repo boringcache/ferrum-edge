@@ -1376,6 +1376,13 @@ fn build_ldap_tls_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("ldap_auth: failed to build rustls client config: {e}"))?;
 
+    // An explicit CA remains a configuration requirement when verification is
+    // disabled. Materialize it before branching so no-verify cannot hide a
+    // malformed, empty, or unusable custom trust store.
+    let custom_root_store = ca_bundle_path
+        .map(|ca_path| build_ldap_root_store(Some(ca_path)))
+        .transpose()?;
+
     let config = if no_verify {
         warn!("ldap_auth: TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY=true)");
         builder
@@ -1390,7 +1397,9 @@ fn build_ldap_tls_config(
         // equivalent to the default root-store verifier. `build_server_verifier_with_crls`
         // uses `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
         // so certs from CAs without a matching CRL are still accepted.
-        let root_store = build_ldap_root_store(ca_bundle_path)?;
+        let root_store = custom_root_store.unwrap_or_else(|| {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        });
         let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
             .map_err(|e| format!("ldap_auth: failed to build TLS verifier: {e}"))?;
         builder.with_webpki_verifier(verifier).with_no_client_auth()
@@ -2012,7 +2021,18 @@ mod tests {
         let f = must(NamedTempFile::new(), "create empty temp CA file");
         let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
         assert!(
-            err.contains("no valid CA certificates"),
+            err.contains("no valid PEM certificates"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn no_verify_still_rejects_empty_declared_ca_bundle() {
+        ensure_crypto_provider();
+        let f = must(NamedTempFile::new(), "create empty temp CA file");
+        let err = build_ldap_tls_config(true, f.path().to_str(), &[]).unwrap_err();
+        assert!(
+            err.contains("no valid PEM certificates"),
             "unexpected error: {err}"
         );
     }
