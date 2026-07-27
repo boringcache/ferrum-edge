@@ -1309,7 +1309,7 @@ mod peer_departure {
             other => panic!("expected a 499 reject, got {other:?}"),
         }
         assert!(
-            ctx.metadata.get("fault_abort_status").is_none(),
+            !ctx.metadata.contains_key("fault_abort_status"),
             "the abort must not also fire for a departed client"
         );
     }
@@ -1334,7 +1334,7 @@ mod peer_departure {
         assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
         assert_eq!(ctx.metadata.get("fault_delay_ms").unwrap(), "1");
         assert!(
-            ctx.metadata.get("fault_delay_outcome").is_none(),
+            !ctx.metadata.contains_key("fault_delay_outcome"),
             "a completed delay must not add an outcome field"
         );
     }
@@ -1354,8 +1354,8 @@ mod peer_departure {
             let mut ctx = ctx_with_peer(&gone);
             let result = run_before_proxy(&plugin, &mut ctx).await;
             assert!(matches!(result, PluginResult::Continue));
-            assert!(ctx.metadata.get("fault_delay_ms").is_none());
-            assert!(ctx.metadata.get("fault_delay_outcome").is_none());
+            assert!(!ctx.metadata.contains_key("fault_delay_ms"));
+            assert!(!ctx.metadata.contains_key("fault_delay_outcome"));
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -1379,6 +1379,6 @@ mod peer_departure {
 
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
-        assert!(ctx.metadata.get("fault_delay_outcome").is_none());
+        assert!(!ctx.metadata.contains_key("fault_delay_outcome"));
     }
 }
