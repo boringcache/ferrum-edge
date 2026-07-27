@@ -1783,9 +1783,8 @@ fn redis_failure_policy_is_accepted_by_every_rate_limit_consumer() {
     ];
 
     for (plugin, config) in cases {
-        let policy = rate_limit_redis_failure_policy(plugin, &config).unwrap_or_else(|error| {
-            panic!("{plugin} must accept redis_failure_policy: {error}")
-        });
+        let policy = rate_limit_redis_failure_policy(plugin, &config)
+            .unwrap_or_else(|error| panic!("{plugin} must accept redis_failure_policy: {error}"));
         assert_eq!(
             policy,
             Some(RedisFailurePolicy::LocalFallback),

@@ -1581,9 +1581,7 @@ impl RedisRateLimitClient {
                     }
                     Err(_) => {
                         if was_available && !topology_unsupported.load(Ordering::Relaxed) {
-                            warn!(
-                                "Redis health check failed — centralized Redis unavailable"
-                            );
+                            warn!("Redis health check failed — centralized Redis unavailable");
                         }
                         available.store(false, Ordering::Relaxed);
                     }

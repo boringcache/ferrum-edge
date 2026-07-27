@@ -2468,9 +2468,7 @@ pub mod _test_support {
 
         let http = PluginHttpClient::default();
         match plugin_name {
-            "rate_limiting" => {
-                Ok(RateLimiting::new(config, http)?.redis_failure_policy_for_test())
-            }
+            "rate_limiting" => Ok(RateLimiting::new(config, http)?.redis_failure_policy_for_test()),
             "graphql" => Ok(GraphqlPlugin::new(config, http)?.redis_failure_policy_for_test()),
             "grpc_method_router" => {
                 Ok(GrpcMethodRouter::new(config, http)?.redis_failure_policy_for_test())

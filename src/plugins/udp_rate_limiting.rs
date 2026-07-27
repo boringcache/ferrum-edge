@@ -9,8 +9,8 @@ use tracing::warn;
 
 use super::utils::rate_limit::{
     RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
-    UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup,
-    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
+    UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,

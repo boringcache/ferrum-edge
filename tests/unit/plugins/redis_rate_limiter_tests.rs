@@ -1327,7 +1327,10 @@ fn parse_cluster_enabled_recognizes_only_a_reported_value() {
     assert_eq!(parse_cluster_enabled("cluster_enabled:2"), Some(true));
     // Absent / unparseable stays unknown so RESP-compatible servers that do not
     // report the field are never rejected by the proactive screen.
-    assert_eq!(parse_cluster_enabled("# Server\r\nredis_version:7.2.4"), None);
+    assert_eq!(
+        parse_cluster_enabled("# Server\r\nredis_version:7.2.4"),
+        None
+    );
     assert_eq!(parse_cluster_enabled(""), None);
     assert_eq!(parse_cluster_enabled("cluster_enabled:"), None);
     assert_eq!(parse_cluster_enabled("cluster_enabled_extra:1"), None);
@@ -1389,10 +1392,7 @@ fn slot_keys_of_one_rate_key_share_a_hash_tag() {
     // are escaped so distinct prefix/rate-key pairs cannot collapse onto the
     // same logical tag.
     let hostile = redis_slot_key(config(), "identity}:x%y{z", &["42"]);
-    assert_eq!(
-        hash_tag(&hostile),
-        "ferrum%3Atest:identity%7D%3Ax%25y%7Bz"
-    );
+    assert_eq!(hash_tag(&hostile), "ferrum%3Atest:identity%7D%3Ax%25y%7Bz");
     assert_ne!(hash_tag(&hostile), hash_tag(&curr));
 }
 
@@ -1521,7 +1521,10 @@ async fn cluster_redirection_error_permanently_disables_the_endpoint() {
     let client = redis_rate_limit_client_for_test(config);
 
     let first = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
-    assert!(first.is_err(), "a MOVED redirection must fail the operation");
+    assert!(
+        first.is_err(),
+        "a MOVED redirection must fail the operation"
+    );
     assert!(
         client.is_topology_unsupported(),
         "MOVED proves the endpoint is a Cluster this client cannot enforce against"
