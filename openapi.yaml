@@ -17467,7 +17467,12 @@ components:
 
     WafPluginConfig:
       type: object
-      description: "Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family requests and optional responses."
+      additionalProperties: false
+      description: >-
+        Plugin: waf — OWASP-style content-pattern threat detection for HTTP-family
+        requests and optional responses. Fixed-shape objects reject unknown keys;
+        intentionally open maps are rule_modes / rule_overrides (rule-id keys),
+        conditions.headers, and global_exemptions.header_present.
       properties:
         mode:
           type: string
@@ -17565,6 +17570,7 @@ components:
                   type: string
               conditions:
                 type: object
+                additionalProperties: false
                 properties:
                   paths:
                     type: array
@@ -17594,6 +17600,7 @@ components:
           default: []
         scoring:
           type: object
+          additionalProperties: false
           description: >-
             Anomaly scoring. When enabled, every matched rule contributes its
             severity weight (or per-rule score) to this WAF instance's cumulative
@@ -17677,6 +17684,7 @@ components:
 
     WafStreamConfig:
       type: object
+      additionalProperties: false
       description: >
         Optional raw TCP/UDP inspection. When present the WAF also attaches to
         stream proxies. L7 signature scanning runs over plaintext application
@@ -17710,6 +17718,7 @@ components:
 
     WafStreamSignature:
       type: object
+      additionalProperties: false
       required: [id, pattern]
       properties:
         id:
@@ -17729,6 +17738,7 @@ components:
 
     WafRule:
       type: object
+      additionalProperties: false
       required: [id, category, target]
       properties:
         id:
@@ -17773,6 +17783,7 @@ components:
                 - response_headers
                 - response_body
             - type: object
+              additionalProperties: false
               required: [type]
               not:
                 required: [path]
@@ -17790,6 +17801,7 @@ components:
                     type: string
                     minLength: 1
             - type: object
+              additionalProperties: false
               required: [type, path]
               not:
                 required: [names]
@@ -17802,6 +17814,7 @@ components:
                   description: >-
                     Required dotted JSON path for body_json_path targets.
             - type: object
+              additionalProperties: false
               required: [type]
               not:
                 anyOf:
@@ -17852,6 +17865,7 @@ components:
           description: Anomaly-score contribution when scoring is enabled; defaults to the per-severity weight.
         conditions:
           type: object
+          additionalProperties: false
           properties:
             paths:
               type: array
@@ -17877,6 +17891,7 @@ components:
 
     WafExemptions:
       type: object
+      additionalProperties: false
       properties:
         paths:
           type: array
@@ -20752,6 +20767,7 @@ components:
 
     AiRateLimiterConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
