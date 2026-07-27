@@ -31,6 +31,7 @@ mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
 mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
+mod db_mutation_decode_fail_closed_tests;
 mod db_offline_bootstrap_tests;
 mod db_proxy_plugin_association_fail_closed_tests;
 mod db_row_decode_rejection_tests;
@@ -90,5 +91,6 @@ mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module

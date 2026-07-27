@@ -132,7 +132,20 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is `{FERRUM_NAMESPACE}:{plugin_name}`.
+- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is
+  `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
+  isolates independent policies of one plugin type inside a namespace while
+  replicas of the same policy keep sharing a budget. An explicit
+  `redis_key_prefix` is the shared-budget opt-in.
+- Every rate-limit window is bounded by `MAX_RATE_LIMIT_WINDOW_SECONDS`
+  (2678400), and ordinary HTTP/GraphQL/gRPC request caps are bounded by
+  `MAX_RATE_LIMIT_MAX_REQUESTS` (1000000);
+  TTL/retention math uses the saturating helpers in
+  `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
+  `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
+  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
+  rate-limit plugin roots are closed key sets; AI and WebSocket rate-limit
+  roots remain intentionally open and must stay in parity with OpenAPI.
 - Redis outage falls back to in-memory and reconnects in the background.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.

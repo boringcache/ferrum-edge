@@ -1376,6 +1376,10 @@ impl RemoteDiscoveryConfig {
         )
     }
 
+    /// Explicit poll/security knobs are constructor parameters so remote-discovery
+    /// cannot silently inherit defaults that weaken revision gating or JWT/TLS
+    /// posture.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_max_stale(
         interval_seconds: u64,
         timeout_seconds: u64,
@@ -1999,6 +2003,14 @@ pub struct NativeRemoteSource {
     node_id: String,
     namespace: String,
     jwt_secret: GrpcJwtSecret,
+    /// Target-cluster JWT audience this poller mints into every discovery
+    /// token (issue #2475). Derived from the STABLE, operator-visible
+    /// `RemoteCluster.name` — never from `control_plane_url`, which is mutable
+    /// and would rebind the credential every time an endpoint moved. The
+    /// receiving control plane compares it against its own
+    /// `FERRUM_MESH_CLUSTER_AUDIENCE`, so a token minted for cluster B is
+    /// refused by cluster C even when B and C share a JWT secret and issuer.
+    audience: String,
     tls_config: Option<DpGrpcTlsConfig>,
     request_timeout: Duration,
 }
@@ -2010,6 +2022,7 @@ impl NativeRemoteSource {
             node_id: ctx.config.node_id.clone(),
             namespace: ctx.config.namespace.clone(),
             jwt_secret,
+            audience: crate::grpc::auth::remote_discovery_audience(&ctx.cluster_name),
             tls_config: ctx
                 .config
                 .tls_config
@@ -2027,6 +2040,7 @@ impl RemoteServiceSource for NativeRemoteSource {
             &self.node_id,
             &self.namespace,
             &self.jwt_secret,
+            &self.audience,
             self.tls_config.as_ref(),
             self.request_timeout,
         )
@@ -2086,10 +2100,11 @@ async fn fetch_remote_slice(
     node_id: &str,
     namespace: &str,
     jwt_secret: &GrpcJwtSecret,
+    audience: &str,
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
 ) -> Result<crate::modes::mesh::slice::MeshSlice, String> {
-    use crate::grpc::dp_client::generate_dp_jwt_with_issuer_and_namespace;
+    use crate::grpc::dp_client::generate_dp_jwt_full;
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
@@ -2119,11 +2134,16 @@ async fn fetch_remote_slice(
             .connect()
             .await
             .map_err(|e| format!("connect to remote CP: {e}"))?;
-        let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+        // Bind the token to the TARGET CLUSTER, not just to the credential:
+        // issuer + expiry + signature cannot express "this token is for
+        // cluster B", so a shared secret used by B and C made B's token valid
+        // at C. The `aud` closes that (issue #2475).
+        let auth_token = generate_dp_jwt_full(
             jwt_secret.as_str(),
             node_id,
             jwt_secret.issuer(),
             Some(namespace),
+            Some(audience),
         )
         .map_err(|e| format!("mint remote CP JWT: {e}"))?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
@@ -2144,6 +2164,10 @@ async fn fetch_remote_slice(
             labels: HashMap::new(),
             waypoint_name: String::new(),
             ambient_udp_source_scoping: false,
+            // Declares the CROSS-CLUSTER subscription class, selecting the
+            // remote-discovery audience policy on the receiving CP. Both
+            // classes fail closed there, so this flag widens nothing.
+            remote_discovery: true,
         };
         // Derive the expectation from the request actually sent, so the two can
         // never drift apart.
@@ -4374,7 +4398,10 @@ mod tests {
     // cross-cluster deployment under network churn/loss stays an infra-level
     // verification step.
 
-    use crate::grpc::auth::verify_grpc_jwt_metadata;
+    use crate::grpc::auth::{
+        GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience,
+        verify_grpc_jwt_metadata_with_audience,
+    };
     use crate::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
     use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
     use crate::modes::mesh::slice::MeshSlice;
@@ -4385,6 +4412,10 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
     use tonic::{Request, Response, Status};
+
+    /// Cluster name every `remote_ctx` poll context uses, and therefore the
+    /// identity the stub CP expects in the discovery token's `aud`.
+    const STUB_CLUSTER_NAME: &str = "west";
 
     /// What the stub remote CP emits on a `MeshSubscribe`.
     #[derive(Clone, Copy)]
@@ -4426,7 +4457,22 @@ mod tests {
             request: Request<MeshSubscribeRequest>,
         ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
             if let Some(secret) = &self.verify_secret {
-                verify_grpc_jwt_metadata(request.metadata(), secret.as_str(), secret.issuer())?;
+                // Mirror the real `MeshGrpcServer` policy selection: a
+                // cross-cluster poll must present this cluster's discovery
+                // audience; anything else must not carry a reserved one.
+                let expected = remote_discovery_audience(STUB_CLUSTER_NAME);
+                let policy = if request.get_ref().remote_discovery {
+                    GrpcAudiencePolicy::Required(&expected)
+                } else {
+                    GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
+                };
+                verify_grpc_jwt_metadata_with_audience(
+                    request.metadata(),
+                    secret.as_str(),
+                    secret.issuer(),
+                    policy,
+                )
+                .map_err(|(status, _)| status)?;
             }
 
             let slice_update = MeshConfigUpdate {
@@ -4562,7 +4608,7 @@ mod tests {
         request_timeout: Duration,
     ) -> RemoteClusterPollContext {
         RemoteClusterPollContext {
-            cluster_name: "west".to_string(),
+            cluster_name: STUB_CLUSTER_NAME.to_string(),
             trust_domain: td("remote.local"),
             network: None,
             control_plane_url: url.to_string(),
