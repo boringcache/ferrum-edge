@@ -252,6 +252,7 @@ impl UdpRateLimiting {
     /// Exercise the production dual-gate decision with an isolated global
     /// limiter so parallel external tests never mutate process-global state.
     #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
         &self,
         global: &AtomicLogRateLimiter,
@@ -264,12 +265,14 @@ impl UdpRateLimiting {
 
     /// Observed per-instance suppressed-event accumulator. Test-only.
     #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn rejection_warn_suppressed_count_for_test(&self) -> u64 {
         self.rejection_warn.suppressed_count_for_test()
     }
 
     /// Reset this instance's rejection diagnostic limiter. Test-only.
     #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn reset_rate_limit_rejection_warn_for_test(&self) {
         self.rejection_warn.reset_for_test();
     }
