@@ -4045,8 +4045,11 @@ fn test_admin_charges_path_is_non_owning_when_unconfigured() {
             && charges_block.contains("empty_charges_prometheus"),
         "GET /charges must render empty shapes without claiming the registry"
     );
+    // `try_global_registry()` contains the substring `global_registry()`; strip
+    // the non-owning helper so this assertion only catches owning calls.
+    let without_try = charges_block.replace("try_global_registry()", "");
     assert!(
-        !charges_block.contains("global_registry()"),
+        !without_try.contains("global_registry()"),
         "GET /charges must not call owning global_registry()"
     );
 }
