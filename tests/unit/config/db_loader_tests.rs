@@ -2766,9 +2766,9 @@ async fn write_topology_permit_blocks_failover_until_dropped() {
         database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
     });
 
-    failover_before_lock_rx
-        .await
-        .expect("failover reconnect must reach the transition write lock while the mutation pin is held");
+    failover_before_lock_rx.await.expect(
+        "failover reconnect must reach the transition write lock while the mutation pin is held",
+    );
     // Deterministic: the writer cannot enter while_holding until readers drop.
     assert!(
         !failover_holding.load(Ordering::SeqCst),
@@ -2871,7 +2871,11 @@ async fn failover_before_admit_rejects_without_opt_in() {
     let admit_task = tokio::spawn(async move {
         let permit = admit_store.acquire_write_topology_permit().await;
         let status = admit_store.failover_topology_status();
-        (permit.is_pinned(), status.primary_active, status.allow_writes)
+        (
+            permit.is_pinned(),
+            status.primary_active,
+            status.allow_writes,
+        )
     });
 
     // Give the admit task a chance to block on the write lock (no sleeps: the
@@ -2884,7 +2888,10 @@ async fn failover_before_admit_rejects_without_opt_in() {
     let (pinned, primary_active, allow_writes) = admit_task.await.expect("join admit");
     database_store_set_reconnect_transition_hooks_for_test(&store, None);
 
-    assert!(pinned, "admit after failover must still take a topology pin");
+    assert!(
+        pinned,
+        "admit after failover must still take a topology pin"
+    );
     assert!(!primary_active, "admit must observe published failover");
     assert!(
         !allow_writes,

@@ -683,10 +683,9 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
 
-    let err = state
-        .admit_write()
-        .await
-        .expect_err("admit_write must fail closed on failover without opt-in");
+    let Err(err) = state.admit_write().await else {
+        panic!("admit_write must fail closed on failover without opt-in");
+    };
     assert_eq!(err.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
 }
 

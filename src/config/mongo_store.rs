@@ -1519,9 +1519,7 @@ mod inner {
         /// by external unit tests through `_test_support` to prove Admin /
         /// admission publication gating without network I/O.
         #[allow(dead_code)] // exercised via external unit tests through the lib target
-        pub fn new_unconnected_for_test(
-            failover_urls: Vec<String>,
-        ) -> Result<Self, anyhow::Error> {
+        pub fn new_unconnected_for_test(failover_urls: Vec<String>) -> Result<Self, anyhow::Error> {
             let settings = MongoConnSettings {
                 database_name: "test".to_string(),
                 app_name: None,
@@ -13538,7 +13536,11 @@ mod inner {
             let blocked_admin = store
                 .install_reconnected_bundle(connection_bundle("blocked_admin"), false)
                 .expect_err("an Admin write-topology pin must block bundle replacement");
-            assert!(blocked_admin.to_string().contains("Admin write-topology permit"));
+            assert!(
+                blocked_admin
+                    .to_string()
+                    .contains("Admin write-topology permit")
+            );
             assert_eq!(store.db().name(), "test");
             // Nested admission acquire while Admin pin is held must not deadlock
             // (distinct fair RwLocks).

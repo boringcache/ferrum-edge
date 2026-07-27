@@ -14,8 +14,8 @@ use ferrum_edge::_test_support::{
     mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
     mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
     mongo_store_acquire_connection_generation_pin_for_test, mongo_store_new_unconnected_for_test,
-    mongo_store_published_database_name_for_test, mongo_store_try_publish_reconnected_bundle_for_test,
-    mtls_dns_policy_requires_consumer_load,
+    mongo_store_published_database_name_for_test,
+    mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
@@ -868,7 +868,9 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         .expect("publish_reconnected_bundle body");
     let admin_try_write_at = publish_body
         .find("admin_write_topology.try_write()")
-        .expect("publish_reconnected_bundle must fail-fast on the Admin write-topology guard first");
+        .expect(
+            "publish_reconnected_bundle must fail-fast on the Admin write-topology guard first",
+        );
     let generation_try_write_at = publish_body
         .find("connection_generation.try_write()")
         .expect("publish_reconnected_bundle must fail-fast on the generation guard second");
