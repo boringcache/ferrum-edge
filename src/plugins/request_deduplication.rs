@@ -1972,6 +1972,11 @@ impl RequestDeduplication {
             response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
+        // A size-admission failure replaces the in-flight owner with a
+        // non-replayable execution barrier. Never let that replacement expire
+        // before the lease it supersedes, even when the replayable response
+        // itself would have used the shorter configured TTL.
+        let execution_barrier_retention = retention.max(self.inflight_ttl);
         let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
             Entry::Occupied(entry) => entry,
@@ -1993,12 +1998,15 @@ impl RequestDeduplication {
                 if self.try_reserve_execution_barrier() {
                     entry.insert(DeduplicationEntry::ExecutionBarrier {
                         inserted_at,
-                        retention,
+                        retention: execution_barrier_retention,
                         fingerprint: fingerprint.to_string(),
                         owner_token: owner_token.to_string(),
                     });
                 } else {
-                    self.extend_execution_barrier_overflow(inserted_at, retention);
+                    self.extend_execution_barrier_overflow(
+                        inserted_at,
+                        execution_barrier_retention,
+                    );
                 }
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
@@ -2019,12 +2027,15 @@ impl RequestDeduplication {
                 if self.try_reserve_execution_barrier() {
                     entry.insert(DeduplicationEntry::ExecutionBarrier {
                         inserted_at,
-                        retention,
+                        retention: execution_barrier_retention,
                         fingerprint: fingerprint.to_string(),
                         owner_token: owner_token.to_string(),
                     });
                 } else {
-                    self.extend_execution_barrier_overflow(inserted_at, retention);
+                    self.extend_execution_barrier_overflow(
+                        inserted_at,
+                        execution_barrier_retention,
+                    );
                 }
             }
             let redis_candidate = if self.redis_client.is_some() {

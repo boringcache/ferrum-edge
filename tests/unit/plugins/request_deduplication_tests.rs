@@ -2397,6 +2397,55 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
     }
 }
 
+/// A response-byte admission skip must not shorten an external operation's
+/// protection when the replay TTL is shorter than the in-flight lease.
+#[tokio::test]
+async fn oversized_external_operation_barrier_outlives_short_replay_ttl() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 1,
+        "inflight_ttl_seconds": 60,
+        "max_entry_size_bytes": 1,
+        "max_total_size_bytes": 8192
+    }));
+    let mut owner_ctx = new_ctx("POST", "/api");
+    let mut owner_headers =
+        HashMap::from([("idempotency-key".to_string(), "long-lease".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut owner_ctx, &mut owner_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    owner_ctx.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut owner_ctx, 200, &HashMap::new(), b"executed")
+            .await,
+        PluginResult::Continue
+    ));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let mut retry_ctx = new_ctx("POST", "/api");
+    let mut retry_headers =
+        HashMap::from([("idempotency-key".to_string(), "long-lease".to_string())]);
+    assert!(
+        matches!(
+            plugin
+                .before_proxy(&mut retry_ctx, &mut retry_headers)
+                .await,
+            PluginResult::Reject {
+                status_code: 409,
+                ..
+            }
+        ),
+        "the size-skip barrier expired at ttl_seconds instead of inflight_ttl_seconds"
+    );
+}
+
 /// Per-key execution barriers are hard-capped. Additional completed operations
 /// collapse into one fixed process-global refusal deadline rather than growing
 /// attacker-influenced key storage or failing open.
