@@ -1442,7 +1442,7 @@ mod inner {
         ///      mutation holds [`DatabaseBackend::acquire_write_topology_permit`]
         ///   2. `connection_generation` — blocks publication while admission
         ///      pins the current generation
-        ///   Readers never nest both locks on the same fair `RwLock`. Admin
+        /// - Readers never nest both locks on the same fair `RwLock`. Admin
         ///   permits use only (1); admission uses only (2); publication takes
         ///   exclusive sides in that order. A deferred reconnect leaves
         ///   topology untouched.

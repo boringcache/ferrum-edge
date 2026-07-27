@@ -976,9 +976,11 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
             || mongo_acquire.contains("self.admin_write_topology.clone().read_owned().await"),
         "Mongo write admit must pin via admin_write_topology read_owned:\n{mongo_acquire}"
     );
+    // Forbid code expressions that acquire/read the admission lock. Comments may
+    // still name `connection_generation` when explaining why the locks are distinct.
     assert!(
-        !mongo_acquire.contains("connection_generation"),
-        "Mongo write admit must not nest on connection_generation:\n{mongo_acquire}"
+        !mongo_acquire.contains("connection_generation."),
+        "Mongo write admit must not acquire/read connection_generation:\n{mongo_acquire}"
     );
 
     // All Mongo publication paths funnel through publish_reconnected_bundle.
