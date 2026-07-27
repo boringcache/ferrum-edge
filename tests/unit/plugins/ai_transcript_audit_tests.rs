@@ -7882,12 +7882,12 @@ async fn rate_limited_candidate_is_not_teed_with_streaming_capture_on() {
     );
 }
 
-/// A capture-time reservation that never emits must release its slot so a later
-/// candidate in the same window can be admitted. Configured as a sampling loser
-/// that only *might* emit via `always_capture_on_error`; a successful 200 path
-/// does not emit, drops staging, and frees the reservation.
+/// A sampling loser that may emit only through `always_capture_on_error` must
+/// not reserve finite RPM budget before its response is known. Otherwise a slow
+/// successful request can occupy the only slot and suppress a concurrent error
+/// record before the successful request releases its speculative reservation.
 #[tokio::test]
-async fn discarded_rate_reservation_is_released_for_later_candidate() {
+async fn inflight_unsampled_success_does_not_suppress_concurrent_error_audit() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -7916,15 +7916,7 @@ async fn discarded_rate_reservation_is_released_for_later_candidate() {
     assert_eq!(
         plugin.capture_counters(),
         (1, 0),
-        "override-eligible loser still reserves and captures"
-    );
-    plugin
-        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
-        .await;
-    assert_eq!(
-        audit_meta(&first, SINK_KEY).as_deref(),
-        Some("skipped"),
-        "successful response without error/guardrail must not emit"
+        "override-eligible loser is captured without precluding a later error"
     );
 
     let mut second = make_ctx();
@@ -7934,12 +7926,21 @@ async fn discarded_rate_reservation_is_released_for_later_candidate() {
     assert_eq!(
         plugin.capture_counters(),
         (2, 0),
-        "released reservation must admit a later candidate in the same window"
+        "concurrent override candidates must retain request evidence"
     );
     plugin
         .capture_final_response_body(&mut second, 500, &headers, br#"{"error":"x"}"#)
         .await;
     assert_eq!(audit_meta(&second, SINK_KEY).as_deref(), Some("queued"));
+
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        audit_meta(&first, SINK_KEY).as_deref(),
+        Some("skipped"),
+        "successful response without error/guardrail must not emit"
+    );
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["capture_reason"], "error");
