@@ -85,9 +85,25 @@ failures. They close the client side without dialing the backend or recording a
 backend circuit-breaker failure.
 
 The deliberate exception is operator-enabled HTTP/3 0-RTT early data
-(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled,
-Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
-so backends can apply their own replay policy.
+(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled
+for HTTP/3 without frontend mTLS, Ferrum sets the QUIC TLS early-data size to
+`u32::MAX` (quinn/rustls require `0` or `2^32-1`; a finite TLS byte cap is not
+available on QUIC), permits only configured replay-safe methods, and forwards
+`Early-Data: 1` so backends can apply their own replay policy. HTTPS/H1/H2
+currently keep rustls 0-RTT disabled until per-request early-data state is
+available, so the method allowlist does not enable a TCP TLS early-data byte cap
+either.
+
+0-RTT and frontend mTLS are mutually exclusive on the HTTP/3 listener. When
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set, the H3 listener sets QUIC
+rustls `max_early_data_size` to `0` and never takes quinn's 0.5-RTT accept path.
+Accepting the connection before the peer's `Certificate` flight would leave
+`peer_identity()` unknowable for the connection's lifetime, while accepting
+client early data only after the full handshake would lose the replay-state
+signal needed by the method gate. `FERRUM_TLS_EARLY_DATA_METHODS` is therefore
+inert for HTTP/3 on such a listener (a startup warning says so); ordinary 1-RTT
+H3 mTLS keeps working and `mtls_auth` / `spiffe_identity` receive the presented
+client certificate.
 
 ## Configuration Scenarios
 
@@ -244,6 +260,9 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 - Must be in PEM format
 - Can contain one or multiple CA certificates
 - All certificates in the bundle are trusted for client verification
+- Bundle admission is atomic: every declared `CERTIFICATE` record must parse
+  and be accepted as a trust root, or startup/reload rejects the complete
+  candidate and keeps the last-known-good TLS configuration
 - Clients must present certificates signed by one of these CAs
 
 ## Admin API TLS Configuration
@@ -433,7 +452,14 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **SVID file rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE` when all three sources are file-backed |
 
-All TLS sources are validated at startup and config load time when their owning runtime is built. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+
+Certificate/key PEM parsing is capped at 4 MiB per source and certificate
+bundles at 4096 records. A configured client-CA is still fully admitted when a
+testing-only no-verify mode disables use of its verifier. DTLS server identity
+sources accept a complete leaf-first certificate chain. Ferrum admits every
+declared record atomically, verifies the leaf against the configured private
+key, and transmits the complete chain; it never publishes only a usable prefix.
 
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller swaps the active DTLS server material for new DTLS sessions. Existing TLS/DTLS sessions keep the config they negotiated with. A failed reload keeps the previous config in service and logs a warning without exposing PEM contents.
 
@@ -603,7 +629,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
 | `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound). `FERRUM_TLS_CURVES` is accepted as an alias |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
-| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Session ID cache for TLS 1.2 resumption (inbound only) |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Inbound stateful session cache for TLS 1.2 session IDs and HTTP/3 server 0-RTT sessions |
 
 ### Protocol Version Examples
 
@@ -718,7 +744,7 @@ When using load balancers:
 ## Performance Considerations
 
 - **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Enabled by default. TLS 1.3 uses stateless session tickets (auto-rotating keys, unlimited capacity). TLS 1.2 falls back to a stateful session ID cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` (default 4096). Resumption saves 1 RTT on reconnections. 0-RTT early data is disabled for security (replay risk).
+- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
 - **Hardware Acceleration**: Consider for high-throughput scenarios
 - **Certificate Size**: Smaller certificates improve performance
 

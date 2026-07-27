@@ -73,7 +73,7 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | `HTTPRoute` `RequestRedirect` | Yes | Redirect filters materialize action-only dispatch rules with status, hostname, scheme, port, and path replacement support |
 | `HTTPRoute` weighted `backendRefs` | Yes | Multiple non-zero backends create a weighted upstream; a rule whose backendRefs are **all** `weight: 0` remains traffic-capturing and returns HTTP 500 through a synthesized fault-abort — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Cross-namespace `HTTPRoute.backendRefs` | Yes | Requires an exact `ReferenceGrant`; missing grants are rejected and unresolved |
-| Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace |
+| Cross-namespace `parentRefs` | Yes | Allowed only when the referenced Gateway listener permits the route namespace. `allowedRoutes.namespaces.selector` is parsed atomically with Kubernetes label-key/value and operator-cardinality validation; a malformed component invalidates the listener and attaches no routes. |
 | Invalid backend references | Yes | Missing Services, unsupported backend target kinds, and unpermitted cross-namespace refs are reported as unresolved and materialize fail-closed HTTP 500 routes |
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
@@ -162,6 +162,14 @@ Service having a ready EndpointSlice endpoint when
 reflects translation/materialization only. Route programming uses the typed
 route-to-parent materialization records emitted alongside proxy generation; it
 does not reconstruct source routes from proxy ID strings.
+
+A malformed `allowedRoutes.namespaces.selector` sets the affected listener's
+`Accepted=False` and `Programmed=False` conditions with reason `Invalid`.
+The condition message contains only the stable selector field path and
+validation class; label keys, label values, and unknown operator text are not
+echoed. `attachedRoutes` is `0`, and reconciliation withdraws any attachment
+previously materialized by an older valid selector. Valid sibling listeners
+continue to reconcile independently.
 
 ### Condition reasons that diverge from the upstream constants table
 

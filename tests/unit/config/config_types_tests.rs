@@ -1007,7 +1007,7 @@ fn mtls_auth_compatibility_checks_proxy_and_proxy_group_scopes() {
 }
 
 #[test]
-fn mtls_auth_compatibility_rejects_chain_fingerprints_on_dtls() {
+fn mtls_auth_compatibility_allows_chain_fingerprints_on_dtls() {
     let config = GatewayConfig {
         proxies: vec![stream_proxy("dtls", BackendScheme::Dtls, true)],
         plugin_configs: vec![mtls_plugin(
@@ -1021,9 +1021,7 @@ fn mtls_auth_compatibility_rejects_chain_fingerprints_on_dtls() {
         ..empty_config()
     };
 
-    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("UDP/DTLS does not expose"));
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
 }
 
 #[test]
@@ -1051,7 +1049,7 @@ fn mtls_auth_compatibility_allows_terminated_tcp_and_dtls_issuer_pins() {
 }
 
 #[test]
-fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
+fn local_mtls_auth_shadowing_and_fallback_allow_dtls_chain_fingerprints() {
     let mut proxy = stream_proxy("dtls", BackendScheme::Dtls, true);
     proxy.plugins = vec![PluginAssociation {
         plugin_config_id: "mtls-local".to_string(),
@@ -1083,12 +1081,7 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
     removed
         .plugin_configs
         .retain(|plugin| plugin.id != "mtls-local");
-    let removal_errors = removed.validate_mtls_auth_compatibility().unwrap_err();
-    assert!(
-        removal_errors
-            .iter()
-            .any(|error| error.contains("UDP/DTLS does not expose"))
-    );
+    assert!(removed.validate_mtls_auth_compatibility().is_ok());
 
     let mut renamed = config;
     renamed
@@ -1097,12 +1090,7 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
         .find(|plugin| plugin.id == "mtls-local")
         .expect("local plugin exists")
         .plugin_name = "cors".to_string();
-    let rename_errors = renamed.validate_mtls_auth_compatibility().unwrap_err();
-    assert!(
-        rename_errors
-            .iter()
-            .any(|error| error.contains("UDP/DTLS does not expose"))
-    );
+    assert!(renamed.validate_mtls_auth_compatibility().is_ok());
 }
 
 #[test]

@@ -163,14 +163,30 @@ pub fn build_backend_dtls_config(
     let skip_verify = !proxy.resolved_tls.verify_server_cert || tls_no_verify;
 
     // Load client certificate for mutual TLS, or generate an ephemeral one.
-    let certificate = if let (Some(cert_path), Some(key_path)) = (
+    let certificate = match (
         &proxy.resolved_tls.client_cert_path,
         &proxy.resolved_tls.client_key_path,
     ) {
-        load_dtls_certificate(cert_path, key_path)?
-    } else {
-        generate_ephemeral_cert()?
+        (Some(cert_path), Some(key_path)) => load_dtls_certificate(cert_path, key_path)?,
+        (None, None) => generate_ephemeral_cert()?,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "DTLS backend mTLS client certificate and private key must be configured together"
+            ));
+        }
     };
+
+    // A declared custom trust source remains an admission requirement even
+    // when no-verify disables use of the resulting verifier.
+    if skip_verify
+        && let Some(ca_path) = proxy
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref()
+            .or(global_ca_bundle_path)
+    {
+        load_root_store_from_pem(ca_path)?;
+    }
 
     let config = Arc::new(Config::default());
     let (server_name, server_cert_verifier) = if skip_verify {
@@ -1681,33 +1697,20 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
         )
     })?;
 
-    // Parse PEM to DER
-    let mut cert_reader = cert_material.bytes.expose_secret();
-    let mut certificate_chain = Vec::new();
-    for (index, certificate) in rustls_pemfile::certs(&mut cert_reader).enumerate() {
-        let certificate = certificate.map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to parse certificate #{} in {}: {}",
-                index + 1,
-                cert_material.display_source_id,
-                error
-            )
-        })?;
-        certificate_chain.push(certificate);
-    }
-    if certificate_chain.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No certificate found in {}",
-            cert_material.display_source_id
-        ));
-    }
-
-    let mut key_reader = key_material.bytes.expose_secret();
-    let parsed_key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
-        .ok_or_else(|| {
-            anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
-        })?;
+    // Parse every declared certificate and exactly one key through the shared
+    // bounded, fail-closed PEM admission path. The patched dimpl stack presents
+    // the complete leaf-first chain, so a valid multi-certificate identity is
+    // retained rather than rejected or silently truncated.
+    let certificate_chain = crate::tls::parse_pem_certificate_bundle(
+        cert_material.bytes.expose_secret(),
+        "DTLS certificate",
+        &cert_material.display_source_id,
+    )?;
+    let parsed_key = crate::tls::parse_pem_private_key(
+        key_material.bytes.expose_secret(),
+        "DTLS private key",
+        &key_material.display_source_id,
+    )?;
     // Adopt immediately so every subsequent success/error return clears the
     // Ferrum-managed DER owner without relying on manual zeroize call sites.
     let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook)?;
@@ -1776,33 +1779,11 @@ pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore,
             e
         )
     })?;
-    let mut certs = Vec::new();
-    let mut parse_errors = 0usize;
-    let mut reader = material.bytes.expose_secret();
-    for cert in rustls_pemfile::certs(&mut reader) {
-        match cert {
-            Ok(cert) => certs.push(cert),
-            Err(err) => {
-                parse_errors += 1;
-                tracing::warn!(
-                    pem_path = %material.display_source_id,
-                    error = %err,
-                    "Skipping unparsable certificate while loading DTLS CA bundle"
-                );
-            }
-        }
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    let (added, ignored) = roots.add_parsable_certificates(certs);
-    if added == 0 {
-        return Err(anyhow::anyhow!(
-            "No valid certificates found in DTLS CA file {} (ignored: {}, parse_errors: {})",
-            material.display_source_id,
-            ignored,
-            parse_errors
-        ));
-    }
-    Ok(roots)
+    crate::tls::root_cert_store_from_pem_bundle(
+        material.bytes.expose_secret(),
+        "DTLS CA bundle",
+        &material.display_source_id,
+    )
 }
 
 fn load_backend_root_store(
@@ -2086,6 +2067,57 @@ mod tests {
         record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
         record
+    }
+
+    #[test]
+    fn dtls_root_store_rejects_mixed_malformed_bundle_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed-ca.pem");
+        let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+        std::fs::write(
+            &path,
+            format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+        )
+        .expect("write mixed CA bundle");
+
+        let error = load_root_store_from_pem(path.to_str().expect("utf8 path"))
+            .expect_err("a malformed later record must reject the complete DTLS trust bundle")
+            .to_string();
+        assert!(error.contains("DTLS CA bundle"), "got: {error}");
+        assert!(error.contains("record #2"), "got: {error}");
+    }
+
+    #[test]
+    fn dtls_root_store_rejects_all_malformed_bundle() {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(
+            file.path(),
+            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write malformed CA");
+
+        let error = load_root_store_from_pem(file.path().to_str().expect("utf8 path"))
+            .expect_err("an all-malformed DTLS trust bundle must fail")
+            .to_string();
+        assert!(error.contains("record #1"), "got: {error}");
+    }
+
+    #[test]
+    fn dtls_root_store_rejects_individual_unusable_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("unusable-root.pem");
+        let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+        std::fs::write(
+            &path,
+            format!("{valid}-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n"),
+        )
+        .expect("write unusable root bundle");
+
+        let error = load_root_store_from_pem(path.to_str().expect("utf8 path"))
+            .expect_err("one unusable root must reject the complete DTLS trust bundle")
+            .to_string();
+        assert!(error.contains("record #2"), "got: {error}");
+        assert!(error.contains("not a usable trust root"), "got: {error}");
     }
 
     #[test]
