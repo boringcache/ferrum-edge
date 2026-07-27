@@ -583,6 +583,10 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 
 **Protocols:** all (HTTP, gRPC, WebSocket, TCP, UDP)
 
+**Failure policy:** `KeepLastKnownGood` — construction/validation failures,
+including an incomplete or unusable custom TLS CA bundle, reject the candidate
+plugin generation and keep the last-known-good logger instance.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname and must not include URL userinfo. Path/query may carry collector tokens when required; operational diagnostics always emit a structurally redacted form (`scheme://host[:port]/redacted`). Malformed or non-WebSocket schemes are rejected at config load time. |
@@ -652,7 +656,7 @@ Unknown top-level configuration keys are rejected at admission with an actionabl
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
 
-The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`).
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure, write/flush timeout, connect/handshake timeout, or disconnect. Delivery is at-least-once: a timeout or I/O error after a partial write may cause the full batch to be retried, so collectors must tolerate duplicates. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`), skip-verify setting (`FERRUM_TLS_NO_VERIFY`), and CRL list (`FERRUM_TLS_CRL_FILE_PATH`). A selected custom CA bundle is admitted atomically: every certificate record must parse and be usable as a trust root, and an empty bundle rejects the candidate while the last-known-good logger remains active.
 
 ```yaml
 plugin_name: tcp_logging

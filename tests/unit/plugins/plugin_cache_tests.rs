@@ -15,7 +15,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::config_delta::ConfigDelta;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     apply_initial_response_header_policies,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
@@ -414,6 +414,27 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         known_namespaces: Vec::new(),
         ..Default::default()
     }
+}
+
+fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_path),
+        Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    )
 }
 
 async fn run_before_proxy_chain(
@@ -2057,6 +2078,55 @@ async fn test_tcp_logging_unknown_key_reload_keeps_last_known_good() {
     assert!(
         Arc::ptr_eq(&before[0], &after[0]),
         "KeepLastKnownGood must retain the accepted tcp_logging instance"
+    );
+}
+
+#[tokio::test]
+async fn test_ws_logging_malformed_ca_reload_keeps_last_known_good() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("ws-ca.pem");
+    let valid_ca = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+    std::fs::write(&ca_path, &valid_ca).expect("write valid CA");
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "ws-logging-1",
+            "ws_logging",
+            json!({"endpoint_url": "wss://localhost:9300/logs"}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::with_http_client(
+        &valid,
+        plugin_client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .expect("valid ws_logging must admit");
+    let before = cache.get_plugins("p1");
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].name(), "ws_logging");
+
+    std::fs::write(
+        &ca_path,
+        format!("{valid_ca}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+    )
+    .expect("replace CA with mixed bundle");
+    let mut replacement = valid.clone();
+    replacement.plugin_configs[0].config =
+        json!({"endpoint_url": "wss://localhost:9300/logs", "batch_size": 51});
+    let error = cache
+        .rebuild(&replacement)
+        .expect_err("malformed replacement CA must reject cache publication");
+    assert!(error.contains("record #2"), "got: {error}");
+
+    let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
+    assert!(
+        Arc::ptr_eq(&before[0], &after[0]),
+        "rejected ws_logging CA replacement must retain the last-known-good instance"
     );
 }
 

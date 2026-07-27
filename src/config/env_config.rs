@@ -5011,7 +5011,7 @@ impl EnvConfig {
                 .map_err(|e| e.to_string())?;
         }
         if let Some(ref path) = self.tls_ca_bundle_path {
-            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+            crate::config::types::validate_pem_ca_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
                 .map_err(|e| e.to_string())?;
         }
 

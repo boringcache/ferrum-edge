@@ -257,6 +257,9 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
 - Must be in PEM format
 - Can contain one or multiple CA certificates
 - All certificates in the bundle are trusted for client verification
+- Bundle admission is atomic: every declared `CERTIFICATE` record must parse
+  and be accepted as a trust root, or startup/reload rejects the complete
+  candidate and keeps the last-known-good TLS configuration
 - Clients must present certificates signed by one of these CAs
 
 ## Admin API TLS Configuration
@@ -446,7 +449,14 @@ Frontend proxy, Admin API, and frontend DTLS cert/key/client-CA/OCSP/CRL sources
 | **Loaded but static** | Inline frontend/admin/DTLS/backend/database/CP-gRPC/DP-gRPC sources |
 | **SVID file rotation** | `FERRUM_GATEWAY_SVID_*_PATH` / `_SOURCE` when all three sources are file-backed |
 
-All TLS sources are validated at startup and config load time when their owning runtime is built. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+All TLS sources are validated at startup and config load time when their owning runtime is built. Certificate and CA bundles are atomic: Ferrum rejects the complete candidate if any declared `CERTIFICATE` record is malformed or any CA record cannot be admitted as a trust root; it never installs a usable subset. If any configured certificate, key, CA bundle, OCSP response, or CRL source is missing, unreadable, expired, not-yet-valid, mismatched, or contains invalid PEM data where PEM is expected, the gateway refuses to start or rejects the config reload. OCSP response sources must resolve to non-empty DER bytes. There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key sources must always be configured as a pair.
+
+Certificate/key PEM parsing is capped at 4 MiB per source and certificate
+bundles at 4096 records. A configured client-CA is still fully admitted when a
+testing-only no-verify mode disables use of its verifier. DTLS server identity
+sources must contain exactly one certificate because the DTLS stack cannot
+present an intermediate chain; Ferrum rejects a multi-certificate DTLS identity
+instead of publishing only its first record.
 
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller swaps the active DTLS server material for new DTLS sessions. Existing TLS/DTLS sessions keep the config they negotiated with. A failed reload keeps the previous config in service and logs a warning without exposing PEM contents.
 

@@ -84,6 +84,37 @@ fn load_probe_tls_material(
         .map_err(|e| format!("{label}: {e}"))
 }
 
+fn load_probe_tls_certificates(
+    source_value: &str,
+    kind: MaterialKind,
+    label: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let source = CertSource::parse(source_value, kind);
+    let material =
+        load_material_blocking(&source, kind).map_err(|error| format!("{label}: {error}"))?;
+    crate::tls::parse_pem_certificate_bundle(
+        material.bytes.expose_secret(),
+        label,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn load_probe_tls_root_store(
+    source_value: &str,
+    label: &str,
+) -> Result<rustls::RootCertStore, String> {
+    let source = CertSource::parse(source_value, MaterialKind::CaBundle);
+    let material = load_material_blocking(&source, MaterialKind::CaBundle)
+        .map_err(|error| format!("{label}: {error}"))?;
+    crate::tls::root_cert_store_from_pem_bundle(
+        material.bytes.expose_secret(),
+        label,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Re-export the cap from types so runtime and validation share one value.
 use crate::config::types::MAX_RECENT_FAILURES_PER_TARGET;
 
@@ -1723,41 +1754,44 @@ async fn build_grpc_probe_channel_no_verify(
 
     // Build root cert store (still needed for mTLS client auth builder)
     let ca_path = tls_config.server_ca_cert_path.as_deref().or(global_ca_path);
-    let mut root_store = if ca_path.is_some() {
-        rustls::RootCertStore::empty()
+    let root_store = if let Some(ca_path) = ca_path {
+        load_probe_tls_root_store(ca_path, "gRPC health probe CA").map_err(std::io::Error::other)?
     } else {
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
-    if let Some(ca_path) = ca_path
-        && let Ok(ca_data) =
-            load_probe_tls_material(ca_path, MaterialKind::CaBundle, "gRPC health probe CA")
-    {
-        for cert in rustls_pemfile::certs(&mut &ca_data[..]).flatten() {
-            let _ = root_store.add(cert);
-        }
-    }
 
     // Build client config with optional mTLS
     let cert_path = tls_config.client_cert_path.as_deref().or(global_cert_path);
     let key_path = tls_config.client_key_path.as_deref().or(global_key_path);
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-    let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let cert_data = load_probe_tls_material(
-            cert_path,
-            MaterialKind::Cert,
-            "gRPC health probe client cert",
-        )
-        .map_err(std::io::Error::other)?;
-        let key_data =
-            load_probe_tls_material(key_path, MaterialKind::Key, "gRPC health probe client key")
-                .map_err(std::io::Error::other)?;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-            .filter_map(|r| r.ok())
-            .collect();
-        let key = rustls_pemfile::private_key(&mut &key_data[..])?.ok_or("No private key found")?;
-        builder.with_client_auth_cert(certs, key)?
-    } else {
-        builder.with_no_client_auth()
+    let mut client_config = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = load_probe_tls_certificates(
+                cert_path,
+                MaterialKind::Cert,
+                "gRPC health probe client cert",
+            )
+            .map_err(std::io::Error::other)?;
+            let key_source = CertSource::parse(key_path, MaterialKind::Key);
+            let key_material =
+                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
+                    std::io::Error::other(format!("gRPC health probe client key: {error}"))
+                })?;
+            let key = crate::tls::parse_pem_private_key(
+                key_material.bytes.expose_secret(),
+                "gRPC health probe client key",
+                &key_material.display_source_id,
+            )
+            .map_err(std::io::Error::other)?;
+            builder.with_client_auth_cert(certs, key)?
+        }
+        (None, None) => builder.with_no_client_auth(),
+        _ => {
+            return Err(std::io::Error::other(
+                "gRPC health probe mTLS client certificate and private key must be configured together",
+            )
+            .into());
+        }
     };
 
     // Disable server cert verification
@@ -2252,6 +2286,85 @@ mod tests {
             format_probe_url("http", "backend.local", 8080, "/health"),
             "http://backend.local:8080/health"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_no_verify_probe_rejects_mixed_client_chain_before_connect() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("client-chain.pem");
+        let key_path = dir.path().join("client-key.pem");
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let params = CertificateParams::new(vec!["client.local".to_string()]).expect("cert params");
+        let certificate = params.self_signed(&key_pair).expect("self-sign cert");
+        std::fs::write(
+            &cert_path,
+            format!(
+                "{}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+                certificate.pem()
+            ),
+        )
+        .expect("write mixed client chain");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write client key");
+
+        let mut tls_config = BackendTlsConfig::default_verify();
+        tls_config.client_cert_path = Some(cert_path.to_string_lossy().into_owned());
+        tls_config.client_key_path = Some(key_path.to_string_lossy().into_owned());
+        tls_config.verify_server_cert = false;
+        let endpoint = tonic::transport::Endpoint::from_static("https://127.0.0.1:9");
+
+        let error = build_grpc_probe_channel_no_verify(
+            &endpoint,
+            "localhost",
+            Duration::from_millis(50),
+            &tls_config,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a malformed client-chain record must fail before dialing")
+        .to_string();
+        assert!(
+            error.contains("gRPC health probe client cert"),
+            "got: {error}"
+        );
+        assert!(error.contains("record #2"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn grpc_no_verify_probe_rejects_all_malformed_client_chain_before_connect() {
+        ensure_crypto_provider();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("client-chain.pem");
+        let key_path = dir.path().join("client-key.pem");
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        std::fs::write(
+            &cert_path,
+            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write malformed client chain");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write client key");
+
+        let mut tls_config = BackendTlsConfig::default_verify();
+        tls_config.client_cert_path = Some(cert_path.to_string_lossy().into_owned());
+        tls_config.client_key_path = Some(key_path.to_string_lossy().into_owned());
+        tls_config.verify_server_cert = false;
+        let endpoint = tonic::transport::Endpoint::from_static("https://127.0.0.1:9");
+
+        let error = build_grpc_probe_channel_no_verify(
+            &endpoint,
+            "localhost",
+            Duration::from_millis(50),
+            &tls_config,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an all-malformed client chain must fail before dialing")
+        .to_string();
+        assert!(error.contains("record #1"), "got: {error}");
     }
 
     #[tokio::test]

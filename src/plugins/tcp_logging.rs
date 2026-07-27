@@ -397,35 +397,33 @@ fn build_tls_connector(
     tls_ca_bundle_path: Option<&str>,
     tls_crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<tokio_rustls::TlsConnector, String> {
+    // Materialize a declared custom bundle even when verification is disabled.
+    // An explicit but malformed source is still a configuration error.
+    let custom_root_store = tls_ca_bundle_path
+        .map(|ca_path| {
+            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
+            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
+                .map_err(|error| format!("TCP logging: failed to load CA bundle: {error}"))?;
+            crate::tls::root_cert_store_from_pem_bundle(
+                ca_material.bytes.expose_secret(),
+                "TCP logging CA bundle",
+                &ca_material.display_source_id,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+
     let tls_config = if tls_no_verify {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
-        let mut root_store = rustls::RootCertStore::empty();
-        if let Some(ca_path) = tls_ca_bundle_path {
-            let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
-            let ca_material = load_material_blocking(&source, MaterialKind::CaBundle)
-                .map_err(|error| format!("TCP logging: failed to load CA bundle: {error}"))?;
-            let source_id = ca_material.display_source_id.clone();
-            let mut reader = ca_material.bytes.expose_secret();
-            let certs = rustls_pemfile::certs(&mut reader)
-                .filter_map(|cert| cert.ok())
-                .collect::<Vec<_>>();
-            if certs.is_empty() {
-                return Err(format!(
-                    "TCP logging: no valid certificates found in CA bundle {source_id}"
-                ));
-            }
-            for cert in certs {
-                root_store.add(cert).map_err(|error| {
-                    format!("TCP logging: failed to add CA cert from {source_id}: {error}")
-                })?;
-            }
+        let root_store = if let Some(root_store) = custom_root_store {
+            root_store
         } else {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        }
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
 
         // Apply gateway CRL list (`FERRUM_TLS_CRL_FILE_PATH`) so that revoked
         // log-sink certificates are rejected, matching the proxy backend / DTLS
