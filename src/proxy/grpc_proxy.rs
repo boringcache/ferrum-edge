@@ -946,7 +946,7 @@ impl GrpcPoolManager {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+        let (mut sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 format!("h2c handshake failed: {}", e),
@@ -954,7 +954,19 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // Spawn the connection driver
+        // hyper/h2 `handshake()` resolves after the client preface is written;
+        // peer SETTINGS still arrive on the connection driver. Wait for
+        // readiness before treating this DNS candidate as established so a
+        // TCP-successful non-H2 peer cannot pin the pool and suppress failover.
+        sender.ready().await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                format!("h2c handshake failed: {}", e),
+                e,
+            )
+        })?;
+
+        // Spawn only after the peer completed the H2 preface exchange.
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("gRPC h2c connection closed: {}", e);
@@ -982,7 +994,7 @@ impl GrpcPoolManager {
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+        let (mut sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2Handshake,
                 format!("h2 handshake failed: {}", e),
@@ -990,7 +1002,15 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // Spawn the connection driver
+        sender.ready().await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2Handshake,
+                format!("h2 handshake failed: {}", e),
+                e,
+            )
+        })?;
+
+        // Spawn only after the peer completed the H2 preface exchange.
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);

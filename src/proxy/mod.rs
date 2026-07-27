@@ -11198,7 +11198,6 @@ pub(crate) async fn connect_websocket_backend(
         crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |addr| {
             let request = ws_request.clone();
             let connector = connector.clone();
-            let ws_config = ws_config.clone();
             let idle_tracker = idle_tracker.clone();
             async move {
                 let tcp = tokio::net::TcpStream::connect(addr).await?;
@@ -11209,6 +11208,7 @@ pub(crate) async fn connect_websocket_backend(
                 client_async_tls_with_config(
                     request,
                     WsActivityIo::new(tcp, idle_tracker),
+                    // WebSocketConfig is Copy; pass by value (clippy::clone_on_copy).
                     Some(ws_config),
                     connector,
                 )

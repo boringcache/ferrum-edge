@@ -12,7 +12,6 @@
 //! for H3 backend targets and the H3 frontend server (`http3/server.rs`).
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -680,28 +679,6 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
             proxy.backend_connect_timeout_ms, phase, host, port, proxy.id
         ),
     ))
-}
-
-async fn timeout_backend_handshake<F, D>(
-    future: F,
-    connect_started: Instant,
-    connect_timeout: Duration,
-    proxy: &Proxy,
-    host: &str,
-    port: u16,
-    phase: &str,
-) -> Result<(D, H3SendRequest), anyhow::Error>
-where
-    F: Future<Output = Result<(D, H3SendRequest), h3::error::ConnectionError>>,
-{
-    let remaining = connect_timeout
-        .checked_sub(connect_started.elapsed())
-        .ok_or_else(|| h3_backend_connect_timeout(proxy, host, port, phase))?;
-
-    tokio::time::timeout(remaining, future)
-        .await
-        .map_err(|_| h3_backend_connect_timeout(proxy, host, port, phase))?
-        .map_err(|e| anyhow::anyhow!("{} handshake failed: {}", phase, e))
 }
 
 /// Error returned by [`Http3ConnectionPool`] when an HTTP/3 request fails.
@@ -1794,24 +1771,38 @@ impl Http3ConnectionPool {
         .await?;
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let (connection, addr) =
+        let (pooled, addr) =
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
-                    endpoint
+                    let connection = endpoint
                         .connect_with(client_config, addr, tls_server_name)?
                         .await
-                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))
+                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+
+                    // Keep the H3 session setup inside the candidate attempt so a
+                    // QUIC-successful peer that cannot speak HTTP/3 cannot pin
+                    // this pool and suppress failover to a later DNS address.
+                    let quic_conn = connection.clone();
+                    let (mut driver, send_request) =
+                        h3::client::new(h3_quinn::Connection::new(connection))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+
+                    tokio::spawn(async move {
+                        let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                        debug!("HTTP/3 pool connection driver closed: {}", err);
+                    });
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
                 }
             })
             .await
             .map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { .. } => {
-                    h3_backend_connect_timeout(proxy, host, port, "QUIC")
+                    h3_backend_connect_timeout(proxy, host, port, "HTTP/3")
                 }
                 crate::dns::CandidateConnectError::Failed { source, .. } => source,
             })?;
@@ -1821,29 +1812,7 @@ impl Http3ConnectionPool {
             host, port, addr
         );
 
-        // Clone the quinn::Connection (`Arc`-based, cheap) before passing it
-        // into `h3_quinn::Connection::new` so the pool entry retains a handle
-        // for `close_reason()` health checks. h3_quinn would otherwise own
-        // the only ref via its internal stream-stream tasks.
-        let quic_conn = connection.clone();
-        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
-        let (mut driver, send_request) = timeout_backend_handshake(
-            h3_handshake,
-            connect_started,
-            connect_timeout,
-            proxy,
-            host,
-            port,
-            "HTTP/3",
-        )
-        .await?;
-
-        tokio::spawn(async move {
-            let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            debug!("HTTP/3 pool connection driver closed: {}", err);
-        });
-
-        Ok(H3PooledConnection::new(send_request, quic_conn))
+        Ok(pooled)
     }
 
     /// Create a new QUIC connection + h3 session to an explicit host/port
@@ -1897,24 +1866,38 @@ impl Http3ConnectionPool {
         .await?;
 
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let (connection, addr) =
+        let (pooled, addr) =
             crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
-                    endpoint
+                    let connection = endpoint
                         .connect_with(client_config, addr, tls_server_name)?
                         .await
-                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))
+                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+
+                    // Keep the H3 session setup inside the candidate attempt so a
+                    // QUIC-successful peer that cannot speak HTTP/3 cannot pin
+                    // this pool and suppress failover to a later DNS address.
+                    let quic_conn = connection.clone();
+                    let (mut driver, send_request) =
+                        h3::client::new(h3_quinn::Connection::new(connection))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+
+                    tokio::spawn(async move {
+                        let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                        debug!("HTTP/3 pool connection driver closed: {}", err);
+                    });
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
                 }
             })
             .await
             .map_err(|error| match error {
                 crate::dns::CandidateConnectError::TimedOut { .. } => {
-                    h3_backend_connect_timeout(proxy, host, port, "QUIC")
+                    h3_backend_connect_timeout(proxy, host, port, "HTTP/3")
                 }
                 crate::dns::CandidateConnectError::Failed { source, .. } => source,
             })?;
@@ -1924,28 +1907,7 @@ impl Http3ConnectionPool {
             host, port, addr
         );
 
-        // See `create_connection` for why we clone the quinn::Connection
-        // before handing it to h3_quinn — the pool entry needs a handle for
-        // `close_reason()` health checks.
-        let quic_conn = connection.clone();
-        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
-        let (mut driver, send_request) = timeout_backend_handshake(
-            h3_handshake,
-            connect_started,
-            connect_timeout,
-            proxy,
-            host,
-            port,
-            "HTTP/3",
-        )
-        .await?;
-
-        tokio::spawn(async move {
-            let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            debug!("HTTP/3 pool connection driver closed: {}", err);
-        });
-
-        Ok(H3PooledConnection::new(send_request, quic_conn))
+        Ok(pooled)
     }
 
     /// Execute an HTTP/3 request on an existing SendRequest handle.

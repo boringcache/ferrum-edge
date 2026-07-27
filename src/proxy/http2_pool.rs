@@ -246,11 +246,21 @@ impl Http2PoolManager {
 
                 let io = TokioIo::new(tls_stream);
                 let builder = Self::build_h2_builder(pool_config);
-                let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+                let (mut sender, conn) = builder.handshake(io).await.map_err(|e| {
                     Http2PoolError::BackendUnavailable {
                         message: format!("h2 handshake failed: {}", e),
                         source: Some(BackendUnavailableSource::Hyper(e)),
                     }
+                })?;
+
+                // hyper/h2 `handshake()` resolves after the client preface is
+                // written; peer SETTINGS still arrive on the connection driver.
+                // Wait for readiness before treating this DNS candidate as
+                // established so a TLS-successful non-H2 peer cannot suppress
+                // failover to a later address.
+                sender.ready().await.map_err(|e| Http2PoolError::BackendUnavailable {
+                    message: format!("h2 handshake failed: {}", e),
+                    source: Some(BackendUnavailableSource::Hyper(e)),
                 })?;
 
                 // Spawn only after the complete candidate establishment

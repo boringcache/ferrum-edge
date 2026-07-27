@@ -1402,7 +1402,7 @@ impl MeshMtlsConnectionPool {
                 }
 
                 let io = TokioIo::new(tls_stream);
-                let (sender, connection) =
+                let (mut sender, connection) =
                     builder
                         .handshake(io)
                         .await
@@ -1410,6 +1410,15 @@ impl MeshMtlsConnectionPool {
                             host: target_host.to_string(),
                             message: e.to_string(),
                         })?;
+
+                // hyper/h2 `handshake()` resolves after the client preface is
+                // written; wait for peer SETTINGS before accepting this
+                // candidate so a TLS-successful non-H2 peer cannot suppress
+                // DNS failover.
+                sender.ready().await.map_err(|e| HbonePoolError::H2Handshake {
+                    host: target_host.to_string(),
+                    message: e.to_string(),
+                })?;
 
                 // Spawn only after complete protocol establishment. Failed or
                 // timed-out candidates cannot leave driver tasks behind.

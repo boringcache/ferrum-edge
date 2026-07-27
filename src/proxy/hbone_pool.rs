@@ -1607,7 +1607,7 @@ pub(crate) async fn dial_h2_connect_sender(
                 builder.max_concurrent_streams(max_streams);
             }
 
-            let (sender, mut connection) =
+            let (mut sender, mut connection) =
                 builder
                     .handshake(tls_stream)
                     .await
@@ -1615,6 +1615,33 @@ pub(crate) async fn dial_h2_connect_sender(
                         host: target_host.to_string(),
                         message: e.to_string(),
                     })?;
+
+            // Raw h2 `handshake()` returns after writing the client preface;
+            // peer SETTINGS require polling `connection`. Drive it until
+            // `ready()` succeeds so a TLS-successful non-H2 peer cannot
+            // suppress DNS failover, then detach the driver.
+            tokio::select! {
+                ready = sender.ready() => {
+                    ready.map_err(|e| HbonePoolError::H2Handshake {
+                        host: target_host.to_string(),
+                        message: e.to_string(),
+                    })?;
+                }
+                conn = &mut connection => {
+                    return Err(match conn {
+                        Ok(()) => HbonePoolError::H2Handshake {
+                            host: target_host.to_string(),
+                            message: "H2 connection closed before handshake completed"
+                                .to_string(),
+                        },
+                        Err(e) => HbonePoolError::H2Handshake {
+                            host: target_host.to_string(),
+                            message: e.to_string(),
+                        },
+                    });
+                }
+            }
+
             if pool_config.enable_http2
                 && let Some(ping_pong) = connection.ping_pong()
             {

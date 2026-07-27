@@ -589,8 +589,9 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
     let _failing_task = tokio::spawn(async move {
         while let Ok((mut socket, _)) = failing_listener.accept().await {
             task_attempts.fetch_add(1, Ordering::Relaxed);
-            // A valid TCP peer speaking HTTP/1.1 cannot satisfy the h2c
-            // prior-knowledge handshake.
+            // Prior-knowledge h2c writes the client preface before reading peer
+            // SETTINGS. Respond with HTTP/1.1 so the preface exchange fails and
+            // the pool must advance to the healthy second address exactly once.
             let _ = socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .await;
