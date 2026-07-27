@@ -2839,11 +2839,17 @@ pub(crate) fn validate_plugin_security_composition_candidate(
         }
     }
 
-    if let Err(error) = validate_plugin_security_composition(&global_plugins) {
+    // Keep the gateway-wide global chain behind the same slice-shaped
+    // validation boundary used by the former per-namespace map. Besides
+    // preserving one admission path, this makes it explicit that globals from
+    // every namespace are validated together because runtime installs them
+    // together.
+    let plugins = &global_plugins;
+    if let Err(error) = validate_plugin_security_composition(plugins) {
         errors.push(format!("global plugins: {error}"));
     }
     if let Err(error) =
-        validate_correlation_id_composition(&global_plugins, http_client.real_ip_header())
+        validate_correlation_id_composition(plugins, http_client.real_ip_header())
     {
         errors.push(format!("global plugins: {error}"));
     }

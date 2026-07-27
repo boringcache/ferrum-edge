@@ -4517,6 +4517,9 @@ fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
             vec!["reviews.default.svc.cluster.local"],
         ),
     ];
+    for proxy in &mut config.proxies {
+        proxy.namespace = "default".to_string();
+    }
     assert!(
         config.validate_unique_listen_paths().is_ok(),
         "same-service per-port outbound siblings must not conflict"
@@ -4542,6 +4545,9 @@ fn test_unique_listen_paths_exempts_mesh_inbound_per_port_siblings() {
             vec!["reviews.default.svc.cluster.local"],
         ),
     ];
+    for proxy in &mut config.proxies {
+        proxy.namespace = "default".to_string();
+    }
     assert!(
         config.validate_unique_listen_paths().is_ok(),
         "same-service per-port inbound siblings must not conflict"

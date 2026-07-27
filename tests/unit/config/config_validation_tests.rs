@@ -675,7 +675,7 @@ fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("multiple correlation_id plugins")),
+            .any(|error| error.contains("duplicate effective header_name")),
         "global correlation owners are installed gateway-wide and must conflict: {errors:?}"
     );
 }
