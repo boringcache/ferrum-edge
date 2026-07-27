@@ -2436,18 +2436,15 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
     .await
     .unwrap();
     store.note_failover_admin_write();
+    assert!(store.failover_topology_status().primary_failback_fenced);
 
     // Even though primary is reachable, the store must retain the failover
     // snapshot after a mutation admission there.
-    let error = store
+    let active = store
         .try_failover_reconnect(&primary_rw_url)
         .await
-        .expect_err("primary failback must be refused after the admission");
-    assert!(
-        error
-            .to_string()
-            .contains("Refusing primary database failback")
-    );
+        .expect("the fenced primary must fall through to a healthy failover");
+    assert_eq!(active, failover_rw_url);
     assert!(
         !store.failover_topology_status().primary_active,
         "the stale primary must not replace the failover topology"
@@ -2457,6 +2454,12 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
             .failover_topology_status()
             .opt_in_writes_enabled_during_window,
         "the failover window remains active"
+    );
+    assert!(
+        store
+            .failover_topology_status()
+            .primary_failback_fenced,
+        "reconnecting the failover must preserve the local fence"
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),

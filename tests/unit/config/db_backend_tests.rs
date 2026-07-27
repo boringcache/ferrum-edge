@@ -736,6 +736,12 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     assert!(state.ensure_primary_failback_allowed().is_ok());
     state.note_admin_write();
     assert!(state.ensure_primary_failback_allowed().is_err());
+    assert!(state.status().primary_failback_fenced);
+    state.mark_failover("sqlite:///tmp/failover-3.db");
+    assert!(
+        state.status().primary_failback_fenced,
+        "switching failover URLs must not clear the admission fence"
+    );
     assert!(!state.primary_active());
 }
 

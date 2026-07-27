@@ -45,6 +45,8 @@ pub struct DbFailoverTopologyStatus {
     /// any point while on failover. Conservative process-local risk marker only;
     /// it does not count successful mutations.
     pub opt_in_writes_enabled_during_window: bool,
+    /// `true` after this process admits a failover-window Admin mutation.
+    pub primary_failback_fenced: bool,
 }
 
 impl Default for DbFailoverTopologyStatus {
@@ -55,6 +57,7 @@ impl Default for DbFailoverTopologyStatus {
             active_url_redacted: None,
             allow_writes: false,
             opt_in_writes_enabled_during_window: false,
+            primary_failback_fenced: false,
         }
     }
 }
@@ -160,6 +163,7 @@ impl DbFailoverTopologyState {
             active_url_redacted: (**self.active_url_redacted.load()).clone(),
             allow_writes: self.allow_writes(),
             opt_in_writes_enabled_during_window: self.opt_in_during_window.load(Ordering::Acquire),
+            primary_failback_fenced: self.failover_write_admitted.load(Ordering::Acquire),
         }
     }
 
@@ -250,8 +254,20 @@ impl DbFailoverTopologyState {
 
     /// Record an Admin mutation admitted while the failover topology is pinned.
     pub fn note_admin_write(&self) {
-        if !self.primary_active() {
-            self.failover_write_admitted.store(true, Ordering::Release);
+        if !self.primary_active()
+            && self
+                .failover_write_admitted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let redacted = (**self.active_url_redacted.load())
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            warn!(
+                active_url_redacted = %redacted,
+                failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
+                "Admin mutation admitted on failover topology; automatic primary failback is now fenced in this process until reconciliation or restart"
+            );
         }
     }
 
@@ -260,10 +276,31 @@ impl DbFailoverTopologyState {
         if self.primary_active() || !self.failover_write_admitted.load(Ordering::Acquire) {
             return Ok(());
         }
-        anyhow::bail!(
-            "Refusing primary database failback because an Admin write was admitted on the active failover topology; reconcile the failover changes onto the primary or restart after replication catch-up"
+        Err(PrimaryFailbackFenced.into())
+    }
+}
+
+/// Typed policy refusal so reconnect loops can skip a stale primary without
+/// mistaking the fence for a permanent database error that suppresses healthy
+/// failover candidates.
+#[derive(Debug)]
+pub struct PrimaryFailbackFenced;
+
+impl std::fmt::Display for PrimaryFailbackFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "Refusing primary database failback because an Admin write was admitted on the active failover topology; reconcile the failover changes onto the primary or restart after replication catch-up",
         )
     }
+}
+
+impl std::error::Error for PrimaryFailbackFenced {}
+
+/// Return whether an error chain carries the primary-failback policy refusal.
+pub fn primary_failback_fenced(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PrimaryFailbackFenced>().is_some())
 }
 
 /// Validate that a plugin row can be restored as an explicit association on

@@ -11360,11 +11360,12 @@ components:
         `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, those writes are permitted under
         the operator's synchronously replicated multi-primary assertion; this
         opt-in divergence-risk contract records each admitted failover-window
-        mutation conservatively and fences automatic primary failback until
-        reconciliation or restart. Managed
-        TLS/ACME stores are independent and are not gated by
-        this topology. This object does not claim per-request mutation success.
-      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
+        mutation conservatively and process-locally fences automatic primary
+        failback until reconciliation or restart. The fence is not
+        coordinated across gateway replicas. Managed TLS/ACME stores are
+        independent and are not gated by this topology. This object does not
+        claim per-request mutation success.
+      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window, primary_failback_fenced]
       properties:
         primary_active:
           type: boolean
@@ -11383,6 +11384,13 @@ components:
             Sticky process-local marker: opt-in writes were enabled at any point
             during the current failover window. Conservative risk signal only;
             does not count admitted, rejected, or successful mutations.
+        primary_failback_fenced:
+          type: boolean
+          description: |
+            `true` after this gateway process admits an Admin mutation on the
+            failover topology. While true, this process will not publish a
+            recovered primary and will continue trying configured failover URLs.
+            This is not a durable or cross-replica coordination marker.
         failover_since_unix_ms:
           type: integer
           format: uint64

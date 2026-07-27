@@ -1775,6 +1775,7 @@ pub async fn handle_admin_request(
                     "allow_writes": topology.allow_writes,
                     "opt_in_writes_enabled_during_window":
                         topology.opt_in_writes_enabled_during_window,
+                    "primary_failback_fenced": topology.primary_failback_fenced,
                 });
                 if let Some(since) = topology.failover_since_unix_ms {
                     failover["failover_since_unix_ms"] = json!(since);
