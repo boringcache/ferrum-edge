@@ -704,6 +704,109 @@ fn test_dtls_loader_preserves_leaf_first_chain_and_validates_leaf_key() {
     );
 }
 
+#[test]
+fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
+    use std::sync::{Arc, Mutex};
+
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let root = generate_ca("DTLS zeroize root");
+    let leaf = generate_signed_cert(&root, "localhost", &["localhost"]);
+    let other = generate_signed_cert(&root, "other.example", &["other.example"]);
+    let cert_path = write_pem(&temp_dir, "leaf.pem", &leaf.cert_pem);
+    let key_path = write_pem(&temp_dir, "leaf.key", &leaf.key_pem);
+    let mismatched_key_path = write_pem(&temp_dir, "other.key", &other.key_pem);
+
+    let key_der_len = {
+        let mut key_reader = leaf.key_pem.as_bytes();
+        rustls_pemfile::private_key(&mut key_reader)
+            .expect("parse leaf key PEM")
+            .expect("leaf key present")
+            .secret_der()
+            .len()
+    };
+    assert!(key_der_len > 0, "expected non-empty leaf key DER");
+
+    let success_observations = Arc::new(Mutex::new(Vec::new()));
+    let success_hook = {
+        let observations = Arc::clone(&success_observations);
+        move |zeroized: &[u8]| {
+            observations
+                .lock()
+                .expect("lock success zeroization observations")
+                .push(zeroized.to_vec());
+        }
+    };
+    let loaded = ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+        &cert_path,
+        &key_path,
+        success_hook,
+    )
+    .expect("successful load must still admit a matching leaf/key pair");
+    assert_eq!(loaded.certificates().len(), 1);
+    {
+        let observations = success_observations
+            .lock()
+            .expect("lock success zeroization observations");
+        assert_eq!(
+            observations.len(),
+            1,
+            "success path must zeroize the Ferrum-managed rustls DER owner exactly once"
+        );
+        assert_eq!(observations[0].len(), key_der_len);
+        assert!(
+            observations[0].iter().all(|byte| *byte == 0),
+            "success-path drop hook must observe only zeroized private-key storage"
+        );
+    }
+    drop(loaded);
+
+    let mismatch_observations = Arc::new(Mutex::new(Vec::new()));
+    let mismatch_hook = {
+        let observations = Arc::clone(&mismatch_observations);
+        move |zeroized: &[u8]| {
+            observations
+                .lock()
+                .expect("lock mismatch zeroization observations")
+                .push(zeroized.to_vec());
+        }
+    };
+    let error = ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+        &cert_path,
+        &mismatched_key_path,
+        mismatch_hook,
+    )
+    .expect_err("mismatched leaf/key pair must fail closed");
+    assert!(
+        error.to_string().contains("do not form a valid pair"),
+        "unexpected mismatch error: {error}"
+    );
+    let mismatched_key_der_len = {
+        let mut key_reader = other.key_pem.as_bytes();
+        rustls_pemfile::private_key(&mut key_reader)
+            .expect("parse mismatched key PEM")
+            .expect("mismatched key present")
+            .secret_der()
+            .len()
+    };
+    {
+        let observations = mismatch_observations
+            .lock()
+            .expect("lock mismatch zeroization observations");
+        assert_eq!(
+            observations.len(),
+            1,
+            "mismatch path must zeroize the Ferrum-managed rustls DER owner exactly once"
+        );
+        assert_eq!(observations[0].len(), mismatched_key_der_len);
+        assert!(
+            observations[0].iter().all(|byte| *byte == 0),
+            "mismatch-path drop hook must observe only zeroized private-key storage"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
     let _ =

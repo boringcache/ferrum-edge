@@ -1560,6 +1560,84 @@ impl DtlsServer {
 // Certificate Loading
 // ============================================================================
 
+/// Encoding discriminant for reconstructing a borrowed rustls private-key view
+/// from Ferrum-owned DER bytes without [`PrivateKeyDer::clone_key`].
+#[derive(Clone, Copy)]
+enum DtlsKeyDerEncoding {
+    Pkcs1,
+    Sec1,
+    Pkcs8,
+}
+
+/// Ferrum-owned DTLS private-key DER that is cleared before its allocation is
+/// released.
+///
+/// `rustls_pki_types::PrivateKeyDer` implements [`zeroize::Zeroize`] but not
+/// `Drop`/`ZeroizeOnDrop`. Adopting the PEM-parsed owner into this guard copies
+/// the secret into Ferrum-managed storage and immediately zeroizes the rustls
+/// owner, then reconstructs only borrowed rustls views for ring parsing and
+/// leaf/key matching.
+struct ZeroizingDtlsKeyDer {
+    bytes: Vec<u8>,
+    encoding: DtlsKeyDerEncoding,
+    drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+}
+
+impl ZeroizingDtlsKeyDer {
+    fn adopt(
+        mut key: rustls::pki_types::PrivateKeyDer<'static>,
+        drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
+    ) -> Self {
+        use zeroize::Zeroize;
+
+        let encoding = match &key {
+            rustls::pki_types::PrivateKeyDer::Pkcs1(_) => DtlsKeyDerEncoding::Pkcs1,
+            rustls::pki_types::PrivateKeyDer::Sec1(_) => DtlsKeyDerEncoding::Sec1,
+            rustls::pki_types::PrivateKeyDer::Pkcs8(_) => DtlsKeyDerEncoding::Pkcs8,
+        };
+        let bytes = key.secret_der().to_vec();
+        // rustls-pki-types does not clear on Drop; wipe the PEM-parsed owner now
+        // that Ferrum owns the only live DER copy used by the loader.
+        key.zeroize();
+        Self {
+            bytes,
+            encoding,
+            drop_hook,
+        }
+    }
+
+    fn private_key_der(&self) -> rustls::pki_types::PrivateKeyDer<'_> {
+        match self.encoding {
+            DtlsKeyDerEncoding::Pkcs1 => rustls::pki_types::PrivateKeyDer::Pkcs1(
+                rustls::pki_types::PrivatePkcs1KeyDer::from(self.bytes.as_slice()),
+            ),
+            DtlsKeyDerEncoding::Sec1 => rustls::pki_types::PrivateKeyDer::Sec1(
+                rustls::pki_types::PrivateSec1KeyDer::from(self.bytes.as_slice()),
+            ),
+            DtlsKeyDerEncoding::Pkcs8 => rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(self.bytes.as_slice()),
+            ),
+        }
+    }
+
+    fn secret_der(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for ZeroizingDtlsKeyDer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        // Preserve length until any observer runs so tests can assert every
+        // live key byte was cleared before the allocation is released.
+        self.bytes.as_mut_slice().zeroize();
+        if let Some(hook) = self.drop_hook.as_ref() {
+            hook(&self.bytes);
+        }
+    }
+}
+
 /// Load a leaf-first DTLS certificate chain from PEM and convert it to DER.
 ///
 /// Every certificate record is parsed and retained in configured order. The
@@ -1568,6 +1646,16 @@ impl DtlsServer {
 pub fn load_dtls_certificate(
     cert_path: &str,
     key_path: &str,
+) -> Result<DtlsCertificateChain, anyhow::Error> {
+    load_dtls_certificate_with_key_drop_hook(cert_path, key_path, None)
+}
+
+/// Test-only seam that observes Ferrum-managed DTLS key DER after zeroization
+/// and before the backing allocation is released.
+pub(crate) fn load_dtls_certificate_with_key_drop_hook(
+    cert_path: &str,
+    key_path: &str,
+    drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
 ) -> Result<DtlsCertificateChain, anyhow::Error> {
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
@@ -1608,29 +1696,49 @@ pub fn load_dtls_certificate(
     }
 
     let mut key_reader = key_material.bytes.expose_secret();
-    let key_der = rustls_pemfile::private_key(&mut key_reader)
+    let parsed_key = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key PEM: {}", e))?
         .ok_or_else(|| {
             anyhow::anyhow!("No private key found in {}", key_material.display_source_id)
         })?;
+    // Adopt immediately so every subsequent success/error return clears the
+    // Ferrum-managed DER owner without relying on manual zeroize call sites.
+    let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook);
 
-    rustls::sign::CertifiedKey::from_der(
-        certificate_chain.clone(),
-        key_der.clone_key(),
-        &rustls::crypto::ring::default_provider(),
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "DTLS certificate {} and private key {} do not form a valid pair: {error}",
-            cert_material.display_source_id,
-            key_material.display_source_id
-        )
-    })?;
+    // Ferrum pins rustls's ring provider. Parse from a borrow — do not
+    // `clone_key()` into `CertifiedKey::from_der`, which would create another
+    // owned DER allocation that ring drops without clearing.
+    let borrowed_key = key_der.private_key_der();
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(
+        |error| {
+            anyhow::anyhow!(
+                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+                cert_material.display_source_id,
+                key_material.display_source_id
+            )
+        },
+    )?;
+    let certified_key = rustls::sign::CertifiedKey::new(certificate_chain.clone(), signing_key);
+    match certified_key.keys_match() {
+        // Preserve rustls `CertifiedKey::from_der` semantics: Unknown is not fatal.
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+                cert_material.display_source_id,
+                key_material.display_source_id
+            ));
+        }
+    }
+
+    // Copy into dimpl's zeroizing owner, then drop the Ferrum DER guard so the
+    // rustls-shaped copy lives only long enough for parsing/validation.
+    let private_key = DtlsPrivateKey::from(key_der.secret_der().to_vec());
+    drop(key_der);
 
     // dimpl only supports ECDSA P-256 / P-384. Reject unsupported algorithms at
     // materialization time so admission/config load surfaces the defect instead
     // of panicking inside the DTLS handshake on first use.
-    let private_key = DtlsPrivateKey::from(key_der.secret_der().to_vec());
     Config::default()
         .crypto_provider()
         .key_provider

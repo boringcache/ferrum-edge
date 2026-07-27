@@ -3877,6 +3877,20 @@ pub mod _test_support {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
     }
 
+    /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
+    /// the backing allocation is released (issue #3224 loader ownership path).
+    pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+        cert_path: &str,
+        key_path: &str,
+        drop_hook: impl Fn(&[u8]) + Send + Sync + 'static,
+    ) -> Result<dimpl::DtlsCertificateChain, anyhow::Error> {
+        crate::dtls::load_dtls_certificate_with_key_drop_hook(
+            cert_path,
+            key_path,
+            Some(std::sync::Arc::new(drop_hook)),
+        )
+    }
+
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
