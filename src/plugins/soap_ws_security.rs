@@ -1555,7 +1555,8 @@ impl SoapWsSecurity {
 
         let amortized_target = (max_entries / 10)
             .clamp(1, NONCE_MAX_MAINTENANCE_ENTRIES)
-            .min(remaining_budget);
+            .min(remaining_budget)
+            .min(state.age_index.len());
         let mut candidates = Vec::with_capacity(remaining_budget);
         let mut projected_entries = state.cache.len();
         let mut projected_bytes = state.retained_key_bytes;

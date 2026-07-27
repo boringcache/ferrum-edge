@@ -4640,6 +4640,39 @@ fn test_nonce_age_index_forced_eviction_is_exact_oldest() {
 }
 
 #[test]
+fn test_nonce_byte_cap_evicts_when_cache_has_fewer_than_amortized_target() {
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 100_000,
+            "cache_ttl_seconds": 86_400,
+            "max_encoded_length": 4_096,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("tight byte cap must admit");
+
+    let first = "A".repeat(4_096);
+    let second = "B".repeat(4_096);
+    harness
+        .claim_at(&first, Duration::ZERO)
+        .expect("first maximum-length nonce must admit");
+    harness
+        .claim_at(&second, Duration::from_secs(1))
+        .expect("the only cached nonce must be evicted to satisfy the byte cap");
+
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, 4_096);
+    assert_eq!(snapshot.last_forced_candidates, 1);
+    assert!(
+        harness.claim_at(&first, Duration::from_secs(2)).is_ok(),
+        "the evicted nonce must no longer pin replay state"
+    );
+}
+
+#[test]
 fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
     const ENTRY_LEN: usize = 16;
     const ENTRY_COUNT: usize = 4_096 / ENTRY_LEN;
