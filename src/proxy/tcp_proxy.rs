@@ -2677,15 +2677,15 @@ async fn handle_tcp_connection_inner(
         // half-open probe slot claimed by can_execute above is released —
         // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
         // until reload.
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
@@ -2712,9 +2712,6 @@ async fn handle_tcp_connection_inner(
                 ));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, params.backend_port);
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the passthrough path. The cap is checked before connect so we don't
         // count failed handshakes against the cap. The guard's RAII drop
@@ -2761,20 +2758,35 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let backend_stream =
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect_err(|_| {
-                    if let Some(ref cb_config) = cb_info.cb_config {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            &cb_info.namespace,
-                            proxy_id,
-                            cb_info.cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
-                    }
-                })?;
+        let (backend_stream, addr) = crate::dns::connect_candidates(
+            &candidates,
+            params.backend_port,
+            connect_timeout,
+            |addr| {
+                connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        })
+        .inspect_err(|_| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        })?;
+        backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -3137,15 +3149,15 @@ async fn handle_tcp_connection_inner(
         }
 
         // Resolve backend IP via DNS
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
@@ -3208,10 +3220,6 @@ async fn handle_tcp_connection_inner(
                 return Err(anyhow::anyhow!(err_msg));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, current_port);
-        // DNS succeeded — record the resolved IP for logging.
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the non-passthrough connect path. Checked once per retry attempt
         // so failed dials don't consume slots; the guard's `Drop` impl
@@ -3300,34 +3308,58 @@ async fn handle_tcp_connection_inner(
         };
 
         // Attempt backend TCP connection (with optional TLS origination)
-        let connect_result = if is_backend_tls {
-            connect_backend_tls_cached(
-                addr,
-                &current_host,
-                connect_timeout,
-                cached_backend_tls,
-                params.tcp_fastopen_enabled,
-                overload,
-                current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                proxy_id,
-            )
-            .await
-            .map(|s| BackendStream::Tls(Box::new(s)))
-        } else {
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect(|stream| {
-                    apply_backend_tcp_keepalive(
-                        proxy_id,
-                        stream,
+        let current_host_ref = current_host.as_str();
+        let params_ref = &params;
+        let connect_result = crate::dns::connect_candidates(
+            &candidates,
+            current_port,
+            connect_timeout,
+            |addr| async move {
+                if is_backend_tls {
+                    connect_backend_tls_cached(
+                        addr,
+                        current_host_ref,
+                        connect_timeout,
+                        cached_backend_tls,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
                         current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                    );
-                })
-                .map(BackendStream::Plain)
-        };
+                        proxy_id,
+                    )
+                    .await
+                    .map(|stream| BackendStream::Tls(Box::new(stream)))
+                } else {
+                    connect_backend_plain(
+                        addr,
+                        connect_timeout,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
+                    )
+                    .await
+                    .inspect(|stream| {
+                        apply_backend_tcp_keepalive(
+                            proxy_id,
+                            stream,
+                            current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+                        );
+                    })
+                    .map(BackendStream::Plain)
+                }
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        });
 
         match connect_result {
-            Ok(_stream) => {
+            Ok((_stream, addr)) => {
+                backend_info.backend_resolved_ip = Some(addr.ip().to_string());
                 // Connection succeeded — break out of retry loop with the
                 // address, carrying the inflight guard so the per-target
                 // counter is decremented at relay exit.

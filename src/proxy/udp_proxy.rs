@@ -679,6 +679,76 @@ fn cached_backend_dtls_config(
     Ok(entry.value().as_ref().clone())
 }
 
+enum ConnectedUdpBackend {
+    Plain(UdpSocket),
+    Dtls(crate::dtls::DtlsConnection),
+}
+
+enum UdpBackendCandidateError {
+    Io(std::io::Error),
+    Dtls(anyhow::Error),
+}
+
+impl From<std::io::Error> for UdpBackendCandidateError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Bind, connect, and (when requested) complete DTLS using the shared rotated
+/// DNS order. The DTLS parameters retain the original hostname for SNI and
+/// certificate verification; only the UDP peer address changes per attempt.
+async fn connect_udp_backend_candidates(
+    candidates: &crate::dns::ResolvedAddresses,
+    port: u16,
+    connect_timeout: Duration,
+    dtls_params: Option<crate::dtls::BackendDtlsParams>,
+) -> Result<(ConnectedUdpBackend, SocketAddr), anyhow::Error> {
+    crate::dns::connect_candidates(candidates, port, connect_timeout, |addr| {
+        let dtls_params = dtls_params.clone();
+        async move {
+            let bind_addr = if addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            let socket = UdpSocket::bind(bind_addr).await?;
+            socket.connect(addr).await?;
+            match dtls_params {
+                Some(params) => crate::dtls::DtlsConnection::connect(socket, params)
+                    .await
+                    .map(ConnectedUdpBackend::Dtls)
+                    .map_err(UdpBackendCandidateError::Dtls),
+                None => Ok(ConnectedUdpBackend::Plain(socket)),
+            }
+        }
+    })
+    .await
+    .map_err(|error| match error {
+        crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+            "UDP/DTLS connect budget exhausted after {}ms (last={})",
+            connect_timeout.as_millis(),
+            last_addr
+        ),
+        crate::dns::CandidateConnectError::Failed {
+            last_addr,
+            source: UdpBackendCandidateError::Io(source),
+        } => anyhow::anyhow!(
+            "All UDP DNS candidates failed (last={}): {}",
+            last_addr,
+            source
+        ),
+        crate::dns::CandidateConnectError::Failed {
+            source: UdpBackendCandidateError::Dtls(source),
+            ..
+        } => StreamSetupError::with_colon_detail(
+            StreamSetupKind::BackendDtlsHandshake,
+            format!("{source:#}"),
+        )
+        .into(),
+    })
+}
+
 /// Insert a pending-session gate for a new source without consuming an active
 /// session slot. The active slot is reserved only after first-datagram plugin
 /// checks and mesh destination enforcement admit the flow.
@@ -3385,15 +3455,15 @@ async fn handle_dtls_client_inner(
         }
     }
 
-    let resolved_ip = match dns_cache
-        .resolve(
+    let candidates = match dns_cache
+        .resolve_candidates(
             &backend_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
         .await
     {
-        Ok(ip) => ip,
+        Ok(addresses) => addresses,
         Err(e) => {
             // Settle any HALF_OPEN probe slot `can_execute` admitted. A
             // backend-egress-policy denial dialed no backend, so release the slot
@@ -3420,129 +3490,45 @@ async fn handle_dtls_client_inner(
             ));
         }
     };
-    let backend_addr = SocketAddr::new(resolved_ip, backend_port);
-    // DNS succeeded — record the resolved IP for logging.
-    backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
-    // Create backend connection — plain UDP or DTLS depending on backend_scheme.
-    // Frontend DTLS termination can forward to either plain UDP or DTLS backends.
-    // Bind ephemeral socket to the correct address family matching the backend.
-    let ephemeral_bind: &str = if backend_addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
+    let dtls_params = (proxy.effective_scheme() == BackendScheme::Dtls)
+        .then(|| {
+            cached_backend_dtls_config(
+                backend_dtls_config_cache,
+                &proxy,
+                &backend_host,
+                tls_no_verify,
+                crls,
+                tls_ca_bundle_path,
+            )
+        })
+        .transpose()?;
+    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let (connected, backend_addr) = match connect_udp_backend_candidates(
+        &candidates,
+        backend_port,
+        connect_timeout,
+        dtls_params,
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(error) => {
+            if let Some(ref cb_config) = proxy.circuit_breaker {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
+                    proxy_id,
+                    cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_is_half_open_probe);
+            }
+            return Err(error);
+        }
     };
-    let (backend_udp, backend_dtls): (
-        Option<Arc<UdpSocket>>,
-        Option<Arc<crate::dtls::DtlsConnection>>,
-    ) = if proxy.effective_scheme() == BackendScheme::Dtls {
-        let socket = match UdpSocket::bind(ephemeral_bind).await {
-            Ok(s) => s,
-            Err(e) => {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
-                }
-                return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
-            }
-        };
-        if let Err(e) = socket.connect(backend_addr).await {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
-                cb.record_failure(502, true, cb_is_half_open_probe);
-            }
-            return Err(anyhow::anyhow!(
-                "Failed to connect to backend {}: {}",
-                backend_addr,
-                e
-            ));
-        }
-        let dtls_params = cached_backend_dtls_config(
-            backend_dtls_config_cache,
-            &proxy,
-            &backend_host,
-            tls_no_verify,
-            crls,
-            tls_ca_bundle_path,
-        )?;
-        let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
-            Ok(d) => Arc::new(d),
-            Err(e) => {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
-                }
-                // dtls::DtlsConnection::connect returns anyhow::Error, which
-                // doesn't implement std::error::Error directly — render the
-                // chain into the message so log lines and source-walking
-                // consumers still see the underlying cause.
-                //
-                // `with_colon_detail` joins as `"{prefix}: {detail}"`,
-                // matching the legacy `anyhow!("{}: {}", STREAM_ERR_..., e)`
-                // wording byte-for-byte so exact-match log pipelines keyed
-                // on the old token keep working.
-                return Err(StreamSetupError::with_colon_detail(
-                    StreamSetupKind::BackendDtlsHandshake,
-                    format!("{e:#}"),
-                )
-                .into());
-            }
-        };
-        debug!(
-            proxy_id = %proxy_id,
-            client = %client_addr,
-            backend = %backend_addr,
-            "Backend DTLS handshake completed (frontend DTLS session)"
-        );
-        (None, Some(dtls))
-    } else {
-        let sock = match UdpSocket::bind(ephemeral_bind).await {
-            Ok(s) => s,
-            Err(e) => {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
-                }
-                return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
-            }
-        };
-        if let Err(e) = sock.connect(backend_addr).await {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
-                cb.record_failure(502, true, cb_is_half_open_probe);
-            }
-            return Err(anyhow::anyhow!(
-                "Failed to connect to backend {}: {}",
-                backend_addr,
-                e
-            ));
-        }
-        (Some(Arc::new(sock)), None)
+    backend_info.backend_resolved_ip = Some(backend_addr.ip().to_string());
+    let (backend_udp, backend_dtls) = match connected {
+        ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
+        ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
     };
 
     // Record circuit breaker success — backend connection established.
@@ -3894,15 +3880,15 @@ async fn create_session(
     }
 
     // DNS resolve
-    let resolved_ip = match dns_cache
-        .resolve(
+    let candidates = match dns_cache
+        .resolve_candidates(
             &backend_host,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
         .await
     {
-        Ok(ip) => ip,
+        Ok(addresses) => addresses,
         Err(e) => {
             // Settle any HALF_OPEN probe slot `can_execute` admitted. A
             // backend-egress-policy denial dialed no backend, so release the slot
@@ -3929,127 +3915,47 @@ async fn create_session(
             ));
         }
     };
-    let backend_addr = SocketAddr::new(resolved_ip, backend_port);
-
-    // Create backend connection — plain UDP or DTLS.
-    // In passthrough mode, always use plain UDP — the client's encrypted DTLS
-    // datagrams pass through directly to the backend which terminates DTLS.
-    // Bind ephemeral socket to the correct address family matching the backend.
-    let ephemeral_bind: &str = if backend_addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let (backend_socket, dtls_conn) =
-        if proxy.effective_scheme() == BackendScheme::Dtls && !is_passthrough {
-            // DTLS: create a connected socket and perform DTLS handshake via dimpl.
-            let socket = match UdpSocket::bind(ephemeral_bind).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if let Some(ref cb_config) = proxy.circuit_breaker {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
-                            proxy_id,
-                            cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_is_half_open_probe);
-                    }
-                    return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
-                }
-            };
-            if let Err(e) = socket.connect(backend_addr).await {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
-                }
-                return Err(anyhow::anyhow!(
-                    "Failed to connect UDP socket to {}: {}",
-                    backend_addr,
-                    e
-                ));
-            }
-
-            let dtls_params = cached_backend_dtls_config(
+    let use_dtls = proxy.effective_scheme() == BackendScheme::Dtls && !is_passthrough;
+    let dtls_params = use_dtls
+        .then(|| {
+            cached_backend_dtls_config(
                 backend_dtls_config_cache,
                 &proxy,
                 &backend_host,
                 tls_no_verify,
                 crls,
                 tls_ca_bundle_path,
-            )?;
-            let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
-                Ok(d) => Arc::new(d),
-                Err(e) => {
-                    if let Some(ref cb_config) = proxy.circuit_breaker {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
-                            proxy_id,
-                            cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_is_half_open_probe);
-                    }
-                    // dtls::DtlsConnection::connect returns anyhow::Error,
-                    // which doesn't implement std::error::Error directly —
-                    // render the chain into the message so consumers still
-                    // see the underlying cause. See the sibling DTLS site
-                    // above for the `with_colon_detail` rationale (legacy
-                    // `"{prefix}: {err}"` wording stability).
-                    return Err(StreamSetupError::with_colon_detail(
-                        StreamSetupKind::BackendDtlsHandshake,
-                        format!("{e:#}"),
-                    )
-                    .into());
-                }
-            };
-            debug!(
-                proxy_id = %proxy_id,
-                client = %client_addr,
-                backend = %backend_addr,
-                "DTLS handshake completed for backend connection"
-            );
-            (None, Some(dtls))
-        } else {
-            // Plain UDP
-            let socket = match UdpSocket::bind(ephemeral_bind).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if let Some(ref cb_config) = proxy.circuit_breaker {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
-                            proxy_id,
-                            cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_is_half_open_probe);
-                    }
-                    return Err(anyhow::anyhow!("Failed to bind UDP socket: {}", e));
-                }
-            };
-            if let Err(e) = socket.connect(backend_addr).await {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true, cb_is_half_open_probe);
-                }
-                return Err(anyhow::anyhow!(
-                    "Failed to connect UDP socket to {}: {}",
-                    backend_addr,
-                    e
-                ));
+            )
+        })
+        .transpose()?;
+    let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+    let (connected, backend_addr) = match connect_udp_backend_candidates(
+        &candidates,
+        backend_port,
+        connect_timeout,
+        dtls_params,
+    )
+    .await
+    {
+        Ok(connected) => connected,
+        Err(error) => {
+            if let Some(ref cb_config) = proxy.circuit_breaker {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
+                    proxy_id,
+                    cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_is_half_open_probe);
             }
-            (Some(Arc::new(socket)), None)
-        };
+            return Err(error);
+        }
+    };
+    let resolved_ip = backend_addr.ip();
+    let (backend_socket, dtls_conn) = match connected {
+        ConnectedUdpBackend::Plain(socket) => (Some(Arc::new(socket)), None),
+        ConnectedUdpBackend::Dtls(connection) => (None, Some(Arc::new(connection))),
+    };
 
     // Record circuit breaker success — backend socket established.
     if let Some(ref cb_config) = proxy.circuit_breaker {

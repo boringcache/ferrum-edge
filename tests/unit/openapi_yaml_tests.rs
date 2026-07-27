@@ -9078,3 +9078,66 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
         "docs must enumerate bedrock as an accepted provider"
     );
 }
+
+#[test]
+fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
+    use ferrum_edge::plugins::body_validator::{
+        BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/BodyValidatorConfig")
+        .expect("BodyValidatorConfig schema");
+
+    // Unknown keys must be refused by the published schema too, not just the
+    // runtime constructor (GHSA-w7x7-ppx9-5v74).
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let method_entry = schema
+        .pointer("/properties/protobuf_method_messages/additionalProperties")
+        .expect("protobuf_method_messages value schema");
+    assert_eq!(method_entry["additionalProperties"], json!(false));
+
+    // Runtime allow-list ↔ OpenAPI property parity, so a typo cannot drift
+    // back in through either side alone.
+    let mut documented: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("BodyValidatorConfig properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_CONFIG_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "BodyValidatorConfig properties must match the runtime allow-list"
+    );
+
+    let mut documented: Vec<String> = method_entry["properties"]
+        .as_object()
+        .expect("protobuf method entry properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_PROTOBUF_METHOD_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "protobuf method entry keys must match the runtime allow-list"
+    );
+
+    assert_eq!(
+        schema["properties"]["json_schema_draft"]["enum"],
+        json!(["draft2020-12", "draft7"])
+    );
+}

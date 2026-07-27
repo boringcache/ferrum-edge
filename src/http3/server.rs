@@ -6522,8 +6522,7 @@ async fn handle_h3_request(
                 }
 
                 // Re-screen the rotated retry target BEFORE admission/dispatch:
-                // the native-H3 pool's `resolve_backend_addr_cached` fast-path
-                // returns IP literals without going through `DnsCache`, so a
+                // the native-H3 pool's cached resolver accepts IP literals, so a
                 // rotated denied literal / `dns_override` target (e.g. a warn-only
                 // DB/DP config carrying `169.254.169.254`) would otherwise be
                 // admitted and dialed here, bypassing the pre-loop screen that only

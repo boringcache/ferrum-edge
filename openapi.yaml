@@ -505,8 +505,14 @@ paths:
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
         Creates an ACME order through the optional `acme` Cargo feature and
-        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material. When
-        Ferrum is built without that feature this endpoint returns
+        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material.
+        Every ACME URL must be HTTPS and remain on the configured directory's
+        normalized host and effective port. Ferrum rejects credential-directory
+        drift, legacy embedded endpoint sets, redirects, and any fresh DNS answer
+        containing a non-public address or more than 64 addresses. Fresh DNS and
+        all TCP candidates share one 30-second wall-clock deadline. Every ACME
+        response, including certificate chains, is capped at 1 MiB while streaming.
+        When Ferrum is built without the feature this endpoint returns
         `501 Not Implemented`.
       tags: [TLS]
       requestBody:
@@ -570,7 +576,10 @@ paths:
         `acme://certificates/{id}` record. Ferrum reuses persisted account
         credentials from the latest order for the certificate when available,
         or uses credentials supplied in the request. Finalize the returned
-        order after the selected challenge is reachable.
+        order after the selected challenge is reachable. The same HTTPS,
+        same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
+        public-egress checks, and 1 MiB streaming response cap used for initial
+        issuance apply to this renewal.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -648,6 +657,10 @@ paths:
         the order, fetches the issued certificate, and stores it as an
         `acme://certificates/{id}` record. The endpoint requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
+        Persisted order and server-provided authorization, challenge, finalize,
+        and certificate URLs remain subject to the directory's HTTPS same-origin
+        policy, the shared 30-second fresh-DNS/TCP deadline, the complete-answer
+        public-address and 64-address checks, and the 1 MiB streaming response cap.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -6220,12 +6233,14 @@ components:
         directory_url:
           type: string
           description: >-
-            ACME directory URL. Must be an absolute `https` URL with a host. Literal
-            IP hosts must be public addresses; private/reserved literals (loopback,
-            RFC1918, link-local, ULA, and the `169.254.169.254` metadata address) are
-            rejected to limit SSRF. Hostnames are not resolved here, so a hostname that
-            points at a private IP is not blocked by this check — apply network-level
-            egress controls as well.
+            ACME directory URL. Must be an absolute `https` URL without userinfo or
+            a fragment. The host must be an ordinary DNS name or canonical IP
+            literal; percent-encoded and ambiguous legacy numeric IPv4 spellings
+            are rejected before DNS. The complete fresh A/AAAA answer must contain
+            at most 64 candidates and every candidate must be public. Fresh DNS
+            and all TCP attempts share a 30-second deadline. All server-provided
+            resource URLs must retain this URL's normalized host and effective
+            port, and every ACME response body is capped at 1 MiB while streaming.
         contact:
           type: array
           items:
@@ -6241,7 +6256,10 @@ components:
           description: ACME challenge type to prepare for this order.
         existing_account_credentials_json:
           type: string
-          description: Previously persisted instant-acme account credentials JSON. Persisted but never returned.
+          description: >-
+            Previously persisted instant-acme account credentials JSON. Its directory
+            must exactly match `directory_url`; legacy embedded `urls` sets are
+            rejected. Persisted but never returned.
         allow_overwrite:
           type: boolean
           default: false
@@ -6302,7 +6320,10 @@ components:
           description: ACME challenge type to prepare for the renewal order.
         existing_account_credentials_json:
           type: string
-          description: Optional instant-acme account credentials JSON. Persisted in the renewal order but never returned.
+          description: >-
+            Optional instant-acme account credentials JSON. Its directory must match
+            the certificate directory and legacy embedded `urls` sets are rejected.
+            Persisted in the renewal order but never returned.
         allow_overwrite:
           type: boolean
           default: false
@@ -12627,7 +12648,7 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload. Requires a fully-open backend egress policy: librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned client exposes no connect/resolve callback, so those addresses cannot be screened. Admission returns 400 whenever FERRUM_BACKEND_* policy can deny any address (including the default posture). broker_list is parsed with librdkafka's [proto://]host[:port] grammar, so protocol-prefixed denied literals and protocol prefixes that disagree with security_protocol are rejected."
       required:
         - broker_list
         - topic
@@ -17946,11 +17967,48 @@ components:
 
     BodyValidatorConfig:
       type: object
-      description: "Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation for request/response bodies."
+      additionalProperties: false
+      description: >-
+        Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation
+        for request/response bodies. Unknown top-level keys and unknown keys
+        inside a protobuf_method_messages entry are rejected at construction, so
+        a typo can never silently disable an intended rule; the plugin is
+        fail-closed, and a rejected configuration keeps the last known-good
+        generation. Configured JSON Schemas are compiled once at construction
+        under an explicit draft, XML bodies are parsed by a real XML parser, and
+        decoded protobuf messages must satisfy proto2 required-field
+        initialization. Configuration errors use value-free field and category
+        messages; supplied keys, paths, URIs, schema values, XML entries, and
+        compiler diagnostics are not reproduced.
       properties:
         json_schema:
           type: object
-          description: JSON Schema for request body validation
+          description: >-
+            JSON Schema for request body validation. Compiled at plugin
+            construction under json_schema_draft; a malformed schema, an unknown
+            or unsupported keyword shape, an invalid type name, a non-local
+            $ref/$dynamicRef, a non-fragment $id/id, a $vocabulary declaration,
+            a $schema naming another draft, or a schema exceeding the 32-level /
+            20000-node budget fails construction. Reference and identifier
+            policy applies only at actual schema positions; property/definition
+            names and unreferenced literal annotation/instance objects are not
+            interpreted as keywords. A supported local URI-fragment JSON Pointer
+            makes its object/boolean target an actual schema even under a
+            normally literal or unknown container; pointer percent-decoding,
+            escaping, root handling, and cycles match the validator library.
+            Draft 7 walks definitions but not $defs unless directly referenced;
+            Draft 2020-12 walks both. Budgets count every JSON node in the
+            supplied value.
+        json_schema_draft:
+          type: string
+          enum: [draft2020-12, draft7]
+          default: draft2020-12
+          description: >-
+            JSON Schema dialect used to compile json_schema and
+            response_json_schema. There is no auto-detect mode; a schema whose
+            $schema names a different draft is rejected. $dynamicRef has
+            reference semantics only under draft2020-12 and remains an unknown,
+            inert keyword under draft7.
         required_fields:
           type: array
           items:
@@ -17960,13 +18018,24 @@ components:
         validate_xml:
           type: boolean
           default: false
-          description: Enable XML well-formedness validation
+          description: >-
+            Enable XML well-formedness validation. The body must parse as a
+            single well-formed XML document (one root element, valid names,
+            attribute grammar and uniqueness, valid characters, declared entity
+            references, no text outside the root). The original text is parsed
+            without Unicode whitespace trimming. External SYSTEM/PUBLIC
+            identifiers on the DOCTYPE or an entity declaration are always
+            rejected; external entities are never retrieved.
         required_xml_elements:
           type: array
           items:
             type: string
           default: []
-          description: Required XML element names
+          description: >-
+            Required XML element names, matched against parsed element names.
+            A bare name matches that local name in any namespace; Clark notation
+            ("{http://example.com/ns}item") requires the expanded namespace URI
+            and local name to match, and "{}item" requires no namespace.
         xml_max_entities:
           type: integer
           format: uint64
@@ -17996,7 +18065,11 @@ components:
             actual headers do not match and are skipped.
         response_json_schema:
           type: object
-          description: JSON Schema for response body validation
+          description: >-
+            JSON Schema for response body validation. Compiled at plugin
+            construction under json_schema_draft with the same fail-closed rules
+            as json_schema. Response-side violations are reported to the client
+            without the rejected upstream value or its instance location.
         response_required_fields:
           type: array
           items:
@@ -18006,6 +18079,10 @@ components:
         response_validate_xml:
           type: boolean
           default: false
+          description: >-
+            Enable response XML well-formedness validation with the same exact-
+            text parsing and external DOCTYPE/entity identifier rejection as
+            validate_xml.
         response_required_xml_elements:
           type: array
           items:
@@ -18038,6 +18115,7 @@ components:
           type: object
           additionalProperties:
             type: object
+            additionalProperties: false
             properties:
               request:
                 type: string
@@ -18045,11 +18123,19 @@ components:
               response:
                 type: string
                 description: Fully-qualified protobuf message type for response validation
-          description: Per-method message type overrides keyed by gRPC path
+          description: >-
+            Per-method message type overrides keyed by gRPC path. Each entry
+            accepts only 'request' and 'response'; any other key rejects the
+            configuration.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
-          description: Reject messages containing field numbers not in the descriptor
+          description: >-
+            Reject messages containing field numbers not in the descriptor. This
+            is independent of proto2 required-field initialization, which is
+            always enforced: a decoded message that omits any proto2 required
+            field, at the top level or inside a present nested/repeated/map/
+            extension message value, is rejected regardless of this setting.
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64

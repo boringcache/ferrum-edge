@@ -584,6 +584,8 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 
 **Protocols:** all (HTTP, gRPC, WebSocket, TCP, UDP)
 
+**Egress policy:** `ws_logging` dials outside the shared plugin HTTP client, so it applies the same strict connection-establishment path as `ldap_auth`. Every connection *and reconnection* bypasses both DNS cache layers, resolves the complete A+AAAA answer set, rejects the whole answer if any candidate is denied by the backend egress policy, rechecks each candidate immediately before its socket is opened, and dials only screened addresses. The configured hostname is kept as the TLS SNI / certificate identity and the WebSocket `Host` authority, so a DNS rebind between admission and a later reconnect cannot steer log shipping at a denied destination.
+
 **Failure policy:** `KeepLastKnownGood` — construction/validation failures,
 including an incomplete or unusable custom TLS CA bundle, reject the candidate
 plugin generation and keep the last-known-good logger instance.
@@ -757,6 +759,8 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 **Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
 
 **Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
+
+> **Requires a fully-open backend egress policy.** librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so Ferrum cannot screen those addresses. `kafka_logging` therefore **fails closed** and is refused whenever the backend egress policy can deny any address — which includes the default posture. `broker_list` is parsed with librdkafka's exact `[proto://]host[:port]` grammar, so protocol-prefixed denied literals (e.g. `PLAINTEXT://169.254.169.254:9092`) are rejected too. See [Backend Egress / SSRF Protection](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
 
 Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
@@ -3715,7 +3719,9 @@ config:
 
 ### `body_validator`
 
-Validates JSON, XML, and gRPC protobuf request and response bodies against schemas. Supports comprehensive JSON Schema validation.
+Validates JSON, XML, and gRPC protobuf request and response bodies against schemas.
+
+**Fail-closed configuration:** unknown top-level keys, and unknown keys inside a `protobuf_method_messages` entry, are rejected before any default is applied. `body_validator` is registered `FailClosed`, so a rejected configuration keeps the last known-good plugin generation on every admission path (Admin API 400, file-mode startup/reload failure, DB warning, CP rejection, DP snapshot retention). A misspelled `response_json_scheam` or `respones` can no longer be ignored while another valid rule lets construction succeed. Configuration errors identify only fixed fields, keyword categories, supported draft names, and safe structural indexes; they never echo supplied keys, paths, URIs, schema values, XML entries, or compiler diagnostics into admission or logging surfaces.
 
 Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
 
@@ -3727,10 +3733,11 @@ Request-side validation only buffers matching request bodies: methods that can c
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `json_schema` | Object | — | JSON Schema for request body validation |
+| `json_schema` | Object | — | JSON Schema for request body validation, compiled at plugin construction |
+| `json_schema_draft` | string | `draft2020-12` | JSON Schema dialect (`draft2020-12` or `draft7`) used to compile `json_schema` and `response_json_schema` |
 | `required_fields` | String[] | `[]` | Simple required field names |
 | `validate_xml` | bool | `false` | Enable XML well-formedness validation |
-| `required_xml_elements` | String[] | `[]` | Required XML element names |
+| `required_xml_elements` | String[] | `[]` | Required XML element names, matched on parsed names (see XML validation below) |
 | `xml_max_entities` | usize | `100` | Maximum `<!ENTITY` declarations allowed in XML DOCTYPEs before rejecting as possible entity-expansion abuse. Applies to request and response XML validation. |
 | `xml_reject_nested_entities` | bool | `true` | Reject XML entity definitions, including parameter-entity expansions, that reference or generate other entity definitions. |
 | `content_types` | String[] | `["application/json","application/xml","text/xml"]` | Request media types to validate (exact type/subtype; see matching rules above) |
@@ -3755,7 +3762,7 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `protobuf_request_type` | String | — | Default fully-qualified protobuf message type for request validation |
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
-| `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
+| `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
 | `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
 **gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
@@ -3789,7 +3796,30 @@ ambiguous values cannot match a configured JSON/XML rule and are released;
 the shared refinement still refuses release when another active plugin may
 rewrite `Content-Type`.
 
-**Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
+**JSON Schema validation**: `json_schema` and `response_json_schema` are compiled once, at plugin construction, with the `jsonschema` crate under the draft named by `json_schema_draft` (`draft2020-12` by default, `draft7` also supported). Nothing is compiled or interpreted per request. Standard vocabulary applies, including local `$ref` / `$defs`, union `type` arrays, `const`, `pattern`, conditionals, and array constraints. `format` is asserted (not merely annotated) in both drafts; unknown format names remain advisory per the specification.
+
+Configuration fails closed — and therefore preserves the previous plugin generation — when a schema:
+
+- is not a valid schema for the configured draft (malformed keyword shapes, invalid type names such as `"type": "objcet"`, invalid `pattern` regexes)
+- uses a `$ref` or `$dynamicRef` that is not a local fragment (`#...`), a non-fragment `$id` / `id`, or a `$vocabulary` declaration at an actual schema position
+- declares a `$schema` naming a draft other than the configured one
+- nests deeper than 32 levels or contains more than 20000 JSON nodes, counting the complete supplied value including literal `enum` / `const` data and annotations
+
+No JSON Schema reference is ever retrieved over the network or from the filesystem: the `jsonschema` dependency is built with `default-features = false`, which removes the HTTP and file retrievers, and non-local references are additionally rejected with an explicit configuration error. Local recursive references are supported; semantic auditing deduplicates reference targets by identity, and instance recursion is bounded by `serde_json`'s 128-level parse nesting limit.
+
+The audit follows only schema-bearing positions for the selected draft, including property/definition maps, composition and tuple arrays, and single-schema keywords such as `items`, `additionalProperties`, conditionals, and unevaluated constraints. It also follows every supported local `$ref` / `$dynamicRef` URI-fragment JSON Pointer target, even when that target is stored under `default`, `const`, `examples`, or another normally literal/unknown container: percent-decoding, JSON Pointer `~0` / `~1` unescaping, root `#`, invalid pointers, and cycles match the reference library. Ordinary unreferenced objects in those containers remain literal instance/annotation data, so members named `id`, `$ref`, `$id`, `$schema`, `$vocabulary`, or `$dynamicRef` do not acquire schema meaning merely from their spelling. Map member names under `properties`, `patternProperties`, `$defs`, and `definitions` are names, not active keywords. Draft 7 traverses `definitions`, while Draft 2020-12 traverses `$defs` and the library's compatible `definitions` map; a Draft 7 `$defs` value becomes a schema only when a local pointer explicitly targets it. `$dynamicRef` has reference semantics only under Draft 2020-12 and remains an unknown, inert keyword under Draft 7. Anchors require no separate semantic pass because the library indexes them only at the same draft-recognized schema positions the ordinary walk audits. Boolean subschemas are supported.
+
+Client-visible schema failures never echo the rejected value. A request failure names the failing keyword and the instance location (`/items/0/id`); a response failure names only the keyword, so an upstream body's shape is not described back to the client.
+
+**XML validation**: bodies are parsed with `roxmltree`, a maintained namespace-aware, non-fetching XML parser, so well-formedness means what the XML specification says it means: exactly one document element, valid XML `Name` syntax, correct attribute grammar with quoted and unique attributes, valid characters, declared entity references, and no character data outside the root. The exact original UTF-8 text is passed to the parser without `trim()` or other whitespace normalization, so only XML 1.0 whitespace is accepted around the document. Malformed declarations, unterminated constructs, and quote-aware `>` handling follow the parser's contract. The parser is bounded to 100000 nodes.
+
+Two policy guards run before parsing: the configured `<!ENTITY` declaration cap (`xml_max_entities`) with nested-entity rejection (`xml_reject_nested_entities`), and unconditional rejection of external `SYSTEM` / `PUBLIC` identifiers on either the DOCTYPE external subset or an entity declaration. Ferrum accepts no external identifier and never resolves one. The guard is quote/comment/CDATA-aware, so keyword-looking literal text is not misclassified. Internal DTD subsets remain permitted so the entity knobs stay authoritative; the parser still applies its own billion-laughs limits (expansion depth 10, 255 references per reference).
+
+`required_xml_elements` / `response_required_xml_elements` match **parsed** element names, not source bytes, so a name inside a comment, CDATA section, or processing instruction never satisfies a requirement. A bare entry (`item`) matches that local name in any namespace. Clark notation (`{http://example.com/ns}item`) requires the expanded namespace URI **and** the local name to match. `{}item` requires the element to be in no namespace. An entry that opens `{` without closing `}`, or that has an empty local name, is a configuration error.
+
+**Protobuf initialization**: after decoding, every proto2 `required` field must be present — at the top level and recursively inside present singular, repeated, map, and extension message values. Presence, not value, is what is checked: a required scalar carrying its type's default value is present, because proto2 tracks it with a hasbit. proto3 descriptors have no `required` cardinality and are unaffected, and a proto3-only descriptor pool skips the walk entirely. The walk is bounded to 32 levels of message nesting and 50000 messages, and fails closed if either budget is exhausted. This is independent of `protobuf_reject_unknown_fields`, applies to compressed frames and per-method request/response descriptors alike, and the error names the descriptor field path only — never a payload value.
+
+**Supported JSON Schema `format` values**: the `jsonschema` crate's format vocabulary for the configured draft, which includes `email`, `ipv4`, `ipv6`, `uri`, `uri-reference`, `date-time`, `date`, `time`, `hostname`, `json-pointer`, `regex`, and `uuid`.
 
 ### `openapi_validator`
 
