@@ -3318,6 +3318,96 @@ async fn parameter_entity_expanding_entity_declarations_is_rejected() {
 }
 
 #[tokio::test]
+async fn attlist_parameter_entity_expansion_is_rejected() {
+    // Bare `%many;` in the subset is already covered. The same expansion inside
+    // another markup declaration (ATTLIST) must still fail closed — that is the
+    // quote-aware `<!` skip path that charges parameter entities in markup.
+    let plugin = xml_plugin();
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn attlist_parameter_entity_count_exceeds_cap_when_nesting_allowed() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_reject_nested_entities": false,
+        "xml_max_entities": 1
+    }))
+    .unwrap();
+    // The parameter entity declaration itself consumes the only allowed slot;
+    // expanding it into two more declarations must still exceed the cap.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn attlist_parameter_entity_without_nested_declarations_is_allowed() {
+    let plugin = xml_plugin();
+    // Empty replacement text contributes zero nested declarations, so the
+    // markup charge is a no-op and the ATTLIST remains well-formed.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % empty "">"#,
+        r#"<!ATTLIST r id CDATA #IMPLIED%empty;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn quoted_parameter_entity_inside_attlist_is_not_charged() {
+    let plugin = xml_plugin();
+    // `%many;` appears only as a quoted default attribute value, so the
+    // expansion policy must not treat it as an active parameter reference.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA "%many;">"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn incomplete_attlist_still_charges_parameter_entity_references() {
+    let plugin = xml_plugin();
+    // Missing `>` forces the declaration-end scan to the end of the body; the
+    // unquoted `%many;` inside must still be charged and rejected.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn too_many_xml_entities_are_rejected() {
     let plugin = BodyValidator::new(&json!({
         "validate_xml": true,
@@ -4070,6 +4160,111 @@ fn draft7_schemas_compile_under_the_matching_configured_draft() {
 }
 
 #[test]
+fn non_string_schema_keywords_fail_closed() {
+    // Active keyword values must be strings; a typed mismatch used to skip the
+    // decisive policy check while admission still reported the schema as live.
+    let cases = [
+        (json!({"$ref": true}), "non-string '$ref'"),
+        (json!({"$dynamicRef": 7}), "non-string '$dynamicRef'"),
+        (json!({"$id": false}), "non-string '$id'"),
+        (json!({"id": ["legacy"]}), "non-string 'id'"),
+        (json!({"$schema": {"uri": "x"}}), "non-string '$schema'"),
+    ];
+    for (schema, needle) in cases {
+        let error = BodyValidator::new(&json!({"json_schema": schema}))
+            .err()
+            .expect("non-string schema keyword must fail closed");
+        assert!(
+            error.contains(needle),
+            "expected {needle:?} in {error}"
+        );
+    }
+}
+
+#[test]
+fn draft7_schema_mismatch_names_the_configured_draft() {
+    let mismatched = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object"
+        }
+    });
+    let error = BodyValidator::new(&mismatched)
+        .err()
+        .expect("draft mismatch must fail closed");
+    assert!(
+        error.contains("unsupported '$schema'"),
+        "{error}"
+    );
+    assert!(
+        error.contains("draft7"),
+        "rejection must name the configured draft: {error}"
+    );
+}
+
+#[test]
+fn draft7_boolean_dependencies_are_active_schema_positions() {
+    // Draft 7 dependency values may be schemas (object or boolean) or property-
+    // name arrays. A boolean schema must be walked so `false` is decisive.
+    let config = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "object",
+            "dependencies": {
+                "flag": true
+            }
+        }
+    });
+    BodyValidator::new(&config).expect("boolean dependency schema must compile");
+}
+
+#[test]
+fn local_pointer_rejects_scalar_and_array_out_of_range_targets() {
+    let array_oob = json!({
+        "examples": [{"type": "string"}],
+        "$ref": "#/examples/5"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": array_oob}))
+        .err()
+        .expect("array out-of-range pointer must fail");
+    assert!(error.contains("resolves nowhere"), "{error}");
+
+    let through_scalar = json!({
+        "type": "string",
+        "$ref": "#/type/next"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": through_scalar}))
+        .err()
+        .expect("pointer through a scalar must fail");
+    assert!(error.contains("resolves nowhere"), "{error}");
+}
+
+#[test]
+fn local_pointer_unusual_tilde_escapes_still_resolve() {
+    // referencing keeps unknown `~` escapes and a trailing `~` as literal text
+    // after the `~0` / `~1` substitutions. Construction must follow that exact
+    // spelling so a key that only exists under the library's unescape is found.
+    let unknown_escape = json!({
+        "default": {
+            "a~2b": {"type": "integer"}
+        },
+        "$ref": "#/default/a~2b"
+    });
+    BodyValidator::new(&json!({"json_schema": unknown_escape}))
+        .expect("unknown tilde escape must round-trip as a literal key");
+
+    let trailing_tilde = json!({
+        "default": {
+            "trail~": {"type": "string"}
+        },
+        "$ref": "#/default/trail~"
+    });
+    BodyValidator::new(&json!({"json_schema": trailing_tilde}))
+        .expect("trailing tilde must round-trip as a literal key");
+}
+
+#[test]
 fn schema_recursion_and_size_budgets_are_bounded() {
     // 40 levels of nesting exceeds the 32-level budget.
     let mut schema = json!({"type": "string"});
@@ -4354,6 +4549,9 @@ fn malformed_required_xml_element_entries_are_rejected() {
         json!({"required_xml_elements": ["{http://example.com/ns"]}),
         json!({"required_xml_elements": ["{http://example.com/ns}"]}),
         json!({"response_required_xml_elements": ["{ns"]}),
+        // Local names must not embed Clark braces after the namespace closes.
+        json!({"required_xml_elements": ["item{bad}"]}),
+        json!({"response_required_xml_elements": ["{http://e.com/ns}a}b"]}),
     ];
     for config in configs {
         assert!(
