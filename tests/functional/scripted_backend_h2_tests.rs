@@ -21,6 +21,8 @@
 //! `GrpcStep::{SendGoaway,SendRstStream,CloseAfterHeaders}` lowering.
 //! `GrpcStep::{AcceptStreamingRpc,ExpectReset}` cover the live bidi deadline
 //! cancellation path.
+//! `GrpcStep::AwaitTestSignal` / `H2Step::AwaitTestSignal` gate the pooled
+//! GOAWAY canceled-send regression so response headers land before GOAWAY.
 //! `H2Step::SendGoaway` (the non-closing graceful form) is intentionally
 //! reserved for in-flight graceful-drain coverage: the round-2 matrix needs
 //! a terminal connection fault, so it uses `SendGoawayAndClose` instead.
@@ -2531,6 +2533,14 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
                     code: 0,
                     message: "",
                 },
+                // Park until the test confirms the warmup RPC completed. Hosted
+                // evidence showed GOAWAY in the same script burst as the warmup
+                // response racing hyper's client: request headers reached
+                // AcceptRpc (acceptors_waiting→0) while send_request still
+                // failed with "connection error" / grpc-status 14 before
+                // response headers were delivered. AwaitTestSignal makes that
+                // ordering an explicit fixture barrier instead of a sleep.
+                GrpcStep::AwaitTestSignal,
                 // Keep the socket open so the pool can still hand out the
                 // dying sender for one more send_request (hyper is_canceled).
                 GrpcStep::SendGoawayKeepOpen { error_code: 0 },
@@ -2611,9 +2621,30 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         backend.step_errors().await,
         harness.captured_combined().unwrap_or_default()
     );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "warmup must reuse the single probe-pooled sender; a proactive redial \
+         before GOAWAY would hide the DispatchCanceled path; \
+         handshakes={}, streams={}, backend_step_errors={:?}\n\
+         --- captured gateway output ---\n{}",
+        backend.handshakes_completed(),
+        backend.received_stream_count(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert_eq!(
+        backend.goaways_sent(),
+        0,
+        "GOAWAY must not fire until after the warmup RPC is observed complete"
+    );
 
-    // Brief pause so the scripted GOAWAY lands while the pooled sender is idle.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Release the scripted GOAWAY only after the warmup RPC completed, then
+    // wait until the fixture has actually issued it so the second send hits
+    // the stale pooled sender rather than racing a still-healthy connection.
+    wait_for_backend_awaiting_test_signal(&backend, Duration::from_secs(5)).await;
+    backend.release_test_signal();
+    wait_for_backend_goaway_sent(&backend, 1, Duration::from_secs(5)).await;
 
     let second = client
         .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
@@ -2707,6 +2738,53 @@ async fn wait_for_grpc_h2c_probe_accept_armed(
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_backend_awaiting_test_signal(backend: &ScriptedGrpcBackend, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend.awaiting_test_signal() >= 1 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "script did not park on AwaitTestSignal within {timeout:?}; \
+                 awaiting={}, goaways_sent={}, accepted={}, streams={}, \
+                 backend_step_errors={:?}",
+                backend.awaiting_test_signal(),
+                backend.goaways_sent(),
+                backend.accepted_connections(),
+                backend.received_stream_count(),
+                backend.step_errors().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_backend_goaway_sent(
+    backend: &ScriptedGrpcBackend,
+    at_least: u32,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend.goaways_sent() >= at_least {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "fixture did not issue GOAWAY within {timeout:?}; \
+                 goaways_sent={}, awaiting_test_signal={}, accepted={}, \
+                 backend_step_errors={:?}",
+                backend.goaways_sent(),
+                backend.awaiting_test_signal(),
+                backend.accepted_connections(),
+                backend.step_errors().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

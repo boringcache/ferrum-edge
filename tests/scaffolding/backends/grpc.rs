@@ -99,6 +99,10 @@ pub enum GrpcStep {
     /// Useful for proving that a gateway forwards server-streaming DATA before
     /// the backend reaches EOF.
     Sleep(Duration),
+    /// Block until the test calls [`ScriptedGrpcBackend::release_test_signal`].
+    /// Separates a completed RPC response from a later connection fault without
+    /// a wall-clock sleep.
+    AwaitTestSignal,
     /// Send the gRPC status trailer (`grpc-status: <code>` and
     /// `grpc-message: <message>` when non-empty). Implicitly closes the
     /// stream.
@@ -254,6 +258,21 @@ impl ScriptedGrpcBackend {
         self.inner.acceptors_waiting()
     }
 
+    /// Scripts currently blocked in [`GrpcStep::AwaitTestSignal`].
+    pub fn awaiting_test_signal(&self) -> u32 {
+        self.inner.awaiting_test_signal()
+    }
+
+    /// GOAWAY frames issued by the script.
+    pub fn goaways_sent(&self) -> u32 {
+        self.inner.goaways_sent()
+    }
+
+    /// Release every script blocked on [`GrpcStep::AwaitTestSignal`].
+    pub fn release_test_signal(&self) {
+        self.inner.release_test_signal();
+    }
+
     /// Every RPC observed by `AcceptRpc`, in arrival order.
     pub async fn received_streams(&self) -> Vec<ReceivedStream> {
         self.inner.received_streams().await
@@ -336,6 +355,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             }]
         }
         GrpcStep::Sleep(duration) => vec![H2Step::Sleep(duration)],
+        GrpcStep::AwaitTestSignal => vec![H2Step::AwaitTestSignal],
         GrpcStep::RespondStatus { code, message } => {
             let mut trailers = vec![("grpc-status", code.to_string())];
             if !message.is_empty() {
