@@ -6976,9 +6976,7 @@ impl DatabaseStore {
                 info!("Reconnected to primary database");
                 return Ok(primary_url.to_string());
             }
-            Err(error)
-                if crate::config::db_backend::primary_failback_fenced(&error) =>
-            {
+            Err(error) if crate::config::db_backend::primary_failback_fenced(&error) => {
                 warn!(
                     "Primary database failback remains fenced after an admitted failover-window Admin write; retrying configured failover URLs"
                 );

@@ -2456,9 +2456,7 @@ async fn failover_write_gate_fences_primary_after_opt_in_admission() {
         "the failover window remains active"
     );
     assert!(
-        store
-            .failover_topology_status()
-            .primary_failback_fenced,
+        store.failover_topology_status().primary_failback_fenced,
         "reconnecting the failover must preserve the local fence"
     );
     assert_eq!(
