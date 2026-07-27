@@ -15,7 +15,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(feature = "acme")]
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
@@ -424,8 +425,10 @@ impl AcmeCertificateStore {
             record.created_at = now;
             record.updated_at = now;
         }
-        certificates.insert(record.id.clone(), record.clone());
-        self.persist_locked(&certificates)?;
+        let mut candidate = certificates.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *certificates = candidate;
         Ok(record)
     }
 
@@ -435,10 +438,12 @@ impl AcmeCertificateStore {
             .certificates
             .write()
             .map_err(|_| AcmeError::Write("ACME certificate store lock is poisoned".to_string()))?;
-        let removed = certificates
+        let mut candidate = certificates.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| AcmeError::NotFound(id.to_string()))?;
-        self.persist_locked(&certificates)?;
+        self.persist_locked(&candidate)?;
+        *certificates = candidate;
         Ok(removed)
     }
 
@@ -460,16 +465,7 @@ impl AcmeCertificateStore {
             certificates: certificates.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| AcmeError::Write(error.to_string()))?;
         Ok(())
     }
@@ -562,8 +558,10 @@ impl AcmeOrderStore {
             record.created_at = now;
             record.updated_at = now;
         }
-        orders.insert(record.id.clone(), record.clone());
-        self.persist_locked(&orders)?;
+        let mut candidate = orders.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *orders = candidate;
         Ok(record)
     }
 
@@ -573,10 +571,12 @@ impl AcmeOrderStore {
             .orders
             .write()
             .map_err(|_| AcmeError::Write("ACME order store lock is poisoned".to_string()))?;
-        let removed = orders
+        let mut candidate = orders.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| AcmeError::OrderNotFound(id.to_string()))?;
-        self.persist_locked(&orders)?;
+        self.persist_locked(&candidate)?;
+        *orders = candidate;
         Ok(removed)
     }
 
@@ -667,16 +667,7 @@ impl AcmeOrderStore {
             orders: orders.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            ORDER_STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| AcmeError::Write(error.to_string()))?;
         Ok(())
     }
@@ -764,8 +755,10 @@ impl AcmeAccountStore {
                 last_used_at: Some(now),
             }
         };
-        accounts.insert(key, record.clone());
-        self.persist_locked(&accounts)?;
+        let mut candidate = accounts.clone();
+        candidate.insert(key, record.clone());
+        self.persist_locked(&candidate)?;
+        *accounts = candidate;
         Ok(record)
     }
 
@@ -777,16 +770,7 @@ impl AcmeAccountStore {
             accounts: accounts.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            ACCOUNT_STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| AcmeError::Write(error.to_string()))?;
         Ok(())
     }
@@ -2375,12 +2359,6 @@ pub mod client {
             );
         }
     }
-}
-
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AcmeError> {
-    crate::tls::private_file::write_private_file(path, bytes)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -8,14 +8,13 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
@@ -228,7 +227,7 @@ impl ManagedTlsStore {
             ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
         })?;
         let now = Utc::now();
-        let previous = if let Some(existing) = records.get(&record.id) {
+        if let Some(existing) = records.get(&record.id) {
             if !allow_overwrite {
                 return Err(ManagedTlsError::AlreadyExists(record.id));
             }
@@ -241,26 +240,17 @@ impl ManagedTlsStore {
             }
             record.created_at = existing.created_at;
             record.updated_at = now;
-            Some(existing.clone())
         } else {
             record.created_at = now;
             record.updated_at = now;
-            None
-        };
-        let id = record.id.clone();
-        records.insert(id.clone(), record.clone());
-        if let Err(error) = self.persist_locked(&records) {
-            // Roll back the in-memory mutation so a failed write is not visible.
-            match previous {
-                Some(previous) => {
-                    records.insert(id, previous);
-                }
-                None => {
-                    records.remove(&id);
-                }
-            }
-            return Err(error);
         }
+        // Persist the candidate snapshot first; publish into the live map only
+        // after durable replacement succeeds so readers never observe a failed
+        // mutation.
+        let mut candidate = records.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *records = candidate;
         Ok(record)
     }
 
@@ -269,14 +259,12 @@ impl ManagedTlsStore {
         let mut records = self.records.write().map_err(|_| {
             ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
         })?;
-        let removed = records
+        let mut candidate = records.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))?;
-        if let Err(error) = self.persist_locked(&records) {
-            // Restore the removed record so a failed delete is not visible.
-            records.insert(removed.id.clone(), removed);
-            return Err(error);
-        }
+        self.persist_locked(&candidate)?;
+        *records = candidate;
         Ok(removed)
     }
 
@@ -298,16 +286,7 @@ impl ManagedTlsStore {
             records: records.clone(),
         })
         .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            ManagedTlsError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
         Ok(())
     }
@@ -743,12 +722,6 @@ pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
         .clone()
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagedTlsError> {
-    crate::tls::private_file::write_private_file(path, bytes)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,6 +956,11 @@ mod tests {
         let reopened = ManagedTlsStore::open(dir.path()).expect("reopen");
         let on_disk = reopened.get("persist-ca").expect("disk original retained");
         assert_eq!(on_disk.ca_bundle_pem.as_deref(), Some("ca"));
+        assert!(
+            crate::tls::private_file::private_temp_artifacts_for_tests(dir.path())
+                .expect("list temps")
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -1019,5 +997,10 @@ mod tests {
         assert!(store.get("persist-jwks").is_ok());
         let reopened = ManagedTlsStore::open(dir.path()).expect("reopen");
         assert!(reopened.get("persist-jwks").is_ok());
+        assert!(
+            crate::tls::private_file::private_temp_artifacts_for_tests(dir.path())
+                .expect("list temps")
+                .is_empty()
+        );
     }
 }
