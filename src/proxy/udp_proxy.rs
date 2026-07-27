@@ -283,8 +283,9 @@ pub(crate) fn take_udp_last_client_if_live<T>(
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
 type BackendDtlsConfigCache = Arc<BackendDtlsConfigCacheState>;
 
-/// Listener-local cache of built backend DTLS params keyed by the inputs that
-/// affect the resulting config. The key is path/options-based, so it cannot
+/// Listener-local cache of built backend DTLS params keyed by the owning
+/// `(namespace, proxy_id)` and the inputs that affect the resulting config.
+/// The key is path/options-based, so it cannot
 /// observe in-place cert/key/CA rotation — backend TLS live reload bumps the
 /// shared `reload_epoch` (via
 /// `StreamListenerManager::bump_backend_tls_reload_epoch`, called from
@@ -378,6 +379,9 @@ impl Drop for PendingSessionGate {
 
 #[derive(Clone, Eq, PartialEq)]
 struct BackendDtlsConfigCacheKey {
+    /// Required for shared SNI listeners, which can serve same-ID proxies from
+    /// different namespaces through one listener-local cache.
+    proxy_namespace: String,
     proxy_id: String,
     backend_host: String,
     client_cert_path: Option<String>,
@@ -397,6 +401,7 @@ struct BackendDtlsConfigCacheKey {
 
 impl Hash for BackendDtlsConfigCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.proxy_namespace.hash(state);
         self.proxy_id.hash(state);
         self.backend_host.hash(state);
         self.client_cert_path.hash(state);
@@ -422,6 +427,7 @@ fn backend_dtls_config_cache_key(
     reload_epoch: u64,
 ) -> BackendDtlsConfigCacheKey {
     BackendDtlsConfigCacheKey {
+        proxy_namespace: proxy.namespace.clone(),
         proxy_id: proxy.id.clone(),
         backend_host: backend_host.to_string(),
         client_cert_path: proxy.resolved_tls.client_cert_path.clone(),
@@ -4864,6 +4870,39 @@ backend_tls_verify_server_cert: false
         assert_eq!(
             first.certificate.private_key, second.certificate.private_key,
             "cached DTLS params should reuse the generated ephemeral key"
+        );
+    }
+
+    #[test]
+    fn backend_dtls_config_cache_isolates_same_id_across_namespaces() {
+        let proxy = test_dtls_proxy();
+        let mut other_namespace = proxy.clone();
+        other_namespace.namespace = "tenant-b".to_string();
+        let cache: BackendDtlsConfigCache = Arc::new(BackendDtlsConfigCacheState::new(Arc::new(
+            AtomicU64::new(0),
+        )));
+        let crls = Arc::new(Vec::new());
+
+        let first =
+            cached_backend_dtls_config(&cache, &proxy, "localhost", true, &crls, None).unwrap();
+        let second = cached_backend_dtls_config(
+            &cache,
+            &other_namespace,
+            "localhost",
+            true,
+            &crls,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cache.entries.len(),
+            2,
+            "same-ID proxies in different namespaces need distinct DTLS cache entries"
+        );
+        assert_ne!(
+            first.certificate.certificate, second.certificate.certificate,
+            "one namespace must not reuse another namespace's generated DTLS client identity"
         );
     }
 

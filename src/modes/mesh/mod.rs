@@ -33,12 +33,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
-    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
+    LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, PassiveHealthCheck, PluginAssociation,
+    PluginConfig, PluginScope, Proxy,
     ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
     UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
     UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
@@ -6671,7 +6673,7 @@ fn apply_destination_rules(
     // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
     // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let mut outbound_upstream_owner_port: HashMap<String, u16> = mesh_slice
+    let mut outbound_upstream_owner_port: HashMap<NamespacedResourceId, u16> = mesh_slice
         .services
         .iter()
         .flat_map(|svc| {
@@ -6679,19 +6681,28 @@ fn apply_destination_rules(
                 .into_iter()
                 .map(|sp| {
                     (
-                        mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 })
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
                 .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
@@ -6705,14 +6716,20 @@ fn apply_destination_rules(
     for spec in
         mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
     for spec in mesh_outbound_http_bywl_upstreams(
         &mesh_slice.services,
         &mesh_slice.workloads,
         multi_cluster,
     ) {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
 
     for dr in sorted_destination_rules {
@@ -6820,6 +6837,10 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
+            let upstream_owner_key = NamespacedResourceId::new(
+                upstream.namespace.as_str(),
+                upstream.id.as_str(),
+            );
             // Captured owned (like `upstream_base_tls`) so the per-port
             // `entry()` mutable borrow below does not conflict with reading the
             // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
@@ -6837,7 +6858,7 @@ fn apply_destination_rules(
                 // leak onto this upstream merely because their service port
                 // number appears as a fallback target's dial port.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
-                    outbound_upstream_owner_port.get(&upstream.id)
+                    outbound_upstream_owner_port.get(&upstream_owner_key)
                 {
                     if port != owning_port {
                         debug!(
@@ -6898,7 +6919,8 @@ fn apply_destination_rules(
                     None
                 };
 
-                let is_owner_entry = outbound_upstream_owner_port.get(&upstream.id) == Some(port);
+                let is_owner_entry =
+                    outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
                 // Seed a FRESH fanned slot's passive health from the upstream
                 // level — which carries this DR's top-level outlierDetection,
                 // applied above — so a PARTIAL per-port outlier override

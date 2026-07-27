@@ -753,8 +753,8 @@ pub(crate) fn validate_runtime_resource_ids(
     let mut errors = Vec::new();
 
     for proxy in &config.proxies {
-        let trusted = trusted_mesh_ids
-            .is_some_and(|ids| ids.allows_proxy(&proxy.namespace, &proxy.id));
+        let trusted =
+            trusted_mesh_ids.is_some_and(|ids| ids.allows_proxy(&proxy.namespace, &proxy.id));
         if !trusted && let Err(msg) = validate_resource_id(&proxy.id) {
             errors.push(format!("Proxy ID: {}", msg));
         }
@@ -8335,8 +8335,7 @@ impl ProxyState {
         // fully BEFORE swap" guard must live inside the swap function so a
         // future caller (e.g. an admin "import config" handler) cannot
         // publish an invalid config to the hot path.
-        if let Err(errors) =
-            self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
+        if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
         {
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);

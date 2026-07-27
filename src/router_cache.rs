@@ -4496,11 +4496,10 @@ mod tests {
     fn mesh_outbound_port_group_selects_sibling_by_orig_dst_port() {
         let mut proxies = Vec::new();
         for port in [8080u16, 80, 90] {
-            let mut p =
-                minimal_default_mesh_proxy_for_routing(
-                    &format!("__mesh-outbound-default-reviews-{port}"),
-                    "/",
-                );
+            let mut p = minimal_default_mesh_proxy_for_routing(
+                &format!("__mesh-outbound-default-reviews-{port}"),
+                "/",
+            );
             p.hosts = vec!["reviews".to_string()];
             proxies.push(p);
         }
