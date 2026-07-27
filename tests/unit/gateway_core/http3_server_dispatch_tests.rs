@@ -1527,7 +1527,7 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     // otherwise the "did the chain change this field?" comparison is against a
     // map the chain already rewrote and every mutation reads as a no-op.
     let buffered_response_region = src
-        .split("        // Capture original response invariants before `after_proxy`")
+        .split("        // buffered native-H3 path. Unlike the streamed paths")
         .nth(1)
         .expect("buffered native-H3 response region")
         .split("// Build and send buffered response")
