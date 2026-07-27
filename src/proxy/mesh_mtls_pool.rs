@@ -1106,9 +1106,9 @@ impl MeshMtlsConnectionPool {
 
         let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
             .ok_or_else(|| HbonePoolError::ConnectTimeout {
-                addr: format!("{target_host}:{mtls_port}"),
-                timeout_ms: effective_connect_timeout_ms,
-            })?;
+            addr: format!("{target_host}:{mtls_port}"),
+            timeout_ms: effective_connect_timeout_ms,
+        })?;
         // Snapshot the SVID and CRL slots before dialing: the SPIFFE TLS
         // resolver/verifier use these snapshots for the handshake, so an
         // unchanged slot across the dial proves the session was built from the
@@ -1370,14 +1370,12 @@ impl MeshMtlsConnectionPool {
                     pool_config.tcp_keepalive_seconds,
                 );
 
-                let tls_stream =
-                    connector
-                        .connect(server_name, tcp)
-                        .await
-                        .map_err(|e| HbonePoolError::TlsHandshake {
-                            host: target_host.to_string(),
-                            message: e.to_string(),
-                        })?;
+                let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+                    HbonePoolError::TlsHandshake {
+                        host: target_host.to_string(),
+                        message: e.to_string(),
+                    }
+                })?;
 
                 let mut builder = http2::Builder::new(TokioExecutor::new());
                 builder.timer(TokioTimer::new());

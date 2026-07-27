@@ -1797,11 +1797,8 @@ impl Http3ConnectionPool {
         let connect_started = Instant::now();
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let (connection, addr) = crate::dns::connect_candidates(
-            &candidates,
-            port,
-            connect_timeout,
-            |addr| {
+        let (connection, addr) =
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
@@ -1810,15 +1807,14 @@ impl Http3ConnectionPool {
                         .await
                         .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))
                 }
-            },
-        )
-        .await
-        .map_err(|error| match error {
-            crate::dns::CandidateConnectError::TimedOut { .. } => {
-                h3_backend_connect_timeout(proxy, host, port, "QUIC")
-            }
-            crate::dns::CandidateConnectError::Failed { source, .. } => source,
-        })?;
+            })
+            .await
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => {
+                    h3_backend_connect_timeout(proxy, host, port, "QUIC")
+                }
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            })?;
 
         debug!(
             "HTTP/3 pool: connected to {}:{} (resolved: {})",
@@ -1904,11 +1900,8 @@ impl Http3ConnectionPool {
         let connect_started = Instant::now();
         let tls_server_name =
             crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let (connection, addr) = crate::dns::connect_candidates(
-            &candidates,
-            port,
-            connect_timeout,
-            |addr| {
+        let (connection, addr) =
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
                 let client_config = client_config.clone();
                 async move {
                     let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
@@ -1917,15 +1910,14 @@ impl Http3ConnectionPool {
                         .await
                         .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))
                 }
-            },
-        )
-        .await
-        .map_err(|error| match error {
-            crate::dns::CandidateConnectError::TimedOut { .. } => {
-                h3_backend_connect_timeout(proxy, host, port, "QUIC")
-            }
-            crate::dns::CandidateConnectError::Failed { source, .. } => source,
-        })?;
+            })
+            .await
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => {
+                    h3_backend_connect_timeout(proxy, host, port, "QUIC")
+                }
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            })?;
 
         debug!(
             "HTTP/3 pool: connected to {}:{} (resolved: {})",

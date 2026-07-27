@@ -2459,12 +2459,7 @@ async fn handle_tcp_connection_inner(
             params.backend_port,
             connect_timeout,
             |addr| {
-                connect_backend_plain(
-                    addr,
-                    connect_timeout,
-                    params.tcp_fastopen_enabled,
-                    overload,
-                )
+                connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
             },
         )
         .await
@@ -2477,15 +2472,15 @@ async fn handle_tcp_connection_inner(
             crate::dns::CandidateConnectError::Failed { source, .. } => source,
         })
         .inspect_err(|_| {
-                    if let Some(ref cb_config) = cb_info.cb_config {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            proxy_id,
-                            cb_info.cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
-                    }
-                })?;
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = circuit_breaker_cache.get_or_create(
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        })?;
         backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected

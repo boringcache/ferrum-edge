@@ -304,12 +304,9 @@ async fn connect_backend(
         && node_waypoint_inbound_relay_mark_enabled())
     .then_some(NODE_WAYPOINT_INBOUND_AUTH_MARK);
     let timeout = Duration::from_millis(effective_connect_timeout_ms);
-    let (stream, addr) = match crate::dns::connect_candidates(
-        &candidates,
-        port,
-        timeout,
-        |addr| crate::socket_opts::connect_with_socket_opts_and_mark(addr, socket_mark),
-    )
+    let (stream, addr) = match crate::dns::connect_candidates(&candidates, port, timeout, |addr| {
+        crate::socket_opts::connect_with_socket_opts_and_mark(addr, socket_mark)
+    })
     .await
     {
         Ok(connected) => connected,

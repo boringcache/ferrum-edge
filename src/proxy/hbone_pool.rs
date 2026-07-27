@@ -1589,17 +1589,14 @@ pub(crate) async fn dial_h2_connect_sender(
                 pool_config.tcp_keepalive_seconds,
             );
 
-            let tls_stream =
-                connector
-                    .connect(server_name, tcp)
-                    .await
-                    .map_err(|e| HbonePoolError::TlsHandshake {
-                        host: target_host.to_string(),
-                        message: e.to_string(),
-                    })?;
+            let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+                HbonePoolError::TlsHandshake {
+                    host: target_host.to_string(),
+                    message: e.to_string(),
+                }
+            })?;
 
-            let (stream_window_size, connection_window_size) =
-                h2_window_sizes(pool_config);
+            let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
             let mut builder = h2::client::Builder::new();
             builder
                 .initial_window_size(stream_window_size)

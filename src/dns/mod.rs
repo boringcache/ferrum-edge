@@ -343,7 +343,9 @@ where
         Some((last_addr, source)) => Err(CandidateConnectError::Failed { last_addr, source }),
         None => Err(CandidateConnectError::TimedOut {
             last_addr: SocketAddr::new(
-                addresses.first().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                addresses
+                    .first()
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                 port,
             ),
         }),
@@ -546,8 +548,7 @@ impl DnsCache {
         addresses: Vec<IpAddr>,
         hostname: &str,
     ) -> Result<Arc<[IpAddr]>, anyhow::Error> {
-        let mut approved =
-            Vec::with_capacity(addresses.len().min(Self::MAX_ADDRESSES_PER_ANSWER));
+        let mut approved = Vec::with_capacity(addresses.len().min(Self::MAX_ADDRESSES_PER_ANSWER));
         let mut first_denial = None;
         for addr in addresses {
             if approved.len() == Self::MAX_ADDRESSES_PER_ANSWER {
@@ -757,7 +758,9 @@ impl DnsCache {
                 debug!(
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
                     hostname,
-                    addrs.first().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    addrs
+                        .first()
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                     native_ttl,
                     ttl
                 );
@@ -2048,11 +2051,12 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
         let hostname = name.as_str().to_string();
 
         Box::pin(async move {
-            let addresses = cache.resolve_candidates(&hostname, None, None).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let addresses = cache
+                .resolve_candidates(&hostname, None, None)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
-                },
-            )?;
+                })?;
 
             // reqwest expects an iterator of SocketAddr. The port is ignored
             // (reqwest uses the port from the URL), but SocketAddr requires one.
@@ -2110,12 +2114,7 @@ mod tests {
         }
     }
 
-    fn seed_answer(
-        cache: &DnsCache,
-        hostname: &str,
-        addresses: Vec<IpAddr>,
-        stale: bool,
-    ) {
+    fn seed_answer(cache: &DnsCache, hostname: &str, addresses: Vec<IpAddr>, stale: bool) {
         let now = Instant::now();
         cache.cache.insert(
             hostname.to_string(),
@@ -2285,15 +2284,10 @@ mod tests {
             start: 0,
         };
         let started = Instant::now();
-        let result = connect_candidates(
-            &addresses,
-            443,
-            Duration::from_millis(40),
-            |_| async {
-                std::future::pending::<()>().await;
-                Ok::<(), std::io::Error>(())
-            },
-        )
+        let result = connect_candidates(&addresses, 443, Duration::from_millis(40), |_| async {
+            std::future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        })
         .await;
         assert!(matches!(
             result,
@@ -2323,11 +2317,8 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_attempts = seen.clone();
 
-        let (selected_identity, selected_addr) = connect_candidates(
-            &addresses,
-            443,
-            Duration::from_secs(1),
-            |addr| {
+        let (selected_identity, selected_addr) =
+            connect_candidates(&addresses, 443, Duration::from_secs(1), |addr| {
                 let seen_attempts = seen_attempts.clone();
                 async move {
                     seen_attempts.lock().unwrap().push((addr, identity));
@@ -2337,10 +2328,9 @@ mod tests {
                         Ok(identity)
                     }
                 }
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
 
         assert_eq!(selected_addr.ip(), second);
         assert_eq!(selected_identity, identity);

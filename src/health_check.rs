@@ -2371,8 +2371,7 @@ mod tests {
 
     #[test]
     fn grpc_probe_dials_candidate_but_preserves_original_authority() {
-        let (endpoint, origin) =
-            grpc_probe_urls("https", "backend.internal", "192.0.2.25", 8443);
+        let (endpoint, origin) = grpc_probe_urls("https", "backend.internal", "192.0.2.25", 8443);
         assert_eq!(endpoint, "https://192.0.2.25:8443");
         assert_eq!(origin, "https://backend.internal:8443");
     }

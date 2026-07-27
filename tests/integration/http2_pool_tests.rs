@@ -147,10 +147,8 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
 
 /// Start a TLS + HTTP/2 echo backend on an ephemeral port.
 /// Returns (join_handle, port).
-async fn start_h2_tls_backend() -> Result<
-    (tokio::task::JoinHandle<()>, u16),
-    Box<dyn std::error::Error>,
-> {
+async fn start_h2_tls_backend()
+-> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let cert_pem = include_str!("../certs/server.crt");
     let key_pem = include_str!("../certs/server.key");
     start_h2_tls_backend_with_cert(cert_pem, key_pem).await
@@ -164,8 +162,7 @@ async fn start_h2_tls_backend_with_cert(
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    let handle =
-        start_tls_backend_on(listener, cert_pem, key_pem, vec![b"h2".to_vec()]).await?;
+    let handle = start_tls_backend_on(listener, cert_pem, key_pem, vec![b"h2".to_vec()]).await?;
 
     // Give the listener task a moment to start accepting.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -548,11 +545,8 @@ async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failur
     )
     .await
     .expect("start HTTP/1.1 TLS backend");
-    let dns = TestDnsServer::spawn(vec![
-        IpAddr::V4(http1_ip),
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-    ])
-    .await;
+    let dns =
+        TestDnsServer::spawn(vec![IpAddr::V4(http1_ip), IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
     let pool = Http2ConnectionPool::new(
         PoolConfig::default(),
         ferrum_edge::config::EnvConfig::default(),

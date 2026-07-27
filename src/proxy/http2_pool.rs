@@ -392,7 +392,6 @@ impl Http2PoolManager {
             Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
         })
     }
-
 }
 
 #[async_trait]
