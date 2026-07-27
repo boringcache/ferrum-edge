@@ -6040,6 +6040,7 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
         "primary_active": false,
         "allow_writes": false,
         "opt_in_writes_enabled_during_window": false,
+        "primary_failback_fenced": false,
         "failover_since_unix_ms": 1_700_000_000_000u64,
         "active_url_redacted": "sqlite:///tmp/failover.db"
     });
@@ -6081,8 +6082,8 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
         "topology schema must document opt-in divergence-risk contract"
     );
     assert!(
-        !topology_desc.contains("fence") || topology_desc.contains("not a durable fence"),
-        "must not claim a durable failback fence"
+        topology_desc.contains("fences") && topology_desc.contains("restarted after operator"),
+        "topology schema must document the process-local failback fence"
     );
 }
 
