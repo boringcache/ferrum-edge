@@ -1347,11 +1347,7 @@ async fn test_normalizer_still_emits_tool_calls_when_tool_choice_allows() {
         .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
         .await
         .expect("auto must translate");
-    assert!(
-        ctx.metadata
-            .get("ai_stream_router.tool_choice_none")
-            .is_none()
-    );
+    assert!(!ctx.metadata.contains_key("ai_stream_router.tool_choice_none"));
 
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
