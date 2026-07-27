@@ -18,7 +18,15 @@
 //!
 //! The guard compares the *data* — the set of (repo-relative path, content hash)
 //! pairs — not the manifest's byte layout, so the on-disk header, ordering, and
-//! whitespace are cosmetic. Content hash is SHA-256 over LF-normalized bytes.
+//! whitespace are cosmetic.
+//!
+//! Hashing contract:
+//! - Known text paths (allowlisted extensions / basenames) use SHA-256 over
+//!   LF-normalized bytes (`\r` stripped) so CRLF checkouts stay stable.
+//! - Every other path — including `.der` / `.bin` artifacts and any
+//!   unrecognized extension — is hashed byte-for-byte. Classification is
+//!   fail-safe: unknown paths default to byte-exact hashing so CR bytes in
+//!   binary data cannot be added, removed, or altered unnoticed.
 //!
 //! Crate-local `Cargo.lock` files under `vendor/` are ignored by default because
 //! documented standalone vendor tests (`cargo test --manifest-path
@@ -97,16 +105,49 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// SHA-256 over LF-normalized bytes. Stripping `\r` means a CRLF checkout on a
-/// Windows dev box doesn't spuriously trip the guard — vendored upstream sources
-/// are LF, and we only need stable, reproducible digests for drift detection,
-/// not byte-faithful file hashes. (Matches `tr -d '\r' | shasum -a 256`.)
-fn hash_normalized(path: &Path) -> String {
-    let bytes = fs::read(path).expect("read vendor file");
-    let normalized: Vec<u8> = bytes.into_iter().filter(|b| *b != b'\r').collect();
+/// Whether `path` is a known vendored text path eligible for LF normalization.
+///
+/// Only an explicit allowlist of source/docs/config basenames and extensions is
+/// treated as text. Unrecognized paths — including binary artifacts such as
+/// `.der` / `.bin` and any future unknown extension — return `false` so they
+/// are hashed byte-for-byte (fail-closed for unrecognized data).
+fn vendor_path_uses_lf_normalization(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    match name {
+        "LICENSE" | "LICENSE-MIT" | "LICENSE-APACHE" | ".gitignore" | ".cargo-ok" => {
+            return true;
+        }
+        _ => {}
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    matches!(
+        ext,
+        "rs" | "md" | "toml" | "yml" | "yaml" | "json" | "txt" | "sh" | "lock" | "orig"
+    )
+}
+
+/// SHA-256 for a vendor file under the text/binary hashing contract.
+///
+/// Text paths strip `\r` before hashing (matches `tr -d '\r' | shasum -a 256`)
+/// so CRLF checkouts of vendored sources stay stable. Binary and unrecognized
+/// paths hash the on-disk bytes unchanged.
+fn hash_vendor_bytes(path: &Path, bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&normalized);
+    if vendor_path_uses_lf_normalization(path) {
+        let normalized: Vec<u8> = bytes.iter().copied().filter(|b| *b != b'\r').collect();
+        hasher.update(&normalized);
+    } else {
+        hasher.update(bytes);
+    }
     hex::encode(hasher.finalize())
+}
+
+fn hash_vendor_file(path: &Path) -> String {
+    let bytes = fs::read(path).expect("read vendor file");
+    hash_vendor_bytes(path, &bytes)
 }
 
 /// The authoritative comparison set: repo-relative vendor path -> content hash.
@@ -127,7 +168,7 @@ fn compute_entries() -> BTreeMap<String, String> {
                 .expect("vendor path under repo root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            (rel, hash_normalized(p))
+            (rel, hash_vendor_file(p))
         })
         .collect()
 }
@@ -151,7 +192,12 @@ fn parse_manifest(s: &str) -> BTreeMap<String, String> {
 
 fn render_manifest(entries: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
-    out.push_str("# Vendor integrity manifest — SHA-256 of LF-normalized file contents.\n");
+    out.push_str(
+        "# Vendor integrity manifest — SHA-256 of governed vendor file contents.\n",
+    );
+    out.push_str(
+        "# Text (allowlisted) paths: LF-normalized (CR stripped). Binary/unrecognized: byte-exact.\n",
+    );
     out.push_str("# Compared as (path, hash) data; header/order/whitespace are cosmetic.\n");
     out.push_str("# Regenerate: scripts/update_vendor_integrity.sh  (docs/dependency-policy.md)\n");
     for (path, hash) in entries {
@@ -256,4 +302,77 @@ fn non_lockfile_vendor_paths_remain_hashed() {
     assert!(should_hash_vendor_file(
         "vendor/h3-0.0.8-ferrum-patched/src/lib.rs"
     ));
+}
+
+#[test]
+fn known_text_vendor_paths_use_lf_normalization() {
+    for path in [
+        "vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs",
+        "vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml",
+        "vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml.orig",
+        "vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock",
+        "vendor/dimpl-0.6.1-ferrum-patched/.gitignore",
+        "vendor/dimpl-0.6.1-ferrum-patched/.cargo-ok",
+        "vendor/h3-0.0.8-ferrum-patched/LICENSE",
+        "vendor/reqwest-0.13.3-ferrum-patched/LICENSE-MIT",
+        "vendor/reqwest-0.13.3-ferrum-patched/LICENSE-APACHE",
+        "vendor/dimpl-0.6.1-ferrum-patched/.cargo_vcs_info.json",
+        "docs/note.md",
+        "script.sh",
+        "config.yml",
+        "config.yaml",
+        "notes.txt",
+    ] {
+        assert!(
+            vendor_path_uses_lf_normalization(Path::new(path)),
+            "expected LF normalization for text path: {path}"
+        );
+    }
+}
+
+#[test]
+fn binary_and_unrecognized_vendor_paths_are_byte_exact() {
+    for path in [
+        "vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p256_cert.der",
+        "vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/test_data.bin",
+        "vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_sha384_sig.der",
+        "vendor/future-crate/unknown.blob",
+        "vendor/future-crate/data.wasm",
+        "vendor/future-crate/no_extension_payload",
+    ] {
+        assert!(
+            !vendor_path_uses_lf_normalization(Path::new(path)),
+            "expected byte-exact hashing for binary/unrecognized path: {path}"
+        );
+    }
+}
+
+#[test]
+fn text_hash_strips_cr_bytes_but_binary_hash_preserves_them() {
+    // Identical payload with an embedded CR: text normalization must hide it,
+    // binary hashing must pin it.
+    let with_cr = b"alpha\r\nbeta\r";
+    let without_cr = b"alpha\nbeta";
+
+    let text_path = Path::new("vendor/example/src/lib.rs");
+    let binary_path = Path::new("vendor/example/assets/fixture.der");
+
+    assert_eq!(
+        hash_vendor_bytes(text_path, with_cr),
+        hash_vendor_bytes(text_path, without_cr),
+        "text paths must LF-normalize before hashing"
+    );
+    assert_ne!(
+        hash_vendor_bytes(binary_path, with_cr),
+        hash_vendor_bytes(binary_path, without_cr),
+        "binary paths must hash CR bytes byte-for-byte"
+    );
+
+    // Spot-check against the system digest for the binary contract.
+    let mut hasher = Sha256::new();
+    hasher.update(with_cr);
+    assert_eq!(
+        hash_vendor_bytes(binary_path, with_cr),
+        hex::encode(hasher.finalize())
+    );
 }

@@ -1,4 +1,5 @@
-# Vendor integrity manifest — SHA-256 of LF-normalized file contents.
+# Vendor integrity manifest — SHA-256 of governed vendor file contents.
+# Text (allowlisted) paths: LF-normalized (CR stripped). Binary/unrecognized: byte-exact.
 # Compared as (path, hash) data; header/order/whitespace are cosmetic.
 # Regenerate: scripts/update_vendor_integrity.sh  (docs/dependency-policy.md)
 afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91  vendor/dimpl-0.6.1-ferrum-patched/.cargo-ok
@@ -45,10 +46,10 @@ a117c56ed9879be6e44be781d93a3015a60e9b4f02200e105ee26964e41ce4ac  vendor/dimpl-0
 0eab353f37e1b561384ff66f8d6662102c2b7849d6bdc3559968d9aa80bb7c2a  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/rust_crypto/random.rs
 6650131acec0e7acccadae1c83c88b976ae88f976e2d2bf99727f86e8bad4505  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/rust_crypto/sign.rs
 89affdfcb76f925aa0a23674646d6441eb634c5e64e0bf9d9a306a75fecbc27a  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/mod.rs
-d0fe812e201979bec0d19bd94e94e23e57f9479b35bb868eebec7fda820ce613  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p256_cert.der
+c8ba32d2c18837e59a7b4cb5a88522a52c165743ac09bc27abd5026bdf1aa2b1  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p256_cert.der
 5549f1523db8d87ac0dace7899be6c2d502ab173c0f4708a87ec3d1b6a6d0585  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p256_sha256_sig.der
-d7dedd56959d7877d036d48d6608fc7e1b8a6117930f44c2a065032727ab2945  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_cert.der
-f896474855c143dfe61b81b5999acfa8f606deb25780228ebb2e0bffefe6e263  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_sha384_sig.der
+35a894cd94181524a4c44221b782df014f3e59ab8c91a4dd9f0d2b456cd3c288  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_cert.der
+142a14523d8b1661337995d8c348d2ba1d4be8506beb5c48d16559f33adabb80  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/p384_sha384_sig.der
 40d999c96444045249999be2b82f0ee7111b10e42f84d503a611c0ca12231ace  vendor/dimpl-0.6.1-ferrum-patched/src/crypto/validation/test_data.bin
 95b71b83aa90361fcdb445790cdfec121fa081f9fa47d25814097acda781a44f  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/client.rs
 4e59dc8b02abcac664a55e72bfcca866b4eb077c8a31e96f2d91916ef4a5ab98  vendor/dimpl-0.6.1-ferrum-patched/src/dtls12/context.rs
@@ -106,7 +107,7 @@ bd4d5e738169c73253e4cc1522b1bb06048af71cf4f715d3eb006cc47190e9ae  vendor/dimpl-0
 8f80a4c75fcb6d559c212dbcef8c1019b5fe873b58a4849f0df133805da38073  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/queue.rs
 f974a3dcb851f4f23e5b83135d00af3d86136f6f4c4f36a970868baf8f2d3d74  vendor/dimpl-0.6.1-ferrum-patched/src/dtls13/server.rs
 86baeacfb53745cee38cbc156c688ba6a85b06811c78fc8b8c6e382e43bb972d  vendor/dimpl-0.6.1-ferrum-patched/src/error.rs
-23be6c11531b5db868d3b93bfe9a878bf928695d2d593e186cbc57c0430f5797  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
+ce5fc7f60e2828816dedd815f25dc3566ccb0953bd79369e704b71b6236cdb17  vendor/dimpl-0.6.1-ferrum-patched/src/lib.rs
 fae07477be7a08625fc6bdc9d949b08b744ce8d7d0119f3616f56e80ad5ad1d1  vendor/dimpl-0.6.1-ferrum-patched/src/rng.rs
 49caabfeb201e65a21a4f0cb1ef76020030ca985997d4ba063322f0d2889ceba  vendor/dimpl-0.6.1-ferrum-patched/src/time_tricks.rs
 f134d1fb91dc327fed41cf9667be7e44a4413658aff2846d3fb61bfc77e0f5e6  vendor/dimpl-0.6.1-ferrum-patched/src/timer.rs

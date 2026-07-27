@@ -1008,15 +1008,6 @@ index 1777e2f..5024618 100644
              Self::KeyingMaterial(v, p) => write!(f, "KeyingMaterial({}, {:?})", v.len(), p),
              Self::ApplicationData(v) => write!(f, "ApplicationData({})", v.len()),
              Self::CloseNotify => write!(f, "CloseNotify"),
-@@ -899,7 +1137,7 @@ mod test {
-     }
- 
-     fn new_instance_13() -> Dtls {
--        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
-+        let mut cert = generate_self_signed_certificate().expect("Failed to generate cert");
-         let config = Arc::new(Config::default());
-         Dtls::new_13(config, cert, Instant::now())
-     }
 @@ -1050,11 +1288,11 @@ mod test {
      #[test]
      #[should_panic(expected = "Server certificate cannot be empty")]

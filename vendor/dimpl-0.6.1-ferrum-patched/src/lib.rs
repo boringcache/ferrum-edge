@@ -1137,7 +1137,7 @@ mod test {
     }
 
     fn new_instance_13() -> Dtls {
-        let mut cert = generate_self_signed_certificate().expect("Failed to generate cert");
+        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
         let config = Arc::new(Config::default());
         Dtls::new_13(config, cert, Instant::now())
     }

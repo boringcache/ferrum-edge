@@ -128,8 +128,11 @@ feature). Each entry documents the confinement and the upstream we are waiting o
 ### 3. Vendor drift guard
 
 `tests/integration/vendor_integrity_tests.rs` hashes every governed file under
-`vendor/` (LF-normalized SHA-256) and compares it to
-`vendor/VENDOR_INTEGRITY.sha256`. Incidental crate-local `Cargo.lock` files
+`vendor/` and compares it to `vendor/VENDOR_INTEGRITY.sha256`. Known text paths
+(allowlisted source/docs/config extensions and basenames) use LF-normalized
+SHA-256 (`\r` stripped) so CRLF checkouts stay stable; binary artifacts and any
+unrecognized path are hashed byte-for-byte so CR bytes in `.der` / `.bin` (and
+similar) cannot change unnoticed. Incidental crate-local `Cargo.lock` files
 created by documented standalone vendor tests are ignored by default; intentionally
 committed lockfiles that pin a standalone regression graph (currently
 `vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock`) are allowlisted in
