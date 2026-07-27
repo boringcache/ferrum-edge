@@ -133,16 +133,17 @@ fn start_counting_http_backend_on(
             };
             let accepted = Arc::clone(&accepted);
             tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let mut request_prefix = [0u8; 9];
                 // Count only the proxied HTTP/1.1 GET for this fixture's path.
                 // With `FERRUM_POOL_WARMUP_ENABLED=false`, the binary gateway still
                 // runs an initial backend-capability refresh that dials plaintext
                 // backends with h2c prior-knowledge (`PRI * HTTP/2.0`). Counting
                 // bare TCP accepts would attribute that probe to a plugin-rejected
-                // request and falsely fail the fail-closed security assertion.
-                let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
-                if head.starts_with("GET /test") {
+                // request and falsely fail the fail-closed security assertion. An
+                // exact read avoids missing a real GET when TCP fragments its prefix.
+                if stream.read_exact(&mut request_prefix).await.is_ok()
+                    && request_prefix == *b"GET /test"
+                {
                     accepted.fetch_add(1, Ordering::Relaxed);
                 }
                 let body = r#"{"status":"ok"}"#;
