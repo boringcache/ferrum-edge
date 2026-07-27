@@ -2684,6 +2684,16 @@ impl AiTranscriptAudit {
     /// metadata. Expensive capture (keyed HMAC, redaction, excerpt, model/tool
     /// extraction) runs only for [`BodyPhase::Final`], where the bytes are the
     /// backend-visible ones and capture admission can be decided.
+    ///
+    /// Invariant: this instance must not publish shared candidate / sampling /
+    /// stream / request-hash metadata until its retained-byte lease has been
+    /// acquired and its local staging entry is installed. Publishing earlier
+    /// leaves stale markers when `try_acquire` fails; `discard_staged_candidate`
+    /// deliberately refuses to clear a true shared marker when this instance
+    /// inserted no staging (a co-located peer may own that state), so a failed
+    /// local admission would otherwise poison final-phase fallback decisions.
+    /// Failure paths drop the staging permit and any rate reservation via RAII
+    /// and never install a lease or staging entry.
     fn stage_candidate(
         &self,
         ctx: &mut RequestContext,
@@ -2735,42 +2745,23 @@ impl AiTranscriptAudit {
             }
         };
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
-
-        ctx.metadata
-            .insert(MD_RECORD_ID.to_string(), record_id.clone());
-        ctx.metadata
-            .insert(MD_CANDIDATE.to_string(), "true".to_string());
-        ctx.metadata
-            .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
-        // `sampled` carries the sampling ROLL (matching the exported record's
-        // `sampled` field), which is fully known here at staging time — write
-        // it now so request-only configs and streamed responses (which never
-        // reach the buffered response hook) still log it. The buffered path
-        // re-confirms the same value.
-        ctx.metadata
-            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
-        // `stream: true` means an SSE response is expected; record it so the
-        // response buffer decision streams rather than stalls (buffering a
-        // stream holds it until EOF, and under retry the buffered->stream
-        // content-type downgrade is disabled).
-        if scan_limited
+        // Decide the stream marker locally; publish only after local staging
+        // succeeds so a refused retained-byte lease cannot leave
+        // `MD_STREAM_REQUEST` without an owning staging entry.
+        let stream_requested = scan_limited
             || parsed
                 .as_ref()
                 .and_then(|json| json.get("stream"))
                 .and_then(Value::as_bool)
-                == Some(true)
-        {
-            ctx.metadata
-                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
-        }
+                == Some(true);
 
         // Every staged AI candidate is eligible for stream capture.
         // `forces_reqwest_dispatch` and `response_stream_inspector` apply the
         // `sampled`-mode tee gate
         // (`stream_tee_wanted`) at dispatch/response time, when the request-side
-        // guardrails (2925–2978, which run after this plugin's staging at 2740)
-        // have already published their metadata. Non-AI JSON POSTs are never
-        // staged, so they stay on the native-H3 path.
+        // guardrails (2925–2978, which run after this plugin's staging
+        // publication below) have already published their metadata. Non-AI JSON
+        // POSTs are never staged, so they stay on the native-H3 path.
         //
         // A `Provisional` body is pre-transform: hashing/redacting/excerpting it
         // would be discarded by the final-body refresh on any mutating chain and
@@ -2780,12 +2771,12 @@ impl AiTranscriptAudit {
             BodyPhase::Final => self.capture_request(parsed.as_ref(), body, sample_hit),
             BodyPhase::Provisional => RequestCapture::default(),
         };
-        self.publish_request_capture(ctx, &capture);
 
         // Charge the aggregate retained-byte budget for this staged candidate
-        // before it is published into the shared map. Provisional staging and
-        // deliberately skipped captures charge zero; Final captures charge the
-        // measured excerpt + bounded model/tool bytes.
+        // before it is published into the shared map or onto shared request
+        // metadata. Provisional staging and deliberately skipped captures
+        // charge zero; Final captures charge the measured excerpt + bounded
+        // model/tool bytes.
         let staged_bytes = if capture.skipped.is_some() {
             0
         } else {
@@ -2796,6 +2787,9 @@ impl AiTranscriptAudit {
             )
         };
         let Some(retained_lease) = self.retained_budget.try_acquire(staged_bytes) else {
+            // No local staging entry was installed, so discard must not clear a
+            // peer-owned shared marker/hash. Dropping `staging_permit` and
+            // `capture` (rate reservation) releases every resource taken here.
             self.discard_staged_candidate(ctx);
             let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
                 || self.on_sink_error == SinkErrorPolicy::Reject;
@@ -2810,8 +2804,11 @@ impl AiTranscriptAudit {
             };
         };
 
+        // Install local staging before any shared metadata publish so a later
+        // failure cannot leave candidate/hash/stream markers without an owner.
+        let published_hash = capture.hash.clone();
         self.staging.insert(
-            record_id,
+            record_id.clone(),
             AuditStaging {
                 _staging_permit: staging_permit,
                 retained_lease,
@@ -2837,6 +2834,36 @@ impl AiTranscriptAudit {
                 captured: phase == BodyPhase::Final,
                 capture_skipped: capture.skipped,
                 rate_reservation: capture.rate_reservation,
+            },
+        );
+
+        // Local staging owns this candidate: only now publish shared metadata.
+        ctx.metadata
+            .insert(MD_RECORD_ID.to_string(), record_id);
+        ctx.metadata
+            .insert(MD_CANDIDATE.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
+        // `sampled` carries the sampling ROLL (matching the exported record's
+        // `sampled` field), which is fully known here at staging time — write
+        // it now so request-only configs and streamed responses (which never
+        // reach the buffered response hook) still log it. The buffered path
+        // re-confirms the same value.
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
+        // `stream: true` means an SSE response is expected; record it so the
+        // response buffer decision streams rather than stalls (buffering a
+        // stream holds it until EOF, and under retry the buffered->stream
+        // content-type downgrade is disabled).
+        if stream_requested {
+            ctx.metadata
+                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+        }
+        self.publish_request_capture(
+            ctx,
+            &RequestCapture {
+                hash: published_hash,
+                ..RequestCapture::default()
             },
         );
         PluginResult::Continue

@@ -8104,6 +8104,274 @@ async fn refresh_growth_refusal_does_not_retain_uncharged_metadata() {
     );
 }
 
+/// A refused retained-byte staging admission must not publish this instance's
+/// shared candidate / sampling / stream / request-hash metadata, and must not
+/// erase a co-located peer instance's valid shared markers. Publishing those
+/// keys before `try_acquire` + local staging insert would leave stale markers
+/// that `discard_staged_candidate` deliberately refuses to clear when this
+/// instance owns no staging entry.
+#[tokio::test]
+async fn retained_budget_staging_refusal_leaves_no_stale_or_peer_erasing_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "full_body",
+                "allow_full_body": true,
+                "sampling": { "rate": 1.0 },
+                "limits": {
+                    "max_request_bytes": 1024,
+                    "max_response_bytes": 1024,
+                    "max_stream_capture_bytes": 1024,
+                    "buffer_max_bytes": 180000
+                },
+                "capture": { "request": true, "response": true },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "buffer_capacity": 10000,
+                    "max_retries": 0,
+                    "on_buffer_full": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let small_body = br#"{"model":"a","messages":[{"role":"user","content":"hi"}]}"#;
+    let headers = json_headers();
+    // Hold Final staging leases until the aggregate budget has no room for
+    // another non-zero staging charge (`STAGING_ENTRY_OVERHEAD_BYTES`).
+    let mut fillers = Vec::new();
+    for _ in 0..240 {
+        let mut filler = make_ctx();
+        let result = plugin
+            .on_final_request_body_with_context(&mut filler, &headers, small_body)
+            .await;
+        if !matches!(result, PluginResult::Continue)
+            || filler
+                .metadata
+                .get("ai_transcript_audit.candidate")
+                .map(String::as_str)
+                != Some("true")
+        {
+            break;
+        }
+        fillers.push(filler);
+        let snap = plugin.status_snapshot();
+        if snap.buffer_max_bytes.saturating_sub(snap.retained_bytes) < 1_024 {
+            break;
+        }
+    }
+    let before = plugin.status_snapshot();
+    assert!(
+        before
+            .buffer_max_bytes
+            .saturating_sub(before.retained_bytes)
+            < 1_024,
+        "budget must be saturated below one staging overhead charge"
+    );
+    assert!(!fillers.is_empty(), "fillers must hold the retained-byte leases");
+
+    // Fresh context: refusal must leave no candidate/hash/stream metadata from
+    // this failing instance (final-phase fallback must not see a false owner).
+    let mut refused = make_ctx();
+    let refused_result = plugin
+        .on_final_request_body_with_context(&mut refused, &headers, stream_request_body())
+        .await;
+    assert!(
+        matches!(
+            refused_result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "saturated retained-byte staging must fail closed: {refused_result:?}"
+    );
+    assert_ne!(
+        refused
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "refused admission must not publish MD_CANDIDATE=true"
+    );
+    assert!(
+        !refused
+            .metadata
+            .contains_key("ai_transcript_audit.record_id"),
+        "refused admission must not publish MD_RECORD_ID"
+    );
+    assert!(
+        !refused
+            .metadata
+            .contains_key("ai_transcript_audit.request_hash"),
+        "refused admission must not publish MD_REQUEST_HASH"
+    );
+    assert!(
+        !refused
+            .metadata
+            .contains_key("ai_transcript_audit.stream_request"),
+        "refused admission must not publish MD_STREAM_REQUEST"
+    );
+    assert!(
+        !refused
+            .metadata
+            .contains_key("ai_transcript_audit.sample_hit"),
+        "refused admission must not publish sampling flags"
+    );
+    assert_eq!(
+        refused
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected")
+    );
+    let after_refuse = plugin.status_snapshot();
+    assert_eq!(
+        after_refuse.retained_bytes, before.retained_bytes,
+        "refused staging must not retain a leaked byte lease"
+    );
+    assert!(
+        !plugin.should_buffer_response_body(&refused),
+        "no local staging means this instance must not buffer from stale markers"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&refused),
+        "no local staging means this instance must not force stream dispatch"
+    );
+
+    // Peer already owns shared markers + its own staging. A saturated sibling
+    // must leave those markers intact so the peer can still tee/export.
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "request": true, "response": true, "streaming_response": true },
+                "sampling": { "rate": 1.0 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid peer");
+    peer.start_background_tasks().expect("peer live start");
+    peer.commit_background_tasks();
+    let mut peer_ctx = make_ctx();
+    assert!(matches!(
+        peer.on_final_request_body_with_context(&mut peer_ctx, &headers, stream_request_body())
+            .await,
+        PluginResult::Continue
+    ));
+    let peer_record_id = peer_ctx
+        .metadata
+        .get("ai_transcript_audit.record_id")
+        .cloned()
+        .expect("peer publishes record_id after successful staging");
+    let peer_hash = peer_ctx
+        .metadata
+        .get("ai_transcript_audit.request_hash")
+        .cloned()
+        .expect("peer publishes request_hash after successful staging");
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    let peer_attack = plugin
+        .on_final_request_body_with_context(&mut peer_ctx, &headers, stream_request_body())
+        .await;
+    assert!(
+        matches!(
+            peer_attack,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "saturated instance must still fail closed against a peer-owned context"
+    );
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "failed local admission must not erase a peer's MD_CANDIDATE"
+    );
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.record_id")
+            .map(String::as_str),
+        Some(peer_record_id.as_str()),
+        "failed local admission must not replace a peer's MD_RECORD_ID"
+    );
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.request_hash")
+            .map(String::as_str),
+        Some(peer_hash.as_str()),
+        "failed local admission must not erase a peer's MD_REQUEST_HASH"
+    );
+    assert_eq!(
+        peer_ctx
+            .metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true"),
+        "failed local admission must not erase a peer's MD_STREAM_REQUEST"
+    );
+    assert!(
+        peer.forces_reqwest_dispatch(&peer_ctx),
+        "peer must retain stream dispatch after a sibling's refused admission"
+    );
+    assert!(
+        peer.response_stream_inspector(&peer_ctx, 200, Some("text/event-stream"))
+            .is_some(),
+        "peer must still tee its owned stream after a sibling refusal"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&peer_ctx),
+        "saturated sibling must not claim the peer's stream markers"
+    );
+    let after_peer = plugin.status_snapshot();
+    assert_eq!(
+        after_peer.retained_bytes, before.retained_bytes,
+        "peer-context refusal must not leak a retained-byte lease on the saturated instance"
+    );
+
+    // Keep fillers alive through the assertions above.
+    assert_eq!(
+        plugin.status_snapshot().retained_bytes,
+        before.retained_bytes
+    );
+    drop(fillers);
+}
+
 /// Fail-closed pre-commit admission reserves the complete maximum serialized
 /// delivery charge, so late metadata growth cannot make the eventual queue
 /// publication under-accounted.
