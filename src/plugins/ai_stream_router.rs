@@ -1093,9 +1093,7 @@ fn resolve_anthropic_tool_choice(
         },
         Value::Object(object) => {
             // Closed OpenAI shape: {type:"function", function:{name:...}}.
-            if object.len() != 2
-                || object.get("type").and_then(Value::as_str) != Some("function")
-            {
+            if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("function") {
                 return Err("unsupported or malformed tool_choice".to_string());
             }
             let function = object
