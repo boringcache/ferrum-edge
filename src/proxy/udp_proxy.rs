@@ -3688,12 +3688,7 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
-            maybe_touch_udp_idle_activity(
-                activity_fwd.as_ref(),
-                coarse_epoch_millis(),
-                true,
-                true,
-            );
+            maybe_touch_udp_idle_activity(activity_fwd.as_ref(), coarse_epoch_millis(), true, true);
         }
     });
 
@@ -3779,12 +3774,7 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
-            maybe_touch_udp_idle_activity(
-                activity_rev.as_ref(),
-                coarse_epoch_millis(),
-                true,
-                true,
-            );
+            maybe_touch_udp_idle_activity(activity_rev.as_ref(), coarse_epoch_millis(), true, true);
         }
     });
 

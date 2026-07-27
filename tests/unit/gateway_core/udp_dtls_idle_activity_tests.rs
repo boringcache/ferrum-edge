@@ -126,20 +126,25 @@ fn idle_timeout_boundary_is_strictly_greater_than() {
 #[test]
 fn rejected_keepalive_pattern_releases_session_slot_at_timeout_boundary() {
     // Reproduction shape from GHSA-m9rp-jm6c-f65p: exhaust rate budget, then
-    // send one rejected datagram slightly before each idle interval. With the
-    // fixed refresh policy the watermark never moves, so max-session slots
-    // reclaim at the first idle deadline.
+    // keep sending rejected datagrams inside the idle interval. With the fixed
+    // refresh policy the watermark never moves, so max-session slots reclaim
+    // at the first idle deadline.
     let idle_timeout_ms = 60_000;
     let session_start = 1_000_000_u64;
     let activity = AtomicU64::new(session_start);
 
-    for i in 1..=5 {
-        let rejected_at = session_start + (i * idle_timeout_ms) - 100;
+    for rejected_at in [
+        session_start + 10_000,
+        session_start + 20_000,
+        session_start + 30_000,
+        session_start + 40_000,
+        session_start + idle_timeout_ms - 100,
+    ] {
         maybe_touch_udp_idle_activity_for_test(&activity, rejected_at, false, false);
         assert_eq!(activity.load(Ordering::Relaxed), session_start);
         assert!(
             !udp_idle_expired_for_test(rejected_at, session_start, idle_timeout_ms),
-            "rejected keepalive #{i} must still be inside the original idle window"
+            "rejected keepalive at {rejected_at}ms must still be inside the original idle window"
         );
     }
 
