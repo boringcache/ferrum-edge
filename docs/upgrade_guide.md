@@ -142,6 +142,48 @@ restart validation. For file mode, edit the YAML/JSON copy and run the staged
 validation step again. Do not bypass the check by adding placeholder HTTP/UDP
 targets; disable or remove a policy that has no TCP listener to protect.
 
+### `kafka_logging` Fails Closed Under a Restrictive Egress Policy
+
+`kafka_logging` is now refused at config admission whenever the backend egress
+policy is able to deny any address — which includes the **default** posture
+(`FERRUM_BACKEND_ALLOW_IPS=both` plus the dangerous-range baseline). librdkafka
+resolves bootstrap hostnames itself and dials brokers advertised by cluster
+metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so
+Ferrum cannot screen the addresses it actually connects to. The gateway refuses
+the configuration rather than leaving an unenforced egress path.
+
+Symptoms on upgrade: file mode fails startup; database/CP admin writes return
+400; a data plane refuses the update and keeps its last accepted generation
+(`kafka_logging` is `KeepLastKnownGood`).
+
+Before cutover, inventory every enabled `kafka_logging` plugin row and choose
+one of:
+
+- **Recommended.** Move log shipping to a sink that dials through Ferrum's
+  policy-aware path (`http_logging`, `tcp_logging`, `ws_logging`,
+  `loki_logging`) and bridge to Kafka outside the gateway.
+- Remove or disable the `kafka_logging` rows.
+- Accept an unrestricted backend egress policy for the whole gateway
+  (`FERRUM_BACKEND_ALLOW_IPS=both`, no `FERRUM_BACKEND_DENY_CIDRS`,
+  `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`). This weakens every other
+  outbound path — proxy backends, service discovery, and all other plugin
+  endpoints — and the gateway logs an unrestricted-egress warning at startup.
+
+Separately, `broker_list` is now parsed with librdkafka's exact
+`[proto://]host[:port]` grammar. Two shapes that were previously accepted are
+now rejected even under a fully-open policy: an unsupported or malformed
+protocol prefix, and a protocol prefix that disagrees with `security_protocol`
+(librdkafka would have discarded that entry and stopped parsing the rest of the
+list, silently shrinking the broker set).
+
+### Ambient Proxy Environment Is Ignored by Plugin Clients
+
+Plugin outbound HTTP no longer honours `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, or `NO_PROXY` inherited from the process environment. Deployments
+that relied on an ambient proxy to reach a log sink, AI provider, JWKS/OIDC
+endpoint, webhook, or ClickHouse chargeback sink must point the plugin's
+configured endpoint directly at the reachable destination instead.
+
 ### Body Validator Enforcement Hardening
 
 `body_validator` now enforces the policy it advertises, which makes several

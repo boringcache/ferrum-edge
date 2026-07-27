@@ -8486,10 +8486,12 @@ pub(crate) fn screen_redis_endpoint_egress(
 /// the shared resolver. A denied literal endpoint must still be rejected at
 /// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// LDAP hostnames are freshly resolved and screened immediately before every
-/// connection/reconnection. Other clients outside `DnsCache` retain their
-/// documented hostname limitations; JWKS hostname resolution keeps the shared
-/// client's runtime policy backstop.
+/// LDAP and `ws_logging` hostnames are freshly resolved and screened
+/// immediately before every connection/reconnection, and only screened
+/// addresses are dialed. `kafka_logging` cannot reach that bar with the pinned
+/// librdkafka client and is therefore refused outright under any policy that
+/// can deny an address (see `kafka_logging::screen_kafka_broker_list_egress`).
+/// JWKS hostname resolution keeps the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
@@ -8533,25 +8535,14 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 ));
             }
         }
-        // broker_list is a comma-separated list of `host:port` (or `[v6]:port`,
-        // or a bare host/IP) entries with no scheme.
+        // broker_list is parsed with the pinned librdkafka grammar
+        // (`[proto://]host[:port]`, comma separated) so protocol-prefixed
+        // literals are screened too, and kafka_logging is refused outright when
+        // the policy can deny addresses librdkafka would dial without Ferrum
+        // ever seeing them (bootstrap hostname resolution, metadata-advertised
+        // brokers). See `kafka_logging::screen_kafka_broker_list_egress`.
         "kafka_logging" => {
-            if let Some(brokers) = config.get("broker_list").and_then(|v| v.as_str()) {
-                for entry in brokers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    let literal = entry
-                        .parse::<std::net::SocketAddr>()
-                        .map(|sa| sa.ip())
-                        .ok()
-                        .or_else(|| crate::config::types::egress_literal_ip(entry));
-                    if let Some(ip) = literal
-                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                    {
-                        return Err(format!(
-                            "broker_list IP {ip} denied by backend egress policy: {reason}"
-                        ));
-                    }
-                }
-            }
+            kafka_logging::screen_kafka_broker_list_egress(config, backend_allow_ips)?;
         }
         // endpoint_url is a single ws:// / wss:// URL; ws_logging dials it via
         // tokio_tungstenite outside the shared client + DnsCache.

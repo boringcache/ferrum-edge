@@ -4214,7 +4214,16 @@ fn build_clickhouse_http_client(
         return Ok(ClickHouseHttpClient::Shared(Box::new(shared.clone())));
     }
 
+    // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+    // process state (matches the shared PluginHttpClient builders). reqwest
+    // enables system-proxy discovery by default. With a proxy selected, the
+    // connector dials and screens the *proxy* while the proxy resolves and
+    // connects to the configured ClickHouse host, so the ultimate destination
+    // address never passes the `DnsCacheResolver` egress screen installed
+    // below. Inherited proxy environment must not be able to override the
+    // gateway's documented outbound address boundary.
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms))
         .timeout(Duration::from_millis(cfg.timeout_ms))
         // Do not follow redirects: a 3xx from an allowed ClickHouse host could

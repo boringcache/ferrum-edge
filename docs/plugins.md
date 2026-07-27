@@ -583,6 +583,8 @@ Sends transaction summaries as JSON to an external WebSocket endpoint. Like `htt
 
 **Protocols:** all (HTTP, gRPC, WebSocket, TCP, UDP)
 
+**Egress policy:** `ws_logging` dials outside the shared plugin HTTP client, so it applies the same strict connection-establishment path as `ldap_auth`. Every connection *and reconnection* bypasses both DNS cache layers, resolves the complete A+AAAA answer set, rejects the whole answer if any candidate is denied by the backend egress policy, rechecks each candidate immediately before its socket is opened, and dials only screened addresses. The configured hostname is kept as the TLS SNI / certificate identity and the WebSocket `Host` authority, so a DNS rebind between admission and a later reconnect cannot steer log shipping at a denied destination.
+
 **Failure policy:** `KeepLastKnownGood` — construction/validation failures,
 including an incomplete or unusable custom TLS CA bundle, reject the candidate
 plugin generation and keep the last-known-good logger instance.
@@ -756,6 +758,8 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 **Availability:** Built into every default Ferrum Edge binary. `rdkafka` / librdkafka is an unconditional dependency — there is no `kafka` Cargo feature to enable or disable.
 
 **Admission:** Kafka is `KeepLastKnownGood`: invalid startup configuration is rejected, and an invalid reload candidate is not published, so the previously accepted producer generation continues serving. This prevents a misspelled security control or conflicting TLS/CRL setting from silently removing the configured audit sink.
+
+> **Requires a fully-open backend egress policy.** librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so Ferrum cannot screen those addresses. `kafka_logging` therefore **fails closed** and is refused whenever the backend egress policy can deny any address — which includes the default posture. `broker_list` is parsed with librdkafka's exact `[proto://]host[:port]` grammar, so protocol-prefixed denied literals (e.g. `PLAINTEXT://169.254.169.254:9092`) are rejected too. See [Backend Egress / SSRF Protection](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
 
 Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
