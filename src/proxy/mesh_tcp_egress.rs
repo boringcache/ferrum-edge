@@ -177,11 +177,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
 
     // Least-connection accounting parity with the HTTP relay path. Held across
     // the transport-specific dial and the relay; dropped on any early return.
-    let balancer = connection_balancer(
-        &epoch.load_balancer,
-        &proxy.namespace,
-        &entry.upstream_id,
-    );
+    let balancer = connection_balancer(&epoch.load_balancer, &proxy.namespace, &entry.upstream_id);
     let _lb_guard = LoadBalancerConnectionGuard::new(Some(Arc::clone(&target)), balancer);
 
     // Select the transport from the target's tag (mutually exclusive — the

@@ -1155,11 +1155,26 @@ fn try_create_plugin(
         .map(|plugin| Some(Arc::new(plugin) as Arc<dyn Plugin>))
     } else if matches!(
         pc.plugin_name.as_str(),
-        "request_deduplication" | "request_mirror" | "api_chargeback_sink"
+        "request_deduplication"
+            | "request_mirror"
+            | "api_chargeback_sink"
+            | "rate_limiting"
+            | "graphql"
+            | "grpc_method_router"
+            | "udp_rate_limiting"
+            | "ws_rate_limiting"
+            | "ai_rate_limiter"
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling
         // instances. Do not use the process-local runtime instance id here.
+        //
+        // The rate limiters use it as the default Redis key namespace suffix
+        // (`{namespace}:{plugin}:{config_id}`) so two independent policies of
+        // the same type in one namespace no longer increment and reject against
+        // one another's counters. It must be the configured resource id, not a
+        // process-local id: replicas of the same policy on separate data planes
+        // must keep sharing one distributed budget.
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,
@@ -2815,18 +2830,12 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             merged.push(Arc::clone(plugin));
         }
         if let Err(error) = validate_plugin_security_composition(&merged) {
-            errors.push(format!(
-                "proxy={}/{}: {error}",
-                proxy.namespace, proxy.id
-            ));
+            errors.push(format!("proxy={}/{}: {error}", proxy.namespace, proxy.id));
         }
         if let Err(error) =
             validate_correlation_id_composition(&merged, http_client.real_ip_header())
         {
-            errors.push(format!(
-                "proxy={}/{}: {error}",
-                proxy.namespace, proxy.id
-            ));
+            errors.push(format!("proxy={}/{}: {error}", proxy.namespace, proxy.id));
         }
     }
 
@@ -5024,7 +5033,9 @@ impl PluginCache {
                                 // rules to also run for VS-translated routes.
                                 // Emit a warn so the silent shadowing is at
                                 // least operator-visible.
-                                if pc.id.starts_with("__istio_vs_") {
+                                if pc.id.starts_with("istio-vs-req-xform-")
+                                    || pc.id.starts_with("istio-vs-resp-xform-")
+                                {
                                     let shadowed = merged.iter().any(|p| {
                                         p.name() == plugin.name()
                                             && global_ptrs

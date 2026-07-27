@@ -81,13 +81,10 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
     };
     let mut names: HashMap<String, HashMap<String, String>> = HashMap::new();
     for proxy in &config.proxies {
-        names
-            .entry(proxy.namespace.clone())
-            .or_default()
-            .insert(
-                proxy.id.clone(),
-                proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
-            );
+        names.entry(proxy.namespace.clone()).or_default().insert(
+            proxy.id.clone(),
+            proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
+        );
     }
     registry.set_active_proxy_names(names);
 }
@@ -1036,11 +1033,7 @@ impl ChargebackRegistry {
             // Capacity covers separators, status, protocol_family label
             // ("stream" is longest), and three 16-hex price bit fields.
             let mut owned_key = String::with_capacity(
-                consumer.len()
-                    + proxy_namespace.len()
-                    + proxy_id.len()
-                    + scope.currency.len()
-                    + 74,
+                consumer.len() + proxy_namespace.len() + proxy_id.len() + scope.currency.len() + 74,
             );
             write_chargeback_key(
                 &mut owned_key,

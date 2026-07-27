@@ -85,6 +85,73 @@ pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
 
+/// Exact identities created by one trusted mesh-materialization pass.
+///
+/// The constructor is private to this module: callers outside the
+/// materialization boundary can inspect an allowlist during runtime
+/// validation, but cannot bless arbitrary reserved-prefix IDs. The input
+/// snapshot is validated with the ordinary operator grammar before any mesh
+/// resources are injected, so every reserved identity collected afterward was
+/// created by the materializers in this module.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedMeshGeneratedResourceIds {
+    proxies: HashMap<String, HashSet<String>>,
+    plugin_configs: HashMap<String, HashSet<String>>,
+    upstreams: HashMap<String, HashSet<String>>,
+}
+
+impl TrustedMeshGeneratedResourceIds {
+    fn from_materialized_config(config: &GatewayConfig) -> Self {
+        let mut trusted = Self::default();
+        for proxy in &config.proxies {
+            if proxy.id.starts_with("__mesh") {
+                trusted
+                    .proxies
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        for plugin in &config.plugin_configs {
+            if plugin.id.starts_with("__mesh") {
+                trusted
+                    .plugin_configs
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert(plugin.id.clone());
+            }
+        }
+        for upstream in &config.upstreams {
+            if upstream.id.starts_with("__mesh") {
+                trusted
+                    .upstreams
+                    .entry(upstream.namespace.clone())
+                    .or_default()
+                    .insert(upstream.id.clone());
+            }
+        }
+        trusted
+    }
+
+    pub(crate) fn allows_proxy(&self, namespace: &str, id: &str) -> bool {
+        self.proxies
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_plugin_config(&self, namespace: &str, id: &str) -> bool {
+        self.plugin_configs
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_upstream(&self, namespace: &str, id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
     Inbound,
@@ -947,6 +1014,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
+    // here exactly like every other leading-underscore ID. Only after this
+    // strict gate succeeds may the trusted materializers below create reserved
+    // resources and record their exact `(kind, namespace, id)` identities for
+    // the post-materialization runtime swap check.
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+
     let mesh_errors = config.validate_mesh_fields();
     if !mesh_errors.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1112,22 +1191,17 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
     }
 
     if !udp_proxy_ids.is_empty() {
-        config
-            .proxies
-            .retain(|proxy| {
-                !udp_proxy_ids
-                    .get(proxy.namespace.as_str())
-                    .is_some_and(|ids| ids.contains(proxy.id.as_str()))
-            });
+        config.proxies.retain(|proxy| {
+            !udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        });
         config.plugin_configs.retain(|plugin| {
-            plugin
-                .proxy_id
-                .as_deref()
-                .is_none_or(|proxy_id| {
-                    !udp_proxy_ids
-                        .get(plugin.namespace.as_str())
-                        .is_some_and(|ids| ids.contains(proxy_id))
-                })
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !udp_proxy_ids
+                    .get(plugin.namespace.as_str())
+                    .is_some_and(|ids| ids.contains(proxy_id))
+            })
         });
     }
     if !udp_upstreams.is_empty() {
@@ -1472,8 +1546,7 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
         })
         .collect();
     for upstream in &mut candidate.upstreams {
-        if let Some(old) =
-            previous_by_id.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
+        if let Some(old) = previous_by_id.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
             && upstream_content_eq(upstream, old)
         {
             // Content-identical to the last accepted projection: preserve the
@@ -4935,7 +5008,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(scheme),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(scheme),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -6763,43 +6836,44 @@ fn apply_destination_rules(
                 // may seed those fallback slots. Sibling DR entries must not
                 // leak onto this upstream merely because their service port
                 // number appears as a fallback target's dial port.
-                let store_ports: Vec<u16> =
-                    if let Some(owning_port) = outbound_upstream_owner_port.get(&upstream.id) {
-                        if port != owning_port {
-                            debug!(
-                                rule = %dr.name,
-                                upstream = %upstream.id,
-                                port = port,
-                                owning_port = owning_port,
-                                "DestinationRule portLevelSettings entry belongs to a sibling per-port upstream; skipping here"
-                            );
-                            continue;
-                        }
-                        vec![*port]
-                    } else if upstream_policy_ports.contains(port) {
-                        vec![*port]
-                    } else if has_service_discovery {
-                        let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
-                            upstream_policy_ports.len() + 1
-                        } else {
-                            1
-                        });
-                        ports.push(*port);
-                        if mesh_sd_selected_port == Some(*port) {
-                            ports.extend(upstream_policy_ports.iter().copied());
-                        }
-                        ports.sort_unstable();
-                        ports.dedup();
-                        ports
-                    } else {
-                        warn!(
+                let store_ports: Vec<u16> = if let Some(owning_port) =
+                    outbound_upstream_owner_port.get(&upstream.id)
+                {
+                    if port != owning_port {
+                        debug!(
                             rule = %dr.name,
                             upstream = %upstream.id,
                             port = port,
-                            "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
+                            owning_port = owning_port,
+                            "DestinationRule portLevelSettings entry belongs to a sibling per-port upstream; skipping here"
                         );
                         continue;
-                    };
+                    }
+                    vec![*port]
+                } else if upstream_policy_ports.contains(port) {
+                    vec![*port]
+                } else if has_service_discovery {
+                    let mut ports = Vec::with_capacity(if mesh_sd_selected_port == Some(*port) {
+                        upstream_policy_ports.len() + 1
+                    } else {
+                        1
+                    });
+                    ports.push(*port);
+                    if mesh_sd_selected_port == Some(*port) {
+                        ports.extend(upstream_policy_ports.iter().copied());
+                    }
+                    ports.sort_unstable();
+                    ports.dedup();
+                    ports
+                } else {
+                    warn!(
+                        rule = %dr.name,
+                        upstream = %upstream.id,
+                        port = port,
+                        "DestinationRule portLevelSettings entry references a port not used by any target; skipping"
+                    );
+                    continue;
+                };
                 // Resolve per-port backend TLS over the upstream base, mirroring
                 // the per-subset TLS overlay. Computed before the `override_slot`
                 // mutable borrow. Fail-closed: an unresolvable per-port TLS
@@ -8711,11 +8785,7 @@ fn inject_mesh_global_plugins(
         }
     } else {
         // Remove any stale instance (e.g., operator flipped policy back).
-        remove_mesh_managed_plugin(
-            config,
-            MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
-            &runtime.namespace,
-        );
+        remove_mesh_managed_plugin(config, MESH_OUTBOUND_REGISTRY_PLUGIN_ID, &runtime.namespace);
     }
 
     // Merge applicable Telemetry resources (most specific scope wins per section).
@@ -13297,6 +13367,8 @@ async fn apply_mesh_slice_generation(
         federation_activation,
     ) {
         Ok(mut config) => {
+            let trusted_mesh_ids =
+                TrustedMeshGeneratedResourceIds::from_materialized_config(&config);
             let previous_config = proxy_state.config.load_full();
             // Materialized mesh upstreams are rebuilt with fresh per-apply
             // timestamps every slice apply (the materializers stamp `Utc::now()`
@@ -13347,7 +13419,7 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_config(config);
+            let outcome = proxy_state.update_mesh_config(config, &trusted_mesh_ids);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -15350,6 +15422,46 @@ mod tests {
     }
 
     #[test]
+    fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
+        let runtime = test_mesh_runtime_config();
+        let prepared =
+            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id.starts_with("__mesh")),
+            "fixture must contain a trusted mesh-generated resource"
+        );
+        assert!(
+            prepared.validate_resource_ids().is_err(),
+            "the ordinary external config boundary must stay strict"
+        );
+
+        let trusted = TrustedMeshGeneratedResourceIds::from_materialized_config(&prepared);
+        crate::proxy::validate_runtime_resource_ids(&prepared, Some(&trusted))
+            .expect("exact mesh-generated identities pass the runtime check");
+
+        let mut hostile = prepared;
+        let mut injected = hostile
+            .plugin_configs
+            .first()
+            .cloned()
+            .expect("managed plugin");
+        injected.id = "__mesh_hostile_after_materialization".to_string();
+        hostile.plugin_configs.push(injected);
+        let errors = crate::proxy::validate_runtime_resource_ids(&hostile, Some(&trusted))
+            .expect_err("an unrecorded reserved identity must still fail closed");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("PluginConfig ID")
+                    && error.contains("__mesh_hostile_after_materialization")
+            }),
+            "unexpected runtime identity errors: {errors:?}"
+        );
+    }
+
+    #[test]
     fn mesh_outbound_sidecar_materializes_per_port_with_authority_tag() {
         // Sidecar multi-port egress is per-port now that the destination
         // sidecar's inbound disambiguates by the request authority port:
@@ -16450,6 +16562,17 @@ mod tests {
                 .all(|plugin| plugin.proxy_id.as_deref() != Some("operator-udp")),
             "proxy-scoped plugin config must not dangle after disabling UDP proxy"
         );
+    }
+
+    #[test]
+    fn mesh_outbound_relay_builder_preserves_backend_protocol_dispatch() {
+        let tcp = mesh_outbound_tcp_relay_proxy("default", "redis", 6379, "tcp-upstream");
+        let udp = mesh_outbound_udp_relay_proxy("default", "dns", 53, "udp-upstream");
+
+        assert_eq!(tcp.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(tcp.dispatch_kind, DispatchKind::TcpRaw);
+        assert_eq!(udp.backend_scheme, Some(BackendScheme::Udp));
+        assert_eq!(udp.dispatch_kind, DispatchKind::UdpRaw);
     }
 
     #[test]

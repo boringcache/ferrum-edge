@@ -1754,7 +1754,18 @@ pub struct RequestContext {
     pub direct_client_ip: String,
     canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
+    /// Canonical policy path (`crate::policy_path`). Every security decision —
+    /// routing, WAF, `openapi_validator`, `request_termination`, authorization,
+    /// cache/replay keys, rewrites, and the assembled backend request line —
+    /// must read this field so none of them can act on a different semantic
+    /// path than the backend executes (advisory `GHSA-69xf-42xm-4w4f`).
     pub path: String,
+    /// The client's request target exactly as received, retained only when
+    /// canonicalization changed it. This private field is accessible only to
+    /// the descendant `hmac_auth` module through an opaque, debug-redacted
+    /// wrapper. Its wire signature binds the literal bytes the client signed.
+    /// Never route, authorize, or log this value.
+    raw_path: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -2442,6 +2453,7 @@ impl RequestContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
+            raw_path: None,
             request_authority: None,
             request_is_secure: false,
             frontend_listen_port: None,
@@ -3207,6 +3219,7 @@ impl RequestContext {
             canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
@@ -3974,6 +3987,14 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Record the client's original request target after canonicalization
+    /// changed it. Frontends call this once, at the boundary, immediately
+    /// before overwriting [`Self::path`] with the canonical form.
+    #[inline]
+    pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
+        self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are
@@ -7666,6 +7687,12 @@ pub fn create_plugin_with_http_client_and_config_id(
     // LDAP repeats this screen at every dial; config admission remains useful for
     // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+    // Rate limiters partition their default Redis key space by this id so two
+    // independent policies of one plugin type in a namespace never share
+    // counters (GHSA-gr3x-g777-hm78). Validation/direct construction has no
+    // resource id and uses the standalone placeholder.
+    let rate_limit_config_id =
+        plugin_config_id.unwrap_or(utils::rate_limit::STANDALONE_RATE_LIMIT_CONFIG_ID);
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -7781,20 +7808,32 @@ pub fn create_plugin_with_http_client_and_config_id(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "graphql" => {
+            let plugin = graphql::GraphqlPlugin::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "grpc_method_router" => {
+            let plugin = grpc_method_router::GrpcMethodRouter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "rate_limiting" => {
+            let plugin = rate_limiting::RateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_mirror" => Ok(Some(Arc::new(
             request_mirror::RequestMirror::new_with_config_id(
                 config,
@@ -7883,10 +7922,14 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )?))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "ai_rate_limiter" => {
+            let plugin = ai_rate_limiter::AiRateLimiter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
@@ -7930,13 +7973,22 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
             config,
         )?))),
-        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "udp_rate_limiting" => Ok(Some(Arc::new(
-            udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http_client.clone())?,
-        ))),
+        "ws_rate_limiting" => {
+            let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "udp_rate_limiting" => {
+            let plugin = udp_rate_limiting::UdpRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
             config,
             http_client,

@@ -1296,19 +1296,17 @@ pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[Plugin
 /// reaches a consumer. `apply_route_overrides: true` lets the plugin
 /// accept the empty-rules config.
 ///
-/// The id uses the reserved `__istio_vs_` prefix so (a) operators can
-/// recognize auto-emitted instances at a glance, (b) the prefix cannot
-/// collide with operator-chosen ids (validated names disallow leading
-/// underscores), and (c) `plugin_cache.rs` keys off the prefix to warn
-/// operators when this auto-emit shadows an operator-configured global
-/// `request_transformer`.
+/// The id uses the translator-owned `istio-vs-req-xform-` prefix so it remains
+/// recognizable and deterministic while satisfying the same resource-ID
+/// grammar enforced on CP-delivered full snapshots. Namespace-qualified
+/// ownership and the full proxy id keep distinct translated routes isolated.
 pub(crate) fn route_request_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("__istio_vs_req_xform_{proxy_id}"),
+        id: format!("istio-vs-req-xform-{proxy_id}"),
         plugin_name: "request_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -1326,14 +1324,14 @@ pub(crate) fn route_request_transformer_plugin_for_proxy(
 }
 
 /// Counterpart to [`route_request_transformer_plugin_for_proxy`] for response
-/// header transforms. Same `__istio_vs_` prefix convention.
+/// header transforms. Same valid translator-owned prefix convention.
 pub(crate) fn route_response_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("__istio_vs_resp_xform_{proxy_id}"),
+        id: format!("istio-vs-resp-xform-{proxy_id}"),
         plugin_name: "response_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -2561,10 +2559,7 @@ pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &st
 /// K8s-generated IDs are lossy across dashed namespace/name joins, and ordinary
 /// IDs are only unique within a namespace, so ownership maps must never fall
 /// back to a delimiter-encoded bare string.
-pub(crate) fn namespaced_resource_key(
-    namespace: &str,
-    id: &str,
-) -> Option<NamespacedResourceId> {
+pub(crate) fn namespaced_resource_key(namespace: &str, id: &str) -> Option<NamespacedResourceId> {
     if namespace.is_empty() || id.is_empty() {
         return None;
     }

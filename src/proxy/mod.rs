@@ -95,6 +95,7 @@ use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
     PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
+    validate_namespace, validate_resource_id,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -106,6 +107,7 @@ use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTru
 use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
+use crate::modes::mesh::TrustedMeshGeneratedResourceIds;
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
@@ -676,7 +678,7 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
             continue;
         };
         let target_namespaces: HashSet<&str> = if plugin.scope == PluginScope::Global {
-            config
+            let namespaces: HashSet<&str> = config
                 .proxies
                 .iter()
                 .filter(|proxy| proxy.dispatch_kind.is_http_family())
@@ -686,9 +688,10 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
                             || candidate.plugin_name != plugin.plugin_name
                             || candidate.namespace != proxy.namespace
                             || candidate.scope == PluginScope::Global
-                            || !proxy.plugins.iter().any(|association| {
-                                association.plugin_config_id == candidate.id
-                            })
+                            || !proxy
+                                .plugins
+                                .iter()
+                                .any(|association| association.plugin_config_id == candidate.id)
                         {
                             return false;
                         }
@@ -702,7 +705,15 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
                     })
                 })
                 .map(|proxy| proxy.namespace.as_str())
-                .collect()
+                .collect();
+            // A global plugin with no currently-attached HTTP proxies must
+            // still fail closed against its own namespace: otherwise a dangling
+            // upstream_id is invisible until the first proxy appears.
+            if namespaces.is_empty() {
+                std::iter::once(plugin.namespace.as_str()).collect()
+            } else {
+                namespaces
+            }
         } else {
             std::iter::once(plugin.namespace.as_str()).collect()
         };
@@ -718,6 +729,65 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
                     }
                 }
             }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate runtime resource identities, allowing only the exact
+/// mesh-generated identities recorded by the trusted materialization pass.
+///
+/// Ordinary file/database/CP/operator configs pass `None` and therefore use
+/// the same strict grammar as [`GatewayConfig::validate_resource_ids`].
+/// Namespaces, consumers, non-reserved IDs, and reserved IDs absent from the
+/// exact kind-qualified allowlist are always validated strictly.
+pub(crate) fn validate_runtime_resource_ids(
+    config: &GatewayConfig,
+    trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    for proxy in &config.proxies {
+        let trusted = trusted_mesh_ids
+            .is_some_and(|ids| ids.allows_proxy(&proxy.namespace, &proxy.id));
+        if !trusted && let Err(msg) = validate_resource_id(&proxy.id) {
+            errors.push(format!("Proxy ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&proxy.namespace) {
+            errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+        }
+    }
+    for consumer in &config.consumers {
+        if let Err(msg) = validate_resource_id(&consumer.id) {
+            errors.push(format!("Consumer ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&consumer.namespace) {
+            errors.push(format!("Consumer '{}': {}", consumer.id, msg));
+        }
+    }
+    for plugin in &config.plugin_configs {
+        let trusted = trusted_mesh_ids
+            .is_some_and(|ids| ids.allows_plugin_config(&plugin.namespace, &plugin.id));
+        if !trusted && let Err(msg) = validate_resource_id(&plugin.id) {
+            errors.push(format!("PluginConfig ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&plugin.namespace) {
+            errors.push(format!("PluginConfig '{}': {}", plugin.id, msg));
+        }
+    }
+    for upstream in &config.upstreams {
+        let trusted = trusted_mesh_ids
+            .is_some_and(|ids| ids.allows_upstream(&upstream.namespace, &upstream.id));
+        if !trusted && let Err(msg) = validate_resource_id(&upstream.id) {
+            errors.push(format!("Upstream ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&upstream.namespace) {
+            errors.push(format!("Upstream '{}': {}", upstream.id, msg));
         }
     }
 
@@ -850,22 +920,15 @@ fn inject_gateway_workload_metrics_if_svid(
             &mut config.plugin_configs[operator_idx].config,
             &spiffe_id,
         );
-        config
-            .plugin_configs
-            .retain(|plugin| {
-                plugin.namespace != namespace
-                    || plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
-            });
+        config.plugin_configs.retain(|plugin| {
+            plugin.namespace != namespace || plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+        });
         return;
     }
 
-    if let Some(existing) = config
-        .plugin_configs
-        .iter_mut()
-        .find(|plugin| {
-            plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
-        })
-    {
+    if let Some(existing) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+    }) {
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
         existing.scope = PluginScope::Global;
@@ -7665,6 +7728,14 @@ impl ProxyState {
     /// can log every reason in one pass instead of discovering them
     /// iteratively across reloads.
     fn validate_full_config(&self, config: &GatewayConfig) -> Result<(), Vec<String>> {
+        self.validate_full_config_with_mesh_ids(config, None)
+    }
+
+    fn validate_full_config_with_mesh_ids(
+        &self,
+        config: &GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+    ) -> Result<(), Vec<String>> {
         // Warn-only — TLS field validation (cert paths, expiry, IP policy).
         if let Err(errors) = config.validate_all_fields_with_ip_policy(
             self.env_config.tls_cert_expiry_warning_days,
@@ -7686,7 +7757,7 @@ impl ProxyState {
         // error vector so callers can log every reason at once instead of
         // discovering them iteratively across reloads.
         let mut errors: Vec<String> = Vec::new();
-        if let Err(errs) = config.validate_resource_ids() {
+        if let Err(errs) = validate_runtime_resource_ids(config, trusted_mesh_ids) {
             errors.extend(errs);
         }
         if let Err(errs) = config.validate_regex_listen_paths() {
@@ -8213,7 +8284,27 @@ impl ProxyState {
     }
 
     /// Update the proxy configuration.
-    pub fn update_config(&self, mut new_config: GatewayConfig) -> ConfigApplyOutcome {
+    pub fn update_config(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+        self.update_config_with_mesh_ids(new_config, None)
+    }
+
+    /// Mesh-only update path carrying the exact identities emitted by the
+    /// trusted materialization pass. It changes only resource-ID validation;
+    /// every other rejecting validator and the atomic publication path are
+    /// shared with [`Self::update_config`].
+    pub(crate) fn update_mesh_config(
+        &self,
+        new_config: GatewayConfig,
+        trusted_mesh_ids: &TrustedMeshGeneratedResourceIds,
+    ) -> ConfigApplyOutcome {
+        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids))
+    }
+
+    fn update_config_with_mesh_ids(
+        &self,
+        mut new_config: GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+    ) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
@@ -8244,7 +8335,9 @@ impl ProxyState {
         // fully BEFORE swap" guard must live inside the swap function so a
         // future caller (e.g. an admin "import config" handler) cannot
         // publish an invalid config to the hot path.
-        if let Err(errors) = self.validate_full_config(&new_config) {
+        if let Err(errors) =
+            self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
+        {
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);
             }
@@ -18611,6 +18704,14 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
+    // domain validation to load shedding costs a certificate. The lookup
+    // resolves the *canonical* policy path (advisory GHSA-69xf-42xm-4w4f), so an
+    // escaped-but-legal spelling of a live challenge cannot slip past the ACME
+    // handler here and then fall through to routing under a different reading.
+    // A refused or ambiguous target resolves to `None` and reaches the single
+    // canonicalization boundary in `handle_proxy_request_inner`, which is the
+    // only place a path is rejected.
     if req.method() == hyper::Method::GET
         && let Some(key_authorization) =
             crate::tls::acme::http01_key_authorization_for_path(req.uri().path())
@@ -18874,6 +18975,106 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    // Classify before the canonical-path boundary so a refusal uses the
+    // client's wire representation. WebSocket Upgrade / Extended CONNECT wins
+    // over any hostile Content-Type, matching backend dispatch and the H3
+    // frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
+    // Retain the representation just classified, exactly as the H3 frontend
+    // does right after it builds its context. Without this the marker existed
+    // only when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
+    // deployment — the backend speaks gRPC-Web itself and the translator is
+    // deliberately absent — left `client_grpc_framing_representation` with
+    // nothing to read. A backend that omits `Content-Type` (or a response hook
+    // that strips it) then reached the buffered representation gate as untyped
+    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
+    // response body rule was configured. The classification is taken from the
+    // immutable inbound content-type before any hook runs, so it records the
+    // client's own representation and never a rewritten one.
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
+    }
+
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
+    // transport-level checks above — which bound the work by the operator's
+    // URL-length limit and settle smuggling/authority questions first — and
+    // before routing, every plugin phase, and backend dispatch, so no
+    // protected surface ever observes a non-canonical target. An ambiguous
+    // target is refused here rather than resolved to one of its readings.
+    //
+    // `path` and `ctx.path` are the only path coordinates the rest of this
+    // handler uses (backend URL building reads the local `path`; plugins read
+    // `ctx.path`), so rebinding both here is what makes policy and the wire
+    // agree. Nothing between `RequestContext::new` and this point inspects the
+    // path.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for the overwhelming majority of traffic.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            // The raw target is attacker-controlled: log only the fixed reason
+            // token, never the bytes.
+            warn!(
+                reason = rejection.reason(),
+                "Rejected request: ambiguous percent-encoded request path"
+            );
+            record_request(&state, 400);
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                    &[],
+                ));
+            }
+            if request_uses_grpc_content_type {
+                return Ok(grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                ));
+            }
+            return Ok(build_response(
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+            ));
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            // Move the original target into the context for `hmac_auth`; the
+            // canonical form replaces it everywhere else.
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path_for_hmac(raw_path);
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
@@ -19075,48 +19276,6 @@ async fn handle_proxy_request_inner(
     });
     ctx.request_authority = request_authority;
 
-    // Classify before routing so route/method rejects can use the client's wire
-    // representation. WebSocket Upgrade / Extended CONNECT wins over any
-    // hostile Content-Type, matching backend dispatch and the H3 frontend.
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
-    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
-    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
-    // Retain the representation just classified, exactly as the H3 frontend does
-    // right after it builds its context. Without this the marker existed only
-    // when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
-    // deployment — the backend speaks gRPC-Web itself and the translator is
-    // deliberately absent — left `client_grpc_framing_representation` with
-    // nothing to read. A backend that omits `Content-Type` (or a response hook
-    // that strips it) then reached the buffered representation gate as untyped
-    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
-    // response body rule was configured. The classification is taken from the
-    // immutable inbound content-type before any hook runs, so it records the
-    // client's own representation and never a rewritten one.
-    if let Some(content_type) = grpc_web_response_content_type {
-        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
-    }
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
 
@@ -25011,10 +25170,19 @@ async fn handle_proxy_request_inner(
 
             // Replay the original request body on retry. On connection failures
             // the body was never sent, so replaying is correct and safe.
-            // The final retry attempt uses streaming if configured.
-            let is_last_attempt = attempt >= retry_config.max_retries;
-            let h3_retry_stream_response =
-                should_stream_h3_retry_response(should_stream, attempt, retry_config.max_retries);
+            //
+            // The caller's response-streaming decision (`should_stream`) is
+            // preserved on EVERY attempt, not only the last one (issue #2949).
+            // `retry::should_retry` consults status/`error_class`/method only —
+            // all known once the response headers arrive and before any body
+            // byte is read — so an attempt that turns out retryable simply drops
+            // its `reqwest::Response` / `H3StreamingResponse` undrained, exactly
+            // as the initial attempt (dispatched with `should_stream`) already
+            // does. Making streaming attempt-positional instead forced a healthy
+            // `text/event-stream` that succeeded before the last attempt through
+            // full-body collection: unbounded when
+            // `max_response_body_size_bytes` is `0`, and otherwise a stalled
+            // stream that 502s at the cap or the read timeout.
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
@@ -25027,7 +25195,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    h3_retry_stream_response,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -25045,7 +25213,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    should_stream && is_last_attempt,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -34058,10 +34226,6 @@ fn classify_h3_pool_error(
     classify_h3_error(e.as_ref())
 }
 
-fn should_stream_h3_retry_response(stream_response: bool, attempt: u32, max_retries: u32) -> bool {
-    stream_response && attempt >= max_retries
-}
-
 /// Build the 502 returned when an H3 backend response body exceeds
 /// `max_response_body_size_bytes`. `connection_error` stays `false` (the
 /// request demonstrably reached the backend) and the
@@ -34255,7 +34419,7 @@ async fn proxy_to_backend_http3_retry(
                 // Fast path: reject before streaming when the declared
                 // Content-Length exceeds the configured response size limit —
                 // mirrors the reqwest retry path's pre-stream reject. Without
-                // this the final streaming retry attempt would forward an
+                // this a streaming retry attempt would forward an
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
@@ -40910,23 +41074,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn h3_retry_streams_only_the_final_attempt_when_requested() {
-        assert!(
-            !super::should_stream_h3_retry_response(true, 0, 2),
-            "non-final H3 retries must stay buffered so another retry can replay"
-        );
-        assert!(
-            !super::should_stream_h3_retry_response(false, 2, 2),
-            "a buffered-response request must stay buffered even on the final retry"
-        );
-        assert!(
-            super::should_stream_h3_retry_response(true, 2, 2),
-            "the final H3 retry must preserve the original streaming response decision"
-        );
-    }
-
-    /// Guards the declared-Content-Length fast-path reject used by the final
+    /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
     /// over-limit Content-Length triggers the pre-stream 502.
     #[test]
@@ -41570,8 +41718,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let mut foreign_upstream =
-            upstream_with_targets("shared-id", &[("foreign.test", 8080)]);
+        let mut foreign_upstream = upstream_with_targets("shared-id", &[("foreign.test", 8080)]);
         foreign_upstream.namespace = "tenant-b".to_string();
         let config = GatewayConfig {
             proxies: vec![proxy],
@@ -41611,8 +41758,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let mut tenant_a_upstream =
-            upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
+        let mut tenant_a_upstream = upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
         tenant_a_upstream.namespace = "tenant-a".to_string();
         let config = GatewayConfig {
             proxies: vec![tenant_a, tenant_b],
@@ -41625,6 +41771,72 @@ mod tests {
             .expect_err("a gateway-wide global must resolve for every proxy namespace");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("tenant-b"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_without_http_proxies_rejects_dangling_reference() {
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a global with no current HTTP attachment must not pass vacuously");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-a"), "{errors:?}");
+        assert!(errors[0].contains("missing"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_without_http_proxies_uses_own_namespace() {
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut own_upstream = upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
+        own_upstream.namespace = "tenant-a".to_string();
+        let config = GatewayConfig {
+            upstreams: vec![own_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config)
+            .expect("the unattached global resolves in its declaring namespace");
     }
 
     #[test]
@@ -43087,12 +43299,8 @@ mod tests {
         let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
         next_same_id_other_namespace.namespace = "tenant-b".to_string();
         next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(0);
-        let mut next = make_validation_config(vec![
-            next_a,
-            next_b,
-            next_c,
-            next_same_id_other_namespace,
-        ]);
+        let mut next =
+            make_validation_config(vec![next_a, next_b, next_c, next_same_id_other_namespace]);
         next.normalize_fields();
 
         // "a" was already disabled -> excluded; only the transitions report.
@@ -43173,12 +43381,8 @@ mod tests {
         let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
         next_same_id_other_namespace.namespace = "tenant-b".to_string();
         next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(120);
-        let mut next = make_validation_config(vec![
-            next_a,
-            next_b,
-            next_c,
-            next_same_id_other_namespace,
-        ]);
+        let mut next =
+            make_validation_config(vec![next_a, next_b, next_c, next_same_id_other_namespace]);
         next.normalize_fields();
 
         let mut newly =
@@ -43381,7 +43585,10 @@ mod tests {
         };
         let mut config = make_validation_config(vec![]);
         config.plugin_configs = vec![
-            managed("tenant-b", "spiffe://tenant-b.example/ns/tenant-b/sa/gateway"),
+            managed(
+                "tenant-b",
+                "spiffe://tenant-b.example/ns/tenant-b/sa/gateway",
+            ),
             managed("ferrum", "spiffe://old.example/ns/ferrum/sa/old"),
         ];
 
@@ -43391,8 +43598,7 @@ mod tests {
             .plugin_configs
             .iter()
             .find(|plugin| {
-                plugin.namespace == "ferrum"
-                    && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                plugin.namespace == "ferrum" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
             })
             .expect("ferrum managed plugin");
         assert_eq!(
@@ -43406,8 +43612,7 @@ mod tests {
             .plugin_configs
             .iter()
             .find(|plugin| {
-                plugin.namespace == "tenant-b"
-                    && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+                plugin.namespace == "tenant-b" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
             })
             .expect("tenant-b managed plugin");
         assert_eq!(

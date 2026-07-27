@@ -936,8 +936,8 @@ fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginC
 
 fn retarget_route_action_plugin(mut plugin: PluginConfig, proxy_id: &str) -> Option<PluginConfig> {
     plugin.id = match plugin.plugin_name.as_str() {
-        "request_transformer" => format!("__istio_vs_req_xform_{proxy_id}"),
-        "response_transformer" => format!("__istio_vs_resp_xform_{proxy_id}"),
+        "request_transformer" => format!("istio-vs-req-xform-{proxy_id}"),
+        "response_transformer" => format!("istio-vs-resp-xform-{proxy_id}"),
         _ => return None,
     };
     plugin.proxy_id = Some(proxy_id.to_string());
@@ -5835,7 +5835,7 @@ mod tests {
         assert_eq!(request_transformer.proxy_id.as_deref(), Some(proxy_id));
         assert_eq!(
             request_transformer.id,
-            format!("__istio_vs_req_xform_{proxy_id}")
+            format!("istio-vs-req-xform-{proxy_id}")
         );
         assert!(
             result.config.proxies[0]
@@ -7786,10 +7786,10 @@ mod tests {
         )
         .expect("lossy cross-namespace HTTPRoutes must both translate");
 
-        let expected_id = resource_id("gwapi-route", "a", "b-c", "http-0");
+        let expected_id = resource_id("gwapi-route", "a", "b-c", "httproute-0");
         assert_eq!(
             expected_id,
-            resource_id("gwapi-route", "a-b", "c", "http-0"),
+            resource_id("gwapi-route", "a-b", "c", "httproute-0"),
             "fixture must exercise the lossy dash-join collision"
         );
 
@@ -7843,27 +7843,19 @@ mod tests {
             "Gateway API merge within namespace a-b must still combine GET+POST rules"
         );
         assert!(
-            result
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| {
-                    plugin.plugin_name == "request_transformer"
-                        && plugin.namespace == "a"
-                        && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
-                }),
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
             "tenant a request_transformer must not be suppressed by tenant a-b"
         );
         assert!(
-            result
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| {
-                    plugin.plugin_name == "request_transformer"
-                        && plugin.namespace == "a-b"
-                        && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
-                }),
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a-b"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
             "tenant a-b request_transformer must not be suppressed by tenant a"
         );
     }

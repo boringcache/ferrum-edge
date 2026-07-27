@@ -656,9 +656,7 @@ async fn test_global_plugin_qualifies_same_proxy_id_by_matched_namespace() {
     let namespace_labels: std::collections::HashSet<String> = registry
         .entries
         .iter()
-        .filter(|entry| {
-            entry.consumer.as_ref() == CONSUMER && entry.proxy_id.as_ref() == PROXY_ID
-        })
+        .filter(|entry| entry.consumer.as_ref() == CONSUMER && entry.proxy_id.as_ref() == PROXY_ID)
         .map(|entry| entry.namespace_label.to_string())
         .collect();
     assert_eq!(
