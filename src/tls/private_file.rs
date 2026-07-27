@@ -117,24 +117,18 @@ fn write_private_file_inner(path: &Path, bytes: &[u8]) -> io::Result<()> {
         PrivateFileFault::Write => {
             // Create the file so cleanup paths can be exercised, then fail the write.
             create_private_file(path)?;
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "injected fault: failed to write private temp file '{}'",
-                    path.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "injected fault: failed to write private temp file '{}'",
+                path.display()
+            )));
         }
         PrivateFileFault::Sync => {
             let mut file = create_private_file(path)?;
             file.write_all(bytes)?;
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "injected fault: failed to fsync private temp file '{}'",
-                    path.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "injected fault: failed to fsync private temp file '{}'",
+                path.display()
+            )));
         }
         PrivateFileFault::None
         | PrivateFileFault::Rename
@@ -195,9 +189,7 @@ pub(crate) fn replace_private_file(final_path: &Path, bytes: &[u8]) -> io::Resul
 
     let previous = read_previous_snapshot(final_path)?;
 
-    if let Err(error) = write_private_file(&tmp_path, bytes) {
-        return Err(error);
-    }
+    write_private_file(&tmp_path, bytes)?;
 
     if let Err(error) = rename_temp_into_place(&tmp_path, final_path) {
         return remove_path_preserving_primary(&tmp_path, error);
@@ -221,14 +213,11 @@ fn read_previous_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
 fn rename_temp_into_place(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if injected_fault() == PrivateFileFault::Rename {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "injected fault: failed to rename private temp file '{}' to '{}'",
-                tmp_path.display(),
-                final_path.display()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "injected fault: failed to rename private temp file '{}' to '{}'",
+            tmp_path.display(),
+            final_path.display()
+        )));
     }
     fs::rename(tmp_path, final_path)
 }
@@ -249,13 +238,10 @@ fn sync_parent_dir_inner(parent: &Path, allow_injected_fault: bool) -> io::Resul
     {
         #[cfg(test)]
         if allow_injected_fault && take_dir_sync_fault() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "injected fault: failed to fsync parent directory '{}' after rename",
-                    parent.display()
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "injected fault: failed to fsync parent directory '{}' after rename",
+                parent.display()
+            )));
         }
         #[cfg(not(test))]
         let _ = allow_injected_fault;
@@ -268,8 +254,7 @@ fn sync_parent_dir_inner(parent: &Path, allow_injected_fault: bool) -> io::Resul
         let _ = parent;
         #[cfg(test)]
         if allow_injected_fault && take_dir_sync_fault() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "injected fault: failed to fsync parent directory after rename",
             ));
         }
@@ -325,12 +310,12 @@ fn restore_previous_after_publish_failure(
             // Only fsync the parent after rollback itself succeeded. Syncing
             // after a failed restore can durably commit the failed destination.
             let mut extras = Vec::new();
-            if let Some(parent) = final_path.parent() {
-                if let Err(sync_error) = sync_parent_dir_after_rollback(parent) {
-                    extras.push(format!(
-                        "also failed to fsync parent directory after rollback: {sync_error}"
-                    ));
-                }
+            if let Some(parent) = final_path.parent()
+                && let Err(sync_error) = sync_parent_dir_after_rollback(parent)
+            {
+                extras.push(format!(
+                    "also failed to fsync parent directory after rollback: {sync_error}"
+                ));
             }
             if extras.is_empty() {
                 Err(primary)
@@ -352,13 +337,10 @@ fn restore_previous_after_publish_failure(
 fn rollback_failed_create_publish(final_path: &Path) -> io::Result<()> {
     #[cfg(test)]
     if take_restore_fault() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "injected fault: failed to remove published private file '{}' during create rollback",
-                final_path.display()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "injected fault: failed to remove published private file '{}' during create rollback",
+            final_path.display()
+        )));
     }
     match fs::remove_file(final_path) {
         Ok(()) => Ok(()),
@@ -377,13 +359,10 @@ fn rollback_failed_create_publish(final_path: &Path) -> io::Result<()> {
 fn restore_private_file_best_effort(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
     if take_restore_fault() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "injected fault: failed to restore prior private file '{}'",
-                final_path.display()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "injected fault: failed to restore prior private file '{}'",
+            final_path.display()
+        )));
     }
     let parent = match final_path.parent() {
         Some(parent) => parent,
