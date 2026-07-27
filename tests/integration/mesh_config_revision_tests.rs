@@ -548,7 +548,10 @@ async fn explicit_scope_boundary_failure_demotes_only_that_namespace() {
         HashSet::from(["alpha-fresh", "beta-last-good"]),
         "the failed namespace retains LKG while the healthy namespace refreshes"
     );
-    assert_eq!(outcome.sequences, HashMap::from([("alpha".to_string(), 20)]));
+    assert_eq!(
+        outcome.sequences,
+        HashMap::from([("alpha".to_string(), 20)])
+    );
     assert_eq!(outcome.refreshed_namespaces, vec!["alpha"]);
     assert_eq!(outcome.failed_namespaces, vec!["beta"]);
     assert_eq!(

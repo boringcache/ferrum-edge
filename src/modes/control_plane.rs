@@ -949,8 +949,7 @@ async fn load_full_config_multi_with_sequence(
     // harmlessly replayed by the next incremental poll, but it cannot skip a
     // write the snapshot may not contain.
     //
-    let publishes_store_global_revision =
-        mesh_authority.is_some() && matches!(scope, CpScope::All);
+    let publishes_store_global_revision = mesh_authority.is_some() && matches!(scope, CpScope::All);
 
     // A sequenced All-scope revision domain is store-global, so that watermark
     // must be captured before even the per-namespace boundaries and resource
