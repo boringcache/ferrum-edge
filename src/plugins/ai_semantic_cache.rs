@@ -5268,7 +5268,15 @@ fn validate_semantic_embedding_endpoint(
             "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
         );
     }
-    if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
+    let authority_start = parsed_endpoint.scheme().len() + "://".len();
+    let authority_has_userinfo = endpoint
+        .get(authority_start..)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    if authority_has_userinfo
+        || !parsed_endpoint.username().is_empty()
+        || parsed_endpoint.password().is_some()
+    {
         return Err(
             "ai_semantic_cache: 'semantic_embedding_endpoint' must not include username or password; use semantic_embedding_api_key for credentials"
                 .to_string(),
@@ -5300,11 +5308,9 @@ fn validate_semantic_embedding_endpoint(
 }
 
 fn redacted_semantic_embedding_endpoint(parsed: &Url) -> String {
-    let mut redacted = parsed.clone();
-    redacted.set_path("/...");
-    redacted.set_query(None);
-    redacted.set_fragment(None);
-    redacted.to_string()
+    let mut redacted = parsed.origin().ascii_serialization();
+    redacted.push_str("/...");
+    redacted
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
@@ -5356,11 +5362,11 @@ mod tests {
     #[test]
     fn redacted_semantic_embedding_endpoint_strips_credential_path_and_query() {
         let parsed = Url::parse(
-            "https://embeddings.example/private/signed-secret?code=query-secret#frag",
+            "https://embeddings.example:8443/private/signed-secret?code=query-secret#frag",
         )
         .expect("test URL must parse");
         let redacted = redacted_semantic_embedding_endpoint(&parsed);
-        assert_eq!(redacted, "https://embeddings.example/...");
+        assert_eq!(redacted, "https://embeddings.example:8443/...");
         assert!(!redacted.contains("signed-secret"));
         assert!(!redacted.contains("query-secret"));
         assert!(!redacted.contains('#'));

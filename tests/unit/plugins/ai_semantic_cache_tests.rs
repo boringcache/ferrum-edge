@@ -612,6 +612,18 @@ fn test_semantic_embedding_endpoint_rejects_userinfo_without_echoing_credentials
         !error.contains(secret),
         "config error leaked URL credential: {error}"
     );
+
+    let empty_userinfo = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "https://@embeddings.example.com/v1/embeddings",
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        empty_userinfo.is_err(),
+        "an explicit empty userinfo section must also be rejected"
+    );
 }
 
 #[tokio::test]
