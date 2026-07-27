@@ -93,37 +93,43 @@ impl Drop for PrivateFileFaultGuard {
 
 /// Write `bytes` to a new private file at `path` (typically a temp name).
 ///
-/// On create/write/sync failure the path is removed when present, and the
-/// original I/O error is preserved.
+/// A create failure returns without touching `path`, because an existing path
+/// belongs to another writer. After Ferrum successfully creates the file,
+/// write/sync failures remove only that owned file while preserving the
+/// original I/O error.
 pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    match write_private_file_inner(path, bytes) {
+    #[cfg(test)]
+    if injected_fault() == PrivateFileFault::Create {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "injected fault: failed to create private temp file '{}'",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut file = create_private_file(path)?;
+    let result = write_private_file_inner(path, bytes, &mut file);
+    // Windows cannot unlink an open file. Close the handle before cleaning up
+    // an owned partial write on every platform.
+    drop(file);
+    match result {
         Ok(()) => Ok(()),
         Err(error) => remove_path_preserving_primary(path, error),
     }
 }
 
-fn write_private_file_inner(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_private_file_inner(path: &Path, bytes: &[u8], file: &mut File) -> io::Result<()> {
     #[cfg(test)]
     match injected_fault() {
-        PrivateFileFault::Create => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "injected fault: failed to create private temp file '{}'",
-                    path.display()
-                ),
-            ));
-        }
         PrivateFileFault::Write => {
-            // Create the file so cleanup paths can be exercised, then fail the write.
-            create_private_file(path)?;
             return Err(io::Error::other(format!(
                 "injected fault: failed to write private temp file '{}'",
                 path.display()
             )));
         }
         PrivateFileFault::Sync => {
-            let mut file = create_private_file(path)?;
             file.write_all(bytes)?;
             return Err(io::Error::other(format!(
                 "injected fault: failed to fsync private temp file '{}'",
@@ -131,15 +137,14 @@ fn write_private_file_inner(path: &Path, bytes: &[u8]) -> io::Result<()> {
             )));
         }
         PrivateFileFault::None
+        | PrivateFileFault::Create
         | PrivateFileFault::Rename
         | PrivateFileFault::DirSync
         | PrivateFileFault::Restore => {}
     }
 
-    let mut file = create_private_file(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    file.sync_all()
 }
 
 fn create_private_file(path: &Path) -> io::Result<File> {
@@ -441,6 +446,22 @@ mod tests {
         let result = f();
         guard.disarm();
         result
+    }
+
+    #[test]
+    fn create_collision_never_removes_an_unowned_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("existing-temp");
+        fs::write(&path, b"other-writer").expect("seed colliding file");
+
+        let error = write_private_file(&path, b"ferrum-data")
+            .expect_err("create_new must reject a colliding path");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&path).expect("colliding file preserved"),
+            b"other-writer"
+        );
     }
 
     #[test]
