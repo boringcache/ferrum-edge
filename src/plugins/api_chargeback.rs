@@ -117,6 +117,7 @@ const ADMISSION_WARN_INTERVAL_NANOS: u64 = 60_000_000_000;
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
 
+#[allow(dead_code)] // Used by external tests; production uses try_global_registry / global_registry_with_shard_amount.
 pub fn global_registry() -> Arc<ChargebackRegistry> {
     global_registry_with_shard_amount(crate::util::sharding::pool_shard_amount(0))
 }
