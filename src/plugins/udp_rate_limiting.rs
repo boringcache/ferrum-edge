@@ -50,6 +50,15 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 
+/// Outcome of a UDP rate-limit rejection diagnostic decision. Test-only fields
+/// expose the suppressed counts carried by an emit without logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RejectionWarnDecisionForTest {
+    pub(crate) emitted: bool,
+    pub(crate) instance_suppressed: Option<u64>,
+    pub(crate) global_suppressed: Option<u64>,
+}
+
 static GLOBAL_REJECTION_WARN: OnceLock<AtomicLogRateLimiter> = OnceLock::new();
 
 fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
@@ -60,6 +69,12 @@ fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
 #[doc(hidden)]
 pub(crate) fn reset_global_rate_limit_rejection_warn_for_test() {
     global_rejection_warn().reset_for_test();
+}
+
+/// Observed process-wide suppressed-event accumulator. Test-only.
+#[doc(hidden)]
+pub(crate) fn global_rejection_warn_suppressed_count_for_test() -> u64 {
+    global_rejection_warn().suppressed_count_for_test()
 }
 
 pub struct UdpRateLimiting {
@@ -257,6 +272,25 @@ impl UdpRateLimiting {
         now_ms: u64,
     ) -> bool {
         self.record_rate_limit_rejection_warn(limit_kind, proxy_id, now_ms)
+            .emitted
+    }
+
+    /// Same as [`record_rate_limit_rejection_warn_for_test`] but exposes the
+    /// per-scope suppressed counts carried by an emit decision. Test-only.
+    #[doc(hidden)]
+    pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
+        &self,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> RejectionWarnDecisionForTest {
+        self.record_rate_limit_rejection_warn(limit_kind, proxy_id, now_ms)
+    }
+
+    /// Observed per-instance suppressed-event accumulator. Test-only.
+    #[doc(hidden)]
+    pub(crate) fn rejection_warn_suppressed_count_for_test(&self) -> u64 {
+        self.rejection_warn.suppressed_count_for_test()
     }
 
     /// Reset this instance's rejection diagnostic limiter. Test-only.
@@ -270,12 +304,15 @@ impl UdpRateLimiting {
         limit_kind: &'static str,
         proxy_id: &str,
         now_ms: u64,
-    ) -> bool {
-        let Some(instance_suppressed) = self.rejection_warn.on_event(now_ms) else {
-            return false;
-        };
-        let Some(global_suppressed) = global_rejection_warn().on_event(now_ms) else {
-            return false;
+    ) -> RejectionWarnDecisionForTest {
+        let Some((instance_suppressed, global_suppressed)) =
+            AtomicLogRateLimiter::dual_gate_emit(&self.rejection_warn, global_rejection_warn(), now_ms)
+        else {
+            return RejectionWarnDecisionForTest {
+                emitted: false,
+                instance_suppressed: None,
+                global_suppressed: None,
+            };
         };
         warn!(
             plugin = "udp_rate_limiting",
@@ -285,7 +322,11 @@ impl UdpRateLimiting {
             globally_suppressed = global_suppressed,
             "UDP rate limit exceeded, dropping datagram"
         );
-        true
+        RejectionWarnDecisionForTest {
+            emitted: true,
+            instance_suppressed: Some(instance_suppressed),
+            global_suppressed: Some(global_suppressed),
+        }
     }
 
     fn redis_ip_key(client_ip: &str) -> String {

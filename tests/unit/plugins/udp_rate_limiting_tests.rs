@@ -687,33 +687,52 @@ fn rejection_warn_rolls_window_and_carries_suppressed_count() {
     let plugin = make_plugin(json!({"datagrams_per_second": 1}));
     reset_udp_rejection_warn_state(&plugin);
 
-    assert!(
-        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
-            &plugin,
-            "datagram_count",
-            "proxy-1",
-            0,
-        )
+    let first = ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
+        &plugin,
+        "datagram_count",
+        "proxy-1",
+        0,
     );
+    assert!(first.emitted);
+    assert_eq!(first.instance_suppressed, Some(0));
+    assert_eq!(first.global_suppressed, Some(0));
+
     for t in 1..=999 {
-        assert!(
-            !ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+        let decision =
+            ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
                 &plugin,
                 "datagram_count",
                 "proxy-1",
                 t,
-            )
-        );
+            );
+        assert!(!decision.emitted);
+        assert_eq!(decision.instance_suppressed, None);
+        assert_eq!(decision.global_suppressed, None);
     }
-    assert!(
-        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin
+        ),
+        999,
+        "per-instance suppressed accounting must retain every in-window rejection"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_global_rejection_warn_suppressed_count_for_test(
+        ),
+        999,
+        "global suppressed accounting must retain every in-window rejection"
+    );
+
+    let rollover =
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
             &plugin,
             "datagram_count",
             "proxy-1",
             1_000,
-        ),
-        "window rollover must emit a summary"
-    );
+        );
+    assert!(rollover.emitted, "window rollover must emit a summary");
+    assert_eq!(rollover.instance_suppressed, Some(999));
+    assert_eq!(rollover.global_suppressed, Some(999));
 }
 
 #[tokio::test]
@@ -790,14 +809,56 @@ fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
             0,
         )
     );
+    let denied = ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
+        &plugin_b,
+        "datagram_count",
+        "proxy-b",
+        0,
+    );
     assert!(
-        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+        !denied.emitted,
+        "global gate must deny the second instance's first rejection in the same window"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin_b
+        ),
+        1,
+        "denied instance must retain its rolled-back rejection"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_global_rejection_warn_suppressed_count_for_test(
+        ),
+        1,
+        "global accounting must retain the denied rejection"
+    );
+
+    for t in 1..=999 {
+        let _ = ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
             &plugin_b,
             "datagram_count",
             "proxy-b",
-            0,
-        )
+            t,
+        );
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin_b
+        ),
+        1_000,
+        "instance aggregate must carry every rejection through a denied rollover"
     );
+
+    let rollover =
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
+            &plugin_b,
+            "datagram_count",
+            "proxy-b",
+            1_000,
+        );
+    assert!(rollover.emitted);
+    assert_eq!(rollover.instance_suppressed, Some(1_000));
+    assert_eq!(rollover.global_suppressed, Some(1_000));
 
     let mut global_emissions = 0usize;
     for t in 1..=10_000 {
@@ -821,6 +882,53 @@ fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
     assert!(
         global_emissions <= 12,
         "global + per-instance bounds must cap warnings across instances: {global_emissions}"
+    );
+}
+
+#[test]
+fn concurrent_rejection_warns_stay_bounded_with_preserved_accounting() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let plugin = Arc::new(make_plugin(json!({"datagrams_per_second": 1})));
+    reset_udp_rejection_warn_state(&plugin);
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let plugin = Arc::clone(&plugin);
+        handles.push(thread::spawn(move || {
+            let mut emissions = 0usize;
+            for _ in 0..2_000 {
+                if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+                    &plugin,
+                    "datagram_count",
+                    "proxy-1",
+                    1_000,
+                ) {
+                    emissions += 1;
+                }
+            }
+            emissions
+        }));
+    }
+
+    let emissions: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(
+        emissions, 1,
+        "identical timestamps within one window must emit at most once per instance"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin
+        ),
+        8 * 2_000 - 1,
+        "per-instance suppressed accounting must survive concurrent floods"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_global_rejection_warn_suppressed_count_for_test(
+        ),
+        8 * 2_000 - 1,
+        "global suppressed accounting must survive concurrent floods"
     );
 }
 

@@ -5,11 +5,12 @@
 //! per window carrying how many events were suppressed since the last emit. The
 //! event that triggers an emit is logged and is never counted as suppressed.
 //!
-//! Ordering: all atomics use [`Ordering::Relaxed`]. Suppressed counts are
-//! monotonic between emits and may be slightly low under concurrent winners of
-//! the emit [`compare_exchange`](std::sync::atomic::AtomicU64::compare_exchange);
-//! losing threads fold their event into `suppressed` instead of emitting a
-//! spurious zero-suppressed line.
+//! Suppressed counts saturate at [`u64::MAX`] and never wrap. Between emits the
+//! count is monotonic; concurrent losers of the emit
+//! [`compare_exchange`](std::sync::atomic::AtomicU64::compare_exchange) fold
+//! their event into `suppressed` instead of emitting a spurious zero-suppressed
+//! line. Callers composing multiple limiters must roll back an emit claim when
+//! a partner gate denies emission so neither scope loses accounting.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,12 +20,31 @@ const UNSET_MS: u64 = u64::MAX;
 /// Default emit window: at most one summary line per second.
 pub const DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS: u64 = 1_000;
 
+/// A successful emit-window claim before a composed gate commits or rolls back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmitClaim {
+    pub(crate) previous_last_emit_ms: u64,
+    pub(crate) suppressed: u64,
+}
+
 /// Bounds the rate of a repeated log line without locks.
 #[derive(Debug)]
 pub struct AtomicLogRateLimiter {
     last_emit_ms: AtomicU64,
     suppressed: AtomicU64,
     window_ms: u64,
+}
+
+#[inline]
+fn fetch_add_saturating(counter: &AtomicU64, delta: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(delta);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 impl AtomicLogRateLimiter {
@@ -44,14 +64,16 @@ impl AtomicLogRateLimiter {
 
     /// Record an event at `now_ms` (monotonic millis).
     ///
-    /// Returns `Some(suppressed)` when the caller should log now — `suppressed`
-    /// is the number of events dropped since the previous emit (`0` for the
-    /// first ever emit) — and `None` when the caller should stay silent.
+    /// Returns an [`EmitClaim`] when this scope would emit now. The caller must
+    /// either log and leave the claim committed, or call
+    /// [`rollback_emit_claim`](Self::rollback_emit_claim) when a composed gate
+    /// denies emission so the triggering event is folded back into
+    /// `suppressed` without losing accounting.
     #[inline]
-    pub fn on_event(&self, now_ms: u64) -> Option<u64> {
+    pub(crate) fn on_event(&self, now_ms: u64) -> Option<EmitClaim> {
         let last_ms = self.last_emit_ms.load(Ordering::Relaxed);
         if last_ms != UNSET_MS && now_ms.saturating_sub(last_ms) < self.window_ms {
-            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            fetch_add_saturating(&self.suppressed, 1);
             return None;
         }
 
@@ -60,10 +82,53 @@ impl AtomicLogRateLimiter {
             .compare_exchange(last_ms, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            Some(self.suppressed.swap(0, Ordering::Relaxed))
+            Some(EmitClaim {
+                previous_last_emit_ms: last_ms,
+                suppressed: self.suppressed.swap(0, Ordering::Relaxed),
+            })
         } else {
-            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            fetch_add_saturating(&self.suppressed, 1);
             None
+        }
+    }
+
+    /// Undo a claim from [`on_event`](Self::on_event) when a partner gate denied
+    /// emission. The triggering event is folded into `suppressed`; a rolled
+    /// back first emit anchors the window at `now_ms` without logging.
+    #[inline]
+    pub(crate) fn rollback_emit_claim(&self, claim: &EmitClaim, now_ms: u64) {
+        self.suppressed
+            .store(claim.suppressed.saturating_add(1), Ordering::Relaxed);
+        if claim.previous_last_emit_ms == UNSET_MS {
+            self.last_emit_ms.store(now_ms, Ordering::Relaxed);
+        } else {
+            self.last_emit_ms
+                .store(claim.previous_last_emit_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Compose per-instance and process-wide scopes: record every rejection at
+    /// both, emit only when both admit, and roll back neither scope's aggregate
+    /// when the partner gate denies.
+    #[inline]
+    pub(crate) fn dual_gate_emit(
+        instance: &Self,
+        global: &Self,
+        now_ms: u64,
+    ) -> Option<(u64, u64)> {
+        let instance_claim = instance.on_event(now_ms);
+        let global_claim = global.on_event(now_ms);
+        match (&instance_claim, &global_claim) {
+            (Some(instance), Some(global)) => Some((instance.suppressed, global.suppressed)),
+            (Some(instance), None) => {
+                instance.rollback_emit_claim(instance, now_ms);
+                None
+            }
+            (None, Some(global)) => {
+                global.rollback_emit_claim(global, now_ms);
+                None
+            }
+            (None, None) => None,
         }
     }
 
@@ -73,55 +138,17 @@ impl AtomicLogRateLimiter {
         self.last_emit_ms.store(UNSET_MS, Ordering::Relaxed);
         self.suppressed.store(0, Ordering::Relaxed);
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn first_event_emits_with_zero_suppressed() {
-        let limiter = AtomicLogRateLimiter::new();
-        assert_eq!(limiter.on_event(0), Some(0));
+    /// Observed suppressed-event accumulator. Test-only.
+    #[doc(hidden)]
+    pub fn suppressed_count_for_test(&self) -> u64 {
+        self.suppressed.load(Ordering::Relaxed)
     }
 
-    #[test]
-    fn suppresses_within_window_then_summarizes() {
-        let limiter = AtomicLogRateLimiter::new();
-        assert_eq!(limiter.on_event(0), Some(0));
-        for t in [1, 100, 500, 999] {
-            assert_eq!(limiter.on_event(t), None);
-        }
-        assert_eq!(limiter.on_event(1_000), Some(4));
-        assert_eq!(limiter.on_event(1_001), None);
-        assert_eq!(limiter.on_event(2_000), Some(1));
-    }
-
-    #[test]
-    fn non_advancing_clock_suppresses_after_first() {
-        let limiter = AtomicLogRateLimiter::new();
-        assert_eq!(limiter.on_event(42), Some(0));
-        for _ in 0..1_000 {
-            assert_eq!(limiter.on_event(42), None);
-        }
-    }
-
-    #[test]
-    fn suppressed_count_saturates() {
-        let limiter = AtomicLogRateLimiter {
-            last_emit_ms: AtomicU64::new(0),
-            suppressed: AtomicU64::new(u64::MAX),
-            window_ms: DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS,
-        };
-        assert_eq!(limiter.on_event(10), None);
-        assert_eq!(
-            limiter.suppressed.load(Ordering::Relaxed),
-            u64::MAX,
-            "saturating add must not wrap"
-        );
-        assert_eq!(
-            limiter.on_event(DEFAULT_ATOMIC_LOG_RATE_LIMIT_WINDOW_MS),
-            Some(u64::MAX)
-        );
+    /// Seed limiter state for external regressions. Test-only.
+    #[doc(hidden)]
+    pub fn seed_for_test(&self, last_emit_ms: u64, suppressed: u64) {
+        self.last_emit_ms.store(last_emit_ms, Ordering::Relaxed);
+        self.suppressed.store(suppressed, Ordering::Relaxed);
     }
 }
