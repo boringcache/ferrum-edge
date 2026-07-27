@@ -4420,6 +4420,151 @@ async fn replace_api_spec_rejects_external_proxy_referencing_spec_owned_upstream
     );
 }
 
+/// Malformed `upstreams.id` must fail closed inside the external-reference
+/// guard (issue #3210). SQLite type drift (`X'FF'`) makes `AnyRow::try_get::<String>`
+/// reject the column; the lossy `filter_map(...ok())` path used to drop that
+/// id, treat the protected set as empty, and skip the mesh_route_dispatch scan.
+#[tokio::test]
+async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let ns = "ferrum";
+
+    let proxy_id = uid("proxy");
+    let upstream_id = uid("upstream");
+    let spec_id = uid("spec");
+    let mesh_plugin_id = uid("mesh-dispatch");
+    let body = format!(
+        r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "API", "version": "1.0.0" }},
+            "x-ferrum-proxy": {{
+                "id": "{proxy_id}",
+                "backend_host": "backend.internal",
+                "backend_port": 443,
+                "listen_path": "/{proxy_id}"
+            }},
+            "x-ferrum-upstream": {{
+                "id": "{upstream_id}",
+                "targets": [{{ "host": "target.internal", "port": 443 }}]
+            }}
+        }}"#
+    );
+    let (bundle, spec) = make_spec_from_openapi_body(&spec_id, &proxy_id, ns, &body);
+    store
+        .submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("initial submit failed");
+
+    // External enabled mesh_route_dispatch naming the spec-owned upstream —
+    // the reference the guard must not skip when ID decode fails.
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: mesh_plugin_id.clone(),
+            namespace: ns.to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            config: serde_json::json!({
+                "rules": [{
+                    "match": { "methods": ["GET"] },
+                    "destination": { "upstream_id": upstream_id }
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("create external mesh_route_dispatch plugin failed");
+
+    let mut conn = store.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upstreams SET id = X'FF' WHERE id = ? AND namespace = ?")
+        .bind(&upstream_id)
+        .bind(ns)
+        .execute(&mut *conn)
+        .await
+        .expect("injecting undecodable upstream id must succeed");
+    drop(conn);
+
+    let blob_upstream_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstreams \
+         WHERE namespace = ? AND api_spec_id = ? AND typeof(id) = 'blob'",
+    )
+    .bind(ns)
+    .bind(&spec_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("blob upstream count must succeed");
+    assert_eq!(blob_upstream_before, 1);
+
+    let err = store
+        .delete_api_spec(ns, &spec_id)
+        .await
+        .expect_err("malformed upstream id must abort api_spec deletion");
+    let message = err.to_string();
+    assert!(
+        message.contains("operation=ensure_no_external_spec_upstream_refs"),
+        "error should identify the reference-integrity guard, got: {message}"
+    );
+    assert!(
+        message.contains("resource=upstreams")
+            && message.contains("column=id")
+            && message.contains(&format!("namespace={ns}"))
+            && message.contains(&format!("api_spec_id={spec_id}")),
+        "error should include namespace/spec/column context without relying on later selects, got: {message}"
+    );
+    assert!(
+        !message.contains(&mesh_plugin_id),
+        "decode-path failure must abort before the mesh_route_dispatch reference check embeds the plugin id: {message}"
+    );
+
+    assert!(
+        store
+            .get_api_spec(ns, &spec_id)
+            .await
+            .expect("get_api_spec failed")
+            .is_some(),
+        "api_specs row must remain after rollback"
+    );
+    assert!(
+        store
+            .get_proxy(ns, &proxy_id)
+            .await
+            .expect("get_proxy failed")
+            .is_some(),
+        "spec-owned proxy must remain after rollback"
+    );
+    let blob_upstream_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstreams \
+         WHERE namespace = ? AND api_spec_id = ? AND typeof(id) = 'blob'",
+    )
+    .bind(ns)
+    .bind(&spec_id)
+    .fetch_one(&store.pool())
+    .await
+    .expect("blob upstream count after delete must succeed");
+    assert_eq!(
+        blob_upstream_after, 1,
+        "spec-owned upstream must remain after rollback"
+    );
+    assert!(
+        store
+            .get_plugin_config(ns, &mesh_plugin_id)
+            .await
+            .expect("get_plugin_config failed")
+            .is_some(),
+        "external mesh_route_dispatch plugin must remain after rollback"
+    );
+}
+
 // ============================================================================
 // Fix 1 (DB layer) — server-side timestamp stamping
 // ============================================================================

@@ -8203,6 +8203,12 @@ impl DatabaseStore {
             );
         }
 
+        // Every selected spec-owned upstream id must decode. Silently dropping
+        // a row on try_get failure shrinks the protected set and can make an
+        // all-failed selection look empty, skipping the mesh_route_dispatch
+        // scan and allowing replace/delete to commit with dangling external
+        // references (issue #3210). The empty-set fast path is only for a
+        // query that truly returned no rows.
         let upstream_rows: Vec<AnyRow> = sqlx::query(
             &self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"),
         )
@@ -8210,12 +8216,19 @@ impl DatabaseStore {
         .bind(spec_id)
         .fetch_all(&mut **tx)
         .await?;
-        let spec_upstream_ids: HashSet<String> = upstream_rows
-            .iter()
-            .filter_map(|row| row.try_get::<String, _>("id").ok())
-            .collect();
-        if spec_upstream_ids.is_empty() {
+        if upstream_rows.is_empty() {
             return Ok(());
+        }
+        let mut spec_upstream_ids = HashSet::with_capacity(upstream_rows.len());
+        for row in &upstream_rows {
+            let id = row.try_get::<String, _>("id").map_err(|e| {
+                anyhow::Error::from(e).context(format!(
+                    "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     failed to decode spec-owned upstream id required for external reference checks"
+                ))
+            })?;
+            spec_upstream_ids.insert(id);
         }
 
         let plugin_rows: Vec<AnyRow> = sqlx::query(
