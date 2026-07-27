@@ -780,9 +780,7 @@ fn streaming_content_length_needs_repair(
 /// Preserve at most one valid streaming representation length and canonicalize
 /// its spelling. Multiple case variants are duplicate `Content-Length` fields
 /// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
-fn canonicalize_streaming_content_length(
-    headers: &mut std::collections::HashMap<String, String>,
-) {
+fn canonicalize_streaming_content_length(headers: &mut std::collections::HashMap<String, String>) {
     let mut parsed = None;
     let mut count = 0usize;
     for (name, value) in headers.iter() {
@@ -1854,10 +1852,7 @@ mod tests {
                 is_head: false,
             },
         );
-        assert_eq!(
-            mixed.get("content-length").map(String::as_str),
-            Some("42")
-        );
+        assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
         assert!(!mixed.contains_key("Content-Length"));
 
         let mut duplicates = std::collections::HashMap::from([
