@@ -54,13 +54,13 @@ impl TransactionLogSchema {
     /// Compiles every schema entry without staging anything in the process-global
     /// registry.
     pub(crate) fn validate_config(config: &Value) -> Result<(), String> {
-        validate_and_compile_entries(config)?;
+        Self::validate_and_compile_entries(config)?;
         Ok(())
     }
 
     pub fn new(config: &Value) -> Result<Self, String> {
         let mut schemas: HashMap<String, Arc<SummarySchema>> = HashMap::new();
-        for (name, raw, compiled) in validate_and_compile_entries(config)? {
+        for (name, raw, compiled) in Self::validate_and_compile_entries(config)? {
             schemas.insert(name.clone(), compiled.clone());
             // Register into the active staging area. Isolated constructor
             // validation is a no-op; graph validation and cache reloads open
