@@ -2424,8 +2424,7 @@ async fn oversized_external_operation_barrier_outlives_short_replay_ttl() {
         let plugin = make_plugin(config);
         let key = format!("long-lease-{label}");
         let mut owner_ctx = new_ctx("POST", "/api");
-        let mut owner_headers =
-            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        let mut owner_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
         assert!(matches!(
             plugin
                 .before_proxy(&mut owner_ctx, &mut owner_headers)
@@ -2476,8 +2475,7 @@ async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
 
     for key in ["total-overflow-a", "total-overflow-b"] {
         let mut owner_ctx = new_ctx("POST", "/api");
-        let mut owner_headers =
-            HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        let mut owner_headers = HashMap::from([("idempotency-key".to_string(), key.to_string())]);
         assert!(matches!(
             plugin
                 .before_proxy(&mut owner_ctx, &mut owner_headers)
@@ -2499,8 +2497,10 @@ async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
     tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
 
     let mut blocked_ctx = new_ctx("POST", "/api");
-    let mut blocked_headers =
-        HashMap::from([("idempotency-key".to_string(), "total-overflow-c".to_string())]);
+    let mut blocked_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "total-overflow-c".to_string(),
+    )]);
     match plugin
         .before_proxy(&mut blocked_ctx, &mut blocked_headers)
         .await
@@ -2511,9 +2511,9 @@ async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
             assert_eq!(status_code, 503);
             assert!(body.contains("execution-barrier capacity"));
         }
-        other => panic!(
-            "total-capacity barrier overflow must fail closed past ttl_seconds: {other:?}"
-        ),
+        other => {
+            panic!("total-capacity barrier overflow must fail closed past ttl_seconds: {other:?}")
+        }
     }
 }
 
