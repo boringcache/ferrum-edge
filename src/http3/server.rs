@@ -13266,6 +13266,7 @@ mod build_h3_backend_headers_tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

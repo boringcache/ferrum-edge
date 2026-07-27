@@ -184,6 +184,72 @@ that relied on an ambient proxy to reach a log sink, AI provider, JWKS/OIDC
 endpoint, webhook, or ClickHouse chargeback sink must point the plugin's
 configured endpoint directly at the reachable destination instead.
 
+### Body Validator Enforcement Hardening
+
+`body_validator` now enforces the policy it advertises, which makes several
+previously-accepted configurations fail closed. Because the plugin is
+fail-closed, a rejected configuration keeps the last known-good generation:
+database and control-plane publication rejects the row, a DP keeps its last
+accepted snapshot, and file-mode startup or reload rejects the file. Audit every
+`body_validator` config in the cloned database or staging config before cutover.
+
+Configuration is now rejected when:
+
+- an unknown top-level key is present (previously ignored), or a
+  `protobuf_method_messages` entry contains any key other than `request` /
+  `response`. Typos such as `response_json_scheam` or `respones` used to be
+  silently dropped while the remaining valid rule kept admission succeeding.
+- `json_schema` / `response_json_schema` is not a valid JSON Schema under the
+  configured draft. Schemas are now compiled with the `jsonschema` crate at
+  plugin construction instead of being interpreted by a partial evaluator, so
+  malformed keyword shapes, invalid type names (`"type": "objcet"`), and invalid
+  `pattern` regexes are configuration errors rather than no-ops.
+- an actual schema position uses a non-local `$ref`/`$dynamicRef` (anything not
+  starting with `#`), a non-fragment `$id` / `id`, a `$vocabulary` declaration,
+  or a `$schema` naming a draft other than the configured one. Property and
+  definition names with those spellings, and literal objects under `enum`,
+  `const`, `default`, or `examples`, are not schema keywords unless a supported
+  local URI-fragment JSON Pointer actually targets that object. Pointer targets
+  are audited with percent-decoding and JSON Pointer escaping before compile,
+  including targets under otherwise literal/unknown containers. No external
+  reference is ever fetched: the dependency is built without HTTP or file
+  retrievers.
+- the complete supplied schema value nests deeper than 32 levels or contains
+  more than 20000 JSON nodes. Literal and annotation data counts toward both
+  budgets.
+- `json_schema_draft` (new, default `draft2020-12`, also accepts `draft7`) has
+  any other value. Draft-4 spellings such as a boolean `exclusiveMinimum` are
+  rejected; convert them to the numeric draft-7/2020-12 form.
+
+Runtime behavior also tightens:
+
+- Standard keywords the old evaluator ignored are now enforced. `$ref`/`$defs`,
+  array `type` unions, conditionals, and dependent keywords all take effect, so
+  traffic a schema was always meant to reject now actually gets rejected.
+  Draft 7 treats `definitions` as its ordinary definition container; `$defs`
+  remains an unknown/literal value there unless a local pointer explicitly
+  targets it. Draft 2020-12 follows both `$defs` and the validator library's
+  compatible `definitions` map. `$dynamicRef` has reference semantics under
+  Draft 2020-12 and remains an unknown, inert keyword under Draft 7.
+- XML bodies are parsed by a real XML parser instead of a tag-balancing scan.
+  Documents with multiple roots, text outside the root, invalid element or
+  attribute names, unquoted or duplicated attributes, undeclared entity
+  references, invalid characters, or non-XML Unicode whitespace outside the
+  document are now rejected. The original body is parsed without trimming;
+  legal XML space (`SP`, `TAB`, `CR`, `LF`) around the root remains accepted.
+  `required_xml_elements` matches parsed element names: a bare name matches that
+  local name in any namespace, `{uri}local` requires both, and `{}local`
+  requires no namespace. A configured entry that previously relied on a raw
+  `prefix:local` source match must be rewritten as `local` or `{uri}local`.
+- External XML identifiers (`SYSTEM` / `PUBLIC`) on the DOCTYPE external subset
+  or an entity declaration are always rejected. Internal DTD subsets remain
+  supported under the entity count/nesting policy.
+- Decoded gRPC protobuf messages must satisfy proto2 required-field
+  initialization, recursively through present nested, repeated, map, and
+  extension message values. proto3 descriptors are unaffected. Clients that
+  relied on sending an uninitialized proto2 message must be fixed before
+  upgrade.
+
 ### Response Cache Shared-Storage Hardening
 
 `response_caching` now applies RFC 9111 shared-cache rules that earlier
