@@ -1010,17 +1010,20 @@ pub(super) async fn handle_renew_acme_certificate(
                 ));
             }
         };
-        let (record, overwrite) = match acme_order_record_from_request(state, AcmeOrderRequest {
-            id: Some(renewal_order_id),
-            certificate_id: Some(certificate_id.to_string()),
-            domains: certificate.domains,
-            directory_url: certificate.directory_url,
-            contact: request.contact,
-            terms_of_service_agreed: request.terms_of_service_agreed,
-            challenge_type: request.challenge_type,
-            existing_account_credentials_json,
-            allow_overwrite: request.allow_overwrite,
-        })
+        let (record, overwrite) = match acme_order_record_from_request(
+            state,
+            AcmeOrderRequest {
+                id: Some(renewal_order_id),
+                certificate_id: Some(certificate_id.to_string()),
+                domains: certificate.domains,
+                directory_url: certificate.directory_url,
+                contact: request.contact,
+                terms_of_service_agreed: request.terms_of_service_agreed,
+                challenge_type: request.challenge_type,
+                existing_account_credentials_json,
+                allow_overwrite: request.allow_overwrite,
+            },
+        )
         .await
         {
             Ok(value) => value,

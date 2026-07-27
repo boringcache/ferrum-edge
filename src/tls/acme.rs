@@ -1252,9 +1252,7 @@ impl AcmeEndpointPolicy {
         let host = directory
             .host_str()
             .ok_or_else(|| {
-                AcmeError::BlockedDirectoryUrl(
-                    "directory URL must include a host".to_string(),
-                )
+                AcmeError::BlockedDirectoryUrl("directory URL must include a host".to_string())
             })?
             .to_ascii_lowercase();
         let port = directory.port_or_known_default().ok_or_else(|| {
@@ -1276,14 +1274,10 @@ impl AcmeEndpointPolicy {
         let parsed = parse_acme_https_endpoint(endpoint, label)?;
         let host = parsed
             .host_str()
-            .ok_or_else(|| {
-                AcmeError::BlockedDirectoryUrl(format!("{label} must include a host"))
-            })?
+            .ok_or_else(|| AcmeError::BlockedDirectoryUrl(format!("{label} must include a host")))?
             .to_ascii_lowercase();
         let port = parsed.port_or_known_default().ok_or_else(|| {
-            AcmeError::BlockedDirectoryUrl(format!(
-                "{label} must include a valid HTTPS port"
-            ))
+            AcmeError::BlockedDirectoryUrl(format!("{label} must include a valid HTTPS port"))
         })?;
         if host != self.origin.host || port != self.origin.port {
             return Err(AcmeError::BlockedDirectoryUrl(format!(
@@ -2294,11 +2288,8 @@ pub mod client {
                         ));
                     }
                     let address = SocketAddr::new(candidate, port);
-                    match tokio::time::timeout_at(
-                        deadline,
-                        tokio::net::TcpStream::connect(address),
-                    )
-                    .await
+                    match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(address))
+                        .await
                     {
                         Ok(Ok(stream)) => return Ok(TokioIo::new(stream)),
                         Ok(Err(error)) => last_error = Some(error),
@@ -2320,9 +2311,7 @@ pub mod client {
     fn response_body_too_large_error() -> instant_acme::Error {
         instant_acme::Error::Other(Box::new(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "ACME response body exceeds the {MAX_ACME_RESPONSE_BODY_BYTES}-byte limit"
-            ),
+            format!("ACME response body exceeds the {MAX_ACME_RESPONSE_BODY_BYTES}-byte limit"),
         )))
     }
 
@@ -2453,9 +2442,7 @@ pub mod client {
         let validate_string =
             |value: &serde_json::Value, label: &'static str| -> Result<(), AcmeClientError> {
                 let endpoint = value.as_str().ok_or_else(|| {
-                    AcmeClientError::EgressPolicy(format!(
-                        "{label} must be an absolute URL string"
-                    ))
+                    AcmeClientError::EgressPolicy(format!("{label} must be an absolute URL string"))
                 })?;
                 policy
                     .validate_endpoint(endpoint, label)
@@ -2523,9 +2510,7 @@ pub mod client {
         let value = serde_json::from_str::<serde_json::Value>(credentials_json.expose_secret())
             .map_err(|error| AcmeClientError::DeserializeCredentials(error.to_string()))?;
         let object = value.as_object().ok_or_else(|| {
-            AcmeClientError::DeserializeCredentials(
-                "credentials must be a JSON object".to_string(),
-            )
+            AcmeClientError::DeserializeCredentials("credentials must be a JSON object".to_string())
         })?;
         if object.get("urls").is_some_and(|urls| !urls.is_null()) {
             return Err(AcmeClientError::EgressPolicy(
@@ -2637,16 +2622,11 @@ pub mod client {
         challenge_type: ChallengeType,
         challenge_name: &'static str,
     ) -> Result<PreparedAcmeHttp01Order, AcmeClientError> {
-        let endpoint_policy =
-            super::AcmeEndpointPolicy::new(&config.account.directory_url)
+        let endpoint_policy = super::AcmeEndpointPolicy::new(&config.account.directory_url)
             .map_err(|error| AcmeClientError::InvalidRequest(error.to_string()))?;
         let domains = normalize_order_domains(config.domains)?;
-        let account = resolve_account(
-            &config.account,
-            endpoint_policy.clone(),
-            config.dns_cache,
-        )
-        .await?;
+        let account =
+            resolve_account(&config.account, endpoint_policy.clone(), config.dns_cache).await?;
         let identifiers = domains
             .iter()
             .cloned()
@@ -2806,18 +2786,15 @@ pub mod client {
             ));
         }
         if let Some(credentials_json) = config.existing_credentials_json.as_ref() {
-            let account =
-                restore_account(credentials_json, endpoint_policy, dns_cache).await?;
+            let account = restore_account(credentials_json, endpoint_policy, dns_cache).await?;
             return Ok(ResolvedAccount {
                 account,
                 credentials_json: credentials_json.clone(),
             });
         }
 
-        let builder = Account::builder_with_http(build_policy_http_client(
-            endpoint_policy,
-            dns_cache,
-        )?);
+        let builder =
+            Account::builder_with_http(build_policy_http_client(endpoint_policy, dns_cache)?);
         let contact = config
             .contact
             .iter()
@@ -2845,8 +2822,7 @@ pub mod client {
         endpoint_policy: super::AcmeEndpointPolicy,
         dns_cache: DnsCache,
     ) -> Result<Account, AcmeClientError> {
-        let credentials =
-            validate_and_deserialize_credentials(credentials_json, &endpoint_policy)?;
+        let credentials = validate_and_deserialize_credentials(credentials_json, &endpoint_policy)?;
         Account::builder_with_http(build_policy_http_client(endpoint_policy, dns_cache)?)
             .from_credentials(credentials)
             .await
@@ -2911,9 +2887,8 @@ pub mod client {
             fn request(
                 &self,
                 _request: Request<BodyWrapper<Bytes>>,
-            ) -> Pin<
-                Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>,
-            > {
+            ) -> Pin<Box<dyn Future<Output = Result<BytesResponse, instant_acme::Error>> + Send>>
+            {
                 self.requests.fetch_add(1, Ordering::SeqCst);
                 let mut builder = Response::builder().status(self.status);
                 if let Some(location) = self.location {
@@ -3003,9 +2978,8 @@ pub mod client {
 
         #[test]
         fn credential_directory_mismatch_and_legacy_urls_fail_closed() {
-            let policy =
-                super::super::AcmeEndpointPolicy::new("https://acme.example/directory")
-                    .expect("policy");
+            let policy = super::super::AcmeEndpointPolicy::new("https://acme.example/directory")
+                .expect("policy");
             let mismatch = SecretString::new(
                 serde_json::json!({
                     "id": "https://acme.example/account/1",
@@ -3034,7 +3008,10 @@ pub mod client {
             let error = validate_and_deserialize_credentials(&legacy, &policy)
                 .err()
                 .expect("legacy embedded endpoint set must be rejected");
-            assert!(error.to_string().contains("legacy ACME credentials"), "{error}");
+            assert!(
+                error.to_string().contains("legacy ACME credentials"),
+                "{error}"
+            );
         }
 
         #[tokio::test]
@@ -3053,7 +3030,9 @@ pub mod client {
                 .expect_err("private DNS answer must be rejected");
             assert_eq!(error.kind(), io::ErrorKind::Other);
             assert!(
-                error.to_string().contains("denied by backend egress policy"),
+                error
+                    .to_string()
+                    .contains("denied by backend egress policy"),
                 "{error}"
             );
         }
@@ -3080,12 +3059,9 @@ pub mod client {
             let destination = "https://deadline.acme.test/directory"
                 .parse::<Uri>()
                 .expect("ACME destination");
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                connector.call(destination),
-            )
-            .await
-            .expect("connector must enforce its shorter shared deadline");
+            let result = tokio::time::timeout(Duration::from_secs(1), connector.call(destination))
+                .await
+                .expect("connector must enforce its shorter shared deadline");
             let error = result
                 .err()
                 .expect("stalled fresh DNS resolution must time out");
@@ -3127,9 +3103,7 @@ pub mod client {
                 .expect_err("excessive complete DNS answer must be rejected");
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert!(
-                error
-                    .to_string()
-                    .contains("exceeding the limit of 64"),
+                error.to_string().contains("exceeding the limit of 64"),
                 "{error}"
             );
         }
@@ -3234,8 +3208,7 @@ pub mod client {
 
         #[tokio::test]
         async fn private_directory_and_order_resource_urls_never_reach_transport() {
-            let (client, requests) =
-                fake_boundary(serde_json::json!({}), StatusCode::OK, None);
+            let (client, requests) = fake_boundary(serde_json::json!({}), StatusCode::OK, None);
             for endpoint in [
                 "https://127.0.0.1/directory",
                 "https://169.254.169.254/order/1",
@@ -3283,7 +3256,7 @@ pub mod client {
 
         #[tokio::test]
         async fn private_order_authorization_challenge_finalize_and_certificate_fields_are_rejected()
-        {
+         {
             let cases = [
                 (
                     serde_json::json!({}),
@@ -3333,8 +3306,7 @@ pub mod client {
 
         #[tokio::test]
         async fn https_and_redirect_invariants_fail_closed() {
-            let (client, requests) =
-                fake_boundary(serde_json::json!({}), StatusCode::FOUND, None);
+            let (client, requests) = fake_boundary(serde_json::json!({}), StatusCode::FOUND, None);
             assert!(
                 boundary_request(&client, "http://acme.example/directory")
                     .await
@@ -3474,9 +3446,9 @@ mod tests {
             " https://acme-staging-v02.api.letsencrypt.org/directory ", // trimmed
             "https://1.1.1.1/dir",                                      // public IPv4 literal
             "https://[2606:4700:4700::1111]/dir",                       // public IPv6 literal
-            "https://localhost/dir",    // rejected later when it resolves to loopback
-            "https://beef.cafe/dir",    // hex-only hostname is not a numeric IP
-            "https://dead.cab/dir",     // hex-only hostname is not a numeric IP
+            "https://localhost/dir", // rejected later when it resolves to loopback
+            "https://beef.cafe/dir", // hex-only hostname is not a numeric IP
+            "https://dead.cab/dir",  // hex-only hostname is not a numeric IP
             "https://abc.def.1a2b/dir", // mixed hex hostname
         ] {
             assert!(
