@@ -20,7 +20,7 @@
 //! memory overhead — only enable when needed.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -29,6 +29,10 @@ use super::utils::size_limit::{
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Authoritative closed set of top-level `response_size_limiting` configuration keys.
+const RESPONSE_SIZE_LIMITING_CONFIG_KEYS: &[&str] = &["max_bytes", "require_buffered_check"];
 
 pub struct ResponseSizeLimiting {
     max_bytes: u64,
@@ -37,26 +41,33 @@ pub struct ResponseSizeLimiting {
 
 impl ResponseSizeLimiting {
     pub fn new(config: &Value) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_obj) = config.as_object() else {
             return Err("response_size_limiting: config must be an object".to_string());
-        }
+        };
+        reject_unknown_keys(
+            config_obj,
+            "config",
+            RESPONSE_SIZE_LIMITING_CONFIG_KEYS,
+            "response_size_limiting: ",
+        )?;
 
         let max_bytes = required_positive_u64(config, "max_bytes", "response_size_limiting")?;
-        let require_buffered_check = match config.get("require_buffered_check") {
-            Some(Value::Bool(value)) => *value,
-            Some(Value::Null) | None => false,
-            Some(_) => {
-                return Err(
-                    "response_size_limiting: 'require_buffered_check' must be a boolean"
-                        .to_string(),
-                );
-            }
-        };
+        let require_buffered_check = optional_bool(config_obj, "require_buffered_check")?;
 
         Ok(Self {
             max_bytes,
             require_buffered_check,
         })
+    }
+}
+
+fn optional_bool(config: &Map<String, Value>, key: &str) -> Result<bool, String> {
+    match config.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!(
+            "response_size_limiting: '{key}' must be a boolean"
+        )),
     }
 }
 

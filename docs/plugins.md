@@ -3873,6 +3873,8 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 
 **Priority:** 3490
 
+Configuration must be a top-level object. The only accepted keys are `max_bytes` and `require_buffered_check`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `require_buffered_checks` cannot silently disable strict route enforcement. Omitted `require_buffered_check` defaults to `false`; explicit `null` is rejected.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `max_bytes` | u64 | — (required, > 0) | Maximum allowed response body size in bytes. The plugin errors at construction if absent or zero. |

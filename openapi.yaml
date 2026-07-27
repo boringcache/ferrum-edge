@@ -17875,6 +17875,7 @@ components:
 
     ResponseSizeLimitingConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: response_size_limiting — Per-proxy response body size limits.
         Rejects oversized responses with HTTP 502 either via Content-Length
@@ -17884,6 +17885,8 @@ components:
         without Content-Length cannot be enforced by this plugin — the
         global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
         case via the gateway's `SizeLimitedStreamingResponse` adapter.
+        Unknown keys and non-object configs are rejected. Explicit null
+        members are rejected; omitted keys keep defaults.
       required:
         - max_bytes
       properties:
