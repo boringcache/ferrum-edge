@@ -10,7 +10,9 @@ benchmark itself. Required PR CI does run lightweight static contracts for this
 lane inside the `Performance Regression Check` job in `.github/workflows/ci.yml`
 (workflow verifier self-test + repository contract, evaluator self-test, and a
 `python3 -m py_compile` check of the scenario harness) before optional
-benchmark/build gating. The lightweight HTTP/1 overhead gate in `ci.yml`
+benchmark/build gating. That PR job has read-only contents permission and does
+not persist checkout credentials while running PR-controlled code. The
+lightweight HTTP/1 overhead gate in `ci.yml`
 remains the PR path for measured overhead. Noisy shared-runner microbenchmarks
 stay out of branch protection.
 
@@ -40,6 +42,7 @@ Additional scenarios from
 - **Connection churn** — HTTP/1 with keep-alive / idle pool disabled
 - **Long-lived soak** — `proto_bench saturate` hold window
 - **Resource plateau** — RSS, FD count, and task/thread samples from `/proc`
+  after the connection ramp, comparing early/late three-sample medians
 - **Reload under load** — file-mode `SIGHUP` while traffic is flowing
 
 ## Budgets and trends
@@ -52,16 +55,22 @@ Versioned budgets live in
   does not block the schedule.
 - **Harness / data-completeness failures are always hard failures**, even
   while `enforcement` is `alert`: missing expected protocol samples,
-  zero-total/invalid metrics, non-finite or malformed numeric fields (NaN,
-  Infinity, non-numeric counts/rates/plateau arrays), missing required
-  scenario output, and insufficient RSS/FD/task sampling all fail the job.
+  missing per-iteration RPS/error/p50/p95/p99 fields, zero-total/invalid
+  metrics, non-finite or malformed numeric fields (NaN, Infinity, non-numeric
+  counts/rates/plateau arrays), missing or malformed runner-health/history
+  evidence, nonzero scenario benchmark exits, an undelivered reload `SIGHUP`,
+  missing required scenario output, and insufficient RSS/FD/task sampling all
+  fail the job.
   Finite measured product regressions such as zero RPS or large latency stay
   alert-only under `enforcement=alert`.
 - Absolute `min_gateway_rps` / `max_p*_us` floors are intentionally `null`
   until operators measure variance on `ubuntu-latest` + `ci-release` and fill
   them in. Do not invent floors from unexecuted local runs.
 - When prior trend artifacts exist, the evaluator also applies a rolling
-  median ± MAD comparison (`rolling` block in the budgets file).
+  median ± MAD comparison (`rolling` block in the budgets file). History is
+  accepted only from the newest successful `main` run, validated against schema
+  version 1, filtered to the same runner/build profile, and bounded to the
+  configured rolling window.
 - Each run publishes machine-readable artifacts:
   - `combined_results.json`
   - `budget_report.json`
@@ -87,7 +96,8 @@ and latency alerts as provisional.
 
 Actions → **Protocol Performance Regression** → Run workflow.
 
-Optional inputs: duration, concurrency, iterations, protocol subset.
+Optional inputs: duration, concurrency, iterations, and one protocol selection
+(or `all` for the complete matrix).
 
 ## Local static checks (no benchmarks)
 

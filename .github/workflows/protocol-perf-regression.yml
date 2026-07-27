@@ -39,10 +39,22 @@ on:
           - "2"
           - "3"
       protocols:
-        description: "Protocols to test (or 'all')"
+        description: "Protocol to test (or the complete matrix)"
         required: false
         default: "all"
-        type: string
+        type: choice
+        options:
+          - "all"
+          - "http1"
+          - "http1-tls"
+          - "http2"
+          - "http3"
+          - "ws"
+          - "grpc"
+          - "tcp"
+          - "tcp-tls"
+          - "udp"
+          - "udp-dtls"
 
 concurrency:
   group: protocol-perf-regression

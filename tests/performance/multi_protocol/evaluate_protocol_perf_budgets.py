@@ -217,19 +217,16 @@ def is_valid_gateway_sample(sample: dict[str, Any]) -> bool:
         return False
     if not str(sample.get("protocol", "")).strip():
         return False
+    if "total_requests" not in sample or "total_errors" not in sample:
+        return False
     total = sample_total(sample)
     if total is None or total <= 0:
         return False
-    # Zero RPS / large but finite latency remain valid measured outcomes.
-    if parse_nonnegative_number(sample.get("rps")) is None:
-        return False
-    for key in ("p50_us", "p99_us"):
-        if parse_nonnegative_number(sample.get(key, 0)) is None:
+    # All issue-required metrics must be present. Zero RPS / large but finite
+    # latency remain valid measured outcomes and are budget alerts, not gaps.
+    for key in ("rps", "p50_us", "p95_us", "p99_us"):
+        if key not in sample or parse_nonnegative_number(sample.get(key)) is None:
             return False
-    for key in ("p95_us", "p90_us"):
-        if key in sample and sample.get(key) is not None:
-            if parse_nonnegative_number(sample.get(key)) is None:
-                return False
     return True
 
 
@@ -297,26 +294,170 @@ def rolling_breach(
 
 
 def history_metric(
-    history_doc: dict[str, Any] | None, protocol: str, metric: str
+    history_doc: dict[str, Any] | None,
+    protocol: str,
+    metric: str,
+    *,
+    runner_class: str | None,
+    build_profile: str | None,
 ) -> list[float]:
-    if not history_doc:
+    if not isinstance(history_doc, dict):
         return []
     points = history_doc.get("points", [])
     values: list[float] = []
+    if not isinstance(points, list):
+        return values
     for point in points:
+        if not isinstance(point, dict):
+            continue
+        if runner_class and point.get("runner_class") != runner_class:
+            continue
+        if build_profile and point.get("build_profile") != build_profile:
+            continue
         protocols = point.get("protocols", {})
+        if not isinstance(protocols, dict):
+            continue
         sample = protocols.get(protocol)
         if not isinstance(sample, dict):
             continue
         if metric not in sample or sample[metric] is None:
             continue
-        values.append(float(sample[metric]))
+        value = parse_nonnegative_number(sample[metric])
+        if value is not None:
+            values.append(value)
     return values
 
 
 def hard_fail(failures: list[str], message: str) -> None:
     """Data-completeness / harness errors always fail the job."""
     failures.append(message)
+
+
+def validate_gateway_run_completeness(
+    results: dict[str, Any], expected: list[str], failures: list[str]
+) -> None:
+    """Require exactly one gateway sample per selected protocol in every run."""
+    runs = results.get("runs")
+    if not isinstance(runs, dict) or not runs:
+        hard_fail(failures, "matrix: missing/nonempty runs object")
+        return
+
+    iterations = parse_nonnegative_int(results.get("iterations"))
+    if iterations is None or iterations <= 0:
+        hard_fail(failures, "matrix: invalid/missing positive iterations metadata")
+    elif len(runs) != iterations:
+        hard_fail(
+            failures,
+            f"matrix: expected {iterations} iteration(s), found {len(runs)} run object(s)",
+        )
+
+    for run_name, benchmarks in runs.items():
+        if not isinstance(benchmarks, list) or not benchmarks:
+            hard_fail(failures, f"matrix: {run_name} missing/nonempty benchmark list")
+            continue
+        counts = {proto: 0 for proto in expected}
+        for sample in benchmarks:
+            if not isinstance(sample, dict):
+                continue
+            if not is_gateway_target(str(sample.get("target", ""))):
+                continue
+            proto = normalize_protocol_name(str(sample.get("protocol", "")))
+            if proto in counts:
+                counts[proto] += 1
+        for proto, count in counts.items():
+            if count != 1:
+                hard_fail(
+                    failures,
+                    f"matrix: {run_name} expected exactly one {proto} gateway sample, "
+                    f"found {count}",
+                )
+
+
+def validate_history_doc(history_doc: Any, failures: list[str]) -> None:
+    """Fail closed on malformed prior artifacts instead of silently resetting trends."""
+    if history_doc is None:
+        return
+    if not isinstance(history_doc, dict):
+        hard_fail(failures, "history: root must be an object")
+        return
+    if history_doc.get("schema_version") != 1:
+        hard_fail(failures, "history: schema_version must equal 1")
+    points = history_doc.get("points")
+    if not isinstance(points, list):
+        hard_fail(failures, "history: points must be a list")
+        return
+    for index, point in enumerate(points):
+        prefix = f"history: point {index}"
+        if not isinstance(point, dict):
+            hard_fail(failures, f"{prefix} must be an object")
+            continue
+        for key in (
+            "commit",
+            "run_id",
+            "timestamp",
+            "runner_class",
+            "build_profile",
+            "budget_version",
+        ):
+            if not isinstance(point.get(key), str) or not point[key].strip():
+                hard_fail(failures, f"{prefix} missing nonempty {key}")
+        protocols = point.get("protocols")
+        if not isinstance(protocols, dict) or not protocols:
+            hard_fail(failures, f"{prefix} protocols must be a nonempty object")
+            continue
+        for proto, sample in protocols.items():
+            if not isinstance(proto, str) or not proto.strip() or not isinstance(sample, dict):
+                hard_fail(failures, f"{prefix} has malformed protocol summary")
+                continue
+            samples = parse_nonnegative_int(sample.get("samples"))
+            if samples is None or samples <= 0:
+                hard_fail(failures, f"{prefix} {proto} has invalid samples count")
+            for metric in ("rps", "p50_us", "p95_us", "p99_us"):
+                if parse_nonnegative_number(sample.get(metric)) is None:
+                    hard_fail(failures, f"{prefix} {proto} has invalid {metric}")
+            if parse_unit_rate(sample.get("error_rate")) is None:
+                hard_fail(failures, f"{prefix} {proto} has invalid error_rate")
+        if not isinstance(point.get("scenarios"), dict):
+            hard_fail(failures, f"{prefix} scenarios must be an object")
+        if not isinstance(point.get("runner_health"), dict):
+            hard_fail(failures, f"{prefix} runner_health must be an object")
+
+
+def validate_runner_health(
+    results: dict[str, Any], budgets: dict[str, Any], failures: list[str]
+) -> None:
+    runner_class = results.get("runner_class")
+    build_profile = results.get("build_profile")
+    if runner_class != budgets.get("runner_class"):
+        hard_fail(
+            failures,
+            "runner_health: results runner_class does not match versioned budgets",
+        )
+    if build_profile != budgets.get("build_profile"):
+        hard_fail(
+            failures,
+            "runner_health: results build_profile does not match versioned budgets",
+        )
+
+    health = results.get("runner_health")
+    if not isinstance(health, dict) or not health:
+        hard_fail(failures, "runner_health: missing required evidence")
+        return
+    if health.get("runner_class") != runner_class:
+        hard_fail(failures, "runner_health: runner_class metadata mismatch")
+    if health.get("build_profile") != build_profile:
+        hard_fail(failures, "runner_health: build_profile metadata mismatch")
+    for metric in (
+        "avg_steal_percent",
+        "sleep_1ms_avg_us",
+        "sleep_1ms_p99_us",
+        "sleep_1ms_max_us",
+    ):
+        if parse_nonnegative_number(health.get(metric)) is None:
+            hard_fail(failures, f"runner_health: invalid/missing {metric}")
+    nproc = parse_nonnegative_int(health.get("nproc"))
+    if nproc is None or nproc <= 0:
+        hard_fail(failures, "runner_health: invalid/missing positive nproc")
 
 
 def scenario_request_sample_usable(sample: Any) -> bool:
@@ -328,7 +469,12 @@ def scenario_request_sample_usable(sample: Any) -> bool:
                 return False
     total = sample_total(sample)
     if total is not None and total > 0:
-        return True
+        if "total_requests" not in sample or "total_errors" not in sample:
+            return False
+        return all(
+            key in sample and parse_nonnegative_number(sample.get(key)) is not None
+            for key in ("rps", "p50_us", "p95_us", "p99_us")
+        )
     # Malformed request/error counts are never usable.
     if total is None and (
         "total_requests" in sample or "total_errors" in sample
@@ -379,6 +525,18 @@ def validate_required_scenarios(
         if key not in scenarios or not isinstance(scenarios.get(key), dict):
             hard_fail(failures, f"scenarios: missing required scenario {key}")
 
+    for key in ("connection_churn", "reload_under_load", "soak"):
+        block = scenarios.get(key)
+        if not isinstance(block, dict):
+            continue
+        exit_code = parse_nonnegative_int(block.get("bench_exit_code"))
+        if exit_code != 0:
+            hard_fail(
+                failures,
+                f"scenarios: {key} benchmark exit code must be zero, got "
+                f"{block.get('bench_exit_code')!r}",
+            )
+
     for key in ("connection_churn", "reload_under_load"):
         block = scenarios.get(key)
         if not isinstance(block, dict):
@@ -397,6 +555,10 @@ def validate_required_scenarios(
                 "(require finite rate in [0, 1])",
             )
 
+    reload = scenarios.get("reload_under_load")
+    if isinstance(reload, dict) and reload.get("sighup_sent") is not True:
+        hard_fail(failures, "scenarios: reload_under_load SIGHUP was not delivered")
+
     soak = scenarios.get("soak")
     if isinstance(soak, dict) and not scenario_request_sample_usable(soak.get("sample")):
         hard_fail(
@@ -407,6 +569,9 @@ def validate_required_scenarios(
 
     plateau = scenarios.get("resource_plateau")
     if isinstance(plateau, dict):
+        sample_count = parse_nonnegative_int(plateau.get("sample_count"))
+        if sample_count is None:
+            hard_fail(failures, "scenarios: resource_plateau invalid sample_count")
         for resource in ("rss_bytes", "fd_count", "task_count"):
             series = plateau.get(resource, [])
             problem = resource_series_structurally_valid(
@@ -425,6 +590,16 @@ def validate_required_scenarios(
                 hard_fail(
                     failures,
                     f"scenarios: resource_plateau {resource} {problem}",
+                )
+            if (
+                sample_count is not None
+                and isinstance(series, list)
+                and len(series) != sample_count
+            ):
+                hard_fail(
+                    failures,
+                    f"scenarios: resource_plateau {resource} length {len(series)} "
+                    f"does not match sample_count {sample_count}",
                 )
 
 
@@ -466,6 +641,10 @@ def evaluate(
         hard_fail(failures, f"protocols: invalid selection: {exc}")
         expected = []
 
+    validate_history_doc(history_doc, failures)
+    validate_runner_health(results, budgets, failures)
+    validate_gateway_run_completeness(results, expected, failures)
+
     gateway = extract_gateway_samples(results)
 
     # Surface invalid/zero-total gateway samples as harness failures even when
@@ -499,14 +678,11 @@ def evaluate(
             for value in (parse_nonnegative_number(s.get("p50_us", 0)) for s in samples)
             if value is not None
         ]
-        p95_vals = []
-        for sample in samples:
-            raw = sample.get("p95_us")
-            if raw is None:
-                raw = sample.get("p90_us", 0)
-            parsed = parse_nonnegative_number(raw)
-            if parsed is not None:
-                p95_vals.append(parsed)
+        p95_vals = [
+            value
+            for value in (parse_nonnegative_number(s.get("p95_us")) for s in samples)
+            if value is not None
+        ]
         p99_vals = [
             value
             for value in (parse_nonnegative_number(s.get("p99_us", 0)) for s in samples)
@@ -514,7 +690,7 @@ def evaluate(
         ]
         err_vals = [rate for rate in (error_rate(s) for s in samples) if rate is not None]
 
-        if not rps_vals or not p50_vals or not p99_vals:
+        if not rps_vals or not p50_vals or not p95_vals or not p99_vals or not err_vals:
             hard_fail(
                 failures,
                 f"{proto}: gateway samples failed finite metric extraction "
@@ -525,9 +701,9 @@ def evaluate(
         summary = {
             "samples": len(samples),
             "rps": median(rps_vals),
-            "error_rate": median(err_vals) if err_vals else 0.0,
+            "error_rate": median(err_vals),
             "p50_us": median(p50_vals),
-            "p95_us": median(p95_vals) if p95_vals else 0.0,
+            "p95_us": median(p95_vals),
             "p99_us": median(p99_vals),
         }
         protocol_summary[proto] = summary
@@ -536,7 +712,8 @@ def evaluate(
         max_error = proto_budget.get("max_error_rate", global_cfg.get("max_error_rate"))
         if max_error is not None and summary["error_rate"] > float(max_error):
             note(
-                f"{proto}: error_rate {summary['error_rate']:.4f} exceeds budget {float(max_error):.4f}"
+                f"{proto}: error_rate {summary['error_rate']:.4f} exceeds budget "
+                f"{float(max_error):.4f}"
             )
 
         for key, metric, higher_is_worse in (
@@ -564,7 +741,21 @@ def evaluate(
         ):
             breach = rolling_breach(
                 float(summary[metric]),
-                history_metric(history_doc, proto, metric)[-window:],
+                history_metric(
+                    history_doc,
+                    proto,
+                    metric,
+                    runner_class=(
+                        results.get("runner_class")
+                        if isinstance(results.get("runner_class"), str)
+                        else None
+                    ),
+                    build_profile=(
+                        results.get("build_profile")
+                        if isinstance(results.get("build_profile"), str)
+                        else None
+                    ),
+                )[-window:],
                 mad_multiplier=mad_multiplier,
                 min_samples=min_samples,
                 higher_is_worse=higher_is_worse,
@@ -590,9 +781,15 @@ def evaluate(
                 series = plateau.get(resource, [])
                 if resource_series_structurally_valid(series, min_samples=2) is not None:
                     continue
-                start = parse_nonnegative_number(series[0])
-                end = parse_nonnegative_number(series[-1])
-                if start is None or end is None or start <= 0:
+                values = [
+                    value
+                    for value in (parse_nonnegative_number(item) for item in series)
+                    if value is not None
+                ]
+                window_samples = min(3, max(1, len(values) // 2))
+                start = median(values[:window_samples])
+                end = median(values[-window_samples:])
+                if start <= 0:
                     continue
                 growth = end / start
                 limit = float(global_cfg.get(growth_key, 2.5))
@@ -668,7 +865,7 @@ def merge_history(
     history_doc: dict[str, Any] | None, point: dict[str, Any], window: int
 ) -> dict[str, Any]:
     points = []
-    if history_doc and isinstance(history_doc.get("points"), list):
+    if isinstance(history_doc, dict) and isinstance(history_doc.get("points"), list):
         points.extend(history_doc["points"])
     points.append(point)
     return {
@@ -679,6 +876,13 @@ def merge_history(
 
 def _clean_results_fixture() -> dict[str, Any]:
     return {
+        "schema_version": 1,
+        "commit": "0123456789abcdef0123456789abcdef01234567",
+        "run_id": "1234",
+        "timestamp": "2026-07-26T12:00:00+00:00",
+        "runner_class": "ubuntu-latest",
+        "build_profile": "ci-release",
+        "iterations": "1",
         "protocols": "http1",
         "runs": {
             "run_1": [
@@ -703,26 +907,45 @@ def _clean_results_fixture() -> dict[str, Any]:
             },
             "reload_under_load": {
                 "error_rate": 0.01,
+                "bench_exit_code": 0,
+                "sighup_sent": True,
                 "sample": {
                     "total_requests": 100,
                     "total_errors": 1,
                     "rps": 10.0,
+                    "p50_us": 100,
+                    "p95_us": 200,
+                    "p99_us": 300,
                 },
             },
             "connection_churn": {
                 "error_rate": 0.01,
+                "bench_exit_code": 0,
                 "sample": {
                     "total_requests": 100,
                     "total_errors": 1,
                     "rps": 10.0,
+                    "p50_us": 100,
+                    "p95_us": 200,
+                    "p99_us": 300,
                 },
             },
             "soak": {
+                "bench_exit_code": 0,
                 "sample": {
                     "heartbeat_success_rate": 0.99,
                     "connect_success_rate": 0.99,
                 },
             },
+        },
+        "runner_health": {
+            "runner_class": "ubuntu-latest",
+            "build_profile": "ci-release",
+            "avg_steal_percent": 0.0,
+            "sleep_1ms_avg_us": 1100.0,
+            "sleep_1ms_p99_us": 1200.0,
+            "sleep_1ms_max_us": 1300.0,
+            "nproc": 4,
         },
     }
 
@@ -731,7 +954,10 @@ def self_test() -> int:
     failures: list[str] = []
 
     budgets = {
+        "schema_version": 1,
         "budget_version": "test",
+        "runner_class": "ubuntu-latest",
+        "build_profile": "ci-release",
         "enforcement": "alert",
         "rolling": {"window": 8, "mad_multiplier": 5.0, "min_samples": 3},
         "global": {
@@ -790,6 +1016,23 @@ def self_test() -> int:
             f"http1 subset expected_protocols mismatch: {evaluation.get('expected_protocols')}"
         )
 
+    # Every selected protocol must appear exactly once per declared iteration.
+    missing_iteration = json.loads(json.dumps(results))
+    missing_iteration["iterations"] = "2"
+    missing_iteration["runs"]["run_2"] = []
+    evaluation = evaluate(missing_iteration, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("missing per-iteration protocol sample should hard-fail")
+    if not any("run_2" in msg for msg in evaluation["failures"]):
+        failures.append("missing per-iteration sample should identify the empty run")
+
+    # Issue-required metric fields must be present, including the newly emitted p95.
+    missing_p95 = json.loads(json.dumps(results))
+    del missing_p95["runs"]["run_1"][0]["p95_us"]
+    evaluation = evaluate(missing_p95, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("missing p95 gateway metric should hard-fail")
+
     # Zero-total / invalid metrics must hard-fail.
     zero_total = json.loads(json.dumps(results))
     zero_total["runs"]["run_1"][0]["total_requests"] = 0
@@ -797,7 +1040,10 @@ def self_test() -> int:
     evaluation = evaluate(zero_total, budgets, None)
     if evaluation["status"] != "failed":
         failures.append("zero-total gateway sample should hard-fail")
-    if not any("invalid/zero-total" in msg or "missing expected" in msg for msg in evaluation["failures"]):
+    if not any(
+        "invalid/zero-total" in msg or "missing expected" in msg
+        for msg in evaluation["failures"]
+    ):
         failures.append("zero-total should produce data-quality failure text")
 
     if error_rate({"total_requests": 0, "total_errors": 0}) is not None:
@@ -865,6 +1111,12 @@ def self_test() -> int:
         failures.append("parse_finite_number must reject NaN")
     if parse_unit_rate(1.5) is not None:
         failures.append("parse_unit_rate must reject rates above 1")
+
+    missing_health = json.loads(json.dumps(results))
+    missing_health["runner_health"] = {}
+    evaluation = evaluate(missing_health, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("missing runner-health evidence should hard-fail")
 
     # Finite zero-RPS / large latency remain alert-only measured outcomes.
     zero_rps = json.loads(json.dumps(results))
@@ -939,6 +1191,18 @@ def self_test() -> int:
     if not any("error_rate" in msg for msg in evaluation["failures"]):
         failures.append("NaN scenario error_rate should mention malformed error_rate")
 
+    failed_bench = json.loads(json.dumps(results))
+    failed_bench["scenarios"]["soak"]["bench_exit_code"] = 2
+    evaluation = evaluate(failed_bench, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("nonzero scenario benchmark exit should hard-fail")
+
+    missed_reload = json.loads(json.dumps(results))
+    missed_reload["scenarios"]["reload_under_load"]["sighup_sent"] = False
+    evaluation = evaluate(missed_reload, budgets, None)
+    if evaluation["status"] != "failed":
+        failures.append("undelivered reload SIGHUP should hard-fail")
+
     thin_plateau = json.loads(json.dumps(results))
     thin_plateau["scenarios"]["resource_plateau"]["rss_bytes"] = [100]
     thin_plateau["scenarios"]["resource_plateau"]["fd_count"] = [20]
@@ -981,13 +1245,16 @@ def self_test() -> int:
     if evaluation["status"] != "failed" or not evaluation["failures"]:
         failures.append("gate enforcement should fail on budget breach")
 
-    history = {
-        "points": [
-            {"protocols": {"HTTP/1.1": {"rps": 1000.0, "p99_us": 300.0, "error_rate": 0.0}}},
-            {"protocols": {"HTTP/1.1": {"rps": 1010.0, "p99_us": 310.0, "error_rate": 0.0}}},
-            {"protocols": {"HTTP/1.1": {"rps": 990.0, "p99_us": 290.0, "error_rate": 0.0}}},
-        ]
-    }
+    history_points = []
+    for index, (rps, p99) in enumerate(
+        ((1000.0, 300.0), (1010.0, 310.0), (990.0, 290.0)), start=1
+    ):
+        point = build_trends_point(results, evaluate(results, budgets, None))
+        point["run_id"] = str(index)
+        point["protocols"]["HTTP/1.1"]["rps"] = rps
+        point["protocols"]["HTTP/1.1"]["p99_us"] = p99
+        history_points.append(point)
+    history = {"schema_version": 1, "points": history_points}
     collapsed = json.loads(json.dumps(results))
     collapsed["runs"]["run_1"][0]["rps"] = 100.0
     evaluation = evaluate(collapsed, budgets, history)
@@ -996,6 +1263,27 @@ def self_test() -> int:
     if not any("rolling rps regression" in alert for alert in evaluation["alerts"]):
         failures.append("collapsed RPS should trip rolling baseline alert")
 
+    malformed_history = {"schema_version": 99, "points": []}
+    evaluation = evaluate(results, budgets, malformed_history)
+    if evaluation["status"] != "failed":
+        failures.append("malformed history schema should hard-fail")
+    if not any("history" in message for message in evaluation["failures"]):
+        failures.append("malformed history should report a history failure")
+
+    nonfinite_history = json.loads(json.dumps(history))
+    nonfinite_history["points"][0]["protocols"]["HTTP/1.1"]["p95_us"] = float("nan")
+    evaluation = evaluate(results, budgets, nonfinite_history)
+    if evaluation["status"] != "failed":
+        failures.append("non-finite history metric should hard-fail")
+
+    bounded = merge_history(
+        {"schema_version": 1, "points": history_points},
+        build_trends_point(results, evaluate(results, budgets, None)),
+        2,
+    )
+    if len(bounded["points"]) != 2:
+        failures.append("merged trend history must remain bounded to rolling window")
+
     leaky = json.loads(json.dumps(results))
     leaky["scenarios"]["resource_plateau"]["rss_bytes"] = [100, 400, 500]
     evaluation = evaluate(leaky, budgets, None)
@@ -1003,6 +1291,23 @@ def self_test() -> int:
         failures.append("RSS growth should alert-only under alert enforcement")
     if not any("rss_bytes" in alert for alert in evaluation["alerts"]):
         failures.append("RSS plateau growth should alert")
+
+    endpoint_spike = json.loads(json.dumps(results))
+    endpoint_spike["scenarios"]["resource_plateau"]["rss_bytes"] = [
+        100,
+        100,
+        100,
+        110,
+        110,
+        110,
+        10_000,
+    ]
+    endpoint_spike["scenarios"]["resource_plateau"]["fd_count"] = [20] * 7
+    endpoint_spike["scenarios"]["resource_plateau"]["task_count"] = [10] * 7
+    endpoint_spike["scenarios"]["resource_plateau"]["sample_count"] = 7
+    evaluation = evaluate(endpoint_spike, budgets, None)
+    if any("rss_bytes" in alert for alert in evaluation["alerts"]):
+        failures.append("single endpoint spike must not define plateau growth")
 
     if error_rate({"total_requests": 90, "total_errors": 10}) != 0.1:
         failures.append("error_rate calculation mismatch")

@@ -3778,10 +3778,13 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Lightweight protocol-perf contract gates (no benchmarks): keep evaluator /
       # workflow/harness integrity on the required PR CI surface. The scheduled

@@ -43,12 +43,8 @@ RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
 CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 
-PINNED_ACTION = re.compile(
-    r"uses:\s*(?P<action>(?!./)[^@\s]+)@(?P<ref>[0-9a-f]{40})\b",
-    re.IGNORECASE,
-)
-MUTABLE_ACTION = re.compile(
-    r"uses:\s*(?P<action>(?!./)[^@\s]+)@(?P<ref>v?[0-9][^@\s]*)\b",
+EXTERNAL_ACTION = re.compile(
+    r"uses:\s*(?P<action>(?!\./)[^@\s]+)@(?P<ref>[^\s#]+)",
     re.IGNORECASE,
 )
 APPROVED_SETUP = (
@@ -87,6 +83,11 @@ def require(condition: bool, message: str, failures: list[str]) -> None:
 def validate_workflow_text(text: str, failures: list[str]) -> None:
     require("schedule:" in text, "workflow must declare a schedule trigger", failures)
     require("workflow_dispatch:" in text, "workflow must declare workflow_dispatch", failures)
+    require(
+        "pull_request:" not in text and "pull_request_target:" not in text,
+        "benchmark workflow must not execute untrusted pull-request code",
+        failures,
+    )
     require(
         'runs-on: ubuntu-latest' in text or "runs-on: ubuntu-latest" in text,
         "workflow must document/use ubuntu-latest runner class",
@@ -132,24 +133,35 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         "workflow must publish machine-readable trends",
         failures,
     )
+    require("permissions:" in text, "workflow must declare explicit permissions", failures)
+    require("contents: read" in text, "workflow must use contents: read", failures)
+    require("actions: read" in text, "workflow must use actions: read", failures)
+    require(
+        "write-all" not in text
+        and not re.search(r"^\s+[A-Za-z_-]+:\s*write\s*$", text, re.MULTILINE),
+        "benchmark workflow must not request write permissions",
+        failures,
+    )
+    require(
+        "--branch main" in text and "--status success" in text,
+        "history must come from a successful run on the trusted main branch",
+        failures,
+    )
 
-    for match in MUTABLE_ACTION.finditer(text):
+    external = list(EXTERNAL_ACTION.finditer(text))
+    require(bool(external), "workflow must use at least one external action", failures)
+    for match in external:
         ref = match.group("ref")
-        if re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE):
-            continue
-        failures.append(
-            f"mutable external action ref forbidden: "
-            f"{match.group('action')}@{ref}"
+        require(
+            bool(re.fullmatch(r"[0-9a-f]{40}", ref, flags=re.IGNORECASE)),
+            f"mutable external action ref forbidden: {match.group('action')}@{ref}",
+            failures,
         )
-
-    pinned = list(PINNED_ACTION.finditer(text))
-    require(bool(pinned), "workflow must pin external actions to full commit SHAs", failures)
 
     local_uses = re.findall(r"uses:\s*(\./\.github/actions/[^\s]+)", text)
     for action in local_uses:
         require(
-            any(action.startswith(prefix) for prefix in APPROVED_SETUP)
-            or action.startswith("./.github/actions/"),
+            action in APPROVED_SETUP,
             f"unexpected local action path: {action}",
             failures,
         )
@@ -182,6 +194,22 @@ def validate_evaluator_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        "validate_gateway_run_completeness" in text
+        and "expected exactly one" in text,
+        "evaluator must require one protocol sample per matrix iteration",
+        failures,
+    )
+    require(
+        "validate_history_doc" in text and "schema_version must equal 1" in text,
+        "evaluator must fail closed on malformed prior trend artifacts",
+        failures,
+    )
+    require(
+        "validate_runner_health" in text and "missing required evidence" in text,
+        "evaluator must require valid runner-health evidence",
+        failures,
+    )
+    require(
         "validate_required_scenarios" in text,
         "evaluator must validate required scenario output",
         failures,
@@ -211,7 +239,18 @@ def validate_evaluator_contract(text: str, failures: list[str]) -> None:
         ("NaN heartbeat_success_rate should hard-fail", "non-finite heartbeat self-test"),
         ("NaN saturate rps should hard-fail", "non-finite saturate rps self-test"),
         ("non-finite resource plateau values should hard-fail", "non-finite plateau self-test"),
-        ("finite zero-RPS should alert-only under alert enforcement", "zero-RPS alert-only self-test"),
+        (
+            "finite zero-RPS should alert-only under alert enforcement",
+            "zero-RPS alert-only self-test",
+        ),
+        ("missing p95 gateway metric should hard-fail", "missing-p95 self-test"),
+        (
+            "missing per-iteration protocol sample should hard-fail",
+            "per-iteration completeness self-test",
+        ),
+        ("malformed history schema should hard-fail", "history-schema self-test"),
+        ("missing runner-health evidence should hard-fail", "runner-health self-test"),
+        ("undelivered reload SIGHUP should hard-fail", "reload-signal self-test"),
     ):
         require(needle in text, f"evaluator self-test missing coverage: {label}", failures)
 
@@ -254,15 +293,55 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        '["./target/release/proto_bench"' in text
-        or "['./target/release/proto_bench'" in text,
+        '["proto_bench"' in text or "['proto_bench'" in text,
         "scenarios harness must use literal proto_bench argv lists",
+        failures,
+    )
+    require(
+        'protocol_tool_env["PATH"]' in text
+        and 'str(SCRIPT_DIR / "target" / "release")' in text,
+        "scenarios harness must resolve protocol tools only from the built crate directory",
+        failures,
+    )
+    require(
+        "terminate_process" in text and "process.wait(" in text,
+        "scenarios harness must terminate and reap owned child processes",
+        failures,
+    )
+    require(
+        "stop_sampler" in text and "sampler_stop.set()" in text,
+        "scenarios harness must deterministically stop its resource sampler",
+        failures,
+    )
+    require(
+        "SIGHUP was not delivered" in text,
+        "scenarios harness must hard-fail when reload SIGHUP is not delivered",
         failures,
     )
 
 
 def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
     """Required PR CI must run lightweight protocol-perf validators without benches."""
+    performance_job = re.search(
+        r"(?ms)^  performance-regression:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        text,
+    )
+    require(
+        performance_job is not None,
+        "ci.yml must contain the performance-regression job",
+        failures,
+    )
+    performance_body = performance_job.group("body") if performance_job else ""
+    require(
+        "    permissions:\n      contents: read" in performance_body,
+        "ci.yml performance-regression must use contents: read",
+        failures,
+    )
+    require(
+        "persist-credentials: false" in performance_body,
+        "ci.yml performance-regression checkout must not persist credentials",
+        failures,
+    )
     require(
         "Verify protocol-perf contracts (static)" in text,
         "ci.yml Performance Regression Check must run protocol-perf static contracts",
@@ -426,6 +505,9 @@ on:
   schedule:
     - cron: "0 5 * * 0"
   workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
 jobs:
   regress:
     runs-on: ubuntu-latest
@@ -436,6 +518,7 @@ jobs:
       - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
       - run: python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py
       - run: echo protocol_perf_budgets.json alert trends runner_health
+      - run: gh run list --branch main --status success
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
 """
     validate_workflow_text(good, failures)
@@ -456,6 +539,15 @@ jobs:
     if not any("mutable" in item for item in bad_failures):
         failures.append("self-test expected mutable action detection")
 
+    branch_ref_failures: list[str] = []
+    mutable_branch = good.replace(
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/checkout@main",
+    )
+    validate_workflow_text(mutable_branch, branch_ref_failures)
+    if not any("mutable" in item for item in branch_ref_failures):
+        failures.append("self-test expected mutable branch action detection")
+
     swallow_failures: list[str] = []
     swallowed = """
 proto_bench http1 --json > "${OUTPUT_DIR}/connection_churn.json" 2>"${OUTPUT_DIR}/connection_churn.log" || true
@@ -470,12 +562,18 @@ churn_rc = 0
 soak_rc = 0
 reload_rc = 0
 subprocess.run(
-    ["./target/release/proto_bench", "http1", "--json"],
+    ["proto_bench", "http1", "--json"],
     check=False,
 )
+protocol_tool_env["PATH"] = str(SCRIPT_DIR / "target" / "release")
 # no || true after json redirects
 missing usable measurement sample
 resource_plateau insufficient rss_bytes sampling
+def terminate_process(process):
+    process.wait(timeout=5)
+def stop_sampler():
+    sampler_stop.set()
+SIGHUP was not delivered
 """
     good_scenario_failures: list[str] = []
     validate_scenarios_contract(good_scenarios, good_scenario_failures)
@@ -487,8 +585,12 @@ resource_plateau insufficient rss_bytes sampling
     pr_ci_good = """
   performance-regression:
     name: Performance Regression Check
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
       - name: Verify protocol-perf contracts (static)
         run: |
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test

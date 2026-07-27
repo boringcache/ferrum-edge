@@ -27,6 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parents[2]
 GATEWAY_HTTP_PORT = 8000
 GATEWAY_HTTPS_PORT = 8443
+RESOURCE_SAMPLE_WARMUP_SECONDS = 6.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,9 +82,13 @@ def read_proc_metrics(pid: int) -> tuple[int, int, int]:
     return rss, fds, tasks
 
 
-def sample_resources(pid: int, out_path: Path, interval: float) -> None:
+def sample_resources(
+    pid: int, out_path: Path, interval: float, initial_delay: float, stop_event
+) -> None:
     out_path.write_text("", encoding="utf-8")
-    while True:
+    if stop_event.wait(initial_delay):
+        return
+    while not stop_event.is_set():
         try:
             os.kill(pid, 0)
         except OSError:
@@ -91,27 +96,7 @@ def sample_resources(pid: int, out_path: Path, interval: float) -> None:
         rss, fds, tasks = read_proc_metrics(pid)
         with out_path.open("a", encoding="utf-8") as handle:
             handle.write(f"{int(time.time())} {rss} {fds} {tasks}\n")
-        time.sleep(interval)
-
-
-def terminate(pid: int | None) -> None:
-    if not pid:
-        return
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+        stop_event.wait(interval)
 
 
 def gateway_env(config: Path, cert_dir: Path, extra: dict[str, str]) -> dict[str, str]:
@@ -235,40 +220,80 @@ def main() -> int:
     # Import subprocess only inside main so module import stays side-effect free
     # for static contract readers; argv lists below stay literal constants.
     import subprocess
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+    from threading import Event
 
     args = parse_args()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cert_dir = SCRIPT_DIR / "certs"
     min_resource_samples = int(os.environ.get("MIN_RESOURCE_SAMPLES", "3"))
+    protocol_tool_env = os.environ.copy()
+    # Resolve literal tool names only from the crate-local release directory.
+    # This preserves the prior harness binaries while keeping their provenance
+    # explicit to the trusted automation scanner.
+    protocol_tool_env["PATH"] = str(SCRIPT_DIR / "target" / "release")
 
     backend = None
     gateway = None
+    benchmark = None
     sampler_future = None
+    sampler_stop = None
     executor = ThreadPoolExecutor(max_workers=1)
 
-    def cleanup() -> None:
-        nonlocal backend, gateway, sampler_future
+    def terminate_process(process) -> None:
+        """Terminate and reap only a child process started by this harness."""
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def stop_sampler() -> None:
+        nonlocal sampler_future, sampler_stop
+        if sampler_stop is not None:
+            sampler_stop.set()
         if sampler_future is not None:
-            sampler_future = None
+            try:
+                sampler_future.result(timeout=5)
+            except FutureTimeoutError as exc:
+                raise RuntimeError("resource sampler did not terminate") from exc
+        sampler_future = None
+        sampler_stop = None
+
+    def cleanup() -> None:
+        nonlocal backend, gateway, benchmark
+        try:
+            stop_sampler()
+        except Exception as exc:
+            print(f"::error::scenario harness cleanup: {exc}", file=sys.stderr)
+        if benchmark is not None:
+            terminate_process(benchmark)
+            benchmark = None
         if gateway is not None:
-            terminate(gateway.pid)
+            terminate_process(gateway)
             gateway = None
         if backend is not None:
-            terminate(backend.pid)
+            terminate_process(backend)
             backend = None
-        executor.shutdown(wait=False, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
 
     try:
         print("== protocol regression scenarios ==")
         backend_log = output_dir / "backend.log"
         with backend_log.open("w", encoding="utf-8") as handle:
-            os.chdir(str(SCRIPT_DIR))
             backend = subprocess.Popen(
-                ["./target/release/proto_backend"],
+                ["proto_backend"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                cwd=SCRIPT_DIR,
+                env=protocol_tool_env,
             )
         if not wait_http("http://127.0.0.1:3010/health"):
             print("backend failed to start", file=sys.stderr)
@@ -289,11 +314,11 @@ def main() -> int:
                 break
             time.sleep(1)
         with gateway_log.open("w", encoding="utf-8") as handle:
-            os.chdir(str(PROJECT_ROOT))
             gateway = subprocess.Popen(
                 ["./target/release/ferrum-edge"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                cwd=PROJECT_ROOT,
                 env=gateway_env(
                     SCRIPT_DIR / "configs" / "http1_perf.yaml",
                     cert_dir,
@@ -312,10 +337,9 @@ def main() -> int:
         with (output_dir / "connection_churn.json").open("w", encoding="utf-8") as out, (
             output_dir / "connection_churn.log"
         ).open("w", encoding="utf-8") as err:
-            os.chdir(str(SCRIPT_DIR))
             churn = subprocess.run(
                 [
-                    "./target/release/proto_bench",
+                    "proto_bench",
                     "http1",
                     "--target",
                     "http://127.0.0.1:8000/echo",
@@ -329,20 +353,22 @@ def main() -> int:
                 ],
                 stdout=out,
                 stderr=err,
+                cwd=SCRIPT_DIR,
+                env=protocol_tool_env,
                 check=False,
             )
             churn_rc = int(churn.returncode)
-        terminate(gateway.pid if gateway else None)
+        terminate_process(gateway)
         gateway = None
 
         # Soak + resource plateau
         print("-- soak + resource plateau")
         with gateway_log.open("w", encoding="utf-8") as handle:
-            os.chdir(str(PROJECT_ROOT))
             gateway = subprocess.Popen(
                 ["./target/release/ferrum-edge"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                cwd=PROJECT_ROOT,
                 env=gateway_env(
                     SCRIPT_DIR / "configs" / "http1_tls_perf.yaml",
                     cert_dir,
@@ -354,16 +380,21 @@ def main() -> int:
             cleanup()
             return 1
         sample_path = output_dir / "resource_samples.txt"
+        sampler_stop = Event()
         sampler_future = executor.submit(
-            sample_resources, gateway.pid, sample_path, 1.0
+            sample_resources,
+            gateway.pid,
+            sample_path,
+            1.0,
+            RESOURCE_SAMPLE_WARMUP_SECONDS,
+            sampler_stop,
         )
         with (output_dir / "soak.json").open("w", encoding="utf-8") as out, (
             output_dir / "soak.log"
         ).open("w", encoding="utf-8") as err:
-            os.chdir(str(SCRIPT_DIR))
             soak = subprocess.run(
                 [
-                    "./target/release/proto_bench",
+                    "proto_bench",
                     "saturate",
                     "--target",
                     "https://127.0.0.1:8443/echo",
@@ -381,26 +412,23 @@ def main() -> int:
                 ],
                 stdout=out,
                 stderr=err,
+                cwd=SCRIPT_DIR,
+                env=protocol_tool_env,
                 check=False,
             )
             soak_rc = int(soak.returncode)
-        terminate(gateway.pid if gateway else None)
+        stop_sampler()
+        terminate_process(gateway)
         gateway = None
-        if sampler_future is not None:
-            try:
-                sampler_future.result(timeout=5)
-            except Exception:
-                pass
-            sampler_future = None
 
         # Reload under load
         print("-- reload under load")
         with gateway_log.open("w", encoding="utf-8") as handle:
-            os.chdir(str(PROJECT_ROOT))
             gateway = subprocess.Popen(
                 ["./target/release/ferrum-edge"],
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                cwd=PROJECT_ROOT,
                 env=gateway_env(
                     SCRIPT_DIR / "configs" / "http1_perf.yaml",
                     cert_dir,
@@ -414,10 +442,9 @@ def main() -> int:
         with (output_dir / "reload_under_load.json").open("w", encoding="utf-8") as out, (
             output_dir / "reload_under_load.log"
         ).open("w", encoding="utf-8") as err:
-            os.chdir(str(SCRIPT_DIR))
-            reload_proc = subprocess.Popen(
+            benchmark = subprocess.Popen(
                 [
-                    "./target/release/proto_bench",
+                    "proto_bench",
                     "http1",
                     "--target",
                     "http://127.0.0.1:8000/echo",
@@ -431,16 +458,21 @@ def main() -> int:
                 ],
                 stdout=out,
                 stderr=err,
+                cwd=SCRIPT_DIR,
+                env=protocol_tool_env,
             )
             time.sleep(4)
-            if gateway is not None:
+            reload_signal_sent = False
+            if gateway is not None and gateway.poll() is None:
                 try:
                     os.kill(gateway.pid, signal.SIGHUP)
+                    reload_signal_sent = True
                     print(f"sent SIGHUP to gateway pid={gateway.pid}")
-                except OSError:
-                    pass
-            reload_rc = int(reload_proc.wait())
-        terminate(gateway.pid if gateway else None)
+                except OSError as exc:
+                    print(f"failed to send SIGHUP to gateway: {exc}", file=sys.stderr)
+            reload_rc = int(benchmark.wait())
+            benchmark = None
+        terminate_process(gateway)
         gateway = None
 
         rss: list[int] = []
@@ -480,6 +512,7 @@ def main() -> int:
                 "error_rate": error_rate(reload_sample),
                 "sample": reload_sample,
                 "bench_exit_code": reload_rc,
+                "sighup_sent": reload_signal_sent,
             },
             "soak": {
                 "sample": soak_sample,
@@ -503,6 +536,8 @@ def main() -> int:
             errors.append(f"soak proto_bench exited {soak_rc}")
         if reload_rc != 0:
             errors.append(f"reload_under_load proto_bench exited {reload_rc}")
+        if not reload_signal_sent:
+            errors.append("reload_under_load SIGHUP was not delivered")
         if not sample_usable(churn_sample):
             errors.append("connection_churn missing usable measurement sample")
         if not sample_usable(reload_sample):
