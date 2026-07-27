@@ -6030,6 +6030,63 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
 }
 
 #[test]
+fn health_failover_topology_and_admin_writes_openapi_parity() {
+    // Issue #3001: authenticated /health exposes failover_topology and
+    // admin_writes_enabled reflects failover write gating.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let topology = json!({
+        "primary_active": false,
+        "allow_writes": false,
+        "opt_in_writes_enabled_during_window": false,
+        "failover_since_unix_ms": 1_700_000_000_000u64,
+        "active_url_redacted": "sqlite:///tmp/failover.db"
+    });
+    assert_component_validity(&spec, "DatabaseFailoverTopology", &topology, true);
+
+    let health = json!({
+        "status": "degraded",
+        "ready": true,
+        "admin_writes_enabled": false,
+        "database": {
+            "status": "connected",
+            "type": "sqlite",
+            "failover_topology": topology
+        }
+    });
+    assert_component_validity(&spec, "HealthResponse", &health, true);
+
+    let admin_writes = spec["components"]["schemas"]["HealthResponse"]["properties"]
+        ["admin_writes_enabled"]["description"]
+        .as_str()
+        .expect("admin_writes_enabled description");
+    assert!(
+        admin_writes.contains("FERRUM_DB_FAILOVER_ALLOW_WRITES")
+            || admin_writes.contains("failover"),
+        "admin_writes_enabled must document failover write blocking"
+    );
+    assert!(
+        admin_writes.contains("config-database")
+            || admin_writes.contains("config-store")
+            || admin_writes.contains("managed TLS"),
+        "admin_writes_enabled must clarify it is the config-database mutation signal, not managed TLS/ACME"
+    );
+
+    let topology_desc = spec["components"]["schemas"]["DatabaseFailoverTopology"]["description"]
+        .as_str()
+        .expect("DatabaseFailoverTopology description");
+    assert!(
+        topology_desc.contains("divergence-risk") || topology_desc.contains("divergence"),
+        "topology schema must document opt-in divergence-risk contract"
+    );
+    assert!(
+        !topology_desc.contains("fence") || topology_desc.contains("not a durable fence"),
+        "must not claim a durable failback fence"
+    );
+}
+
+#[test]
 fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

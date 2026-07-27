@@ -2412,7 +2412,73 @@ pub mod _test_support {
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────
-    pub use crate::config::db_loader::DbPoolConfig;
+    pub use crate::config::db_loader::{
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
+        SqlReconnectTransitionTestHooks,
+    };
+
+    /// Install (or clear) SQL reconnect transition test hooks on one store.
+    pub fn database_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        hooks: Option<SqlReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
+    }
+
+    /// Drive a failover-topology reconnect without the primary-first probe in
+    /// `try_failover_reconnect` (issue #3001 transition serialization tests).
+    pub async fn database_store_reconnect_as_failover_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        db_url: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.reconnect_as_failover(db_url).await
+    }
+
+    // ── config/mongo_store: Admin write-topology / publication test seams ────
+    pub use crate::config::mongo_store::{
+        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+    };
+
+    /// Lazy Mongo store (no live MongoDB) for topology publication tests.
+    pub fn mongo_store_new_unconnected_for_test(
+        failover_urls: Vec<String>,
+    ) -> Result<crate::config::mongo_store::MongoStore, anyhow::Error> {
+        crate::config::mongo_store::MongoStore::new_unconnected_for_test(failover_urls)
+    }
+
+    /// Publish through Mongo's production Admin+admission fail-fast gates.
+    pub async fn mongo_store_try_publish_reconnected_bundle_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        database_name: &str,
+        topology: MongoReconnectTopology,
+        url_redacted: &str,
+    ) -> Result<(), anyhow::Error> {
+        store
+            .try_publish_reconnected_bundle_for_test(database_name, topology, url_redacted)
+            .await
+    }
+
+    /// Install (or clear) Mongo reconnect publication test hooks.
+    pub fn mongo_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        hooks: Option<MongoReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
+    }
+
+    /// Simulate an in-flight admission generation pin without talking to Mongo.
+    pub async fn mongo_store_acquire_connection_generation_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        store.acquire_connection_generation_pin_for_test().await
+    }
+
+    /// Active published Mongo database name (white-box accessor).
+    pub fn mongo_store_published_database_name_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> String {
+        store.published_database_name_for_test()
+    }
 
     // ── config/batch_atomicity ───────────────────────────────────────────────
     pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
