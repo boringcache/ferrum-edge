@@ -721,12 +721,17 @@ where
     pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
         if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
-                Ok(result) => {
+                // Re-check the terminal flag at the success boundary: a task
+                // that proved an unsupported topology while this operation was
+                // in flight must not be overruled by its result (the client
+                // already fails such commands; this keeps `redis_healthy` from
+                // latching true for a refused endpoint).
+                Ok(result) if !self.primary.is_topology_unsupported() => {
                     self.redis_healthy.store(true, Ordering::Relaxed);
                     self.fallback_warned.store(false, Ordering::Relaxed);
                     return result;
                 }
-                Err(()) => {
+                Ok(_) | Err(()) => {
                     self.redis_healthy.store(false, Ordering::Relaxed);
                 }
             }
@@ -750,12 +755,14 @@ where
     ) -> Option<RateLimitOutcome> {
         if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
-                Ok(result) => {
+                // See `check`: a concurrent topology rejection wins over an
+                // in-flight success.
+                Ok(result) if !self.primary.is_topology_unsupported() => {
                     self.redis_healthy.store(true, Ordering::Relaxed);
                     self.fallback_warned.store(false, Ordering::Relaxed);
                     return Some(result);
                 }
-                Err(()) => {
+                Ok(_) | Err(()) => {
                     self.redis_healthy.store(false, Ordering::Relaxed);
                 }
             }
@@ -816,8 +823,11 @@ where
         let redis_healthy = Arc::clone(&self.redis_healthy);
         let fallback_warned = Arc::clone(&self.fallback_warned);
         // Observe availability without retaining the full Redis client (and its
-        // cached connections / credentials) after this limiter is dropped.
-        let available = self.primary.redis_client.availability_flag();
+        // cached connections / credentials) after this limiter is dropped. The
+        // signal is semantic: it cannot read available while the endpoint's
+        // topology is terminal, so this observer can never advertise a false
+        // recovery for an endpoint the client refused.
+        let availability = self.primary.redis_client.availability_signal();
         let interval = self.primary.health_check_interval();
 
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -831,7 +841,7 @@ where
         let join = handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let is_available = available.load(Ordering::Relaxed);
+                let is_available = availability.is_available();
                 let was_healthy = redis_healthy.swap(is_available, Ordering::Relaxed);
                 if is_available && !was_healthy {
                     fallback_warned.store(false, Ordering::Relaxed);

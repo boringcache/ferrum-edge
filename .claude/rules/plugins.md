@@ -172,7 +172,17 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   `redis_failure_policy`; `ai_semantic_cache` has neither.
 - Redis Cluster is NOT supported and is screened, not assumed: `INFO CLUSTER`
   at connect plus `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN` reactively.
-  Rejection is terminal for the client — recovery pings must never clear it.
+  The proactive probe is bounded by `redis_connect_timeout_seconds` (no new
+  key); an unanswered probe is a retryable outage, never proof of Cluster, and
+  its unscreened connection must not carry a policy command.
+  Rejection is terminal for the client — recovery pings must never clear it, and
+  no connection publication, command success, or recovery that completes after
+  the rejection may restore availability (one `EnforcementAvailability` atomic;
+  `publish_reachable` cannot beat `reject_topology`).
+- `ai_rate_limiter` admission only reserves an estimate, so the authoritative
+  post-response reconciliation is also fail-closed: an `enforcement_unavailable`
+  charge on a 2xx returns the same generic 503 as admission. A non-2xx response
+  keeps its status (a failed charge/release there only over-counts).
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
 

@@ -4171,3 +4171,201 @@ async fn expose_headers_non_2xx_release_refreshes_remaining() {
     );
     assert_eq!(observed_usage(&plugin).await, 0);
 }
+
+// ── Fail-closed usage reconciliation (GHSA-87rq-v4hx-8rcq) ────────────────
+//
+// Admission reserves an *estimate*; the authoritative charge is the actual
+// provider token count applied after the response. If centralized enforcement
+// disappears between the two, that charge cannot be recorded — and delivering
+// the upstream 2xx anyway hands the client a completion whose tokens nothing
+// debited. Under the default `redis_failure_policy: "fail_closed"` that is
+// exactly the per-process budget bypass the policy exists to prevent, so the
+// reconciliation path refuses with the same generic 503 admission uses.
+//
+// These drive the production failover seam — a real Redis-backed limiter
+// pointed at an endpoint that is never listening — not a hand-built
+// `RateLimitOutcome`.
+
+/// Redis-mode config whose endpoint is never listening, so every centralized
+/// operation fails and the configured `redis_failure_policy` decides.
+fn unreachable_redis_ai_config(failure_policy: Option<&str>) -> serde_json::Value {
+    let mut config = json!({
+        "token_limit": 1000,
+        "window_seconds": 60,
+        "limit_by": "ip",
+        "expose_headers": true,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_connect_timeout_seconds": 1,
+        // Long enough that no background recovery dial happens during a test.
+        "redis_health_check_interval_seconds": 3600,
+        "redis_key_prefix": "ferrum:ai_rate_limiter:ghsa87rq"
+    });
+    if let (Some(object), Some(policy)) = (config.as_object_mut(), failure_policy) {
+        object.insert("redis_failure_policy".to_string(), json!(policy));
+    }
+    config
+}
+
+/// A context shaped like one admitted while the centralized store was still
+/// healthy: a Redis-mode reservation (window index, no local reservation id) of
+/// `reserved` tokens on a request `before_proxy` identified as an AI call.
+///
+/// Seeded rather than produced by `before_proxy` because the scenario under test
+/// is Redis dying *after* admission — a `fail_closed` plugin whose store is
+/// already unreachable refuses at admission and never reaches reconciliation at
+/// all (see `fail_closed_admission_refuses_when_enforcement_is_unavailable`).
+fn reconcilable_ai_ctx(reserved: u64) -> RequestContext {
+    let mut ctx = ai_request_ctx(200, "hello reconcile");
+    ctx.metadata.insert(
+        "ai_ratelimit_reserved_tokens".to_string(),
+        reserved.to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_ratelimit_reserved_window_index".to_string(),
+        "42".to_string(),
+    );
+    ctx.metadata
+        .insert("ai_ratelimit_request".to_string(), "true".to_string());
+    ctx
+}
+
+/// Mark a context as carrying a federated provider response of `status` that
+/// reported `tokens` total tokens.
+fn mark_federated(ctx: &mut RequestContext, status: &str, tokens: &str) {
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "openai".to_string());
+    ctx.metadata
+        .insert("ai_federation_status".to_string(), status.to_string());
+    ctx.metadata
+        .insert("ai_total_tokens".to_string(), tokens.to_string());
+}
+
+/// Assert a refusal is the generic enforcement-unavailable 503: no rate-limit
+/// headers (this gateway has no authoritative counter to advertise) and no
+/// endpoint, key, or credential disclosure in the body.
+fn assert_generic_enforcement_unavailable(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            // A 503, not a 429: the caller is not over budget — the budget
+            // cannot be evaluated at all.
+            assert_eq!(status_code, 503);
+            assert!(
+                body.contains("temporarily unavailable"),
+                "unexpected refusal body: {body}"
+            );
+            let lowered = body.to_ascii_lowercase();
+            for secret in ["redis", "127.0.0.1", "ghsa87rq", "ferrum", "cluster"] {
+                assert!(
+                    !lowered.contains(secret),
+                    "refusal must not disclose enforcement internals ({secret}): {body}"
+                );
+            }
+            assert!(
+                headers.is_empty(),
+                "a fail-closed refusal must advertise no rate-limit headers: {headers:?}"
+            );
+        }
+        other => panic!("expected a fail-closed refusal, got {other:?}"),
+    }
+}
+
+/// The premise of the reconciliation tests: while centralized enforcement is
+/// unavailable, admission itself refuses under the default policy.
+#[tokio::test]
+async fn fail_closed_admission_refuses_when_enforcement_is_unavailable() {
+    let config = unreachable_redis_ai_config(None);
+    let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = ai_request_ctx(200, "hello admission");
+    let mut request_headers = HashMap::new();
+    let admission = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+    assert_generic_enforcement_unavailable(admission);
+}
+
+/// Ordinary buffered response path: a 2xx whose actual token usage could not be
+/// charged must not be delivered.
+#[tokio::test]
+async fn fail_closed_reconcile_refuses_uncharged_successful_response() {
+    let config = unreachable_redis_ai_config(None);
+    let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = reconcilable_ai_ctx(120);
+    let mut response_headers = json_headers();
+    let body = openai_response(40, 60);
+    let reconciled = plugin
+        .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+        .await;
+    assert_generic_enforcement_unavailable(reconciled);
+    assert!(
+        !response_headers.contains_key("x-ai-ratelimit-usage"),
+        "no telemetry may be published for a budget nothing could evaluate"
+    );
+}
+
+/// Federation/after-proxy reconciliation observes actual usage too (its provider
+/// response is delivered as a synthetic short-circuit), so it must fail closed
+/// on the same terms.
+#[tokio::test]
+async fn fail_closed_reconcile_refuses_uncharged_federated_response() {
+    let config = unreachable_redis_ai_config(None);
+    let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = reconcilable_ai_ctx(120);
+    mark_federated(&mut ctx, "200", "100");
+
+    let mut response_headers = json_headers();
+    let reconciled = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_generic_enforcement_unavailable(reconciled);
+}
+
+/// Safe-release semantics are preserved: when the response is already non-2xx,
+/// a failed charge or release can only over-count this consumer's own budget, so
+/// the error response stands rather than being swapped for a 503.
+#[tokio::test]
+async fn fail_closed_reconcile_keeps_an_already_failed_response() {
+    let config = unreachable_redis_ai_config(None);
+    let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = reconcilable_ai_ctx(120);
+    mark_federated(&mut ctx, "500", "100");
+
+    let mut response_headers = json_headers();
+    assert_continue(
+        plugin
+            .after_proxy(&mut ctx, 500, &mut response_headers)
+            .await,
+    );
+}
+
+/// The documented escape hatch still works — and only when asked for:
+/// `local_fallback` reconciles the actual usage on per-process state instead of
+/// refusing. The reservation lived on Redis, so the now-active local window is
+/// charged the FULL actual usage rather than the relative delta.
+#[tokio::test]
+async fn local_fallback_reconcile_charges_local_state_instead_of_refusing() {
+    let config = unreachable_redis_ai_config(Some("local_fallback"));
+    let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
+
+    let mut ctx = reconcilable_ai_ctx(120);
+    let mut response_headers = json_headers();
+    let body = openai_response(40, 60);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-ratelimit-usage")
+            .map(String::as_str),
+        Some("100"),
+        "local_fallback must reconcile actual usage on per-process state"
+    );
+}

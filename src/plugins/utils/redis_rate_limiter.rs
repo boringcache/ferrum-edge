@@ -30,10 +30,24 @@
 //!    (`MOVED`, `ASK`, `CROSSSLOT`, `CLUSTERDOWN`, `TRYAGAIN` — see
 //!    [`is_cluster_topology_code`]) marks the endpoint permanently unusable.
 //!
+//! The proactive probe is bounded by the configured
+//! `redis_connect_timeout_seconds` (no separate knob): a server can accept and
+//! authenticate a connection and then never answer `INFO`, and an unbounded
+//! screen would hang the first enforcement operation instead of refusing it. A
+//! probe that times out (or fails at the transport) is an ordinary retryable
+//! outage — **not** proof of Cluster topology — and the connection is discarded
+//! unscreened rather than carrying a policy command
+//! ([`TopologyScreen::ProbeFailed`]).
+//!
 //! Topology rejection is **terminal for the life of the client**: unlike an
 //! outage it is not something a `PING` can clear (a Cluster node answers `PING`
 //! happily while still redirecting every key), so the recovery checker never
-//! restores availability. A configuration change rebuilds the client.
+//! restores availability. A configuration change rebuilds the client. The
+//! terminal state is sticky *under concurrency* too: availability lives in one
+//! `EnforcementAvailability` atomic whose "reachable" transition cannot win
+//! against a rejection, so a connection, command, or recovery probe that
+//! completes successfully after another task proved Cluster topology can neither
+//! be published nor reported as success.
 //!
 //! Every key that one atomic operation touches is additionally placed in a
 //! shared hash slot via [`RedisRateLimitClient::make_slot_key`], so the
@@ -102,7 +116,7 @@ use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
@@ -714,19 +728,211 @@ async fn screen_redis_endpoint(
     RedisEndpoint::Url(config.effective_url())
 }
 
+/// Verdict of the proactive `INFO CLUSTER` topology screen.
+///
+/// Three states, not a `bool`: "not proven to be a Cluster" and "could not be
+/// screened at all" have opposite safety properties. The first keeps ordinary
+/// RESP-compatible servers working; the second must never let a policy command
+/// run on the unscreened connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyScreen {
+    /// Not proven to be a Cluster: the connection may serve policy operations.
+    /// The reactive per-command screen still catches redirections.
+    Usable,
+    /// Provably an unsupported Cluster topology. Terminal for the client.
+    ClusterProven,
+    /// The probe itself did not complete — it timed out against the configured
+    /// connect timeout, or the transport failed. This is an ordinary retryable
+    /// availability failure and is **not** evidence of either topology, so the
+    /// connection is discarded rather than used unscreened.
+    ProbeFailed,
+}
+
+/// Classify an `INFO CLUSTER` payload. Only a reported `cluster_enabled` of
+/// non-zero rejects; absent/unparseable stays [`TopologyScreen::Usable`] so a
+/// RESP-compatible server that does not report the field keeps working.
+fn screen_from_info_text(text: &str) -> TopologyScreen {
+    match parse_cluster_enabled(text) {
+        Some(true) => TopologyScreen::ClusterProven,
+        _ => TopologyScreen::Usable,
+    }
+}
+
+/// Classify a successful `INFO CLUSTER` reply of any RESP shape.
+///
+/// Queried as [`redis::Value`] rather than `String` so a server whose reply is
+/// not a plain bulk string produces the compatible "unknown topology" verdict
+/// instead of a client-side type error that the caller would have to interpret.
+fn screen_from_info_value(value: &redis::Value) -> TopologyScreen {
+    match value {
+        redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => screen_from_info_text(text),
+            // Non-UTF-8 INFO payload: unknown, not proof of either topology.
+            Err(_) => TopologyScreen::Usable,
+        },
+        redis::Value::SimpleString(text) => screen_from_info_text(text),
+        redis::Value::VerbatimString { text, .. } => screen_from_info_text(text),
+        // An error carried inline as a value still proves topology by its code.
+        redis::Value::ServerError(error) => {
+            if is_cluster_topology_code(Some(error.code())) {
+                TopologyScreen::ClusterProven
+            } else {
+                TopologyScreen::Usable
+            }
+        }
+        // Any other reply shape is not proof of either topology.
+        _ => TopologyScreen::Usable,
+    }
+}
+
 /// Ask a freshly established connection whether it belongs to a Cluster-mode
-/// server, returning `true` only when the endpoint is provably unusable.
+/// server, under a hard `probe_timeout` deadline.
 ///
 /// A server that rejects or does not implement `INFO` (restricted ACL, minimal
-/// RESP implementation) yields `false`: the endpoint is not *proven* to be a
-/// Cluster, and the reactive per-command screen still catches redirections. An
-/// `INFO` answered with a Cluster-only error code is itself proof.
-async fn connection_reports_cluster_topology(conn: &mut impl redis::aio::ConnectionLike) -> bool {
-    let info: Result<String, redis::RedisError> =
-        redis::cmd("INFO").arg("CLUSTER").query_async(conn).await;
-    match info {
-        Ok(text) => parse_cluster_enabled(&text).unwrap_or(false),
-        Err(e) => is_cluster_topology_code(e.code()),
+/// RESP implementation) yields [`TopologyScreen::Usable`]: the endpoint is not
+/// *proven* to be a Cluster, and the reactive per-command screen still catches
+/// redirections. An `INFO` answered with a Cluster-only error code is itself
+/// proof. A server that accepts and authenticates the connection but never
+/// answers `INFO`, or whose transport fails mid-probe, yields
+/// [`TopologyScreen::ProbeFailed`] — bounded by `probe_timeout` so the first
+/// enforcement operation refuses instead of hanging.
+async fn screen_connection_topology(
+    conn: &mut impl redis::aio::ConnectionLike,
+    probe_timeout: Duration,
+) -> TopologyScreen {
+    let mut probe = redis::cmd("INFO");
+    probe.arg("CLUSTER");
+    match tokio::time::timeout(probe_timeout, probe.query_async::<redis::Value>(conn)).await {
+        Ok(Ok(value)) => screen_from_info_value(&value),
+        Ok(Err(error)) => {
+            if is_cluster_topology_code(error.code()) {
+                TopologyScreen::ClusterProven
+            } else if error.code().is_some() {
+                // The server *answered* with an error reply (unknown command,
+                // restricted ACL, …). Retain compatibility: not proven Cluster.
+                TopologyScreen::Usable
+            } else {
+                // No server error code: an I/O, protocol, or parse failure. The
+                // endpoint was never screened, so it must not carry a command.
+                TopologyScreen::ProbeFailed
+            }
+        }
+        // Accepted and authenticated but never answered INFO.
+        Err(_elapsed) => TopologyScreen::ProbeFailed,
+    }
+}
+
+/// Recovery-probe failure for an endpoint proven to be an unsupported topology.
+///
+/// The recovery loop reports its outcome as a `RedisResult`, so a topology
+/// rejection needs an error value. It is never surfaced to a client.
+fn cluster_topology_probe_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::InvalidClientConfig,
+        "Redis endpoint reports an unsupported topology (Redis Cluster)",
+    ))
+}
+
+/// Recovery-probe failure for a topology screen that never completed — an
+/// ordinary retryable outage, classified as I/O rather than a config fault.
+fn incomplete_topology_probe_error() -> redis::RedisError {
+    redis::RedisError::from((
+        redis::ErrorKind::Io,
+        "Redis topology screen did not complete during recovery",
+    ))
+}
+
+/// Availability of centralized enforcement for one Redis client generation,
+/// shared with the client's recovery checker and with failover health observers.
+///
+/// Deliberately **one** atomic rather than an `available: AtomicBool` plus a
+/// separate `topology_unsupported: AtomicBool`. With two flags, every
+/// "reachable" publication is a check-then-store: a connection, command, or
+/// recovery probe that completed successfully can observe a not-yet-terminal
+/// topology, then store `available = true` after another task proved Cluster
+/// topology — resurrecting enforcement that must stay dead, and making a
+/// failover observer advertise a false recovery. Folding both into one state
+/// makes publishing "reachable" a single read-modify-write that simply cannot
+/// win against a rejection, so terminal really is terminal.
+///
+/// Every read is one atomic load, so hot-path callers keep their O(1) check with
+/// no locks.
+pub(crate) struct EnforcementAvailability {
+    state: AtomicU8,
+}
+
+impl EnforcementAvailability {
+    /// Reachable: enforcement may be consulted.
+    const REACHABLE: u8 = 0;
+    /// Unreachable, but recoverable — the recovery checker may clear this.
+    const UNREACHABLE: u8 = 1;
+    /// Proven to be an unsupported topology. Sticky for this generation.
+    const TOPOLOGY_TERMINAL: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(Self::REACHABLE),
+        }
+    }
+
+    /// Semantic availability: enforcement may be consulted. False whenever the
+    /// topology is terminal, by construction — a caller cannot forget to pair
+    /// this load with a separate terminal check.
+    pub(crate) fn is_available(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::REACHABLE
+    }
+
+    /// Whether the endpoint was rejected as an unsupported topology.
+    fn is_topology_terminal(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::TOPOLOGY_TERMINAL
+    }
+
+    /// Atomically move to `target` unless the topology is already terminal.
+    ///
+    /// Returns whether the transition happened. A single read-modify-write is
+    /// what makes the terminal state actually terminal: there is no window
+    /// between "check the flag" and "store availability" for a rejection to slip
+    /// into.
+    fn transition_unless_terminal(&self, target: u8) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current != Self::TOPOLOGY_TERMINAL).then_some(target)
+            })
+            .is_ok()
+    }
+
+    /// Publish "reachable" — but only if the topology is not terminal.
+    ///
+    /// Returns `false` when the state is (or concurrently became) terminal, in
+    /// which case nothing was written. Callers treat `false` as a failed
+    /// operation: a command that already mutated Redis is reported as an error
+    /// so the consumer's failure policy applies, because over-counting one
+    /// operation is safer than admitting traffic against a topology this client
+    /// cannot enforce on.
+    fn publish_reachable(&self) -> bool {
+        self.transition_unless_terminal(Self::REACHABLE)
+    }
+
+    /// Mark enforcement unreachable, preserving a terminal topology rejection.
+    fn mark_unreachable(&self) {
+        self.transition_unless_terminal(Self::UNREACHABLE);
+    }
+
+    /// Reject the endpoint permanently. Returns `true` the first time only, so
+    /// the operator diagnostic is emitted once per client generation rather than
+    /// once per request.
+    fn reject_topology(&self) -> bool {
+        let previous = self.state.swap(Self::TOPOLOGY_TERMINAL, Ordering::AcqRel);
+        previous != Self::TOPOLOGY_TERMINAL
+    }
+
+    /// Log-safe rendering for `Debug` (never carries endpoint or credentials).
+    fn describe(&self) -> &'static str {
+        match self.state.load(Ordering::Acquire) {
+            Self::REACHABLE => "reachable",
+            Self::TOPOLOGY_TERMINAL => "topology_unsupported",
+            _ => "unreachable",
+        }
     }
 }
 
@@ -795,13 +1001,14 @@ pub struct RedisRateLimitClient {
     config: RedisConfig,
     /// The gateway's shared DNS cache for resolving Redis hostnames.
     dns_cache: Option<DnsCache>,
-    /// Whether Redis is currently reachable.
-    available: Arc<AtomicBool>,
-    /// Whether the configured endpoint was proven to be an unsupported topology
-    /// (Redis Cluster). Terminal for the life of the client: a Cluster node
-    /// answers `PING` while still redirecting every key, so recovery pings must
-    /// never clear it. See the module-level topology notes.
-    topology_unsupported: Arc<AtomicBool>,
+    /// Whether centralized enforcement is reachable, and whether the configured
+    /// endpoint was proven to be an unsupported topology (Redis Cluster).
+    ///
+    /// One atomic so a topology rejection is terminal even when a successful
+    /// connection, command, or recovery probe completes concurrently: a Cluster
+    /// node answers `PING` while still redirecting every key, so nothing may
+    /// restore availability afterwards. See [`EnforcementAvailability`].
+    availability: Arc<EnforcementAvailability>,
     /// Whether the background health checker has been started.
     health_checker_started: AtomicBool,
     /// Abort handle for the background recovery checker (set once on start).
@@ -886,8 +1093,7 @@ impl RedisRateLimitClient {
             next_slot: AtomicUsize::new(0),
             config,
             dns_cache,
-            available: Arc::new(AtomicBool::new(true)),
-            topology_unsupported: Arc::new(AtomicBool::new(false)),
+            availability: Arc::new(EnforcementAvailability::new()),
             health_checker_started: AtomicBool::new(false),
             health_checker_abort: Mutex::new(None),
             tls_no_verify,
@@ -901,18 +1107,22 @@ impl RedisRateLimitClient {
     /// proven to be an unsupported topology is never available again, so a
     /// consumer's failure policy applies for the life of the client.
     pub fn is_available(&self) -> bool {
-        !self.topology_unsupported.load(Ordering::Relaxed) && self.available.load(Ordering::Relaxed)
+        self.availability.is_available()
     }
 
     /// Whether the configured endpoint was rejected as an unsupported topology.
     pub fn is_topology_unsupported(&self) -> bool {
-        self.topology_unsupported.load(Ordering::Relaxed)
+        self.availability.is_topology_terminal()
     }
 
-    /// Shared availability flag for failover observers that must not retain the
-    /// full client (and its cached connections / credentials) after Drop.
-    pub(crate) fn availability_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.available)
+    /// Shared availability signal for failover observers that must not retain
+    /// the full client (and its cached connections / credentials) after Drop.
+    ///
+    /// Semantic, not raw: [`EnforcementAvailability::is_available`] cannot read
+    /// `true` while the topology is terminal, so an observer can never advertise
+    /// a recovery for an endpoint this client refused.
+    pub(crate) fn availability_signal(&self) -> Arc<EnforcementAvailability> {
+        Arc::clone(&self.availability)
     }
 
     /// Mark Redis unavailable and start the recovery checker (test support).
@@ -920,6 +1130,21 @@ impl RedisRateLimitClient {
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
         self.start_health_checker_if_needed();
+    }
+
+    /// Prove an unsupported Cluster topology the way a racing task would
+    /// (test support), so concurrency coverage can land the rejection at an
+    /// exact point in another operation's lifecycle.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn mark_topology_unsupported_for_test(&self) {
+        self.mark_topology_unsupported("test-injected cluster topology proof");
+    }
+
+    /// What a failover health observer reads from this client's shared
+    /// availability signal — the same `Arc` the observer holds (test support).
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn observer_sees_available_for_test(&self) -> bool {
+        self.availability_signal().is_available()
     }
 
     /// Whether the background recovery checker has been started (test support).
@@ -1269,7 +1494,13 @@ impl RedisRateLimitClient {
                 if !self.screen_topology(&mut manager).await {
                     return None;
                 }
-                self.available.store(true, Ordering::Relaxed);
+                // Re-check at the publication boundary: another task may have
+                // proven Cluster topology while this slot was being screened.
+                // Publishing the connection (or availability) afterwards would
+                // let a policy operation run against a refused endpoint.
+                if !self.availability.publish_reachable() {
+                    return None;
+                }
                 info!(
                     redis_url = %self.config.redacted_url(),
                     key_prefix = %self.config.key_prefix,
@@ -1371,7 +1602,11 @@ impl RedisRateLimitClient {
                 if !self.screen_topology(&mut conn).await {
                     return None;
                 }
-                self.available.store(true, Ordering::Relaxed);
+                // Same publication boundary as the pooled path: a concurrent
+                // topology rejection wins over this dedicated connection.
+                if !self.availability.publish_reachable() {
+                    return None;
+                }
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
@@ -1407,7 +1642,7 @@ impl RedisRateLimitClient {
 
     /// Mark Redis as unavailable and clear the connection for re-resolution.
     fn mark_unavailable(&self) {
-        self.available.store(false, Ordering::Relaxed);
+        self.availability.mark_unreachable();
         self.clear_connection();
     }
 
@@ -1419,9 +1654,12 @@ impl RedisRateLimitClient {
     /// [`Self::is_available`] load stays false and the consumer's configured
     /// failure policy governs from here on.
     fn mark_topology_unsupported(&self, reason: &str) {
-        let already = self.topology_unsupported.swap(true, Ordering::Relaxed);
-        self.mark_unavailable();
-        if !already {
+        let first = self.availability.reject_topology();
+        // Drop cached connections so no slot can keep serving the refused
+        // endpoint. `reject_topology` already made the state terminal, so this
+        // cannot be downgraded back to a plain outage.
+        self.clear_connection();
+        if first {
             warn!(
                 redis_url = %self.config.redacted_url(),
                 key_prefix = %self.config.key_prefix,
@@ -1442,14 +1680,48 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Reject a freshly established connection whose server reports Cluster
-    /// topology. Returns `true` when the connection may be used.
-    async fn screen_topology(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
-        if connection_reports_cluster_topology(conn).await {
-            self.mark_topology_unsupported("server reported cluster_enabled");
-            return false;
+    /// Post-I/O success boundary for every Redis command.
+    ///
+    /// Publishes availability and reports whether the operation may be returned
+    /// as a success. `Err(())` means another task proved an unsupported topology
+    /// while this command was in flight: the command may already have mutated
+    /// Redis, but reporting success would let admission proceed against an
+    /// endpoint this client cannot enforce on. Failing the operation instead
+    /// hands the decision to the consumer's `redis_failure_policy`, and a
+    /// double-counted increment is the conservative direction for a limiter.
+    fn note_command_success(&self) -> Result<(), ()> {
+        if self.availability.publish_reachable() {
+            Ok(())
+        } else {
+            Err(())
         }
-        true
+    }
+
+    /// Reject a freshly established connection whose server reports Cluster
+    /// topology, or one that could not be screened at all. Returns `true` only
+    /// when the connection may be used.
+    async fn screen_topology(&self, conn: &mut impl redis::aio::ConnectionLike) -> bool {
+        match screen_connection_topology(conn, self.connect_timeout()).await {
+            TopologyScreen::Usable => true,
+            TopologyScreen::ClusterProven => {
+                self.mark_topology_unsupported("server reported cluster_enabled");
+                false
+            }
+            TopologyScreen::ProbeFailed => {
+                // Bounded by the configured connect timeout. Never proof of
+                // Cluster topology, and never a licence to run a policy command
+                // on the unscreened connection — an ordinary retryable outage.
+                warn!(
+                    redis_url = %self.config.redacted_url(),
+                    timeout_seconds = self.config.connect_timeout_seconds,
+                    "Redis topology screen did not complete — centralized Redis unavailable; \
+                     will retry"
+                );
+                self.mark_unavailable();
+                self.start_health_checker_if_needed();
+                false
+            }
+        }
     }
 
     /// Start a background task that periodically pings Redis to detect recovery.
@@ -1461,8 +1733,7 @@ impl RedisRateLimitClient {
             return; // Already started
         }
 
-        let available = self.available.clone();
-        let topology_unsupported = self.topology_unsupported.clone();
+        let availability = Arc::clone(&self.availability);
         let config = self.config.clone();
         let dns_cache = self.dns_cache.clone();
         let interval = Duration::from_secs(self.config.health_check_interval_seconds);
@@ -1476,8 +1747,10 @@ impl RedisRateLimitClient {
 
                 // A rejected topology is a configuration fault, not an outage:
                 // a Cluster node answers PING while still redirecting every
-                // key, so recovery must never be reported for one.
-                if topology_unsupported.load(Ordering::Relaxed) {
+                // key, so recovery must never be reported for one. Checked
+                // again at the publication boundary below, because a rejection
+                // can also land while this probe is in flight.
+                if availability.is_topology_terminal() {
                     continue;
                 }
 
@@ -1549,41 +1822,47 @@ impl RedisRateLimitClient {
                     };
                     redis::cmd("PING").query_async::<String>(&mut conn).await?;
                     // A PING alone proves nothing about topology, so screen the
-                    // recovered endpoint before ever reporting it healthy.
-                    if connection_reports_cluster_topology(&mut conn).await {
-                        let already = topology_unsupported.swap(true, Ordering::Relaxed);
-                        if !already {
-                            warn!(
-                                redis_url = %config.redacted_url(),
-                                key_prefix = %config.key_prefix,
-                                reason = "server reported cluster topology during recovery",
-                                "Redis endpoint reports an unsupported topology (Redis Cluster is \
-                                 not supported) — centralized Redis access is disabled for this \
-                                 configuration until it is changed"
-                            );
+                    // recovered endpoint before ever reporting it healthy. The
+                    // probe is bounded by the same configured connect timeout as
+                    // the connect paths, so an endpoint that accepts but never
+                    // answers INFO cannot stall the recovery loop.
+                    let screen = screen_connection_topology(&mut conn, connect_timeout).await;
+                    match screen {
+                        TopologyScreen::Usable => Ok::<(), redis::RedisError>(()),
+                        TopologyScreen::ClusterProven => {
+                            if availability.reject_topology() {
+                                warn!(
+                                    redis_url = %config.redacted_url(),
+                                    key_prefix = %config.key_prefix,
+                                    reason = "server reported cluster topology during recovery",
+                                    "Redis endpoint reports an unsupported topology (Redis Cluster \
+                                     is not supported) — centralized Redis access is disabled for \
+                                     this configuration until it is changed"
+                                );
+                            }
+                            Err(cluster_topology_probe_error())
                         }
-                        return Err(redis::RedisError::from((
-                            redis::ErrorKind::InvalidClientConfig,
-                            "Redis endpoint reports an unsupported topology (Redis Cluster)",
-                        )));
+                        TopologyScreen::ProbeFailed => Err(incomplete_topology_probe_error()),
                     }
-                    Ok::<(), redis::RedisError>(())
                 }
                 .await;
 
-                let was_available = available.load(Ordering::Relaxed);
+                let was_available = availability.is_available();
                 match result {
                     Ok(()) => {
-                        if !was_available {
+                        // Publication boundary: a topology rejection proven by
+                        // another task while this probe was in flight wins, so a
+                        // successful PING/INFO can neither restore availability
+                        // nor advertise a recovery an observer would relay.
+                        if availability.publish_reachable() && !was_available {
                             info!("Redis connection recovered — centralized Redis access restored");
                         }
-                        available.store(true, Ordering::Relaxed);
                     }
                     Err(_) => {
-                        if was_available && !topology_unsupported.load(Ordering::Relaxed) {
+                        if was_available && !availability.is_topology_terminal() {
                             warn!("Redis health check failed — centralized Redis unavailable");
                         }
-                        available.store(false, Ordering::Relaxed);
+                        availability.mark_unreachable();
                     }
                 }
             }
@@ -1615,7 +1894,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((count,)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(count)
             }
             Err(e) => {
@@ -1659,7 +1938,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((previous_count, current_count)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok((previous_count.unwrap_or(0), current_count))
             }
             Err(e) => {
@@ -1702,7 +1981,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((count,)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(count)
             }
             Err(e) => {
@@ -1812,7 +2091,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((count, total)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok((count, total))
             }
             Err(e) => {
@@ -1845,7 +2124,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((v1, v2)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok((v1.unwrap_or(0), v2.unwrap_or(0)))
             }
             Err(e) => {
@@ -1871,7 +2150,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(val) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(val)
             }
             Err(e) => {
@@ -1930,7 +2209,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok((exists, length, prefix)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 if exists == 0 {
                     return Ok(BoundedRedisValue::Missing);
                 }
@@ -1988,7 +2267,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(_) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(())
             }
             Err(e) => {
@@ -2030,7 +2309,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(()) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(())
             }
             Err(e) => {
@@ -2068,7 +2347,7 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(value) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(value.is_some())
             }
             Err(e) => {
@@ -2126,7 +2405,7 @@ impl RedisRateLimitClient {
                     self.note_command_failure(&e);
                     return Err(());
                 }
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 return Ok(false);
             }
             Err(e) => {
@@ -2160,11 +2439,11 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(Some((deleted,))) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(deleted > 0)
             }
             Ok(None) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(false)
             }
             Err(e) => {
@@ -2241,7 +2520,7 @@ impl RedisRateLimitClient {
                     self.note_command_failure(&e);
                     return Err(());
                 }
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 return Ok(false);
             }
             Err(e) => {
@@ -2281,11 +2560,11 @@ impl RedisRateLimitClient {
 
         match result {
             Ok(Some(_)) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(true)
             }
             Ok(None) => {
-                self.available.store(true, Ordering::Relaxed);
+                self.note_command_success()?;
                 Ok(false)
             }
             Err(e) => {
@@ -2411,7 +2690,7 @@ impl std::fmt::Debug for RedisRateLimitClient {
         f.debug_struct("RedisRateLimitClient")
             .field("key_prefix", &self.config.key_prefix)
             .field("pool_size", &self.pool.len())
-            .field("available", &self.available.load(Ordering::Relaxed))
+            .field("availability", &self.availability.describe())
             .finish()
     }
 }

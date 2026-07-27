@@ -474,6 +474,22 @@ impl AiRateLimiter {
         }
     }
 
+    /// Generic refusal for "centralized enforcement could not be consulted".
+    ///
+    /// Shared by admission (`before_proxy`) and by authoritative post-response
+    /// usage reconciliation so the two cannot drift apart. Carries **no**
+    /// rate-limit headers: this gateway has no authoritative counter to report,
+    /// and the body names no endpoint, key, credential, or consumer identity —
+    /// a caller must not learn that a centralized store exists, let alone its
+    /// state.
+    fn reject_enforcement_unavailable(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+            body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
     fn reject_unmetered(&self) -> PluginResult {
         PluginResult::Reject {
             status_code: 502,
@@ -709,6 +725,28 @@ impl AiRateLimiter {
                 )
                 .await
             {
+                // The authoritative charge could not be recorded: centralized
+                // enforcement went away between admission/reservation and this
+                // post-response reconcile, and `redis_failure_policy` is
+                // `fail_closed`. Delivering the upstream 2xx would hand the
+                // client a completion whose tokens nothing charged — the exact
+                // budget bypass the fail-closed default exists to prevent — so
+                // refuse with the same generic 503 admission uses.
+                //
+                // Only for a successful response. When the response is already
+                // non-2xx the charge/release failure is a conservative
+                // over-count against this consumer's own budget, and replacing
+                // an error response with a different error buys nothing.
+                //
+                // No warning here: the failover backend already emits one
+                // bounded operational warning per outage, and this path runs
+                // once per request.
+                if outcome.enforcement_unavailable {
+                    if (200..300).contains(&response_status) {
+                        return self.reject_enforcement_unavailable();
+                    }
+                    return PluginResult::Continue;
+                }
                 // Refresh expose-header metadata to the post-reconcile bucket so
                 // later header copies (after_proxy federation/gateway, or
                 // on_response_body on the normal path) describe actual usage —
@@ -1584,11 +1622,7 @@ impl Plugin for AiRateLimiter {
                 // The shared failover backend emits one bounded operational
                 // warning per outage. Do not turn an unavailable dependency
                 // into one warning and one "exceeded" metric per request.
-                return PluginResult::Reject {
-                    status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
-                    body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
-                    headers: HashMap::new(),
-                };
+                return self.reject_enforcement_unavailable();
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             let usage = outcome.usage.unwrap_or(0);

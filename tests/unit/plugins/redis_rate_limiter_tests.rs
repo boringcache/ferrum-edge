@@ -1542,3 +1542,381 @@ async fn cluster_redirection_error_permanently_disables_the_endpoint() {
 
     let _ = shutdown.send(());
 }
+
+// ── Bounded topology screening + terminal rejection under concurrency ──────
+//   (GHSA-87rq-v4hx-8rcq)
+//
+// Two properties the screen has to hold beyond "a Cluster is refused":
+//
+// 1. The proactive `INFO CLUSTER` probe is bounded by the configured
+//    `redis_connect_timeout_seconds`. A server can accept and authenticate a
+//    connection and then never answer `INFO`; an unbounded screen would hang
+//    the first enforcement operation instead of refusing it. A probe that does
+//    not complete is an ordinary outage — never proof of Cluster topology — and
+//    its unscreened connection must not carry a policy command.
+// 2. Rejection is terminal *under concurrency*. A connection, command, or
+//    recovery probe that completes successfully after another task proved
+//    Cluster topology must not be published, must not be returned as a success,
+//    and must not make a failover health observer advertise a recovery.
+
+/// RESP wire form of the command-name bulk string the fake server matches on.
+const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+const GET_CMD: &[u8] = b"$3\r\nGET\r\n";
+
+/// How the fake server answers `INFO CLUSTER`.
+#[derive(Clone, Copy)]
+enum InfoBehavior {
+    /// Answer with this text as a bulk string.
+    Payload(&'static str),
+    /// Answer with these raw RESP bytes (an error line, for example).
+    Raw(&'static str),
+    /// Accept and authenticate the connection, then never answer `INFO`.
+    Never,
+}
+
+struct ScreenedServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    accepts: Arc<AtomicUsize>,
+    infos: Arc<AtomicUsize>,
+    gets: Arc<AtomicUsize>,
+}
+
+fn chunk_contains(chunk: &[u8], needle: &[u8]) -> bool {
+    chunk.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Number of RESP command arrays in one read chunk — the redis crate pipelines
+/// its connection setup, so a single read can carry several commands.
+fn command_count(chunk: &[u8]) -> usize {
+    chunk.iter().filter(|&&byte| byte == b'*').count().max(1)
+}
+
+/// Minimal RESP server: `+OK` to every command except `INFO` (per
+/// [`InfoBehavior`]) and `GET` (always a nil bulk string). `info_delay` /
+/// `get_delay` hold the corresponding reply *after* counting it, so a test can
+/// land a concurrent topology rejection while that exact operation is in flight.
+async fn spawn_screened_redis_server(
+    info: InfoBehavior,
+    info_delay: Duration,
+    get_delay: Duration,
+) -> ScreenedServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let infos = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let infos_task = Arc::clone(&infos);
+    let gets_task = Arc::clone(&gets);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let infos = Arc::clone(&infos_task);
+                    let gets = Arc::clone(&gets_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let chunk = &buf[..n];
+                            let mut reply: Vec<u8> = Vec::new();
+                            if chunk_contains(chunk, INFO_CMD) {
+                                infos.fetch_add(1, Ordering::Relaxed);
+                                tokio::time::sleep(info_delay).await;
+                                match info {
+                                    InfoBehavior::Payload(text) => {
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::Raw(raw) => {
+                                        reply.extend_from_slice(raw.as_bytes());
+                                    }
+                                    // Accepted, authenticated, silent.
+                                    InfoBehavior::Never => continue,
+                                }
+                            } else if chunk_contains(chunk, GET_CMD) {
+                                gets.fetch_add(1, Ordering::Relaxed);
+                                tokio::time::sleep(get_delay).await;
+                                reply.extend_from_slice(b"$-1\r\n");
+                            } else {
+                                for _ in 0..command_count(chunk) {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ScreenedServer {
+        port,
+        shutdown: shutdown_tx,
+        accepts,
+        infos,
+        gets,
+    }
+}
+
+fn screened_client(port: u16, connect_timeout_seconds: u64) -> RedisRateLimitClient {
+    let url = format!("redis://127.0.0.1:{port}/0");
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = connect_timeout_seconds;
+    // Long enough that no background recovery dial happens during a test.
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    redis_rate_limit_client_for_test(config)
+}
+
+/// Await a server-side counter reaching `target`, so a race is landed at a known
+/// point rather than on a hopeful sleep.
+async fn wait_for_count(counter: &Arc<AtomicUsize>, target: usize, what: &str) {
+    for _ in 0..6_000 {
+        if counter.load(Ordering::Relaxed) >= target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{what} never reached {target}");
+}
+
+/// A RESP-compatible server that simply does not report `cluster_enabled` is not
+/// proven to be anything, so it must keep serving policy operations.
+#[tokio::test]
+async fn a_server_without_a_cluster_enabled_field_still_serves_policy_operations() {
+    let info = InfoBehavior::Payload("# Server\r\nredis_version:7.2.4\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert_eq!(
+        served,
+        Ok(None),
+        "an unknown topology must fall through to the reactive screen"
+    );
+    assert!(!client.is_topology_unsupported());
+    assert!(client.is_available());
+    assert_eq!(server.gets.load(Ordering::Relaxed), 1);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A server that answers `INFO` with an ordinary command error (unknown command,
+/// restricted ACL) keeps the documented compatibility behavior.
+#[tokio::test]
+async fn an_unsupported_info_command_error_keeps_the_endpoint_usable() {
+    let info = InfoBehavior::Raw("-ERR unknown command 'INFO'\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert_eq!(
+        served,
+        Ok(None),
+        "a server error reply to INFO is not proof of Cluster topology"
+    );
+    assert!(!client.is_topology_unsupported());
+    assert!(client.is_available());
+
+    let _ = server.shutdown.send(());
+}
+
+/// An `INFO` answered with a Cluster-only wire code is itself proof, even when
+/// the server never reports `cluster_enabled`.
+#[tokio::test]
+async fn a_cluster_wire_error_on_the_info_probe_is_terminal() {
+    let info = InfoBehavior::Raw("-MOVED 1234 127.0.0.1:7001\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert!(
+        refused.is_err(),
+        "a Cluster endpoint must not serve a policy operation"
+    );
+    assert!(
+        client.is_topology_unsupported(),
+        "a Cluster wire code on the screen proves the topology"
+    );
+    assert!(!client.is_available());
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        0,
+        "no policy command may reach a refused endpoint"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The finding that motivated the deadline: a server that accepts and
+/// authenticates but never answers `INFO` must not hang the first enforcement
+/// operation. The probe is bounded by `redis_connect_timeout_seconds`, and an
+/// unanswered screen is an outage — not proof of Cluster topology.
+#[tokio::test]
+async fn an_endpoint_that_never_answers_info_fails_closed_within_the_connect_timeout() {
+    let info = InfoBehavior::Never;
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    // One-second connect timeout, which now also bounds the topology probe.
+    let client = screened_client(server.port, 1);
+
+    let started = std::time::Instant::now();
+    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let elapsed = started.elapsed();
+    assert!(
+        refused.is_err(),
+        "an unscreened endpoint must fail closed instead of serving the command"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the topology probe must be bounded by redis_connect_timeout_seconds, took {elapsed:?}"
+    );
+    assert!(!client.is_available());
+    assert!(
+        !client.is_topology_unsupported(),
+        "an unanswered probe is a retryable outage, not proof of Cluster topology"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        0,
+        "a policy command must never run on a connection that was not screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A command whose reply lands *after* another task proved Cluster topology must
+/// be reported as a failure, so the consumer's `redis_failure_policy` governs.
+/// Over-counting one operation is safer than admitting traffic against a
+/// topology this client cannot enforce on.
+#[tokio::test]
+async fn a_command_completing_after_a_topology_rejection_fails_closed() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, Duration::ZERO, held).await;
+    let client = Arc::new(screened_client(server.port, 5));
+
+    // Control: this fake really does answer the command successfully, so the
+    // failure asserted below is attributable to the rejection alone.
+    let control = client.get_bytes("{ferrum%3Atest:control}").await;
+    assert_eq!(control, Ok(None));
+    assert!(client.is_available());
+
+    let racer = Arc::clone(&client);
+    let raced_key = "{ferrum%3Atest:raced}";
+    let inflight = tokio::spawn(async move { racer.get_bytes(raced_key).await });
+    // The server now holds the racing GET's reply.
+    wait_for_count(&server.gets, 2, "racing GET").await;
+    client.mark_topology_unsupported_for_test();
+
+    let raced = inflight.await.expect("racing task");
+    assert!(
+        raced.is_err(),
+        "a command that completed after the rejection must not be a success"
+    );
+    assert!(
+        !client.is_available(),
+        "topology rejection must stay terminal for this client generation"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "a failover health observer must never see a refused endpoint as available"
+    );
+
+    // Later operations, and the redials they would trigger, stay disabled.
+    let dials = server.accepts.load(Ordering::Relaxed);
+    let after = client.get_bytes("{ferrum%3Atest:after}").await;
+    assert!(after.is_err());
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        dials,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A connection still being screened when another task proves Cluster topology
+/// must never be published to the hot path, even though its own screen passed.
+#[tokio::test]
+async fn a_connection_screened_across_a_topology_rejection_is_never_published() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, held, Duration::ZERO).await;
+    let client = Arc::new(screened_client(server.port, 5));
+
+    let connecting = Arc::clone(&client);
+    let inflight = tokio::spawn(async move { connecting.connect_cached_for_test().await });
+    // The server now holds the screen's INFO reply.
+    wait_for_count(&server.infos, 1, "screening INFO").await;
+    client.mark_topology_unsupported_for_test();
+
+    let published = inflight.await.expect("connecting task");
+    assert!(
+        !published,
+        "a connection screened across a rejection must not be published"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "no pool slot may hold a connection to a refused endpoint"
+    );
+    assert!(!client.is_available());
+    assert!(!client.observer_sees_available_for_test());
+
+    let _ = server.shutdown.send(());
+}
+
+/// The recovery checker's own race: its `PING` and topology screen both succeed,
+/// but a rejection landed while the probe was in flight. It must not restore
+/// availability, so no observer can advertise a false recovery.
+#[tokio::test]
+async fn a_recovery_probe_completing_after_a_rejection_advertises_no_recovery() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, held, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Probe once per second so the race window is reached promptly.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // Enter the state an outage produces: unavailable, recovery checker running.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+
+    // Let the recovery probe reach its topology screen, then prove Cluster
+    // topology from another task while that probe is still in flight.
+    wait_for_count(&server.infos, 1, "recovery screen INFO").await;
+    client.mark_topology_unsupported_for_test();
+
+    // The probe's PING and INFO both succeed after the rejection landed.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        !client.is_available(),
+        "a successful recovery probe must not resurrect a refused endpoint"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "no false recovery may be advertised to a failover health observer"
+    );
+    assert!(client.is_topology_unsupported());
+
+    let _ = server.shutdown.send(());
+}
