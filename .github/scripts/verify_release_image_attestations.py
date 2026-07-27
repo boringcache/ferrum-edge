@@ -96,7 +96,17 @@ def validate_release_workflow(workflow: str) -> list[str]:
             "jobs.release-attestation-gate must use if: always() so attestation "
             "failure cannot skip the fail-closed publication gate"
         )
+    if not re.search(
+        r"(?m)^    permissions:\n      contents: write$",
+        gate_job,
+    ):
+        errors.append(
+            "jobs.release-attestation-gate must retain contents: write so it "
+            "can retract a release after attestation failure"
+        )
     for token in (
+        "CREATE_RESULT: ${{ needs.create-release.result }}",
+        "ATTEST_RESULT: ${{ needs.attest-release-images.result }}",
         'if [ "$ATTEST_RESULT" != "success" ]; then',
         "gh release delete",
         "release publication is blocked until attest-release-images succeeds",
@@ -237,6 +247,36 @@ def run_self_test(workflow: str) -> list[str]:
         (
             "gate rollback delete",
             workflow.replace("gh release delete", "gh release view", 1),
+        ),
+        (
+            "gate attestation result",
+            workflow.replace(
+                "ATTEST_RESULT: ${{ needs.attest-release-images.result }}",
+                "ATTEST_RESULT: ${{ needs.create-release.result }}",
+                1,
+            ),
+        ),
+        (
+            "gate release-delete permission",
+            workflow.replace(
+                "  release-attestation-gate:\n"
+                "    name: Gate release on image attestation\n",
+                "  release-attestation-gate:\n"
+                "    name: Gate release on image attestation\n"
+                "    permissions:\n"
+                "      contents: read\n",
+                1,
+            ).replace(
+                "    permissions:\n"
+                "      contents: write\n"
+                "    steps:\n"
+                "      - name: Require attestation success and "
+                "retract unverified releases",
+                "    steps:\n"
+                "      - name: Require attestation success and "
+                "retract unverified releases",
+                1,
+            ),
         ),
     )
     for label, mutated in mutations:
