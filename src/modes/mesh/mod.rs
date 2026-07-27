@@ -9337,6 +9337,7 @@ pub async fn run(
         mesh_state,
         Some(initial_applied_mesh_slice),
         background_handles,
+        true,
     )
     .await
 }
@@ -9357,6 +9358,10 @@ async fn serve_mesh_runtime(
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
     mesh_background_handles: Vec<JoinHandle<()>>,
+    // External rollback probes share a process with unrelated plugin tests and
+    // must not stop process-global delivery generations. Production always
+    // passes true.
+    finalize_global_plugins_on_shutdown: bool,
 ) -> Result<(), anyhow::Error> {
     // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
     // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
@@ -9393,6 +9398,7 @@ async fn serve_mesh_runtime(
         health_check_handles,
         mesh_background_handles,
         env_config.shutdown_drain_seconds,
+        finalize_global_plugins_on_shutdown,
     );
     if let Err(err) = arm_mesh_runtime_startup(
         &mut owner,
@@ -13647,6 +13653,7 @@ struct MeshStartupOwner {
     tasks: MeshBackgroundTasks,
     listener_handles: Vec<JoinHandle<()>>,
     drain_seconds: u64,
+    finalize_global_plugins_on_shutdown: bool,
 }
 
 impl MeshStartupOwner {
@@ -13656,6 +13663,7 @@ impl MeshStartupOwner {
         health_check_handles: Vec<JoinHandle<()>>,
         mesh_background_handles: Vec<JoinHandle<()>>,
         drain_seconds: u64,
+        finalize_global_plugins_on_shutdown: bool,
     ) -> Self {
         Self {
             shutdown_tx,
@@ -13669,6 +13677,7 @@ impl MeshStartupOwner {
             },
             listener_handles: Vec::new(),
             drain_seconds,
+            finalize_global_plugins_on_shutdown,
         }
     }
 
@@ -13720,7 +13729,13 @@ impl MeshStartupOwner {
             "startup failure",
         )
         .await;
-        shutdown_and_join_mesh(self.proxy_state, self.tasks, self.drain_seconds).await;
+        shutdown_and_join_mesh(
+            self.proxy_state,
+            self.tasks,
+            self.drain_seconds,
+            self.finalize_global_plugins_on_shutdown,
+        )
+        .await;
         err
     }
 
@@ -13732,7 +13747,13 @@ impl MeshStartupOwner {
             "shutdown",
         )
         .await;
-        shutdown_and_join_mesh(self.proxy_state, self.tasks, self.drain_seconds).await;
+        shutdown_and_join_mesh(
+            self.proxy_state,
+            self.tasks,
+            self.drain_seconds,
+            self.finalize_global_plugins_on_shutdown,
+        )
+        .await;
         info!("Mesh runtime mode shutting down");
         listener_result?;
         Ok(())
@@ -13871,6 +13892,7 @@ async fn shutdown_and_join_mesh(
     proxy_state: ProxyState,
     mut tasks: MeshBackgroundTasks,
     drain_seconds: u64,
+    finalize_global_plugins: bool,
 ) {
     proxy_state.stream_listener_manager.shutdown_all().await;
     crate::overload::begin_drain(&proxy_state.overload);
@@ -13892,12 +13914,14 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.mesh_background_handles);
 
     join_mesh_background_handles(tasks.handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
-    crate::observability_delivery::shutdown(Duration::from_millis(
-        proxy_state.env_config.log_shutdown_drain_timeout_ms,
-    ))
-    .await;
-    crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
-    crate::plugins::kafka_logging::finalize_all_generations().await;
+    if finalize_global_plugins {
+        crate::observability_delivery::shutdown(Duration::from_millis(
+            proxy_state.env_config.log_shutdown_drain_timeout_ms,
+        ))
+        .await;
+        crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
+        crate::plugins::kafka_logging::finalize_all_generations().await;
+    }
 }
 
 /// External coverage seams for issue #2372 mesh startup rollback.
@@ -14051,6 +14075,7 @@ pub mod startup_rollback_test_seams {
             mesh_state,
             None,
             vec![sentinel],
+            false,
         )
         .await;
         // Clear any unused inject so later tests cannot observe a stale fault.
@@ -14983,6 +15008,7 @@ mod tests {
                 mesh_state,
                 None,
                 Vec::new(),
+                true,
             )
             .await
         });
