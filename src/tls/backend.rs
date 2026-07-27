@@ -542,8 +542,7 @@ pub fn build_root_cert_store(
 ) -> Result<RootCertStore, TlsError> {
     let ca_path = proxy_ca.or(global_ca);
     if let Some(ca_path) = ca_path {
-        let material =
-            load_backend_material(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
+        let material = load_backend_material(ca_path, MaterialKind::CaBundle, "backend CA bundle")?;
         return crate::tls::root_cert_store_from_pem_bundle(
             material.bytes.expose_secret(),
             "backend CA bundle",

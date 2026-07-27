@@ -1773,8 +1773,8 @@ async fn build_grpc_probe_channel_no_verify(
             )
             .map_err(std::io::Error::other)?;
             let key_source = CertSource::parse(key_path, MaterialKind::Key);
-            let key_material = load_material_blocking(&key_source, MaterialKind::Key)
-                .map_err(|error| {
+            let key_material =
+                load_material_blocking(&key_source, MaterialKind::Key).map_err(|error| {
                     std::io::Error::other(format!("gRPC health probe client key: {error}"))
                 })?;
             let key = crate::tls::parse_pem_private_key(

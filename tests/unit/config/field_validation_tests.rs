@@ -1744,8 +1744,7 @@ fn test_proxy_tls_cert_file_invalid_pem() {
     );
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_client_key_path")
-                && e.contains("no PEM private key")),
+            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("no PEM private key")),
         "Expected invalid PEM key error, got: {:?}",
         errs
     );

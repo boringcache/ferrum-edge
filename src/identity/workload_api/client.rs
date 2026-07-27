@@ -29,9 +29,9 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 #[cfg(unix)]
 use tower::service_fn;
+use tracing::debug;
 #[cfg(unix)]
 use tracing::info;
-use tracing::debug;
 
 use super::latest_wins;
 use super::proto::X509svidRequest;

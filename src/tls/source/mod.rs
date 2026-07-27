@@ -201,10 +201,9 @@ impl PartialEq for CertSourceUri {
 
 impl fmt::Debug for CertSourceUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let redact =
-            self.scheme.is_secret_provider()
-                || self.has_uri_userinfo()
-                || crate::secrets::is_external_secret_value(&self.raw);
+        let redact = self.scheme.is_secret_provider()
+            || self.has_uri_userinfo()
+            || crate::secrets::is_external_secret_value(&self.raw);
         let mut debug = f.debug_struct("CertSourceUri");
         debug.field("scheme", &self.scheme);
         if redact {

@@ -113,12 +113,9 @@ fn read_cert_chain_source(
     let material = load_material_blocking(&source, kind)
         .map_err(|e| SpiffeTlsError::BadKeyMaterial(format!("{label}: {e}")))?;
     let source_id = material.display_source_id.clone();
-    let certificates = crate::tls::parse_pem_certificate_bundle(
-        material.bytes.expose_secret(),
-        label,
-        &source_id,
-    )
-    .map_err(|error| SpiffeTlsError::BadKeyMaterial(error.to_string()))?;
+    let certificates =
+        crate::tls::parse_pem_certificate_bundle(material.bytes.expose_secret(), label, &source_id)
+            .map_err(|error| SpiffeTlsError::BadKeyMaterial(error.to_string()))?;
     if kind == MaterialKind::CaBundle {
         crate::tls::root_cert_store_from_certificates(
             certificates.iter().cloned(),

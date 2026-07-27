@@ -76,9 +76,7 @@ fn malformed_pem_section_start_error_withholds_marker_bearing_line() {
 #[test]
 fn malformed_private_key_error_withholds_marker_bearing_input() {
     let dir = TempDir::new().unwrap();
-    let key = format!(
-        "-----BEGIN PRIVATE KEY-----\n{PEM_MARKER}\n-----END PRIVATE KEY-----\n"
-    );
+    let key = format!("-----BEGIN PRIVATE KEY-----\n{PEM_MARKER}\n-----END PRIVATE KEY-----\n");
     let path = write_pem(&dir, "malformed-key.pem", &key);
 
     let error = validate_pem_key_file("backend TLS client key", &path)

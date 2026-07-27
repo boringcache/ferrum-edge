@@ -11558,8 +11558,7 @@ fn build_mesh_inbound_spiffe_slot_with_federation(
     if let Err(error) = merge_effective_trust_bundles_into_svid_bundle(
         &mut bundle,
         effective_trust_bundles.as_ref(),
-    )
-    {
+    ) {
         warn!(
             %error,
             "Unable to build complete mesh inbound SPIFFE trust bundle; keeping previous trust"

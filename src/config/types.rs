@@ -7045,8 +7045,7 @@ impl Proxy {
         // Also checks certificate expiration: expired certs are rejected,
         // near-expiry certs emit a warning log.
         if let Some(ref path) = self.backend_tls_client_cert_path {
-            let cache_key =
-                tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(&cache_key));
@@ -7065,8 +7064,7 @@ impl Proxy {
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
-            let cache_key =
-                tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
             let already_validated = validated_tls_paths
                 .as_ref()
                 .is_some_and(|s| s.contains(&cache_key));
@@ -8355,8 +8353,7 @@ impl Upstream {
 
         // TLS file content validation with deduplication.
         if let Some(ref path) = self.backend_tls_client_cert_path {
-            let cache_key =
-                tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
             let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
@@ -8373,8 +8370,7 @@ impl Upstream {
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
-            let cache_key =
-                tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
             let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
