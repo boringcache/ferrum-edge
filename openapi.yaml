@@ -10600,6 +10600,19 @@ components:
               max_tool_name_bytes: 128
               max_tool_names_aggregate_bytes: 4096
               max_retained_record_bytes: 135424
+              max_redaction_scan_bytes: 1048576
+              max_entry_bytes: 861696
+              max_entry_retained_bytes: 1723522
+              buffer_max_bytes: 134217728
+              retained_bytes: 0
+              retained_byte_drops: 0
+              max_stream_reservation_secs: 900
+              stream_reservations_expired: 0
+              stream_hash_scope: capped
+              ack_policy: drain
+              ack_max_bytes: 65536
+              ack_timeout_ms: 1000
+              sink_healthy: true
 
     AiTranscriptAuditStatusSnapshot:
       type: object
@@ -10621,6 +10634,19 @@ components:
         - max_tool_name_bytes
         - max_tool_names_aggregate_bytes
         - max_retained_record_bytes
+        - max_redaction_scan_bytes
+        - max_entry_bytes
+        - max_entry_retained_bytes
+        - buffer_max_bytes
+        - retained_bytes
+        - retained_byte_drops
+        - max_stream_reservation_secs
+        - stream_reservations_expired
+        - stream_hash_scope
+        - ack_policy
+        - ack_max_bytes
+        - ack_timeout_ms
+        - sink_healthy
       properties:
         instance_id:
           type: integer
@@ -10665,6 +10691,82 @@ components:
             Coherent per-record retained-memory contract:
             max_request_bytes + max(max_response_bytes, max_stream_capture_bytes)
             + max_model_bytes + max_tool_names_aggregate_bytes.
+        max_redaction_scan_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Hard processing bound for redacted-mode request classification,
+            model/tool extraction, and shaping. Raw payloads above this are
+            never parsed/scanned/copied; oversized JSON POSTs are
+            conservatively audited with explicit omission evidence.
+        max_entry_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum serialized JSON bytes for one admitted record. The derived
+            default covers worst-case JSON escaping of the capture contract.
+        max_entry_retained_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum aggregate lease charge for one entry at max_entry_bytes:
+            2 * (max_entry_bytes + 1) + 128, covering the immutable queued
+            payload, one exact-capacity HTTP batch copy and JSON-array framing,
+            plus fixed queue/retry/delivery state.
+        buffer_max_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Aggregate retained-byte budget covering staged candidates,
+            fail-closed pre-commit reservations, active fail-open stream
+            capture reservations, and queued records.
+        retained_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Live aggregate retained bytes currently charged against
+            `buffer_max_bytes`. A gauge only — never transcript content.
+        retained_byte_drops:
+          type: integer
+          format: uint64
+          description: >-
+            Admissions refused because the aggregate retained-byte budget was
+            saturated. A rising value means the collector cannot keep up.
+        max_stream_reservation_secs:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum lifetime of one active stream's audit capture, staging
+            entry, and reserved commit permit. Expiry clears capture/hash work
+            before accounting is released.
+        stream_reservations_expired:
+          type: integer
+          format: uint64
+          description: >-
+            Stream reservations and inspector capture state revoked by the
+            staging-lifetime deadline owner or repair sweep after exceeding
+            `max_stream_reservation_secs`. Non-zero means streams are
+            outliving their bound.
+        stream_hash_scope:
+          type: string
+          enum: [capped, full]
+          description: How much of a streamed response the keyed digest covers.
+        ack_policy:
+          type: string
+          enum: [drain, json]
+          description: How a collector acknowledgement is validated.
+        ack_max_bytes:
+          type: integer
+          format: uint64
+        ack_timeout_ms:
+          type: integer
+          format: uint64
+        sink_healthy:
+          type: boolean
+          description: >-
+            Whether the last completed batch delivery published a healthy sink
+            (2xx AND a fully drained/validated acknowledgement). Drives
+            `sink.on_sink_error: reject` admission.
 
     ServingListenerFailureSnapshot:
       type: object
@@ -19475,7 +19577,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, sampling/admission, or record emission. The local staging entry is the instance's commit capability and is consumed by atomic removal at buffered or stream-terminal commit. Orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -19512,6 +19614,11 @@ components:
               type: boolean
               default: true
               description: "Extract tool/function names from the request body."
+            stream_hash:
+              type: string
+              enum: [capped, full]
+              default: capped
+              description: "How much of a streamed (SSE) response the exported keyed HMAC-SHA256 response_hash covers. capped (default) stops hashing at limits.max_stream_capture_bytes, so limits.max_stream_capture_bytes bounds audit CPU as well as retained bytes and an indefinitely long high-bandwidth stream cannot keep a keyed hash running for the life of the connection; the digest is then marked response_hash_scope=partial, carries the exact response_hash_bytes it covered, and is domain-separated so it can never collide with or be presented as a full-stream digest. full is the explicit opt-in for deployments whose evidence chain genuinely re-derives the provider's complete response, and accepts unbounded per-byte keyed-hashing cost. The response_hash is a tamper-evidence/correlation token over the captured transcript, not an integrity attestation of the client's byte stream — abnormally terminated and downstream-cut streams already omit it entirely. Buffered (non-streamed) responses are complete by construction and always hash full."
         sampling:
           type: [object, "null"]
           additionalProperties: false
@@ -19605,7 +19712,112 @@ components:
               default: 65536
               description: >-
                 Maximum retained SSE stream-capture bytes. Hard maximum
-                1048576. Counts toward the cross-field aggregate.
+                1048576. Counts toward the cross-field aggregate. Also bounds
+                the streamed keyed digest unless capture.stream_hash is full.
+            max_redaction_scan_bytes:
+              type: integer
+              minimum: 4096
+              maximum: 8388608
+              default: 1048576
+              description: >-
+                Independent hard processing bound for redacted-mode request
+                classification, model/tool extraction, and body shaping. In
+                mode=redacted_body the raw length is checked before serde_json:
+                payloads above this bound are never JSON-parsed, model/tool
+                scanned, redaction-scanned, or copied into an excerpt. An
+                oversized POST application/json is conservatively audited as a
+                possible AI request and treated as potentially streaming (so
+                capture does not buffer a possibly unbounded SSE response);
+                parse-derived model/tool fields are omitted and fail-closed
+                queue/byte admission still applies. The record carries
+                request_body_omitted_reason / response_body_omitted_reason =
+                redaction_scan_limit with the body_truncated flag set. Hashes,
+                envelope, status, and bounded guardrail metadata still export.
+                Streaming redacted capture enforces this bound while chunks
+                arrive: if it is smaller than max_stream_capture_bytes, no
+                more than max_redaction_scan_bytes is copied and crossing the
+                bound records response_body_omitted_reason =
+                redaction_scan_limit rather than exporting a raw boundary
+                fragment. The keyed digest still follows capture.stream_hash
+                until reservation expiry revokes all audit work. mode=full_body
+                caps on a UTF-8 boundary first and never scans past the cap, so
+                it is unaffected.
+            max_entry_bytes:
+              type: integer
+              minimum: 1
+              maximum: 16777216
+              description: >-
+                Maximum serialized JSON bytes for one admitted record. Queue
+                admission first performs an allocation-free bounded counting
+                serialization, then serializes into one exact-capacity immutable
+                Bytes payload. The default/minimum is derived from the configured
+                capture limits and worst-case JSON escaping:
+                6 * (max_request_bytes + max(max_response_bytes,
+                max_stream_capture_bytes) + 256 + 4096 + 8192). The hard maximum
+                is 16777216. A complete record whose bounded envelope still
+                exceeds this ceiling is dropped/rejected, never partially
+                serialized.
+            buffer_max_bytes:
+              type: integer
+              minimum: 65536
+              maximum: 268435456
+              default: 134217728
+              description: >-
+                Aggregate retained-byte budget for one plugin instance,
+                covering staged request candidates, fail-closed pre-commit
+                reservations, active fail-open stream capture, immutable
+                pre-serialized queue payloads, one exact-capacity JSON-array
+                request body, and every sequential retry.
+                sink.buffer_capacity bounds the RECORD COUNT only;
+                without this budget a slow collector can retain capacity x
+                attacker-shaped record bytes. Retry clones share Bytes and do
+                not deep-clone transcript fields; reqwest does not reserialize
+                the batch. The exact per-record lease is
+                2 * (serialized_record_bytes + 1) + 128. Admission is (count AND
+                bytes) and is enforced atomically before publication; leases
+                release on every completion, discard, TTL-sweep,
+                reservation-expiry, and failed-batch path. Saturation follows
+                sink.on_buffer_full (drop or reject). Must be at least
+                2 * (max_entry_bytes + 1) + 128. Live retained_bytes and
+                retained_byte_drops are exposed on authenticated /health.
+            max_stream_reservation_secs:
+              type: integer
+              minimum: 1
+              maximum: 86400
+              default: 900
+              description: >-
+                Maximum lifetime of one active stream's staging entry and its
+                reserved commit permit. An active stream is exempt from the
+                one-hour orphan TTL, so without this bound a never-ending
+                stream, or one whose terminal hook is lost, would hold a
+                staging slot, a queue permit, and its retained bytes forever
+                until all reservations were exhausted. The staging entry owns
+                one cancellable single-fire deadline from first active response
+                selection until staging is actually consumed or dropped. It
+                revokes even an idle selection with no concrete inspector at
+                its deadline without waiting for another request or chunk, and
+                remains armed after normal inspector terminal claim while
+                staging is retained for the immediate transaction-log fallback.
+                Normal staging consumption wakes and cancels the task promptly;
+                the amortized sweep remains a repair net. Both paths dynamically
+                resolve and first revoke any current per-stream response
+                accumulator and keyed HMAC through narrowly scoped shared state,
+                then release the queue permit, staging slot, staging lease, and
+                worst-case queued-record lease exactly once. An atomic
+                fired/cancelled token makes deadline, sweep, terminal,
+                inspector-drop, and log-fallback races single-fire.
+                Later bytes forward unchanged without capture or hash work. No
+                global tombstone remains for the live connection: inspector
+                drop publishes a body-free request-owned handoff only when the
+                stream actually terminates.
+                Normal or abnormal late termination emits at most one
+                best-effort fallback without request/response excerpts or
+                hashes and without resurrecting the released commit permit.
+                The process-global live-slot map is capped at 4096 and expiry
+                releases that capacity; the remaining stream-owned handle has
+                no capture/hash/accounting state.
+                Reclamations are logged and counted in
+                stream_reservations_expired on authenticated /health.
         sink:
           type: object
           required: [endpoint_url]
@@ -19664,7 +19876,24 @@ components:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
+            ack_policy:
+              type: string
+              enum: [drain, json]
+              default: drain
+              description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside the unequivocal affirmative set ok|success|accepted|created fails the batch. Ambiguous partial-delivery values such as partial_ok are unhealthy even without an explicit failure count. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
+            ack_max_bytes:
+              type: integer
+              minimum: 64
+              maximum: 1048576
+              default: 65536
+              description: "Hard bound on the acknowledgement body read from the collector. An advertised Content-Length above this, or a stream that exceeds it, fails the batch instead of buffering unbounded collector output into the flush worker."
+            ack_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 30000
+              default: 1000
+              description: "Maximum time spent draining/validating one acknowledgement after headers arrive. Separate from the plugin HTTP client request timeout so a stalled acknowledgement cannot pin a flush worker for the full request budget."
         privacy:
           type: [object, "null"]
           additionalProperties: false
