@@ -3784,10 +3784,24 @@ jobs:
     needs: ci-plan
     if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      # Lightweight protocol-perf contract gates (no benchmarks): keep evaluator /
+      # workflow/harness integrity on the required PR CI surface. The scheduled
+      # multi-protocol bench in protocol-perf-regression.yml stays non-required.
+      - name: Verify protocol-perf contracts (static)
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+          python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
 
       - name: Detect performance-sensitive changes
         id: perf_changes
