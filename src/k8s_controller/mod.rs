@@ -82,40 +82,58 @@ pub struct K8sControllerTaskFailure {
 /// and propagate controller-task failures instead of detaching them (#3220).
 #[derive(Debug, Default)]
 pub struct K8sControllerShutdownOutcome {
-    /// Tasks that observed shutdown and returned within the grace period.
+    /// Tasks that were still running when shutdown was requested and then
+    /// observed it and returned within the grace period.
     pub completed: Vec<String>,
-    /// Tasks that had already terminated *before* shutdown was requested.
-    /// A watcher, reconciler, or reprobe loop returning during normal
+    /// Tasks that returned *before* their shutdown receiver had observed
+    /// `true`. A watcher, reconciler, or reprobe loop returning during normal
     /// operation means that part of the controller silently stopped
-    /// reconciling; it is reported rather than mistaken for a clean exit.
+    /// reconciling — degraded service, not a clean exit — so it is reported
+    /// separately and fails the process through [`Self::failure_error`].
     pub exited_before_shutdown: Vec<String>,
-    /// Tasks that panicked or were cancelled.
+    /// Tasks that panicked or were cancelled by something other than this
+    /// shutdown path.
     pub failed: Vec<K8sControllerTaskFailure>,
     /// Tasks still running at the grace deadline. They are aborted, and the
     /// abort is reported instead of silently detaching them.
     pub timed_out: Vec<String>,
+    /// Subset of [`Self::timed_out`] whose terminal join was *not* confirmed
+    /// inside the abort-settle budget. For these the abort was issued but no
+    /// happens-before boundary was established, so the task may still be
+    /// unwinding when `shutdown()` returns. Reported explicitly rather than
+    /// claimed as settled.
+    pub abort_unconfirmed: Vec<String>,
 }
 
 impl K8sControllerShutdownOutcome {
     /// `true` when every owned task stopped on its own, on time, without a
     /// panic and without having exited early.
     pub fn is_clean(&self) -> bool {
+        // `abort_unconfirmed` is a subset of `timed_out`, so it needs no
+        // separate term here.
         self.exited_before_shutdown.is_empty()
             && self.failed.is_empty()
             && self.timed_out.is_empty()
     }
 
-    /// An error describing panicked/cancelled controller tasks, if any.
+    /// An error describing abnormally terminated controller tasks, if any.
+    ///
+    /// Two conditions are process-failing:
+    ///
+    /// * a panicked/cancelled task — a real defect;
+    /// * a task that returned successfully *before* shutdown was requested —
+    ///   a silently dead watcher/reconciler/reprobe loop is degraded service,
+    ///   and a control plane that keeps running with one is worse than one
+    ///   that exits and gets restarted.
     ///
     /// A grace-period timeout is deliberately *not* an error: a stuck task is
-    /// aborted and warned about (mirroring background-task drain elsewhere in
-    /// the modes), while a panic is a real defect and is surfaced to `run()`
-    /// so the process exit code reflects it.
+    /// aborted and warned about, mirroring background-task drain elsewhere in
+    /// the modes.
     pub fn failure_error(&self) -> Option<anyhow::Error> {
-        if self.failed.is_empty() {
+        if self.failed.is_empty() && self.exited_before_shutdown.is_empty() {
             return None;
         }
-        let detail = self
+        let mut details: Vec<String> = self
             .failed
             .iter()
             .map(|failure| {
@@ -126,21 +144,70 @@ impl K8sControllerShutdownOutcome {
                 };
                 format!("{} {kind}: {}", failure.task, failure.detail)
             })
-            .collect::<Vec<_>>()
-            .join("; ");
+            .collect();
+        for task in &self.exited_before_shutdown {
+            details.push(format!("{task} exited before shutdown was requested"));
+        }
         Some(anyhow::anyhow!(
-            "Kubernetes controller task(s) terminated abnormally: {detail}"
+            "Kubernetes controller task(s) terminated abnormally: {}",
+            details.join("; ")
         ))
     }
 }
 
+/// How long a deadline-aborted task gets to reach its terminal join before the
+/// abort is reported as unconfirmed. Keeps total teardown bounded at
+/// `grace + ABORT_SETTLE_BUDGET`; an abort normally lands in microseconds, so
+/// this only matters for a task wedged in a blocking `Drop`.
+const ABORT_SETTLE_BUDGET: Duration = Duration::from_secs(1);
+
+/// What a supervisor observed at its task's completion boundary.
+struct TaskCompletion {
+    result: Result<(), tokio::task::JoinError>,
+    /// The shutdown receiver's value read *at the instant the task's join
+    /// resolved*. Reading it later (e.g. in `shutdown()`) would be useless in
+    /// the real control-plane lifecycle, where the global watch is already
+    /// `true` long before the handle is torn down.
+    shutdown_observed: bool,
+}
+
+/// One owned controller task plus its supervisor.
+struct SupervisedTask {
+    name: String,
+    /// Join handle of the **supervisor**, which owns the underlying task's
+    /// `JoinHandle`. Never abort or drop this while the underlying task is
+    /// live: dropping the inner `JoinHandle` would *detach* the real task,
+    /// which is precisely the bug this path exists to fix.
+    supervisor: tokio::task::JoinHandle<TaskCompletion>,
+    /// Abort handle of the **underlying** task, kept separate so the deadline
+    /// path can stop the real work without touching the supervisor.
+    abort: tokio::task::AbortHandle,
+}
+
+/// Terminal classification of a single controller task, resolved once and then
+/// materialized into [`K8sControllerShutdownOutcome`] in spawn order.
+enum TaskDisposition {
+    Completed,
+    ExitedBeforeShutdown,
+    Failed(K8sControllerTaskFailure),
+    TimedOut { abort_confirmed: bool },
+}
+
 pub struct K8sControllerHandle {
     pub metrics: Arc<ControllerMetrics>,
-    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    tasks: Vec<SupervisedTask>,
 }
 
 impl K8sControllerHandle {
     /// Assemble a handle from already-spawned, named controller tasks.
+    ///
+    /// Each task is immediately wrapped in a supervisor that awaits its real
+    /// `JoinHandle` and records the shutdown-receiver state at the completion
+    /// boundary. Doing it here — rather than inspecting `is_finished()` during
+    /// teardown — is what makes an early successful exit detectable at all:
+    /// by the time CP mode calls [`Self::shutdown`], the global shutdown watch
+    /// has already fired, so a later inspection can no longer tell "returned
+    /// while running normally" from "returned because we asked it to".
     ///
     /// Kept crate-visible plus a `_test_support` re-export so external tests
     /// can drive the real shutdown path with synthetic tasks without widening
@@ -148,113 +215,236 @@ impl K8sControllerHandle {
     pub(crate) fn from_named_tasks(
         metrics: Arc<ControllerMetrics>,
         tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+        shutdown: watch::Receiver<bool>,
     ) -> Self {
+        let tasks = tasks
+            .into_iter()
+            .map(|(name, handle)| {
+                let abort = handle.abort_handle();
+                let shutdown_rx = shutdown.clone();
+                let supervisor = tokio::spawn(async move {
+                    let result = handle.await;
+                    TaskCompletion {
+                        result,
+                        shutdown_observed: *shutdown_rx.borrow(),
+                    }
+                });
+                SupervisedTask {
+                    name,
+                    supervisor,
+                    abort,
+                }
+            })
+            .collect();
         Self { metrics, tasks }
     }
 
     /// Signal shutdown, then await every owned task with a bounded grace
-    /// period, aborting and reporting whatever is still running at the
-    /// deadline.
+    /// period, aborting whatever is still running at the deadline and
+    /// confirming those aborts within a bounded settle phase.
     ///
     /// The signal is sent here (idempotently — `watch::Sender::send` on an
     /// already-`true` channel still notifies) so the ordering is structural:
     /// no caller can await controller tasks that were never told to stop.
-    /// When shutdown was already requested by the caller, tasks that have
-    /// finished are simply awaited; when it was not, any already-finished
-    /// task exited for some other reason and is reported through
-    /// [`K8sControllerShutdownOutcome::exited_before_shutdown`].
+    /// Whether a task exited early is decided by its supervisor at the
+    /// completion boundary, not by the state of the channel at this point.
     pub async fn shutdown(
         self,
         shutdown_tx: &watch::Sender<bool>,
         grace: Duration,
     ) -> K8sControllerShutdownOutcome {
-        let mut outcome = K8sControllerShutdownOutcome::default();
-        let shutdown_already_requested = *shutdown_tx.borrow();
-        if !shutdown_already_requested {
-            for (name, handle) in &self.tasks {
-                if handle.is_finished() {
-                    error!(
-                        task = %name,
-                        "Kubernetes controller task exited before shutdown was requested"
-                    );
-                    outcome.exited_before_shutdown.push(name.clone());
-                }
-            }
-        }
         // Ignore the send result: with no receivers left there is nothing to
         // notify, and every task is already gone or about to be joined.
         let _ = shutdown_tx.send(true);
 
-        await_controller_tasks(self.tasks, grace, &mut outcome).await;
+        let mut outcome = K8sControllerShutdownOutcome::default();
+        for (name, disposition) in await_controller_tasks(self.tasks, grace).await {
+            match disposition {
+                TaskDisposition::Completed => outcome.completed.push(name),
+                TaskDisposition::ExitedBeforeShutdown => {
+                    error!(
+                        task = %name,
+                        "Kubernetes controller task exited before shutdown was requested"
+                    );
+                    outcome.exited_before_shutdown.push(name);
+                }
+                TaskDisposition::Failed(failure) => {
+                    error!(
+                        task = %failure.task,
+                        panicked = failure.panicked,
+                        error = %failure.detail,
+                        "Kubernetes controller task did not terminate cleanly"
+                    );
+                    outcome.failed.push(failure);
+                }
+                TaskDisposition::TimedOut { abort_confirmed } => {
+                    if !abort_confirmed {
+                        warn!(
+                            task = %name,
+                            settle_secs = ABORT_SETTLE_BUDGET.as_secs_f64(),
+                            "Kubernetes controller task abort was not confirmed within the \
+                             settle budget; its termination is not established"
+                        );
+                        outcome.abort_unconfirmed.push(name.clone());
+                    }
+                    outcome.timed_out.push(name);
+                }
+            }
+        }
         outcome
     }
 }
 
-/// Await named controller tasks concurrently under a single deadline.
+/// Await supervised controller tasks concurrently under a single deadline,
+/// then abort and settle whatever is left.
 ///
 /// Concurrent (rather than sequential) so a slow watcher does not hide a
 /// reconciler panic behind it, and so the whole set shares one grace budget.
+/// Returns dispositions in spawn order (watchers, reconciler, reprobe)
+/// regardless of completion order, so the outcome is deterministic.
 async fn await_controller_tasks(
-    tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+    tasks: Vec<SupervisedTask>,
     grace: Duration,
-    outcome: &mut K8sControllerShutdownOutcome,
-) {
+) -> Vec<(String, TaskDisposition)> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     if tasks.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    // Abort handles are captured up-front: dropping a `JoinHandle` (which is
-    // what dropping the `FuturesUnordered` at the deadline would do) *detaches*
-    // the task rather than stopping it — precisely the bug this shutdown path
-    // exists to fix. Keyed by spawn index so the deadline path reports stuck
-    // tasks in a deterministic order (watchers, reconciler, reprobe).
-    let mut pending: BTreeMap<usize, (String, tokio::task::AbortHandle)> = BTreeMap::new();
+    let mut names: Vec<String> = Vec::with_capacity(tasks.len());
+    let mut dispositions: BTreeMap<usize, TaskDisposition> = BTreeMap::new();
+    // Underlying-task abort handles, keyed by spawn index. The supervisor
+    // futures below are never aborted or dropped early, so the real tasks are
+    // never detached.
+    let mut pending: BTreeMap<usize, tokio::task::AbortHandle> = BTreeMap::new();
     let mut futures = FuturesUnordered::new();
-    for (index, (name, handle)) in tasks.into_iter().enumerate() {
-        pending.insert(index, (name.clone(), handle.abort_handle()));
-        futures.push(async move { (index, name, handle.await) });
+    for (index, task) in tasks.into_iter().enumerate() {
+        names.push(task.name.clone());
+        pending.insert(index, task.abort);
+        let supervisor = task.supervisor;
+        futures.push(async move { (index, supervisor.await) });
     }
 
     let deadline = tokio::time::Instant::now() + grace;
+    let mut timed_out: Vec<usize> = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, futures.next()).await {
-            Ok(Some((index, name, result))) => {
+            Ok(Some((index, joined))) => {
                 pending.remove(&index);
-                match result {
-                    Ok(()) => outcome.completed.push(name),
-                    Err(err) => {
-                        let panicked = err.is_panic();
-                        error!(
-                            task = %name,
-                            panicked,
-                            error = %err,
-                            "Kubernetes controller task did not terminate cleanly"
-                        );
-                        outcome.failed.push(K8sControllerTaskFailure {
-                            task: name,
-                            panicked,
-                            detail: err.to_string(),
-                        });
-                    }
-                }
+                let name = names.get(index).cloned().unwrap_or_default();
+                dispositions.insert(index, classify_completion(name, joined));
             }
             Ok(None) => break,
             Err(_) => {
-                for (name, abort) in std::mem::take(&mut pending).into_values() {
-                    warn!(
-                        task = %name,
-                        grace_secs = grace.as_secs_f64(),
-                        "Kubernetes controller task still running at grace deadline; aborting"
-                    );
+                for (index, abort) in std::mem::take(&mut pending) {
+                    if let Some(name) = names.get(index) {
+                        warn!(
+                            task = %name,
+                            grace_secs = grace.as_secs_f64(),
+                            "Kubernetes controller task still running at grace deadline; aborting"
+                        );
+                    }
                     abort.abort();
-                    outcome.timed_out.push(name);
+                    timed_out.push(index);
                 }
                 break;
             }
         }
+    }
+
+    // Bounded abort-settle phase: an aborted task's `JoinHandle` resolves only
+    // after its future has actually been dropped, so awaiting the supervisors
+    // here is what turns "abort was requested" into "termination happened".
+    // Dropping `futures` without this would reintroduce detach-on-drop.
+    if !timed_out.is_empty() {
+        let mut confirmed: BTreeSet<usize> = BTreeSet::new();
+        let settle_deadline = tokio::time::Instant::now() + ABORT_SETTLE_BUDGET;
+        while confirmed.len() < timed_out.len() {
+            match tokio::time::timeout_at(settle_deadline, futures.next()).await {
+                Ok(Some((index, joined))) => {
+                    // The task was aborted by *this* path, so a cancellation
+                    // JoinError is the expected terminal state and must not be
+                    // double-counted as a separate failure. A panic racing the
+                    // abort is logged but keeps the `timed_out` classification
+                    // for the same reason.
+                    let name = names.get(index).cloned().unwrap_or_default();
+                    if let Ok(completion) = &joined
+                        && let Err(err) = &completion.result
+                        && err.is_panic()
+                    {
+                        error!(
+                            task = %name,
+                            error = %err,
+                            "Kubernetes controller task panicked while being aborted at the \
+                             grace deadline"
+                        );
+                    }
+                    confirmed.insert(index);
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        for index in timed_out {
+            dispositions.insert(
+                index,
+                TaskDisposition::TimedOut {
+                    abort_confirmed: confirmed.contains(&index),
+                },
+            );
+        }
+    }
+
+    // Anything still unresolved here is a *supervisor* whose underlying task
+    // was already aborted above, so dropping `futures` now detaches only the
+    // supervisor — never live controller work — and the situation is reported
+    // as `abort_unconfirmed` rather than claimed as a settled termination.
+    drop(futures);
+
+    let mut resolved: Vec<(String, TaskDisposition)> = Vec::with_capacity(names.len());
+    for (index, name) in names.into_iter().enumerate() {
+        let disposition = match dispositions.remove(&index) {
+            Some(disposition) => disposition,
+            // Unreachable: every index is either joined above, or aborted and
+            // recorded by the settle phase. Classified conservatively rather
+            // than panicking on the shutdown path.
+            None => TaskDisposition::TimedOut {
+                abort_confirmed: false,
+            },
+        };
+        resolved.push((name, disposition));
+    }
+    resolved
+}
+
+/// Turn a supervisor's join result into a terminal disposition.
+fn classify_completion(
+    name: String,
+    joined: Result<TaskCompletion, tokio::task::JoinError>,
+) -> TaskDisposition {
+    match joined {
+        Ok(completion) => match completion.result {
+            Ok(()) if completion.shutdown_observed => TaskDisposition::Completed,
+            // Returned successfully while the shutdown watch was still
+            // `false`: that part of the controller stopped reconciling on its
+            // own.
+            Ok(()) => TaskDisposition::ExitedBeforeShutdown,
+            Err(err) => TaskDisposition::Failed(K8sControllerTaskFailure {
+                task: name,
+                panicked: err.is_panic(),
+                detail: err.to_string(),
+            }),
+        },
+        // The supervisor only awaits a `JoinHandle`, so it cannot panic and is
+        // never aborted; treat a join failure as an abnormal termination of
+        // the task it was supervising rather than swallowing it.
+        Err(err) => TaskDisposition::Failed(K8sControllerTaskFailure {
+            task: name,
+            panicked: err.is_panic(),
+            detail: format!("supervisor join failed: {err}"),
+        }),
     }
 }
 
@@ -382,7 +572,7 @@ pub async fn start_k8s_controller(
         controller_namespace,
         istio_root_namespace,
         gateway_api_data_plane_service_namespace,
-        shutdown,
+        shutdown.clone(),
         Duration::from_secs(300),
     );
 
@@ -394,7 +584,12 @@ pub async fn start_k8s_controller(
     tasks.push(("reconciler".to_string(), reconciler_handle));
     tasks.push(("crd-reprobe".to_string(), reprobe_handle));
 
-    Ok(K8sControllerHandle::from_named_tasks(metrics, tasks))
+    // The same shutdown receiver the tasks themselves watch: each supervisor
+    // reads it at its task's completion boundary, so a watcher/reconciler that
+    // returns during normal operation is recorded as an early exit even though
+    // CP mode only tears the handle down long after the global watch fired.
+    let handle = K8sControllerHandle::from_named_tasks(metrics, tasks, shutdown);
+    Ok(handle)
 }
 
 async fn build_kube_client(

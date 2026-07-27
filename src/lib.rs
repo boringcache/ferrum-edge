@@ -4425,14 +4425,22 @@ pub mod _test_support {
     /// Build a controller handle over synthetic, already-spawned tasks so
     /// external tests can drive the real
     /// [`K8sControllerHandle::shutdown`] path (delayed exit, panic
-    /// propagation, grace-period abort) without a live Kubernetes API server
-    /// and without making the task list a production-public field.
+    /// propagation, grace-period abort, early exit) without a live Kubernetes
+    /// API server and without making the task list a production-public field.
+    ///
+    /// `shutdown` must be the same watch channel the synthetic tasks observe,
+    /// exactly as `start_k8s_controller` passes the receiver its real tasks
+    /// watch: the per-task supervisors read it at each completion boundary.
+    /// Must be called from within a tokio runtime (the supervisors spawn
+    /// immediately, mirroring production).
     pub fn k8s_controller_handle_for_test(
         tasks: Vec<(String, tokio::task::JoinHandle<()>)>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> K8sControllerHandle {
         K8sControllerHandle::from_named_tasks(
             Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
             tasks,
+            shutdown,
         )
     }
 

@@ -3472,7 +3472,13 @@ pub async fn run(
     // any happens-before boundary proving watchers, status writers, and
     // reconciler broadcasts had stopped. `shutdown()` signals the watch
     // channel first, then awaits every task under one bounded grace budget,
-    // aborting and reporting whatever is still running at the deadline.
+    // aborting whatever is still running at the deadline and confirming those
+    // aborts in a bounded settle phase.
+    //
+    // Note the global shutdown watch is already `true` by the time we get here
+    // (`wait_for_cp_listeners_until_shutdown_or_exit` observed or fired it), so
+    // "did this task exit early?" is decided by each task's supervisor at its
+    // own completion boundary, not by inspecting handles now.
     //
     // Ordering: after the listeners, so no DP stream is still consuming
     // reconciler broadcasts while the controller winds down, and before the
@@ -3493,6 +3499,7 @@ pub async fn run(
                     exited_before_shutdown = outcome.exited_before_shutdown.len(),
                     failed = outcome.failed.len(),
                     timed_out = outcome.timed_out.len(),
+                    abort_unconfirmed = outcome.abort_unconfirmed.len(),
                     "Kubernetes CRD controller shutdown was not clean"
                 );
             }
@@ -3517,8 +3524,8 @@ pub async fn run(
     crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
 
     // A listener failure is the more direct operational signal, so it wins the
-    // exit code; a controller-task panic is surfaced only when the listeners
-    // themselves shut down cleanly (it is logged either way).
+    // exit code; a controller-task panic or early exit is surfaced only when
+    // the listeners themselves shut down cleanly (it is logged either way).
     match (listener_result, k8s_controller_result) {
         (Err(err), _) => Err(err),
         (Ok(()), Some(err)) => Err(err),
