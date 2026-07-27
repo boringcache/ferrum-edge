@@ -1,0 +1,371 @@
+# Scheduled and manually runnable multi-protocol performance regression.
+#
+# Runs the multi_protocol matrix on the documented ubuntu-latest runner class
+# with the stable ci-release build profile, records throughput / error rate /
+# p50/p95/p99 per protocol, then exercises connection churn, long-lived soak
+# with RSS/FD/task plateaus, and reload-under-load. Results are compared to
+# versioned budgets (alert/non-block until absolute floors are measured) and a
+# rolling median±MAD baseline when prior trends are available.
+#
+# This workflow is intentionally NOT a required PR check. The lightweight
+# HTTP/1 overhead gate in ci.yml remains the PR path.
+
+name: Protocol Performance Regression
+
+on:
+  schedule:
+    # Sundays 05:00 UTC — sits beside other weekly maintenance crons without
+    # colliding with Saturday scaling-regression or Monday dependency-audit.
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Protocol-matrix duration per protocol (seconds)"
+        required: false
+        default: "8"
+        type: string
+      concurrency:
+        description: "Protocol-matrix concurrent connections"
+        required: false
+        default: "50"
+        type: string
+      iterations:
+        description: "Protocol-matrix iterations (1-3)"
+        required: false
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+      protocols:
+        description: "Protocols to test (or 'all')"
+        required: false
+        default: "all"
+        type: string
+
+concurrency:
+  group: protocol-perf-regression
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  # Documented stable profile for this regression lane.
+  BENCH_BUILD_PROFILE: ci-release
+  BENCH_RUNNER_CLASS: ubuntu-latest
+
+jobs:
+  protocol-perf-regression:
+    name: Protocol Performance Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Verify workflow contract (static)
+        run: |
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
+          python3 .github/scripts/verify_protocol_perf_regression_workflow.py
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-protocol-perf-regression"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler libcurl4-openssl-dev lsof sysstat bc
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          set -euo pipefail
+          mkdir -p protocol-perf-results
+          {
+            echo "=========================================="
+            echo "  RUNNER HEALTH CHECK — PRE-BENCHMARK"
+            echo "=========================================="
+            echo "runner_class=${BENCH_RUNNER_CLASS}"
+            echo "build_profile=${BENCH_BUILD_PROFILE}"
+            echo ""
+            echo "--- CPU Info ---"
+            nproc
+            lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|Socket|MHz|Hypervisor|Virtualization' || true
+            echo ""
+            echo "--- CPU Steal / Usage ---"
+            vmstat 1 6 | tee /tmp/vmstat_pre.txt
+            AVG_STEAL=$(tail -n 5 /tmp/vmstat_pre.txt | awk '{sum += $17; n++} END {printf "%.1f", (n ? sum/n : 0)}')
+            echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+            if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+              echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbor detected. Treat regressions as provisional."
+            fi
+            echo ""
+            echo "--- Memory ---"
+            free -h
+            echo ""
+            echo "--- System Load ---"
+            uptime
+            echo ""
+            AVG_STEAL="$AVG_STEAL" python3 - <<'PY'
+          import json, os, time
+          samples = []
+          for _ in range(100):
+              t0 = time.monotonic_ns()
+              time.sleep(0.001)
+              samples.append((time.monotonic_ns() - t0) / 1000)
+          samples.sort()
+          health = {
+              "runner_class": os.environ["BENCH_RUNNER_CLASS"],
+              "build_profile": os.environ["BENCH_BUILD_PROFILE"],
+              "avg_steal_percent": float(os.environ.get("AVG_STEAL", "0") or 0),
+              "sleep_1ms_avg_us": sum(samples) / len(samples),
+              "sleep_1ms_p99_us": samples[98],
+              "sleep_1ms_max_us": max(samples),
+              "nproc": os.cpu_count(),
+          }
+          open("protocol-perf-results/runner_health.json", "w", encoding="utf-8").write(
+              json.dumps(health, indent=2) + "\n"
+          )
+          print(json.dumps(health, indent=2))
+          if health["sleep_1ms_p99_us"] > 5000:
+              print("::warning::High scheduler jitter detected — runner may be overloaded")
+          PY
+          } 2>&1 | tee protocol-perf-results/runner_health.log
+
+      - name: Build gateway binary (ci-release)
+        # Gateway under test uses the documented stable CI profile. Harness
+        # binaries stay on the multi_protocol package's release profile (that
+        # crate is not a workspace member and does not define ci-release).
+        run: cargo build --profile ci-release --bin ferrum-edge
+
+      - name: Build benchmark tools (release)
+        run: cd tests/performance/multi_protocol && cargo build --release
+
+      - name: Stage gateway binary for harness scripts
+        run: |
+          set -euo pipefail
+          mkdir -p target/release
+          cp target/ci-release/ferrum-edge target/release/ferrum-edge
+
+      - name: Run multi-protocol matrix
+        timeout-minutes: 60
+        env:
+          BENCH_ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '2' }}
+          BENCH_PROTOCOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.protocols || 'all' }}
+          BENCH_DURATION: ${{ github.event_name == 'workflow_dispatch' && inputs.duration || '8' }}
+          BENCH_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.concurrency || '50' }}
+        run: |
+          set -euo pipefail
+          ITERATIONS="$BENCH_ITERATIONS"
+          for run in $(seq 1 "$ITERATIONS"); do
+            echo ""
+            echo "============================================"
+            echo "  PROTOCOL MATRIX RUN ${run}/${ITERATIONS}"
+            echo "============================================"
+            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $17; n++} END {printf "%.1f", (n ? sum/n : 0)}')
+            echo "Pre-run CPU steal: ${AVG_STEAL}%"
+            if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+              echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% — noisy-neighbor risk"
+            fi
+            cd "${{ github.workspace }}/tests/performance/multi_protocol"
+            bash run_protocol_test.sh \
+              "$BENCH_PROTOCOLS" \
+              --skip-build \
+              --duration "$BENCH_DURATION" \
+              --concurrency "$BENCH_CONCURRENCY" \
+              --payload-size 10240 \
+              --json 2>&1 | tee "/tmp/protocol_matrix_run${run}.txt"
+          done
+
+      - name: Collect protocol matrix JSON
+        if: always()
+        env:
+          NUM_ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '2' }}
+        run: |
+          set -euo pipefail
+          mkdir -p protocol-perf-results
+          python3 - <<'PYEOF'
+          import json, os
+
+          def extract_json_blobs(filepath):
+              if not os.path.exists(filepath):
+                  return []
+              raw = open(filepath, encoding="utf-8").read()
+              decoder = json.JSONDecoder()
+              blobs = []
+              i = 0
+              while i < len(raw):
+                  idx = raw.find("{", i)
+                  if idx == -1:
+                      break
+                  try:
+                      obj, end = decoder.raw_decode(raw, idx)
+                      blobs.append(obj)
+                      i = end
+                  except json.JSONDecodeError:
+                      i = idx + 1
+              return blobs
+
+          num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
+          all_runs = {}
+          for run in range(1, num_iterations + 1):
+              blobs = extract_json_blobs(f"/tmp/protocol_matrix_run{run}.txt")
+              all_runs[f"run_{run}"] = blobs
+              with open(f"protocol-perf-results/matrix_run{run}.json", "w", encoding="utf-8") as handle:
+                  json.dump({"benchmarks": blobs}, handle, indent=2)
+                  handle.write("\n")
+              print(f"Run {run}: collected {len(blobs)} benchmark results")
+          with open("protocol-perf-results/matrix_results.json", "w", encoding="utf-8") as handle:
+              json.dump({"runs": all_runs}, handle, indent=2)
+              handle.write("\n")
+          PYEOF
+
+      - name: Run churn / soak / reload scenarios
+        if: always()
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          bash tests/performance/multi_protocol/run_protocol_regression_scenarios.sh \
+            --output-dir protocol-perf-results/scenarios
+
+      - name: Fetch prior trends history (best-effort)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p protocol-perf-results
+          echo '{"schema_version":1,"points":[]}' > protocol-perf-results/history.json
+          # Pull the newest successful run's trends artifact when present so the
+          # rolling median±MAD baseline can accumulate across scheduled runs.
+          prior_run="$(gh run list \
+            --workflow protocol-perf-regression.yml \
+            --branch main \
+            --status success \
+            --limit 10 \
+            --json databaseId,headSha \
+            --jq "map(select(.headSha != \"${CURRENT_SHA}\")) | .[0].databaseId // empty" \
+            || true)"
+          if [[ -n "${prior_run}" ]]; then
+            mkdir -p protocol-perf-results/prior-trends
+            if gh run download "${prior_run}" \
+              -n protocol-perf-trends-latest \
+              -D protocol-perf-results/prior-trends; then
+              if [[ -f protocol-perf-results/prior-trends/protocol_perf_trends.json ]]; then
+                cp protocol-perf-results/prior-trends/protocol_perf_trends.json \
+                  protocol-perf-results/history.json
+                echo "Loaded prior trends from run ${prior_run}"
+              fi
+            else
+              echo "No prior trends artifact on run ${prior_run}; starting fresh history"
+            fi
+          else
+            echo "No prior successful protocol-perf-regression run found"
+          fi
+
+      - name: Evaluate budgets and publish trends
+        if: always()
+        env:
+          BENCH_DURATION: ${{ github.event_name == 'workflow_dispatch' && inputs.duration || '8' }}
+          BENCH_CONCURRENCY: ${{ github.event_name == 'workflow_dispatch' && inputs.concurrency || '50' }}
+          BENCH_PROTOCOLS: ${{ github.event_name == 'workflow_dispatch' && inputs.protocols || 'all' }}
+          BENCH_ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '2' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, datetime
+          root = pathlib.Path("protocol-perf-results")
+          matrix_path = root / "matrix_results.json"
+          scenarios_path = root / "scenarios" / "scenarios.json"
+          health_path = root / "runner_health.json"
+          matrix = json.loads(matrix_path.read_text(encoding="utf-8")) if matrix_path.is_file() else {"runs": {}}
+          scenarios = json.loads(scenarios_path.read_text(encoding="utf-8")) if scenarios_path.is_file() else {}
+          health = json.loads(health_path.read_text(encoding="utf-8")) if health_path.is_file() else {}
+          combined = {
+              "schema_version": 1,
+              "commit": os.environ.get("GITHUB_SHA"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "runner_class": os.environ.get("BENCH_RUNNER_CLASS"),
+              "build_profile": os.environ.get("BENCH_BUILD_PROFILE"),
+              "duration_secs": os.environ.get("BENCH_DURATION"),
+              "concurrency": os.environ.get("BENCH_CONCURRENCY"),
+              "protocols": os.environ.get("BENCH_PROTOCOLS"),
+              "iterations": os.environ.get("BENCH_ITERATIONS"),
+              "runs": matrix.get("runs", {}),
+              "scenarios": scenarios,
+              "runner_health": health,
+          }
+          (root / "combined_results.json").write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8")
+          PY
+
+          # Alert/non-block: evaluator returns 0 while enforcement=alert even
+          # when soft budgets fire warnings. Gate mode would fail the step.
+          python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py \
+            --results protocol-perf-results/combined_results.json \
+            --budgets tests/performance/multi_protocol/protocol_perf_budgets.json \
+            --history protocol-perf-results/history.json \
+            --trends-out protocol-perf-results/protocol_perf_trends.json \
+            --report-out protocol-perf-results/budget_report.json
+
+      - name: Post regression summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          summary = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          report_path = pathlib.Path("protocol-perf-results/budget_report.json")
+          lines = ["## Protocol Performance Regression", ""]
+          lines.append(f"- Runner class: `{os.environ.get('BENCH_RUNNER_CLASS')}`")
+          lines.append(f"- Build profile: `{os.environ.get('BENCH_BUILD_PROFILE')}`")
+          lines.append(f"- Commit: `{os.environ.get('GITHUB_SHA')}`")
+          if report_path.is_file():
+              report = json.loads(report_path.read_text(encoding="utf-8"))
+              lines.append(f"- Budget version: `{report.get('budget_version')}`")
+              lines.append(f"- Enforcement: `{report.get('enforcement')}`")
+              lines.append(f"- Status: **{report.get('status')}**")
+              lines.append("")
+              lines.append("| Protocol | RPS | Error rate | p50 | p95 | p99 |")
+              lines.append("|---|---:|---:|---:|---:|---:|")
+              for proto, sample in sorted(report.get("protocols", {}).items()):
+                  lines.append(
+                      f"| {proto} | {sample.get('rps', 0):.0f} | {sample.get('error_rate', 0):.4f} "
+                      f"| {sample.get('p50_us', 0):.0f}µs | {sample.get('p95_us', 0):.0f}µs "
+                      f"| {sample.get('p99_us', 0):.0f}µs |"
+                  )
+              if report.get("alerts"):
+                  lines.append("")
+                  lines.append("### Alerts (non-blocking while enforcement=alert)")
+                  for alert in report["alerts"]:
+                      lines.append(f"- {alert}")
+          else:
+              lines.append("No budget report produced.")
+          pathlib.Path(summary).write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
+          PY
+
+      - name: Upload protocol performance artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: protocol-perf-regression-${{ github.sha }}
+          path: protocol-perf-results/
+          retention-days: 90
+
+      - name: Upload trends alias artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: protocol-perf-trends-latest
+          path: protocol-perf-results/protocol_perf_trends.json
+          retention-days: 90
+          if-no-files-found: ignore

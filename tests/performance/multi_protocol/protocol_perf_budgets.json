@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "budget_version": "2026-07-26.v1",
+  "description": "Per-protocol performance budgets for the scheduled multi-protocol regression workflow. Absolute throughput/latency floors stay unset until runner variance is measured on ubuntu-latest with the ci-release profile; enforcement starts as alert-only so shared-runner noise does not block merges.",
+  "runner_class": "ubuntu-latest",
+  "build_profile": "ci-release",
+  "enforcement": "alert",
+  "rolling": {
+    "window": 8,
+    "mad_multiplier": 5.0,
+    "min_samples": 3
+  },
+  "global": {
+    "max_error_rate": 0.05,
+    "max_rss_growth_ratio": 2.5,
+    "max_fd_growth_ratio": 2.5,
+    "max_task_growth_ratio": 2.5,
+    "reload_max_error_rate": 0.15
+  },
+  "protocols": {
+    "HTTP/1.1": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "HTTP/1.1+TLS": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "HTTP/2": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "HTTP/3": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "WebSocket": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "gRPC": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "TCP": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "TCP+TLS": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "UDP": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    },
+    "UDP+DTLS": {
+      "min_gateway_rps": null,
+      "max_p50_us": null,
+      "max_p95_us": null,
+      "max_p99_us": null,
+      "max_error_rate": 0.05
+    }
+  }
+}

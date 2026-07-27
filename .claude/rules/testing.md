@@ -11,6 +11,7 @@ paths:
   - "docs/functional_testing*.md"
   - "docs/ci_cd.md"
   - "docs/connection_saturation_benchmark.md"
+  - "docs/protocol_perf_regression.md"
   - "docs/infrastructure_sizing.md"
   - "comparison/**"
 ---
