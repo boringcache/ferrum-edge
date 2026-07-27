@@ -1101,7 +1101,7 @@ impl HboneConnectionPool {
                 sni_override,
                 pool_config,
                 keepalive_override,
-                connect_timeout_override,
+                Some(remaining),
                 crls_before_dial.clone(),
             ),
         )
@@ -1541,38 +1541,6 @@ pub(crate) async fn dial_h2_connect_sender(
         .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
         .unwrap_or(proxy.backend_connect_timeout_ms);
     let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
-    let connect_started = Instant::now();
-
-    let (tcp, sock_addr) = crate::dns::connect_candidates(
-        &candidates,
-        dial_port,
-        connect_timeout,
-        crate::socket_opts::connect_with_socket_opts,
-    )
-    .await
-    .map_err(|error| match error {
-        crate::dns::CandidateConnectError::TimedOut { last_addr } => {
-            HbonePoolError::ConnectTimeout {
-                addr: last_addr.to_string(),
-                timeout_ms: effective_connect_timeout_ms,
-            }
-        }
-        crate::dns::CandidateConnectError::Failed { last_addr, source } => {
-            HbonePoolError::Connect {
-                addr: last_addr.to_string(),
-                source,
-            }
-        }
-    })?;
-    let addr = sock_addr.to_string();
-    let _ = tcp.set_nodelay(true);
-    crate::socket_opts::apply_pooled_tcp_keepalive(
-        "hbone_pool",
-        &tcp,
-        keepalive_override,
-        pool_config.enable_http_keep_alive,
-        pool_config.tcp_keepalive_seconds,
-    );
 
     // `dial_h2_connect_sender` backs in-cluster HBONE egress (any-federated when
     // the operator target carries no pin, else pinned), the PINNED Sidecar
@@ -1602,71 +1570,85 @@ pub(crate) async fn dial_h2_connect_sender(
             }
         })?;
 
-    let Some(remaining) = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-    else {
-        return Err(HbonePoolError::ConnectTimeout {
-            addr,
-            timeout_ms: effective_connect_timeout_ms,
-        });
-    };
-    let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-        .await
-        .map_err(|_| HbonePoolError::ConnectTimeout {
-            addr: addr.clone(),
-            timeout_ms: effective_connect_timeout_ms,
-        })?
-        .map_err(|e| HbonePoolError::TlsHandshake {
-            host: target_host.to_string(),
-            message: e.to_string(),
-        })?;
+    crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |sock_addr| {
+        let connector = connector.clone();
+        let server_name = server_name.clone();
+        async move {
+            let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                .await
+                .map_err(|source| HbonePoolError::Connect {
+                    addr: sock_addr.to_string(),
+                    source,
+                })?;
+            let _ = tcp.set_nodelay(true);
+            crate::socket_opts::apply_pooled_tcp_keepalive(
+                "hbone_pool",
+                &tcp,
+                keepalive_override,
+                pool_config.enable_http_keep_alive,
+                pool_config.tcp_keepalive_seconds,
+            );
 
-    let (stream_window_size, connection_window_size) = h2_window_sizes(pool_config);
-    let mut builder = h2::client::Builder::new();
-    builder
-        .initial_window_size(stream_window_size)
-        .initial_connection_window_size(connection_window_size)
-        .max_frame_size(pool_config.http2_max_frame_size)
-        .max_concurrent_reset_streams(4096);
-    if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-        builder.max_concurrent_streams(max_streams);
-    }
+            let tls_stream =
+                connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| HbonePoolError::TlsHandshake {
+                        host: target_host.to_string(),
+                        message: e.to_string(),
+                    })?;
 
-    let Some(remaining) = crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-    else {
-        return Err(HbonePoolError::ConnectTimeout {
-            addr,
-            timeout_ms: effective_connect_timeout_ms,
-        });
-    };
-    let (sender, mut connection) = tokio::time::timeout(remaining, builder.handshake(tls_stream))
-        .await
-        .map_err(|_| HbonePoolError::ConnectTimeout {
-            addr,
-            timeout_ms: effective_connect_timeout_ms,
-        })?
-        .map_err(|e| HbonePoolError::H2Handshake {
-            host: target_host.to_string(),
-            message: e.to_string(),
-        })?;
-    if pool_config.enable_http2
-        && let Some(ping_pong) = connection.ping_pong()
-    {
-        spawn_h2_keepalive(
-            ping_pong,
-            pool_config.http2_keep_alive_interval_seconds,
-            pool_config.http2_keep_alive_timeout_seconds,
-        );
-    }
+            let (stream_window_size, connection_window_size) =
+                h2_window_sizes(pool_config);
+            let mut builder = h2::client::Builder::new();
+            builder
+                .initial_window_size(stream_window_size)
+                .initial_connection_window_size(connection_window_size)
+                .max_frame_size(pool_config.http2_max_frame_size)
+                .max_concurrent_reset_streams(4096);
+            if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+                builder.max_concurrent_streams(max_streams);
+            }
 
-    // Connection driver exits when all SendRequest handles are dropped.
-    // In-flight tunnels are covered by RequestGuard on the dispatch path.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
+            let (sender, mut connection) =
+                builder
+                    .handshake(tls_stream)
+                    .await
+                    .map_err(|e| HbonePoolError::H2Handshake {
+                        host: target_host.to_string(),
+                        message: e.to_string(),
+                    })?;
+            if pool_config.enable_http2
+                && let Some(ping_pong) = connection.ping_pong()
+            {
+                spawn_h2_keepalive(
+                    ping_pong,
+                    pool_config.http2_keep_alive_interval_seconds,
+                    pool_config.http2_keep_alive_timeout_seconds,
+                );
+            }
+
+            // Spawn only after TLS and H2 have both succeeded. A failed or
+            // timed-out candidate therefore cannot leak a driver task.
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    debug!("mesh h2 connect pool: HTTP/2 connection closed: {}", e);
+                }
+            });
+            Ok(sender)
         }
-    });
-
-    Ok(sender)
+    })
+    .await
+    .map(|(sender, _)| sender)
+    .map_err(|error| match error {
+        crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+            HbonePoolError::ConnectTimeout {
+                addr: last_addr.to_string(),
+                timeout_ms: effective_connect_timeout_ms,
+            }
+        }
+        crate::dns::CandidateConnectError::Failed { source, .. } => source,
+    })
 }
 
 /// Open one HTTP/2 CONNECT stream to `target_host:target_port` over `sender`,

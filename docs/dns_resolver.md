@@ -173,13 +173,26 @@ changing failover order. Publishing a refreshed answer creates a new set and
 resets its cursor to the first address in the new resolver order.
 
 Reqwest receives that entire rotated iterator. Direct HTTP/2, HTTP/3, gRPC,
-WebSocket, TCP/TLS, UDP/DTLS, HBONE, and mesh-mTLS connectors try candidates in
-the same order. They share one `backend_connect_timeout_ms` wall-clock budget:
-when an attempt starts it receives `remaining_budget / candidates_left`; an
-immediate failure advances immediately, a stalled attempt cannot consume the
-share reserved for later addresses, and the last candidate receives all time
-remaining. Exhausting the overall budget is one connect-timeout failure, not a
-new timeout per address.
+WebSocket, TCP/TLS, DTLS, HBONE, and mesh-mTLS connectors establish the usable
+protocol transport across candidates in the same order. They share one
+`backend_connect_timeout_ms` wall-clock budget: when an attempt starts it
+receives `remaining_budget / candidates_left`; an immediate TCP, TLS, identity,
+ALPN, or protocol-handshake failure advances immediately, a stalled attempt
+cannot consume the share reserved for later addresses, and the last candidate
+receives all time remaining. Exhausting the overall budget is one
+connect-timeout failure, not a new timeout per address.
+
+Plain UDP has no comparable peer handshake. `UdpSocket::connect` only associates
+a local socket with a peer and normally succeeds even when that peer is
+unreachable or blackholed. A new UDP session therefore uses the first address
+in its rotated answer set and advances only when local socket bind/connect setup
+fails immediately. A later send error terminates or reports the established
+session; Ferrum does not replay the datagram to another candidate because the
+original delivery outcome is unknowable and replay could duplicate a one-way
+message. Rotation still gives deterministic per-session distribution. DTLS and
+UDP health probes can fail over when their handshake or response contract makes
+failure observable; generic fire-and-forget UDP cannot infer blackhole failover
+without an application-level acknowledgement contract.
 
 Only the socket peer changes during failover. The configured hostname remains
 the HTTP `Host`/`:authority`, TLS/QUIC/DTLS SNI and certificate-verification

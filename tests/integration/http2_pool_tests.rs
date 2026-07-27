@@ -10,16 +10,24 @@ use bytes::Bytes;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::{Http2ConnectionPool, Http2PoolError};
+use hickory_resolver::proto::{
+    op::Message,
+    rr::{RData, Record, RecordType},
+};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 
 // ============================================================================
 // Helpers
@@ -152,6 +160,20 @@ async fn start_h2_tls_backend_with_cert(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<(tokio::task::JoinHandle<()>, u16), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let handle = start_h2_tls_backend_on(listener, cert_pem, key_pem).await?;
+
+    // Give the listener task a moment to start accepting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok((handle, port))
+}
+
+async fn start_h2_tls_backend_on(
+    listener: tokio::net::TcpListener,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let mut cert_reader = cert_pem.as_bytes();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .filter_map(|cert| cert.ok())
@@ -168,9 +190,6 @@ async fn start_h2_tls_backend_with_cert(
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-
     let handle = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -195,9 +214,100 @@ async fn start_h2_tls_backend_with_cert(
         }
     });
 
-    // Give the listener a moment to start accepting
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    Ok((handle, port))
+    Ok(handle)
+}
+
+struct TestDnsServer {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestDnsServer {
+    async fn spawn(answers: Vec<IpAddr>) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind test DNS server");
+        let addr = socket.local_addr().expect("test DNS server address");
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 2_048];
+            loop {
+                let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                let Ok(request) = Message::from_vec(&buffer[..length]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                let mut response = request.into_response();
+                for &address in &answers {
+                    let data = match (query.query_type(), address) {
+                        (RecordType::A, IpAddr::V4(address)) => RData::A(address.into()),
+                        (RecordType::AAAA, IpAddr::V6(address)) => RData::AAAA(address.into()),
+                        _ => continue,
+                    };
+                    response.add_answer(Record::from_rdata(query.name().clone(), 60, data));
+                }
+                if let Ok(encoded) = response.to_vec() {
+                    let _ = socket.send_to(&encoded, peer).await;
+                }
+            }
+        });
+        Self { addr, task }
+    }
+}
+
+impl Drop for TestDnsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn multi_address_dns_cache(dns_addr: SocketAddr) -> DnsCache {
+    DnsCache::new(DnsConfig {
+        resolver_addresses: Some(dns_addr.to_string()),
+        dns_order: Some("A".to_string()),
+        ..DnsConfig::default()
+    })
+}
+
+fn spawn_h2c_backend_on(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    })
+}
+
+async fn bind_dual_loopback_listeners()
+-> (
+    tokio::net::TcpListener,
+    tokio::net::TcpListener,
+    Ipv4Addr,
+    u16,
+) {
+    let failing_ip = Ipv4Addr::new(127, 0, 0, 2);
+    for _ in 0..10 {
+        let healthy = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind healthy loopback listener");
+        let port = healthy
+            .local_addr()
+            .expect("healthy loopback listener address")
+            .port();
+        if let Ok(failing) = tokio::net::TcpListener::bind((failing_ip, port)).await {
+            return (healthy, failing, failing_ip, port);
+        }
+    }
+    panic!("could not reserve one TCP port on both test loopback addresses");
 }
 
 // ============================================================================
@@ -357,6 +467,109 @@ async fn test_http2_pool_get_sender_connects() {
     assert!(
         pool.pool_size() > 0,
         "Pool should have at least one entry after get_sender"
+    );
+}
+
+#[tokio::test]
+async fn test_http2_pool_fails_over_after_tcp_success_but_tls_failure() {
+    let (healthy_listener, failing_listener, failing_ip, port) =
+        bind_dual_loopback_listeners().await;
+    let failing_attempts = Arc::new(AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&failing_attempts);
+    let _failing_task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = failing_listener.accept().await {
+            task_attempts.fetch_add(1, Ordering::Relaxed);
+            // Accept TCP, then deliberately violate TLS. Before the fix this
+            // post-connect failure escaped the candidate loop and the healthy
+            // second address was never attempted.
+            let _ = socket.write_all(b"not a TLS server").await;
+        }
+    });
+
+    let _healthy_task = start_h2_tls_backend_on(
+        healthy_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+    )
+    .await
+    .expect("start healthy H2 backend");
+    let dns = TestDnsServer::spawn(vec![
+        IpAddr::V4(failing_ip),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    ])
+    .await;
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "multi-address-h2.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+
+    let sender = pool.get_sender(&proxy).await;
+    assert!(
+        sender.is_ok(),
+        "healthy second address should complete TLS and H2: {:?}",
+        sender.err()
+    );
+    assert_eq!(
+        failing_attempts.load(Ordering::Relaxed),
+        1,
+        "the TCP-successful, TLS-failing first address must be attempted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
+    let (healthy_listener, failing_listener, failing_ip, port) =
+        bind_dual_loopback_listeners().await;
+    let failing_attempts = Arc::new(AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&failing_attempts);
+    let _failing_task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = failing_listener.accept().await {
+            task_attempts.fetch_add(1, Ordering::Relaxed);
+            // A valid TCP peer speaking HTTP/1.1 cannot satisfy the h2c
+            // prior-knowledge handshake.
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let _healthy_task = spawn_h2c_backend_on(healthy_listener);
+    let dns = TestDnsServer::spawn(vec![
+        IpAddr::V4(failing_ip),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    ])
+    .await;
+    let pool = GrpcConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "multi-address-h2c.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+
+    let sender = pool.get_sender(&proxy).await;
+    assert!(
+        sender.is_ok(),
+        "healthy second address should complete the h2c handshake: {:?}",
+        sender.err()
+    );
+    assert_eq!(
+        failing_attempts.load(Ordering::Relaxed),
+        1,
+        "the TCP-successful, H2-failing first address must be attempted exactly once"
     );
 }
 

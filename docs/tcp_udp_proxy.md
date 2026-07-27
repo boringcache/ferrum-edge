@@ -287,14 +287,24 @@ The separation of TCP and UDP trust stores allows independent certificate rotati
 
 ### Multi-address DNS backends
 
-For a hostname target, TCP, TCP+TLS, UDP, DTLS, passthrough, and mesh stream
+For a hostname target, TCP, TCP+TLS, DTLS, passthrough, and mesh stream
 connectors consume the shared DNS cache's complete rotated answer set. They try
-alternate IPv4 or IPv6 candidates deterministically within the proxy's single
-overall connect budget; a stalled candidate receives only its share of the
-remaining budget. Denied addresses are filtered independently and the dial
-fails closed if no approved address remains. TLS and DTLS continue to use
-`backend_host` (or the configured TLS name override) for SNI and certificate
-verification—the selected IP is only the socket peer. See
+alternate IPv4 or IPv6 candidates deterministically through their relevant
+connect or handshake boundary within the proxy's single overall connect budget;
+a stalled candidate receives only its share of the remaining budget. Denied
+addresses are filtered independently and the dial fails closed if no approved
+address remains. TLS and DTLS continue to use `backend_host` (or the configured
+TLS name override) for SNI and certificate verification—the selected IP is only
+the socket peer.
+
+Plain UDP is different: it has no network handshake, and `UdpSocket::connect`
+does not prove that a peer is reachable. Each session deterministically selects
+the first address in its rotated set and advances only on an immediate local
+bind/connect setup error. Ferrum does not replay a datagram after a send error,
+because it cannot know whether the original reached the application and a retry
+could duplicate one-way traffic. Response-observable failover is available to
+DTLS and UDP health probes; generic plain-UDP blackholes require an
+application-level acknowledgement contract to detect. See
 [DNS address selection and failover](dns_resolver.md#address-selection-and-failover).
 
 Stream proxies support load balancing via upstreams, the same as HTTP proxies:
