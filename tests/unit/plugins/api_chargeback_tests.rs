@@ -3870,12 +3870,8 @@ fn test_same_identity_multi_status_consumes_distinct_entry_slots() {
     registry.configure(5, 3600, 500, 2, TEST_MAX_BYTES);
     let s = scope();
 
-    registry.record_http(
-        &s, "alice", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0,
-    );
-    registry.record_http(
-        &s, "alice", "proxy-a", "API", 404, 0.001, 0, 0, 0.0, 0.0,
-    );
+    registry.record_http(&s, "alice", "proxy-a", "API", 200, 0.001, 0, 0, 0.0, 0.0);
+    registry.record_http(&s, "alice", "proxy-a", "API", 404, 0.001, 0, 0, 0.0, 0.0);
 
     assert_eq!(
         registry.reserved_entries_for_tests(),
@@ -3886,9 +3882,7 @@ fn test_same_identity_multi_status_consumes_distinct_entry_slots() {
     assert_eq!(by_consumer_calls(&registry, "alice"), 2);
 
     // A third status for the same principal is a new row and must overflow.
-    registry.record_http(
-        &s, "alice", "proxy-a", "API", 500, 0.001, 0, 0, 0.0, 0.0,
-    );
+    registry.record_http(&s, "alice", "proxy-a", "API", 500, 0.001, 0, 0, 0.0, 0.0);
 
     assert_eq!(
         registry.reserved_entries_for_tests(),
