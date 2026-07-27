@@ -593,17 +593,12 @@ impl Plugin for GrpcMethodRouter {
             let key = self.rate_key(ctx, full_method);
             let outcome = self.check_rate(&key, spec).await;
             if !outcome.allowed {
-                warn!(
-                    method = %full_method,
-                    plugin = "grpc_method_router",
-                    enforcement_unavailable = outcome.enforcement_unavailable,
-                    "gRPC method rate limit refused"
-                );
                 // Centralized enforcement could not be consulted under
                 // `redis_failure_policy: "fail_closed"`. Refuse without
                 // advertising a budget this gateway is not enforcing; the
                 // gRPC status derives from the HTTP status, so this maps to
-                // UNAVAILABLE rather than RESOURCE_EXHAUSTED.
+                // UNAVAILABLE rather than RESOURCE_EXHAUSTED. The shared
+                // backend owns the once-per-outage warning.
                 if outcome.enforcement_unavailable {
                     return PluginResult::Reject {
                         status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
@@ -611,6 +606,11 @@ impl Plugin for GrpcMethodRouter {
                         headers: grpc_content_type_header(),
                     };
                 }
+                warn!(
+                    method = %full_method,
+                    plugin = "grpc_method_router",
+                    "gRPC method rate limit exceeded"
+                );
                 let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = grpc_content_type_header();
                 headers.insert(

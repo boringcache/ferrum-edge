@@ -1361,8 +1361,8 @@ fn slot_keys_of_one_rate_key_share_a_hash_tag() {
     let config = || make_config("redis://127.0.0.1:6379/0", false);
     let prev = redis_slot_key(config(), "ip:1.2.3.4", &["41"]);
     let curr = redis_slot_key(config(), "ip:1.2.3.4", &["42"]);
-    assert_eq!(prev, "{ferrum:test:ip:1.2.3.4}:41");
-    assert_eq!(curr, "{ferrum:test:ip:1.2.3.4}:42");
+    assert_eq!(prev, "{ferrum%3Atest:ip%3A1.2.3.4}:41");
+    assert_eq!(curr, "{ferrum%3Atest:ip%3A1.2.3.4}:42");
 
     fn hash_tag(key: &str) -> &str {
         let open = key.find('{').expect("hash tag opens");
@@ -1384,6 +1384,16 @@ fn slot_keys_of_one_rate_key_share_a_hash_tag() {
     // an entire policy onto one hot slot.
     let other = redis_slot_key(config(), "ip:5.6.7.8", &["42"]);
     assert_ne!(hash_tag(&curr), hash_tag(&other));
+
+    // Caller-controlled braces cannot terminate the tag early, and delimiters
+    // are escaped so distinct prefix/rate-key pairs cannot collapse onto the
+    // same logical tag.
+    let hostile = redis_slot_key(config(), "identity}:x%y{z", &["42"]);
+    assert_eq!(
+        hash_tag(&hostile),
+        "ferrum%3Atest:identity%7D%3Ax%25y%7Bz"
+    );
+    assert_ne!(hash_tag(&hostile), hash_tag(&curr));
 }
 
 /// Minimal RESP server: replies `+OK` to every command except `INFO`, which gets

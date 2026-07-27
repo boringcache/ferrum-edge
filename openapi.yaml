@@ -9245,7 +9245,7 @@ components:
             Behavior when the centralized Redis store cannot be consulted: an
             outage, an egress/DNS screen failure, or an endpoint rejected as an
             unsupported topology (Redis Cluster is not supported). fail_closed
-            refuses the request with 503 and no rate-limit headers;
+            closes the WebSocket with a policy Close frame;
             local_fallback explicitly opts into per-process budgets, which
             enforce the configured limit once per gateway process. Only
             meaningful with sync_mode=redis, but validated in either mode.
@@ -9343,7 +9343,7 @@ components:
             Behavior when the centralized Redis store cannot be consulted: an
             outage, an egress/DNS screen failure, or an endpoint rejected as an
             unsupported topology (Redis Cluster is not supported). fail_closed
-            refuses the request with 503 and no rate-limit headers;
+            drops the datagram;
             local_fallback explicitly opts into per-process budgets, which
             enforce the configured limit once per gateway process. Only
             meaningful with sync_mode=redis, but validated in either mode.

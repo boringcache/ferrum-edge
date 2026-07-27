@@ -289,6 +289,15 @@ impl AiRateLimiter {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Effective `redis_failure_policy` for advisory coverage. Not a production
+    /// API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
@@ -1571,6 +1580,16 @@ impl Plugin for AiRateLimiter {
         self.evict_stale_entries();
 
         if !outcome.allowed {
+            if outcome.enforcement_unavailable {
+                // The shared failover backend emits one bounded operational
+                // warning per outage. Do not turn an unavailable dependency
+                // into one warning and one "exceeded" metric per request.
+                return PluginResult::Reject {
+                    status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+                    body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             let usage = outcome.usage.unwrap_or(0);
             warn!(
@@ -1578,19 +1597,8 @@ impl Plugin for AiRateLimiter {
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",
-                enforcement_unavailable = outcome.enforcement_unavailable,
-                "AI token rate limit refused"
+                "AI token rate limit exceeded"
             );
-            // Centralized token budgets could not be consulted under
-            // `redis_failure_policy: "fail_closed"`. Refuse without reporting a
-            // usage/limit this gateway has no authoritative view of.
-            if outcome.enforcement_unavailable {
-                return PluginResult::Reject {
-                    status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
-                    body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
             return self.reject(usage);
         }
 

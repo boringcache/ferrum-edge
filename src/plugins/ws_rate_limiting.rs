@@ -107,6 +107,15 @@ impl WsRateLimiting {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Effective `redis_failure_policy` for advisory coverage. Not a production
+    /// API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
@@ -303,7 +312,6 @@ impl Plugin for WsRateLimiting {
         if outcome.allowed {
             return None;
         }
-        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         let dir_label = match direction {
             WebSocketFrameDirection::ClientToBackend => "client->backend",
@@ -311,14 +319,22 @@ impl Plugin for WsRateLimiting {
         };
         // A fail-closed refusal (centralized enforcement unavailable under
         // `redis_failure_policy: "fail_closed"`) closes the connection just like
-        // an exceeded budget — a frame stream has no other refusal channel.
+        // an exceeded budget — a frame stream has no other refusal channel. The
+        // shared backend already emits the bounded once-per-outage warning.
+        if outcome.enforcement_unavailable {
+            return Some(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: self.close_reason.clone().into(),
+            })));
+        }
+
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
         warn!(
             plugin = "ws_rate_limiting",
             proxy_id = %proxy_id,
             connection_id,
             direction = dir_label,
-            enforcement_unavailable = outcome.enforcement_unavailable,
-            "WebSocket frame rate limit refused, closing connection"
+            "WebSocket frame rate exceeded, closing connection"
         );
         Some(Message::Close(Some(CloseFrame {
             code: CloseCode::Policy,

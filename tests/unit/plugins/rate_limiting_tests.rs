@@ -1772,6 +1772,14 @@ fn redis_failure_policy_is_accepted_by_every_rate_limit_consumer() {
             "udp_rate_limiting",
             redis_fields(json!({ "datagrams_per_second": 10 })),
         ),
+        (
+            "ai_rate_limiter",
+            redis_fields(json!({ "token_limit": 100, "window_seconds": 60 })),
+        ),
+        (
+            "ws_rate_limiting",
+            redis_fields(json!({ "frames_per_second": 10, "burst_size": 10 })),
+        ),
     ];
 
     for (plugin, config) in cases {

@@ -835,10 +835,7 @@ where
                 let was_healthy = redis_healthy.swap(is_available, Ordering::Relaxed);
                 if is_available && !was_healthy {
                     fallback_warned.store(false, Ordering::Relaxed);
-                    info!(
-                        plugin = plugin_name,
-                        "Redis rate limiting recovered — switching back from local fallback"
-                    );
+                    info!(plugin = plugin_name, "Redis rate limiting recovered");
                 }
             }
         });

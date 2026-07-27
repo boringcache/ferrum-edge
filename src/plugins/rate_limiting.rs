@@ -410,13 +410,14 @@ impl RateLimiting {
         let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
+            if outcome.enforcement_unavailable {
+                // The shared failover backend emits one bounded operational
+                // warning per outage. Avoid an attacker-rate warning/metric for
+                // every request while centralized enforcement is unavailable.
+                return self.reject(&outcome);
+            }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(
-                rate_limit_key = %key,
-                plugin = "rate_limiting",
-                enforcement_unavailable = outcome.enforcement_unavailable,
-                "Rate limit request refused"
-            );
+            warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&outcome);
         }
 
@@ -428,12 +429,16 @@ impl RateLimiting {
         let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
         if !outcome.allowed {
+            if outcome.enforcement_unavailable {
+                // See `check_rate`: the backend owns bounded outage
+                // observability, and a 503 is not a rate-limit exceedance.
+                return self.reject(&outcome);
+            }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(
                 rate_limit_key = %key,
                 plugin = "rate_limiting",
-                enforcement_unavailable = outcome.enforcement_unavailable,
-                "Rate limit stream connection refused"
+                "Rate limit exceeded (stream)"
             );
             return self.reject(&outcome);
         }

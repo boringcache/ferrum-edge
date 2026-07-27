@@ -145,11 +145,13 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 
 ## Centralized Rate Limiting
 
-- `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
+- `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{prefix:rate_key}:{window_index}` — the braces are a Redis
-  Cluster hash tag so every key of one atomic operation shares a slot. Default prefix is
+- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
+  are a Redis Cluster hash tag so every key of one atomic operation shares a
+  slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit

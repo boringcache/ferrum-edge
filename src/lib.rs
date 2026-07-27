@@ -2420,10 +2420,12 @@ pub mod _test_support {
         config_id: &str,
     ) -> Result<Option<String>, String> {
         use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
         use crate::plugins::graphql::GraphqlPlugin;
         use crate::plugins::grpc_method_router::GrpcMethodRouter;
         use crate::plugins::rate_limiting::RateLimiting;
         use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+        use crate::plugins::ws_rate_limiting::WsRateLimiting;
 
         let http = PluginHttpClient::default();
         match plugin_name {
@@ -2457,10 +2459,12 @@ pub mod _test_support {
         config: &serde_json::Value,
     ) -> Result<Option<RedisFailurePolicy>, String> {
         use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
         use crate::plugins::graphql::GraphqlPlugin;
         use crate::plugins::grpc_method_router::GrpcMethodRouter;
         use crate::plugins::rate_limiting::RateLimiting;
         use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+        use crate::plugins::ws_rate_limiting::WsRateLimiting;
 
         let http = PluginHttpClient::default();
         match plugin_name {
@@ -2473,6 +2477,12 @@ pub mod _test_support {
             }
             "udp_rate_limiting" => Ok(UdpRateLimiting::new_with_http_client(config, http)?
                 .redis_failure_policy_for_test()),
+            "ai_rate_limiter" => {
+                Ok(AiRateLimiter::new(config, http)?.redis_failure_policy_for_test())
+            }
+            "ws_rate_limiting" => {
+                Ok(WsRateLimiting::new(config, http)?.redis_failure_policy_for_test())
+            }
             other => Err(format!("unsupported rate-limit plugin: {other}")),
         }
     }

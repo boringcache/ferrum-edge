@@ -1594,15 +1594,10 @@ impl Plugin for GraphqlPlugin {
             let key = self.rate_key(ctx, "type", op.op_type);
             let outcome = self.check_rate(&key, spec).await;
             if !outcome.allowed {
-                warn!(
-                    op_type = %op.op_type,
-                    plugin = "graphql",
-                    enforcement_unavailable = outcome.enforcement_unavailable,
-                    "GraphQL operation type rate limit refused"
-                );
                 // Centralized enforcement could not be consulted under
                 // `redis_failure_policy: "fail_closed"`: refuse without
-                // advertising a budget this gateway is not enforcing.
+                // advertising a budget this gateway is not enforcing. The
+                // shared backend owns the once-per-outage warning.
                 if outcome.enforcement_unavailable {
                     return PluginResult::Reject {
                         status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
@@ -1610,6 +1605,11 @@ impl Plugin for GraphqlPlugin {
                         headers: json_content_type_header(),
                     };
                 }
+                warn!(
+                    op_type = %op.op_type,
+                    plugin = "graphql",
+                    "GraphQL operation type rate limit exceeded"
+                );
                 let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(
@@ -1635,12 +1635,6 @@ impl Plugin for GraphqlPlugin {
             let key = self.rate_key(ctx, "op", op_name);
             let outcome = self.check_rate(&key, spec).await;
             if !outcome.allowed {
-                warn!(
-                    operation = %op_name,
-                    plugin = "graphql",
-                    enforcement_unavailable = outcome.enforcement_unavailable,
-                    "GraphQL named operation rate limit refused"
-                );
                 // See the operation-type arm above.
                 if outcome.enforcement_unavailable {
                     return PluginResult::Reject {
@@ -1649,6 +1643,11 @@ impl Plugin for GraphqlPlugin {
                         headers: json_content_type_header(),
                     };
                 }
+                warn!(
+                    operation = %op_name,
+                    plugin = "graphql",
+                    "GraphQL named operation rate limit exceeded"
+                );
                 let remaining = outcome.remaining.unwrap_or(0);
                 let mut headers = json_content_type_header();
                 headers.insert(

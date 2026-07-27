@@ -636,6 +636,32 @@ pub fn parse_cluster_enabled(info: &str) -> Option<bool> {
     None
 }
 
+/// Encoded length of one logical Redis hash-tag component.
+///
+/// `%`, `{`, `}`, and `:` are escaped so the outer tag cannot be truncated by
+/// caller-controlled braces and the `prefix:rate_key` boundary is injective.
+fn slot_tag_component_len(value: &str) -> usize {
+    value.chars().fold(0usize, |len, ch| {
+        len.saturating_add(if matches!(ch, '%' | '{' | '}' | ':') {
+            3
+        } else {
+            ch.len_utf8()
+        })
+    })
+}
+
+fn push_slot_tag_component(key: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '%' => key.push_str("%25"),
+            '{' => key.push_str("%7B"),
+            '}' => key.push_str("%7D"),
+            ':' => key.push_str("%3A"),
+            _ => key.push(ch),
+        }
+    }
+}
+
 /// Screen + resolve the Redis endpoint through the gateway DNS cache, NEVER
 /// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
 /// AND the background recovery checker so neither can hand an unscreened host to
@@ -654,7 +680,7 @@ async fn screen_redis_endpoint(
                     warn!(
                         hostname = %hostname,
                         error = %e,
-                        "Redis host blocked by backend egress policy — failing closed (in-memory fallback)"
+                        "Redis host blocked by backend egress policy — centralized Redis unavailable"
                     );
                     return RedisEndpoint::EgressDenied;
                 }
@@ -665,7 +691,7 @@ async fn screen_redis_endpoint(
                 warn!(
                     hostname = %hostname,
                     error = %e,
-                    "DNS cache resolution failed for Redis host — failing closed (in-memory fallback, will retry)"
+                    "DNS cache resolution failed for Redis host — centralized Redis unavailable; will retry"
                 );
                 return RedisEndpoint::ResolveFailed;
             }
@@ -681,7 +707,7 @@ async fn screen_redis_endpoint(
         warn!(
             redis_ip = %ip,
             reason,
-            "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback)"
+            "Redis literal host blocked by backend egress policy — centralized Redis unavailable"
         );
         return RedisEndpoint::EgressDenied;
     }
@@ -1205,15 +1231,17 @@ impl RedisRateLimitClient {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
             RedisEndpoint::EgressDenied => {
-                // Policy denial: fail closed to the in-memory limiter with NO
+                // Policy denial leaves centralized Redis unavailable with NO
                 // recovery checker — it would re-screen and stay denied every
-                // interval. A config change rebuilds the client.
+                // interval. The consumer's explicit failure policy applies
+                // until a config change rebuilds the client.
                 self.mark_unavailable();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
-                // Transient DNS failure: fail closed (never dial an unscreened
-                // host), but let the recovery checker re-screen later.
+                // Transient DNS failure: never dial an unscreened host. Leave
+                // centralized Redis unavailable and let the recovery checker
+                // re-screen later; the consumer's failure policy applies.
                 self.mark_unavailable();
                 self.start_health_checker_if_needed();
                 return None;
@@ -1307,15 +1335,17 @@ impl RedisRateLimitClient {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
             RedisEndpoint::EgressDenied => {
-                // Policy denial: fail closed to the in-memory limiter with NO
+                // Policy denial leaves centralized Redis unavailable with NO
                 // recovery checker — it would re-screen and stay denied every
-                // interval. A config change rebuilds the client.
+                // interval. The consumer's explicit failure policy applies
+                // until a config change rebuilds the client.
                 self.mark_unavailable();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
-                // Transient DNS failure: fail closed (never dial an unscreened
-                // host), but let the recovery checker re-screen later.
+                // Transient DNS failure: never dial an unscreened host. Leave
+                // centralized Redis unavailable and let the recovery checker
+                // re-screen later; the consumer's failure policy applies.
                 self.mark_unavailable();
                 self.start_health_checker_if_needed();
                 return None;
@@ -1397,7 +1427,7 @@ impl RedisRateLimitClient {
                 key_prefix = %self.config.key_prefix,
                 reason,
                 "Redis endpoint reports an unsupported topology (Redis Cluster is not supported) \
-                 — centralized enforcement is disabled for this configuration until it is changed"
+                 — centralized Redis access is disabled for this configuration until it is changed"
             );
         }
     }
@@ -1521,7 +1551,17 @@ impl RedisRateLimitClient {
                     // A PING alone proves nothing about topology, so screen the
                     // recovered endpoint before ever reporting it healthy.
                     if connection_reports_cluster_topology(&mut conn).await {
-                        topology_unsupported.store(true, Ordering::Relaxed);
+                        let already = topology_unsupported.swap(true, Ordering::Relaxed);
+                        if !already {
+                            warn!(
+                                redis_url = %config.redacted_url(),
+                                key_prefix = %config.key_prefix,
+                                reason = "server reported cluster topology during recovery",
+                                "Redis endpoint reports an unsupported topology (Redis Cluster is \
+                                 not supported) — centralized Redis access is disabled for this \
+                                 configuration until it is changed"
+                            );
+                        }
                         return Err(redis::RedisError::from((
                             redis::ErrorKind::InvalidClientConfig,
                             "Redis endpoint reports an unsupported topology (Redis Cluster)",
@@ -1535,16 +1575,14 @@ impl RedisRateLimitClient {
                 match result {
                     Ok(()) => {
                         if !was_available {
-                            info!(
-                                "Redis rate limiting recovered — switching back from local fallback"
-                            );
+                            info!("Redis connection recovered — centralized Redis access restored");
                         }
                         available.store(true, Ordering::Relaxed);
                     }
                     Err(_) => {
-                        if was_available {
+                        if was_available && !topology_unsupported.load(Ordering::Relaxed) {
                             warn!(
-                                "Redis rate limiting health check failed — centralized enforcement unavailable"
+                                "Redis health check failed — centralized Redis unavailable"
                             );
                         }
                         available.store(false, Ordering::Relaxed);
@@ -2265,29 +2303,35 @@ impl RedisRateLimitClient {
     }
 
     /// Build a full Redis key whose prefix + logical rate key share one Redis
-    /// Cluster hash slot: `{prefix:rate_key}:suffix…`.
+    /// Cluster hash slot: `{escaped-prefix:escaped-rate-key}:suffix…`.
     ///
     /// Redis hashes only the bytes between the first `{` and the following `}`,
     /// so every key produced for one `rate_key` — the previous and current
     /// sliding-window buckets, the datagram and byte counters — lands in the
     /// same slot and one multi-key transaction over them can never be a
     /// `CROSSSLOT` error. Different rate keys still spread across slots, so no
-    /// single slot becomes the whole policy's hot spot.
-    ///
-    /// A `rate_key` containing braces of its own only truncates the tag; the
-    /// truncation is deterministic per rate key, so its buckets still co-locate.
+    /// single slot becomes the whole policy's hot spot. The tag components
+    /// percent-escape `%`, braces, and `:` so caller-controlled identities
+    /// cannot terminate the tag early or collide across the prefix/key
+    /// boundary.
     ///
     /// This client refuses Cluster endpoints outright (see the module-level
     /// topology notes); the tag exists so the key layout is already correct if
     /// that ever changes, and it is inert on single-endpoint servers.
     pub fn make_slot_key(&self, rate_key: &str, suffix: &[&str]) -> String {
         let suffix_len: usize = suffix.iter().map(|component| component.len() + 1).sum();
-        let mut key =
-            String::with_capacity(self.config.key_prefix.len() + rate_key.len() + suffix_len + 3);
+        let prefix_len = slot_tag_component_len(&self.config.key_prefix);
+        let rate_key_len = slot_tag_component_len(rate_key);
+        let mut key = String::with_capacity(
+            prefix_len
+                .saturating_add(rate_key_len)
+                .saturating_add(suffix_len)
+                .saturating_add(3),
+        );
         key.push('{');
-        key.push_str(&self.config.key_prefix);
+        push_slot_tag_component(&mut key, &self.config.key_prefix);
         key.push(':');
-        key.push_str(rate_key);
+        push_slot_tag_component(&mut key, rate_key);
         key.push('}');
         for component in suffix {
             key.push(':');

@@ -353,21 +353,17 @@ impl Plugin for UdpRateLimiting {
         if outcome.allowed {
             return UdpDatagramVerdict::Forward;
         }
-        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         if outcome.enforcement_unavailable {
             // Centralized enforcement could not be consulted under
             // `redis_failure_policy: "fail_closed"`. A datagram has no error
-            // channel, so failing closed is the drop itself.
-            warn!(
-                plugin = "udp_rate_limiting",
-                proxy_id = %ctx.proxy_id,
-                client_ip = %ctx.client_ip,
-                "UDP rate limit enforcement unavailable, dropping"
-            );
+            // channel, so failing closed is the drop itself. The shared backend
+            // emits the bounded once-per-outage warning; per-datagram warnings
+            // here would be attacker-controlled log amplification.
             return UdpDatagramVerdict::Drop;
         }
 
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
         match outcome.metric {
             Some("bytes") => warn!(
                 plugin = "udp_rate_limiting",
