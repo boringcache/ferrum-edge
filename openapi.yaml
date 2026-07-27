@@ -15255,7 +15255,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims."
       additionalProperties: false
       properties:
         reject_missing_security_header:
@@ -15469,11 +15469,14 @@ components:
             Nonce replay protection cache (PasswordDigest only). A nonce is
             retained only after its PasswordDigest verifies, and the cache is
             bounded on three independent axes: per-nonce encoded length,
-            retained entries, and total retained bytes. When neither expiry nor
-            a bounded oldest-first eviction batch can free room the request
-            fails closed (HTTP 401) rather than accepting a nonce whose replay
-            window cannot be recorded. This is the only canonical shape; there
-            is no `nonce_replay_protection` alias.
+            retained entries, and retained key UTF-8 payload bytes counted once
+            per shared immutable key allocation. An exact ordered age index
+            provides O(log n) expiry/oldest operations without a lookup-map
+            scan or stale queue. One request examines at most 64 indexed
+            entries; if that bounded work cannot make room the request fails
+            closed (HTTP 401) rather than accepting a nonce whose replay window
+            cannot be recorded. This is the only canonical shape; there is no
+            `nonce_replay_protection` alias.
           additionalProperties: false
           properties:
             cache_ttl_seconds:
@@ -15489,7 +15492,7 @@ components:
               default: 10000
               minimum: 1
               maximum: 1000000
-              description: Maximum nonce cache entries before eviction sweep. Zero is rejected because it would make replay detection inert.
+              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Expiry and exact-oldest eviction use an ordered age index and examine at most 64 entries per request.
             max_encoded_length:
               type: integer
               format: uint64
@@ -15503,7 +15506,7 @@ components:
               default: 8388608
               minimum: 4096
               maximum: 1073741824
-              description: Maximum total retained nonce-key bytes. Must be at least max_encoded_length. Bounds the cache in bytes as well as entries so max_cache_size cannot be multiplied by the per-nonce length.
+              description: Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length.
 
     CorsExactOrigin:
       oneOf:
