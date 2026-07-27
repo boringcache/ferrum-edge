@@ -97,6 +97,7 @@ paths:
 - TCP read/write timeouts refresh on read progress or partial-write progress. Slow but progressing backends must not be classified as inactive. This applies to userspace copy, splice, io_uring splice, and kTLS splice paths uniformly — `splice_one_direction_no_guard`, `libc_splice_loop`, and `io_uring_splice_loop` refresh the same per-direction watermarks the userspace path uses.
 - Stream proxy port validation happens at config, admin API, startup reconcile, and runtime reconcile. Startup bind is fatal in db/file and non-fatal in DP. Runtime reconcile never crashes.
 - DP does not revalidate CP-pushed port conflicts; bind failure skips only the conflicting proxy.
+- TCP `FERRUM_ACCEPT_THREADS > 1` SO_REUSEPORT accept loops are supervised as peers: any unexpected loop exit cancels siblings, clears `started`, and fails the listener task so reconcile/readiness cannot stay healthy with silently reduced accept capacity. Operator shutdown remains a clean success.
 
 ## Pool Keys And DNS
 

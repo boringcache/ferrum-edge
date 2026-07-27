@@ -2481,7 +2481,9 @@ paths:
         - `configured`: remote clusters declared in the **accepted** slice's
           multicluster config — name, trust domain, network, and whether a
           control plane (`control_plane_configured`) / federation endpoint
-          (`federation_endpoint_configured`) is set. Each carries a
+          (`federation_endpoint_configured`) is set, plus the derived
+          `discovery_audience` this data plane binds that cluster's discovery
+          token to. Each carries a
           `discovered` flag cross-referencing the scoped `discovered` view so a
           configured-but-unreachable cluster is visible.
 
@@ -2595,6 +2597,20 @@ paths:
                         federation_endpoint_configured:
                           type: boolean
                           description: Whether a `federation_endpoint` is set for SPIFFE trust-bundle exchange.
+                        discovery_audience:
+                          type: [string, "null"]
+                          description: |
+                            The JWT `aud` value this data plane mints into
+                            cross-cluster remote-discovery tokens for this
+                            cluster, derived from `cluster_name` as
+                            `ferrum-mesh-discovery:<cluster_name>`. Present only
+                            when `control_plane_configured` is `true` — a
+                            federation-only cluster is never polled and mints no
+                            discovery token. Derived configuration, not a
+                            credential: it names the target cluster and reveals
+                            nothing about the JWT secret. The peer control
+                            plane's `FERRUM_MESH_CLUSTER_AUDIENCE` must produce
+                            this same value or the poll is refused.
                         discovered:
                           type: boolean
                           description: |
@@ -2640,6 +2656,7 @@ paths:
                         network: net2
                         control_plane_configured: true
                         federation_endpoint_configured: true
+                        discovery_audience: "ferrum-mesh-discovery:remote-east"
                         discovered: true
                         outbound_trust_active: true
                         inbound_trust_active: true
@@ -3875,7 +3892,9 @@ paths:
         graph's current upstream, plugin-composition, and named-schema
         dependencies are revalidated before commit with the configured backend
         egress policy and real-IP header. Standalone MongoDB fails closed before
-        multi-document compensation writes.
+        multi-document compensation writes. It also refuses direct deletion of
+        an API-spec-owned proxy with `501` before the first ownership-graph
+        mutation; configure a replica set and retry.
       tags: [Proxies]
       responses:
         "204":
@@ -3894,6 +3913,16 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "501":
+          description: |
+            Standalone MongoDB cannot atomically delete the proxy, scoped
+            plugins, owning API-spec row, generated upstreams, and config-change
+            records. The operation is refused before any of those documents are
+            mutated; `detail` names the replica-set configuration to enable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
         "503":
           $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
@@ -6543,6 +6572,30 @@ components:
 
             The combination of `(hosts, listen_path)` must be unique across all
             HTTP proxies in the same namespace.
+
+
+            **Must already be a canonical policy path.** Request paths are
+            canonicalized at the frontend boundary before route lookup:
+            percent-escapes of characters that are legal literally in a path are
+            decoded (`/%61dmin` becomes `/admin`) and every other escape is
+            rejected with `400`: encoded separators (`%2F`, `%3F`, `%23`),
+            double encodings (`%25…`), encoded control characters, invalid
+            escapes, and escapes of bytes outside that decode set (`%20`,
+            `%7B`, and any percent-encoded non-ASCII byte). Dot
+            segments and backslashes are rejected in both spellings — literal
+            (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
+            because the URL parser that builds the backend request line removes
+            dot segments and reads `\` as a separator. A `.` inside a segment
+            (`/v1.0/users`) is an ordinary path character.
+
+
+            A literal `listen_path` containing any of the above is unreachable,
+            and admission rejects it on every create, update, batch, restore,
+            and config-load path. A `~regex` `listen_path` is a pattern rather
+            than a literal path, so only the percent-escape rules apply to it:
+            `\` and `.` are regex syntax there, and `~^/v1\.0/.*` matching the
+            reachable canonical path `/v1.0/x` stays valid. See
+            `docs/request_path_canonicalization.md`.
           examples:
             - /api/v1
             - =/healthz
@@ -8891,8 +8944,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ws_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -8921,9 +8980,11 @@ components:
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. Counter storage supports
+        datagrams within the same window per client IP. Unknown top-level keys
+        are rejected by the runtime and by this schema. Counter storage supports
         only local memory and Redis; database-backed counters are intentionally
         unsupported.
+      additionalProperties: false
       anyOf:
         - required: [datagrams_per_second]
         - required: [bytes_per_second]
@@ -8948,10 +9009,13 @@ components:
           format: uint64
           default: 1
           minimum: 1
+          maximum: 2678400
           description: >-
-            Window length in seconds. Defaults to 1 second. The effective
-            per-window cap is `datagrams_per_second × window_seconds` (and
-            similarly for bytes).
+            Window length in seconds. Defaults to 1 second. Capped at 2678400
+            (31 days) so the derived Redis TTL (`window_seconds + 1`) and
+            activity-retention horizon (`window_seconds × 2`) cannot wrap. The
+            effective per-window cap is `datagrams_per_second × window_seconds`
+            (and similarly for bytes).
         sync_mode:
           type: string
           enum: [local, redis]
@@ -8966,8 +9030,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:udp_rate_limiting"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -11495,6 +11565,21 @@ components:
           description: |
             Always `not_needed`. Persistence is one transaction, so a failure
             never leaves a partial graph to compensate for.
+
+    ProxyDeleteAtomicityFailureResponse:
+      type: object
+      required: [error, detail]
+      description: |
+        A direct delete of an API-spec-owned proxy that was refused before any
+        proxy ownership resource or config-change document was mutated.
+      properties:
+        error:
+          type: string
+          description: Stable, redacted reason the deletion was not applied
+        detail:
+          type: string
+          description: |
+            Replica-set configuration to enable before retrying the deletion.
 
     BackupResponse:
       type: object
@@ -16685,27 +16770,39 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per second
+          maximum: 1000000
+          description: Max requests per second. Capped at 1000000 (see `max_requests`).
         requests_per_minute:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per minute
+          maximum: 1000000
+          description: Max requests per minute. Capped at 1000000 (see `max_requests`).
         requests_per_hour:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per hour
+          maximum: 1000000
+          description: Max requests per hour. Capped at 1000000 (see `max_requests`).
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`.
+          maximum: 2678400
+          description: >-
+            Custom rate-limit window length in seconds. Must be paired with
+            `max_requests`. Capped at 2678400 (31 days) so the window stays
+            representable as a monotonic duration and as a signed Redis TTL.
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests permitted within `window_seconds`.
+          maximum: 1000000
+          description: >-
+            Maximum requests permitted within `window_seconds`. Capped at
+            1000000 as an operational budget ceiling. Local sliding-window
+            memory is bounded independently by a fixed aggregate-bucket ring
+            per key, not by one timestamp per admitted request.
 
     RateLimitingConfig:
       type: object
@@ -16746,8 +16843,14 @@ components:
           description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:rate_limiting"
-          description: Key prefix for all Redis keys (namespace isolation)
+          default: "{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -17516,6 +17619,7 @@ components:
 
     OpenapiValidatorConfig:
       type: object
+      additionalProperties: false
       required: [operations]
       description: |
         Plugin: openapi_validator — validates request and response bodies
@@ -17529,6 +17633,18 @@ components:
         Usually generated by `x-ferrum-validate` on
         `POST /api-specs` or `PUT /api-specs/{id}`; direct creation requires a
         proxy-scoped plugin attached to a proxy with `api_spec_id` set.
+        Every fixed-field object in this schema is closed: an unknown key at the
+        root or in `bypass`, `error_response`, an `operations[]` entry, or
+        `request_body` is rejected at construction so a misspelled enforcement
+        control cannot silently fall back to a weaker default. An explicit
+        `null` for a non-null field is likewise rejected instead of selecting
+        its omission default. Free-form maps
+        (media types, response status keys, `bypass.header_present`, encoding
+        property names) stay open but their keys are shape-validated.
+        Response schema failures emit only a fixed generic message plus the
+        operator/schema-controlled schema location; backend instance values and
+        JSON property names never appear in client problem bodies or
+        `openapi_validator.response_error` metadata.
       properties:
         enforcement_mode:
           type: string
@@ -17545,8 +17661,10 @@ components:
           description: Validate response bodies when an operation has a response schema.
         request_content_types:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
           default:
             - application/json
             - application/xml
@@ -17558,8 +17676,10 @@ components:
           description: Request media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types.
         response_content_types:
           type: array
+          uniqueItems: true
           items:
             type: string
+            pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
           default:
             - application/json
             - application/xml
@@ -17576,7 +17696,16 @@ components:
         fail_on_missing_response_schema:
           type: boolean
           default: false
-          description: Reject responses with no exact/default schema for the status and content type.
+          description: >-
+            Reject a response whose selected response object yields no schema.
+            Applied after status selection to a missing `Content-Type`, a
+            content type outside `response_content_types`, an unmatched declared
+            media type, a body returned for a status with no declared content,
+            and a status covered by no response object. An empty body for an
+            explicitly empty response declaration remains valid. Statuses with
+            no body semantics (HEAD, 1xx, 204, 205, 304) are always skipped.
+            Strict mode still schedules the response hook when every declared
+            response has an empty content map.
         max_body_bytes:
           type: integer
           format: uint64
@@ -17622,10 +17751,15 @@ components:
               description: Consumer identities that skip validation.
             header_present:
               type: object
+              propertyNames:
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
               additionalProperties:
                 type: [string, "null"]
               default: {}
-              description: Header-name map. Null means any value; a string requires exact value.
+              description: >-
+                Header-name map. Null means any value; a string requires exact
+                value. Keys are matched case-insensitively at runtime; case-
+                equivalent duplicate keys are rejected at construction.
         error_response:
           type: object
           additionalProperties: false
@@ -17644,6 +17778,7 @@ components:
               default: 502
             content_type:
               type: string
+              pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:;.*)?$"
               default: application/problem+json
         error_truncate_chars:
           type: integer
@@ -17663,6 +17798,14 @@ components:
       type: object
       additionalProperties: false
       required: [method, path_template, path_regex]
+      allOf:
+        - if:
+            required: [request_required]
+            properties:
+              request_required:
+                const: true
+          then:
+            required: [request_body]
       properties:
         method:
           type: string
@@ -17691,18 +17834,36 @@ components:
           description: Reject empty request bodies when the OpenAPI requestBody is required.
         request_body:
           type: object
+          additionalProperties: false
+          oneOf:
+            - required: [content]
+              not:
+                anyOf:
+                  - required: [content_type]
+                  - required: [schema]
+                  - required: [encoding]
+            - required: [content_type, schema]
+              not:
+                required: [content]
           properties:
             content:
               type: object
+              minProperties: 1
+              propertyNames:
+                pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorMediaTypeContent"
               description: >
                 Media type to schema map. Each entry is either a bare JSON Schema
                 (object or boolean) or, when encoding metadata is present, a Media
-                Type Object with required `schema` and `encoding` fields.
+                Type Object with required `schema` and `encoding` fields. Keys must
+                be a media type or media range (`type/subtype`, `type/*`, `*/*`).
+                Exactly one of `content` or the `content_type` + `schema` form is
+                allowed; the object is never treated as its own media map.
             content_type:
               type: string
-              description: Alternate single-schema form.
+              pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+              description: Alternate single-schema form. Requires `schema`.
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
               description: Alternate single-schema form (object or boolean schema).
@@ -17714,14 +17875,49 @@ components:
           description: Request body schemas by media type.
         responses:
           type: object
+          propertyNames:
+            pattern: "^(?:[1-5][0-9]{2}|[1-5][Xx]{2}|[Dd][Ee][Ff][Aa][Uu][Ll][Tt])$"
           additionalProperties:
-            type: object
-            additionalProperties:
-              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            $ref: "#/components/schemas/OpenapiValidatorResponse"
           description: >
             Status code to media type to JSON Schema map (object or boolean schemas).
-            Exact status codes are checked first, OpenAPI wildcard ranges such as `4XX`
-            are checked next, and `default` is used as the final fallback.
+            Response selection is status-first: an exact status code wins, then the
+            narrowest matching OpenAPI wildcard range such as `4XX`, then `default`.
+            A selected response object is final — a media-type miss inside it never
+            falls through to a range or `default` object, because those cover status
+            codes that are not otherwise declared. Media keys must be a media type or
+            media range (`type/subtype`, `type/*`, `*/*`) and are matched
+            most-specific-first. A declared status with an empty media map means the
+            status is declared to carry no content; the importer emits those entries
+            so the precedence rule holds. A status entry may alternatively use the
+            OpenAPI Response Object shape `{description?, content: {mediaType: schema}}`;
+            that form is closed and rejects any other key.
+
+    OpenapiValidatorResponse:
+      description: >
+        One response status entry, either the generated media-map form or the
+        closed OpenAPI Response Object form.
+      oneOf:
+        - type: object
+          propertyNames:
+            pattern: "^(?:description|(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?)$"
+          properties:
+            description:
+              type: [string, "null"]
+          additionalProperties:
+            $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        - type: object
+          required: [content]
+          additionalProperties: false
+          properties:
+            description:
+              type: [string, "null"]
+            content:
+              type: object
+              propertyNames:
+                pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+              additionalProperties:
+                $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
 
     OpenapiValidatorMediaTypeContent:
       description: >
@@ -17789,13 +17985,55 @@ components:
           maxProperties: 32
           propertyNames:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
-          additionalProperties: true
+          additionalProperties:
+            $ref: "#/components/schemas/OpenapiValidatorEncodingHeader"
           description: >
             Additional multipart part Header Objects. Present values are validated
             against their schemas; an absent header fails only when its Header Object
             sets required=true (the OpenAPI default is false). Only valid for
             multipart/form-data. Must not redefine Content-Type, Content-Disposition,
-            or Content-Transfer-Encoding.
+            or Content-Transfer-Encoding. Case-equivalent duplicate header names are
+            rejected at construction and during API-spec extraction.
+
+    OpenapiValidatorEncodingHeader:
+      description: >
+        Multipart Encoding Object header entry. A bare JSON Schema preserves
+        Ferrum's historical required-header form. A Header Object is selected
+        by `schema` and is closed so misspelled presence controls cannot weaken
+        validation.
+      oneOf:
+        - allOf:
+            - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            - not:
+                type: object
+                anyOf:
+                  - required: [schema]
+                  - required: [content]
+        - type: object
+          required: [schema]
+          additionalProperties: false
+          properties:
+            description:
+              type: [string, "null"]
+            required:
+              type: boolean
+              default: false
+            deprecated:
+              type: boolean
+            allowEmptyValue:
+              type: boolean
+            style:
+              type: string
+              enum: [simple]
+            explode:
+              type: boolean
+            allowReserved:
+              type: boolean
+            schema:
+              $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+            example: true
+            examples:
+              type: object
 
     RequestTerminationConfig:
       type: object
@@ -17870,11 +18108,25 @@ components:
             path_prefix:
               type: string
               description: >-
-                Only terminate when the request path starts with this prefix.
-                Must start with `/`, or be exactly `*` to match the
+                Only terminate when the canonical request path starts with this
+                prefix. Must start with `/`, or be exactly `*` to match the
                 asterisk-form target of a server-wide `OPTIONS *` request, and
                 contain no control characters; any other value can never match
-                a request path. Mutually exclusive with `header`.
+                a request path. The prefix must also already be a canonical
+                policy path: request paths are canonicalized at the frontend
+                boundary (percent-escapes of characters that are legal
+                literally in a path are decoded, and every other escape —
+                separators, double encodings, control characters, invalid
+                escapes, and escapes of bytes outside that decode set such as
+                `%20` or `%7B` — is rejected with `400`,
+                as are dot segments and backslashes in either spelling). No
+                percent escape, literal `\`, or literal `.`/`..` segment can
+                appear in a canonical path, so a prefix such as `/%61dmin`,
+                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, or
+                `/api\admin` is rejected at admission rather than silently
+                never matching. A `.` inside a segment is fine. See
+                `docs/request_path_canonicalization.md`. Mutually exclusive
+                with `header`.
             header:
               type: string
               description: >-
@@ -18654,8 +18906,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:graphql"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:graphql:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18686,13 +18944,15 @@ components:
 
     GrpcMethodRouterConfig:
       type: object
+      additionalProperties: false
       description: >-
         Plugin: grpc_method_router — Per-method access control and rate limiting
         for gRPC services. Authorizes the backend-effective gRPC path after
         route rewrites, listen-path stripping, backend-path composition, and
         initial target selection, then populates grpc_service, grpc_method, and
         grpc_full_method metadata with that final method. At least one access or
-        rate rule is required. Rate-limit counter storage supports only local
+        rate rule is required. Unknown top-level keys are rejected by the runtime
+        and by this schema. Rate-limit counter storage supports only local
         memory and Redis; database-backed counters are intentionally unsupported.
       allOf:
         - anyOf:
@@ -18770,8 +19030,14 @@ components:
         redis_key_prefix:
           type: string
           minLength: 1
-          default: "ferrum:grpc_method_router"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -18916,7 +19182,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, sampling/admission, or record emission. The local staging entry is the instance's commit capability and is consumed by atomic removal at buffered or stream-terminal commit. Orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -19100,7 +19366,7 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
@@ -19447,7 +19713,12 @@ components:
         embedding provider and a local HNSW vector index.
         Supports local DashMap and Redis exact-response storage. Redis mode
         requires redis_integrity_key and treats Redis as an untrusted,
-        authenticated trust boundary. Multiple
+        authenticated trust boundary. Quarantine DEL failures are counted with
+        rate-limited warnings (no keys/payloads/credentials) and suppressed by a
+        bounded per-instance local fingerprint+TTL marker (fingerprints only
+        after admission failure; constant-work capacity eviction) so the same
+        poisoned remote value cannot amplify download/parse/delete on every
+        request; suppression never converts a miss into a hit. Multiple
         instances on one proxy namespace request staging metadata under
         ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
         per-instance RequestContext maps so differing key policies and
@@ -19792,8 +20063,12 @@ components:
         window_seconds:
           type: integer
           minimum: 1
+          maximum: 2678400
           default: 60
-          description: Sliding window duration in seconds
+          description: >-
+            Sliding window duration in seconds. Capped at 2678400 (31 days) so
+            the window stays representable as a monotonic duration and a signed
+            Redis TTL.
         count_mode:
           type: string
           enum: [total_tokens, prompt_tokens, completion_tokens]
@@ -19843,8 +20118,14 @@ components:
           description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_rate_limiter"
-          description: Key prefix for all Redis keys
+          default: "{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}"
+          description: >-
+            Key prefix for all Redis keys. Defaults to
+            `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
+            independent policies of this plugin type in one namespace do not
+            share counters. Setting this explicitly is the documented opt-in
+            for a deliberately shared budget: every instance configured with
+            the same prefix increments and rejects against the same counters.
         redis_pool_size:
           type: integer
           minimum: 1
@@ -22327,32 +22608,46 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     RateSpec:
       type: object
+      additionalProperties: false
       description: >-
-        Rate limit specification used by grpc_method_router. Both fields are
-        required and must be positive integers. The gRPC runtime currently
-        ignores additional keys, so this shared component remains open to
-        preserve schema/runtime parity.
+        Closed rate limit specification used by grpc_method_router. Both fields
+        are required and must be positive integers; unknown keys are rejected by
+        the runtime and by this schema.
       required: [max_requests, window_seconds]
       properties:
         max_requests:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum requests allowed in the window
+          maximum: 1000000
+          description: >-
+            Maximum requests allowed in the window. Capped at 1000000 as an
+            operational budget ceiling. Local sliding-window memory is bounded
+            independently by a fixed aggregate-bucket ring per key.
         window_seconds:
           type: integer
           format: uint64
           minimum: 1
-          description: Time window in seconds
+          maximum: 2678400
+          description: >-
+            Time window in seconds. Capped at 2678400 (31 days) so the window
+            stays representable as a monotonic duration and a signed Redis TTL.
 
     # ── Cluster Status ─────────────────────────────────────────────────
 

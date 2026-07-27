@@ -13,6 +13,7 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -2725,38 +2726,38 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
     escaping_backslashes % 2 == 0
 }
 
-/// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)
-/// slash escapes anywhere in a `listen_path` value.
+/// Why a configured `listen_path` is not already a canonical policy path, or
+/// `None` when it is usable as written.
 ///
-/// Must stay in lockstep with `normalize_encoded_slashes` in
-/// `src/router_cache.rs`: the runtime normalizes the same set of encodings
-/// on every inbound request path before route lookup, so admission has to
-/// reject the matching set to keep routing/auth lookups symmetric. If the
-/// runtime normalizer is ever taught to recognise additional encodings
-/// (triple-encoded slashes, encoded backslashes, etc.) this helper must be
-/// extended in the same change.
-fn contains_encoded_slash(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
-                return true;
-            }
-            if i + 4 < bytes.len()
-                && bytes[i + 1] == b'2'
-                && bytes[i + 2] == b'5'
-                && bytes[i + 3] == b'2'
-                && matches!(bytes[i + 4], b'F' | b'f')
-            {
-                return true;
-            }
-        }
-        i += 1;
+/// Route lookup runs on the canonical request path
+/// (`crate::policy_path::canonicalize_policy_path`), so a `listen_path` that
+/// is not itself canonical can never match: either the runtime would reject
+/// every request that spelled it that way (`/api%2Fadmin`, an encoded
+/// separator) or the runtime path would canonicalize to different bytes
+/// (`/%61dmin` -> `/admin`). Both are silently unreachable routes, which is
+/// exactly the routing/auth asymmetry the canonical representation exists to
+/// remove — so admission rejects them instead. Delegating to the runtime
+/// canonicalizer keeps admission and request handling on one model rather
+/// than two hand-maintained encoding tables.
+///
+/// The value is checked exactly as written, markers included, matching the
+/// previous encoded-slash admission. `~` and `=` are ordinary path characters
+/// to the canonicalizer, and a regex or exact literal carrying an escape the
+/// runtime would refuse is unreachable for the same reason.
+///
+/// A `~regex` value is a *pattern*, not a literal path, so only the escape
+/// half of the contract applies to it: `\` and `.` are regex syntax there
+/// (`~^/v1\.0/.*` matches the reachable canonical path `/v1.0/x`), while the
+/// canonical request path the pattern is evaluated against already cannot
+/// contain a backslash or a dot segment. Exact (`=/…`) and prefix values are
+/// compared byte-for-byte against that canonical path, so they are held to the
+/// full contract.
+fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
+    if path.starts_with('~') {
+        crate::policy_path::non_canonical_policy_path_pattern_reason(path)
+    } else {
+        crate::policy_path::non_canonical_policy_path_reason(path)
     }
-
-    false
 }
 
 /// Whether a proxy's retry policy can actually trigger for at least one request
@@ -3082,72 +3083,81 @@ pub(crate) fn mesh_transport_retry_conflict_message(
     )
 }
 
-/// Whether a plugin config is known to force request-body buffering for at
-/// least some requests when enabled.
+/// Outcome of screening one enabled plugin config for backend-TLS SNI
+/// request-body-buffering admission.
 ///
-/// Used by backend-TLS SNI admission: plain HTTPS SNI overrides require the
-/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
-/// Config-dependent plugins are screened from their JSON config; unknown /
-/// custom plugins are left to the runtime fail-closed 502 path.
-fn plugin_config_forces_request_body_buffering(pc: &PluginConfig) -> bool {
+/// `shadows_same_named_global` mirrors `PluginCache` merge rules: a disabled
+/// config never shadows; a successfully constructed local (or a
+/// custom/unknown/`Ok(None)` name) does; a built-in whose configuration fails
+/// to construct does not — the cache's `Err` arm leaves the global in place.
+struct SniBufferingScreenEffect {
+    forces_buffering: bool,
+    shadows_same_named_global: bool,
+}
+
+/// Screen one plugin config for SNI buffering admission.
+///
+/// The buffering answer comes from the authoritative
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
+/// on an instance built from the SAME parsed configuration the runtime
+/// `PluginCache` builds — there is no second, config-shaped re-implementation
+/// of the predicate to drift out of sync. See
+/// [`crate::plugins::RequestBodyBufferingScreener`] for the side-effect
+/// guarantees of that construction.
+///
+/// A plugin the screen cannot evaluate (custom / unknown plugin, or a
+/// configuration that does not construct) is admitted with a value-redacted
+/// warning, preserving the documented residual: those requests still fail
+/// closed at runtime with a `502` and
+/// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
+fn screen_plugin_config_for_sni_buffering(
+    proxy_id: &str,
+    pc: &PluginConfig,
+    screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
+) -> SniBufferingScreenEffect {
     if !pc.enabled {
-        return false;
+        return SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: false,
+        };
     }
-    match pc.plugin_name.as_str() {
-        "grpc_web"
-        | "ai_prompt_compressor"
-        | "ai_stream_router"
-        | "ai_federation"
-        | "ai_transcript_audit"
-        | "ai_tool_governor"
-        | "ai_rate_limiter"
-        | "openapi_validator"
-        | "opa"
-        | "mcp_gateway" => true,
-        "request_transformer" => {
-            pc.config
-                .get("body")
-                .is_some_and(|body| !body.is_null() && body != &serde_json::Value::Null)
-                || pc
-                    .config
-                    .get("body_rules")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|rules| !rules.is_empty())
-                || pc
-                    .config
-                    .get("request")
-                    .and_then(|v| v.get("body"))
-                    .is_some_and(|body| !body.is_null())
+    // Built on first use: a proxy whose effective plugin configs are all
+    // disabled (or absent) never constructs the screener's HTTP client.
+    let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
+    match screener.screen(&pc.plugin_name, &pc.config) {
+        crate::plugins::RequestBodyBufferingScreen::Buffers => SniBufferingScreenEffect {
+            forces_buffering: true,
+            shadows_same_named_global: true,
+        },
+        crate::plugins::RequestBodyBufferingScreen::Streams => SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: true,
+        },
+        crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
+            tracing::warn!(
+                proxy_id = %proxy_id,
+                plugin_config_id = %pc.id,
+                plugin_name = %pc.plugin_name,
+                reason = gap.as_str(),
+                "Backend TLS SNI admission could not evaluate request-body buffering for this \
+                 plugin; admitting the proxy. Direct HTTP/2 SNI dispatch still fails closed at \
+                 runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
+                 plugin buffers request bodies"
+            );
+            // `NotBuiltin` covers custom/unknown names and retired aliases
+            // (`Ok(None)`): PluginCache still removes the same-named global in
+            // those arms. Prefer shadowing (and the documented admit residual)
+            // over a false SNI rejection. `ConstructionFailed` mirrors the
+            // cache's `Err` arm and must not shadow.
+            let shadows_same_named_global = matches!(
+                gap,
+                crate::plugins::RequestBodyBufferingScreenGap::NotBuiltin
+            );
+            SniBufferingScreenEffect {
+                forces_buffering: false,
+                shadows_same_named_global,
+            }
         }
-        "compression" => pc
-            .config
-            .get("decompress_request")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "waf" => pc
-            .config
-            .get("request_body_inspection")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "body_validator" => {
-            // Any non-empty request schema / validation config forces buffering.
-            pc.config.get("request").is_some()
-                || pc.config.get("json_schema").is_some()
-                || pc.config.get("xml_schema").is_some()
-                || pc
-                    .config
-                    .get("content_types")
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|m| !m.is_empty())
-        }
-        "ai_request_guard" | "ai_prompt_shield" => {
-            // These buffer when body transforms are configured; treat any
-            // non-empty config beyond enable flags as potentially buffering.
-            pc.config
-                .as_object()
-                .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
-        }
-        _ => false,
     }
 }
 
@@ -3193,6 +3203,14 @@ fn proxy_plain_https_sni_sources<'a>(
 /// on the direct-H2 pool (retry body replay, request-body buffering plugins,
 /// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
 /// per-port TLS overlays so `validate` catches guaranteed total outages.
+///
+/// The buffering leg is derived from the runtime
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
+/// plugin built from the same parsed config (see
+/// [`screen_plugin_config_for_sni_buffering`]), so it tracks every
+/// conditional buffering plugin exactly and needs no per-plugin maintenance.
+/// Plugin construction happens only for proxies that actually carry a plain
+/// HTTPS SNI override, and only for that proxy's effective plugin configs.
 pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     proxy: &Proxy,
     upstream: Option<&Upstream>,
@@ -3229,33 +3247,51 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         ));
     }
 
-    // Effective plugins for this proxy: associations + globals (unless a
-    // local instance shadows that plugin name — mirror PluginCache merging
-    // for the buffering screen only).
+    // Effective plugins for this proxy: associations + globals in the proxy's
+    // namespace (unless a local instance shadows that plugin name — mirror
+    // PluginCache tenancy and merge rules for the buffering screen only).
+    //
+    // The screener owns an HTTP client, so build it lazily: proxies without an
+    // effective plugin config never pay for one, and non-SNI proxies already
+    // returned above.
+    let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
     let mut local_names: HashSet<&str> = HashSet::new();
     for assoc in &proxy.plugins {
-        if let Some(pc) = plugin_configs
+        let Some(pc) = plugin_configs
             .iter()
-            .find(|pc| pc.id == assoc.plugin_config_id)
-        {
+            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
+        else {
+            continue;
+        };
+        match pc.scope {
+            PluginScope::Global => continue,
+            PluginScope::Proxy if pc.proxy_id.as_deref() != Some(proxy.id.as_str()) => continue,
+            PluginScope::Proxy | PluginScope::ProxyGroup => {}
+        }
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        // Mirror PluginCache: only locals that would enter (or deliberately
+        // clear) the merge list shadow a same-named global. Disabled
+        // configs and construction failures do not.
+        if effect.shadows_same_named_global {
             local_names.insert(pc.plugin_name.as_str());
-            if plugin_config_forces_request_body_buffering(pc) {
-                errors.push(format!(
-                    "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                     request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                    proxy.id, pc.id
-                ));
-            }
+        }
+        if effect.forces_buffering {
+            errors.push(format!(
+                "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
+                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
+                proxy.id, pc.id
+            ));
         }
     }
     for pc in plugin_configs {
-        if pc.scope != PluginScope::Global {
+        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
             continue;
         }
         if local_names.contains(pc.plugin_name.as_str()) {
             continue;
         }
-        if plugin_config_forces_request_body_buffering(pc) {
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        if effect.forces_buffering {
             errors.push(format!(
                 "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                  request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
@@ -3573,8 +3609,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Reject any proxy whose `listen_path` contains a percent-encoded slash
-    /// (`%2F`/`%2f` or `%252F`/`%252f`).
+    /// Reject any proxy whose `listen_path` is not already a canonical policy
+    /// path (`crate::policy_path`).
     ///
     /// Runs as a dedicated rejecting validator on every load/reload path
     /// because the catch-all `validate_all_fields_with_ip_policy()` is wired
@@ -3584,8 +3620,8 @@ impl GatewayConfig {
     /// returned by a Mongo backend would still be served and silently
     /// unreachable — the routing/auth bypass the admission rejection in
     /// `Proxy::validate_fields()` is meant to eliminate. Paired with
-    /// `contains_encoded_slash()` in this module and
-    /// `normalize_encoded_slashes()` in `src/router_cache.rs`.
+    /// `non_canonical_listen_path_reason()` in this module and
+    /// `canonicalize_policy_path()` in `src/policy_path.rs`.
     pub fn validate_listen_path_encodings(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
@@ -3595,10 +3631,10 @@ impl GatewayConfig {
             let Some(path) = proxy.listen_path.as_deref() else {
                 continue;
             };
-            if contains_encoded_slash(path) {
+            if let Some(reason) = non_canonical_listen_path_reason(path) {
                 errors.push(format!(
-                    "Proxy '{}': listen_path '{}' contains encoded slashes (%2F or %252F); request paths are normalized before route lookup, so an encoded-slash listen_path is unreachable and creates a routing/auth bypass",
-                    proxy.id, path
+                    "Proxy '{}': listen_path '{}' is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
+                    proxy.id, path, reason
                 ));
             }
         }
@@ -6702,11 +6738,12 @@ impl Proxy {
                                 .to_string(),
                         );
                     }
-                    if contains_encoded_slash(path) {
-                        errors.push(
-                            "listen_path must not contain encoded slashes (%2F or %252F)"
-                                .to_string(),
-                        );
+                    if let Some(reason) = non_canonical_listen_path_reason(path) {
+                        errors.push(format!(
+                            "listen_path must already be a canonical policy path ({reason}); \
+                             request paths are canonicalized before route lookup, so a \
+                             non-canonical listen_path is unreachable and creates a routing/auth bypass"
+                        ));
                     }
                 }
             }
