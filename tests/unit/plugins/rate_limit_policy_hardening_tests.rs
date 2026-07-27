@@ -182,12 +182,12 @@ fn udp_rate_limiting_accepts_every_documented_root_key() {
 
 #[test]
 fn ws_rate_limiting_rejects_misspelled_frame_and_redis_keys() {
-    let fps_error = create_plugin(
-        "ws_rate_limiting",
-        &json!({"frames_per_secod": 1}),
-    )
-    .expect_err("misspelled frames_per_second must fail admission");
-    assert!(fps_error.contains("unknown configuration key(s)"), "{fps_error}");
+    let fps_error = create_plugin("ws_rate_limiting", &json!({"frames_per_secod": 1}))
+        .expect_err("misspelled frames_per_second must fail admission");
+    assert!(
+        fps_error.contains("unknown configuration key(s)"),
+        "{fps_error}"
+    );
     assert!(fps_error.contains("frames_per_secod"), "{fps_error}");
     assert!(fps_error.contains("frames_per_second"), "{fps_error}");
 

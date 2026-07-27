@@ -541,11 +541,8 @@ fn test_invalid_close_reason_type_returns_error() {
 
 #[test]
 fn test_rejects_unknown_root_keys() {
-    let error = WsRateLimiting::new(
-        &json!({"frames_per_secod": 1}),
-        PluginHttpClient::default(),
-    )
-    .expect_err("misspelled frames_per_second must fail admission");
+    let error = WsRateLimiting::new(&json!({"frames_per_secod": 1}), PluginHttpClient::default())
+        .expect_err("misspelled frames_per_second must fail admission");
     assert!(error.contains("unknown configuration key(s)"), "{error}");
     assert!(error.contains("frames_per_secod"), "{error}");
     assert!(error.contains("frames_per_second"), "{error}");
