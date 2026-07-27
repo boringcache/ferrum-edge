@@ -394,7 +394,13 @@ current functional coverage (most suites already run file-mode gateways).
 - Authentication plugin integration — `functional_file_mode_test` key_auth path + [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
 - High proxy-count stress — scheduled `.github/workflows/scaling-regression.yml` (and `functional_load_stress_test` / `functional_scale_perf_test`)
 
-### Exact residuals
+### Exact residual
 
-- Configuration-reload **performance benchmarking** (SIGHUP / file-mode reload latency under large proxy counts) remains unscoped — track with scale/perf work rather than treating it as missing protocol coverage.
 - Live OIDC / OAuth2 introspection integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
+
+### Explicit non-goal
+
+- No dedicated SIGHUP / file-mode reload performance benchmark is currently
+  owed. Functional reload correctness and the scheduled large-configuration
+  scale suites cover the supported contract; open a scoped tracker only if the
+  project adopts a measurable reload-latency budget.
