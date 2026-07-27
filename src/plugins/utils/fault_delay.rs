@@ -237,13 +237,9 @@ pub async fn run_fault_delay_in(
     peer_gone: Option<PeerGoneFuture<'_>>,
 ) -> FaultDelayOutcome {
     let Some(_permit) = admission.try_admit() else {
-        // Cold path only — an admitted delay never logs. Carries no
-        // request-, peer-, or credential-derived value.
-        tracing::debug!(
-            in_flight = admission.in_flight(),
-            capacity = admission.capacity(),
-            "Injected fault delay skipped: process-wide delayed-work budget exhausted"
-        );
+        // Do not log here: once the budget is saturated this is an
+        // attacker-controlled path. The caller records the closed-enum outcome
+        // in request metadata without creating an additional flood surface.
         return FaultDelayOutcome::AdmissionExhausted;
     };
 

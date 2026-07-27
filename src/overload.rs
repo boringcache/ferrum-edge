@@ -1067,8 +1067,7 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
 /// later fault delay in the same test binary.
 pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
     begin_drain(state);
-    let fault_delays = crate::plugins::utils::fault_delay::fault_delay_shutdown();
-    fault_delays.cancel();
+    crate::plugins::utils::fault_delay::fault_delay_shutdown().cancel();
 }
 
 /// Wait for all in-flight connections and requests to drain, up to the
