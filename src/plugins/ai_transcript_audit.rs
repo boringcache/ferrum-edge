@@ -2001,28 +2001,58 @@ impl AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return PluginResult::Continue;
         };
-        let Some(mut staging) = self.staging.get_mut(&record_id) else {
+        let sample_hit = {
+            let Some(mut staging) = self.staging.get_mut(&record_id) else {
+                return PluginResult::Continue;
+            };
+            if !self.commit_may_emit(staging.sample_hit) {
+                return PluginResult::Continue;
+            }
+            let sample_hit = staging.sample_hit;
+
+            if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
+                let Some(permit) = self.logger.try_reserve() else {
+                    ctx.metadata
+                        .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                    return reject_audit_unavailable();
+                };
+                // Both halves of the promise or neither: dropping `permit` here
+                // returns the queue slot.
+                let Some(reservation) = self.reserve_commit_lease() else {
+                    ctx.metadata
+                        .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                    return reject_audit_unavailable();
+                };
+                staging.commit_permit = Some(permit);
+                staging.commit_lease = Some(reservation);
+            }
+            sample_hit
+        };
+        self.ensure_sink_error_admission_for_sample(ctx, sample_hit)
+    }
+
+    /// Fail closed on a known-unhealthy sink without taking a full-entry
+    /// reservation. Used on the request path when buffer reservation is
+    /// deferred to a later response/stream gate.
+    fn ensure_sink_error_admission(&self, ctx: &mut RequestContext) -> PluginResult {
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) else {
             return PluginResult::Continue;
         };
-        if !self.commit_may_emit(staging.sample_hit) {
+        let Some(staging) = self.staging.get(record_id) else {
             return PluginResult::Continue;
-        }
+        };
+        let sample_hit = staging.sample_hit;
+        drop(staging);
+        self.ensure_sink_error_admission_for_sample(ctx, sample_hit)
+    }
 
-        if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
-            let Some(permit) = self.logger.try_reserve() else {
-                ctx.metadata
-                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-                return reject_audit_unavailable();
-            };
-            // Both halves of the promise or neither: dropping `permit` here
-            // returns the queue slot.
-            let Some(reservation) = self.reserve_commit_lease() else {
-                ctx.metadata
-                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-                return reject_audit_unavailable();
-            };
-            staging.commit_permit = Some(permit);
-            staging.commit_lease = Some(reservation);
+    fn ensure_sink_error_admission_for_sample(
+        &self,
+        ctx: &mut RequestContext,
+        sample_hit: bool,
+    ) -> PluginResult {
+        if !self.commit_may_emit(sample_hit) {
+            return PluginResult::Continue;
         }
         if self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed)
@@ -2034,14 +2064,16 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
-    /// Whether request-phase hooks must leave fail-closed commit admission to a
-    /// later response-side gate.
+    /// Whether request-phase hooks must leave fail-closed *buffer* reservation
+    /// to a later response-side gate.
     ///
     /// Ordinary buffered JSON responses reserve in `on_final_response_body`
     /// before the response becomes immutable. Active streaming capture reserves
     /// at response-header / inspector selection. Request-only configs, and
     /// conservative maybe-streaming markers when streaming capture is off, still
-    /// admit on the request path because no later buffered/stream gate will.
+    /// reserve on the request path because no later buffered/stream gate will.
+    /// Sink-health rejection still runs on the request path even when
+    /// reservation is deferred.
     fn defer_commit_admission_to_response(&self, ctx: &RequestContext) -> bool {
         let response_side_hooks =
             self.capture.response || self.capture.streaming != StreamingCapture::Off;
@@ -2052,6 +2084,16 @@ impl AiTranscriptAudit {
             return true;
         }
         self.capture.response && !flag(&ctx.metadata, MD_STREAM_REQUEST)
+    }
+
+    /// Request-phase fail-closed gate: full reservation when no later response
+    /// /stream gate will admit, otherwise sink-health rejection only.
+    fn request_phase_commit_admission(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.defer_commit_admission_to_response(ctx) {
+            self.ensure_sink_error_admission(ctx)
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     fn stream_commit_selected(
@@ -3127,11 +3169,7 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if self.defer_commit_admission_to_response(ctx) {
-            PluginResult::Continue
-        } else {
-            self.ensure_commit_admission(ctx)
-        }
+        self.request_phase_commit_admission(ctx)
     }
 
     /// The proxy only routes the context-aware final-body hook to plugins that
@@ -3159,7 +3197,11 @@ impl Plugin for AiTranscriptAudit {
         // backend-visible bytes.
         if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             self.refresh_staged_request(ctx, body);
-            return PluginResult::Continue;
+            // Refresh may flip `MD_STREAM_REQUEST`. Re-evaluate whether a later
+            // response/stream gate will reserve, or whether request-time
+            // reservation must run now (conservative maybe-stream with
+            // streaming capture off has no later buffered gate).
+            return self.request_phase_commit_admission(ctx);
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
@@ -3174,11 +3216,7 @@ impl Plugin for AiTranscriptAudit {
         if !matches!(stage_result, PluginResult::Continue) {
             return stage_result;
         }
-        if self.defer_commit_admission_to_response(ctx) {
-            PluginResult::Continue
-        } else {
-            self.ensure_commit_admission(ctx)
-        }
+        self.request_phase_commit_admission(ctx)
     }
 
     // ---- reject-path request refresh ----
