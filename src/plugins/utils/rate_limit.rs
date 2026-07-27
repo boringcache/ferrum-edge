@@ -280,6 +280,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn check(&self, key: K, op: &A::Op) -> RateLimitOutcome {
         self.check_at(key, op, Instant::now())
     }
@@ -536,6 +537,7 @@ where
         limiter
     }
 
+    #[cfg(test)]
     pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
         if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
