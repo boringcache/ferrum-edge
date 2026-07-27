@@ -1073,9 +1073,9 @@ fn local_json_pointer_target<'a>(
     field: &'static str,
     keyword: &str,
 ) -> Result<Option<&'a Value>, String> {
-    let fragment = reference.strip_prefix('#').ok_or_else(|| {
-        format!("body_validator: '{field}' has a non-local '{keyword}'")
-    })?;
+    let fragment = reference
+        .strip_prefix('#')
+        .ok_or_else(|| format!("body_validator: '{field}' has a non-local '{keyword}'"))?;
     if fragment.is_empty() || !fragment.starts_with('/') {
         // The root was already visited. Anchor resources are indexed only while
         // the library walks actual draft-specific schema positions, which this

@@ -3596,8 +3596,7 @@ fn configuration_errors_redact_supplied_schema_and_shape_text() {
     const EXTERNAL_REF: &str =
         "https://ref-user:BODY_VALIDATOR_CONFIG_CANARY_REF@example.com/schema";
     const LOCAL_REF: &str = "#/$defs/BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF";
-    const ID_URI: &str =
-        "https://id-user:BODY_VALIDATOR_CONFIG_CANARY_ID@example.com/schema";
+    const ID_URI: &str = "https://id-user:BODY_VALIDATOR_CONFIG_CANARY_ID@example.com/schema";
     const SCHEMA_URI: &str =
         "https://schema-user:BODY_VALIDATOR_CONFIG_CANARY_SCHEMA@example.com/draft";
     const PATTERN: &str = "(?P<BODY_VALIDATOR_CONFIG_CANARY_PATTERN>[";
