@@ -765,7 +765,9 @@ async fn true_ipv6_sources_keep_independent_budgets() {
 
     // The mapped form is the one and only alias of the native IPv4 source.
     assert_eq!(
-        plugin.on_udp_datagram(&make_ctx("::ffff:192.0.2.10", 10)).await,
+        plugin
+            .on_udp_datagram(&make_ctx("::ffff:192.0.2.10", 10))
+            .await,
         UdpDatagramVerdict::Drop
     );
     assert_eq!(plugin.tracked_keys_count(), Some(4));
