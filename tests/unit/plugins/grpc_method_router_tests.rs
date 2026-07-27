@@ -839,7 +839,7 @@ fn test_database_sync_mode_rejected() {
     );
     let err = result.err().expect("database sync_mode must be rejected");
     assert!(
-        err.contains("'sync_mode' must be 'local' or 'redis'"),
+        err.contains("'sync_mode' must be exactly 'local' or 'redis'"),
         "got: {err}"
     );
 }

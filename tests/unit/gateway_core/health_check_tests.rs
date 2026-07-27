@@ -934,6 +934,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        mesh_revision: None,
     }
 }
 

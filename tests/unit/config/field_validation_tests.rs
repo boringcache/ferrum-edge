@@ -11,7 +11,7 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
     PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig,
     SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
-    validate_basic_auth_hmac_secret,
+    validate_basic_auth_hmac_secret, validate_pem_ca_file, validate_pem_cert_file,
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
@@ -1744,8 +1744,7 @@ fn test_proxy_tls_cert_file_invalid_pem() {
     );
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_client_key_path")
-                && e.contains("no valid private keys")),
+            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("no PEM private key")),
         "Expected invalid PEM key error, got: {:?}",
         errs
     );
@@ -1776,6 +1775,90 @@ fn test_proxy_tls_key_without_cert_pairing_error() {
             .any(|e| e.contains("backend_tls_client_cert_path is missing")),
         "Expected cert/key pairing error, got: {:?}",
         errs
+    );
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_mixed_bundle_atomically() {
+    let valid = std::fs::read_to_string("tests/certs/server.crt").unwrap();
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), format!("{valid}{malformed}")).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_client_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("a mixed valid/malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_client_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_all_malformed_bundle() {
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), malformed).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_server_ca_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("an all-malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_server_ca_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[test]
+fn test_validate_pem_ca_file_rejects_unusable_root() {
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        ca_file.path(),
+        "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+
+    let error = validate_pem_ca_file(
+        "backend_tls_server_ca_cert_path",
+        ca_file.path().to_str().unwrap(),
+    )
+    .expect_err("syntactically valid but unusable DER must fail CA admission");
+    assert!(error.contains("record #1"), "got: {error}");
+    assert!(
+        error.contains("certificate failed trust-anchor admission"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_proxy_tls_validation_cache_keeps_cert_and_key_roles_distinct() {
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut proxy = make_proxy("same-source", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+    proxy.backend_tls_client_key_path = Some(cert_path);
+
+    let mut validated_tls_paths = std::collections::HashSet::new();
+    let errors = proxy
+        .validate_fields_with_cache(&mut validated_tls_paths, 30)
+        .expect_err("a certificate-only source must not be cache-reused as a private key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("backend_tls_client_key_path")
+                && error.contains("no PEM private key")),
+        "got: {errors:?}"
     );
 }
 

@@ -46,7 +46,7 @@ async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr)
         .expect("build server config");
     let frontend = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(server_config),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
     let server = Arc::new(
@@ -865,6 +865,32 @@ async fn test_udp_logging_dtls_accepts_valid_ecdsa_material_and_caches() {
 }
 
 #[tokio::test]
+async fn test_udp_logging_dtls_accepts_leaf_first_certificate_bundle() {
+    ensure_crypto_provider();
+    let (leaf, key) = mint_ecdsa_p256_pair();
+    let (additional, _additional_key) = mint_ecdsa_p256_pair();
+    let bundle = write_temp_pem(&format!(
+        "{}{}",
+        std::fs::read_to_string(leaf.path()).expect("read leaf"),
+        std::fs::read_to_string(additional.path()).expect("read additional certificate")
+    ));
+
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": bundle.path().to_str().unwrap(),
+            "dtls_key_path": key.path().to_str().unwrap(),
+            "dtls_no_verify": true
+        }),
+        test_client(),
+    )
+    .expect("UDP logging must materialize the shared leaf-first DTLS loader");
+    assert_eq!(plugin.name(), "udp_logging");
+}
+
+#[tokio::test]
 async fn test_udp_logging_dtls_rejects_malformed_ca_at_admission() {
     let (cert, key) = mint_ecdsa_p256_pair();
     let ca = write_temp_pem("not-a-ca");
@@ -1371,7 +1397,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect("build server config");
     let frontend = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(server_config),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
     let server = Arc::new(
@@ -1395,7 +1421,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     let client_cert = dimpl::certificate::generate_self_signed_certificate().expect("client cert");
     let params = ferrum_edge::dtls::BackendDtlsParams {
         config: Arc::new(dimpl::Config::default()),
-        certificate: client_cert,
+        certificate: client_cert.into(),
         server_name: None,
         server_cert_verifier: None,
         connect_timeout_ms: 10_000,

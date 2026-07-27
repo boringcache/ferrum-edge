@@ -396,8 +396,15 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # directories, bump dependency versions/lockfile normally, and keep the gateway
 # call site using the same upstream API. See
 # `docs/upstream-tungstenite-patches/README.md`.
+#
+# We also carry a narrowly scoped copy of dimpl 0.6.1 that transmits complete
+# leaf-first certificate chains and owns every retained private-key byte copy
+# in zeroizing storage. No compatible upstream release currently provides
+# either security property. See
+# `docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
+dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }

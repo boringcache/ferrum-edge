@@ -17,10 +17,233 @@ use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
 };
 use crate::plugins::PluginHttpClient;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tracing::{info, warn};
+
+/// Bounded, credential-free snapshot of sticky DB failover topology.
+///
+/// Exposed on authenticated `/health` detail and used by admin write gating so
+/// operators can see when the active pool points at a failover URL without
+/// leaking URL userinfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbFailoverTopologyStatus {
+    /// `true` while the active write/runtime pool points at the configured primary.
+    pub primary_active: bool,
+    /// Unix epoch milliseconds when failover topology became active; `None` on primary.
+    pub failover_since_unix_ms: Option<u64>,
+    /// Redacted active DB URL (`redact_url`); never contains credentials.
+    pub active_url_redacted: Option<String>,
+    /// Whether `FERRUM_DB_FAILOVER_ALLOW_WRITES` is currently enabled on this store.
+    pub allow_writes: bool,
+    /// Sticky for the current failover window: opt-in writes were enabled at
+    /// any point while on failover. Conservative process-local risk marker only;
+    /// it does not count successful mutations.
+    pub opt_in_writes_enabled_during_window: bool,
+}
+
+impl Default for DbFailoverTopologyStatus {
+    fn default() -> Self {
+        Self {
+            primary_active: true,
+            failover_since_unix_ms: None,
+            active_url_redacted: None,
+            allow_writes: false,
+            opt_in_writes_enabled_during_window: false,
+        }
+    }
+}
+
+/// Opaque Admin API mutation pin of the active config-store write topology.
+///
+/// Holding this value retains a shared read lock on the backend reconnect
+/// transition gate (SQL `reconnect_transition`) or Mongo Admin write-topology
+/// gate (`admin_write_topology`) so a concurrent reconnect cannot publish a new
+/// topology (pool or Mongo connection) until the permit is dropped. Mongo keeps
+/// this lock distinct from the admission `connection_generation` gate so
+/// mutations may safely enter CRUD/admission paths without nesting the same
+/// fair Tokio `RwLock`. Acquire via
+/// [`DatabaseBackend::acquire_write_topology_permit`] and retain through the
+/// full mutation persistence lifetime (issue #3001 check-to-use race).
+pub struct DbWriteTopologyPermit {
+    _guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+}
+
+impl DbWriteTopologyPermit {
+    /// Construct a pin that holds `guard` until dropped.
+    pub(crate) fn pinned(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        let permit = Self {
+            _guard: Some(guard),
+        };
+        debug_assert!(permit.is_pinned());
+        permit
+    }
+
+    /// No-op permit for backends / modes without a reconnect topology gate.
+    pub fn noop() -> Self {
+        let permit = Self { _guard: None };
+        debug_assert!(!permit.is_pinned());
+        permit
+    }
+
+    /// Whether this permit holds a live topology pin (test/observe helper).
+    pub fn is_pinned(&self) -> bool {
+        self._guard.is_some()
+    }
+}
+
+/// Shared sticky-failover window state for SQL and MongoDB config stores.
+///
+/// Tracks topology transitions and a process-local opt-in risk marker for
+/// issue #3001. Contract: default fail-closed admin writes on failover;
+/// `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` is only for operator-asserted
+/// synchronously replicated multi-primary topologies; automatic failback is
+/// allowed and emits one bounded divergence-risk signal for that window.
+/// This state is not durable across process restart.
+#[derive(Clone)]
+pub struct DbFailoverTopologyState {
+    primary_active: Arc<AtomicBool>,
+    failover_since_unix_ms: Arc<AtomicU64>,
+    active_url_redacted: Arc<ArcSwap<Option<String>>>,
+    allow_writes: Arc<AtomicBool>,
+    opt_in_during_window: Arc<AtomicBool>,
+    /// Ensures the opt-in-enabled signal logs at most once per failover window.
+    opt_in_signal_logged: Arc<AtomicBool>,
+}
+
+impl Default for DbFailoverTopologyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbFailoverTopologyState {
+    pub fn new() -> Self {
+        Self {
+            primary_active: Arc::new(AtomicBool::new(true)),
+            failover_since_unix_ms: Arc::new(AtomicU64::new(0)),
+            active_url_redacted: Arc::new(ArcSwap::from_pointee(None)),
+            allow_writes: Arc::new(AtomicBool::new(false)),
+            opt_in_during_window: Arc::new(AtomicBool::new(false)),
+            opt_in_signal_logged: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn set_allow_writes(&self, allow: bool) {
+        self.allow_writes.store(allow, Ordering::Release);
+        if allow && !self.primary_active() {
+            self.note_opt_in_enabled_during_window();
+        }
+    }
+
+    pub fn allow_writes(&self) -> bool {
+        self.allow_writes.load(Ordering::Acquire)
+    }
+
+    pub fn primary_active(&self) -> bool {
+        self.primary_active.load(Ordering::Acquire)
+    }
+
+    pub fn status(&self) -> DbFailoverTopologyStatus {
+        let since = self.failover_since_unix_ms.load(Ordering::Acquire);
+        DbFailoverTopologyStatus {
+            primary_active: self.primary_active(),
+            failover_since_unix_ms: (since > 0).then_some(since),
+            active_url_redacted: (**self.active_url_redacted.load()).clone(),
+            allow_writes: self.allow_writes(),
+            opt_in_writes_enabled_during_window: self.opt_in_during_window.load(Ordering::Acquire),
+        }
+    }
+
+    fn now_unix_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Sticky opt-in risk marker for the current failover window, with at most
+    /// one log line when the opt-in first becomes effective on failover.
+    fn note_opt_in_enabled_during_window(&self) {
+        self.opt_in_during_window.store(true, Ordering::Release);
+        if self
+            .opt_in_signal_logged
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let redacted = (**self.active_url_redacted.load())
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            warn!(
+                active_url_redacted = %redacted,
+                failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
+                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; Ferrum will allow automatic primary failback and emit a single divergence-risk marker for this window. Use only with operator-asserted synchronously replicated multi-primary replication; this process-local marker is cleared by restart"
+            );
+        }
+    }
+
+    /// Record transition onto a failover URL. Emits a bounded topology signal
+    /// only when leaving primary topology. Subsequent failover reconnects update
+    /// the redacted URL without additional warnings (poll/TLS retry safe).
+    pub fn mark_failover(&self, redacted_url: &str) {
+        let was_primary = self.primary_active.swap(false, Ordering::AcqRel);
+        self.active_url_redacted
+            .store(Arc::new(Some(redacted_url.to_string())));
+        if was_primary {
+            let since = Self::now_unix_ms();
+            self.failover_since_unix_ms.store(since, Ordering::Release);
+            self.opt_in_during_window.store(false, Ordering::Release);
+            self.opt_in_signal_logged.store(false, Ordering::Release);
+            let allow = self.allow_writes();
+            warn!(
+                active_url_redacted = %redacted_url,
+                failover_since_unix_ms = since,
+                allow_writes = allow,
+                "Database topology transitioned to failover; admin writes fail closed unless FERRUM_DB_FAILOVER_ALLOW_WRITES=true"
+            );
+            if allow {
+                self.note_opt_in_enabled_during_window();
+            }
+        }
+        // Already on failover: silent redacted-URL refresh only.
+    }
+
+    /// Record a successful return to the configured primary. Emits one failback
+    /// summary; when opt-in writes were enabled during the window, that summary
+    /// is the bounded divergence-risk marker (issue #3001).
+    pub fn mark_primary(&self, redacted_url: &str) {
+        let was_failover = !self.primary_active.swap(true, Ordering::AcqRel);
+        let since = self.failover_since_unix_ms.swap(0, Ordering::AcqRel);
+        let opt_in = self.opt_in_during_window.swap(false, Ordering::AcqRel);
+        self.opt_in_signal_logged.store(false, Ordering::Release);
+        self.active_url_redacted
+            .store(Arc::new(Some(redacted_url.to_string())));
+        if was_failover || since > 0 {
+            let until = Self::now_unix_ms();
+            if opt_in {
+                warn!(
+                    active_url_redacted = %redacted_url,
+                    failover_since_unix_ms = since,
+                    failover_until_unix_ms = until,
+                    "Database topology transitioned back to primary after an opt-in failover write window; Admin API mutations during that window are not guaranteed on this primary unless the operator's synchronously replicated multi-primary topology already applied them. This divergence-risk marker is process-local and does not survive restart"
+                );
+            } else {
+                info!(
+                    active_url_redacted = %redacted_url,
+                    failover_since_unix_ms = since,
+                    failover_until_unix_ms = until,
+                    "Database topology transitioned back to primary"
+                );
+            }
+        }
+    }
+}
 
 /// Validate that a plugin row can be restored as an explicit association on
 /// `proxy_id`. Global plugins are inherited rather than associated, while a
@@ -1257,6 +1480,28 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         false
     }
 
+    /// Bounded sticky-failover topology snapshot for admin write gating and
+    /// operator health signals. Default is "primary active" for backends that
+    /// do not participate in `FERRUM_DB_FAILOVER_URLS`.
+    fn failover_topology_status(&self) -> DbFailoverTopologyStatus {
+        DbFailoverTopologyStatus::default()
+    }
+
+    /// Apply `FERRUM_DB_FAILOVER_ALLOW_WRITES` after store construction.
+    fn set_failover_allow_writes(&mut self, allow: bool) {
+        let _ = allow;
+    }
+
+    /// Acquire a mutation-only pin of the current write topology.
+    ///
+    /// Holding the returned permit prevents reconnect publication from
+    /// redirecting this mutation onto a different topology. Default is a
+    /// no-op permit for backends that do not participate in sticky failover.
+    /// Ordinary read/request hot paths must not call this.
+    async fn acquire_write_topology_permit(&self) -> DbWriteTopologyPermit {
+        DbWriteTopologyPermit::noop()
+    }
+
     /// Return connection pool statistics for observability.
     ///
     /// Returns `None` when the backend does not expose pool internals
@@ -1340,6 +1585,14 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// for `namespace`. Callers seed this after a full reload so subsequent
     /// incremental polls start from an authoritative snapshot boundary.
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Return the store-wide durable config-change high-water mark.
+    ///
+    /// `config_changes.sequence` is allocated globally, not per namespace.
+    /// Control-plane mesh revision publication uses this value so a namespace
+    /// disappearing from the active scope cannot rewind the advertised
+    /// generation after a CP restart.
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
 
     /// Load only resources changed after `after_sequence`.
     async fn load_incremental_config(

@@ -505,6 +505,27 @@ impl GrpcConnectionPool {
         self.rr_counters.clear();
     }
 
+    /// Drop every cached sender for `proxy` so the next acquisition dials fresh.
+    ///
+    /// Call after a pooled `send_request` fails with hyper `is_canceled`
+    /// (request never left the client) while racing a backend GOAWAY /
+    /// connection-age close. Waiting for `is_closed()` on the next
+    /// `cached()` probe is racy — the dying sender can still look healthy
+    /// for one more poll — so the whole host shard ring is cleared.
+    /// Sibling shards reconnect lazily on the next miss.
+    pub fn invalidate_shards_for_proxy(&self, proxy: &Proxy) {
+        let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+        let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
+        self.with_pool_key(proxy, svid_generation, |key_buf| {
+            let base_len = key_buf.len();
+            for shard in 0..shard_count {
+                Self::write_shard_key_inplace(key_buf, base_len, shard);
+                self.pool.invalidate(key_buf);
+            }
+        });
+    }
+
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
@@ -1197,12 +1218,24 @@ pub enum GrpcBackendUnavailableKind {
     /// `request_reached_wire` returns true and the connect-failure retry
     /// path does not replay non-idempotent POSTs across the same stream.
     BackendRequest,
+    /// A pooled H2 `send_request` failed with hyper `is_canceled() == true`
+    /// while the outbound body was still fully buffered and replayable.
+    /// hyper's contract for that flag is that the request was **never
+    /// dispatched onto the wire** (typical race: backend GOAWAY /
+    /// `MaxConnectionAge` while the pool still handed out a sender that
+    /// passed a single `ready()` probe). Pre-wire under the unified
+    /// [`crate::retry::request_reached_wire`] boundary — maps to
+    /// [`crate::retry::ErrorClass::ConnectionPoolError`] so
+    /// `retry_on_connect_failure` can redial. Streaming / channel bodies
+    /// keep [`Self::BackendRequest`] even on `is_canceled` because the
+    /// upload may already be unreplayable.
+    DispatchCanceled,
 }
 
 impl GrpcBackendUnavailableKind {
     /// Returns `true` for kinds that represent a pre-wire failure (DNS,
-    /// connect, handshake) — safe to replay regardless of HTTP method
-    /// idempotency.
+    /// connect, handshake, never-dispatched pooled send) — safe to replay
+    /// regardless of HTTP method idempotency.
     ///
     /// Returns `false` for [`Self::BackendRequest`], which is emitted
     /// post-handshake from `send_request().await` and may have committed the
@@ -1216,7 +1249,8 @@ impl GrpcBackendUnavailableKind {
             | Self::TlsHandshake
             | Self::H2Handshake
             | Self::H2cHandshake
-            | Self::InvalidServerName => true,
+            | Self::InvalidServerName
+            | Self::DispatchCanceled => true,
             Self::BackendRequest => false,
         }
     }
@@ -2701,6 +2735,12 @@ async fn proxy_grpc_streaming_dispatch(
         }
     };
 
+    // Remaining-budget rewrite AFTER acquisition, for the same reason as the
+    // buffered path: a cold dial must not be re-added to the client's budget.
+    if let Some(deadline) = grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(&mut headers, deadline);
+    }
+
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -2721,6 +2761,12 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC request payload size exceeds maximum of {} bytes",
                         max_grpc_recv_size_bytes
                     ));
+                }
+                // Streaming / channel uploads are unreplayable — keep post-wire
+                // classification even when hyper reports `is_canceled`, but still
+                // drop the stale pooled sender so the next RPC dials fresh.
+                if e.is_canceled() {
+                    grpc_pool.invalidate_shards_for_proxy(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -2750,6 +2796,9 @@ async fn proxy_grpc_streaming_dispatch(
                         max_grpc_recv_size_bytes
                     ));
                 }
+                if e.is_canceled() {
+                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
                     GrpcBackendUnavailableKind::BackendRequest,
@@ -2764,6 +2813,9 @@ async fn proxy_grpc_streaming_dispatch(
                     "gRPC request payload size exceeds maximum of {} bytes",
                     max_grpc_recv_size_bytes
                 ));
+            }
+            if e.is_canceled() {
+                grpc_pool.invalidate_shards_for_proxy(proxy);
             }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::backend_unavailable_with_source(
@@ -2934,16 +2986,24 @@ pub(crate) async fn proxy_grpc_request_core(
         headers.insert(hyper::header::HOST, val);
     }
 
-    // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
-    // that add/replace/remove grpc-timeout are reflected in the effective timeout.
-    // Two distinct timeout regimes:
+    // Carry forward the receipt-anchored absolute deadline from
+    // `prepare_request_deadline` (parsed before before_proxy plugins and
+    // body awaits). Post-merge header mutations do not re-arm this budget;
+    // before_proxy plugins cannot extend or re-anchor RPC time limits via
+    // grpc-timeout. Two distinct timeout regimes:
     //  * client_grpc_deadline_at — a client-supplied absolute end-to-end
-    //    deadline. Pool acquisition consumes it together with the pool's own
+    //    deadline established once at request receipt (via
+    //    `prepare_request_deadline`, independent of the `grpc_deadline`
+    //    plugin). Pool acquisition consumes it together with the pool's own
     //    connect timeout. After acquisition, backend_read_timeout_ms may impose
     //    an earlier response ceiling, but it never acts as a connect timeout.
     //    The resulting response deadline bounds the header wait + body
     //    collection as ONE shared budget — otherwise a slow backend gets up to
     //    ~2x the client's stated deadline (the F11 bug this PR fixes).
+    //    Retries and backoff consume the SAME Instant; the relative
+    //    `grpc-timeout` header is rewritten to the remaining budget before
+    //    each attempt and is never re-anchored from the original relative
+    //    value at dispatch time.
     //  * per_phase_read_ms — the operator backend_read_timeout_ms safety net
     //    used when the client set no deadline. This is a PER-READ stall guard,
     //    not an RPC budget, so each phase (header wait, body collection) gets a
@@ -2951,11 +3011,7 @@ pub(crate) async fn proxy_grpc_request_core(
     //    newly time out a large buffered response from a slow-but-progressing
     //    backend that previously succeeded, so the two phases stay independent —
     //    matching the long-standing operator semantics and the streaming path.
-    let client_grpc_deadline_at = grpc_deadline_at.or_else(|| {
-        parse_grpc_timeout_ms(&headers).and_then(|grpc_ms| {
-            tokio::time::Instant::now().checked_add(Duration::from_millis(grpc_ms))
-        })
-    });
+    let client_grpc_deadline_at = grpc_deadline_at;
     let per_phase_read_ms =
         if client_grpc_deadline_at.is_none() && proxy.backend_read_timeout_ms > 0 {
             Some(proxy.backend_read_timeout_ms)
@@ -2995,6 +3051,16 @@ pub(crate) async fn proxy_grpc_request_core(
         grpc_pool.get_sender(proxy).await?
     };
 
+    // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
+    // acquisition. Computing it before the dial would forward a value that
+    // over-states the budget by however long the connect/handshake took (up to
+    // `backend_connect_timeout_ms` on a cold pool, or the whole retry backoff
+    // on a redial), which is the same re-arming class of error #2933 fixes,
+    // just at a smaller scale. Every attempt still gets exactly one rewrite.
+    if let Some(deadline) = client_grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline);
+    }
+
     // A client deadline remains one absolute end-to-end ceiling. Layer the
     // operator read timeout over response processing only, after connection
     // acquisition, and keep the earlier source typed for accounting.
@@ -3017,6 +3083,12 @@ pub(crate) async fn proxy_grpc_request_core(
     });
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: hyper::Error| {
+        // Buffered unary/client bodies are fully held — hyper `is_canceled`
+        // proves the request never hit the wire, so classify pre-wire and
+        // drop the stale pooled sender for the next attempt / RPC.
+        if e.is_canceled() {
+            grpc_pool.invalidate_shards_for_proxy(proxy);
+        }
         error!("gRPC: backend request failed: {}", e);
         if e.is_timeout() {
             GrpcProxyError::BackendTimeout {
@@ -3024,8 +3096,13 @@ pub(crate) async fn proxy_grpc_request_core(
                 message: format!("Backend timeout: {}", e),
             }
         } else {
+            let kind = if e.is_canceled() {
+                GrpcBackendUnavailableKind::DispatchCanceled
+            } else {
+                GrpcBackendUnavailableKind::BackendRequest
+            };
             GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::BackendRequest,
+                kind,
                 format!("Backend error: {}", e),
                 e,
             )
@@ -3343,6 +3420,45 @@ pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
 /// Per the gRPC spec, the timeout is a positive integer followed by a unit suffix.
 pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
     parse_grpc_timeout_value(headers.get("grpc-timeout")?.to_str().ok()?)
+}
+
+/// Rewrite the outbound `grpc-timeout` header to the remaining budget of a
+/// receipt-anchored absolute deadline.
+///
+/// Call once per backend attempt (including the first), as late as possible —
+/// after the sender has been acquired — so the dial/handshake time is not
+/// silently handed back to the backend. Retries must forward
+/// the decremented remaining timeout rather than re-arming the client's
+/// original relative value. Formatting (millisecond precision when it fits the
+/// gRPC 8-digit wire limit, otherwise coarsened to seconds/minutes/hours) is
+/// shared with the `grpc_deadline` plugin so the two cannot drift.
+///
+/// An already-expired deadline forwards the minimum legal value `1m` rather
+/// than the invalid `0m`; the gateway's own `timeout_at` guards still terminate
+/// the RPC, so this only avoids handing the backend a malformed header.
+pub(crate) fn apply_remaining_grpc_timeout_header(
+    headers: &mut hyper::HeaderMap,
+    deadline: tokio::time::Instant,
+) {
+    let value = remaining_grpc_timeout_header_value(deadline);
+    headers.insert("grpc-timeout", value);
+}
+
+/// Build the wire value for the remaining portion of a receipt-anchored gRPC
+/// deadline. Shared by native gRPC (`HeaderMap`) and pass-through gRPC-Web
+/// (`reqwest::RequestBuilder`) so neither transport can re-arm the original
+/// relative header on a later attempt.
+pub(crate) fn remaining_grpc_timeout_header_value(
+    deadline: tokio::time::Instant,
+) -> hyper::header::HeaderValue {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let ms = crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1);
+    let timeout_val = crate::plugins::grpc_deadline::format_grpc_timeout_ms(ms.max(1));
+    // The shared formatter only emits ASCII digits plus one unit letter, all
+    // accepted by HeaderValue. Avoid unwrap/expect on the request path anyway;
+    // the minimum legal gRPC timeout is a safe fail-closed fallback.
+    hyper::header::HeaderValue::from_str(&timeout_val)
+        .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("1m"))
 }
 
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
@@ -4027,13 +4143,23 @@ mod tests {
             .expect("failed to locate end of proxy_grpc_request_core body");
         let body = &tail[..fn_end];
 
-        // The caller-supplied typed deadline wins; parsing and anchoring the
-        // relative header is compatibility-only. Pool acquisition consumes
-        // only that client deadline (plus the pool's own connect timeout), and
-        // the backend read deadline is constructed afterwards.
+        // The caller-supplied typed deadline is the sole absolute budget.
+        // Reconstructing from the relative header at dispatch would re-arm
+        // a fresh full budget on every retry attempt.
         assert!(
-            body.contains("let client_grpc_deadline_at = grpc_deadline_at.or_else(||"),
-            "the request-scoped typed deadline must be the primary source"
+            body.contains("let client_grpc_deadline_at = grpc_deadline_at;"),
+            "the request-scoped typed deadline must be the sole absolute source"
+        );
+        assert!(
+            body.contains(
+                "apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline)"
+            ),
+            "each attempt must forward a decremented remaining grpc-timeout, \
+             measured after pool acquisition"
+        );
+        assert!(
+            !body.contains("grpc_deadline_at.or_else(||"),
+            "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
         assert!(
             body.contains("timeout_at(client_deadline, grpc_pool.get_sender(proxy))"),
@@ -4062,12 +4188,10 @@ mod tests {
              {timeout_at} timeout_at calls."
         );
 
-        // The deadline Instant add must be overflow-guarded (checked_add) so a
-        // pathological client `grpc-timeout` cannot panic the request path.
+        // Operator backend_read_timeout Instant add must stay overflow-guarded.
         assert!(
-            body.contains("checked_add(Duration::from_millis("),
-            "the client deadline must use checked_add to avoid an Instant \
-             overflow panic on a pathological grpc-timeout."
+            body.contains("checked_add(Duration::from_millis(proxy.backend_read_timeout_ms)"),
+            "backend_read_timeout_ms must use checked_add to avoid an Instant overflow panic"
         );
 
         // The operator `backend_read_timeout_ms` fallback must stay PER-PHASE:

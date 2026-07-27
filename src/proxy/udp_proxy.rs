@@ -5084,12 +5084,9 @@ backend_tls_verify_server_cert: false
 
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(
-            first.certificate.certificate, second.certificate.certificate,
+            first.certificate.certificates(),
+            second.certificate.certificates(),
             "cached DTLS params should reuse the generated ephemeral certificate"
-        );
-        assert_eq!(
-            first.certificate.private_key, second.certificate.private_key,
-            "cached DTLS params should reuse the generated ephemeral key"
         );
     }
 
@@ -5145,7 +5142,8 @@ backend_tls_verify_server_cert: false
             "pre-reload entry should be cleared, leaving only the rebuilt one"
         );
         assert_ne!(
-            first.certificate.certificate, second.certificate.certificate,
+            first.certificate.certificates(),
+            second.certificate.certificates(),
             "a reload epoch bump must rebuild DTLS params (fresh ephemeral cert)"
         );
 
@@ -5153,7 +5151,8 @@ backend_tls_verify_server_cert: false
         let third =
             cached_backend_dtls_config(&cache, &proxy, "localhost", true, &crls, None).unwrap();
         assert_eq!(
-            second.certificate.certificate, third.certificate.certificate,
+            second.certificate.certificates(),
+            third.certificate.certificates(),
             "without another reload the rebuilt params are served from cache"
         );
     }
