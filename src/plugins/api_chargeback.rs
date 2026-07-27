@@ -258,7 +258,8 @@ pub struct InstanceScope {
     /// Instance namespace. Direct registry calls use this as the proxy namespace;
     /// production hooks pass the matched proxy's namespace explicitly so a
     /// gateway-wide global instance cannot conflate same-id tenant proxies.
-    #[allow(dead_code)] // Read by external registry tests; production passes matched namespaces.
+    #[allow(dead_code)]
+    // Read by external registry tests; production passes matched namespaces.
     pub namespace: Arc<str>,
 }
 

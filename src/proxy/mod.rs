@@ -47,7 +47,8 @@ pub mod http2_pool;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
-#[allow(unused_imports)] // Used by external tests; unused in the separately compiled bin target.
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
 pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
