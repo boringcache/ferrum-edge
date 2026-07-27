@@ -42,12 +42,18 @@ for in-process traversals and `[100, 1_000, 5_000]` for slice / translation
 paths. `ip_restriction` fixes the representative rule count at 10,000 and
 parameterises over worst-case decision shape and attached instance count.
 
-## Benches deferred (not yet implemented)
+## Benches elsewhere (E2E harnesses — not criterion micro-benches)
 
-- **HBONE tunnel throughput** — requires a full mesh-mode gateway + mTLS peer. Belongs in a follow-up E2E suite that mirrors `tests/performance/multi_protocol/` (load gen → ferrum-edge → echo backend) rather than a criterion micro-bench.
-- **DNS proxy resolution latency** — `dns_proxy.rs` evaluates resolution inside a UDP/TCP server task. A meaningful bench needs the server spun up and queried over the wire; in-process micro-benching the lookup table alone would understate the real cost.
+HBONE tunnel throughput and DNS proxy resolution latency are **implemented** as
+standalone E2E harnesses (they need a live gateway + peer/stub, so they do not
+belong in this in-process criterion crate):
 
-Open follow-ups in `.context/mesh-audit/SP.md` track both deferrals.
+| Harness | Path | Residual |
+|---|---|---|
+| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Provenance-complete baseline tables still placeholder (`_TBD_`) — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| Mesh DNS proxy latency/QPS | `tests/performance/mesh-dns-e2e/` | Same baseline-publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+
+See each harness README for topology, flags, and how to regenerate numbers.
 
 ## Reading results
 

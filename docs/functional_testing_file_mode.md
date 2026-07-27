@@ -383,9 +383,18 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 ## Future Improvements
 
-- Add tests for TLS-enabled proxies
-- Add WebSocket upgrade testing
-- Add rate limiting plugin functional tests
-- Add authentication plugin integration tests
-- Add benchmarking for configuration reload performance
-- Add stress testing with high proxy counts
+Generic "add TLS/WebSocket/rate-limit/auth/stress" bullets are superseded by
+current functional coverage (most suites already run file-mode gateways).
+
+### Covered elsewhere
+
+- TLS-enabled proxies / frontend TLS — TLS functional suites and protocol tests (not a file-mode-only gap)
+- WebSocket upgrade — `functional_websocket_*` / `functional_ws_*`
+- Rate limiting plugins — `functional_redis_rate_limiting_test` + plugin network suites
+- Authentication plugin integration — `functional_file_mode_test` key_auth path + [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
+- High proxy-count stress — scheduled `.github/workflows/scaling-regression.yml` (and `functional_load_stress_test` / `functional_scale_perf_test`)
+
+### Exact residuals
+
+- Configuration-reload **performance benchmarking** (SIGHUP / file-mode reload latency under large proxy counts) remains unscoped — track with scale/perf work rather than treating it as missing protocol coverage.
+- Live OIDC / OAuth2 introspection integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
