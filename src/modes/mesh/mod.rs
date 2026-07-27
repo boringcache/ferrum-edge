@@ -9336,8 +9336,10 @@ pub async fn run(
         shutdown_tx,
         mesh_state,
         Some(initial_applied_mesh_slice),
-        background_handles,
-        true,
+        MeshRuntimeBackgroundOwnership {
+            handles: background_handles,
+            finalize_global_plugins_on_shutdown: true,
+        },
     )
     .await
 }
@@ -9350,6 +9352,14 @@ fn ensure_runtime_config_protocol_supported(
     }
 }
 
+struct MeshRuntimeBackgroundOwnership {
+    handles: Vec<JoinHandle<()>>,
+    // External rollback probes share a process with unrelated plugin tests and
+    // must not stop process-global delivery generations. Production always
+    // passes true.
+    finalize_global_plugins_on_shutdown: bool,
+}
+
 async fn serve_mesh_runtime(
     env_config: EnvConfig,
     runtime: MeshRuntimeConfig,
@@ -9357,12 +9367,12 @@ async fn serve_mesh_runtime(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
-    mesh_background_handles: Vec<JoinHandle<()>>,
-    // External rollback probes share a process with unrelated plugin tests and
-    // must not stop process-global delivery generations. Production always
-    // passes true.
-    finalize_global_plugins_on_shutdown: bool,
+    background_ownership: MeshRuntimeBackgroundOwnership,
 ) -> Result<(), anyhow::Error> {
+    let MeshRuntimeBackgroundOwnership {
+        handles: mesh_background_handles,
+        finalize_global_plugins_on_shutdown,
+    } = background_ownership;
     // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
     // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
     // every error here must drain them (issue #2372 root review) rather than
@@ -14074,8 +14084,10 @@ pub mod startup_rollback_test_seams {
             shutdown_tx,
             mesh_state,
             None,
-            vec![sentinel],
-            false,
+            MeshRuntimeBackgroundOwnership {
+                handles: vec![sentinel],
+                finalize_global_plugins_on_shutdown: false,
+            },
         )
         .await;
         // Clear any unused inject so later tests cannot observe a stale fault.
@@ -15007,8 +15019,10 @@ mod tests {
                 task_shutdown,
                 mesh_state,
                 None,
-                Vec::new(),
-                true,
+                MeshRuntimeBackgroundOwnership {
+                    handles: Vec::new(),
+                    finalize_global_plugins_on_shutdown: true,
+                },
             )
             .await
         });
