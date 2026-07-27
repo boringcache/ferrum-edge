@@ -321,10 +321,11 @@ reconciled path is therefore an ordinary backend-supplied field, and exempting i
 by name would let any non-gRPC backend bypass an observed or fail-closed
 response-header policy with a single well-chosen trailer name.
 
-An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, rate limits —
-declares no names and mutates no response headers, so its backend trailers are
-forwarded untouched (issue #2941). Chain **presence** is deliberately not the
-gate: that would strip valid trailers from every proxy that merely authenticates.
+An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, or a rate
+limiter with response-header exposure disabled — declares no names and mutates
+no response headers, so its backend trailers are forwarded untouched (issue
+#2941). Chain **presence** is deliberately not the gate: that would strip valid
+trailers from every proxy that merely authenticates.
 A response-body plugin phase that actually processes the response body still
 clears the trailers wholesale, because those hooks cannot inspect or transform a
 trailer at all.
