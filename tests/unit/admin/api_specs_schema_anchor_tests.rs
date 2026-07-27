@@ -653,7 +653,7 @@ fn unknown_absolute_ref_remains_unsupported_external() {
 }
 
 #[test]
-fn recursive_anchor_refs_hit_depth_limit() {
+fn recursive_anchor_refs_are_rejected_as_cycles() {
     let spec = format!(
         r##"{{
   "openapi": "3.1.0",
@@ -689,10 +689,12 @@ fn recursive_anchor_refs_hit_depth_limit() {
         proxy = proxy_block()
     );
     let err = extract_err(&spec);
-    assert!(
-        matches!(err, ExtractError::SchemaTooDeep { .. }),
-        "got: {err}"
-    );
+    // A self-referencing anchor is a cycle, rejected on re-entry rather than
+    // after exhausting the depth ceiling (GHSA-8jc7-c52g-85xr).
+    let ExtractError::SchemaReferenceCycle { path } = &err else {
+        panic!("recursive anchor refs must fail as SchemaReferenceCycle: {err}");
+    };
+    assert!(path.contains("#Node"), "cycle path must name the anchor: {path}");
 }
 
 #[test]
