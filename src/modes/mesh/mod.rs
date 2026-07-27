@@ -9302,14 +9302,23 @@ pub async fn run(
             );
         }
     }
-    let (bootstrap_config, initial_applied_mesh_slice) = wait_for_initial_mesh_config(
+    let (bootstrap_config, initial_applied_mesh_slice) = match wait_for_initial_mesh_config(
         &mesh_state,
         &runtime,
         federation_activation,
         shutdown_tx.subscribe(),
     )
     .await
-    .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
+    {
+        Ok(v) => v,
+        Err(err) => {
+            // Config-consumer / gRPC TLS watcher tasks are already running.
+            // Drain them before surfacing the wait failure (issue #2372).
+            let err =
+                err.context("mesh runtime stopped before receiving a valid initial mesh slice");
+            return Err(fail_mesh_pre_owner(&shutdown_tx, background_handles, err).await);
+        }
+    };
     info!(
         mesh_global_plugins = bootstrap_config.plugin_configs.len(),
         mesh_slice_version = %initial_applied_mesh_slice.version,
@@ -9343,8 +9352,88 @@ async fn serve_mesh_runtime(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
-    mut mesh_background_handles: Vec<JoinHandle<()>>,
+    mesh_background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
+    // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
+    // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
+    // every error here must drain them (issue #2372 root review) rather than
+    // `?`-dropping the JoinHandles.
+    let prepared = prepare_mesh_runtime_before_owner(
+        &env_config,
+        &runtime,
+        config,
+        &shutdown_tx,
+        initial_applied_mesh_slice.as_ref(),
+    );
+    let (
+        dns_cache,
+        hostnames,
+        initial_dns_slice,
+        tls_policy,
+        crls,
+        bpf_metrics_state,
+        proxy_state,
+        health_check_handles,
+    ) = match prepared {
+        Ok(v) => v,
+        Err(err) => {
+            return Err(fail_mesh_pre_owner(&shutdown_tx, mesh_background_handles, err).await);
+        }
+    };
+
+    // Ownership transfers here: MeshStartupOwner takes the background handles
+    // so later arm/fail_with teardown is the sole cleanup path (no double-drain).
+    let mut owner = MeshStartupOwner::new(
+        shutdown_tx,
+        proxy_state,
+        health_check_handles,
+        mesh_background_handles,
+        env_config.shutdown_drain_seconds,
+    );
+    if let Err(err) = arm_mesh_runtime_startup(
+        &mut owner,
+        &env_config,
+        &runtime,
+        &dns_cache,
+        hostnames,
+        initial_dns_slice,
+        initial_applied_mesh_slice,
+        mesh_state,
+        tls_policy,
+        crls,
+        bpf_metrics_state,
+    )
+    .await
+    {
+        return Err(owner.fail_with(err).await);
+    }
+    owner.serve_until_shutdown().await
+}
+
+/// Fallible mesh prep up through `ProxyState` construction.
+///
+/// Callers must drain already-running background tasks on `Err` via
+/// [`fail_mesh_pre_owner`] before returning; this helper does not own those
+/// handles so ownership can transfer cleanly into [`MeshStartupOwner`] on success.
+fn prepare_mesh_runtime_before_owner(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    config: GatewayConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    initial_applied_mesh_slice: Option<&Arc<MeshSlice>>,
+) -> Result<
+    (
+        DnsCache,
+        Vec<(String, Option<String>, Option<u64>)>,
+        Option<Arc<MeshSlice>>,
+        TlsPolicy,
+        tls::CrlList,
+        Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+        ProxyState,
+        Vec<JoinHandle<()>>,
+    ),
+    anyhow::Error,
+> {
     // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
     // BEFORE binding the DNS proxy or spawning any mesh background task. The
     // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
@@ -9356,6 +9445,13 @@ async fn serve_mesh_runtime(
     // (which a later `?` would have left running for in-process retries/tests).
     crate::capture::udp_capture_settings_from_env()
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
+    if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
+        let _ = take_mesh_startup_fault_inject();
+        return Err(anyhow::anyhow!(
+            "injected mesh startup failure before MeshStartupOwner"
+        ));
+    }
 
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
@@ -9395,11 +9491,11 @@ async fn serve_mesh_runtime(
             hostnames.push((target.host.clone(), None, None));
         }
     }
-    let initial_dns_slice = initial_applied_mesh_slice.as_ref().and_then(|slice| {
-        node_waypoint_dns_slice_for_prepared_config(&runtime, slice.as_ref(), &config)
+    let initial_dns_slice = initial_applied_mesh_slice.and_then(|slice| {
+        node_waypoint_dns_slice_for_prepared_config(runtime, slice.as_ref(), &config)
     });
 
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+    let tls_policy = TlsPolicy::from_env_config(env_config)?;
     let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
     // GAP-3D: on node-waypoint topology, create the SOCK_OPS metrics
     // state up front so plugin construction inside `ProxyState::new`
@@ -9419,32 +9515,16 @@ async fn serve_mesh_runtime(
         bpf_metrics_state.clone(),
     )?;
 
-    // Once ProxyState (and its tasks) exist, every later initialization error
-    // must signal shared shutdown and run bounded teardown before returning.
-    let mut owner = MeshStartupOwner::new(
-        shutdown_tx,
-        proxy_state,
-        health_check_handles,
-        mesh_background_handles,
-        env_config.shutdown_drain_seconds,
-    );
-    if let Err(err) = arm_mesh_runtime_startup(
-        &mut owner,
-        &env_config,
-        &runtime,
-        &dns_cache,
+    Ok((
+        dns_cache,
         hostnames,
         initial_dns_slice,
-        initial_applied_mesh_slice,
-        mesh_state,
         tls_policy,
         crls,
-    )
-    .await
-    {
-        return Err(owner.fail_with(err).await);
-    }
-    owner.serve_until_shutdown().await
+        bpf_metrics_state,
+        proxy_state,
+        health_check_handles,
+    ))
 }
 
 /// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
@@ -9461,6 +9541,7 @@ async fn arm_mesh_runtime_startup(
     mesh_state: MeshRuntimeState,
     tls_policy: TlsPolicy,
     crls: tls::CrlList,
+    bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
 ) -> Result<(), anyhow::Error> {
     let shutdown_tx = owner.shutdown_tx.clone();
     let proxy_state = owner.proxy_state.clone();
@@ -13652,9 +13733,12 @@ impl MeshStartupOwner {
             err
         );
         let _ = self.shutdown_tx.send(true);
-        let _ = await_mesh_listener_handles(
+        // Startup rollback must not wait forever on a stuck listener — bound the
+        // join and abort stragglers, then continue background teardown. Normal
+        // serve-until-shutdown keeps unbounded await semantics below.
+        join_mesh_listener_handles_bounded(
             self.listener_handles,
-            self.shutdown_tx.clone(),
+            MESH_STARTUP_LISTENER_DRAIN_TIMEOUT,
             "startup failure",
         )
         .await;
@@ -13677,11 +13761,37 @@ impl MeshStartupOwner {
     }
 }
 
+/// Bound for joining mesh background tasks during startup rollback.
+const MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound for joining mesh listeners during startup-failure rollback only.
+/// Normal serve-until-shutdown retains unbounded await semantics.
+const MESH_STARTUP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Signal shared shutdown and boundedly join already-running mesh background
+/// tasks after a failure that precedes [`MeshStartupOwner`] (initial-config wait
+/// or pre-`ProxyState` preparation). Preserves `err` as the returned cause.
+async fn fail_mesh_pre_owner(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    handles: Vec<JoinHandle<()>>,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    warn!(
+        "Mesh runtime startup failed after spawning config consumers: {}; draining before returning",
+        err
+    );
+    let _ = shutdown_tx.send(true);
+    join_mesh_background_handles(handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
+    err
+}
+
 /// Test-only fault injection for issue #2372 external probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum MeshStartupFaultInject {
     #[default]
     None,
+    /// Before `MeshStartupOwner` exists (UDP / TLS / CRL / ProxyState class).
+    BeforeOwner,
     /// After side effects exist, before the final `startup_result` gate
     /// (SVID / TLS / DNS-bind class failures).
     BeforeStartupGate,
@@ -13724,6 +13834,38 @@ async fn await_mesh_listener_handles(
             let _ = shutdown_tx.send(true);
         };
         crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+    }
+}
+
+/// Join listener tasks with a bound during startup-failure rollback; abort any
+/// still-running listeners when the timeout elapses so a stuck accept loop
+/// cannot wedge rollback forever. Dropping JoinHandles alone would detach them.
+async fn join_mesh_listener_handles_bounded(
+    listener_handles: Vec<JoinHandle<()>>,
+    timeout: Duration,
+    reason: &str,
+) {
+    if listener_handles.is_empty() {
+        return;
+    }
+    let abort_handles: Vec<_> = listener_handles
+        .iter()
+        .map(|handle| handle.abort_handle())
+        .collect();
+    let drain = async {
+        for handle in listener_handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            reason,
+            "Mesh listeners did not drain within {}s during startup rollback; aborting stragglers",
+            timeout.as_secs()
+        );
+        for abort in abort_handles {
+            abort.abort();
+        }
     }
 }
 
@@ -13771,7 +13913,7 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.health_check_handles);
     tasks.handles.extend(tasks.mesh_background_handles);
 
-    join_mesh_background_handles(tasks.handles, Duration::from_secs(5)).await;
+    join_mesh_background_handles(tasks.handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         proxy_state.env_config.log_shutdown_drain_timeout_ms,
     ))
@@ -13800,6 +13942,15 @@ pub mod startup_rollback_test_seams {
         pub shutdown_observed: bool,
         /// The sentinel finished its post-loop async teardown before return.
         pub teardown_completed: bool,
+    }
+
+    /// Observable result for the bounded startup-failure listener join probe.
+    #[derive(Debug, Clone)]
+    pub struct MeshStartupListenerDrainProbe {
+        /// Join returned within a short wall-clock budget (not wedged forever).
+        pub returned_promptly: bool,
+        /// The stuck listener was aborted after the drain timeout.
+        pub stuck_aborted: bool,
     }
 
     fn ensure_crypto_provider() {
@@ -13943,6 +14094,38 @@ pub mod startup_rollback_test_seams {
     /// Failure inside the existing listener/start-signal startup_result gate.
     pub async fn probe_failure_inside_startup_result_gate_for_test() -> MeshStartupRollbackProbe {
         probe_with_fault(MeshStartupFaultInject::InsideStartupGate).await
+    }
+
+    /// Failure before MeshStartupOwner exists (pre-ProxyState preparation).
+    pub async fn probe_failure_before_owner_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::BeforeOwner).await
+    }
+
+    /// Stuck listeners must not wedge startup-failure rollback forever.
+    pub async fn probe_startup_failure_listener_join_is_bounded_for_test()
+    -> MeshStartupListenerDrainProbe {
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let stuck_abort = stuck.abort_handle();
+        let started = std::time::Instant::now();
+        join_mesh_listener_handles_bounded(
+            vec![stuck],
+            Duration::from_millis(20),
+            "startup failure probe",
+        )
+        .await;
+        let returned_promptly = started.elapsed() < Duration::from_millis(500);
+        // AbortHandle::is_finished becomes true once the aborted task ends.
+        let stuck_aborted = tokio::time::timeout(Duration::from_secs(1), async {
+            while !stuck_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        MeshStartupListenerDrainProbe {
+            returned_promptly,
+            stuck_aborted,
+        }
     }
 }
 
