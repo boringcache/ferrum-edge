@@ -1201,6 +1201,115 @@ fn acme_public_egress_policy() -> crate::config::BackendEgressPolicy {
     crate::config::BackendEgressPolicy::from_allow_ips(crate::config::BackendAllowIps::Public)
 }
 
+/// Return whether a host has the lexical shape of a legacy numeric IPv4 address.
+///
+/// WHATWG URL parsing canonicalizes many of these forms to IPv4, but deliberately
+/// does not recognize every spelling accepted by platform resolvers. In
+/// particular, mixed dotted decimal/hex can remain a `Domain` and reach DNS or
+/// `getaddrinfo`. ACME rejects the complete ambiguous grammar rather than trying
+/// to reproduce each platform's value/range rules:
+///
+/// - a single optionally signed decimal, octal-looking, or `0x`/`0X` integer;
+/// - two or more dotted components where every component is decimal/octal-looking
+///   or explicitly hexadecimal, with an optional sign on each component.
+///
+/// Range and component-count checks are intentionally absent. Overflow and
+/// overlong dotted forms are still numeric-looking and must fail closed instead
+/// of changing classification across parsers or operating systems.
+fn is_ambiguous_legacy_numeric_ipv4_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return false;
+    }
+
+    let is_numeric_component = |component: &str| {
+        let component = component
+            .strip_prefix('+')
+            .or_else(|| component.strip_prefix('-'))
+            .unwrap_or(component);
+        if component.is_empty() {
+            return false;
+        }
+        if component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return true;
+        }
+        component
+            .strip_prefix("0x")
+            .or_else(|| component.strip_prefix("0X"))
+            .is_some_and(|hex| {
+                !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+
+    if !host.contains('.') {
+        return is_numeric_component(host);
+    }
+    host.split('.').all(is_numeric_component)
+}
+
+fn reject_non_canonical_acme_host(label: &'static str) -> AcmeError {
+    AcmeError::BlockedDirectoryUrl(format!(
+        "{label} host must be a DNS name or canonical IP literal"
+    ))
+}
+
+/// Cross-check the raw URI host against the WHATWG-parsed host before its
+/// normalized representation is trusted for origin comparison or dialing.
+fn validate_acme_host_spelling(
+    raw_host: &str,
+    parsed: &url::Url,
+    label: &'static str,
+) -> Result<(), AcmeError> {
+    // DNS names do not require percent encoding. Reject it at this boundary so
+    // decoding cannot turn an apparently non-numeric host into a numeric literal
+    // (or make the RFC URI and WHATWG parsers classify different authorities).
+    if raw_host.contains('%') {
+        return Err(reject_non_canonical_acme_host(label));
+    }
+
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            // Only canonical dotted decimal is admitted. This rejects integer,
+            // alternate-radix, abbreviated, Unicode/IDNA-normalized, leading-zero,
+            // trailing-dot, bracketed, and overflow-dependent spellings even when
+            // the URL parser happens to canonicalize one of them to IPv4.
+            let canonical = ip.to_string();
+            if raw_host != canonical.as_str() {
+                return Err(reject_non_canonical_acme_host(label));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            // IPv6 must use URI brackets, but all standard textual compression
+            // and hex-case choices remain valid.
+            let Some(bare) = raw_host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+            else {
+                return Err(reject_non_canonical_acme_host(label));
+            };
+            if bare.parse::<std::net::Ipv6Addr>().ok() != Some(ip) {
+                return Err(reject_non_canonical_acme_host(label));
+            }
+        }
+        Some(url::Host::Domain(domain)) => {
+            // Check both parser views. The raw view catches forms URL leaves as a
+            // domain (the mixed dotted-hex regression); the normalized view closes
+            // case/IDNA normalization differences without rejecting ordinary DNS.
+            if is_ambiguous_legacy_numeric_ipv4_host(raw_host)
+                || is_ambiguous_legacy_numeric_ipv4_host(domain)
+            {
+                return Err(reject_non_canonical_acme_host(label));
+            }
+        }
+        None => {
+            return Err(AcmeError::BlockedDirectoryUrl(format!(
+                "{label} must include a host"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn parse_acme_https_endpoint(raw: &str, label: &'static str) -> Result<url::Url, AcmeError> {
     let uri = raw.parse::<http::Uri>().map_err(|_| {
         AcmeError::BlockedDirectoryUrl(format!("{label} must be a valid absolute URL"))
@@ -1210,6 +1319,20 @@ fn parse_acme_https_endpoint(raw: &str, label: &'static str) -> Result<url::Url,
             "{label} must be an absolute HTTPS URL with an authority"
         )));
     }
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(AcmeError::BlockedDirectoryUrl(format!(
+            "{label} must not include userinfo"
+        )));
+    }
+    let raw_host = uri
+        .host()
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            AcmeError::BlockedDirectoryUrl(format!("{label} must include a host"))
+        })?;
     let parsed = url::Url::parse(raw).map_err(|_| {
         AcmeError::BlockedDirectoryUrl(format!("{label} must be a valid absolute URL"))
     })?;
@@ -1233,6 +1356,7 @@ fn parse_acme_https_endpoint(raw: &str, label: &'static str) -> Result<url::Url,
             "{label} must not include a fragment"
         )));
     }
+    validate_acme_host_spelling(raw_host, &parsed, label)?;
     if let Some(ip) = match parsed.host() {
         Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
         Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
@@ -3216,6 +3340,9 @@ pub mod client {
                 "https://[::1]/challenge/1",
                 "https://[fe80::1]/finalize/1",
                 "https://[fc00::1]/certificate/1",
+                "https://1.2.3.0x4/order/1",
+                "https://0X100000000/authz/1",
+                "https://%31.%32.%33.%34/challenge/1",
             ] {
                 assert!(
                     boundary_request(&client, endpoint).await.is_err(),
@@ -3420,19 +3547,63 @@ mod tests {
     #[test]
     fn directory_url_ssrf_policy_rejects_non_canonical_numeric_ips() {
         for bad in [
-            "https://2130706433/dir", // decimal integer = 127.0.0.1
-            "https://0177.0.0.1/dir", // octal = 127.0.0.1 on glibc
-            "https://127.1/dir",      // abbreviated = 127.0.0.1
-            "https://0x7f.0.0.1/dir", // hex-prefixed = 127.0.0.1
-            "https://127.0.0x1/dir",  // mixed-base dotted = 127.0.0.1
-            "https://127.0x1/dir",    // mixed-base abbreviated = 127.0.0.1
-            "https://1.2.3.0x4/dir",  // mixed-base full dotted
-            "https://0x7f000001/dir", // hex integer = 127.0.0.1
-            "https://0xA9FEA9FE/dir", // hex integer = 169.254.169.254
+            "https://2130706433/dir",
+            "https://0177.0.0.1/dir",
+            "https://127.1/dir",
+            "https://0x7f.0.0.1/dir",
+            "https://127.0.0x1/dir",
+            "https://127.0x1/dir",
+            "https://1.2.3.0x4/dir",
+            "https://1.2.3.0X4/dir",
+            "https://0x7f000001/dir",
+            "https://0xA9FEA9FE/dir",
+            "https://4294967296/dir",
+            "https://0x100000000/dir",
+            "https://040000000000/dir",
+            "https://999.999.999.999/dir",
+            "https://+2130706433/dir",
+            "https://1.2.-3.4/dir",
+            "https://1.2.3.4./dir",
+            "https://%31.%32.%33.%34/dir",
+            "https://[1.2.3.4]/dir",
         ] {
             assert!(
                 validate_acme_directory_url_ssrf_policy(bad).is_err(),
                 "expected rejection for {bad}"
+            );
+        }
+
+        let error =
+            validate_acme_directory_url_ssrf_policy("https://1.2.3.0x4/private-resource")
+                .expect_err("mixed-base host must be rejected");
+        assert!(
+            !error.to_string().contains("1.2.3.0x4"),
+            "rejection must not disclose the endpoint host"
+        );
+    }
+
+    #[test]
+    fn legacy_numeric_classifier_preserves_dns_names() {
+        for (host, ambiguous) in [
+            ("2130706433", true),
+            ("0x100000000", true),
+            ("1.2.3.0x4", true),
+            ("0377.0X0.0.1", true),
+            ("+2130706433", true),
+            ("1.2.-3.4", true),
+            ("999.999.999.999", true),
+            ("1.2.3.4.", true),
+            ("beef.cafe", false),
+            ("dead.cab", false),
+            ("abc.def.1a2b", false),
+            ("3com.example.com", false),
+            ("example.123", false),
+            ("0xlab.io", false),
+        ] {
+            assert_eq!(
+                is_ambiguous_legacy_numeric_ipv4_host(host),
+                ambiguous,
+                "unexpected legacy-numeric classification for {host:?}"
             );
         }
     }
@@ -3443,13 +3614,19 @@ mod tests {
         // connector makes the authoritative public-only decision after fresh DNS.
         for ok in [
             "https://acme-v02.api.letsencrypt.org/directory",
-            " https://acme-staging-v02.api.letsencrypt.org/directory ", // trimmed
-            "https://1.1.1.1/dir",                                      // public IPv4 literal
-            "https://[2606:4700:4700::1111]/dir",                       // public IPv6 literal
-            "https://localhost/dir", // rejected later when it resolves to loopback
-            "https://beef.cafe/dir", // hex-only hostname is not a numeric IP
-            "https://dead.cab/dir",  // hex-only hostname is not a numeric IP
-            "https://abc.def.1a2b/dir", // mixed hex hostname
+            " https://acme-staging-v02.api.letsencrypt.org/directory ",
+            "https://1.1.1.1/dir",
+            "https://[2606:4700:4700::1111]/dir",
+            "https://[2606:4700:4700:0:0:0:0:1111]/dir",
+            "https://ACME.EXAMPLE.COM/dir",
+            "https://acme.example.com./dir",
+            "https://acme.example/%64irectory",
+            "https://localhost/dir",
+            "https://beef.cafe/dir",
+            "https://dead.cab/dir",
+            "https://abc.def.1a2b/dir",
+            "https://3com.example.com/dir",
+            "https://example.123/dir",
         ] {
             assert!(
                 validate_acme_directory_url_ssrf_policy(ok).is_ok(),

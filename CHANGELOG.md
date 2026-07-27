@@ -11,14 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - ACME issuance and renewal now route every connection through a
   Ferrum-controlled, public-only fresh-DNS connector; reject mixed/private DNS
-  answers, answers above 64 addresses, endpoint origin drift,
-  credential-directory mismatch, legacy credential URL sets, hostile order
-  resource URLs, redirects, and response bodies above 1 MiB while preserving
-  HTTPS hostname/certificate verification. Fresh DNS plus all TCP candidates
-  share one 30-second wall-clock budget. **Breaking:** ACME servers that
-  advertise endpoints on another host or port, and pre-0.4 `instant-acme`
-  credentials with embedded `urls`, must be migrated to the configured
-  directory origin (#2407).
+  answers, answers above 64 addresses, ambiguous legacy numeric IPv4 host
+  spellings, endpoint origin drift, credential-directory mismatch, legacy
+  credential URL sets, hostile order resource URLs, redirects, and response
+  bodies above 1 MiB while preserving HTTPS hostname/certificate verification.
+  Fresh DNS plus all TCP candidates share one 30-second wall-clock budget.
+  **Breaking:** ACME servers that advertise endpoints on another host or port,
+  and pre-0.4 `instant-acme` credentials with embedded `urls`, must be migrated
+  to the configured directory origin (#2407).
 - `ai_semantic_cache` no longer discards Redis quarantine-`DEL` failures for
   malformed, oversized, empty, or otherwise inadmissible entries. Failed deletes
   are counted with rate-limited warnings that omit keys, payloads, credentials,

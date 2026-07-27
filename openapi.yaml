@@ -5970,11 +5970,13 @@ components:
           type: string
           description: >-
             ACME directory URL. Must be an absolute `https` URL without userinfo or
-            a fragment. The complete fresh A/AAAA answer must contain at most 64
-            candidates and every candidate must be public. Fresh DNS and all TCP
-            attempts share a 30-second deadline. All server-provided resource URLs
-            must retain this URL's normalized host and effective port, and every
-            ACME response body is capped at 1 MiB while streaming.
+            a fragment. The host must be an ordinary DNS name or canonical IP
+            literal; percent-encoded and ambiguous legacy numeric IPv4 spellings
+            are rejected before DNS. The complete fresh A/AAAA answer must contain
+            at most 64 candidates and every candidate must be public. Fresh DNS
+            and all TCP attempts share a 30-second deadline. All server-provided
+            resource URLs must retain this URL's normalized host and effective
+            port, and every ACME response body is capped at 1 MiB while streaming.
         contact:
           type: array
           items:
