@@ -4356,9 +4356,14 @@ mod inner {
                     .await?;
                 while upstream_cursor.advance(&mut *s).await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    if let Ok(id) = doc.get_str("_id") {
-                        upstream_ids.push(id.to_string());
-                    }
+                    let id = doc.get_str("_id").map_err(|error| {
+                        anyhow::Error::new(error).context(format!(
+                            "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             failed to decode spec-owned upstream id required for external reference checks"
+                        ))
+                    })?;
+                    upstream_ids.push(id.to_string());
                 }
                 drop(upstream_cursor);
 
@@ -4420,9 +4425,14 @@ mod inner {
                     .await?;
                 while upstream_cursor.advance().await? {
                     let doc = upstream_cursor.deserialize_current()?;
-                    if let Ok(id) = doc.get_str("_id") {
-                        upstream_ids.push(id.to_string());
-                    }
+                    let id = doc.get_str("_id").map_err(|error| {
+                        anyhow::Error::new(error).context(format!(
+                            "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                             namespace={namespace} api_spec_id={spec_id} column=_id: \
+                             failed to decode spec-owned upstream id required for external reference checks"
+                        ))
+                    })?;
+                    upstream_ids.push(id.to_string());
                 }
 
                 if upstream_ids.is_empty() {

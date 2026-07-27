@@ -4492,6 +4492,10 @@ async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode(
         .execute(&mut *conn)
         .await
         .expect("injecting undecodable upstream id must succeed");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .expect("restore SQLite foreign-key enforcement");
     drop(conn);
 
     let blob_upstream_before: i64 = sqlx::query_scalar(
@@ -4562,6 +4566,34 @@ async fn delete_api_spec_rolls_back_when_spec_owned_upstream_id_fails_to_decode(
             .expect("get_plugin_config failed")
             .is_some(),
         "external mesh_route_dispatch plugin must remain after rollback"
+    );
+}
+
+#[test]
+fn mongo_api_spec_upstream_reference_guard_fails_closed_on_id_decode() {
+    let source = include_str!("../../src/config/mongo_store.rs");
+    let guard = source
+        .split("async fn ensure_no_external_spec_upstream_refs_opt_session(")
+        .nth(1)
+        .expect("Mongo API-spec external-reference guard exists")
+        .split(
+            "// -----------------------------------------------------------------------\n    // BSON serialization helpers",
+        )
+        .next()
+        .expect("bounded Mongo API-spec external-reference guard");
+
+    assert!(
+        !guard.contains("if let Ok(id) = doc.get_str(\"_id\")"),
+        "Mongo must not silently omit a malformed spec-owned upstream id"
+    );
+    assert_eq!(
+        guard
+            .matches(
+                "failed to decode spec-owned upstream id required for external reference checks",
+            )
+            .count(),
+        2,
+        "session and standalone Mongo guards must both fail closed with contextual decode errors"
     );
 }
 
